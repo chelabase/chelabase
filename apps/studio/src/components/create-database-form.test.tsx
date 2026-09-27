@@ -22,7 +22,15 @@ function setup(api: Partial<ApiClient>) {
   const onSettled = vi.fn();
   render(
     <CreateDatabaseForm
-      api={{ me: vi.fn(), createDatabase: vi.fn(), getDatabase: vi.fn(), ...api }}
+      api={{
+        me: vi.fn(),
+        createDatabase: vi.fn(),
+        getDatabase: vi.fn(),
+        getConnection: vi.fn(),
+        resetPassword: vi.fn(),
+        deleteDatabase: vi.fn(),
+        ...api,
+      }}
       tenantId={"t1" as never}
       projectId={"p1" as never}
       onSettled={onSettled}

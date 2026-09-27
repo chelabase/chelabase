@@ -40,18 +40,18 @@ describe("resetOnLoad", () => {
   it("clears the guard when /v1/me succeeds", async () => {
     const guard = { shouldRedirect: vi.fn(), reset: vi.fn() };
     const me: MeResponse = { user: { sub: "u", org_id: "o" }, tenant: null };
-    const api: ApiClient = { me: vi.fn().mockResolvedValue(me), createDatabase: vi.fn(), getDatabase: vi.fn() };
+    const api = { me: vi.fn().mockResolvedValue(me), createDatabase: vi.fn(), getDatabase: vi.fn() } as unknown as ApiClient;
     await expect(resetOnLoad(api, guard).me()).resolves.toEqual(me);
     expect(guard.reset).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the guard when /v1/me fails", async () => {
     const guard = { shouldRedirect: vi.fn(), reset: vi.fn() };
-    const api: ApiClient = {
+    const api = {
       me: vi.fn().mockRejectedValue(new Error("missing org claim")),
       createDatabase: vi.fn(),
       getDatabase: vi.fn(),
-    };
+    } as unknown as ApiClient;
     await expect(resetOnLoad(api, guard).me()).rejects.toThrow("missing org claim");
     expect(guard.reset).not.toHaveBeenCalled();
   });

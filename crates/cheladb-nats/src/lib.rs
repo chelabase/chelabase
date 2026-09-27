@@ -19,6 +19,16 @@ pub const STREAM_CONTROL: &str = "CHELADB_CONTROL";
 /// Durable consumer name for the provision worker.
 pub const CONSUMER_PROVISION: &str = "cheladb-worker-provision";
 
+/// How long a failed job waits before JetStream redelivers it.
+pub const REDELIVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Durable delete jobs (container + volume teardown).
+pub const SUBJECT_DELETE: &str = "cheladb.delete";
+pub const CONSUMER_DELETE: &str = "cheladb-worker-delete";
+
+/// Core request/reply (not JetStream): reset a database's owner password.
+pub const SUBJECT_RESET_PASSWORD: &str = "cheladb.rpc.reset_password";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEnvelope<T> {
     pub job_id: Uuid,
@@ -31,6 +41,22 @@ pub struct ProvisionDatabaseJob {
     pub project_id: ProjectId,
     pub tenant_id: TenantId,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteDatabaseJob {
+    pub database_id: DatabaseId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub database_id: DatabaseId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetPasswordReply {
+    pub ok: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,21 +96,46 @@ pub async fn connect(config: &NatsConfig) -> Result<async_nats::Client, NatsErro
     Ok(async_nats::connect(&config.url).await?)
 }
 
+/// Every subject the control stream must carry.
+pub fn control_subjects() -> Vec<String> {
+    vec![
+        SUBJECT_PROVISION.to_string(),
+        SUBJECT_RECONCILE.to_string(),
+        SUBJECT_DELETE.to_string(),
+    ]
+}
+
+/// Control subjects an existing stream doesn't carry yet.
+pub fn missing_subjects(existing: &[String]) -> Vec<String> {
+    control_subjects()
+        .into_iter()
+        .filter(|s| !existing.contains(s))
+        .collect()
+}
+
+/// Create the control stream, or add subjects an older stream is missing.
 pub async fn ensure_control_stream(
     client: &async_nats::Client,
 ) -> Result<async_nats::jetstream::Context, NatsError> {
     let js = async_nats::jetstream::new(client.clone());
     match js.get_stream(STREAM_CONTROL).await {
-        Ok(_) => {
-            info!(stream = STREAM_CONTROL, "jetstream stream exists");
+        Ok(stream) => {
+            let mut config = stream.cached_info().config.clone();
+            let missing = missing_subjects(&config.subjects);
+            if missing.is_empty() {
+                info!(stream = STREAM_CONTROL, "jetstream stream exists");
+            } else {
+                config.subjects.extend(missing.iter().cloned());
+                js.update_stream(config)
+                    .await
+                    .map_err(|e| NatsError::JetStream(e.to_string()))?;
+                info!(stream = STREAM_CONTROL, ?missing, "jetstream stream subjects added");
+            }
         }
         Err(_) => {
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: STREAM_CONTROL.to_string(),
-                subjects: vec![
-                    SUBJECT_PROVISION.to_string(),
-                    SUBJECT_RECONCILE.to_string(),
-                ],
+                subjects: control_subjects(),
                 retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
                 ..Default::default()
             })
@@ -109,13 +160,54 @@ pub async fn publish_provision(
     Ok(())
 }
 
+pub async fn publish_delete(
+    js: &async_nats::jetstream::Context,
+    job: &JobEnvelope<DeleteDatabaseJob>,
+) -> Result<(), NatsError> {
+    let payload = serde_json::to_vec(job)?;
+    js.publish(SUBJECT_DELETE.to_string(), payload.into())
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?;
+    Ok(())
+}
+
+/// Run the delete consumer loop, calling `handler` for each job.
+pub async fn run_delete_consumer<F, Fut>(
+    js: async_nats::jetstream::Context,
+    handler: F,
+) -> Result<(), NatsError>
+where
+    F: FnMut(JobEnvelope<DeleteDatabaseJob>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    run_consumer(js, CONSUMER_DELETE, SUBJECT_DELETE, handler).await
+}
+
 /// Run the provision consumer loop, calling `handler` for each job.
 pub async fn run_provision_consumer<F, Fut>(
     js: async_nats::jetstream::Context,
-    mut handler: F,
+    handler: F,
 ) -> Result<(), NatsError>
 where
     F: FnMut(JobEnvelope<ProvisionDatabaseJob>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    run_consumer(js, CONSUMER_PROVISION, SUBJECT_PROVISION, handler).await
+}
+
+/// Pull `subject` with durable consumer `durable`, acking handled jobs and
+/// nak-ing failures for redelivery. Unparseable payloads are acked (dropped).
+async fn run_consumer<T, F, Fut>(
+    js: async_nats::jetstream::Context,
+    durable: &str,
+    subject: &str,
+    mut handler: F,
+) -> Result<(), NatsError>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnMut(JobEnvelope<T>) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     let stream = js
@@ -125,8 +217,8 @@ where
 
     let consumer = stream
         .create_consumer(async_nats::jetstream::consumer::pull::Config {
-            durable_name: Some(CONSUMER_PROVISION.to_string()),
-            filter_subject: SUBJECT_PROVISION.to_string(),
+            durable_name: Some(durable.to_string()),
+            filter_subject: subject.to_string(),
             ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
             ack_wait: std::time::Duration::from_secs(120),
             ..Default::default()
@@ -134,7 +226,7 @@ where
         .await
         .map_err(|e| NatsError::JetStream(e.to_string()))?;
 
-    info!(consumer = CONSUMER_PROVISION, "provision consumer ready");
+    info!(consumer = durable, "consumer ready");
 
     let mut messages = consumer
         .messages()
@@ -150,11 +242,11 @@ where
             }
         };
 
-        let job: JobEnvelope<ProvisionDatabaseJob> = match serde_json::from_slice(&message.payload)
+        let job: JobEnvelope<T> = match serde_json::from_slice(&message.payload)
         {
             Ok(j) => j,
             Err(err) => {
-                warn!("invalid provision payload: {err}");
+                warn!(consumer = durable, "invalid job payload: {err}");
                 let _ = message.ack().await;
                 continue;
             }
@@ -167,9 +259,11 @@ where
                 }
             }
             Err(err) => {
-                warn!("provision handler failed: {err}");
+                warn!(consumer = durable, "job handler failed: {err}");
+                // Back off before redelivery: a failing dependency (e.g. Docker
+                // down) would otherwise spin through redeliveries.
                 if let Err(nak_err) = message
-                    .ack_with(async_nats::jetstream::AckKind::Nak(None))
+                    .ack_with(async_nats::jetstream::AckKind::Nak(Some(REDELIVERY_DELAY)))
                     .await
                 {
                     warn!("nak failed: {nak_err}");
@@ -179,4 +273,19 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_subjects_include_delete() {
+        assert!(control_subjects().contains(&SUBJECT_DELETE.to_string()));
+        assert_eq!(
+            missing_subjects(&["cheladb.provision".into()]),
+            vec![SUBJECT_RECONCILE.to_string(), SUBJECT_DELETE.to_string()]
+        );
+        assert!(missing_subjects(&control_subjects()).is_empty());
+    }
 }

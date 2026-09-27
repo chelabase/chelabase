@@ -22,7 +22,8 @@ export type DatabaseStatus =
   | "provisioning"
   | "ready"
   | "failed"
-  | "deleting";
+  | "deleting"
+  | "deleted";
 
 export interface MeUser {
   sub: string;
@@ -65,6 +66,16 @@ export interface CreateDatabaseAccepted {
   job_id: string;
   database_id: DatabaseId;
   status: DatabaseStatus;
+}
+
+/** Owner credentials of a ready database (`GET /v1/databases/{id}/connection`). */
+export interface ConnectionDetails {
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  password: string;
+  uri: string;
 }
 
 export interface DatabaseDetail {

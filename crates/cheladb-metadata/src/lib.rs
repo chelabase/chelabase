@@ -38,8 +38,14 @@ pub struct DatabaseRecord {
     pub container_id: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
-    /// Dev-only credential for local `psql` poking.
-    pub admin_password: Option<String>,
+    /// Actual Postgres database name (sanitized from `name`).
+    pub database_name: Option<String>,
+    /// The revealed owner role (`postgres`).
+    pub owner_role: Option<String>,
+    /// Owner password, sealed with `cheladb-secrets` (aad = database id).
+    pub owner_password_enc: Option<String>,
+    /// Platform superuser password, sealed the same way. Never revealed.
+    pub platform_password_enc: Option<String>,
     pub error: Option<String>,
 }
 
@@ -51,6 +57,7 @@ pub enum DatabaseStatus {
     Ready,
     Failed,
     Deleting,
+    Deleted,
 }
 
 impl DatabaseStatus {
@@ -61,6 +68,7 @@ impl DatabaseStatus {
             Self::Ready => "ready",
             Self::Failed => "failed",
             Self::Deleting => "deleting",
+            Self::Deleted => "deleted",
         }
     }
 
@@ -71,6 +79,7 @@ impl DatabaseStatus {
             "ready" => Ok(Self::Ready),
             "failed" => Ok(Self::Failed),
             "deleting" => Ok(Self::Deleting),
+            "deleted" => Ok(Self::Deleted),
             other => Err(MetadataError::InvalidStatus(other.to_string())),
         }
     }
@@ -97,6 +106,68 @@ pub enum MetadataError {
     DuplicateDatabaseName,
     #[error("invalid status: {0}")]
     InvalidStatus(String),
+    #[error("invalid database name: {0}")]
+    InvalidDatabaseName(String),
+}
+
+/// Postgres limits identifiers to 63 bytes.
+const MAX_DATABASE_NAME_BYTES: usize = 63;
+/// Databases every Postgres cluster already has.
+const RESERVED_DATABASE_NAMES: [&str; 3] = ["postgres", "template0", "template1"];
+
+/// The Postgres database name for a user-facing name: `[A-Za-z0-9_]` only
+/// (other characters become `_`), at most 63 bytes, and not a system database.
+pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let cleaned = if cleaned.is_empty() { "cheladb".to_string() } else { cleaned };
+    if cleaned.len() > MAX_DATABASE_NAME_BYTES {
+        return Err(MetadataError::InvalidDatabaseName(format!(
+            "must be at most {MAX_DATABASE_NAME_BYTES} characters"
+        )));
+    }
+    if RESERVED_DATABASE_NAMES.contains(&cleaned.to_ascii_lowercase().as_str()) {
+        return Err(MetadataError::InvalidDatabaseName(format!(
+            "\"{cleaned}\" is reserved by Postgres"
+        )));
+    }
+    Ok(cleaned)
+}
+
+/// Outcome of [`MetadataClient::ensure_key_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCheck {
+    /// First run: the check value was stored.
+    Recorded,
+    /// The stored check value opens with the current key.
+    Matches,
+    /// Different key, but nothing was encrypted yet: the new key was adopted.
+    Replaced,
+    /// Different key while encrypted credentials exist: they can't be read.
+    Mismatch { sealed_rows: i64 },
+}
+
+/// Values stored when a database becomes ready.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadyDatabase<'a> {
+    pub container_id: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    pub database_name: &'a str,
+    pub owner_role: &'a str,
+    pub owner_password_enc: &'a str,
+    pub platform_password_enc: &'a str,
+}
+
+/// A database that isn't deleted, as seen by the reconcile loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveDatabase {
+    pub id: DatabaseId,
+    pub status: DatabaseStatus,
+    /// Seconds since the row last changed.
+    pub age_secs: i64,
 }
 
 /// A tenant with its projects and their databases (Studio landing page).
@@ -222,7 +293,7 @@ impl MetadataClient {
         match result {
             Ok(_) => Ok(()),
             Err(sqlx::Error::Database(err))
-                if err.constraint() == Some("databases_project_id_name_key") =>
+                if err.constraint() == Some("databases_live_name_key") =>
             {
                 Err(MetadataError::DuplicateDatabaseName)
             }
@@ -230,57 +301,223 @@ impl MetadataClient {
         }
     }
 
+    /// Update a live database's status. False (nothing written) once a delete
+    /// has begun: provisioning must never overwrite `deleting`/`deleted`.
     pub async fn set_status(
         &self,
         database_id: DatabaseId,
         status: DatabaseStatus,
-    ) -> Result<(), MetadataError> {
-        sqlx::query(
+    ) -> Result<bool, MetadataError> {
+        let updated = sqlx::query(
             r#"
             UPDATE databases
             SET status = $2, error = NULL, updated_at = now()
-            WHERE id = $1
+            WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
             "#,
         )
         .bind(database_id.as_uuid())
         .bind(status.as_str())
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
     }
 
+    /// Mark a live database ready. False (nothing written) once a delete has
+    /// begun; the caller must then tear down what it built.
     pub async fn set_ready(
         &self,
         database_id: DatabaseId,
-        container_id: &str,
-        host: &str,
-        port: u16,
-        admin_password: &str,
-    ) -> Result<(), MetadataError> {
-        sqlx::query(
+        db: ReadyDatabase<'_>,
+    ) -> Result<bool, MetadataError> {
+        let updated = sqlx::query(
             r#"
             UPDATE databases
             SET status = $2,
                 container_id = $3,
                 host = $4,
                 port = $5,
-                admin_password = $6,
+                database_name = $6,
+                owner_role = $7,
+                owner_password_enc = $8,
+                platform_password_enc = $9,
                 error = NULL,
                 updated_at = now()
-            WHERE id = $1
+            WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
             "#,
         )
         .bind(database_id.as_uuid())
         .bind(DatabaseStatus::Ready.as_str())
-        .bind(container_id)
-        .bind(host)
-        .bind(i32::from(port))
-        .bind(admin_password)
+        .bind(db.container_id)
+        .bind(db.host)
+        .bind(i32::from(db.port))
+        .bind(db.database_name)
+        .bind(db.owner_role)
+        .bind(db.owner_password_enc)
+        .bind(db.platform_password_enc)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// Move a database to `deleting`. False when it's already deleting,
+    /// deleted, or missing.
+    pub async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+        let moved = sqlx::query(
+            r#"
+            UPDATE databases
+            SET status = 'deleting', updated_at = now()
+            WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
+            "#,
+        )
+        .bind(database_id.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(moved.rows_affected() == 1)
+    }
+
+    /// Turn the row into a tombstone and forget everything that pointed at
+    /// the (now removed) container and credentials.
+    pub async fn mark_deleted(&self, database_id: DatabaseId) -> Result<(), MetadataError> {
+        sqlx::query(
+            r#"
+            UPDATE databases
+            SET status = 'deleted', deleted_at = now(), updated_at = now(),
+                container_id = NULL, host = NULL, port = NULL,
+                owner_password_enc = NULL, platform_password_enc = NULL
+            WHERE id = $1
+            "#,
+        )
+        .bind(database_id.as_uuid())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
+    /// Store a new owner password for a ready database. False (nothing
+    /// written) otherwise, e.g. when it was deleted while the reset ran.
+    pub async fn set_owner_password_enc(
+        &self,
+        database_id: DatabaseId,
+        owner_password_enc: &str,
+    ) -> Result<bool, MetadataError> {
+        let stored = sqlx::query(
+            "UPDATE databases SET owner_password_enc = $2, updated_at = now()
+             WHERE id = $1 AND status = 'ready'",
+        )
+        .bind(database_id.as_uuid())
+        .bind(owner_password_enc)
+        .execute(&self.pool)
+        .await?;
+        Ok(stored.rows_affected() == 1)
+    }
+
+    /// Fail a database stuck provisioning, but only if it is *still* pending or
+    /// provisioning and untouched for `max_age_secs` at write time. Reconcile
+    /// acts on a snapshot; this re-check keeps it from failing a database the
+    /// provision consumer just picked up. True when it was failed.
+    pub async fn fail_if_stale(
+        &self,
+        database_id: DatabaseId,
+        max_age_secs: i64,
+    ) -> Result<bool, MetadataError> {
+        let failed = sqlx::query(
+            r#"
+            UPDATE databases
+            SET status = 'failed', error = 'provisioning timed out', updated_at = now()
+            WHERE id = $1
+              AND status IN ('pending', 'provisioning')
+              AND updated_at < now() - make_interval(secs => $2)
+            "#,
+        )
+        .bind(database_id.as_uuid())
+        .bind(max_age_secs as f64)
+        .execute(&self.pool)
+        .await?;
+        Ok(failed.rows_affected() == 1)
+    }
+
+    /// Compare the current secrets key with the one existing credentials were
+    /// sealed with. `candidate` is a fresh check value for the current key and
+    /// `opens` tells whether a stored check value opens with it.
+    pub async fn ensure_key_check(
+        &self,
+        candidate: &str,
+        opens: impl Fn(&str) -> bool,
+    ) -> Result<KeyCheck, MetadataError> {
+        const KEY: &str = "secrets_key_check";
+        let inserted = sqlx::query(
+            "INSERT INTO control_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING",
+        )
+        .bind(KEY)
+        .bind(candidate)
+        .execute(&self.pool)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            return Ok(KeyCheck::Recorded);
+        }
+        let stored: String = sqlx::query_scalar("SELECT value FROM control_settings WHERE key = $1")
+            .bind(KEY)
+            .fetch_one(&self.pool)
+            .await?;
+        if opens(&stored) {
+            return Ok(KeyCheck::Matches);
+        }
+        let sealed_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM databases
+             WHERE owner_password_enc IS NOT NULL OR platform_password_enc IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if sealed_rows > 0 {
+            return Ok(KeyCheck::Mismatch { sealed_rows });
+        }
+        sqlx::query("UPDATE control_settings SET value = $2, updated_at = now() WHERE key = $1")
+            .bind(KEY)
+            .bind(candidate)
+            .execute(&self.pool)
+            .await?;
+        Ok(KeyCheck::Replaced)
+    }
+
+    /// Which of `ids` belong to `deleted` tombstones (ids with no row at all
+    /// are not returned).
+    pub async fn deleted_among(
+        &self,
+        ids: &[DatabaseId],
+    ) -> Result<std::collections::HashSet<DatabaseId>, MetadataError> {
+        let uuids: Vec<Uuid> = ids.iter().map(|id| id.as_uuid()).collect();
+        let rows = sqlx::query("SELECT id FROM databases WHERE status = 'deleted' AND id = ANY($1)")
+            .bind(&uuids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| DatabaseId(r.get("id"))).collect())
+    }
+
+    /// Every database that isn't deleted, with the age of its last change.
+    pub async fn list_live_for_reconcile(&self) -> Result<Vec<LiveDatabase>, MetadataError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, status, EXTRACT(EPOCH FROM now() - updated_at)::BIGINT AS age_secs
+            FROM databases
+            WHERE status <> 'deleted'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(LiveDatabase {
+                    id: DatabaseId(r.get("id")),
+                    status: DatabaseStatus::parse(r.get("status"))?,
+                    age_secs: r.get("age_secs"),
+                })
+            })
+            .collect()
+    }
+
+    /// Record a failure (ignored once a delete has begun).
     pub async fn set_failed(
         &self,
         database_id: DatabaseId,
@@ -290,7 +527,7 @@ impl MetadataClient {
             r#"
             UPDATE databases
             SET status = $2, error = $3, updated_at = now()
-            WHERE id = $1
+            WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
             "#,
         )
         .bind(database_id.as_uuid())
@@ -350,7 +587,10 @@ impl MetadataClient {
                 d.container_id,
                 d.host,
                 d.port,
-                d.admin_password,
+                d.database_name,
+                d.owner_role,
+                d.owner_password_enc,
+                d.platform_password_enc,
                 d.error
             FROM databases d
             JOIN projects p ON p.id = d.project_id
@@ -388,10 +628,11 @@ impl MetadataClient {
         let databases = sqlx::query(
             r#"
             SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.container_id,
-                   d.host, d.port, d.admin_password, d.error
+                   d.host, d.port, d.database_name, d.owner_role, d.owner_password_enc,
+                   d.platform_password_enc, d.error
             FROM databases d
             JOIN projects p ON p.id = d.project_id
-            WHERE p.tenant_id = $1
+            WHERE p.tenant_id = $1 AND d.status <> 'deleted'
             ORDER BY d.created_at
             "#,
         )
@@ -422,7 +663,10 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
         container_id: r.get("container_id"),
         host: r.get("host"),
         port: port.and_then(|p| u16::try_from(p).ok()),
-        admin_password: r.get("admin_password"),
+        database_name: r.get("database_name"),
+        owner_role: r.get("owner_role"),
+        owner_password_enc: r.get("owner_password_enc"),
+        platform_password_enc: r.get("platform_password_enc"),
         error: r.get("error"),
     }
 }
@@ -441,9 +685,43 @@ mod tests {
             container_id: None,
             host: None,
             port: None,
-            admin_password: None,
+            database_name: None,
+            owner_role: None,
+            owner_password_enc: None,
+            platform_password_enc: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn database_names_are_sanitized_like_before() {
+        assert_eq!(postgres_database_name("web-1 prod").unwrap(), "web_1_prod");
+        assert_eq!(postgres_database_name("").unwrap(), "cheladb");
+    }
+
+    #[test]
+    fn reserved_database_names_are_rejected() {
+        for reserved in ["postgres", "template0", "template1", "POSTGRES", "Template1"] {
+            assert!(matches!(
+                postgres_database_name(reserved),
+                Err(MetadataError::InvalidDatabaseName(_))
+            ), "{reserved}");
+        }
+    }
+
+    #[test]
+    fn database_names_longer_than_63_bytes_are_rejected() {
+        assert!(postgres_database_name(&"a".repeat(63)).is_ok());
+        assert!(matches!(
+            postgres_database_name(&"a".repeat(64)),
+            Err(MetadataError::InvalidDatabaseName(_))
+        ));
+    }
+
+    #[test]
+    fn deleted_status_round_trips() {
+        assert_eq!(DatabaseStatus::Deleted.as_str(), "deleted");
+        assert_eq!(DatabaseStatus::parse("deleted").unwrap(), DatabaseStatus::Deleted);
     }
 
     #[test]

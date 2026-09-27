@@ -9,7 +9,8 @@ use super::studio::{
     StudioEnv, GATEWAY_URL, MAILPIT_SMTP_HOST, STUDIO_APP_NAME, STUDIO_ORIGIN,
 };
 use crate::paths::{
-    compose_env, compose_file, demo_tenant_id, gateway_dir, issuer, studio_env_file, zitadel_dir,
+    compose_env, compose_file, demo_tenant_id, gateway_dir, issuer, secrets_dir, studio_env_file,
+    zitadel_dir,
 };
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -75,6 +76,7 @@ pub async fn run() -> Result<()> {
 
     // Independent of Zitadel: generate first so it exists even if IAM steps fail.
     let internal_keys = super::internal_keys::ensure(&gateway_dir())?;
+    let secrets_key = super::secrets_key::ensure(&secrets_dir())?;
 
     wait_jwks(&iss).await?;
 
@@ -317,9 +319,11 @@ CHELADB_ZITADEL_API_CLIENT_ID={client_id}\n\
 CHELADB_DEMO_USER_ID={demo_user_id}\n\
 CHELADB_DEMO_TENANT_ID={demo_tenant}\n\
 CHELADB_INTERNAL_SIGNING_KEY={signing_key}\n\
-CHELADB_INTERNAL_VERIFY_KEY={verify_key}\n",
+CHELADB_INTERNAL_VERIFY_KEY={verify_key}\n\
+CHELADB_SECRETS_KEY={secrets_key}\n",
         signing_key = internal_keys.signing.display(),
         verify_key = internal_keys.verify.display(),
+        secrets_key = secrets_key.display(),
     );
     fs::write(&demo_env, contents).with_context(|| format!("write {}", demo_env.display()))?;
     #[cfg(unix)]

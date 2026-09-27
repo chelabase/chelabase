@@ -129,6 +129,43 @@ pub mod orchestrator {
         },
     };
 
+    /// Owner credentials of a ready database (re-revealable).
+    pub const DATABASE_CONNECTION: Endpoint = Endpoint {
+        name: "orchestrator.database_connection",
+        method: Method::Get,
+        path: "/v1/databases/{id}/connection",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    pub const RESET_PASSWORD: Endpoint = Endpoint {
+        name: "orchestrator.reset_password",
+        method: Method::Post,
+        path: "/v1/databases/{id}/reset-password",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    pub const DELETE_DATABASE: Endpoint = Endpoint {
+        name: "orchestrator.delete_database",
+        method: Method::Delete,
+        path: "/v1/databases/{id}",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
     /// The caller, their tenant, projects and databases (Studio landing page).
     pub const ME: Endpoint = Endpoint {
         name: "orchestrator.me",
@@ -149,6 +186,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::CREATE_DATABASE,
     orchestrator::GET_DATABASE,
     orchestrator::ME,
+    orchestrator::DATABASE_CONNECTION,
+    orchestrator::RESET_PASSWORD,
+    orchestrator::DELETE_DATABASE,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

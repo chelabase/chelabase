@@ -3,12 +3,13 @@ import type { DatabaseSummary, MeResponse } from "@cheladb/types";
 import { Button } from "@/components/ui/button";
 import { ApiError, type ApiClient } from "@/lib/api";
 import { CreateDatabaseForm } from "./create-database-form";
+import { DatabaseActions } from "./database-actions";
 
 type MeState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "restarting" }
-  | { status: "ready"; me: MeResponse };
+  | { status: "ready"; me: MeResponse; refreshError?: string };
 
 export interface DashboardProps {
   api: ApiClient;
@@ -28,13 +29,27 @@ export function Dashboard({ api, profile, onSignOut, pollIntervalMs }: Dashboard
         setState({ status: "restarting" });
         return;
       }
-      setState({ status: "error", message: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      // A failed *refresh* keeps showing the last good workspace (and polling
+      // continues); only a failed first load becomes the error view.
+      setState((previous) =>
+        previous.status === "ready"
+          ? { ...previous, refreshError: message }
+          : { status: "error", message },
+      );
     }
   }, [api]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // While anything is being created or deleted, keep the list fresh.
+  useEffect(() => {
+    if (state.status !== "ready" || !hasTransitional(state.me)) return;
+    const timer = setTimeout(() => void load(), pollIntervalMs ?? 2000);
+    return () => clearTimeout(timer);
+  }, [state, load, pollIntervalMs]);
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -64,6 +79,9 @@ export function Dashboard({ api, profile, onSignOut, pollIntervalMs }: Dashboard
             </p>
             <Button onClick={() => void load()}>Retry</Button>
           </div>
+        )}
+        {state.status === "ready" && state.refreshError && (
+          <p className="text-sm text-muted-foreground">Couldn't refresh ({state.refreshError}); retrying…</p>
         )}
         {state.status === "ready" && <Workspace me={state.me} api={api} reload={load} pollIntervalMs={pollIntervalMs} />}
       </main>
@@ -132,14 +150,28 @@ function Workspace({
             onSettled={() => void reload()}
             pollIntervalMs={pollIntervalMs}
           />
-          <DatabasesTable databases={project.databases} />
+          <DatabasesTable databases={project.databases} api={api} onChanged={() => void reload()} />
         </section>
       ))}
     </>
   );
 }
 
-function DatabasesTable({ databases }: { databases: DatabaseSummary[] }) {
+const TRANSITIONAL = new Set(["pending", "provisioning", "deleting"]);
+
+function hasTransitional(me: MeResponse): boolean {
+  return (me.tenant?.projects ?? []).some((p) => p.databases.some((d) => TRANSITIONAL.has(d.status)));
+}
+
+function DatabasesTable({
+  databases,
+  api,
+  onChanged,
+}: {
+  databases: DatabaseSummary[];
+  api: ApiClient;
+  onChanged: () => void;
+}) {
   if (databases.length === 0) {
     return <p className="text-sm text-muted-foreground">No databases yet.</p>;
   }
@@ -150,6 +182,7 @@ function DatabasesTable({ databases }: { databases: DatabaseSummary[] }) {
           <th className="py-2 font-medium">Name</th>
           <th className="py-2 font-medium">Status</th>
           <th className="py-2 font-medium">Endpoint</th>
+          <th className="py-2 font-medium">Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -158,6 +191,9 @@ function DatabasesTable({ databases }: { databases: DatabaseSummary[] }) {
             <td className="py-2">{db.name}</td>
             <td className="py-2">{db.status}</td>
             <td className="py-2 font-mono">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
+            <td className="py-2">
+              <DatabaseActions api={api} database={db} onChanged={onChanged} />
+            </td>
           </tr>
         ))}
       </tbody>

@@ -10,6 +10,7 @@ members = [
     "crates/cheladb-nats",
     "crates/cheladb-auth",
     "crates/cheladb-routes",
+    "crates/cheladb-secrets",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ cheladb-metadata = { path = "crates/cheladb-metadata" }
 cheladb-nats = { path = "crates/cheladb-nats" }
 cheladb-auth = { path = "crates/cheladb-auth" }
 cheladb-routes = { path = "crates/cheladb-routes" }
+cheladb-secrets = { path = "crates/cheladb-secrets" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
@@ -56,6 +58,8 @@ async-trait = "0.1"
 bytes = "1"
 http = "1"
 arc-swap = "1"
+aes-gcm = "0.10"
+tokio-postgres = "0.7"
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 
 # RSA key generation in the `rsa`/`num-bigint-dig` test-support path (JWKS

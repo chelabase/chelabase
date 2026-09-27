@@ -1,6 +1,6 @@
 use axum::{
     extract::{FromRequestParts, Path, State},
-    http::{request::Parts, StatusCode},
+    http::{header::CACHE_CONTROL, request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -10,7 +10,11 @@ use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{
     DatabaseRecord, DatabaseStatus, MetadataClient, MetadataError, ProjectOverview, TenantOverview,
 };
-use cheladb_nats::{JetStreamContext, JobEnvelope, ProvisionDatabaseJob};
+use cheladb_nats::{
+    DeleteDatabaseJob, JetStreamContext, JobEnvelope, ProvisionDatabaseJob, ResetPasswordReply,
+    ResetPasswordRequest, SUBJECT_RESET_PASSWORD,
+};
+use cheladb_secrets::{open_credential, Purpose, SecretKey};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -50,6 +54,12 @@ pub trait MetadataPort: Send + Sync + 'static {
         &self,
         tenant_id: TenantId,
     ) -> impl Future<Output = Result<Option<TenantOverview>, MetadataError>> + Send;
+
+    /// Move to `deleting`; false when already deleting, deleted, or missing.
+    fn begin_delete(
+        &self,
+        database_id: DatabaseId,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -92,25 +102,84 @@ impl MetadataPort for MetadataClient {
     ) -> Result<Option<TenantOverview>, MetadataError> {
         MetadataClient::tenant_overview(self, tenant_id).await
     }
+
+    async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+        MetadataClient::begin_delete(self, database_id).await
+    }
 }
 
-/// Abstraction over enqueuing a provision job, so tests can inject an
-/// in-memory fake instead of a real NATS JetStream context.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Why a reset-password request got no answer from the worker.
+#[derive(Debug)]
+pub enum ResetError {
+    /// A worker is listening but didn't answer in time.
+    Timeout,
+    /// No worker listening, or the request couldn't be sent or parsed.
+    Transport(String),
+}
+
+/// Talking to the worker: durable jobs and the reset-password RPC. Abstracted
+/// so tests can inject an in-memory fake instead of NATS.
 pub trait JobPort: Send + Sync + 'static {
     fn publish_provision(
         &self,
         job: &JobEnvelope<ProvisionDatabaseJob>,
-    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    fn publish_delete(
+        &self,
+        job: &JobEnvelope<DeleteDatabaseJob>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    fn reset_password(
+        &self,
+        database_id: DatabaseId,
+    ) -> impl Future<Output = Result<ResetPasswordReply, ResetError>> + Send;
 }
 
-impl JobPort for JetStreamContext {
-    async fn publish_provision(
-        &self,
-        job: &JobEnvelope<ProvisionDatabaseJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        cheladb_nats::publish_provision(self, job)
+/// How long the orchestrator waits for the worker to reset a password.
+const RESET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// NATS-backed [`JobPort`]: JetStream for jobs, core request/reply for resets.
+#[derive(Clone)]
+pub struct NatsPorts {
+    pub js: JetStreamContext,
+    pub client: async_nats::Client,
+}
+
+impl JobPort for NatsPorts {
+    async fn publish_provision(&self, job: &JobEnvelope<ProvisionDatabaseJob>) -> Result<(), BoxError> {
+        cheladb_nats::publish_provision(&self.js, job)
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_delete(&self, job: &JobEnvelope<DeleteDatabaseJob>) -> Result<(), BoxError> {
+        cheladb_nats::publish_delete(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn reset_password(&self, database_id: DatabaseId) -> Result<ResetPasswordReply, ResetError> {
+        use async_nats::RequestErrorKind;
+        let body = serde_json::to_vec(&ResetPasswordRequest { database_id })
+            .map_err(|e| ResetError::Transport(e.to_string()))?;
+        // A per-request timeout: the client's default (10 s) would otherwise
+        // cut the documented 15 s short.
+        let request = async_nats::Request::new()
+            .payload(body.into())
+            .timeout(Some(RESET_TIMEOUT));
+        let reply = self
+            .client
+            .send_request(SUBJECT_RESET_PASSWORD, request)
+            .await
+            .map_err(|e| match e.kind() {
+            RequestErrorKind::TimedOut => ResetError::Timeout,
+            RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
+            _ => ResetError::Transport(e.to_string()),
+        })?;
+        serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
     }
 }
 
@@ -119,6 +188,8 @@ pub struct AppState<M, J> {
     pub js: J,
     /// Verifies gateway-minted internal identity tokens.
     pub identity: InternalVerifier,
+    /// Decrypts stored database credentials for reveal.
+    pub secrets: SecretKey,
 }
 
 /// Caller verified from the gateway-minted internal identity token. Does not
@@ -258,8 +329,6 @@ struct DatabaseResponse {
     status: DatabaseStatus,
     host: Option<String>,
     port: Option<u16>,
-    /// Dev-only; present when ready for local poking.
-    admin_password: Option<String>,
     error: Option<String>,
 }
 
@@ -273,7 +342,6 @@ impl From<DatabaseRecord> for DatabaseResponse {
             status: r.status,
             host: r.host,
             port: r.port,
-            admin_password: r.admin_password,
             error: r.error,
         }
     }
@@ -355,7 +423,13 @@ where
     Router::new()
         .route(routes::HEALTH.path, get(health))
         .route(routes::CREATE_DATABASE.path, post(create_database::<M, J>))
-        .route(routes::GET_DATABASE.path, get(get_database::<M, J>))
+        // GET and DELETE share one path (cheladb-routes GET_DATABASE / DELETE_DATABASE).
+        .route(
+            routes::GET_DATABASE.path,
+            get(get_database::<M, J>).delete(delete_database::<M, J>),
+        )
+        .route(routes::DATABASE_CONNECTION.path, get(database_connection::<M, J>))
+        .route(routes::RESET_PASSWORD.path, post(reset_password::<M, J>))
         .route(routes::ME.path, get(me::<M, J>))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -416,6 +490,9 @@ where
             Json(serde_json::json!({ "error": "name is required" })),
         )
             .into_response();
+    }
+    if let Err(err) = cheladb_metadata::postgres_database_name(&body.name) {
+        return json_error(StatusCode::BAD_REQUEST, &err.to_string());
     }
 
     let job_id = Uuid::new_v4();
@@ -482,6 +559,12 @@ where
 {
     let database_id = DatabaseId(id);
     match state.metadata.get_database(database_id).await {
+        // Tombstones are invisible through the API.
+        Ok(Some(record)) if record.status == DatabaseStatus::Deleted => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "database not found" })),
+        )
+            .into_response(),
         Ok(Some(record)) => {
             if record.tenant_id != principal.tenant_id {
                 return (
@@ -506,6 +589,209 @@ where
                 .into_response()
         }
     }
+}
+
+fn json_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+/// The caller's own, non-deleted database, or the response to send instead.
+async fn load_owned<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    id: Uuid,
+) -> Result<DatabaseRecord, Box<Response>>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    match state.metadata.get_database(DatabaseId(id)).await {
+        Ok(Some(record)) if record.status == DatabaseStatus::Deleted => {
+            Err(Box::new(json_error(StatusCode::NOT_FOUND, "database not found")))
+        }
+        Ok(Some(record)) if record.tenant_id != principal.tenant_id => {
+            Err(Box::new(json_error(StatusCode::FORBIDDEN, "forbidden")))
+        }
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err(Box::new(json_error(StatusCode::NOT_FOUND, "database not found"))),
+        Err(err) => {
+            error!("load database: {err}");
+            Err(Box::new(internal_error()))
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectionDetails {
+    host: String,
+    port: u16,
+    database: String,
+    user: String,
+    password: String,
+    uri: String,
+}
+
+/// Reveal the owner credentials of a ready database. Never cached, never logged.
+async fn database_connection<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    Path(id): Path<Uuid>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let record = match load_owned(&state, &principal, id).await {
+        Ok(record) => record,
+        Err(resp) => return *resp,
+    };
+    if record.status != DatabaseStatus::Ready {
+        return json_error(
+            StatusCode::CONFLICT,
+            &format!(
+                "database is {}; connection details are available once it is ready",
+                record.status.as_str()
+            ),
+        );
+    }
+    let sealed = record.owner_password_enc.filter(|s| !s.is_empty());
+    let (Some(host), Some(port), Some(database), Some(sealed)) =
+        (record.host, record.port, record.database_name, sealed)
+    else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "credentials unavailable; recreate this database",
+        );
+    };
+    let password = match open_credential(
+        &state.secrets,
+        &record.database_id.to_string(),
+        Purpose::Owner,
+        &sealed,
+    ) {
+        Ok(password) => password,
+        Err(err) => {
+            error!(database_id = %record.database_id, "decrypt owner password: {err}");
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stored credentials can't be decrypted with the current secrets key; \
+                 restore the original CHELADB_SECRETS_KEY file",
+            );
+        }
+    };
+    let user = record.owner_role.unwrap_or_else(|| "postgres".to_string());
+    info!(
+        request_id = %principal.request_id,
+        sub = %principal.sub,
+        database_id = %record.database_id,
+        "revealed connection details"
+    );
+    let uri = format!("postgres://{user}:{password}@{host}:{port}/{database}");
+    (
+        [(CACHE_CONTROL, "no-store")],
+        Json(ConnectionDetails {
+            host,
+            port,
+            database,
+            user,
+            password,
+            uri,
+        }),
+    )
+        .into_response()
+}
+
+async fn reset_password<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    Path(id): Path<Uuid>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let record = match load_owned(&state, &principal, id).await {
+        Ok(record) => record,
+        Err(resp) => return *resp,
+    };
+    if record.status != DatabaseStatus::Ready {
+        return json_error(StatusCode::CONFLICT, "database is not ready");
+    }
+    // Databases from before credentials were stored have no platform password
+    // to reset with; say so instead of failing inside the worker.
+    if record.platform_password_enc.as_deref().is_none_or(str::is_empty) {
+        return json_error(
+            StatusCode::CONFLICT,
+            "credentials unavailable; recreate this database",
+        );
+    }
+    match state.js.reset_password(record.database_id).await {
+        Ok(reply) if reply.ok => {
+            info!(request_id = %principal.request_id, database_id = %record.database_id, "owner password reset");
+            (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+        }
+        Ok(reply) if reply.error.as_deref() == Some("not ready") => {
+            json_error(StatusCode::CONFLICT, "database is not ready")
+        }
+        Ok(reply) if reply.error.as_deref() == Some("timed out") => json_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "the database did not respond; try again",
+        ),
+        Ok(reply) => {
+            error!(database_id = %record.database_id, "reset password failed: {:?}", reply.error);
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "password reset failed")
+        }
+        Err(ResetError::Timeout) => json_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "worker did not respond; try again",
+        ),
+        Err(ResetError::Transport(err)) => {
+            error!(database_id = %record.database_id, "reset password: {err}");
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "worker unavailable")
+        }
+    }
+}
+
+/// Start deleting a database (tombstone). The worker removes the container and
+/// its data; a lost job is retried by the worker's reconcile loop.
+async fn delete_database<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    Path(id): Path<Uuid>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let record = match load_owned(&state, &principal, id).await {
+        Ok(record) => record,
+        Err(resp) => return *resp,
+    };
+    match state.metadata.begin_delete(record.database_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return json_error(StatusCode::CONFLICT, "database is already being deleted")
+        }
+        Err(err) => {
+            error!("begin delete: {err}");
+            return internal_error();
+        }
+    }
+    let job = JobEnvelope {
+        job_id: Uuid::new_v4(),
+        payload: DeleteDatabaseJob {
+            database_id: record.database_id,
+        },
+    };
+    if let Err(err) = state.js.publish_delete(&job).await {
+        error!(database_id = %record.database_id, "publish delete failed (reconcile will retry): {err}");
+    }
+    info!(request_id = %principal.request_id, database_id = %record.database_id, "delete requested");
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "deleting" })),
+    )
+        .into_response()
 }
 
 fn map_metadata_error(err: MetadataError) -> Response {

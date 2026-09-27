@@ -23,7 +23,14 @@ const bound: MeResponse = {
 };
 
 function fakeApi(me: () => Promise<MeResponse>): ApiClient {
-  return { me: vi.fn(me), createDatabase: vi.fn(), getDatabase: vi.fn() };
+  return {
+    me: vi.fn(me),
+    createDatabase: vi.fn(),
+    getDatabase: vi.fn(),
+    getConnection: vi.fn(),
+    resetPassword: vi.fn(),
+    deleteDatabase: vi.fn(),
+  };
 }
 
 const profile = { name: "Ada Lovelace", email: "ada@example.com" };
@@ -68,6 +75,47 @@ describe("Dashboard", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("auth unavailable");
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByRole("heading", { name: "demo / default" })).toBeInTheDocument();
+  });
+
+  it("keeps refreshing while a database is being deleted", async () => {
+    const deleting: MeResponse = {
+      ...bound,
+      tenant: {
+        ...bound.tenant!,
+        projects: [{ ...bound.tenant!.projects[0], databases: [{ ...bound.tenant!.projects[0].databases[0], status: "deleting" }] }],
+      },
+    };
+    const gone: MeResponse = {
+      ...bound,
+      tenant: { ...bound.tenant!, projects: [{ ...bound.tenant!.projects[0], databases: [] }] },
+    };
+    const me = vi.fn<() => Promise<MeResponse>>().mockResolvedValueOnce(deleting).mockResolvedValue(gone);
+    render(<Dashboard api={fakeApi(me)} profile={profile} onSignOut={() => {}} pollIntervalMs={0} />);
+    expect(await screen.findByText("No databases yet.")).toBeInTheDocument();
+    expect(me.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps the last good list when a refresh fails, and keeps refreshing", async () => {
+    const deleting: MeResponse = {
+      ...bound,
+      tenant: {
+        ...bound.tenant!,
+        projects: [{ ...bound.tenant!.projects[0], databases: [{ ...bound.tenant!.projects[0].databases[0], status: "deleting" }] }],
+      },
+    };
+    const gone: MeResponse = {
+      ...bound,
+      tenant: { ...bound.tenant!, projects: [{ ...bound.tenant!.projects[0], databases: [] }] },
+    };
+    const me = vi
+      .fn<() => Promise<MeResponse>>()
+      .mockResolvedValueOnce(deleting)
+      .mockRejectedValueOnce(new Error("gateway hiccup"))
+      .mockResolvedValue(gone);
+    render(<Dashboard api={fakeApi(me)} profile={profile} onSignOut={() => {}} pollIntervalMs={0} />);
+    expect(await screen.findByText("No databases yet.")).toBeInTheDocument();
+    expect(me.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(screen.queryByText(/Couldn't load your workspace/)).toBeNull();
   });
 
   it("signs out", async () => {

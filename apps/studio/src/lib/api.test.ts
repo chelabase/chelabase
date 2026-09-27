@@ -34,6 +34,34 @@ describe("createApiClient", () => {
     expect(JSON.parse(init.body as string)).toEqual({ tenant_id: "t", project_id: "p", name: "web1" });
   });
 
+  it("reveals connection details", async () => {
+    const details = { host: "h", port: 5, database: "d", user: "postgres", password: "p", uri: "postgres://…" };
+    const { api, fetchImpl } = client(jsonResponse(200, details));
+    await expect(api.getConnection("d1")).resolves.toEqual(details);
+    expect(fetchImpl.mock.calls[0][0]).toBe("http://gw/v1/databases/d1/connection");
+  });
+
+  it("resets the password with a POST", async () => {
+    const { api, fetchImpl } = client(jsonResponse(200, {}));
+    await api.resetPassword("d1");
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://gw/v1/databases/d1/reset-password");
+    expect(init.method).toBe("POST");
+  });
+
+  it("deletes with DELETE and accepts 202", async () => {
+    const { api, fetchImpl } = client(jsonResponse(202, { status: "deleting" }));
+    await api.deleteDatabase("d1");
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("http://gw/v1/databases/d1");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("accepts an empty success body", async () => {
+    const { api } = client(new Response(null, { status: 204 }));
+    await expect(api.deleteDatabase("d1")).resolves.toBeUndefined();
+  });
+
   it("surfaces the API's error message", async () => {
     const { api } = client(jsonResponse(409, { error: "database name already exists in project" }));
     await expect(

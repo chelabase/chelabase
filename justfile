@@ -64,6 +64,14 @@ orchestrator:
     cargo run -p orchestrator
 
 worker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -f .cheladb/zitadel/demo.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source .cheladb/zitadel/demo.env
+      set +a
+    fi
     cargo run -p worker
 
 gateway:
@@ -208,8 +216,17 @@ sweep-dbs:
       echo "removing managed tenant containers:"
       docker ps -a --filter 'label=cheladb.managed=true' --format '  {{ "{{.Names}}" }}\t{{ "{{.Status}}" }}'
       docker stop ${ids} >/dev/null
-      docker rm -f ${ids} >/dev/null
+      # -v also drops anonymous volumes of databases created before named volumes.
+      docker rm -f -v ${ids} >/dev/null
       echo "removed $(echo "${ids}" | wc -w | tr -d ' ') container(s)"
+    fi
+
+    volumes="$(docker volume ls -q --filter 'label=cheladb.managed=true' 2>/dev/null || true)"
+    if [[ -z "${volumes}" ]]; then
+      echo "no managed data volumes to remove"
+    else
+      docker volume rm -f ${volumes} >/dev/null
+      echo "removed $(echo "${volumes}" | wc -w | tr -d ' ') data volume(s)"
     fi
 
     if docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db \

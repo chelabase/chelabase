@@ -1,4 +1,5 @@
 import type {
+  ConnectionDetails,
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
   DatabaseDetail,
@@ -33,6 +34,11 @@ export interface ApiClient {
   me(): Promise<MeResponse>;
   createDatabase(request: CreateDatabaseRequest): Promise<CreateDatabaseAccepted>;
   getDatabase(id: string): Promise<DatabaseDetail>;
+  /** Owner credentials; only for ready databases. */
+  getConnection(id: string): Promise<ConnectionDetails>;
+  resetPassword(id: string): Promise<void>;
+  /** Starts deletion (202); the database then shows `deleting` until gone. */
+  deleteDatabase(id: string): Promise<void>;
 }
 
 export function createApiClient(options: ApiClientOptions): ApiClient {
@@ -54,14 +60,23 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
       throw new ApiError(401, await errorMessage(response), restarted);
     }
     if (!response.ok) throw new ApiError(response.status, await errorMessage(response));
-    return (await response.json()) as T;
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
+
+  const databasePath = (id: string) => `/v1/databases/${encodeURIComponent(id)}`;
 
   return {
     me: () => request<MeResponse>("GET", "/v1/me"),
     createDatabase: (req) => request<CreateDatabaseAccepted>("POST", "/v1/databases", req),
-    getDatabase: (id) =>
-      request<DatabaseDetail>("GET", `/v1/databases/${encodeURIComponent(id)}`),
+    getDatabase: (id) => request<DatabaseDetail>("GET", databasePath(id)),
+    getConnection: (id) => request<ConnectionDetails>("GET", `${databasePath(id)}/connection`),
+    resetPassword: async (id) => {
+      await request<unknown>("POST", `${databasePath(id)}/reset-password`);
+    },
+    deleteDatabase: async (id) => {
+      await request<unknown>("DELETE", databasePath(id));
+    },
   };
 }
 

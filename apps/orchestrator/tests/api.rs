@@ -5,10 +5,11 @@ use cheladb_auth::internal::{
 use cheladb_metadata::{
     DatabaseRecord, DatabaseStatus, MetadataError, ProjectOverview, TenantOverview,
 };
-use cheladb_nats::{JobEnvelope, ProvisionDatabaseJob};
+use cheladb_nats::{DeleteDatabaseJob, JobEnvelope, ProvisionDatabaseJob, ResetPasswordReply};
 use cheladb_routes::{Service, ENDPOINTS};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
-use orchestrator::{build_router, AppState, JobPort, MetadataPort};
+use cheladb_secrets::{seal_credential, Purpose, SecretKey};
+use orchestrator::{build_router, AppState, JobPort, MetadataPort, ResetError};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,7 +59,10 @@ fn sample_database(tenant_id: TenantId) -> DatabaseRecord {
         container_id: None,
         host: None,
         port: None,
-        admin_password: None,
+        database_name: None,
+        owner_role: None,
+        owner_password_enc: None,
+        platform_password_enc: None,
         error: None,
     }
 }
@@ -101,11 +105,43 @@ impl MetadataPort for FakeMetadata {
     ) -> Result<Option<TenantOverview>, MetadataError> {
         Ok(self.overviews.lock().unwrap().get(&tenant_id).cloned())
     }
+
+    async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+        let mut dbs = self.databases.lock().unwrap();
+        match dbs.get_mut(&database_id) {
+            Some(db) if !matches!(db.status, DatabaseStatus::Deleting | DatabaseStatus::Deleted) => {
+                db.status = DatabaseStatus::Deleting;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum FakeReset {
+    #[default]
+    Ok,
+    NotReady,
+    Timeout,
+    /// The worker gave up on the database (its own deadline).
+    WorkerTimedOut,
+    /// No worker is listening (NATS no-responders).
+    Unavailable,
 }
 
 #[derive(Clone, Default)]
 struct FakeJobs {
     published: Arc<Mutex<Vec<JobEnvelope<ProvisionDatabaseJob>>>>,
+    deleted: Arc<Mutex<Vec<DatabaseId>>>,
+    resets: Arc<Mutex<Vec<DatabaseId>>>,
+    reset: Arc<Mutex<FakeReset>>,
+}
+
+impl FakeJobs {
+    fn reset_answers(&self, answer: FakeReset) {
+        *self.reset.lock().unwrap() = answer;
+    }
 }
 
 impl JobPort for FakeJobs {
@@ -116,12 +152,34 @@ impl JobPort for FakeJobs {
         self.published.lock().unwrap().push(job.clone());
         Ok(())
     }
+
+    async fn publish_delete(
+        &self,
+        job: &JobEnvelope<DeleteDatabaseJob>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.deleted.lock().unwrap().push(job.payload.database_id);
+        Ok(())
+    }
+
+    async fn reset_password(&self, database_id: DatabaseId) -> Result<ResetPasswordReply, ResetError> {
+        self.resets.lock().unwrap().push(database_id);
+        let answer = *self.reset.lock().unwrap();
+        match answer {
+            FakeReset::Ok => Ok(ResetPasswordReply { ok: true, error: None }),
+            FakeReset::NotReady => Ok(ResetPasswordReply { ok: false, error: Some("not ready".into()) }),
+            FakeReset::Timeout => Err(ResetError::Timeout),
+            FakeReset::WorkerTimedOut => Ok(ResetPasswordReply { ok: false, error: Some("timed out".into()) }),
+            FakeReset::Unavailable => Err(ResetError::Transport("no worker listening".into())),
+        }
+    }
 }
 
 /// A running orchestrator plus the signer standing in for the gateway.
 struct TestApp {
     base: String,
     signer: InternalSigner,
+    /// The secrets key the orchestrator decrypts with.
+    key: SecretKey,
 }
 
 impl TestApp {
@@ -146,10 +204,12 @@ fn identity(org_id: &str) -> Identity {
 /// keypair) on an ephemeral port.
 async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
     let (private_pem, public_pem) = generate_keypair_pem();
+    let key = SecretKey::generate();
     let state = Arc::new(AppState {
         metadata,
         js: jobs,
         identity: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
+        secrets: key.clone(),
     });
     let app: Router = build_router(state);
 
@@ -162,6 +222,7 @@ async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
     TestApp {
         base: format!("http://{addr}"),
         signer: InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
+        key,
     }
 }
 
@@ -325,6 +386,28 @@ async fn empty_name_is_400() {
     assert_eq!(resp.status(), 400);
 }
 
+// Review fix: reserved or over-long names would hand the owner a system
+// database or fail provisioning with a confusing timeout.
+#[tokio::test]
+async fn reserved_or_too_long_database_names_are_400() {
+    let metadata = FakeMetadata::default();
+    let bound_tenant = TenantId::new();
+    metadata.bind_org("org-1", bound_tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app(metadata, jobs.clone()).await;
+    let token = app.token_for_org("org-1");
+    for name in ["postgres".to_string(), "template1".to_string(), "x".repeat(64)] {
+        let resp = post_create(
+            &app,
+            Some(&token),
+            serde_json::json!({ "tenant_id": bound_tenant, "project_id": ProjectId::new(), "name": name }),
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "{name}");
+    }
+    assert!(jobs.published.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn duplicate_database_name_is_409() {
     let metadata = FakeMetadata::default();
@@ -407,7 +490,8 @@ fn overview_with_database(tenant_id: TenantId) -> TenantOverview {
     db.host = Some("127.0.0.1".into());
     db.port = Some(49153);
     db.container_id = Some("secret-container-id".into());
-    db.admin_password = Some("secret-password".into());
+    db.owner_password_enc = Some("v1:secret-owner-sealed".into());
+    db.platform_password_enc = Some("v1:secret-platform-sealed".into());
     TenantOverview {
         id: tenant_id,
         slug: "demo".into(),
@@ -492,9 +576,377 @@ async fn me_never_exposes_database_secrets() {
         .text()
         .await
         .unwrap();
-    for secret in ["secret-password", "secret-container-id", "admin_password", "container_id"] {
+    for secret in [
+        "secret-owner-sealed",
+        "secret-platform-sealed",
+        "secret-container-id",
+        "owner_password_enc",
+        "platform_password_enc",
+        "container_id",
+    ] {
         assert!(!text.contains(secret), "/v1/me leaked {secret}: {text}");
     }
+}
+
+#[tokio::test]
+async fn get_deleted_database_is_404() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let mut record = sample_database(tenant);
+    record.status = DatabaseStatus::Deleted;
+    let id = record.database_id;
+    metadata.insert_database(record);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/v1/databases/{}", app.base, id.as_uuid()))
+        .header(IDENTITY_HEADER, app.token_for_org("org-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+// GET /v1/databases/{id} never returns credentials or container ids.
+#[tokio::test]
+async fn get_database_never_exposes_secrets() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let db = overview_with_database(tenant).projects[0].databases[0].clone();
+    let id = db.database_id;
+    metadata.insert_database(db);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let text = reqwest::Client::new()
+        .get(format!("{}/v1/databases/{}", app.base, id.as_uuid()))
+        .header(IDENTITY_HEADER, app.token_for_org("org-1"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for secret in ["secret-owner-sealed", "secret-platform-sealed", "secret-container-id", "password"] {
+        assert!(!text.contains(secret), "GET leaked {secret}: {text}");
+    }
+}
+
+// --- Lifecycle: reveal, reset, delete ----------------------------------------
+
+/// A ready database with sealed credentials (`s3cret`) under `app.key`.
+fn ready_database(tenant: TenantId, key: &SecretKey) -> DatabaseRecord {
+    let mut db = sample_database(tenant);
+    db.name = "web1".into();
+    db.database_name = Some("web1".into());
+    db.owner_role = Some("postgres".into());
+    db.host = Some("127.0.0.1".into());
+    db.port = Some(49153);
+    db.owner_password_enc =
+        Some(seal_credential(key, &db.database_id.to_string(), Purpose::Owner, "s3cret"));
+    db.platform_password_enc =
+        Some(seal_credential(key, &db.database_id.to_string(), Purpose::Platform, "platform-pw"));
+    db
+}
+
+async fn call(app: &TestApp, method: reqwest::Method, path: &str, org: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .request(method, format!("{}{path}", app.base))
+        .header(IDENTITY_HEADER, app.token_for_org(org))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// App with org-1 bound to a tenant; `setup` gets the tenant and key to insert rows.
+async fn lifecycle_app(jobs: FakeJobs, setup: impl FnOnce(&FakeMetadata, TenantId, &SecretKey)) -> TestApp {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let app = spawn_app(metadata.clone(), jobs).await;
+    setup(&metadata, tenant, &app.key);
+    app
+}
+
+#[tokio::test]
+async fn reveal_ready_database_returns_decrypted_owner_credentials() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["user"], "postgres");
+    assert_eq!(body["password"], "s3cret");
+    assert_eq!(body["database"], "web1");
+    assert_eq!(body["host"], "127.0.0.1");
+    assert_eq!(body["port"], 49153);
+    assert_eq!(body["uri"], "postgres://postgres:s3cret@127.0.0.1:49153/web1");
+}
+
+// Review fix: a replaced secrets key gets an explicit message, not a bare 500.
+#[tokio::test]
+async fn reveal_with_a_different_secrets_key_explains_the_key_mismatch() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, _k| {
+        let db = ready_database(t, &SecretKey::generate());
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 500);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("secrets key"), "{body}");
+}
+
+// Swapping the stored columns must never reveal the platform superuser password.
+#[tokio::test]
+async fn reveal_rejects_a_platform_credential_in_the_owner_column() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
+        let mut db = ready_database(t, k);
+        db.owner_password_enc = db.platform_password_enc.clone();
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 500);
+    assert!(!resp.text().await.unwrap().contains("platform-pw"));
+}
+
+#[tokio::test]
+async fn reveal_not_ready_is_409() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
+        let mut db = ready_database(t, k);
+        db.status = DatabaseStatus::Provisioning;
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 409);
+}
+
+// Review Focus 2.
+#[tokio::test]
+async fn reveal_without_stored_credentials_is_409_with_recreate_hint() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
+        let mut db = ready_database(t, k);
+        db.owner_password_enc = None;
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
+}
+
+#[tokio::test]
+async fn reveal_other_tenant_is_403() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, _t, k| {
+        let db = ready_database(TenantId::new(), k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn reveal_deleted_is_404() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
+        let mut db = ready_database(t, k);
+        db.status = DatabaseStatus::Deleted;
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn reset_password_ok_is_200() {
+    let jobs = FakeJobs::default();
+    let mut id = None;
+    let app = lifecycle_app(jobs.clone(), |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(*jobs.resets.lock().unwrap(), vec![id.unwrap()]);
+}
+
+#[tokio::test]
+async fn reset_password_not_ready_is_409_without_asking_the_worker() {
+    let jobs = FakeJobs::default();
+    let mut id = None;
+    let app = lifecycle_app(jobs.clone(), |m, t, k| {
+        let mut db = ready_database(t, k);
+        db.status = DatabaseStatus::Pending;
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 409);
+    assert!(jobs.resets.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reset_password_worker_says_not_ready_is_409() {
+    let jobs = FakeJobs::default();
+    jobs.reset_answers(FakeReset::NotReady);
+    let mut id = None;
+    let app = lifecycle_app(jobs, |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 409);
+}
+
+// Review Focus 5.
+#[tokio::test]
+async fn reset_password_worker_timeout_is_504() {
+    let jobs = FakeJobs::default();
+    jobs.reset_answers(FakeReset::Timeout);
+    let mut id = None;
+    let app = lifecycle_app(jobs, |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 504);
+}
+
+#[tokio::test]
+async fn reset_password_worker_deadline_is_504() {
+    let jobs = FakeJobs::default();
+    jobs.reset_answers(FakeReset::WorkerTimedOut);
+    let mut id = None;
+    let app = lifecycle_app(jobs, |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 504);
+}
+
+#[tokio::test]
+async fn reset_password_with_no_worker_is_503() {
+    let jobs = FakeJobs::default();
+    jobs.reset_answers(FakeReset::Unavailable);
+    let mut id = None;
+    let app = lifecycle_app(jobs, |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 503);
+}
+
+// Databases created before credentials were stored can't be reset either.
+#[tokio::test]
+async fn reset_password_without_stored_credentials_is_409_with_recreate_hint() {
+    let jobs = FakeJobs::default();
+    let mut id = None;
+    let app = lifecycle_app(jobs.clone(), |m, t, k| {
+        let mut db = ready_database(t, k);
+        db.platform_password_enc = None;
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
+    assert!(jobs.resets.lock().unwrap().is_empty(), "worker must not be asked");
+}
+
+#[tokio::test]
+async fn delete_ready_database_is_202_and_publishes_job() {
+    let jobs = FakeJobs::default();
+    let mut id = None;
+    let app = lifecycle_app(jobs.clone(), |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::DELETE, &format!("/v1/databases/{}", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 202);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "deleting");
+    assert_eq!(*jobs.deleted.lock().unwrap(), vec![id.unwrap()]);
+}
+
+#[tokio::test]
+async fn delete_twice_is_409() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let path = format!("/v1/databases/{}", id.unwrap().as_uuid());
+    assert_eq!(call(&app, reqwest::Method::DELETE, &path, "org-1").await.status(), 202);
+    assert_eq!(call(&app, reqwest::Method::DELETE, &path, "org-1").await.status(), 409);
+}
+
+#[tokio::test]
+async fn delete_deleted_is_404() {
+    let mut id = None;
+    let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
+        let mut db = ready_database(t, k);
+        db.status = DatabaseStatus::Deleted;
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::DELETE, &format!("/v1/databases/{}", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn delete_other_tenant_is_403() {
+    let jobs = FakeJobs::default();
+    let mut id = None;
+    let app = lifecycle_app(jobs.clone(), |m, _t, k| {
+        let db = ready_database(TenantId::new(), k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::DELETE, &format!("/v1/databases/{}", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 403);
+    assert!(jobs.deleted.lock().unwrap().is_empty());
 }
 
 /// Every endpoint `cheladb-routes` assigns to the orchestrator must be routed

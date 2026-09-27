@@ -54,7 +54,7 @@ pnpm install
 | `just dev-down` | Stop host processes from `just dev` (Compose stays up) |
 | `just stop` | `dev-down` then `down` |
 | `just create-db-demo` | Authenticated `POST /v1/databases` through the gateway (:8000) |
-| `just sweep-dbs` | Remove worker-provisioned Postgres containers (+ metadata rows if deps up) |
+| `just sweep-dbs` | Dev reset: remove every worker-provisioned container and data volume (+ all metadata rows if deps up) |
 | `just check` | Rust + TS typechecks |
 | `just orchestrator` / `worker` / `gateway` / `studio` | Foreground one process |
 
@@ -124,8 +124,29 @@ How it's wired:
 1. `just dev` (needs Docker; worker talks to the Docker socket)
 2. `just create-db-demo demo1` (positional; `name=demo1` would become the literal name)
 3. Poll `GET http://127.0.0.1:8000/v1/databases/<id>` with a minted Bearer token until `status` is `ready`
-4. `psql` using `host`, `port`, user `cheladb`, password from `admin_password` (dev-only field)
-5. `just sweep-dbs` to prune tenant containers (not removed by `just stop`)
+4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgres://postgres:…` URI; `psql "<uri>"`
+5. `DELETE http://127.0.0.1:8000/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset.
+
+## Database lifecycle
+
+Each database is its own `postgres:17` container with a named data volume (`cheladb-db-<id>`) and two roles:
+
+| Role | Who uses it | Privileges |
+| --- | --- | --- |
+| `postgres` | You (revealed in Studio / `…/connection`) | Owns the database and `public` schema; `CREATEDB`, `CREATEROLE`, `BYPASSRLS`; `pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, `pg_signal_backend`; installs trusted extensions. **Not** a superuser. |
+| `cheladb_platform` | The platform only (reset, delete, reconcile, later the Postgres proxy) | `SUPERUSER`. Never revealed. |
+
+This is the Supabase/Neon pattern: near-full control for you, while the platform keeps access you can't break. Postgres 17 only lets `CREATEROLE` manage roles it created, so `postgres` can't alter or drop `cheladb_platform`.
+
+- **Connection details** (`GET /v1/databases/{id}/connection`, Studio → *Connection details*) can be revealed any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key at `CHELADB_SECRETS_KEY` (`.cheladb/secrets/secrets.key`, created by bootstrap). Keep that file: without it stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist (after `just sweep-dbs` a new key is simply adopted). Databases created before this existed report "credentials unavailable; recreate this database".
+- **Reset password** (`POST …/reset-password`) sets a new owner password. Existing sessions keep working until they reconnect. If the worker isn't running you get `503`.
+- **Delete** (`DELETE /v1/databases/{id}`, Studio asks you to type the name) removes the container and its data. The row stays as a `deleted` tombstone (hidden from the API) and the name can be reused.
+- **Reconcile**: every 30 s the worker fails databases stuck provisioning (> 10 min) or whose container vanished, retries lost deletes, and removes the container/volume of deleted databases. A managed container or volume with *no* metadata row at all (e.g. after a metadata reset or restoring an old backup) is only reported in the worker log, never removed: it may hold the only copy of someone's data. Clear those deliberately with `just sweep-dbs`.
+- `CHELADB_DB_OWNER_SUPERUSER=true` makes the `postgres` role of *new* databases a real superuser (self-hosted opt-in). Users can then break reset/delete/reconcile for that database.
+- Connections currently go straight to `127.0.0.1:<port>`. A Postgres proxy (`pgproxy`) will replace that; it's a separate front door from the HTTP gateway because Postgres clients don't speak HTTP.
+- **Upgrading from before this feature is one-way.** The migration drops the old plaintext `admin_password` column, so older binaries can't run against the upgraded metadata database (and sqlx refuses to start with a migration it doesn't know). Existing databases keep running; recreate them to get revealable credentials.
+- **Security notes.** The password Postgres is initialised with (visible via `docker inspect`) is replaced right after init; only the encrypted replacement is stored. Because `postgres` has `pg_read_all_data`, it can read the platform role's SCRAM verifier in `pg_authid`; with 32 random characters that isn't practically crackable, but treat it as sensitive.
+- Metadata tests that need a real database are opt-in: `cargo test -p cheladb-metadata --test live_db -- --ignored --test-threads=1` (with `just deps-up`).
 
 ## Local dependencies
 
