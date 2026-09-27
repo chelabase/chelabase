@@ -1,7 +1,7 @@
 //! Idempotent local Zitadel bootstrap (Management API ensure + demo tenant bind).
 
 use crate::paths::{
-    compose_env, compose_file, demo_tenant_id, issuer, zitadel_dir,
+    compose_env, compose_file, demo_tenant_id, gateway_dir, issuer, zitadel_dir,
 };
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -65,6 +65,9 @@ pub async fn run() -> Result<()> {
     let zdir = zitadel_dir();
     fs::create_dir_all(&zdir).with_context(|| format!("mkdir {}", zdir.display()))?;
 
+    // Independent of Zitadel: generate first so it exists even if IAM steps fail.
+    let internal_keys = super::internal_keys::ensure(&gateway_dir())?;
+
     wait_jwks(&iss).await?;
 
     let admin_pat_path = zdir.join("admin.pat");
@@ -84,6 +87,15 @@ pub async fn run() -> Result<()> {
         admin_pat,
         org_id: None,
     };
+
+    info!("waiting for Zitadel API…");
+    wait_api_ready(
+        &format!("{iss}/auth/v1/users/me"),
+        &api.admin_pat,
+        60,
+        Duration::from_secs(1),
+    )
+    .await?;
 
     info!("loading bootstrap caller identity…");
     let me = api.get("/auth/v1/users/me").await?;
@@ -250,7 +262,11 @@ CHELADB_ZITADEL_PROJECT_ID={project_id}\n\
 CHELADB_ZITADEL_API_APP_ID={app_id_s}\n\
 CHELADB_ZITADEL_API_CLIENT_ID={client_id}\n\
 CHELADB_DEMO_USER_ID={demo_user_id}\n\
-CHELADB_DEMO_TENANT_ID={demo_tenant}\n"
+CHELADB_DEMO_TENANT_ID={demo_tenant}\n\
+CHELADB_INTERNAL_SIGNING_KEY={signing_key}\n\
+CHELADB_INTERNAL_VERIFY_KEY={verify_key}\n",
+        signing_key = internal_keys.signing.display(),
+        verify_key = internal_keys.verify.display(),
     );
     fs::write(&demo_env, contents).with_context(|| format!("write {}", demo_env.display()))?;
     #[cfg(unix)]
@@ -283,6 +299,26 @@ async fn wait_jwks(issuer: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     bail!("Zitadel not ready at {issuer}");
+}
+
+/// Poll `url` (authenticated with `bearer`) until Zitadel's API answers
+/// without a 5xx. Zitadel serves JWKS a moment before its REST gateway can
+/// reach its own gRPC backend, so a JWKS 200 alone doesn't mean the
+/// Management/Auth APIs are ready.
+async fn wait_api_ready(url: &str, bearer: &str, attempts: u32, delay: Duration) -> Result<()> {
+    let client = reqwest::Client::new();
+    let mut last = String::from("no response");
+    for attempt in 0..attempts {
+        match client.get(url).bearer_auth(bearer).send().await {
+            Ok(resp) if !resp.status().is_server_error() => return Ok(()),
+            Ok(resp) => last = resp.status().to_string(),
+            Err(err) => last = err.to_string(),
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    bail!("Zitadel API not ready at {url} after {attempts} attempts (last: {last})")
 }
 
 async fn wait_admin_pat(path: &Path) -> Result<()> {
@@ -429,4 +465,69 @@ fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
     }
     info!("bound demo tenant {demo_tenant} → zitadel_org_id={org_id}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Serves `/api` with 503 for the first `failures` calls, then 200.
+    async fn flaky_api(failures: usize) -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = Router::new().route(
+            "/api",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) < failures {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/api"), calls)
+    }
+
+    #[tokio::test]
+    async fn waits_through_transient_503s_until_the_api_answers() {
+        let (url, calls) = flaky_api(2).await;
+        wait_api_ready(&url, "pat", 10, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_when_the_api_never_recovers() {
+        let (url, calls) = flaky_api(usize::MAX).await;
+        let err = wait_api_ready(&url, "pat", 3, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not ready"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retries_while_nothing_is_listening_yet() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}/api");
+        assert!(wait_api_ready(&url, "pat", 2, Duration::from_millis(10))
+            .await
+            .is_err());
+    }
 }

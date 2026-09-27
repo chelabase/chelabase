@@ -9,6 +9,7 @@ members = [
     "crates/cheladb-metadata",
     "crates/cheladb-nats",
     "crates/cheladb-auth",
+    "crates/cheladb-routes",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ cheladb-types = { path = "crates/cheladb-types" }
 cheladb-metadata = { path = "crates/cheladb-metadata" }
 cheladb-nats = { path = "crates/cheladb-nats" }
 cheladb-auth = { path = "crates/cheladb-auth" }
+cheladb-routes = { path = "crates/cheladb-routes" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
@@ -45,6 +47,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
+tempfile = "3"
+pingora-core = "0.9"
+pingora-proxy = "0.9"
+pingora-http = "0.9"
+pingora-error = "0.9"
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+arc-swap = "1"
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 
 # RSA key generation in the `rsa`/`num-bigint-dig` test-support path (JWKS
 # mocks) is orders of magnitude slower unoptimized; opt these in dev builds

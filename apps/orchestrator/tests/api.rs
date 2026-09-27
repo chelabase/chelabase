@@ -1,12 +1,15 @@
 use axum::Router;
-use cheladb_auth::test_support::{BrokenJwks, MockJwks};
-use cheladb_auth::JwtVerifier;
+use cheladb_auth::internal::{
+    generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier, IDENTITY_HEADER,
+};
 use cheladb_metadata::{DatabaseRecord, DatabaseStatus, MetadataError};
 use cheladb_nats::{JobEnvelope, ProvisionDatabaseJob};
+use cheladb_routes::{Service, ENDPOINTS};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
 use orchestrator::{build_router, AppState, JobPort, MetadataPort};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 #[derive(Clone, Default)]
@@ -101,17 +104,38 @@ impl JobPort for FakeJobs {
     }
 }
 
-/// Boots the real orchestrator router over the given (possibly-fake) state on
-/// an ephemeral port and returns its base URL.
-async fn spawn_app_with_verifier(
-    metadata: FakeMetadata,
-    jobs: FakeJobs,
-    verifier: JwtVerifier,
-) -> String {
+/// A running orchestrator plus the signer standing in for the gateway.
+struct TestApp {
+    base: String,
+    signer: InternalSigner,
+}
+
+impl TestApp {
+    /// An internal identity token for `org_id`, as the gateway would mint it.
+    fn token_for_org(&self, org_id: &str) -> String {
+        self.signer
+            .sign(Service::Orchestrator.name(), &identity(org_id))
+            .unwrap()
+    }
+}
+
+fn identity(org_id: &str) -> Identity {
+    Identity {
+        sub: "user-1".into(),
+        org_id: org_id.into(),
+        auth: AuthMethod::PlatformJwt,
+        request_id: "test-rid".into(),
+    }
+}
+
+/// Boots the real orchestrator router (fake metadata/jobs, fresh internal
+/// keypair) on an ephemeral port.
+async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
+    let (private_pem, public_pem) = generate_keypair_pem();
     let state = Arc::new(AppState {
         metadata,
         js: jobs,
-        verifier,
+        identity: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
     });
     let app: Router = build_router(state);
 
@@ -121,35 +145,53 @@ async fn spawn_app_with_verifier(
         axum::serve(listener, app).await.unwrap();
     });
 
-    format!("http://{addr}")
+    TestApp {
+        base: format!("http://{addr}"),
+        signer: InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
+    }
 }
 
-/// Boots the real orchestrator router (fake metadata/jobs, mock JWKS) on an
-/// ephemeral port and returns its base URL plus the mock JWKS handle for signing.
-async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> (String, MockJwks) {
-    let mock = MockJwks::start().await;
-    let verifier = JwtVerifier::new(mock.config(vec![]));
-    let base = spawn_app_with_verifier(metadata, jobs, verifier).await;
-    (base, mock)
+fn create_body(tenant_id: TenantId) -> serde_json::Value {
+    serde_json::json!({
+        "tenant_id": tenant_id,
+        "project_id": ProjectId::new(),
+        "name": "demo",
+    })
+}
+
+async fn post_create(app: &TestApp, identity_header: Option<&str>, body: serde_json::Value) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/v1/databases", app.base))
+        .json(&body);
+    if let Some(token) = identity_header {
+        req = req.header(IDENTITY_HEADER, token);
+    }
+    req.send().await.unwrap()
 }
 
 #[tokio::test]
 async fn health_is_public() {
-    let (base, _mock) = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let resp = reqwest::get(format!("{}/health", app.base)).await.unwrap();
     assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
-async fn missing_bearer_token_is_401() {
-    let (base, _mock) = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+async fn missing_identity_is_401() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let resp = post_create(&app, None, create_body(TenantId::new())).await;
+    assert_eq!(resp.status(), 401);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("gateway"));
+}
+
+#[tokio::test]
+async fn bearer_token_without_identity_is_401() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
     let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .json(&serde_json::json!({
-            "tenant_id": TenantId::new(),
-            "project_id": ProjectId::new(),
-            "name": "demo",
-        }))
+        .post(format!("{}/v1/databases", app.base))
+        .bearer_auth("some-zitadel-jwt")
+        .json(&create_body(TenantId::new()))
         .send()
         .await
         .unwrap();
@@ -157,63 +199,49 @@ async fn missing_bearer_token_is_401() {
 }
 
 #[tokio::test]
-async fn invalid_bearer_token_is_401() {
-    let (base, _mock) = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth("not-a-real-jwt")
-        .json(&serde_json::json!({
-            "tenant_id": TenantId::new(),
-            "project_id": ProjectId::new(),
-            "name": "demo",
-        }))
-        .send()
-        .await
-        .unwrap();
+async fn garbage_identity_is_401() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let resp = post_create(&app, Some("not-a-jwt"), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]
-async fn expired_bearer_token_is_401() {
-    let metadata = FakeMetadata::default();
-    let (base, mock) = spawn_app(metadata.clone(), FakeJobs::default()).await;
-    let token = mock.sign(serde_json::json!({
-        "sub": "user-1",
-        "iss": mock.issuer(),
-        "exp": 1,
-        cheladb_auth::CLAIM_ORG_ID: "org-1",
-    }));
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "tenant_id": TenantId::new(),
-            "project_id": ProjectId::new(),
-            "name": "demo",
-        }))
-        .send()
-        .await
+async fn expired_identity_is_401() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let token = app
+        .signer
+        .sign_at(Service::Orchestrator.name(), &identity("org-1"), now - 3600)
         .unwrap();
+    let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn identity_minted_for_another_service_is_401() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let token = app.signer.sign("some-other-service", &identity("org-1")).unwrap();
+    let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn identity_from_untrusted_key_is_401() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let (other_private, _) = generate_keypair_pem();
+    let forger = InternalSigner::from_pem(other_private.as_bytes()).unwrap();
+    let token = forger
+        .sign(Service::Orchestrator.name(), &identity("org-1"))
+        .unwrap();
+    let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]
 async fn unbound_org_is_403_with_bootstrap_hint() {
-    let (base, mock) = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let token = mock.token_for_org("user-1", "org-not-bound", 300);
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "tenant_id": TenantId::new(),
-            "project_id": ProjectId::new(),
-            "name": "demo",
-        }))
-        .send()
-        .await
-        .unwrap();
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let token = app.token_for_org("org-not-bound");
+    let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 403);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("zitadel-bootstrap"));
@@ -222,23 +250,10 @@ async fn unbound_org_is_403_with_bootstrap_hint() {
 #[tokio::test]
 async fn body_tenant_mismatch_is_403() {
     let metadata = FakeMetadata::default();
-    let bound_tenant = TenantId::new();
-    metadata.bind_org("org-1", bound_tenant);
-    let (base, mock) = spawn_app(metadata, FakeJobs::default()).await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
-
-    let other_tenant = TenantId::new();
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "tenant_id": other_tenant,
-            "project_id": ProjectId::new(),
-            "name": "demo",
-        }))
-        .send()
-        .await
-        .unwrap();
+    metadata.bind_org("org-1", TenantId::new());
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let token = app.token_for_org("org-1");
+    let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 403);
 }
 
@@ -248,21 +263,20 @@ async fn valid_request_is_202_accepted_and_publishes_job() {
     let bound_tenant = TenantId::new();
     metadata.bind_org("org-1", bound_tenant);
     let jobs = FakeJobs::default();
-    let (base, mock) = spawn_app(metadata, jobs.clone()).await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
+    let app = spawn_app(metadata, jobs.clone()).await;
+    let token = app.token_for_org("org-1");
 
     let project_id = ProjectId::new();
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
+    let resp = post_create(
+        &app,
+        Some(&token),
+        serde_json::json!({
             "tenant_id": bound_tenant,
             "project_id": project_id,
             "name": "demo-db",
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     assert_eq!(resp.status(), 202);
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -282,20 +296,18 @@ async fn empty_name_is_400() {
     let metadata = FakeMetadata::default();
     let bound_tenant = TenantId::new();
     metadata.bind_org("org-1", bound_tenant);
-    let (base, mock) = spawn_app(metadata, FakeJobs::default()).await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let token = app.token_for_org("org-1");
+    let resp = post_create(
+        &app,
+        Some(&token),
+        serde_json::json!({
             "tenant_id": bound_tenant,
             "project_id": ProjectId::new(),
             "name": "   ",
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), 400);
 }
 
@@ -305,52 +317,10 @@ async fn duplicate_database_name_is_409() {
     let bound_tenant = TenantId::new();
     metadata.bind_org("org-1", bound_tenant);
     metadata.fail_next_insert();
-    let (base, mock) = spawn_app(metadata, FakeJobs::default()).await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "tenant_id": bound_tenant,
-            "project_id": ProjectId::new(),
-            "name": "demo-db",
-        }))
-        .send()
-        .await
-        .unwrap();
-
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let token = app.token_for_org("org-1");
+    let resp = post_create(&app, Some(&token), create_body(bound_tenant)).await;
     assert_eq!(resp.status(), 409);
-}
-
-#[tokio::test]
-async fn jwks_unreachable_is_503() {
-    let broken = BrokenJwks::start().await;
-    let verifier = JwtVerifier::new(cheladb_auth::ZitadelAuthConfig {
-        issuer: "http://irrelevant-issuer".into(),
-        jwks_url: broken.jwks_url().to_string(),
-        audiences: vec![],
-    });
-    let base = spawn_app_with_verifier(FakeMetadata::default(), FakeJobs::default(), verifier).await;
-
-    // Any syntactically valid bearer with a kid triggers a JWKS fetch attempt,
-    // which fails against `broken` before the mismatched issuer above matters.
-    let mock = MockJwks::start().await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/v1/databases"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "tenant_id": TenantId::new(),
-            "project_id": ProjectId::new(),
-            "name": "demo",
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 503);
 }
 
 #[tokio::test]
@@ -361,12 +331,12 @@ async fn get_database_own_tenant_is_200() {
     let record = sample_database(bound_tenant);
     let database_id = record.database_id;
     metadata.insert_database(record);
-    let (base, mock) = spawn_app(metadata, FakeJobs::default()).await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let token = app.token_for_org("org-1");
 
     let resp = reqwest::Client::new()
-        .get(format!("{base}/v1/databases/{}", database_id.as_uuid()))
-        .bearer_auth(token)
+        .get(format!("{}/v1/databases/{}", app.base, database_id.as_uuid()))
+        .header(IDENTITY_HEADER, token)
         .send()
         .await
         .unwrap();
@@ -379,18 +349,16 @@ async fn get_database_own_tenant_is_200() {
 #[tokio::test]
 async fn get_database_other_tenant_is_403_forbidden() {
     let metadata = FakeMetadata::default();
-    let bound_tenant = TenantId::new();
-    metadata.bind_org("org-1", bound_tenant);
-    let other_tenant = TenantId::new();
-    let record = sample_database(other_tenant);
+    metadata.bind_org("org-1", TenantId::new());
+    let record = sample_database(TenantId::new());
     let database_id = record.database_id;
     metadata.insert_database(record);
-    let (base, mock) = spawn_app(metadata, FakeJobs::default()).await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let token = app.token_for_org("org-1");
 
     let resp = reqwest::Client::new()
-        .get(format!("{base}/v1/databases/{}", database_id.as_uuid()))
-        .bearer_auth(token)
+        .get(format!("{}/v1/databases/{}", app.base, database_id.as_uuid()))
+        .header(IDENTITY_HEADER, token)
         .send()
         .await
         .unwrap();
@@ -403,17 +371,56 @@ async fn get_database_other_tenant_is_403_forbidden() {
 #[tokio::test]
 async fn get_database_unknown_id_is_404() {
     let metadata = FakeMetadata::default();
-    let bound_tenant = TenantId::new();
-    metadata.bind_org("org-1", bound_tenant);
-    let (base, mock) = spawn_app(metadata, FakeJobs::default()).await;
-    let token = mock.token_for_org("user-1", "org-1", 300);
+    metadata.bind_org("org-1", TenantId::new());
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let token = app.token_for_org("org-1");
 
     let resp = reqwest::Client::new()
-        .get(format!("{base}/v1/databases/{}", uuid::Uuid::new_v4()))
-        .bearer_auth(token)
+        .get(format!("{}/v1/databases/{}", app.base, uuid::Uuid::new_v4()))
+        .header(IDENTITY_HEADER, token)
         .send()
         .await
         .unwrap();
 
     assert_eq!(resp.status(), 404);
+}
+
+/// Every endpoint `cheladb-routes` assigns to the orchestrator must be routed
+/// by the orchestrator's own router. A 401 still proves the route exists; only
+/// 404 (unknown path) and 405 (wrong method) mean drift.
+#[tokio::test]
+async fn every_declared_orchestrator_endpoint_is_routed() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let client = reqwest::Client::new();
+    let declared: Vec<_> = ENDPOINTS
+        .iter()
+        .filter(|ep| ep.service == Service::Orchestrator)
+        .collect();
+    assert!(!declared.is_empty());
+
+    for ep in declared {
+        let method = reqwest::Method::from_bytes(ep.method.as_str().as_bytes()).unwrap();
+        let url = format!("{}{}", app.base, fill_params(ep.path));
+        let status = client.request(method, &url).send().await.unwrap().status();
+        assert!(
+            status != 404 && status != 405,
+            "{} {} is declared in cheladb-routes but the orchestrator answered {status}",
+            ep.method.as_str(),
+            ep.path
+        );
+    }
+}
+
+fn fill_params(template: &str) -> String {
+    template
+        .split('/')
+        .map(|segment| {
+            if segment.starts_with('{') {
+                uuid::Uuid::nil().to_string()
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }

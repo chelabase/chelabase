@@ -18,10 +18,12 @@ axum = { workspace = true, optional = true }
 rsa = { version = "0.9", features = ["pem"], optional = true }
 base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
 
 [dev-dependencies]
 cheladb-auth = { path = ".", features = ["test-support"] }
 base64 = { workspace = true }
 
 [features]
-test-support = ["dep:axum", "dep:rsa", "dep:base64", "dep:rand"]
+keygen = ["dep:ed25519-dalek", "dep:rand"]
+test-support = ["keygen", "dep:axum", "dep:rsa", "dep:base64", "dep:rand"]

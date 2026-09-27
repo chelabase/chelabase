@@ -67,6 +67,14 @@ worker:
     cargo run -p worker
 
 gateway:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -f .cheladb/zitadel/demo.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source .cheladb/zitadel/demo.env
+      set +a
+    fi
     cargo run -p gateway
 
 studio:
@@ -125,9 +133,9 @@ dev: deps-up
     echo "=== Cheladb dev stack (detached) ==="
     echo "Seed tenant_id:  {{demo_tenant_id}}"
     echo "Seed project_id: {{demo_project_id}}"
-    echo "Orchestrator:    http://127.0.0.1:8081"
+    echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
+    echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
     echo "Worker health:   http://127.0.0.1:8082/health"
-    echo "Gateway TCP:     127.0.0.1:15432"
     echo "Studio:          http://localhost:3000"
     echo "Zitadel console: http://localhost:8080/ui/console"
     echo "Demo IAM:        .cheladb/zitadel/ (cargo run -p cheladb -- auth token)"
@@ -174,7 +182,7 @@ create-db-demo name="demo1":
       set +a
     fi
     TOKEN="$(cargo run -q -p cheladb -- auth token)"
-    curl -sS -X POST "http://127.0.0.1:8081/v1/databases" \
+    curl -sS -X POST "http://127.0.0.1:8000/v1/databases" \
       -H "content-type: application/json" \
       -H "Authorization: Bearer ${TOKEN}" \
       -d "{\"tenant_id\":\"{{demo_tenant_id}}\",\"project_id\":\"{{demo_project_id}}\",\"name\":\"{{name}}\"}"

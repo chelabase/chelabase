@@ -17,6 +17,7 @@ path = "src/main.rs"
 cheladb-auth = { workspace = true }
 cheladb-metadata = { workspace = true }
 cheladb-nats = { workspace = true }
+cheladb-routes = { workspace = true }
 cheladb-types = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

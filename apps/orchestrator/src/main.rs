@@ -1,4 +1,4 @@
-use cheladb_auth::JwtVerifier;
+use cheladb_auth::internal::InternalVerifier;
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{connect, ensure_control_stream, NatsConfig};
 use orchestrator::{build_router, AppState};
@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
         database_url: "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into(),
     });
     let nats_config = NatsConfig::from_env().expect("nats config");
-    let verifier = JwtVerifier::from_env().expect("zitadel auth config");
+    let identity = InternalVerifier::from_env().expect("internal identity verify key");
 
     let metadata = MetadataClient::connect(&metadata_config).await?;
     metadata.migrate().await?;
@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         metadata,
         js,
-        verifier,
+        identity,
     };
 
     let app = build_router(Arc::new(state));

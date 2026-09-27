@@ -1,8 +1,8 @@
-//! Zitadel JWKS JWT verification for Cheladb.
+//! Authentication for Cheladb.
 //!
-//! - Verify JWTs locally via JWKS (no introspection).
-//! - Soft-bind uses claim `urn:zitadel:iam:org:id` → metadata `tenants.zitadel_org_id`.
-//! - Token introspection and API keys are deferred.
+//! - [`JwtVerifier`]: Zitadel JWTs verified locally via JWKS (no introspection).
+//!   Soft-bind uses claim `urn:zitadel:iam:org:id` → metadata `tenants.zitadel_org_id`.
+//! - [`internal`]: gateway-minted internal identity tokens for service-to-service trust.
 
 use jsonwebtoken::{
     decode, decode_header, Algorithm, DecodingKey, Validation,
@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
+
+pub mod internal;
 
 /// Zitadel org id claim (when asserted via org-scoped flows).
 pub const CLAIM_ORG_ID: &str = "urn:zitadel:iam:org:id";

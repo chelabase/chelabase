@@ -1,11 +1,12 @@
 use axum::{
     extract::{FromRequestParts, Path, State},
-    http::{header::AUTHORIZATION, request::Parts, StatusCode},
+    http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use cheladb_auth::{AuthError, JwtVerifier};
+use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
+use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{DatabaseRecord, DatabaseStatus, MetadataClient, MetadataError};
 use cheladb_nats::{JetStreamContext, JobEnvelope, ProvisionDatabaseJob};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
@@ -102,10 +103,12 @@ impl JobPort for JetStreamContext {
 pub struct AppState<M, J> {
     pub metadata: M,
     pub js: J,
-    pub verifier: JwtVerifier,
+    /// Verifies gateway-minted internal identity tokens.
+    pub identity: InternalVerifier,
 }
 
-/// Authenticated caller after JWKS verify + org→tenant soft-bind resolution.
+/// Caller established by the gateway (internal identity token) after
+/// org→tenant soft-bind resolution.
 #[derive(Debug, Clone)]
 struct AuthPrincipal {
     #[allow(dead_code)]
@@ -113,6 +116,7 @@ struct AuthPrincipal {
     #[allow(dead_code)]
     org_id: String,
     tenant_id: TenantId,
+    request_id: String,
 }
 
 impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for AuthPrincipal
@@ -126,22 +130,18 @@ where
         parts: &mut Parts,
         state: &Arc<AppState<M, J>>,
     ) -> Result<Self, Self::Rejection> {
-        let header = parts
+        let token = parts
             .headers
-            .get(AUTHORIZATION)
+            .get(IDENTITY_HEADER)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| auth_error_response(AuthError::Unauthorized))?;
-
-        let token = header
-            .strip_prefix("Bearer ")
-            .or_else(|| header.strip_prefix("bearer "))
-            .ok_or_else(|| auth_error_response(AuthError::Unauthorized))?;
+            .ok_or_else(|| {
+                unauthorized("missing internal identity; call the API through the gateway")
+            })?;
 
         let claims = state
-            .verifier
-            .verify(token)
-            .await
-            .map_err(auth_error_response)?;
+            .identity
+            .verify(token, Service::Orchestrator.name())
+            .map_err(|err| unauthorized(&err.to_string()))?;
 
         let tenant_id = state
             .metadata
@@ -169,26 +169,17 @@ where
             sub: claims.sub,
             org_id: claims.org_id,
             tenant_id,
+            request_id: claims.rid,
         })
     }
 }
 
-fn auth_error_response(err: AuthError) -> Response {
-    match err {
-        AuthError::Unauthorized | AuthError::InvalidToken(_) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-        AuthError::Jwks(_) | AuthError::Config(_) => {
-            error!("auth infrastructure error: {err}");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "auth unavailable" })),
-            )
-                .into_response()
-        }
-    }
+fn unauthorized(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,9 +233,9 @@ where
     J: JobPort,
 {
     Router::new()
-        .route("/health", get(health))
-        .route("/v1/databases", post(create_database::<M, J>))
-        .route("/v1/databases/{id}", get(get_database::<M, J>))
+        .route(routes::HEALTH.path, get(health))
+        .route(routes::CREATE_DATABASE.path, post(create_database::<M, J>))
+        .route(routes::GET_DATABASE.path, get(get_database::<M, J>))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -314,7 +305,13 @@ where
             .into_response();
     }
 
-    info!(%job_id, %database_id, name = %body.name, "accepted create database");
+    info!(
+        %job_id,
+        %database_id,
+        name = %body.name,
+        request_id = %principal.request_id,
+        "accepted create database"
+    );
 
     (
         StatusCode::ACCEPTED,

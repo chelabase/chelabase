@@ -27,6 +27,13 @@ pub fn zitadel_dir() -> PathBuf {
     repo_root().join(".cheladb/zitadel")
 }
 
+pub fn gateway_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELADB_GATEWAY_DIR") {
+        return PathBuf::from(dir);
+    }
+    repo_root().join(".cheladb/gateway")
+}
+
 pub fn compose_file() -> PathBuf {
     env::var("COMPOSE_FILE")
         .map(PathBuf::from)

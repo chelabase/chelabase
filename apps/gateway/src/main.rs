@@ -1,53 +1,52 @@
-//! Cheladb gateway stub.
-//!
-//! Future: Cloudflare Pingora proxy with Postgres wire parsing and metadata-based
-//! dynamic routing. Auth will verify JWTs via JWKS (`cheladb-auth`), not introspection.
-//!
-//! This skeleton binds a TCP port and closes connections with a clear stub response
-//! so the service shape exists without pulling in the full Pingora bootstrap yet.
+//! Cheladb HTTP API gateway: the single front door on plain HTTP.
 
-use cheladb_auth::ZitadelAuthConfig;
-use cheladb_metadata::MetadataConfig;
-use std::net::SocketAddr;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tracing::{info, warn};
+use cheladb_auth::internal::InternalSigner;
+use cheladb_auth::JwtVerifier;
+use gateway::config::GatewayConfig;
+use gateway::pipeline::Pipeline;
+use gateway::proxy::Gateway;
+use gateway::registry::{Registry, SharedRegistry};
+use pingora_core::server::configuration::ServerConf;
+use pingora_core::server::Server;
+use std::sync::Arc;
+use tracing::info;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gateway=info".into()),
+                .unwrap_or_else(|_| "gateway=info,cheladb_auth=info,pingora=warn".into()),
         )
         .init();
 
-    let _metadata = MetadataConfig::from_env().unwrap_or_else(|err| {
-        warn!("{err}; using placeholder metadata URL");
-        MetadataConfig {
-            database_url: "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into(),
-        }
-    });
-    let _auth = ZitadelAuthConfig::from_env().expect("auth config");
+    let config = GatewayConfig::from_env()?;
+    let verifier = JwtVerifier::from_env()?;
+    let signer = InternalSigner::from_env()?;
+    let registry = Arc::new(SharedRegistry::new(
+        Registry::from_config(&config.platform_hosts).map_err(anyhow::Error::msg)?,
+    ));
+    let pipeline = Pipeline::new(registry, config.studio_origins.clone(), verifier, signer);
 
-    let addr: SocketAddr = std::env::var("CHELADB_GATEWAY_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:15432".into())
-        .parse()?;
+    // Pingora's defaults assume zero-downtime binary upgrades with long grace
+    // periods. Under `just dev`, Compose, or k8s a process manager restarts us,
+    // so exit promptly on SIGTERM.
+    let conf = ServerConf {
+        grace_period_seconds: Some(0),
+        graceful_shutdown_timeout_seconds: Some(5),
+        threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        ..ServerConf::default()
+    };
 
-    let listener = TcpListener::bind(addr).await?;
-    info!(
-        %addr,
-        "gateway listening (TCP stub — Pingora + Postgres wire protocol not wired yet)"
+    let mut server = Server::new_with_opt_and_conf(None, conf);
+    server.bootstrap();
+    let mut service = pingora_proxy::http_proxy_service(
+        &server.configuration,
+        Gateway::new(pipeline, config.upstreams.clone(), config.upstream_timeout),
     );
+    service.add_tcp(&config.listen);
+    server.add_service(service);
 
-    loop {
-        let (mut socket, peer) = listener.accept().await?;
-        info!(%peer, "accepted connection (stub — closing)");
-        tokio::spawn(async move {
-            let msg = b"cheladb gateway stub: Postgres wire routing not implemented\n";
-            let _ = socket.write_all(msg).await;
-            let _ = socket.shutdown().await;
-        });
-    }
+    info!(listen = %config.listen, "gateway listening");
+    server.run_forever();
 }
