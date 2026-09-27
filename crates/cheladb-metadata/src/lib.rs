@@ -28,7 +28,7 @@ impl MetadataConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseRecord {
     pub database_id: DatabaseId,
     pub project_id: ProjectId,
@@ -97,6 +97,44 @@ pub enum MetadataError {
     DuplicateDatabaseName,
     #[error("invalid status: {0}")]
     InvalidStatus(String),
+}
+
+/// A tenant with its projects and their databases (Studio landing page).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TenantOverview {
+    pub id: TenantId,
+    pub slug: String,
+    pub projects: Vec<ProjectOverview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectOverview {
+    pub id: ProjectId,
+    pub slug: String,
+    pub databases: Vec<DatabaseRecord>,
+}
+
+/// Attach each database to its project, keeping project and database order.
+/// Databases whose project isn't listed are dropped.
+pub fn group_overview(
+    id: TenantId,
+    slug: String,
+    projects: Vec<(ProjectId, String)>,
+    databases: Vec<DatabaseRecord>,
+) -> TenantOverview {
+    let projects = projects
+        .into_iter()
+        .map(|(project_id, project_slug)| ProjectOverview {
+            id: project_id,
+            slug: project_slug,
+            databases: databases
+                .iter()
+                .filter(|d| d.project_id == project_id)
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    TenantOverview { id, slug, projects }
 }
 
 #[derive(Debug, Clone)]
@@ -323,20 +361,135 @@ impl MetadataClient {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| {
-            let port: Option<i32> = r.try_get("port").ok().flatten();
-            DatabaseRecord {
-                database_id: DatabaseId(r.get("id")),
-                project_id: ProjectId(r.get("project_id")),
-                tenant_id: TenantId(r.get("tenant_id")),
-                name: r.get("name"),
-                status: DatabaseStatus::parse(r.get("status")).unwrap_or(DatabaseStatus::Failed),
-                container_id: r.get("container_id"),
-                host: r.get("host"),
-                port: port.and_then(|p| u16::try_from(p).ok()),
-                admin_password: r.get("admin_password"),
-                error: r.get("error"),
-            }
-        }))
+        Ok(row.as_ref().map(database_from_row))
+    }
+
+    /// The tenant, its projects (by slug) and their databases (oldest first).
+    pub async fn tenant_overview(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Option<TenantOverview>, MetadataError> {
+        let Some(tenant) = sqlx::query("SELECT slug FROM tenants WHERE id = $1")
+            .bind(tenant_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let projects = sqlx::query(
+            "SELECT id, slug FROM projects WHERE tenant_id = $1 ORDER BY slug",
+        )
+        .bind(tenant_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| (ProjectId(r.get("id")), r.get::<String, _>("slug")))
+        .collect();
+        let databases = sqlx::query(
+            r#"
+            SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.container_id,
+                   d.host, d.port, d.admin_password, d.error
+            FROM databases d
+            JOIN projects p ON p.id = d.project_id
+            WHERE p.tenant_id = $1
+            ORDER BY d.created_at
+            "#,
+        )
+        .bind(tenant_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(database_from_row)
+        .collect();
+        Ok(Some(group_overview(
+            tenant_id,
+            tenant.get("slug"),
+            projects,
+            databases,
+        )))
+    }
+}
+
+/// Map a `databases ⋈ projects` row (see `get_database`) to a record.
+fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
+    let port: Option<i32> = r.try_get("port").ok().flatten();
+    DatabaseRecord {
+        database_id: DatabaseId(r.get("id")),
+        project_id: ProjectId(r.get("project_id")),
+        tenant_id: TenantId(r.get("tenant_id")),
+        name: r.get("name"),
+        status: DatabaseStatus::parse(r.get("status")).unwrap_or(DatabaseStatus::Failed),
+        container_id: r.get("container_id"),
+        host: r.get("host"),
+        port: port.and_then(|p| u16::try_from(p).ok()),
+        admin_password: r.get("admin_password"),
+        error: r.get("error"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(project_id: ProjectId, name: &str) -> DatabaseRecord {
+        DatabaseRecord {
+            database_id: DatabaseId::new(),
+            project_id,
+            tenant_id: TenantId(DEMO_TENANT_ID),
+            name: name.into(),
+            status: DatabaseStatus::Ready,
+            container_id: None,
+            host: None,
+            port: None,
+            admin_password: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn group_overview_attaches_databases_to_their_projects() {
+        let (a, b) = (ProjectId::new(), ProjectId::new());
+        let overview = group_overview(
+            TenantId(DEMO_TENANT_ID),
+            "demo".into(),
+            vec![(a, "alpha".into()), (b, "beta".into())],
+            vec![record(b, "b1"), record(a, "a1"), record(b, "b2")],
+        );
+        assert_eq!(overview.slug, "demo");
+        let names = |i: usize| -> Vec<String> {
+            overview.projects[i]
+                .databases
+                .iter()
+                .map(|d| d.name.clone())
+                .collect()
+        };
+        assert_eq!(overview.projects[0].slug, "alpha");
+        assert_eq!(names(0), vec!["a1"]);
+        assert_eq!(names(1), vec!["b1", "b2"]);
+    }
+
+    #[test]
+    fn group_overview_keeps_projects_without_databases() {
+        let a = ProjectId::new();
+        let overview = group_overview(
+            TenantId(DEMO_TENANT_ID),
+            "demo".into(),
+            vec![(a, "alpha".into())],
+            vec![],
+        );
+        assert_eq!(overview.projects.len(), 1);
+        assert!(overview.projects[0].databases.is_empty());
+    }
+
+    #[test]
+    fn group_overview_drops_databases_of_unlisted_projects() {
+        let a = ProjectId::new();
+        let overview = group_overview(
+            TenantId(DEMO_TENANT_ID),
+            "demo".into(),
+            vec![(a, "alpha".into())],
+            vec![record(ProjectId::new(), "stray")],
+        );
+        assert!(overview.projects[0].databases.is_empty());
     }
 }

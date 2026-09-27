@@ -12,7 +12,7 @@ apps/
   worker/         JetStream consumer + Docker Postgres provisioner
   gateway/        HTTP API gateway (Pingora): routing, Zitadel JWT → internal identity
   cheladb/        Local CLI (auth bootstrap / token mint; future control-plane commands)
-  studio/         Vite + TanStack Router + Tailwind + shadcn (Base UI) + Zustand
+  studio/         Vite + TanStack Router + Tailwind + shadcn (Base UI); Zitadel sign-in (oidc-client-ts)
 crates/
   cheladb-types/
   cheladb-metadata/   sqlx migrations + client
@@ -100,6 +100,24 @@ Design notes:
 - [create-database vertical slice](docs/superpowers/specs/2026-09-27-create-database-vertical-slice-design.md)
 - [orchestrator auth](docs/superpowers/specs/2026-09-27-orchestrator-auth-design.md)
 - [API gateway](docs/superpowers/specs/2026-09-27-gateway-design.md)
+- [Studio auth](docs/superpowers/specs/2026-09-27-studio-auth-design.md)
+
+## Studio sign-in
+
+Studio uses **Zitadel's hosted login** for sign-in and sign-up; there is no custom auth UI.
+
+1. `just dev`, then open http://localhost:3000 and choose **Create account** (or **Sign in**).
+2. Zitadel emails a verification code. Locally every email lands in **Mailpit**: http://localhost:8025.
+3. After verifying you land on `/app`: your tenant and project, their databases, and a form to create one. Everything goes through the gateway on `:8000` with your Zitadel JWT.
+
+How it's wired:
+
+- `cheladb auth bootstrap` registers the `cheladb-studio` OIDC app (PKCE, JWT access tokens), points Zitadel's SMTP at Mailpit, and writes `apps/studio/.env.local` (gitignored). Re-run it if Studio says settings are missing. Bootstrap never edits an existing `cheladb-studio` app; if its settings drifted it logs a warning (fix it in the console, or delete the app and re-run bootstrap). A Mailpit SMTP config without credentials, which Zitadel can't send with, is replaced automatically.
+- Skip email verification in local dev: `CHELADB_DEV_SKIP_EMAIL_VERIFICATION=true just zitadel-bootstrap` (or `… just dev`). Bootstrap installs a Zitadel *Pre Creation* Action that marks self-signup emails verified. Run bootstrap without the variable to turn verification back on. Zitadel has no built-in setting for this. **Local dev only:** anyone could register with an email they don't own.
+- Everyone who signs up joins the same organization, tenant and project (a shared team workspace, by design for self-hosting). Per-signup isolation is the "one org per signup" option in the spec.
+- Open Studio at `http://localhost:3000`; visits to `127.0.0.1:3000` are redirected there, since the Zitadel redirect URI and gateway CORS are registered for `localhost`.
+- New signups join the bootstrapped org, which is bound to the demo tenant. That pin is one scope in `apps/studio/src/lib/auth.ts`. Moving to one organization per signup is sketched in the [Studio auth spec](docs/superpowers/specs/2026-09-27-studio-auth-design.md).
+- `GET /v1/me` returns the caller plus their tenant, projects and databases, or `tenant: null` when the org has no tenant.
 
 ## Create-database smoke test
 
@@ -117,6 +135,7 @@ Design notes:
 | NATS (+ JetStream) | 4222 (monitor 8222) | Provision queue |
 | Zitadel | 8080 | Console: http://localhost:8080/ui/console |
 | Zitadel Postgres | 5434 | Zitadel’s own DB |
+| Mailpit | 8025 | Local email inbox (signup verification codes) |
 | Orchestrator | 8081 | Internal HTTP API (via gateway) |
 | Worker health | 8082 | `/health` |
 | Gateway | 8000 | HTTP front door (Pingora) |
@@ -125,4 +144,4 @@ Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env`
 
 ## Still out of scope
 
-Postgres wire proxy (apps/pgproxy), gateway TLS, Studio OIDC UI, API keys, protocol-admin RBAC, delete/reconcile, CI, git remote. Next: studio.
+Postgres wire proxy (apps/pgproxy), gateway TLS, per-signup organizations, API keys, protocol-admin RBAC, delete/reconcile, CI, git remote.

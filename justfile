@@ -120,13 +120,13 @@ dev: deps-up
     cargo build -p orchestrator -p worker -p gateway -p cheladb
 
     # Start orchestrator first so migrations add tenants.zitadel_org_id, then re-bind.
-    nohup cargo run -p orchestrator >"{{dev_dir}}/orchestrator.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid cargo run -p orchestrator >"{{dev_dir}}/orchestrator.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     sleep 3
     cargo run -q -p cheladb -- auth bootstrap >/dev/null || true
 
-    nohup cargo run -p worker >"{{dev_dir}}/worker.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
-    nohup cargo run -p gateway >"{{dev_dir}}/gateway.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
-    nohup pnpm --filter @cheladb/studio dev >"{{dev_dir}}/studio.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid cargo run -p worker >"{{dev_dir}}/worker.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid cargo run -p gateway >"{{dev_dir}}/gateway.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid pnpm --filter @cheladb/studio dev >"{{dev_dir}}/studio.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
 
     sleep 2
     echo ""
@@ -136,7 +136,8 @@ dev: deps-up
     echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
     echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
     echo "Worker health:   http://127.0.0.1:8082/health"
-    echo "Studio:          http://localhost:3000"
+    echo "Studio:          http://localhost:3000  (sign in / create account)"
+    echo "Mailpit (email): http://localhost:8025  (signup verification codes)"
     echo "Zitadel console: http://localhost:8080/ui/console"
     echo "Demo IAM:        .cheladb/zitadel/ (cargo run -p cheladb -- auth token)"
     echo "Logs:            {{dev_dir}}/*.log"
@@ -157,11 +158,18 @@ dev-down:
       exit 0
     fi
     while read -r pid; do
-      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        # also kill process group children (cargo/vite wrappers)
-        pkill -P "$pid" 2>/dev/null || true
+      [[ -n "$pid" ]] || continue
+      # A stale pids file (reboot, crash) can name a pid the OS has since
+      # reused: only touch processes that are still our cargo/pnpm apps.
+      cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
+      if [[ ! "$cmd" =~ (cargo|pnpm|target/debug/|vite) ]]; then
+        echo "skipping pid $pid (${cmd:-not running})"
+        continue
       fi
+      # `just dev` starts each app under setsid, so its pid is also its process
+      # group id: killing the group also stops grandchildren (cargo → binary,
+      # pnpm → vite) that a plain `kill` would orphan.
+      kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     done <"{{dev_dir}}/pids"
     rm -f "{{dev_dir}}/pids"
     echo "dev host processes stopped"
@@ -221,6 +229,7 @@ check:
     pnpm --filter @cheladb/types typecheck
     pnpm --filter @cheladb/zitadel typecheck
     pnpm --filter @cheladb/studio typecheck
+    pnpm --filter @cheladb/studio test
 
 zitadel-generate:
     pnpm --filter @cheladb/zitadel generate

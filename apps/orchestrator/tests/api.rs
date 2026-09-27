@@ -2,7 +2,9 @@ use axum::Router;
 use cheladb_auth::internal::{
     generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier, IDENTITY_HEADER,
 };
-use cheladb_metadata::{DatabaseRecord, DatabaseStatus, MetadataError};
+use cheladb_metadata::{
+    DatabaseRecord, DatabaseStatus, MetadataError, ProjectOverview, TenantOverview,
+};
 use cheladb_nats::{JobEnvelope, ProvisionDatabaseJob};
 use cheladb_routes::{Service, ENDPOINTS};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
@@ -17,6 +19,7 @@ struct FakeMetadata {
     tenants_by_org: Arc<Mutex<HashMap<String, TenantId>>>,
     fail_insert: Arc<Mutex<bool>>,
     databases: Arc<Mutex<HashMap<DatabaseId, DatabaseRecord>>>,
+    overviews: Arc<Mutex<HashMap<TenantId, TenantOverview>>>,
 }
 
 impl FakeMetadata {
@@ -36,6 +39,10 @@ impl FakeMetadata {
 
     fn fail_next_insert(&self) {
         *self.fail_insert.lock().unwrap() = true;
+    }
+
+    fn set_overview(&self, overview: TenantOverview) {
+        self.overviews.lock().unwrap().insert(overview.id, overview);
     }
 }
 
@@ -86,6 +93,13 @@ impl MetadataPort for FakeMetadata {
         database_id: DatabaseId,
     ) -> Result<Option<DatabaseRecord>, MetadataError> {
         Ok(self.databases.lock().unwrap().get(&database_id).cloned())
+    }
+
+    async fn tenant_overview(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Option<TenantOverview>, MetadataError> {
+        Ok(self.overviews.lock().unwrap().get(&tenant_id).cloned())
     }
 }
 
@@ -383,6 +397,104 @@ async fn get_database_unknown_id_is_404() {
         .unwrap();
 
     assert_eq!(resp.status(), 404);
+}
+
+fn overview_with_database(tenant_id: TenantId) -> TenantOverview {
+    let project_id = ProjectId::new();
+    let mut db = sample_database(tenant_id);
+    db.project_id = project_id;
+    db.name = "web1".into();
+    db.host = Some("127.0.0.1".into());
+    db.port = Some(49153);
+    db.container_id = Some("secret-container-id".into());
+    db.admin_password = Some("secret-password".into());
+    TenantOverview {
+        id: tenant_id,
+        slug: "demo".into(),
+        projects: vec![ProjectOverview {
+            id: project_id,
+            slug: "default".into(),
+            databases: vec![db],
+        }],
+    }
+}
+
+async fn get_me(app: &TestApp, identity_header: Option<&str>) -> reqwest::Response {
+    let mut req = reqwest::Client::new().get(format!("{}/v1/me", app.base));
+    if let Some(token) = identity_header {
+        req = req.header(IDENTITY_HEADER, token);
+    }
+    req.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn me_for_bound_org_returns_tenant_projects_and_databases() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    metadata.set_overview(overview_with_database(tenant));
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+
+    let resp = get_me(&app, Some(&app.token_for_org("org-1"))).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["user"]["sub"], "user-1");
+    assert_eq!(body["user"]["org_id"], "org-1");
+    assert_eq!(body["tenant"]["id"], serde_json::json!(tenant));
+    assert_eq!(body["tenant"]["slug"], "demo");
+    let project = &body["tenant"]["projects"][0];
+    assert_eq!(project["slug"], "default");
+    let db = &project["databases"][0];
+    assert_eq!(db["name"], "web1");
+    assert_eq!(db["status"], "ready");
+    assert_eq!(db["host"], "127.0.0.1");
+    assert_eq!(db["port"], 49153);
+    assert!(db["database_id"].is_string());
+}
+
+#[tokio::test]
+async fn me_for_unbound_org_returns_null_tenant() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let resp = get_me(&app, Some(&app.token_for_org("org-unbound"))).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["user"]["org_id"], "org-unbound");
+    assert!(body["tenant"].is_null());
+}
+
+// Review Focus 2.
+#[tokio::test]
+async fn me_for_bound_org_with_missing_tenant_row_returns_null_tenant() {
+    let metadata = FakeMetadata::default();
+    metadata.bind_org("org-1", TenantId::new());
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let resp = get_me(&app, Some(&app.token_for_org("org-1"))).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["tenant"].is_null());
+}
+
+#[tokio::test]
+async fn me_without_identity_is_401() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    assert_eq!(get_me(&app, None).await.status(), 401);
+}
+
+#[tokio::test]
+async fn me_never_exposes_database_secrets() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    metadata.set_overview(overview_with_database(tenant));
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let text = get_me(&app, Some(&app.token_for_org("org-1")))
+        .await
+        .text()
+        .await
+        .unwrap();
+    for secret in ["secret-password", "secret-container-id", "admin_password", "container_id"] {
+        assert!(!text.contains(secret), "/v1/me leaked {secret}: {text}");
+    }
 }
 
 /// Every endpoint `cheladb-routes` assigns to the orchestrator must be routed

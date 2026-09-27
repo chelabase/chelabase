@@ -16,7 +16,7 @@ export function asDatabaseId(value: string): DatabaseId {
   return value as DatabaseId;
 }
 
-/** Stub control-plane API types (hand-written until orchestrator OpenAPI exists). */
+/** Control-plane API shapes (snake_case, as served by the orchestrator via the gateway). */
 export type DatabaseStatus =
   | "pending"
   | "provisioning"
@@ -24,22 +24,56 @@ export type DatabaseStatus =
   | "failed"
   | "deleting";
 
+export interface MeUser {
+  sub: string;
+  org_id: string;
+}
+
+export interface DatabaseSummary {
+  database_id: DatabaseId;
+  name: string;
+  status: DatabaseStatus;
+  host: string | null;
+  port: number | null;
+}
+
+export interface ProjectView {
+  id: ProjectId;
+  slug: string;
+  databases: DatabaseSummary[];
+}
+
+export interface TenantView {
+  id: TenantId;
+  slug: string;
+  projects: ProjectView[];
+}
+
+/** `tenant` is null when the caller's org isn't bound to a Cheladb tenant yet. */
+export interface MeResponse {
+  user: MeUser;
+  tenant: TenantView | null;
+}
+
 export interface CreateDatabaseRequest {
-  tenantId: TenantId;
-  projectId: ProjectId;
+  tenant_id: TenantId;
+  project_id: ProjectId;
   name: string;
 }
 
 export interface CreateDatabaseAccepted {
-  jobId: string;
-  databaseId: DatabaseId;
-  status: "accepted";
+  job_id: string;
+  database_id: DatabaseId;
+  status: DatabaseStatus;
 }
 
-export interface DatabaseSummary {
-  id: DatabaseId;
-  projectId: ProjectId;
-  tenantId: TenantId;
+export interface DatabaseDetail {
+  database_id: DatabaseId;
+  project_id: ProjectId;
+  tenant_id: TenantId;
   name: string;
   status: DatabaseStatus;
+  host: string | null;
+  port: number | null;
+  error: string | null;
 }

@@ -1,7 +1,15 @@
 //! Idempotent local Zitadel bootstrap (Management API ensure + demo tenant bind).
 
+use super::dev_email::{
+    action_payload, find_action, skip_enabled, trigger_actions_with, ACTION_NAME, ENV_VAR,
+    INTERNAL_AUTH_FLOW, PRE_CREATION_TRIGGER,
+};
+use super::studio::{
+    find_smtp_config, render_studio_env, smtp_payload, studio_app_drift, studio_app_payload,
+    StudioEnv, GATEWAY_URL, MAILPIT_SMTP_HOST, STUDIO_APP_NAME, STUDIO_ORIGIN,
+};
 use crate::paths::{
-    compose_env, compose_file, demo_tenant_id, gateway_dir, issuer, zitadel_dir,
+    compose_env, compose_file, demo_tenant_id, gateway_dir, issuer, studio_env_file, zitadel_dir,
 };
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -39,7 +47,7 @@ impl ApiClient {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await.with_context(|| format!("{path}"))?;
+        let resp = req.send().await.with_context(|| path.to_string())?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -173,6 +181,51 @@ pub async fn run() -> Result<()> {
     }
     let client_id = client_id.unwrap();
 
+    // --- Studio SPA app (OIDC, PKCE, JWT access tokens) ---
+    let (_, mut studio_client_id) = find_api_app(&apps, STUDIO_APP_NAME);
+    if studio_client_id.is_none() {
+        info!("creating OIDC app {STUDIO_APP_NAME}…");
+        let created = api
+            .post(
+                &format!("/management/v1/projects/{project_id}/apps/oidc"),
+                studio_app_payload(STUDIO_ORIGIN),
+            )
+            .await?;
+        studio_client_id = created
+            .get("clientId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if studio_client_id.is_none() {
+            bail!("create OIDC app failed: {created}");
+        }
+    } else {
+        info!(
+            "OIDC app {STUDIO_APP_NAME} exists (client_id={})",
+            studio_client_id.as_deref().unwrap()
+        );
+        // Bootstrap never edits an existing app; say so if it has drifted.
+        if let Some(app) = find_named(&apps, STUDIO_APP_NAME) {
+            let drift = studio_app_drift(app, STUDIO_ORIGIN);
+            for line in &drift {
+                warn!("{STUDIO_APP_NAME} differs from what bootstrap would create — {line}");
+            }
+            if !drift.is_empty() {
+                warn!(
+                    "fix it in the Zitadel console, or delete the app there and re-run \
+                     `just zitadel-bootstrap` (it will be recreated)"
+                );
+            }
+        }
+    }
+    let studio_client_id = studio_client_id.unwrap();
+
+    // --- SMTP → Mailpit (signup verification emails in local dev) ---
+    ensure_mailpit_smtp(&api).await?;
+
+    // --- Optional dev switch: skip email verification for self-signups ---
+    ensure_email_verification_mode(&api, skip_enabled(std::env::var(ENV_VAR).ok().as_deref()))
+        .await?;
+
     // --- Demo machine user ---
     let users = api
         .post(
@@ -278,6 +331,18 @@ CHELADB_INTERNAL_VERIFY_KEY={verify_key}\n",
     }
 
     info!("wrote {}", demo_env.display());
+
+    let studio_env = studio_env_file();
+    let studio_contents = render_studio_env(&StudioEnv {
+        issuer: &iss,
+        client_id: &studio_client_id,
+        project_id: &project_id,
+        org_id: &org_id,
+        api_url: GATEWAY_URL,
+    });
+    fs::write(&studio_env, studio_contents)
+        .with_context(|| format!("write {}", studio_env.display()))?;
+    info!("wrote {}", studio_env.display());
     info!("mint a demo access token with: cargo run -q -p cheladb -- auth token");
     info!("bootstrap complete (idempotent)");
     Ok(())
@@ -299,6 +364,100 @@ async fn wait_jwks(issuer: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     bail!("Zitadel not ready at {issuer}");
+}
+
+/// Point Zitadel's email at Mailpit (create or activate; never duplicate).
+async fn ensure_mailpit_smtp(api: &ApiClient) -> Result<()> {
+    let search = api.post("/admin/v1/smtp/_search", json!({})).await?;
+    let existing = find_smtp_config(&search, MAILPIT_SMTP_HOST);
+    let id = match &existing {
+        Some(c) if c.has_credentials && c.active => {
+            info!("SMTP → {MAILPIT_SMTP_HOST} already active");
+            return Ok(());
+        }
+        Some(c) if c.has_credentials => c.id.clone(),
+        Some(c) => {
+            warn!(
+                "SMTP config {} has no credentials, so Zitadel never sends mail with it; replacing it",
+                c.id
+            );
+            create_mailpit_smtp(api).await?
+        }
+        None => create_mailpit_smtp(api).await?,
+    };
+    api.post(&format!("/admin/v1/smtp/{id}/_activate"), json!({}))
+        .await?;
+    if let Some(stale) = existing.filter(|c| !c.has_credentials) {
+        api.request(reqwest::Method::DELETE, &format!("/admin/v1/smtp/{}", stale.id), None)
+            .await?;
+    }
+    info!("activated SMTP → {MAILPIT_SMTP_HOST} (read mail at http://localhost:8025)");
+    Ok(())
+}
+
+/// Install/activate the skip-verification Action when `skip` is set; otherwise
+/// deactivate it if an earlier run installed it.
+async fn ensure_email_verification_mode(api: &ApiClient, skip: bool) -> Result<()> {
+    let search = api.post("/management/v1/actions/_search", json!({})).await?;
+    let existing = find_action(&search, ACTION_NAME);
+
+    if !skip {
+        if let Some((id, true)) = existing {
+            api.post(&format!("/management/v1/actions/{id}/_deactivate"), json!({}))
+                .await?;
+            info!("email verification required again (deactivated {ACTION_NAME})");
+        }
+        return Ok(());
+    }
+
+    let id = match existing {
+        Some((id, active)) => {
+            if !active {
+                api.post(&format!("/management/v1/actions/{id}/_reactivate"), json!({}))
+                    .await?;
+            }
+            id
+        }
+        None => {
+            let created = api.post("/management/v1/actions", action_payload()).await?;
+            created
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .with_context(|| format!("create action failed: {created}"))?
+        }
+    };
+    let flow = api
+        .get(&format!("/management/v1/flows/{INTERNAL_AUTH_FLOW}"))
+        .await?;
+    let action_ids = trigger_actions_with(&flow, PRE_CREATION_TRIGGER, &id);
+    api.post(
+        &format!("/management/v1/flows/{INTERNAL_AUTH_FLOW}/trigger/{PRE_CREATION_TRIGGER}"),
+        json!({ "actionIds": action_ids }),
+    )
+    .await?;
+    warn!("{ENV_VAR} is on: self-signups skip email verification (local dev only)");
+    Ok(())
+}
+
+async fn create_mailpit_smtp(api: &ApiClient) -> Result<String> {
+    let created = api
+        .post("/admin/v1/smtp", smtp_payload(MAILPIT_SMTP_HOST))
+        .await?;
+    created
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("create SMTP config failed: {created}"))
+}
+
+/// The entry named `name` in a Zitadel `_search` result.
+fn find_named<'a>(search: &'a Value, name: &str) -> Option<&'a Value> {
+    search
+        .get("result")?
+        .as_array()?
+        .iter()
+        .find(|v| v.get("name").and_then(|n| n.as_str()) == Some(name))
 }
 
 /// Poll `url` (authenticated with `bearer`) until Zitadel's API answers

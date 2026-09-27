@@ -128,6 +128,19 @@ pub mod orchestrator {
             cors: Cors::Studio,
         },
     };
+
+    /// The caller, their tenant, projects and databases (Studio landing page).
+    pub const ME: Endpoint = Endpoint {
+        name: "orchestrator.me",
+        method: Method::Get,
+        path: "/v1/me",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
 }
 
 /// Every public endpoint the gateway exposes.
@@ -135,6 +148,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::HEALTH,
     orchestrator::CREATE_DATABASE,
     orchestrator::GET_DATABASE,
+    orchestrator::ME,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

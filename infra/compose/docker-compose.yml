@@ -87,6 +87,18 @@ services:
     volumes:
       - ../../.cheladb/zitadel:/zitadel-bootstrap
 
+  # Local mail catcher: Zitadel's signup verification codes land here (UI :8025).
+  mailpit:
+    image: axllent/mailpit:v1.31.3
+    restart: unless-stopped
+    environment:
+      # Zitadel needs SMTP credentials (it can't handle an empty password), so
+      # accept any user/password over plain SMTP. Local dev only.
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      - "8025:8025"
+
 volumes:
   metadata_pg_data:
   nats_data:

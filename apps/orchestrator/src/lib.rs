@@ -7,7 +7,9 @@ use axum::{
 };
 use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
 use cheladb_routes::{orchestrator as routes, Service};
-use cheladb_metadata::{DatabaseRecord, DatabaseStatus, MetadataClient, MetadataError};
+use cheladb_metadata::{
+    DatabaseRecord, DatabaseStatus, MetadataClient, MetadataError, ProjectOverview, TenantOverview,
+};
 use cheladb_nats::{JetStreamContext, JobEnvelope, ProvisionDatabaseJob};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
 use serde::{Deserialize, Serialize};
@@ -43,6 +45,11 @@ pub trait MetadataPort: Send + Sync + 'static {
         &self,
         database_id: DatabaseId,
     ) -> impl Future<Output = Result<Option<DatabaseRecord>, MetadataError>> + Send;
+
+    fn tenant_overview(
+        &self,
+        tenant_id: TenantId,
+    ) -> impl Future<Output = Result<Option<TenantOverview>, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -78,6 +85,13 @@ impl MetadataPort for MetadataClient {
     ) -> Result<Option<DatabaseRecord>, MetadataError> {
         MetadataClient::get_database(self, database_id).await
     }
+
+    async fn tenant_overview(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Option<TenantOverview>, MetadataError> {
+        MetadataClient::tenant_overview(self, tenant_id).await
+    }
 }
 
 /// Abstraction over enqueuing a provision job, so tests can inject an
@@ -107,19 +121,16 @@ pub struct AppState<M, J> {
     pub identity: InternalVerifier,
 }
 
-/// Caller established by the gateway (internal identity token) after
-/// org→tenant soft-bind resolution.
+/// Caller verified from the gateway-minted internal identity token. Does not
+/// require the caller's org to be bound to a tenant.
 #[derive(Debug, Clone)]
-struct AuthPrincipal {
-    #[allow(dead_code)]
+struct Caller {
     sub: String,
-    #[allow(dead_code)]
     org_id: String,
-    tenant_id: TenantId,
     request_id: String,
 }
 
-impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for AuthPrincipal
+impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for Caller
 where
     M: MetadataPort,
     J: JobPort,
@@ -143,35 +154,77 @@ where
             .verify(token, Service::Orchestrator.name())
             .map_err(|err| unauthorized(&err.to_string()))?;
 
-        let tenant_id = state
-            .metadata
-            .get_tenant_by_zitadel_org_id(&claims.org_id)
-            .await
-            .map_err(|err| {
-                error!("tenant lookup by zitadel org: {err}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": "internal error" })),
-                )
-                    .into_response()
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({
-                        "error": "no Cheladb tenant bound to this Zitadel org; run just zitadel-bootstrap"
-                    })),
-                )
-                    .into_response()
-            })?;
-
-        Ok(AuthPrincipal {
+        Ok(Caller {
             sub: claims.sub,
             org_id: claims.org_id,
-            tenant_id,
             request_id: claims.rid,
         })
     }
+}
+
+/// Caller whose org is bound to a Cheladb tenant (soft-bind).
+#[derive(Debug, Clone)]
+struct AuthPrincipal {
+    #[allow(dead_code)]
+    sub: String,
+    #[allow(dead_code)]
+    org_id: String,
+    tenant_id: TenantId,
+    request_id: String,
+}
+
+impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for AuthPrincipal
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState<M, J>>,
+    ) -> Result<Self, Self::Rejection> {
+        let caller = Caller::from_request_parts(parts, state).await?;
+        let tenant_id = lookup_tenant(state, &caller.org_id)
+            .await
+            .map_err(|_| internal_error())?
+            .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "no Cheladb tenant bound to this Zitadel org; run just zitadel-bootstrap"
+                })),
+            )
+                .into_response()
+        })?;
+
+        Ok(AuthPrincipal {
+            sub: caller.sub,
+            org_id: caller.org_id,
+            tenant_id,
+            request_id: caller.request_id,
+        })
+    }
+}
+
+/// The tenant bound to `org_id`, if any (lookup failures are logged).
+async fn lookup_tenant<M: MetadataPort, J>(
+    state: &AppState<M, J>,
+    org_id: &str,
+) -> Result<Option<TenantId>, MetadataError> {
+    state
+        .metadata
+        .get_tenant_by_zitadel_org_id(org_id)
+        .await
+        .inspect_err(|err| error!("tenant lookup by zitadel org: {err}"))
+}
+
+fn internal_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "internal error" })),
+    )
+        .into_response()
 }
 
 fn unauthorized(message: &str) -> Response {
@@ -226,6 +279,73 @@ impl From<DatabaseRecord> for DatabaseResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct MeResponse {
+    user: MeUser,
+    /// `None` when the caller's org isn't bound to a Cheladb tenant yet.
+    tenant: Option<TenantView>,
+}
+
+#[derive(Debug, Serialize)]
+struct MeUser {
+    sub: String,
+    org_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TenantView {
+    id: TenantId,
+    slug: String,
+    projects: Vec<ProjectView>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectView {
+    id: ProjectId,
+    slug: String,
+    databases: Vec<DatabaseSummary>,
+}
+
+/// Public database fields only: never credentials or container ids.
+#[derive(Debug, Serialize)]
+struct DatabaseSummary {
+    database_id: DatabaseId,
+    name: String,
+    status: DatabaseStatus,
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+impl From<TenantOverview> for TenantView {
+    fn from(t: TenantOverview) -> Self {
+        Self {
+            id: t.id,
+            slug: t.slug,
+            projects: t.projects.into_iter().map(ProjectView::from).collect(),
+        }
+    }
+}
+
+impl From<ProjectOverview> for ProjectView {
+    fn from(p: ProjectOverview) -> Self {
+        Self {
+            id: p.id,
+            slug: p.slug,
+            databases: p
+                .databases
+                .into_iter()
+                .map(|d| DatabaseSummary {
+                    database_id: d.database_id,
+                    name: d.name,
+                    status: d.status,
+                    host: d.host,
+                    port: d.port,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
 pub fn build_router<M, J>(state: Arc<AppState<M, J>>) -> Router
 where
@@ -236,12 +356,39 @@ where
         .route(routes::HEALTH.path, get(health))
         .route(routes::CREATE_DATABASE.path, post(create_database::<M, J>))
         .route(routes::GET_DATABASE.path, get(get_database::<M, J>))
+        .route(routes::ME.path, get(me::<M, J>))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "service": "orchestrator" }))
+}
+
+async fn me<M, J>(State(state): State<Arc<AppState<M, J>>>, caller: Caller) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let tenant = match lookup_tenant(&state, &caller.org_id).await {
+        Err(_) => return internal_error(),
+        Ok(None) => None,
+        Ok(Some(tenant_id)) => match state.metadata.tenant_overview(tenant_id).await {
+            Ok(overview) => overview.map(TenantView::from),
+            Err(err) => {
+                error!("tenant overview: {err}");
+                return internal_error();
+            }
+        },
+    };
+    Json(MeResponse {
+        user: MeUser {
+            sub: caller.sub,
+            org_id: caller.org_id,
+        },
+        tenant,
+    })
+    .into_response()
 }
 
 async fn create_database<M, J>(

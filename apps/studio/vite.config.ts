@@ -23,5 +23,7 @@ export default defineConfig({
   ],
   server: {
     port: 3000,
+    // The Zitadel redirect URI is registered for :3000; never drift to another port.
+    strictPort: true,
   },
 });

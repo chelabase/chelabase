@@ -1,27 +1,33 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { ZITADEL_VERSION } from "@cheladb/zitadel";
+import { Navigate, createFileRoute } from "@tanstack/react-router";
+import { useAuth } from "react-oidc-context";
 import { Button } from "@/components/ui/button";
-import { useStudioStore } from "@/stores/studio-store";
 
-export const Route = createFileRoute("/")({ component: Home });
+export const Route = createFileRoute("/")({ component: Landing });
 
-function Home() {
-  const ready = useStudioStore((s) => s.ready);
-
+function Landing() {
+  const auth = useAuth();
+  if (auth.isAuthenticated) return <Navigate to="/app" replace />;
   return (
-    <div className="min-h-screen bg-background p-8 text-foreground">
+    <main className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background p-8 text-foreground">
       <h1 className="text-3xl font-semibold tracking-tight">Cheladb Studio</h1>
-      <p className="mt-3 max-w-xl text-muted-foreground">
-        Scaffold placeholder. Routes and product UI come next. Workspace packages
-        are wired: <code className="text-sm">@cheladb/types</code>,{" "}
-        <code className="text-sm">@cheladb/zitadel</code> ({ZITADEL_VERSION}).
-      </p>
-      <p className="mt-4 text-sm text-muted-foreground">
-        Store ready: {ready ? "yes" : "no"}
-      </p>
-      <div className="mt-6">
-        <Button type="button">shadcn / Base UI</Button>
+      <p className="max-w-md text-center text-muted-foreground">Postgres databases for your projects.</p>
+      <div className="flex gap-3">
+        <Button disabled={auth.isLoading} onClick={() => void auth.signinRedirect()}>
+          Sign in
+        </Button>
+        <Button
+          variant="outline"
+          disabled={auth.isLoading}
+          onClick={() => void auth.signinRedirect({ prompt: "create" })}
+        >
+          Create account
+        </Button>
       </div>
-    </div>
+      {auth.error && (
+        <p role="alert" className="text-sm text-destructive">
+          Sign-in failed: {auth.error.message}
+        </p>
+      )}
+    </main>
   );
 }
