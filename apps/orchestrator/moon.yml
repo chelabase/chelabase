@@ -1,0 +1,14 @@
+language: "rust"
+
+tasks:
+  check:
+    command: "cargo"
+    args: ["check", "-p", "orchestrator"]
+  build:
+    command: "cargo"
+    args: ["build", "-p", "orchestrator"]
+  run:
+    command: "cargo"
+    args: ["run", "-p", "orchestrator"]
+    options:
+      persistent: true

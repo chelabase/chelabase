@@ -1,0 +1,12 @@
+language: "rust"
+
+tasks:
+  check:
+    command: "cargo"
+    args: ["check", "-p", "cheladb"]
+  build:
+    command: "cargo"
+    args: ["build", "-p", "cheladb"]
+  run:
+    command: "cargo"
+    args: ["run", "-p", "cheladb"]

@@ -1,0 +1,9 @@
+language: "rust"
+
+tasks:
+  check:
+    command: "cargo"
+    args: ["check", "-p", "cheladb-nats"]
+  build:
+    command: "cargo"
+    args: ["build", "-p", "cheladb-nats"]

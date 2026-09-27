@@ -1,0 +1,211 @@
+use cheladb_auth::test_support::{BrokenJwks, MockJwks};
+use cheladb_auth::{AuthError, JwtVerifier, VerifiedClaims};
+use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Assert the verify() call failed with `InvalidToken` whose message contains
+/// `needle` — not just any `InvalidToken`. Distinguishing *why* verification
+/// failed matters: several failure paths (kid miss, bad signature, expired,
+/// wrong issuer) all land on the same enum variant, and a test that only
+/// matches the variant would keep passing even if the wrong check tripped.
+fn assert_invalid_token_containing(result: Result<VerifiedClaims, AuthError>, needle: &str) {
+    match result {
+        Ok(claims) => panic!("expected InvalidToken containing {needle:?}, got Ok({claims:?})"),
+        Err(AuthError::InvalidToken(msg)) => {
+            assert!(
+                msg.contains(needle),
+                "expected InvalidToken message to contain {needle:?}, got {msg:?}"
+            );
+        }
+        Err(other) => panic!("expected InvalidToken containing {needle:?}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn valid_token_verifies_successfully() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let token = mock.token_for_org("user-1", "org-1", 300);
+
+    let claims = verifier.verify(&token).await.expect("should verify");
+    assert_eq!(claims.sub, "user-1");
+    assert_eq!(claims.org_id, "org-1");
+}
+
+#[tokio::test]
+async fn tampered_signature_is_rejected() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let token = mock.token_for_org("user-1", "org-1", 300);
+    let tampered = tamper_signature(&token);
+
+    assert_invalid_token_containing(verifier.verify(&tampered).await, "InvalidSignature");
+}
+
+#[tokio::test]
+async fn expired_token_is_rejected() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let token = mock.sign(json!({
+        "sub": "user-1",
+        "iss": mock.issuer(),
+        "exp": now() - 3600,
+        cheladb_auth::CLAIM_ORG_ID: "org-1",
+    }));
+
+    assert_invalid_token_containing(verifier.verify(&token).await, "ExpiredSignature");
+}
+
+#[tokio::test]
+async fn wrong_issuer_is_rejected() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let token = mock.sign(json!({
+        "sub": "user-1",
+        "iss": "http://not-the-configured-issuer",
+        "exp": now() + 300,
+        cheladb_auth::CLAIM_ORG_ID: "org-1",
+    }));
+
+    assert_invalid_token_containing(verifier.verify(&token).await, "InvalidIssuer");
+}
+
+#[tokio::test]
+async fn unknown_kid_is_rejected() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+
+    // Sign with the mock's real key, then swap the header's kid to one the
+    // mock's JWKS response doesn't contain.
+    let token = mock.token_for_org("user-1", "org-1", 300);
+    let tampered = tamper_kid(&token, "no-such-kid");
+
+    assert_invalid_token_containing(verifier.verify(&tampered).await, "no jwk for kid");
+}
+
+#[tokio::test]
+async fn missing_kid_header_is_rejected() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let tampered = tamper_kid_removed(&mock.token_for_org("user-1", "org-1", 300));
+
+    assert_invalid_token_containing(verifier.verify(&tampered).await, "missing kid");
+}
+
+#[tokio::test]
+async fn malformed_token_is_rejected() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+
+    let err = verifier.verify("not-a-jwt").await.unwrap_err();
+    assert!(matches!(err, AuthError::InvalidToken(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn empty_token_is_unauthorized() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+
+    let err = verifier.verify("   ").await.unwrap_err();
+    assert!(matches!(err, AuthError::Unauthorized), "got {err:?}");
+}
+
+#[tokio::test]
+async fn audience_mismatch_is_rejected_end_to_end() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec!["expected-aud".into()]));
+    let token = mock.sign(json!({
+        "sub": "user-1",
+        "iss": mock.issuer(),
+        "exp": now() + 300,
+        "aud": "wrong-aud",
+        cheladb_auth::CLAIM_ORG_ID: "org-1",
+    }));
+
+    assert_invalid_token_containing(
+        verifier.verify(&token).await,
+        "audience does not match",
+    );
+}
+
+#[tokio::test]
+async fn jwks_endpoint_unreachable_surfaces_jwks_error() {
+    let broken = BrokenJwks::start().await;
+    let config = cheladb_auth::ZitadelAuthConfig {
+        issuer: "http://irrelevant-issuer".into(),
+        jwks_url: broken.jwks_url().to_string(),
+        audiences: vec![],
+    };
+    let verifier = JwtVerifier::new(config);
+
+    // Any syntactically valid header with a kid triggers a JWKS fetch attempt,
+    // which fails against `broken` before the issuer above is ever checked.
+    let mock = MockJwks::start().await;
+    let token = mock.token_for_org("user-1", "org-1", 300);
+
+    let err = verifier.verify(&token).await.unwrap_err();
+    assert!(matches!(err, AuthError::Jwks(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn org_claim_falls_back_to_resource_owner_end_to_end() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let token = mock.sign(json!({
+        "sub": "user-1",
+        "iss": mock.issuer(),
+        "exp": now() + 300,
+        cheladb_auth::CLAIM_RESOURCE_OWNER_ID: "org-from-resource-owner",
+    }));
+
+    let claims = verifier.verify(&token).await.expect("should verify");
+    assert_eq!(claims.org_id, "org-from-resource-owner");
+}
+
+/// Flip a bit in the signature segment so the token's kid/header/payload stay
+/// intact (and thus still resolve to a real, cached key) but the signature no
+/// longer matches — isolating "signature verification" from "kid lookup".
+fn tamper_signature(token: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let (head_and_payload, sig_b64) = token.rsplit_once('.').unwrap();
+    let mut sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
+    sig_bytes[0] ^= 0xFF;
+    let tampered_sig = URL_SAFE_NO_PAD.encode(sig_bytes);
+    format!("{head_and_payload}.{tampered_sig}")
+}
+
+/// Swaps the base64url header segment's `kid` field for negative tests.
+/// jsonwebtoken's decode path resolves the `kid` (via our JWKS lookup) before it
+/// validates the signature, so this exercises the "kid not found" branch — the
+/// message assertion in `unknown_kid_is_rejected` is what actually proves that,
+/// since changing the header also invalidates the signature.
+fn tamper_kid(token: &str, new_kid: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let mut parts = token.splitn(3, '.');
+    let header_b64 = parts.next().unwrap();
+    let rest: Vec<&str> = parts.collect();
+    let mut header: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64).unwrap()).unwrap();
+    header["kid"] = serde_json::Value::String(new_kid.to_string());
+    let new_header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    format!("{new_header_b64}.{}", rest.join("."))
+}
+
+fn tamper_kid_removed(token: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let mut parts = token.splitn(3, '.');
+    let header_b64 = parts.next().unwrap();
+    let rest: Vec<&str> = parts.collect();
+    let mut header: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64).unwrap()).unwrap();
+    header.as_object_mut().unwrap().remove("kid");
+    let new_header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    format!("{new_header_b64}.{}", rest.join("."))
+}

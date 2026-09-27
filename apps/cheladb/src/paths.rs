@@ -1,0 +1,67 @@
+use std::env;
+use std::path::PathBuf;
+
+/// Repo root: `CHELADB_ROOT`, else walk up from cwd for `justfile`.
+pub fn repo_root() -> PathBuf {
+    if let Ok(root) = env::var("CHELADB_ROOT") {
+        return PathBuf::from(root);
+    }
+    let Ok(mut dir) = env::current_dir() else {
+        return PathBuf::from(".");
+    };
+    loop {
+        if dir.join("justfile").is_file() {
+            return dir;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn zitadel_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELADB_ZITADEL_DIR") {
+        return PathBuf::from(dir);
+    }
+    repo_root().join(".cheladb/zitadel")
+}
+
+pub fn compose_file() -> PathBuf {
+    env::var("COMPOSE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("infra/compose/docker-compose.yml"))
+}
+
+pub fn compose_env() -> PathBuf {
+    env::var("COMPOSE_ENV")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("infra/compose/.env.example"))
+}
+
+pub fn issuer() -> String {
+    env::var("CHELADB_ZITADEL_ISSUER").unwrap_or_else(|_| "http://localhost:8080".into())
+}
+
+pub fn demo_tenant_id() -> String {
+    env::var("CHELADB_DEMO_TENANT_ID")
+        .unwrap_or_else(|_| "00000000-0000-4000-8000-000000000001".into())
+}
+
+/// Parse KEY=VALUE lines from a dotenv-style file.
+pub fn load_dotenv_file(path: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            map.insert(k.to_string(), v.to_string());
+        }
+    }
+    map
+}

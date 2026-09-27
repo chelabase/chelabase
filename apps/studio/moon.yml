@@ -1,0 +1,15 @@
+language: "typescript"
+
+tasks:
+  dev:
+    command: "pnpm"
+    args: ["dev"]
+    options:
+      persistent: true
+      cache: false
+  build:
+    command: "pnpm"
+    args: ["build"]
+  typecheck:
+    command: "pnpm"
+    args: ["typecheck"]

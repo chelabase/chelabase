@@ -1,0 +1,19 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cheladb Postgres wire protocol gateway (Pingora stub)"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+cheladb-auth = { workspace = true }
+cheladb-metadata = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }

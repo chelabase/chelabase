@@ -1,0 +1,33 @@
+language: "bash"
+
+tasks:
+  up:
+    command: "docker"
+    args:
+      - "compose"
+      - "-f"
+      - "docker-compose.yml"
+      - "--env-file"
+      - ".env.example"
+      - "up"
+      - "-d"
+    options:
+      cache: false
+  down:
+    command: "docker"
+    args:
+      - "compose"
+      - "-f"
+      - "docker-compose.yml"
+      - "down"
+    options:
+      cache: false
+  ps:
+    command: "docker"
+    args:
+      - "compose"
+      - "-f"
+      - "docker-compose.yml"
+      - "ps"
+    options:
+      cache: false

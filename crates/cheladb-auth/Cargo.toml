@@ -1,0 +1,27 @@
+[package]
+name = "cheladb-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zitadel JWKS JWT verification for Cheladb"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true, optional = true }
+rsa = { version = "0.9", features = ["pem"], optional = true }
+base64 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+cheladb-auth = { path = ".", features = ["test-support"] }
+base64 = { workspace = true }
+
+[features]
+test-support = ["dep:axum", "dep:rsa", "dep:base64", "dep:rand"]

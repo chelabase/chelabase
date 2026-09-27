@@ -1,0 +1,25 @@
+[package]
+name = "worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cheladb provisioning / reconciliation worker"
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+cheladb-metadata = { workspace = true }
+cheladb-nats = { workspace = true }
+cheladb-types = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }
+bollard = { workspace = true }
+futures-util = { workspace = true }
+rand = { workspace = true }

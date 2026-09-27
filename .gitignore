@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / pnpm
+node_modules/
+dist/
+.turbo/
+*.tsbuildinfo
+apps/studio/.tanstack/
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# moon / proto
+.moon/cache
+.moon/docker
+.proto/
+
+# Logs
+*.log
+
+# Local detached-dev state (just dev PIDs / logs)
+.cheladb/

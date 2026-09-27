@@ -1,0 +1,34 @@
+[package]
+name = "orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cheladb control-plane orchestrator API"
+
+[lib]
+name = "orchestrator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+cheladb-auth = { workspace = true }
+cheladb-metadata = { workspace = true }
+cheladb-nats = { workspace = true }
+cheladb-types = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+cheladb-auth = { workspace = true, features = ["test-support"] }
+reqwest = { workspace = true }
