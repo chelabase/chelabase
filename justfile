@@ -290,3 +290,7 @@ neon-smoke:
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:
     infra/neon/tests/run.sh
+
+# Round trip through the Rust storage-controller client (needs just neon-up)
+neon-test-live:
+    cargo test -p cheladb-neon --test storcon_live -- --ignored

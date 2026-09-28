@@ -15,6 +15,7 @@ On `main`:
   - delete by tombstone
   - reconcile
 - **Neon storage stack** (step 1, done): opt-in with `just neon-up`. Nothing uses it yet. See "Progress" below.
+- **`crates/cheladb-neon`** (step 2, done): the storage-controller client, compute spec, SCRAM, LSNs, compute JWTs and Neon ids. Nothing calls it yet.
 
 Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 
@@ -120,7 +121,8 @@ It's your own public Apache-2.0 code, and it already implements a working Neon c
    - Add the storage services to Compose.
    - First check: is there about 40 GB free for a source build, and can we pull the `ghcr.io/cheladb/*` images as a fallback?
    - Done when the storage stack comes up healthy next to the existing services.
-2. **`crates/cheladb-neon`.** A straight port with its tests: storcon client, compute-spec builder, `scram`, `lsn`, compute JWKS. Sort out the dependency versions here.
+2. **`crates/cheladb-neon`.** ✅ Done 2026-09-28; see "Progress".
+   - A straight port with its tests: storcon client, compute-spec builder, `scram`, `lsn`, compute JWKS.
 3. **Internal control-plane listener and Neon's proxy.**
    - Endpoints: `proxy_api`, `compute_spec`, storage-controller hooks.
    - Replace the `storcon-hook` stand-in: point the storage controller's `--control-plane-url` at the listener (`host.docker.internal:8083`, with `extra_hosts: host-gateway`) and delete the stub service.
@@ -142,6 +144,8 @@ It's your own public Apache-2.0 code, and it already implements a working Neon c
 Steps 5, 6 and 7 are independent once step 4 lands, so they can be reordered. Branching comes first because it's why we adopted Neon.
 
 **Can be done at any point:** NATS auth, TLS, restart policies, running more than one worker, CI.
+
+**Dependency follow-up:** `cheladb-neon` uses reqwest 0.13, jsonwebtoken 11 and base64 0.23; the other crates still use 0.12, 9 and 0.22, so `Cargo.lock` carries both. Move the rest of the workspace up and make them workspace pins.
 
 ## Progress
 
@@ -176,6 +180,27 @@ Spec: `docs/superpowers/specs/2026-09-28-neon-data-plane-design.md`. Plan: `docs
 - **Deletes are asynchronous:** `DELETE` answers 202 until the object is gone, then 200 or 404.
 - The Compose project's default network is `cheladb_default`. The existing demo databases are on `bridge` and aren't affected. Step 4's computes join `cheladb_default`.
 - The hook token is `CHELADB_STORCON_HOOK_TOKEN` (default `cheladb-dev-storcon-hook`), which Compose reads. Step 3's listener checks it.
+
+### Step 2: `crates/cheladb-neon` (done 2026-09-28)
+
+Spec: `docs/superpowers/specs/2026-09-28-cheladb-neon-crate-design.md`. Plan: `docs/superpowers/plans/2026-09-28-cheladb-neon-crate.md`.
+
+**What exists now:**
+- The workspace is on edition 2024 (resolver 3). No rustfmt run; existing files keep their formatting.
+- `crates/cheladb-neon`, at the latest crate versions, declared in its own `Cargo.toml`:
+  - `NeonId`: 32 lowercase hex; `NeonId::from(uuid)` maps one of our ids to its tenant id.
+  - `Lsn`, with serde as the text form.
+  - `scram::verifier`, with the RFC 7677 vector. It applies SASLprep first, as Postgres does, and hashes the raw password when SASLprep rejects it.
+  - `spec::config_response` for compute_ctl.
+  - `ComputeSigner`: Ed25519 tokens and the JWKS for `compute_ctl_config`.
+  - `StorconClient`: tenants (create, describe, delete), timelines (create, branch, get, delete), locate, active safekeepers. 30 s timeout; deletes poll 120 × 500 ms, bounded overall by that budget plus one request timeout. Plain HTTP only: no TLS feature, so no aws-lc-rs.
+- Tests: unit tests, `tests/storcon_mock.rs` (in-process mock), and `tests/storcon_live.rs`, run by `just neon-test-live` after `just neon-up`.
+
+**Findings to carry forward:**
+- The old `jwt.rs` and `scram.rs` compile unchanged against jsonwebtoken 11 and the 0.11/0.13 RustCrypto crates.
+- The edition move needed one `cargo fix` edit (a macro fragment) and five let-chain rewrites for clippy's `collapsible_if`. Its 12 tail-expression drop-order warnings only move awaited temporaries ahead of locals, which is harmless here.
+- The live storage controller matched the mock's response shapes: the round trip, including a branch at an LSN, passed first time. A fresh tenant's shard reports no pending compute notification and no `last_error` while `storcon-hook` answers.
+- The storage controller lists tenants at `GET /control/v1/tenant`; `/v1/tenant` is 404.
 
 ## The data API (PostgREST equivalent)
 

@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "apps/orchestrator",
     "apps/worker",
@@ -11,11 +11,12 @@ members = [
     "crates/cheladb-auth",
     "crates/cheladb-routes",
     "crates/cheladb-secrets",
+    "crates/cheladb-neon",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/cheladb/cheladb"
 
@@ -26,6 +27,7 @@ cheladb-nats = { path = "crates/cheladb-nats" }
 cheladb-auth = { path = "crates/cheladb-auth" }
 cheladb-routes = { path = "crates/cheladb-routes" }
 cheladb-secrets = { path = "crates/cheladb-secrets" }
+cheladb-neon = { path = "crates/cheladb-neon" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }

@@ -591,16 +591,12 @@ async fn wait_for_published_port(docker: &Docker, container_id: &str) -> Result<
             .network_settings
             .as_ref()
             .and_then(|n| n.ports.as_ref())
+            && let Some(Some(bindings)) = ports.get("5432/tcp")
+            && let Some(binding) = bindings.first()
+            && let Some(host_port) = &binding.host_port
+            && let Ok(port) = host_port.parse::<u16>()
         {
-            if let Some(Some(bindings)) = ports.get("5432/tcp") {
-                if let Some(binding) = bindings.first() {
-                    if let Some(host_port) = &binding.host_port {
-                        if let Ok(port) = host_port.parse::<u16>() {
-                            return Ok(port);
-                        }
-                    }
-                }
-            }
+            return Ok(port);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

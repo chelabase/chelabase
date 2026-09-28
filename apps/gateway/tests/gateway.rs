@@ -128,10 +128,10 @@ async fn spawn_gateway_with(
 async fn wait_ready(base: &str) {
     let client = reqwest::Client::new();
     for _ in 0..100 {
-        if let Ok(resp) = client.get(format!("{base}/_gateway/health")).send().await {
-            if resp.status() == 200 {
-                return;
-            }
+        if let Ok(resp) = client.get(format!("{base}/_gateway/health")).send().await
+            && resp.status() == 200
+        {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
