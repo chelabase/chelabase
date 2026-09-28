@@ -138,7 +138,9 @@ pub fn generate_keypair_pem() -> (String, String) {
     use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
     use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
-    let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("OS random number generator");
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
     let private = signing
         .to_pkcs8_pem(LineEnding::LF)
         .expect("encode ed25519 private key")

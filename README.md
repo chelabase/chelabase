@@ -21,7 +21,7 @@ crates/
   cheladb-routes/     Public endpoint declarations shared by gateway + services
 packages/
   types/          @cheladb/types
-  zitadel/        @cheladb/zitadel (OpenAPI → orval, pin v2.71.11)
+  zitadel/        @cheladb/zitadel (OpenAPI → orval, pin v2.71.19)
 infra/compose/    metadata Postgres, NATS JetStream, Zitadel
 scripts/          zitadel-reset (Compose volume escape hatch only)
 docs/superpowers/specs/

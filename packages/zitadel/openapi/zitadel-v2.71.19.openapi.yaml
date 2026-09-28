@@ -3,9 +3,9 @@ info:
   title: Zitadel API (Cheladb vendor subset)
   description: >
     Pinned subset of Zitadel HTTP APIs for Studio codegen.
-    Source pin: ghcr.io/zitadel/zitadel:v2.71.11
+    Source pin: ghcr.io/zitadel/zitadel:v2.71.19
     Regenerate via `pnpm --filter @cheladb/zitadel generate`.
-  version: 2.71.11
+  version: 2.71.19
   license:
     name: Apache-2.0
 servers:

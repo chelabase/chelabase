@@ -55,6 +55,11 @@ if command -v docker >/dev/null; then
       | "\(.host_ip // "0.0.0.0"):\(.published)"] | sort | join(" ")')"
   check "storage publishes only 1234 and 9898, on 127.0.0.1" \
     test "$published" = "127.0.0.1:1234 127.0.0.1:9898"
+  unexposed="$("${compose[@]}" --profile neon config --format json | jq -r '
+    [.services | to_entries[] | .key as $s | .value.ports[]?
+      | select(.host_ip != "127.0.0.1") | "\($s):\(.published)"] | join(" ")')"
+  check "every published port is bound to 127.0.0.1${unexposed:+ (not: $unexposed)}" \
+    test -z "$unexposed"
   token="$(CHELADB_STORCON_HOOK_TOKEN=from-env "${compose[@]}" --profile neon config --format json |
     jq -r '.services["storage-controller"].command[]' | grep -- '--control-plane-jwt-token=' || true)"
   check "the hook token comes from CHELADB_STORCON_HOOK_TOKEN" \

@@ -2,9 +2,11 @@
 
 use crate::names::{database_id_from_volume, volume_name};
 use crate::reconcile::Observed;
-use bollard::container::{ListContainersOptions, RemoveContainerOptions};
 use bollard::errors::Error as DockerError;
-use bollard::volume::{CreateVolumeOptions, ListVolumesOptions, RemoveVolumeOptions};
+use bollard::models::VolumeCreateRequest;
+use bollard::query_parameters::{
+    ListContainersOptions, ListVolumesOptions, RemoveContainerOptions, RemoveVolumeOptions,
+};
 use bollard::Docker;
 use cheladb_types::DatabaseId;
 use std::collections::HashMap;
@@ -31,11 +33,11 @@ fn is_not_found(err: &DockerError) -> bool {
 /// Create the database's data volume (a no-op if it already exists).
 pub async fn ensure_volume(docker: &Docker, id: DatabaseId) -> Result<(), String> {
     docker
-        .create_volume(CreateVolumeOptions {
-            name: volume_name(id),
-            driver: "local".to_string(),
-            driver_opts: HashMap::new(),
-            labels: labels(id),
+        .create_volume(VolumeCreateRequest {
+            name: Some(volume_name(id)),
+            driver: Some("local".to_string()),
+            labels: Some(labels(id)),
+            ..Default::default()
         })
         .await
         .map(|_| ())
@@ -80,7 +82,7 @@ pub async fn observe(docker: &Docker) -> Result<Observed, String> {
     let containers = docker
         .list_containers(Some(ListContainersOptions {
             all: true,
-            filters: filters.clone(),
+            filters: Some(filters.clone()),
             ..Default::default()
         }))
         .await
@@ -97,7 +99,7 @@ pub async fn observe(docker: &Docker) -> Result<Observed, String> {
     }
 
     let volumes = docker
-        .list_volumes(Some(ListVolumesOptions { filters }))
+        .list_volumes(Some(ListVolumesOptions { filters: Some(filters) }))
         .await
         .map_err(|e| format!("list volumes: {e}"))?;
     for volume in volumes.volumes.unwrap_or_default() {

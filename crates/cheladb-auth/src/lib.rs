@@ -397,8 +397,7 @@ pub mod test_support {
     impl MockJwks {
         /// Start the mock JWKS server on an ephemeral localhost port.
         pub async fn start() -> Self {
-            let mut rng = rand::thread_rng();
-            let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
+            let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("rsa keygen");
             let public_key = private_key.to_public_key();
             let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
             let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());

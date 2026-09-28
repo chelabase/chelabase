@@ -21,14 +21,14 @@ x-neon-s3-env: &neon-s3-env
 
 services:
   metadata-db:
-    image: postgres:17-alpine
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
     environment:
       POSTGRES_USER: cheladb
       POSTGRES_PASSWORD: cheladb
       POSTGRES_DB: cheladb_metadata
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - metadata_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -38,12 +38,12 @@ services:
       retries: 10
 
   nats:
-    image: nats:2.11-alpine
+    image: nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
     restart: unless-stopped
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
     volumes:
       - nats_data:/data
     healthcheck:
@@ -53,13 +53,13 @@ services:
       retries: 10
 
   zitadel-db:
-    image: postgres:17-alpine
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - zitadel_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -72,7 +72,7 @@ services:
   # Upstream project license is AGPL; used here as a self-hosted IdP dependency.
   # FirstInstance machine PAT is written once on a fresh zitadel_pg_data volume.
   zitadel:
-    image: ghcr.io/zitadel/zitadel:v2.71.11
+    image: ghcr.io/zitadel/zitadel:v2.71.19@sha256:32834d46240c5ece9f86c5e5f706b167c2064fba76bbf9213e3494023c38ca5d
     restart: unless-stopped
     command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode disabled
     environment:
@@ -97,13 +97,13 @@ services:
       zitadel-db:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ../../.cheladb/zitadel:/zitadel-bootstrap
 
   # Local mail catcher: Zitadel's signup verification codes land here (UI :8025).
   mailpit:
-    image: axllent/mailpit:v1.31.3
+    image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
     restart: unless-stopped
     environment:
       # Zitadel needs SMTP credentials (it can't handle an empty password), so
@@ -111,7 +111,7 @@ services:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
       MP_SMTP_AUTH_ALLOW_INSECURE: "true"
     ports:
-      - "8025:8025"
+      - "127.0.0.1:8025:8025"
 
   # --- Neon storage (profile "neon") ------------------------------------------------------
   # Flags and health checks come from the old cheladb repo's core/docker/docker-compose.yml,
@@ -119,7 +119,7 @@ services:
 
   # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL.
   seaweedfs:
-    image: chrislusf/seaweedfs:4.47
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     profiles: ["neon"]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
@@ -196,7 +196,7 @@ services:
         condition: service_completed_successfully
 
   storcon-db:
-    image: postgres:17-alpine
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     profiles: ["neon"]
     restart: unless-stopped
     environment:

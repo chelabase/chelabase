@@ -5,28 +5,23 @@ edition.workspace = true
 license.workspace = true
 description = "Neon storage-controller client, compute spec, SCRAM verifiers and compute JWTs for Cheladb"
 
-# Latest releases as of 2026-09-28, declared here rather than as workspace pins: other
-# crates still use reqwest 0.12, jsonwebtoken 9 and base64 0.22.
 [dependencies]
-anyhow = "1.0.104"
-base64 = "0.23.1"
-getrandom = "0.4.3"
-hex = "0.4.3"
-hmac = "0.13.0"
-jsonwebtoken = { version = "11.1.0", features = ["use_pem", "rust_crypto"] }
-pbkdf2 = "0.13.0"
-# No TLS: the storage controller and the other Neon services speak plain HTTP. (reqwest
-# 0.13's `rustls` feature would also pull in aws-lc-rs, which needs a C toolchain.)
-reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
-stringprep = "0.1.5"
-thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["time"] }
-uuid = { version = "1.26.1", features = ["v4"] }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+jsonwebtoken = { workspace = true }
+pbkdf2 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+stringprep = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-axum = "0.8.9"
-ed25519-dalek = { version = "3.0.0", features = ["pem"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net"] }
+axum = { workspace = true }
+ed25519-dalek = { workspace = true }

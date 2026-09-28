@@ -15,9 +15,10 @@ parking_lot = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true, optional = true }
-rsa = { version = "0.9", features = ["pem"], optional = true }
+# 0.9 is the latest stable; `getrandom` gives it its own OsRng (it predates rand 0.10).
+rsa = { version = "0.9.10", features = ["pem", "getrandom"], optional = true }
 base64 = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -25,5 +26,5 @@ cheladb-auth = { path = ".", features = ["test-support"] }
 base64 = { workspace = true }
 
 [features]
-keygen = ["dep:ed25519-dalek", "dep:rand"]
-test-support = ["keygen", "dep:axum", "dep:rsa", "dep:base64", "dep:rand"]
+keygen = ["dep:ed25519-dalek", "dep:getrandom"]
+test-support = ["keygen", "dep:axum", "dep:rsa", "dep:base64"]

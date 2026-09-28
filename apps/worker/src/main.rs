@@ -1,8 +1,8 @@
 use axum::{routing::get, Json, Router};
-use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, StartContainerOptions,
+use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, StartContainerOptions,
 };
-use bollard::models::{HostConfig, PortBinding};
 use bollard::Docker;
 use cheladb_metadata::{DatabaseStatus, MetadataClient, MetadataConfig, ReadyDatabase};
 use cheladb_nats::{
@@ -34,6 +34,8 @@ use worker::roles::{
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 /// Every cluster's `postgres` database; the owner role doesn't own it.
 const MAINTENANCE_DATABASE: &str = "postgres";
+/// Tenant databases run this image until provisioning moves to Neon (roadmap step 4).
+const POSTGRES_IMAGE: &str = "postgres:17.11";
 /// Hard cap on one reset, below the orchestrator's NATS request timeout.
 const RESET_DEADLINE: Duration = Duration::from_secs(8);
 /// Hard cap on opening a platform session (TCP + startup handshake).
@@ -273,8 +275,8 @@ async fn provision(ctx: &Ctx, database_id: DatabaseId, name: &str) -> Result<Pro
             host_port: Some("0".to_string()),
         }]),
     )]);
-    let config = Config {
-        image: Some("postgres:17".to_string()),
+    let config = ContainerCreateBody {
+        image: Some(POSTGRES_IMAGE.to_string()),
         env: Some(vec![
             format!("POSTGRES_USER={PLATFORM_ROLE}"),
             format!("POSTGRES_PASSWORD={init_password}"),
@@ -290,14 +292,14 @@ async fn provision(ctx: &Ctx, database_id: DatabaseId, name: &str) -> Result<Pro
             auto_remove: Some(false),
             ..Default::default()
         }),
-        exposed_ports: Some(HashMap::from([("5432/tcp".to_string(), HashMap::new())])),
+        exposed_ports: Some(vec!["5432/tcp".to_string()]),
         ..Default::default()
     };
 
     docker
         .create_image(
-            Some(bollard::image::CreateImageOptions {
-                from_image: "postgres:17",
+            Some(CreateImageOptions {
+                from_image: Some(POSTGRES_IMAGE.to_string()),
                 ..Default::default()
             }),
             None,
@@ -305,20 +307,20 @@ async fn provision(ctx: &Ctx, database_id: DatabaseId, name: &str) -> Result<Pro
         )
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| format!("pull postgres:17: {e}"))?;
+        .map_err(|e| format!("pull {POSTGRES_IMAGE}: {e}"))?;
 
     let created = docker
         .create_container(
             Some(CreateContainerOptions {
-                name: container_name(database_id),
-                platform: None,
+                name: Some(container_name(database_id)),
+                ..Default::default()
             }),
             config,
         )
         .await
         .map_err(|e| format!("create container: {e}"))?;
     docker
-        .start_container(&created.id, None::<StartContainerOptions<String>>)
+        .start_container(&created.id, None::<StartContainerOptions>)
         .await
         .map_err(|e| format!("start container: {e}"))?;
 

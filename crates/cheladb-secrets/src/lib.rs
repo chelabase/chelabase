@@ -5,7 +5,7 @@
 //! Stored as `v1:` + base64(nonce ‖ ciphertext). Database credentials bind
 //! their purpose (owner vs platform) too, so the two can't be swapped.
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use aes_gcm::aead::{Aead, Generate, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::path::Path;
@@ -29,7 +29,7 @@ pub struct SecretKey(Key<Aes256Gcm>);
 
 impl SecretKey {
     pub fn generate() -> Self {
-        Self(Aes256Gcm::generate_key(&mut OsRng))
+        Self(Key::<Aes256Gcm>::generate())
     }
 
     pub fn to_base64(&self) -> String {
@@ -46,7 +46,9 @@ impl SecretKey {
                 bytes.len()
             )));
         }
-        Ok(Self(*Key::<Aes256Gcm>::from_slice(&bytes)))
+        let key = Key::<Aes256Gcm>::try_from(bytes.as_slice())
+            .map_err(|_| SecretsError::Config("expected 32 bytes".into()))?;
+        Ok(Self(key))
     }
 
     pub fn from_file(path: &Path) -> Result<Self, SecretsError> {
@@ -133,7 +135,7 @@ fn credential_aad(database_id: &str, purpose: Purpose) -> String {
 }
 
 fn seal_with(prefix: &str, key: &SecretKey, aad: &str, plaintext: &str) -> String {
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::generate();
     let ciphertext = Aes256Gcm::new(&key.0)
         .encrypt(
             &nonce,
@@ -157,7 +159,7 @@ fn open_with(prefix: &str, key: &SecretKey, aad: &str, sealed: &str) -> Result<S
     let (nonce, ciphertext) = bytes.split_at(NONCE_LEN);
     let plaintext = Aes256Gcm::new(&key.0)
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::try_from(nonce).map_err(|_| SecretsError::Malformed)?,
             Payload {
                 msg: ciphertext,
                 aad: aad.as_bytes(),

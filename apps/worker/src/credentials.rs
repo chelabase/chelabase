@@ -2,8 +2,8 @@
 
 /// 32 alphanumeric characters: strong, and safe inside SQL literals and URIs.
 pub fn generate_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(32)
         .map(char::from)

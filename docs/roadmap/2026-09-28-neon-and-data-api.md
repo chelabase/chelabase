@@ -145,7 +145,13 @@ Steps 5, 6 and 7 are independent once step 4 lands, so they can be reordered. Br
 
 **Can be done at any point:** NATS auth, TLS, restart policies, running more than one worker, CI.
 
-**Dependency follow-up:** `cheladb-neon` uses reqwest 0.13, jsonwebtoken 11 and base64 0.23; the other crates still use 0.12, 9 and 0.22, so `Cargo.lock` carries both. Move the rest of the workspace up and make them workspace pins.
+**Dependency follow-up:** ✅ Done 2026-09-28 by the dependency refresh (see "Progress"). Every crate uses workspace pins at the latest releases.
+
+**Before step 3: Zitadel v4.** Zitadel v2 stopped getting releases after v2.71.19 (2025-11-12); v4 is current. Moving touches Studio's hosted login, the generated client in `packages/zitadel` and `cheladb auth bootstrap`, so it gets its own spec and branch, done between the dependency refresh and step 3.
+
+**Security follow-ups found during the refresh:**
+- ✅ Every published port is bound to `127.0.0.1` (metadata-db, zitadel-db, NATS, Zitadel and Mailpit were on all interfaces); `just neon-test` checks it.
+- No TLS to the metadata database or NATS yet (the "TLS" item above). sqlx has `tls-rustls-aws-lc-rs`, so turning it on is a server-side and connection-string change.
 
 ## Progress
 
@@ -201,6 +207,23 @@ Spec: `docs/superpowers/specs/2026-09-28-cheladb-neon-crate-design.md`. Plan: `d
 - The edition move needed one `cargo fix` edit (a macro fragment) and five let-chain rewrites for clippy's `collapsible_if`. Its 12 tail-expression drop-order warnings only move awaited temporaries ahead of locals, which is harmless here.
 - The live storage controller matched the mock's response shapes: the round trip, including a branch at an LSN, passed first time. A fresh tenant's shard reports no pending compute notification and no `last_error` while `storcon-hook` answers.
 - The storage controller lists tenants at `GET /control/v1/tenant`; `/v1/tenant` is 404.
+
+### Dependency refresh (done 2026-09-28)
+
+Branch `deps-refresh`, one commit per group; tests, clippy and the Studio checks passed after each.
+
+- **Rust:** reqwest 0.13.5, jsonwebtoken 11.1.0, base64 0.23.1, ed25519-dalek 3.0.0, rand 0.10.3, aes-gcm 0.11.1, sqlx 0.9.0, async-nats 0.50.0, bollard 0.21.1, tower-http 0.7.1. Every workspace pin now names its exact current version, and `cheladb-neon` uses them.
+- **TLS and JWT crypto is aws-lc-rs everywhere** (reqwest `rustls`, jsonwebtoken `aws_lc_rs`, async-nats `aws-lc-rs`): it has post-quantum key exchange and FIPS mode, which ring lacks. It needs a C toolchain.
+- **pnpm:** vite 8.3.1, @vitejs/plugin-react 6.1.1, orval 8.38.0, lucide-react 1.48.0, TypeScript 7.0.2, @types/node 24 (we run Node 24). The TanStack packages that were on `"latest"` are pinned.
+- **Docker:** every image pinned by index digest. Postgres 17.11 (not 18: existing volumes would need a dump and restore), NATS 2.15.0, Zitadel v2.71.19.
+
+**Findings to carry forward:**
+- **jsonwebtoken 11 panics at runtime if one binary enables both `aws_lc_rs` and `rust_crypto`.** Every crate must use the workspace pin.
+- **pnpm 12 enforces a minimum release age.** Asking for a version published hours ago makes it write exemptions into `pnpm-workspace.yaml`; don't keep those. Let it resolve the newest version that passes.
+- TypeScript 7 removed `baseUrl`; Studio's `paths` already start with `./`.
+- reqwest 0.13 puts `.form()` and `.query()` behind features of those names.
+- Remaining duplicate crates in `Cargo.lock` come from pingora 0.9 and rsa 0.9 (latest stable) and from reqwest's own tower-http 0.6. We can't remove them.
+- The worker's provisioning path on bollard 0.21 is compile-checked and its volume handling is live-tested (`apps/worker/tests/docker_live.rs`). Container creation hasn't run live yet.
 
 ## The data API (PostgREST equivalent)
 
