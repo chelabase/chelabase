@@ -19,6 +19,51 @@ On `main`:
 
 Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 
+## Resume here (handoff, 2026-09-28)
+
+**State of the repo:**
+- `main` has the dependency refresh, Zitadel v4 with our own login (`ui-auth`), `CHELADB_MODE`, `just cleanup`, and every minor finding from the two reviews fixed. There are no open review findings.
+- The only other branch is `neon-control-plane-listener`: the approved step 3 spec (2 docs commits, `240288a` and `5ae0f52`), based on the old `main` at `0eef624`. Its plan isn't written yet.
+- **Last green run:**
+  - `cargo test --workspace`: 312/312, three runs in a row;
+  - clippy: clean;
+  - `just neon-test`: all passed;
+  - Studio: 72/72, plus typecheck and build;
+  - `just auth-e2e`: ok, live;
+  - a real browser pass (Playwright) of sign-up, the taken-email redirect, sign-in, reset from the Mailpit link, sign-out, and verify-mode sign-up.
+- The local state is clean after `just cleanup`. There is one account, `clean-start@example.com` / `Clean-pass1!`, and no tenant databases.
+
+**Next session, in order:**
+1. `git checkout neon-control-plane-listener && git rebase main`. It's docs only, so no conflicts are expected.
+2. Re-check the spec against what landed since it was written, and amend it:
+   - `ui-auth` is on 8084 and the new listener takes 8083;
+   - every published port stays on 127.0.0.1 (`just neon-test` enforces this);
+   - `CHELADB_MODE` exists, so decide whether the proxy or password mode should follow it.
+3. **Decision already made: no long proxy cache.** 10 s is too long, because a user must be able to sign in right after a password reset. Before planning, find in Neon's proxy source at the pinned ref (`infra/neon/NEON_REF`) whether `--project-info-cache` can be turned off, e.g. `size=0`, or given a TTL of about 1 s. Then write the result into the spec. Our control plane answers locally, so skipping the cache is cheap. Also note for step 4: resetting a password must not depend on invalidating the cache, which is a no-op at this ref.
+4. Write the step 3 plan (writing-plans), then execute it.
+
+**Findings to carry forward (environment and tooling):**
+- **Ephemeral ports run out on this machine.** WSL's `net.ipv4.ip_local_port_range` is `44620 48715`, about 4,000 ports. Many test and e2e runs in a row leave around 10,000 sockets in TIME-WAIT, and then `bind("127.0.0.1:0")` fails in the gateway and `ui-auth` tests. It looks like flakiness but isn't. To fix it:
+  - wait a minute or two; or
+  - widen the range: `sudo sysctl -w net.ipv4.ip_local_port_range="32768 60999"`. This is the user's machine, so it hasn't been changed.
+- **Rate limits in `just auth-e2e`:** sign-in allows 10 per minute per IP, and every run comes from 127.0.0.1, so wait a minute between runs.
+- **Playwright MCP:** registered at user scope with proto's pnpm, by absolute path, because `npx` isn't on PATH:
+
+  ```
+  claude mcp add playwright --scope user -- ~/.proto/shims/pnpm dlx @playwright/mcp@latest --headless --browser chromium
+  ```
+
+  It needs the browser build that matches `@playwright/mcp`, installed with `pnpm dlx @playwright/mcp@latest install-browser chrome-for-testing`. Its output goes to `.playwright-mcp/`, which is git-ignored.
+- **Starting apps outside `just dev`:** anything started by hand isn't in `.cheladb/dev/pids`, so `just stop` doesn't kill it, and the next `just dev` fails with "Address already in use". `just cleanup` also stops anything on the dev ports.
+- **Studio and the gateway must be the same site** (`localhost`, not `127.0.0.1`). Otherwise browsers drop `ui-auth`'s `SameSite=Strict` cookies. Bootstrap writes `VITE_API_URL=http://localhost:8000`, and a test pins this.
+- **TanStack Router JSON-parses search params by default.** Studio replaces the parser (`src/lib/search.ts`) so that all-digit Zitadel ids and codes stay strings.
+- **Zitadel v4 behaviours:**
+  - A new user is invisible to `POST /v2/sessions` for a moment (404), and `ui-auth` retries for up to 1 s.
+  - Usernames are unique, emails aren't.
+  - Error messages are translated text, not ids.
+  - `end_session` with `id_token_hint` ends the session itself and skips our `/logout` page.
+  - Password hashing makes an existing account about 0.25 s slower, so sign-in is padded to 1.5 s and sign-up to 2.5 s.
+
 ## Decisions made
 
 ### Which Neon parts to keep and which to re-engineer
@@ -223,7 +268,7 @@ Branch `deps-refresh`, one commit per group; tests, clippy and the Studio checks
 - TypeScript 7 removed `baseUrl`; Studio's `paths` already start with `./`.
 - reqwest 0.13 puts `.form()` and `.query()` behind features of those names.
 - Remaining duplicate crates in `Cargo.lock` come from pingora 0.9 and rsa 0.9 (latest stable) and from reqwest's own tower-http 0.6. We can't remove them.
-- The worker's provisioning path on bollard 0.21 is compile-checked and its volume handling is live-tested (`apps/worker/tests/docker_live.rs`). Container creation hasn't run live yet.
+- The worker's provisioning path on bollard 0.21 is live-tested (2026-09-28). A database created through the gateway was ready with `postgres:17.11` on 127.0.0.1 only and answered queries. Password reset rotated the password and the old one was refused. Delete left no container or volume behind. The volume handling is also covered by `apps/worker/tests/docker_live.rs`.
 
 ### Zitadel v4 and our own login (done 2026-09-28)
 
@@ -248,14 +293,31 @@ Branch `zitadel-v4`. Plan: `docs/superpowers/plans/2026-09-28-zitadel-v4-and-own
   - forced password change (`changeRequired`).
   
   Its email-verification gate is optional (`EMAIL_VERIFICATION`); ours always applies. MFA and forced password change belong to the later phases in the spec.
-- **Deferred from the security review (minor):**
-  - `Secure` cookies are opt-in rather than the default.
-  - The per-email sign-in limit lets anyone block a chosen account for a minute.
-  - ui-auth trusts `X-Forwarded-For`, which is safe only while it listens on loopback.
-  - `/login` has no `Referrer-Policy: no-referrer`.
-  - A decoy sign-up sends no "you already have an account" email.
-  - Nobody checks the permissions of the token and cookie-key files.
-  - We haven't confirmed that Zitadel escapes `_` and `%` in email queries.
+- **Modes:** `CHELADB_MODE` is `self-hosted` (the default, the dev mode) or `platform` (the hosted cloud, not built yet). In self-hosted mode:
+  - email verification is off;
+  - a sign-up for a taken email says so and goes to sign in;
+  - cookies aren't `Secure`.
+  
+  Platform mode:
+  - requires verification;
+  - answers a taken email with a decoy (and emails the owner a reset link);
+  - sets `Secure` cookies.
+  
+  `CHELADB_REQUIRE_EMAIL_VERIFICATION` and `CHELADB_UI_AUTH_SECURE_COOKIES` override the mode.
+- **`just cleanup`** wipes local state (tenant databases, every Zitadel account, Mailpit) and re-bootstraps.
+- **The reviews' minor findings are fixed (2026-09-28):**
+  - Only failed sign-ins count against an email.
+  - A non-loopback `ui-auth` needs `CHELADB_UI_AUTH_TRUSTED_PROXY=true`.
+  - Studio sends no Referer.
+  - `ui-auth` warns about token and cookie-key files other users can read.
+  - `auth-request` is rate-limited.
+  - An expired `/verify` offers Start again.
+  - Sign-up is padded 1 s beyond sign-in, since it waits for Zitadel's projections.
+  - Bootstrap waits for `login-client.pat`, and gives a clear error for an app without a client id.
+  - Sign-out also clears the `cheladb_session` cookie.
+  - Empty URL parameters are dropped.
+  - Zitadel escapes `_` and `%` in email queries (checked live), so ui-auth needs no escaping.
+- **Studio's sign-out ends the Zitadel session itself:** `end_session` with `id_token_hint` returns straight to Studio. Zitadel only goes through our `/logout` page when it has no hint.
 
 ## The data API (PostgREST equivalent)
 

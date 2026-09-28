@@ -9,7 +9,7 @@ export function parseSearch(search: string): Record<string, string> {
 export function stringifySearch(search: Record<string, unknown>): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(search)) {
-    if (value !== undefined && value !== null) params.set(key, String(value));
+    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
   }
   const text = params.toString();
   return text ? `?${text}` : "";

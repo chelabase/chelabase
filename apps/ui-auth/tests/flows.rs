@@ -935,3 +935,113 @@ async fn a_taken_email_without_verification_says_it_exists() {
         "no sign-in from the sign-up form"
     );
 }
+
+// --- Minor findings -----------------------------------------------------------------
+
+// An expired or missing step cookie is a dead sign-in, not a bad code: Studio offers "Start again".
+#[tokio::test]
+async fn verify_without_a_step_cookie_is_gone() {
+    let h = harness().await;
+    let a = h
+        .post(
+            "/auth/v1/verify-email",
+            json!({"code": "123456"}),
+            None,
+            "1.1.1.1",
+        )
+        .await;
+    assert_eq!(
+        (a.status, a.body),
+        (StatusCode::GONE, json!({"error": messages::GONE}))
+    );
+}
+
+#[tokio::test]
+async fn auth_request_is_rate_limited_per_ip() {
+    let h = harness().await;
+    for _ in 0..60 {
+        h.post(
+            "/auth/v1/auth-request",
+            json!({"authRequest": "V2_1"}),
+            None,
+            "2.3.4.5",
+        )
+        .await;
+    }
+    let a = h
+        .post(
+            "/auth/v1/auth-request",
+            json!({"authRequest": "V2_1"}),
+            None,
+            "2.3.4.5",
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+// Successful sign-ins don't use up the per-email limit, so nobody can lock a known account
+// out by signing in as it... they'd need its password.
+#[tokio::test]
+async fn only_failed_sign_ins_count_against_an_email() {
+    let h = harness().await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    for i in 0..7 {
+        let a = h
+            .post(
+                "/auth/v1/sign-in",
+                signin(
+                    &h.mock.add_auth_request(false),
+                    "ada@example.com",
+                    "Secret-pass1",
+                ),
+                None,
+                &format!("9.8.7.{i}"),
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::OK, "attempt {i}");
+    }
+}
+
+// Sign-up waits out Zitadel's projection lag, so its floor sits above sign-in's.
+#[tokio::test]
+async fn sign_up_answers_take_the_longer_minimum() {
+    let h = harness_with(false, 300).await;
+    let start = Instant::now();
+    h.post(
+        "/auth/v1/sign-up",
+        signup(
+            &h.mock.add_auth_request(true),
+            "new@example.com",
+            "Secret-pass1",
+        ),
+        None,
+        "1.1.1.1",
+    )
+    .await;
+    assert!(start.elapsed() >= Duration::from_millis(1300));
+}
+
+// Platform mode: the real owner of a taken email hears about the attempt (a reset link).
+#[tokio::test]
+async fn a_decoy_sign_up_emails_the_owner_a_reset_link() {
+    let h = harness().await;
+    let id = h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.post(
+        "/auth/v1/sign-up",
+        signup(
+            &h.mock.add_auth_request(true),
+            "ada@example.com",
+            "Secret-pass1",
+        ),
+        None,
+        "1.1.1.1",
+    )
+    .await;
+    for _ in 0..50 {
+        if !h.mock.emails().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(h.mock.emails(), vec![(id, "reset".to_string())]);
+}

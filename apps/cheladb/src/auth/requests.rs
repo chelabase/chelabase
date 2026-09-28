@@ -94,6 +94,18 @@ pub fn find_app(listed: &Value, name: &str) -> Option<App> {
     })
 }
 
+/// The id of an app called `name`, whether or not its client id is readable.
+pub fn app_id_named(listed: &Value, name: &str) -> Option<String> {
+    listed
+        .get("applications")?
+        .as_array()?
+        .iter()
+        .find(|a| a.get("name").and_then(Value::as_str) == Some(name))?
+        .get("applicationId")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Fields of the existing Studio app that differ from what bootstrap wants.
 pub fn studio_app_drift(app: &Value, origin: &str) -> Vec<&'static str> {
     let want = studio_app_config(origin);
@@ -116,7 +128,6 @@ pub fn created_client_id(value: &Value) -> Option<String> {
         .as_str()
         .map(str::to_string)
 }
-
 
 pub fn machine_user_search(username: &str) -> Value {
     json!({"queries": [{"userNameQuery": {"userName": username, "method": "TEXT_QUERY_METHOD_EQUALS"}}]})

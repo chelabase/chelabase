@@ -25,14 +25,9 @@ pub async fn run() -> Result<()> {
     let secrets = secrets_key::ensure(&secrets_dir())?;
     let cookie_key = secrets_key::ensure_file(&ui_auth_dir(), "cookie.key")?;
 
-    let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat").await?;
+    let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat", 45, TOKEN_POLL).await?;
     let login_client = zdir.join("login-client.pat");
-    if !login_client.is_file() {
-        bail!(
-            "missing {}: Zitadel writes it only on a fresh instance. Run: just zitadel-reset",
-            login_client.display()
-        );
-    }
+    wait_for_file(&login_client, "login-client.pat", 45, TOKEN_POLL).await?;
 
     let api = HttpZitadel::new(&iss, &admin_pat);
     let org_id = wait_ready(|| steps::ensure_org(&api)).await?;
@@ -79,15 +74,17 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_file(path: &Path, what: &str) -> Result<String> {
-    for _ in 0..45 {
+const TOKEN_POLL: Duration = Duration::from_secs(2);
+
+async fn wait_for_file(path: &Path, what: &str, attempts: u32, delay: Duration) -> Result<String> {
+    for _ in 0..attempts {
         if let Ok(text) = fs::read_to_string(path) {
             let token: String = text.chars().filter(|c| !c.is_whitespace()).collect();
             if !token.is_empty() {
                 return Ok(token);
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(delay).await;
     }
     bail!(
         "missing {} ({what}): written only on a fresh Zitadel volume. Run: just zitadel-reset",
@@ -119,6 +116,39 @@ mod tests {
     fn host(url: &str) -> &str {
         let rest = url.split_once("://").unwrap().1;
         rest.split(['/', ':']).next().unwrap()
+    }
+
+    // Zitadel writes admin.pat and login-client.pat moments apart on a fresh instance:
+    // both are waited for, not just the first.
+    #[tokio::test]
+    async fn waits_for_a_token_file_then_reads_it_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("login-client.pat");
+        let writer = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                std::fs::write(path, " tok\n").unwrap();
+            })
+        };
+        let token = wait_for_file(&path, "login-client.pat", 50, Duration::from_millis(10)).await;
+        writer.await.unwrap();
+        assert_eq!(token.unwrap(), "tok");
+    }
+
+    #[tokio::test]
+    async fn a_token_file_that_never_appears_says_to_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = wait_for_file(
+            &dir.path().join("x.pat"),
+            "x.pat",
+            2,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("just zitadel-reset"), "{err}");
     }
 
     // ui-auth's SameSite=Strict cookies are dropped on cross-site fetches: Studio and the

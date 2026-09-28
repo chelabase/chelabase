@@ -106,7 +106,7 @@ Design notes:
 
 ## Studio sign-in
 
-Studio has its own sign-in pages (`/login`, `/register`, `/verify`, `/password-reset`, `/logout`). Zitadel v4 sends every sign-in there; the pages call `ui-auth` through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login-client token and keeps step state in encrypted HttpOnly cookies. Answers never reveal whether an account exists.
+Studio has its own sign-in pages (`/login`, `/register`, `/verify`, `/password-reset`, `/logout`). Zitadel v4 sends every sign-in there; the pages call `ui-auth` through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login-client token and keeps step state in encrypted HttpOnly cookies. In platform mode, answers don't reveal whether an account exists (with one known limit: signing up and then signing in with the same email and password tells a new email from a taken one). In self-hosted mode, a sign-up for a taken email says so and sends you to sign in.
 
 1. `just dev`, then open http://localhost:3000 and choose **Create account** (or **Sign in**).
 2. You land in Studio straight away (email verification is off in self-hosted mode). Emails such as password resets land in **Mailpit**: http://localhost:8025.

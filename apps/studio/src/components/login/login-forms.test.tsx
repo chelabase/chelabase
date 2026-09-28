@@ -121,3 +121,12 @@ describe("taken email (self-hosted)", () => {
     expect(toRegister).not.toHaveBeenCalled();
   });
 });
+
+describe("VerifyEmailForm, expired", () => {
+  it("offers to start again when the sign-in is over", async () => {
+    const verifyEmail = vi.fn().mockRejectedValue(new LoginApiError(410, "This sign-in has expired, start again"));
+    render(<VerifyEmailForm api={api({ verifyEmail })} initialCode="123456" go={vi.fn()} toVerify={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Verify" }));
+    expect(await screen.findByRole("link", { name: "Start again" })).toHaveAttribute("href", "/");
+  });
+});

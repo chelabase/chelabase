@@ -4,6 +4,8 @@ import { useAuth } from "react-oidc-context";
 import { Dashboard } from "@/components/dashboard";
 import { SignInError } from "@/components/sign-in-error";
 import { createApiClient } from "@/lib/api";
+import { createLoginApi } from "@/lib/login-api";
+import { signOut } from "@/lib/sign-out";
 import { useStudioEnv } from "@/lib/env-context";
 import { createReauthGuard, resetOnLoad } from "@/lib/reauth";
 
@@ -45,7 +47,7 @@ function AppPage() {
     <Dashboard
       api={api}
       profile={{ name: auth.user?.profile.name, email: auth.user?.profile.email }}
-      onSignOut={() => void auth.signoutRedirect()}
+      onSignOut={() => void signOut(createLoginApi(env.apiUrl), () => auth.signoutRedirect())}
     />
   );
 }

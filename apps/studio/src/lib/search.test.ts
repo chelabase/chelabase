@@ -12,7 +12,8 @@ describe("search params", () => {
   });
 
   it("round-trips through stringify", () => {
-    expect(stringifySearch({ authRequest: "V2_1", empty: "" })).toBe("?authRequest=V2_1&empty=");
+    // Empty values are left out, so routes with optional params don't show `?code=`.
+    expect(stringifySearch({ authRequest: "V2_1", empty: "" })).toBe("?authRequest=V2_1");
     expect(stringifySearch({})).toBe("");
     expect(parseSearch(stringifySearch({ a: "x y&z" }))).toEqual({ a: "x y&z" });
   });

@@ -1,7 +1,5 @@
 # Cheladb local control-plane dependencies.
 # Rust apps and Studio run on the host against these services.
-#
-# Zitadel image pin: keep in sync with packages/zitadel (OpenAPI codegen).
 
 name: cheladb
 

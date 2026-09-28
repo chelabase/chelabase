@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
-import { Field, LoginLayout, Problem, follow, messageOf, type FormProps } from "./sign-in-form";
+import { EXPIRED, Field, LoginLayout, Problem, follow, messageOf, type FormProps } from "./sign-in-form";
 
 export function VerifyEmailForm({ api, initialCode = "", go, toVerify }: FormProps) {
   const [code, setCode] = useState(initialCode);
@@ -31,7 +31,7 @@ export function VerifyEmailForm({ api, initialCode = "", go, toVerify }: FormPro
       <p className="text-sm text-muted-foreground">Enter the code we sent to your email.</p>
       <form onSubmit={submit} className="space-y-4">
         <Field label="Code" value={code} onChange={setCode} autoComplete="one-time-code" />
-        {error && <Problem message={error} />}
+        {error && <Problem message={error} restart={error === EXPIRED} />}
         <Button type="submit" disabled={busy} className="w-full">Verify</Button>
       </form>
       <Button variant="outline" onClick={() => void resend()} className="w-full">Send a new code</Button>

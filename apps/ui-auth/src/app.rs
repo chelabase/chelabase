@@ -55,6 +55,9 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
+/// Sign-up may wait up to a second for Zitadel to see the new user (`new_user_session`), so its
+/// answers are padded this much beyond sign-in's, or a new email would answer slower than a taken one.
+const SIGN_UP_EXTRA: Duration = Duration::from_secs(1);
 const HOUR: Duration = Duration::from_secs(3600);
 
 /// Counts one attempt against each key in order, stopping at the first that is over its
@@ -183,7 +186,11 @@ struct AuthRequestBody {
     auth_request: String,
 }
 
-async fn auth_request(State(s): S, Json(b): Json<AuthRequestBody>) -> Response {
+async fn auth_request(State(s): S, headers: HeaderMap, Json(b): Json<AuthRequestBody>) -> Response {
+    let ip = client_ip(&headers);
+    if !allowed(&s, &[(format!("auth-request:ip:{ip}"), 60, MINUTE)]) {
+        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+    }
     if !is_auth_request_id(&b.auth_request) {
         return error(StatusCode::GONE, GONE);
     }
@@ -211,15 +218,18 @@ async fn sign_in(State(s): S, headers: HeaderMap, Json(b): Json<SignInBody>) -> 
 async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
-    if !allowed(
-        s,
-        &[
-            (format!("sign-in:ip:{ip}"), 10, MINUTE),
-            (format!("sign-in:email:{}", email_tag(&email)), 5, MINUTE),
-        ],
-    ) {
+    // Per email, only failures count: signing in as someone takes their password, so nobody
+    // can use up a known account's attempts.
+    let email_key = format!("sign-in:email:{}", email_tag(&email));
+    if !allowed(s, &[(format!("sign-in:ip:{ip}"), 10, MINUTE)])
+        || s.limiter.over(&email_key, 5, MINUTE)
+    {
         return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
     }
+    let refused = || {
+        s.limiter.hit(&email_key, MINUTE);
+        error(StatusCode::UNAUTHORIZED, BAD_CREDENTIALS)
+    };
     if !is_auth_request_id(&b.auth_request) {
         return error(StatusCode::GONE, GONE);
     }
@@ -228,14 +238,14 @@ async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Resp
     }
     let user_id = match s.zitadel.find_user_by_email(&s.config.org_id, &email).await {
         Ok(Some(id)) => id,
-        Ok(None) => return error(StatusCode::UNAUTHORIZED, BAD_CREDENTIALS),
+        Ok(None) => return refused(),
         Err(e) => return unavailable(&e),
     };
     let session = match s.zitadel.create_session(&user_id, &b.password).await {
         Ok(session) => session,
         Err(ZError::Rejected { .. }) => {
             info!(email = %email_tag(&email), "sign-in refused");
-            return error(StatusCode::UNAUTHORIZED, BAD_CREDENTIALS);
+            return refused();
         }
         Err(e) => return unavailable(&e),
     };
@@ -264,11 +274,11 @@ struct SignUpBody {
 async fn sign_up(State(s): S, headers: HeaderMap, Json(b): Json<SignUpBody>) -> Response {
     let start = Instant::now();
     let answer = sign_up_inner(&s, &headers, b).await;
-    pad(start, s.config.min_response).await;
+    pad(start, s.config.min_response + SIGN_UP_EXTRA).await;
     answer
 }
 
-async fn sign_up_inner(s: &AppState, headers: &HeaderMap, b: SignUpBody) -> Response {
+async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
     if !allowed(
@@ -327,7 +337,7 @@ async fn sign_up_inner(s: &AppState, headers: &HeaderMap, b: SignUpBody) -> Resp
 /// A sign-up for a taken email. With verification on (platform), it's answered exactly like a
 /// new one, with a cookie that can't verify. With it off (self-hosted), a new sign-up has no
 /// code step to hide behind, so the user is told and Studio sends them to sign in.
-fn taken(s: &AppState, email: &str, auth_request: String) -> Response {
+fn taken(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
     if s.config.skip_email_verification {
         info!(email = %email_tag(email), "sign-up for a taken email");
         return error(StatusCode::CONFLICT, ACCOUNT_EXISTS);
@@ -336,8 +346,11 @@ fn taken(s: &AppState, email: &str, auth_request: String) -> Response {
 }
 
 /// Answer a sign-up for a taken email exactly like a new one, with a cookie that can't verify.
-fn decoy(s: &AppState, email: &str, auth_request: String) -> Response {
+/// The account's owner gets a password-reset email instead, so a real owner who forgot they
+/// signed up has a way back in.
+fn decoy(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
     info!(email = %email_tag(email), "sign-up for a taken email (decoy)");
+    spawn_reset_email(s, email.to_string());
     let decoy = LoginState {
         auth_request,
         user_id: None,
@@ -359,7 +372,7 @@ async fn new_user_session(s: &AppState, user_id: &str, password: &str) -> Result
     let mut attempt = 0;
     loop {
         match s.zitadel.create_session(user_id, password).await {
-            Err(ZError::Rejected { status: 404, .. }) if attempt < 20 => {
+            Err(ZError::Rejected { status: 404, .. }) if attempt < 10 => {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -403,8 +416,9 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
     if !allowed(s, &checks) {
         return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
     }
+    // No (or an expired) step cookie: the sign-in is over, whatever the code.
     let Some(state) = state else {
-        return error(StatusCode::BAD_REQUEST, BAD_CODE);
+        return error(StatusCode::GONE, GONE);
     };
     let (Some(user_id), Some(session_id), Some(session_token), false) = (
         state.user_id,
@@ -475,7 +489,13 @@ async fn password_reset(State(s): S, headers: HeaderMap, Json(b): Json<EmailBody
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
     }
-    // In the background, so the answer time doesn't reveal whether the user exists.
+    spawn_reset_email(&s, email);
+    reply(StatusCode::OK, json!({}), Vec::new())
+}
+
+/// Send a reset link to `email`'s account, if it has one, in the background, so the answer
+/// time doesn't reveal whether the user exists.
+fn spawn_reset_email(s: &Arc<AppState>, email: String) {
     let s2 = s.clone();
     tokio::spawn(async move {
         let template = format!(
@@ -496,7 +516,6 @@ async fn password_reset(State(s): S, headers: HeaderMap, Json(b): Json<EmailBody
             Err(e) => warn!(error = %e, "password reset lookup failed"),
         }
     });
-    reply(StatusCode::OK, json!({}), Vec::new())
 }
 
 #[derive(Deserialize)]

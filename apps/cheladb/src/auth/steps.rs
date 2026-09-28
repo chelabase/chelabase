@@ -2,7 +2,7 @@
 
 use crate::auth::requests::*;
 use crate::auth::zitadel::ZitadelApi;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -39,14 +39,27 @@ pub async fn ensure_project(api: &impl ZitadelApi, org_id: &str) -> Result<Strin
     project_id_from(&created).with_context(|| format!("CreateProject: {created}"))
 }
 
-async fn list_apps(api: &impl ZitadelApi, project_id: &str) -> Result<Value> {
-    api.connect(APPS, "ListApplications", apps_search(project_id))
-        .await
+/// The app called `name` in the project, if any. One without a readable client id is an error:
+/// creating another would leave two apps with the same name.
+async fn existing_app(api: &impl ZitadelApi, project_id: &str, name: &str) -> Result<Option<App>> {
+    let listed = api
+        .connect(APPS, "ListApplications", apps_search(project_id))
+        .await?;
+    if let Some(app) = find_app(&listed, name) {
+        return Ok(Some(app));
+    }
+    if let Some(id) = app_id_named(&listed, name) {
+        bail!(
+            "Zitadel has an app named {name} (id {id}) without a client id in its listing; \
+             delete it in the console (or run `just zitadel-reset`) and re-run bootstrap"
+        );
+    }
+    Ok(None)
 }
 
 /// The API app's client id (the gateway accepts it as a token audience).
 pub async fn ensure_api_app(api: &impl ZitadelApi, project_id: &str) -> Result<String> {
-    if let Some(app) = find_app(&list_apps(api, project_id).await?, API_APP) {
+    if let Some(app) = existing_app(api, project_id, API_APP).await? {
         return Ok(app.client_id);
     }
     let created = api
@@ -66,7 +79,7 @@ pub async fn ensure_studio_app(
     project_id: &str,
     origin: &str,
 ) -> Result<String> {
-    if let Some(app) = find_app(&list_apps(api, project_id).await?, STUDIO_APP) {
+    if let Some(app) = existing_app(api, project_id, STUDIO_APP).await? {
         let drift = studio_app_drift(&app.raw, origin);
         if !drift.is_empty() {
             api.connect(
@@ -305,6 +318,28 @@ mod tests {
         assert!(
             fake.calls()
                 .contains(&"ApplicationService/UpdateApplication".to_string())
+        );
+    }
+
+    // An app we can't read a client id from must not be "created" again next to itself.
+    #[tokio::test]
+    async fn a_named_app_without_a_client_id_is_an_error_not_a_duplicate() {
+        let fake = Fake::default().with(
+            "ApplicationService/ListApplications",
+            json!({"applications": [{"applicationId": "a2", "name": "cheladb-studio"}]}),
+        );
+        let err = ensure_studio_app(&fake, "p1", ORIGIN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cheladb-studio") && err.contains("a2"),
+            "{err}"
+        );
+        assert!(
+            !fake.calls().iter().any(|c| c.contains("Create")),
+            "{:?}",
+            fake.calls()
         );
     }
 

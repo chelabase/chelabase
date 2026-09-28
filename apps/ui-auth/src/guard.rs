@@ -27,6 +27,19 @@ impl RateLimiter {
         entry.1 += 1;
         entry.1 <= limit
     }
+
+    /// Whether `key` has already used `limit` attempts in its current window; counts nothing.
+    pub fn over(&self, key: &str, limit: u32, window: Duration) -> bool {
+        let windows = self.windows.lock().expect("limiter lock");
+        windows
+            .get(key)
+            .is_some_and(|(start, n)| start.elapsed() < window && *n >= limit)
+    }
+
+    /// Counts one attempt against `key` without checking a limit (e.g. after a failure).
+    pub fn hit(&self, key: &str, window: Duration) {
+        self.allow(key, u32::MAX, window);
+    }
 }
 
 /// The rightmost `X-Forwarded-For` entry: the one the gateway appended from the TCP peer.
@@ -91,6 +104,19 @@ mod tests {
             limiter.allow("short", 1, Duration::from_millis(1)),
             "a new window starts over"
         );
+    }
+
+    #[test]
+    fn a_peek_does_not_count_and_a_failure_does() {
+        let limiter = RateLimiter::default();
+        let minute = Duration::from_secs(60);
+        for _ in 0..10 {
+            assert!(!limiter.over("k", 2, minute));
+        }
+        limiter.hit("k", minute);
+        limiter.hit("k", minute);
+        assert!(limiter.over("k", 2, minute));
+        assert!(!limiter.over("other", 2, minute));
     }
 
     #[tokio::test]
