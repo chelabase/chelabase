@@ -5,6 +5,20 @@
 
 name: cheladb
 
+# --- Neon storage (profile "neon": `just neon-up`; opt-in until provisioning moves to Neon) ---
+# Pinned by digest; `just neon-up` overrides these with a local `just neon-build` when present.
+# The packages are private: `docker login ghcr.io` first (infra/neon/README.md).
+x-neon-images:
+  neon: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a}
+  # Not run until roadmap step 4; recorded here so the pin lives in one place.
+  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/cheladb/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93}
+
+# S3 credentials for SeaweedFS. Local dev only.
+x-neon-s3-env: &neon-s3-env
+  AWS_ACCESS_KEY_ID: cheladb-dev
+  AWS_SECRET_ACCESS_KEY: cheladb-dev-secret
+  AWS_DEFAULT_REGION: us-east-1
+
 services:
   metadata-db:
     image: postgres:17-alpine
@@ -99,7 +113,210 @@ services:
     ports:
       - "8025:8025"
 
+  # --- Neon storage (profile "neon") ------------------------------------------------------
+  # Flags and health checks come from the old cheladb repo's core/docker/docker-compose.yml,
+  # checked there against the pinned Neon source.
+
+  # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47
+    profiles: ["neon"]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /tmp/s3.json <<EOT
+        {"identities": [{"name": "neon",
+          "credentials": [{"accessKey": "cheladb-dev", "secretKey": "cheladb-dev-secret"}],
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+        EOT
+        exec weed server -s3 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
+    volumes:
+      - neon_seaweedfs_data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8333"]
+      interval: 2s
+      retries: 60
+
+  create-bucket:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: "no"
+    environment: *neon-s3-env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 60); do
+          aws --endpoint-url http://seaweedfs:8333 s3 mb s3://neon 2>/dev/null ||
+            aws --endpoint-url http://seaweedfs:8333 s3 ls s3://neon >/dev/null && exit 0
+          sleep 2
+        done
+        exit 1
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+
+  storage-broker:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: unless-stopped
+    command: ["storage_broker", "--listen-addr=0.0.0.0:50051"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/50051"]
+      interval: 2s
+      retries: 60
+
+  # One safekeeper keeps WAL on one disk; enough for local dev.
+  safekeeper1:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: unless-stopped
+    environment: *neon-s3-env
+    command:
+      - safekeeper
+      - --id=1
+      - -D
+      - /data
+      - --listen-pg=0.0.0.0:5454
+      - --listen-http=0.0.0.0:7676
+      - --advertise-pg=safekeeper1:5454
+      - --availability-zone=az-1
+      - --broker-endpoint=http://storage-broker:50051
+      - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
+    volumes:
+      - neon_safekeeper1_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      storage-broker:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+
+  storcon-db:
+    image: postgres:17-alpine
+    profiles: ["neon"]
+    restart: unless-stopped
+    environment:
+      # Local dev only.
+      POSTGRES_USER: storcon
+      POSTGRES_PASSWORD: storcon
+      POSTGRES_DB: storage_controller
+    volumes:
+      - neon_storcon_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storcon -d storage_controller"]
+      interval: 2s
+      retries: 60
+
+  storage-controller:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: unless-stopped
+    command:
+      - storage_controller
+      # --dev: no JWT auth between storage components. Their ports stay on the Compose
+      # network; only the API below is published, on loopback.
+      - --dev
+      - --listen=0.0.0.0:1234
+      # Attachment changes (every tenant create, too) are pushed to the control plane's
+      # hook, and a tenant's reconcile fails until the hook answers. Until the control
+      # plane's internal listener exists (roadmap step 3: host.docker.internal:8083),
+      # storcon-hook answers 200. The token is local dev only.
+      - --control-plane-url=http://storcon-hook:5678/storcon
+      - --control-plane-jwt-token=${CHELADB_STORCON_HOOK_TOKEN:-cheladb-dev-storcon-hook}
+      - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
+    ports:
+      # The control plane runs on the host.
+      - "127.0.0.1:1234:1234"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1234/ready"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      storcon-db:
+        condition: service_healthy
+      storcon-hook:
+        condition: service_started
+
+  # Stand-in for the control plane's storage-controller hook until roadmap step 3: answers
+  # 200 to every request (notify-attach, notify-safekeepers) and does nothing.
+  storcon-hook:
+    image: hashicorp/http-echo:1.0.0@sha256:fcb75f691c8b0414d670ae570240cbf95502cc18a9ba57e982ecac589760a186
+    profiles: ["neon"]
+    restart: unless-stopped
+    command: ["-listen=:5678", "-text=ok"]
+
+  # Registers with the storage controller from metadata.json at startup.
+  pageserver:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: unless-stopped
+    environment: *neon-s3-env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /data/.neon
+        echo 'id=1' > /data/.neon/identity.toml
+        cat > /data/.neon/pageserver.toml <<EOT
+        broker_endpoint='http://storage-broker:50051'
+        pg_distrib_dir='/usr/local/'
+        listen_pg_addr='0.0.0.0:6400'
+        listen_http_addr='0.0.0.0:9898'
+        control_plane_api='http://storage-controller:1234/upcall/v1/'
+        virtual_file_io_mode='buffered'
+        remote_storage={ endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/pageserver' }
+        EOT
+        echo '{"host":"pageserver","port":6400,"http_host":"pageserver","http_port":9898,"availability_zone_id":"az-1"}' > /data/.neon/metadata.json
+        exec pageserver -D /data/.neon
+    ports:
+      # HTTP API for the host-side control plane; the pg port (6400) stays internal.
+      - "127.0.0.1:9898:9898"
+    volumes:
+      - neon_pageserver_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9898/v1/status"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      storage-broker:
+        condition: service_healthy
+      storage-controller:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+
+  # One-shot: registers the safekeepers with the storage controller and marks them Active.
+  register-safekeepers:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        S=http://storage-controller:1234
+        for ID in 1; do
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"id\":$$ID,\"created_at\":\"2023-10-25T09:11:25Z\",\"updated_at\":\"2024-08-28T11:32:43Z\",\"region_id\":\"local\",\"host\":\"safekeeper$$ID\",\"port\":5454,\"http_port\":7676,\"https_port\":null,\"version\":5957,\"availability_zone_id\":\"az-$$ID\"}" \
+            $$S/control/v1/safekeeper/$$ID
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{"scheduling_policy":"Active"}' $$S/control/v1/safekeeper/$$ID/scheduling_policy
+        done
+    depends_on:
+      storage-controller:
+        condition: service_healthy
+      safekeeper1:
+        condition: service_healthy
+
 volumes:
   metadata_pg_data:
   nats_data:
   zitadel_pg_data:
+  neon_seaweedfs_data:
+  neon_pageserver_data:
+  neon_safekeeper1_data:
+  neon_storcon_pg_data:

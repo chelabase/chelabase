@@ -29,3 +29,6 @@ apps/studio/.tanstack/
 
 # Local detached-dev state (just dev PIDs / logs)
 .cheladb/
+
+# Neon source checkout for `just neon-build`
+infra/neon/.cache/

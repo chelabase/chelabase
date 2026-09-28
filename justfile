@@ -12,6 +12,11 @@ dev_dir := ".cheladb/dev"
 demo_tenant_id := "00000000-0000-4000-8000-000000000001"
 demo_project_id := "00000000-0000-4000-8000-000000000002"
 
+# Neon storage services (Compose profile "neon").
+neon_services := "seaweedfs create-bucket storage-broker safekeeper1 storcon-db storcon-hook storage-controller pageserver register-safekeepers"
+# The long-running ones: `up --wait` fails on a one-shot that has exited, even with 0.
+neon_daemons := "seaweedfs storage-broker safekeeper1 storcon-db storcon-hook storage-controller pageserver"
+
 # List available recipes
 default:
     @just --list
@@ -24,9 +29,9 @@ deps-up:
     chmod 777 .cheladb/zitadel 2>/dev/null || true
     docker compose -f {{compose_file}} --env-file {{compose_env}} up -d
 
-# Stop control-plane infrastructure containers
+# Stop control-plane infrastructure containers (and the Neon storage stack, if running)
 deps-down:
-    docker compose -f {{compose_file}} --env-file {{compose_env}} down
+    docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon down
 
 # Show Compose service status
 deps-ps:
@@ -250,3 +255,38 @@ check:
 
 zitadel-generate:
     pnpm --filter @cheladb/zitadel generate
+
+# --- Neon storage (opt-in until provisioning moves to Neon) ---
+
+# Build the Neon images from source at infra/neon/NEON_REF (~40 min, ~40 GB free disk)
+neon-build:
+    infra/neon/build.sh neon
+    infra/neon/build.sh compute-node
+
+# Start the Neon storage stack (a local neon-build if present, else the pinned GHCR images)
+neon-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    images="$(scripts/neon-images.sh)"
+    # shellcheck disable=SC2086
+    export $images
+    compose=(docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon)
+    # create-bucket runs as a dependency; register-safekeepers is run last, with its own status.
+    "${compose[@]}" up -d --wait {{neon_daemons}}
+    "${compose[@]}" run --rm register-safekeepers
+
+# Stop and remove the Neon storage containers (volumes kept)
+neon-down:
+    docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon rm -sf {{neon_services}}
+
+# Show the Neon storage containers
+neon-ps:
+    docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon ps -a {{neon_services}}
+
+# Check the running Neon storage stack (creates and deletes a throwaway tenant)
+neon-smoke:
+    scripts/neon-smoke.sh
+
+# Offline checks: Neon build scripts, Compose services, neon scripts
+neon-test:
+    infra/neon/tests/run.sh

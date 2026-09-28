@@ -19,6 +19,8 @@ tasks:
       - "compose"
       - "-f"
       - "docker-compose.yml"
+      - "--profile"
+      - "neon"
       - "down"
     options:
       cache: false
