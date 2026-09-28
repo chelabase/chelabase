@@ -68,11 +68,9 @@ services:
       timeout: 5s
       retries: 10
 
-  # Pinned Zitadel release (Apache-compatible consumption for local IAM).
-  # Upstream project license is AGPL; used here as a self-hosted IdP dependency.
-  # FirstInstance machine PAT is written once on a fresh zitadel_pg_data volume.
+  # Zitadel v4: sign-in pages are Studio's own (/login …), served by ui-auth. FirstInstance writes admin.pat and login-client.pat once, on a fresh zitadel_pg_data volume.
   zitadel:
-    image: ghcr.io/zitadel/zitadel:v2.71.19@sha256:32834d46240c5ece9f86c5e5f706b167c2064fba76bbf9213e3494023c38ca5d
+    image: ghcr.io/zitadel/zitadel:v4.19.1@sha256:f98935f56505ec6fa3e6523261cd1b8ace0c622e16da4a45acd493cb472f003f
     restart: unless-stopped
     command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode disabled
     environment:
@@ -93,6 +91,14 @@ services:
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Cheladb Bootstrap
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
       ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH: /zitadel-bootstrap/login-client.pat
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_USERNAME: login-client
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Cheladb ui-auth
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: http://localhost:3000/
+      ZITADEL_OIDC_DEFAULTLOGINURLV2: "http://localhost:3000/login?authRequest="
+      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "http://localhost:3000/logout?post_logout_redirect="
     depends_on:
       zitadel-db:
         condition: service_healthy

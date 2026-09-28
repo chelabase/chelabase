@@ -5,8 +5,6 @@
   "scripts": {
     "studio:dev": "pnpm --filter @cheladb/studio dev",
     "studio:build": "pnpm --filter @cheladb/studio build",
-    "types:check": "pnpm --filter @cheladb/types typecheck",
-    "zitadel:generate": "pnpm --filter @cheladb/zitadel generate",
-    "zitadel:typecheck": "pnpm --filter @cheladb/zitadel typecheck"
+    "types:check": "pnpm --filter @cheladb/types typecheck"
   }
 }

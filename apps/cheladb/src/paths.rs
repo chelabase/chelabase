@@ -40,6 +40,14 @@ pub fn studio_env_file() -> PathBuf {
     repo_root().join("apps/studio/.env.local")
 }
 
+/// Where `cheladb auth bootstrap` keeps ui-auth's cookie key.
+pub fn ui_auth_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELADB_UI_AUTH_DIR") {
+        return PathBuf::from(dir);
+    }
+    repo_root().join(".cheladb/ui-auth")
+}
+
 pub fn gateway_dir() -> PathBuf {
     if let Ok(dir) = env::var("CHELADB_GATEWAY_DIR") {
         return PathBuf::from(dir);

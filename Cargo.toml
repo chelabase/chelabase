@@ -5,6 +5,7 @@ members = [
     "apps/worker",
     "apps/gateway",
     "apps/cheladb",
+    "apps/ui-auth",
     "crates/cheladb-types",
     "crates/cheladb-metadata",
     "crates/cheladb-nats",

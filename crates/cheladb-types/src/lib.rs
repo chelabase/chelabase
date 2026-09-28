@@ -56,3 +56,4 @@ mod tests {
         assert_eq!(id.as_uuid(), parsed);
     }
 }
+pub mod mode;

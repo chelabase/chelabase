@@ -41,6 +41,7 @@ impl Method {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Service {
     Orchestrator,
+    UiAuth,
 }
 
 impl Service {
@@ -48,6 +49,7 @@ impl Service {
     pub const fn name(self) -> &'static str {
         match self {
             Service::Orchestrator => "orchestrator",
+            Service::UiAuth => "ui-auth",
         }
     }
 }
@@ -71,6 +73,8 @@ pub enum Cors {
     None,
     /// Callable from the Studio origins (`CHELADB_STUDIO_ORIGINS`).
     Studio,
+    /// Callable from the Studio origins with cookies (credentials); never for a "*" setting.
+    StudioCredentials,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +184,37 @@ pub mod orchestrator {
     };
 }
 
+/// Studio's sign-in pages, served by `ui-auth`.
+pub mod ui_auth {
+    use super::{Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+
+    const POLICY: Policy = Policy {
+        auth: Auth::Public,
+        cors: Cors::StudioCredentials,
+    };
+
+    const fn post(name: &'static str, path: &'static str) -> Endpoint {
+        Endpoint {
+            name,
+            method: Method::Post,
+            path,
+            scope: Scope::Platform,
+            service: Service::UiAuth,
+            policy: POLICY,
+        }
+    }
+
+    pub const AUTH_REQUEST: Endpoint = post("ui_auth.auth_request", "/auth/v1/auth-request");
+    pub const SIGN_IN: Endpoint = post("ui_auth.sign_in", "/auth/v1/sign-in");
+    pub const SIGN_UP: Endpoint = post("ui_auth.sign_up", "/auth/v1/sign-up");
+    pub const VERIFY_EMAIL: Endpoint = post("ui_auth.verify_email", "/auth/v1/verify-email");
+    pub const RESEND_CODE: Endpoint = post("ui_auth.resend_code", "/auth/v1/resend-code");
+    pub const PASSWORD_RESET: Endpoint = post("ui_auth.password_reset", "/auth/v1/password-reset");
+    pub const PASSWORD_RESET_CONFIRM: Endpoint =
+        post("ui_auth.password_reset_confirm", "/auth/v1/password-reset/confirm");
+    pub const LOGOUT: Endpoint = post("ui_auth.logout", "/auth/v1/logout");
+}
+
 /// Every public endpoint the gateway exposes.
 pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::HEALTH,
@@ -189,6 +224,14 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::DATABASE_CONNECTION,
     orchestrator::RESET_PASSWORD,
     orchestrator::DELETE_DATABASE,
+    ui_auth::AUTH_REQUEST,
+    ui_auth::SIGN_IN,
+    ui_auth::SIGN_UP,
+    ui_auth::VERIFY_EMAIL,
+    ui_auth::RESEND_CODE,
+    ui_auth::PASSWORD_RESET,
+    ui_auth::PASSWORD_RESET_CONFIRM,
+    ui_auth::LOGOUT,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,5 +417,18 @@ mod tests {
                 assert_eq!(opens, closes, "{} has a malformed param segment", ep.path);
             }
         }
+    }
+
+    #[test]
+    fn ui_auth_endpoints_are_public_posts_with_credentialed_cors() {
+        for ep in ENDPOINTS.iter().filter(|e| e.service == Service::UiAuth) {
+            assert_eq!(ep.method, Method::Post, "{}", ep.path);
+            assert_eq!(ep.policy.auth, Auth::Public, "{}", ep.path);
+            assert_eq!(ep.policy.cors, Cors::StudioCredentials, "{}", ep.path);
+            assert!(ep.path.starts_with("/auth/v1/"), "{}", ep.path);
+        }
+        assert_eq!(ENDPOINTS.iter().filter(|e| e.service == Service::UiAuth).count(), 8);
+        assert!(matches!(match_endpoint(Scope::Platform, "POST", "/auth/v1/password-reset/confirm"),
+            Match::Found(ep) if ep.name == "ui_auth.password_reset_confirm"));
     }
 }

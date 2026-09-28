@@ -4004,6 +4004,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "ui-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cheladb-routes",
+ "cheladb-secrets",
+ "cheladb-types",
+ "dotenvy",
+ "hex",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "unicase"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

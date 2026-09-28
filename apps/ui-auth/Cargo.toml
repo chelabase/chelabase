@@ -1,0 +1,35 @@
+[package]
+name = "ui-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cheladb's login backend: holds Zitadel's login-client token for Studio's sign-in pages"
+
+[lib]
+name = "ui_auth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ui-auth"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+cheladb-routes = { workspace = true }
+cheladb-secrets = { workspace = true }
+cheladb-types = { workspace = true }
+dotenvy = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

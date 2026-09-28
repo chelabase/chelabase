@@ -32,3 +32,6 @@ apps/studio/.tanstack/
 
 # Neon source checkout for `just neon-build`
 infra/neon/.cache/
+
+# Playwright MCP snapshots and logs
+.playwright-mcp/

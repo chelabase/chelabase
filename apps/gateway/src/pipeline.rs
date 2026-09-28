@@ -182,17 +182,21 @@ impl Pipeline {
         let Match::Found(endpoint) = match_endpoint(scope, requested, req.path) else {
             return None;
         };
-        if endpoint.policy.cors != Cors::Studio {
+        if !matches!(endpoint.policy.cors, Cors::Studio | Cors::StudioCredentials) {
             return None;
         }
+        let credentials = endpoint.policy.cors == Cors::StudioCredentials;
         let mut headers = vec![("vary", "Origin".to_string())];
-        if self.origin_allowed(origin) {
+        if self.origin_allowed(origin) && !(credentials && self.wildcard()) {
             headers.extend([
                 ("access-control-allow-origin", origin.to_string()),
                 ("access-control-allow-methods", requested.to_string()),
                 ("access-control-allow-headers", CORS_ALLOW_HEADERS.to_string()),
                 ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
             ]);
+            if credentials {
+                headers.push(("access-control-allow-credentials", "true".to_string()));
+            }
         }
         Some(GatewayResponse {
             status: 204,
@@ -204,14 +208,25 @@ impl Pipeline {
     /// CORS response headers for a Studio endpoint. `Vary: Origin` is always
     /// present so caches never reuse a response across origins.
     fn cors_headers(&self, endpoint: &Endpoint, headers: &HeaderMap) -> Vec<(&'static str, String)> {
-        if endpoint.policy.cors != Cors::Studio {
+        if endpoint.policy.cors == Cors::None {
             return Vec::new();
         }
+        let credentials = endpoint.policy.cors == Cors::StudioCredentials;
         let mut cors = vec![("vary", "Origin".to_string())];
-        if let Some(origin) = header_str(headers, "origin").filter(|o| self.origin_allowed(o)) {
+        if let Some(origin) = header_str(headers, "origin")
+            .filter(|o| self.origin_allowed(o) && !(credentials && self.wildcard()))
+        {
             cors.push(("access-control-allow-origin", origin.to_string()));
+            if credentials {
+                cors.push(("access-control-allow-credentials", "true".to_string()));
+            }
         }
         cors
+    }
+
+    /// Credentialed CORS needs an explicit origin list; a "*" entry disables it.
+    fn wildcard(&self) -> bool {
+        self.studio_origins.iter().any(|o| o == "*")
     }
 
     fn origin_allowed(&self, origin: &str) -> bool {
@@ -676,5 +691,43 @@ mod tests {
         );
         assert_eq!(resp.status, 401);
         assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some(STUDIO));
+    }
+
+    #[tokio::test]
+    async fn ui_auth_allows_credentials_for_studio_only() {
+        let h = harness(&[]).await;
+        let plan = expect_plan(run(&h.pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", STUDIO)]).await.outcome);
+        assert_eq!(plan.endpoint.service, Service::UiAuth);
+        assert_eq!(plan.identity, None);
+        assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), Some(STUDIO));
+        assert_eq!(header(&plan.response_headers, "access-control-allow-credentials"), Some("true"));
+
+        let other = expect_plan(run(&h.pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", "http://evil.example")]).await.outcome);
+        assert_eq!(header(&other.response_headers, "access-control-allow-origin"), None);
+        assert_eq!(header(&other.response_headers, "access-control-allow-credentials"), None);
+    }
+
+    #[tokio::test]
+    async fn ui_auth_preflight_allows_credentials() {
+        let h = harness(&[]).await;
+        let resp = expect_response(run(&h.pipeline, "OPTIONS", "/auth/v1/sign-in", None,
+            &[("origin", STUDIO), ("access-control-request-method", "POST")]).await.outcome);
+        assert_eq!(resp.status, 204);
+        assert_eq!(header(&resp.headers, "access-control-allow-credentials"), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_origin_setting_never_allows_credentials() {
+        let jwks = MockJwks::start().await;
+        let (private_pem, _) = generate_keypair_pem();
+        let pipeline = Pipeline::new(
+            Arc::new(SharedRegistry::new(Registry::new(Vec::<String>::new()))),
+            vec!["*".to_string()],
+            JwtVerifier::new(jwks.config(vec![])),
+            InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
+        );
+        let plan = expect_plan(run(&pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", STUDIO)]).await.outcome);
+        assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), None);
+        assert_eq!(header(&plan.response_headers, "access-control-allow-credentials"), None);
     }
 }

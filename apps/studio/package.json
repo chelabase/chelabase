@@ -16,7 +16,6 @@
   "dependencies": {
     "@base-ui/react": "^1.8.0",
     "@cheladb/types": "workspace:*",
-    "@cheladb/zitadel": "workspace:*",
     "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-devtools": "^0.10.13",
     "@tanstack/react-router": "^1.170.39",

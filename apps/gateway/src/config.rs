@@ -17,10 +17,10 @@ impl GatewayConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             listen: env_or("CHELADB_GATEWAY_ADDR", "127.0.0.1:8000"),
-            upstreams: Upstreams::new(&env_or(
-                "CHELADB_ORCHESTRATOR_URL",
-                "http://127.0.0.1:8081",
-            ))
+            upstreams: Upstreams::new(
+                &env_or("CHELADB_ORCHESTRATOR_URL", "http://127.0.0.1:8081"),
+                &env_or("CHELADB_UI_AUTH_URL", "http://127.0.0.1:8084"),
+            )
             .map_err(anyhow::Error::msg)?,
             platform_hosts: split_csv(&env_or("CHELADB_PLATFORM_HOSTS", "")),
             studio_origins: split_csv(&env_or("CHELADB_STUDIO_ORIGINS", "http://localhost:3000")),

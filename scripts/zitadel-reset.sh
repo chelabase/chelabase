@@ -21,7 +21,7 @@ else
   echo "[zitadel-reset] no zitadel_pg_data volume found"
 fi
 
-rm -f "${ZDIR}/admin.pat" "${ZDIR}/demo.env" "${ZDIR}/demo-sa.json"
+rm -f "${ZDIR}/admin.pat" "${ZDIR}/login-client.pat" "${ZDIR}/demo.env" "${ZDIR}/demo-sa.json"
 mkdir -p "$ZDIR"
 chmod 777 "$ZDIR" 2>/dev/null || true
 

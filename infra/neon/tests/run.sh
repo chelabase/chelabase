@@ -60,6 +60,13 @@ if command -v docker >/dev/null; then
       | select(.host_ip != "127.0.0.1") | "\($s):\(.published)"] | join(" ")')"
   check "every published port is bound to 127.0.0.1${unexposed:+ (not: $unexposed)}" \
     test -z "$unexposed"
+  zitadel="$("${compose[@]}" config --format json | jq -r '.services.zitadel')"
+  check "zitadel is v4.19.1, pinned by digest" \
+    grep -Eq '"ghcr\.io/zitadel/zitadel:v4\.19\.1@sha256:[0-9a-f]{64}"' <<<"$zitadel"
+  check "zitadel sends sign-ins to Studio's /login" \
+    test "$(jq -r '.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2' <<<"$zitadel")" = "http://localhost:3000/login?authRequest="
+  check "zitadel writes the login-client token" \
+    test "$(jq -r '.environment.ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH' <<<"$zitadel")" = "/zitadel-bootstrap/login-client.pat"
   token="$(CHELADB_STORCON_HOOK_TOKEN=from-env "${compose[@]}" --profile neon config --format json |
     jq -r '.services["storage-controller"].command[]' | grep -- '--control-plane-jwt-token=' || true)"
   check "the hook token comes from CHELADB_STORCON_HOOK_TOKEN" \

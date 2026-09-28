@@ -8,6 +8,11 @@ pub const SECRETS_KEY_FILE: &str = "secrets.key";
 /// Create `dir/secrets.key` once (0600) and return its absolute path. Never
 /// overwrites: existing encrypted passwords depend on this key.
 pub fn ensure(dir: &Path) -> Result<PathBuf> {
+    ensure_file(dir, SECRETS_KEY_FILE)
+}
+
+/// Create `dir/<file_name>` holding a fresh key once (0600); never overwritten.
+pub fn ensure_file(dir: &Path, file_name: &str) -> Result<PathBuf> {
     use anyhow::Context;
     use std::io::Write;
 
@@ -15,9 +20,9 @@ pub fn ensure(dir: &Path) -> Result<PathBuf> {
     let path = dir
         .canonicalize()
         .with_context(|| format!("resolve {}", dir.display()))?
-        .join(SECRETS_KEY_FILE);
+        .join(file_name);
     if path.is_file() {
-        tracing::info!("reusing secrets key {}", path.display());
+        tracing::info!("reusing key {}", path.display());
         return Ok(path);
     }
     let mut options = std::fs::OpenOptions::new();
@@ -36,7 +41,7 @@ pub fn ensure(dir: &Path) -> Result<PathBuf> {
             .as_bytes(),
     )
     .with_context(|| format!("write {}", path.display()))?;
-    tracing::info!("wrote secrets key {}", path.display());
+    tracing::info!("wrote key {}", path.display());
     Ok(path)
 }
 
@@ -60,6 +65,17 @@ mod tests {
         let first = std::fs::read(ensure(dir.path()).unwrap()).unwrap();
         let second = std::fs::read(ensure(dir.path()).unwrap()).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn ensure_file_creates_a_named_key_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ensure_file(dir.path(), "cookie.key").unwrap();
+        assert!(first.ends_with("cookie.key"));
+        let before = std::fs::read(&first).unwrap();
+        ensure_file(dir.path(), "cookie.key").unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), before);
+        assert!(cheladb_secrets::SecretKey::from_file(&first).is_ok());
     }
 
     #[cfg(unix)]

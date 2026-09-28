@@ -90,6 +90,17 @@ gateway:
     fi
     cargo run -p gateway
 
+ui-auth:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -f .cheladb/zitadel/demo.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source .cheladb/zitadel/demo.env
+      set +a
+    fi
+    cargo run -p ui-auth
+
 studio:
     pnpm --filter @cheladb/studio dev
 
@@ -130,7 +141,7 @@ dev: deps-up
       set +a
     fi
 
-    cargo build -p orchestrator -p worker -p gateway -p cheladb
+    cargo build -p orchestrator -p worker -p gateway -p ui-auth -p cheladb
 
     # Start orchestrator first so migrations add tenants.zitadel_org_id, then re-bind.
     nohup setsid cargo run -p orchestrator >"{{dev_dir}}/orchestrator.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
@@ -139,6 +150,7 @@ dev: deps-up
 
     nohup setsid cargo run -p worker >"{{dev_dir}}/worker.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid cargo run -p gateway >"{{dev_dir}}/gateway.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid cargo run -p ui-auth >"{{dev_dir}}/ui-auth.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid pnpm --filter @cheladb/studio dev >"{{dev_dir}}/studio.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
 
     sleep 2
@@ -149,6 +161,7 @@ dev: deps-up
     echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
     echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
     echo "Worker health:   http://127.0.0.1:8082/health"
+    echo "ui-auth:         http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
     echo "Studio:          http://localhost:3000  (sign in / create account)"
     echo "Mailpit (email): http://localhost:8025  (signup verification codes)"
     echo "Zitadel console: http://localhost:8080/ui/console"
@@ -189,6 +202,34 @@ dev-down:
 
 # Stop host apps then Compose
 stop: dev-down down
+
+# Fresh start: stop dev apps; delete tenant DBs, all Zitadel accounts and Mailpit; re-bootstrap
+[confirm("Delete all tenant databases, every Zitadel account and all Mailpit email? [y/N]")]
+cleanup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Keeps secrets.key, the gateway and cookie keys, the seeded demo tenant/project and the
+    # Neon storage stack.
+    just="{{just_executable()}}"
+    "$just" dev-down
+    # Anything still on the dev ports (e.g. an app started by hand) would keep old code running.
+    for port in 8000 8081 8082 8084 3000; do
+      for pid in $(ss -ltnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+        cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
+        if [[ "$cmd" =~ (gateway|orchestrator|worker|ui-auth|vite|node) ]]; then
+          echo "stopping pid $pid on :$port ($cmd)"
+          kill "$pid" 2>/dev/null || true
+        fi
+      done
+    done
+    "$just" deps-up
+    "$just" sweep-dbs
+    "$just" zitadel-reset
+    curl -fsS -X DELETE http://localhost:8025/api/v1/messages >/dev/null && echo "emptied Mailpit"
+    for _ in $(seq 60); do [[ -s .cheladb/zitadel/login-client.pat ]] && break; sleep 1; done
+    "$just" zitadel-bootstrap
+    echo ""
+    echo "clean. Run: just dev"
 
 # --- Demo helpers ---
 
@@ -249,12 +290,8 @@ sweep-dbs:
 check:
     cargo check --workspace
     pnpm --filter @cheladb/types typecheck
-    pnpm --filter @cheladb/zitadel typecheck
     pnpm --filter @cheladb/studio typecheck
     pnpm --filter @cheladb/studio test
-
-zitadel-generate:
-    pnpm --filter @cheladb/zitadel generate
 
 # --- Neon storage (opt-in until provisioning moves to Neon) ---
 
@@ -294,3 +331,7 @@ neon-test:
 # Round trip through the Rust storage-controller client (needs just neon-up)
 neon-test-live:
     cargo test -p cheladb-neon --test storcon_live -- --ignored
+
+# Live sign-up/sign-in/reset/logout through the gateway and ui-auth (needs just dev)
+auth-e2e:
+    scripts/auth-e2e.sh

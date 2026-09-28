@@ -6,11 +6,14 @@ import { buildOidcConfig } from "./lib/auth";
 import { readEnv, type StudioEnv } from "./lib/env";
 import { EnvContext } from "./lib/env-context";
 import { canonicalRedirect } from "./lib/origin";
+import { parseSearch, stringifySearch } from "./lib/search";
 
 const router = createRouter({
   routeTree,
   defaultPreload: "intent",
   scrollRestoration: true,
+  parseSearch,
+  stringifySearch,
 });
 
 declare module "@tanstack/react-router" {

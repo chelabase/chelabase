@@ -7,7 +7,7 @@
 
 On `main`:
 - **HTTP gateway** (Pingora, `apps/gateway`).
-- **Studio sign-in** through Zitadel's hosted login, with a landing page and create-database.
+- **Studio sign-in** through our own pages and `ui-auth` on Zitadel v4.19.1, with a landing page and create-database.
 - **Database lifecycle** on plain `postgres:17` containers:
   - two roles
   - encrypted, re-revealable credentials
@@ -147,7 +147,7 @@ Steps 5, 6 and 7 are independent once step 4 lands, so they can be reordered. Br
 
 **Dependency follow-up:** ✅ Done 2026-09-28 by the dependency refresh (see "Progress"). Every crate uses workspace pins at the latest releases.
 
-**Before step 3: Zitadel v4.** Zitadel v2 stopped getting releases after v2.71.19 (2025-11-12); v4 is current. Moving touches Studio's hosted login, the generated client in `packages/zitadel` and `cheladb auth bootstrap`, so it gets its own spec and branch, done between the dependency refresh and step 3.
+**Before step 3: Zitadel v4 (done 2026-09-28, branch `zitadel-v4`).** Zitadel v2 stopped getting releases after v2.71.19 (2025-11-12); v4 is current. Moving touches Studio's hosted login, the generated client in `packages/zitadel` and `cheladb auth bootstrap`, so it gets its own spec and branch, done between the dependency refresh and step 3. Spec: `docs/superpowers/specs/2026-09-28-zitadel-v4-and-own-login-design.md`. It also replaces Zitadel's hosted login with our own: pages in Studio and a small Rust service, `ui-auth`.
 
 **Security follow-ups found during the refresh:**
 - ✅ Every published port is bound to `127.0.0.1` (metadata-db, zitadel-db, NATS, Zitadel and Mailpit were on all interfaces); `just neon-test` checks it.
@@ -224,6 +224,38 @@ Branch `deps-refresh`, one commit per group; tests, clippy and the Studio checks
 - reqwest 0.13 puts `.form()` and `.query()` behind features of those names.
 - Remaining duplicate crates in `Cargo.lock` come from pingora 0.9 and rsa 0.9 (latest stable) and from reqwest's own tower-http 0.6. We can't remove them.
 - The worker's provisioning path on bollard 0.21 is compile-checked and its volume handling is live-tested (`apps/worker/tests/docker_live.rs`). Container creation hasn't run live yet.
+
+### Zitadel v4 and our own login (done 2026-09-28)
+
+Branch `zitadel-v4`. Plan: `docs/superpowers/plans/2026-09-28-zitadel-v4-and-own-login.md`.
+
+- **Zitadel v4.19.1**, pinned by digest, on a fresh instance. It sends every sign-in to Studio's `/login?authRequest=…` and writes `login-client.pat` on first start. `packages/zitadel` is gone.
+- **`cheladb auth bootstrap`, rebuilt:** idempotent steps over v2 REST (orgs, users, keys) and ConnectRPC JSON (projects, apps). The one exception is SMTP, which v4.19.1 still has only in the v1 admin API. A second run changes nothing. It also creates `.cheladb/ui-auth/cookie.key`.
+- **`apps/ui-auth`** (`:8084`, routed by the gateway at `/auth/v1/*` with credentialed CORS for Studio only): sign-in, sign-up with email code, resend, password reset and logout, with state in AES-GCM cookies.
+- **Studio pages:** `/login`, `/register`, `/verify`, `/password-reset`, `/logout`.
+- **`just auth-e2e`** runs the whole flow live with curl and Mailpit, including a timing check.
+
+**Findings to carry forward:**
+- **Zitadel's password hashing is slow enough to reveal accounts by timing.** At a 500 ms floor, sign-in for an existing email took about 0.75 s and for an unknown email 0.50 s. The default floor is now 1500 ms (`CHELADB_UI_AUTH_MIN_RESPONSE_MS`), and `just auth-e2e` fails if the two differ by 150 ms or more. Revisit the floor if Zitadel's hasher settings change.
+- **Right after `CreateUser`, `POST /v2/sessions` can answer 404 "User could not be found"** until Zitadel's projections catch up. ui-auth retries for up to 2 s.
+- **Zitadel enforces unique usernames, not unique emails.** Sign-up looks the email up before `CreateUser` and gives an existing email the decoy answer.
+- **Zitadel's messages are translated text, not error ids.** ui-auth never branches on them. It checks password complexity itself, and every other rejection at reset confirm means a bad code.
+- **Ids go into Zitadel URL paths,** so ui-auth only passes on `V2_<digits>` (pending sign-ins) and digits (users). The security review found that `../` in an id reached other Zitadel endpoints.
+- **Compared with Zitadel's own login (`apps/login` at v4.19.1),** ours doesn't read:
+  - MFA enforcement (`checkMFAFactors`);
+  - lockout settings (it shows remaining attempts; we deliberately don't);
+  - `ignoreUnknownUsernames` (we always hide unknown users);
+  - forced password change (`changeRequired`).
+  
+  Its email-verification gate is optional (`EMAIL_VERIFICATION`); ours always applies. MFA and forced password change belong to the later phases in the spec.
+- **Deferred from the security review (minor):**
+  - `Secure` cookies are opt-in rather than the default.
+  - The per-email sign-in limit lets anyone block a chosen account for a minute.
+  - ui-auth trusts `X-Forwarded-For`, which is safe only while it listens on loopback.
+  - `/login` has no `Referrer-Policy: no-referrer`.
+  - A decoy sign-up sends no "you already have an account" email.
+  - Nobody checks the permissions of the token and cookie-key files.
+  - We haven't confirmed that Zitadel escapes `_` and `%` in email queries.
 
 ## The data API (PostgREST equivalent)
 
