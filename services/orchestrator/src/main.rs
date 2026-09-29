@@ -1,10 +1,13 @@
 use cheladb_auth::internal::InternalVerifier;
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{connect, ensure_control_stream, NatsConfig};
+use cheladb_neon::{DockerLocator, StorconClient};
 use cheladb_secrets::{key_check_value, verify_key_check, SecretKey};
+use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
 use orchestrator::{build_router, AppState, NatsPorts};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 #[tokio::main]
@@ -22,6 +25,8 @@ async fn main() -> anyhow::Result<()> {
     });
     let nats_config = NatsConfig::from_env().expect("nats config");
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
+    let internal_config = InternalConfig::from_env()?;
+    let signer = internal_config.load_signer()?;
 
     let metadata = MetadataClient::connect(&metadata_config).await?;
     metadata.migrate().await?;
@@ -31,6 +36,19 @@ async fn main() -> anyhow::Result<()> {
 
     let secrets = SecretKey::from_env()?;
     ensure_secrets_key(&metadata, &secrets).await?;
+
+    let internal_state = Arc::new(InternalState {
+        metadata: metadata.clone(),
+        locator: DockerLocator::connect(&internal_config.compute_network)?,
+        storcon: StorconClient::new(&internal_config.storcon_url, 0)
+            .with_timeout(Duration::from_secs(10)),
+        signer,
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?,
+        proxy_token: internal_config.proxy_token.clone(),
+        storcon_token: internal_config.storcon_token.clone(),
+    });
 
     let state = AppState {
         metadata,
@@ -44,9 +62,17 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = std::env::var("CHELADB_ORCHESTRATOR_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8081".into())
         .parse()?;
-    info!("orchestrator listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let internal_listener = tokio::net::TcpListener::bind(internal_config.addr).await?;
+    info!("orchestrator listening on {addr}");
+    info!(
+        "internal listener (proxy, compute_ctl, storage controller) on {}",
+        internal_config.addr
+    );
+    tokio::try_join!(
+        async { axum::serve(listener, app).await },
+        async { axum::serve(internal_listener, build_internal_router(internal_state)).await },
+    )?;
     Ok(())
 }
 

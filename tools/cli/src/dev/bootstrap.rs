@@ -3,8 +3,10 @@
 use crate::dev::env_files::{DemoEnv, render_demo_env, render_studio_env};
 use crate::dev::zitadel::HttpZitadel;
 use crate::dev::{internal_keys, secrets_key, steps, tenant};
+use crate::neon::compute_jwt;
 use crate::paths::{
-    auth_dir, demo_tenant_id, gateway_dir, issuer, secrets_dir, studio_env_file, zitadel_dir,
+    auth_dir, demo_tenant_id, gateway_dir, issuer, neon_dir, secrets_dir, studio_env_file,
+    zitadel_dir,
 };
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -31,6 +33,7 @@ pub async fn run() -> Result<()> {
         )
     })?;
     let cookie_key = secrets_key::ensure_file(&cookie_dir, "cookie.key")?;
+    let compute_jwt = compute_jwt::ensure(&neon_dir())?;
 
     let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat", 45, TOKEN_POLL).await?;
     let login_client = zdir.join("login-client.pat");
@@ -65,6 +68,7 @@ pub async fn run() -> Result<()> {
             secrets_key: &path(&secrets),
             auth_token_file: &path(&login_client.canonicalize()?),
             auth_cookie_key: &path(&cookie_key),
+            compute_jwt_dir: &path(&compute_jwt.dir),
         }),
     )
     .with_context(|| format!("write {}", demo_env.display()))?;

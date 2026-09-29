@@ -47,15 +47,16 @@ if command -v docker >/dev/null; then
   compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -f "$compose_file")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
   check "without the profile, only the existing services" \
-    test "$(services)" = "mailpit metadata-db nats zitadel zitadel-db "
-  check "the neon profile adds the storage services" \
-    test "$(services --profile neon)" = "create-bucket mailpit metadata-db nats pageserver register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db storcon-hook zitadel zitadel-db "
-  published="$("${compose[@]}" --profile neon config --format json | jq -r '
+    test "$(services)" = "mailpit metadata-db nats valkey zitadel zitadel-db "
+  check "the neon profile adds the storage services and the proxy" \
+    test "$(services --profile neon)" = "create-bucket mailpit metadata-db nats pageserver proxy proxy-tls register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db valkey zitadel zitadel-db "
+  neon_json="$("${compose[@]}" --profile neon config --format json)"
+  published="$(jq <<<"$neon_json" -r '
     [.services[] | select((.profiles // []) | index("neon")) | .ports[]?
       | "\(.host_ip // "0.0.0.0"):\(.published)"] | sort | join(" ")')"
-  check "storage publishes only 1234 and 9898, on 127.0.0.1" \
-    test "$published" = "127.0.0.1:1234 127.0.0.1:9898"
-  unexposed="$("${compose[@]}" --profile neon config --format json | jq -r '
+  check "neon publishes only 1234, 4432, 4444 and 9898, on 127.0.0.1" \
+    test "$published" = "127.0.0.1:1234 127.0.0.1:4432 127.0.0.1:4444 127.0.0.1:9898"
+  unexposed="$(jq <<<"$neon_json" -r '
     [.services | to_entries[] | .key as $s | .value.ports[]?
       | select(.host_ip != "127.0.0.1") | "\($s):\(.published)"] | join(" ")')"
   check "every published port is bound to 127.0.0.1${unexposed:+ (not: $unexposed)}" \
@@ -71,6 +72,35 @@ if command -v docker >/dev/null; then
     jq -r '.services["storage-controller"].command[]' | grep -- '--control-plane-jwt-token=' || true)"
   check "the hook token comes from CHELADB_STORCON_HOOK_TOKEN" \
     test "$token" = "--control-plane-jwt-token=from-env"
+  storcon="$(jq -r '.services["storage-controller"]' <<<"$neon_json")"
+  check "the storage controller calls the orchestrator's internal listener" \
+    grep -qx -- '--control-plane-url=http://host.docker.internal:8083/storcon' <(jq -r '.command[]' <<<"$storcon")
+  check "the storage controller can resolve host.docker.internal" \
+    grep -q 'host-gateway' <<<"$(jq -c '.extra_hosts' <<<"$storcon")"
+  proxy="$(jq -r '.services.proxy' <<<"$neon_json")"
+  proxy_args="$(jq -r '.command[]' <<<"$proxy")"
+  check "the proxy asks the orchestrator's internal listener" \
+    grep -qx -- '--auth-endpoint=http://host.docker.internal:8083/proxy/api/v1' <<<"$proxy_args"
+  check "the proxy serves Postgres wire and serverless" \
+    bash -c "grep -qx -- '--proxy=0.0.0.0:4432' <<<\"\$1\" && grep -qx -- '--wss=0.0.0.0:4444' <<<\"\$1\"" _ "$proxy_args"
+  check "the proxy caches role secrets for at most a minute" \
+    grep -qx -- '--project-info-cache=size=10000,ttl=1m,max_roles=10,gc_interval=60m' <<<"$proxy_args"
+  check "the proxy uses Valkey (cache clearing, query cancel)" \
+    bash -c "grep -qx -- '--redis-auth-type=plain' <<<\"\$1\" && grep -qx -- '--redis-plain=redis://valkey:6379' <<<\"\$1\"" _ "$proxy_args"
+  valkey="$(jq -r '.services.valkey' <<<"$neon_json")"
+  check "valkey is 9.1.2, pinned by digest" \
+    grep -Eq '"valkey/valkey:9\.1\.2-alpine@sha256:[0-9a-f]{64}"' <<<"$valkey"
+  check "valkey is published on 127.0.0.1:6379 only" \
+    test "$(jq -r '[.ports[] | "\(.host_ip):\(.published)"] | join(" ")' <<<"$valkey")" = "127.0.0.1:6379"
+  check "the proxy can resolve host.docker.internal" \
+    grep -q 'host-gateway' <<<"$(jq -c '.extra_hosts' <<<"$proxy")"
+  check "the proxy waits for a healthy valkey" \
+    test "$(jq -r '.depends_on.valkey.condition' <<<"$proxy")" = "service_healthy"
+  check "valkey's healthcheck has an explicit timeout" \
+    test "$(jq -r '.healthcheck.timeout // empty' <<<"$valkey")" != ""
+  ptoken="$(CHELADB_PROXY_API_TOKEN=from-env "${compose[@]}" --profile neon config --format json |
+    jq -r '.services.proxy.environment.NEON_PROXY_TO_CONTROLPLANE_TOKEN')"
+  check "the proxy's token comes from CHELADB_PROXY_API_TOKEN" test "$ptoken" = "from-env"
 else
   pass "no docker: skipped the compose config checks"
 fi
@@ -220,8 +250,26 @@ else
   pass "no python3: skipped the smoke cleanup checks"
 fi
 
+# --- CHELADB_INTERNAL_ADDR validation (fails before touching docker) -----------------------
+for script in neon-compute-demo neon-e2e; do
+  for bad in localhost 127.0.0.1: 127.0.0.1:http ":8083" "[::1]" "127.0.0.1:99999"; do
+    status=0
+    CHELADB_INTERNAL_ADDR="$bad" "$root/scripts/$script.sh" >/dev/null 2>"$stub/addr-err" || status=$?
+    check "$script rejects CHELADB_INTERNAL_ADDR='$bad'" \
+      bash -c 'test "$1" -eq 1 && grep -q "CHELADB_INTERNAL_ADDR=" "$2"' _ "$status" "$stub/addr-err"
+  done
+done
+addr_ok() { # addr_ok <value>: passes the shared validator
+  bash -c 'LOG_PREFIX=t; . "$1/scripts/lib/neon-common.sh"; check_internal_addr "$2"' _ "$root" "$1" >/dev/null 2>&1
+}
+check "CHELADB_INTERNAL_ADDR accepts 127.0.0.1:8083" addr_ok 127.0.0.1:8083
+check "CHELADB_INTERNAL_ADDR accepts [::1]:8083" addr_ok "[::1]:8083"
+check "CHELADB_INTERNAL_ADDR accepts a host name" addr_ok host.docker.internal:8083
+
 # --- justfile -----------------------------------------------------------------------------
 check "neon-ps shows exited one-shots too" bash -c "just --justfile '$root/justfile' --show neon-ps | grep -q ' ps -a '"
+check "neon-down also removes demo computes" bash -c "just --justfile '$root/justfile' --show neon-down | grep -q 'cheladb-compute-'"
+check "deps-down also removes demo computes" bash -c "just --justfile '$root/justfile' --show deps-down | grep -q 'cheladb-compute-'"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

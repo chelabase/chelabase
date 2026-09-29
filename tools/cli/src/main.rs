@@ -1,6 +1,7 @@
 //! Cheladb local CLI — local development setup / token mint (foundation for a fuller control-plane CLI).
 
 mod dev;
+mod neon;
 mod paths;
 
 use clap::{Parser, Subcommand};
@@ -19,6 +20,11 @@ enum Commands {
         #[command(subcommand)]
         command: DevCommands,
     },
+    /// Neon compute helpers (roadmap step 3)
+    Neon {
+        #[command(subcommand)]
+        command: NeonCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -27,6 +33,26 @@ enum DevCommands {
     Bootstrap,
     /// Mint a short-lived JWT access token (stdout) via JWT profile
     Token,
+}
+
+#[derive(Subcommand, Debug)]
+enum NeonCommands {
+    /// Print the SCRAM-SHA-256 verifier for the password on stdin
+    Verifier,
+    /// Print compute_ctl's arguments for an endpoint, one per line
+    ComputeArgs {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        control_plane_uri: String,
+    },
+    /// Tell the proxies to drop a role's cached secret (after a password change)
+    PasswordUpdated {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        role: String,
+    },
 }
 
 #[tokio::main]
@@ -44,6 +70,19 @@ async fn main() -> anyhow::Result<()> {
         Commands::Dev { command } => match command {
             DevCommands::Bootstrap => dev::bootstrap::run().await,
             DevCommands::Token => dev::token::run().await,
+        },
+        Commands::Neon { command } => match command {
+            NeonCommands::Verifier => neon::verifier(),
+            NeonCommands::ComputeArgs {
+                endpoint,
+                control_plane_uri,
+            } => {
+                neon::compute_args(&endpoint, &control_plane_uri);
+                Ok(())
+            }
+            NeonCommands::PasswordUpdated { endpoint, role } => {
+                neon::password_updated(&endpoint, &role).await
+            }
         },
     }
 }

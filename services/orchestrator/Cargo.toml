@@ -31,7 +31,13 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 dotenvy = { workspace = true }
 anyhow = { workspace = true }
+cheladb-neon = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 cheladb-auth = { workspace = true, features = ["test-support"] }
-reqwest = { workspace = true }
+jsonwebtoken = { workspace = true }
+tempfile = { workspace = true }

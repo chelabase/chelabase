@@ -45,7 +45,7 @@ pub fn ensure(dir: &Path) -> Result<InternalKeyPaths> {
 
 /// Create `path` owner-only from the start (never briefly umask-readable) and
 /// refuse to replace an existing file.
-fn write_private(path: &Path, pem: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, pem: &str) -> Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

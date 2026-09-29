@@ -13,9 +13,9 @@ demo_tenant_id := "00000000-0000-4000-8000-000000000001"
 demo_project_id := "00000000-0000-4000-8000-000000000002"
 
 # Neon storage services (Compose profile "neon").
-neon_services := "seaweedfs create-bucket storage-broker safekeeper1 storcon-db storcon-hook storage-controller pageserver register-safekeepers"
+neon_services := "seaweedfs create-bucket storage-broker safekeeper1 storcon-db storage-controller pageserver register-safekeepers proxy-tls proxy"
 # The long-running ones: `up --wait` fails on a one-shot that has exited, even with 0.
-neon_daemons := "seaweedfs storage-broker safekeeper1 storcon-db storcon-hook storage-controller pageserver"
+neon_daemons := "seaweedfs storage-broker safekeeper1 storcon-db storage-controller pageserver proxy"
 
 # List available recipes
 default:
@@ -31,6 +31,7 @@ deps-up:
 
 # Stop control-plane infrastructure containers (and the Neon storage stack, if running)
 deps-down:
+    docker ps -aq --filter name=^cheladb-compute- | xargs -r docker rm -f
     docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon down
 
 # Show Compose service status
@@ -160,6 +161,7 @@ dev: deps-up
     echo "Seed project_id: {{demo_project_id}}"
     echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
     echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
+    echo "Internal:        http://127.0.0.1:8083  (internal; proxy / compute_ctl / storage controller)"
     echo "Worker health:   http://127.0.0.1:8082/health"
     echo "auth:            http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
     echo "Studio:          http://localhost:3000  (sign in / create account)"
@@ -312,8 +314,9 @@ neon-up:
     "${compose[@]}" up -d --wait {{neon_daemons}}
     "${compose[@]}" run --rm register-safekeepers
 
-# Stop and remove the Neon storage containers (volumes kept)
+# Stop and remove the Neon services (volumes kept) and any demo compute containers
 neon-down:
+    docker ps -aq --filter name=^cheladb-compute- | xargs -r docker rm -f
     docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon rm -sf {{neon_services}}
 
 # Show the Neon storage containers
@@ -323,6 +326,15 @@ neon-ps:
 # Check the running Neon storage stack (creates and deletes a throwaway tenant)
 neon-smoke:
     scripts/neon-smoke.sh
+
+# A hand-made compute behind the proxy (needs just neon-up and just dev); --down removes it
+neon-compute-demo *args:
+    scripts/neon-compute-demo.sh {{args}}
+
+# Live check of step 3: psql, SQL over HTTP and the serverless driver through the proxy, query
+# cancel, and a password change that works at once (needs just neon-up and just dev)
+neon-e2e:
+    scripts/neon-e2e.sh
 
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:

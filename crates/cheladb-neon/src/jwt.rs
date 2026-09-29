@@ -14,6 +14,10 @@ use sha2::{Digest, Sha256};
 
 const TOKEN_TTL_SECS: u64 = 300;
 
+/// File names of the key pair `cheladb dev bootstrap` writes to `.cheladb/neon/`.
+pub const PRIVATE_KEY_FILE: &str = "compute-jwt.pem";
+pub const PUBLIC_KEY_FILE: &str = "compute-jwt.pub";
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     compute_id: String,
@@ -79,31 +83,32 @@ impl ComputeSigner {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A fresh Ed25519 key pair for [`ComputeSigner::new`]: the PKCS#8 PEM private key and the
+/// base64url (no padding) public key.
+pub fn generate_keypair() -> (String, String) {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::pkcs8::EncodePrivateKey;
     use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 
-    /// A throwaway Ed25519 key pair: PKCS#8 PEM and the base64url public key.
-    fn test_keypair() -> (String, String) {
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).expect("OS random number generator");
-        let key = SigningKey::from_bytes(&seed);
-        let pem = key
-            .to_pkcs8_pem(LineEnding::LF)
-            .expect("PKCS#8 PEM")
-            .to_string();
-        let x = URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes());
-        (pem, x)
-    }
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("OS random number generator");
+    let key = SigningKey::from_bytes(&seed);
+    let pem = key
+        .to_pkcs8_pem(LineEnding::LF)
+        .expect("PKCS#8 PEM")
+        .to_string();
+    (pem, URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn signs_tokens_verifiable_with_the_published_jwk() {
-        let (pem, x) = test_keypair();
+        let (pem, x) = generate_keypair();
         let signer = ComputeSigner::new(&pem, &x).unwrap();
         let token = signer.token_for("ep-abc").unwrap();
         // Verify the way compute_ctl does: a DecodingKey built from the JWK itself.
@@ -120,21 +125,30 @@ mod tests {
 
     #[test]
     fn surrounding_whitespace_in_the_public_key_does_not_change_the_kid() {
-        let (pem, x) = test_keypair();
+        let (pem, x) = generate_keypair();
         let kid = |x: &str| ComputeSigner::new(&pem, x).unwrap().jwks()["keys"][0]["kid"].clone();
         assert_eq!(kid(&format!("{x}\n")), kid(&x));
     }
 
     #[test]
     fn rejects_a_mismatched_public_key() {
-        let (pem, _) = test_keypair();
-        let (_, other_x) = test_keypair();
+        let (pem, _) = generate_keypair();
+        let (_, other_x) = generate_keypair();
         assert!(ComputeSigner::new(&pem, &other_x).is_err());
     }
 
     #[test]
     fn rejects_a_malformed_private_key() {
-        let (_, x) = test_keypair();
+        let (_, x) = generate_keypair();
         assert!(ComputeSigner::new("not a pem", &x).is_err());
+    }
+
+    #[test]
+    fn generated_key_pairs_are_fresh_and_work() {
+        let (pem_a, x_a) = generate_keypair();
+        let (_, x_b) = generate_keypair();
+        assert_ne!(x_a, x_b);
+        assert_eq!(x_a.len(), 43, "32 bytes, base64url without padding");
+        assert!(ComputeSigner::new(&pem_a, &x_a).is_ok());
     }
 }

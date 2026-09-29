@@ -50,6 +50,21 @@ services:
       timeout: 5s
       retries: 10
 
+  # Valkey (BSD-3-Clause, speaks the Redis protocol). Neon's proxy uses it for query cancel and
+  # for the cache-clearing messages the control plane publishes on a password change. Local dev:
+  # no auth, loopback only. Platform mode needs auth and TLS.
+  valkey:
+    image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes: ["valkey_data:/data"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
   zitadel-db:
     image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
@@ -225,16 +240,16 @@ services:
       # network; only the API below is published, on loopback.
       - --dev
       - --listen=0.0.0.0:1234
-      # Attachment changes (every tenant create, too) are pushed to the control plane's
-      # hook, and a tenant's reconcile fails until the hook answers. Until the control
-      # plane's internal listener exists (roadmap step 3: host.docker.internal:8083),
-      # storcon-hook answers 200. The token is local dev only.
-      - --control-plane-url=http://storcon-hook:5678/storcon
+      # Attachment changes (every tenant create, too) are pushed to the orchestrator's
+      # internal listener on the host; a tenant's reconcile waits until it answers. The
+      # token is local dev only.
+      - --control-plane-url=http://host.docker.internal:8083/storcon
       - --control-plane-jwt-token=${CHELADB_STORCON_HOOK_TOKEN:-cheladb-dev-storcon-hook}
       - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
     ports:
       # The control plane runs on the host.
       - "127.0.0.1:1234:1234"
+    extra_hosts: ["host.docker.internal:host-gateway"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1234/ready"]
       interval: 2s
@@ -242,16 +257,6 @@ services:
     depends_on:
       storcon-db:
         condition: service_healthy
-      storcon-hook:
-        condition: service_started
-
-  # Stand-in for the control plane's storage-controller hook until roadmap step 3: answers
-  # 200 to every request (notify-attach, notify-safekeepers) and does nothing.
-  storcon-hook:
-    image: hashicorp/http-echo:1.0.0@sha256:fcb75f691c8b0414d670ae570240cbf95502cc18a9ba57e982ecac589760a186
-    profiles: ["neon"]
-    restart: unless-stopped
-    command: ["-listen=:5678", "-text=ok"]
 
   # Registers with the storage controller from metadata.json at startup.
   pageserver:
@@ -316,11 +321,82 @@ services:
       safekeeper1:
         condition: service_healthy
 
+  # Writes the proxy's TLS certificate once: a local CA and a *.localtest.me certificate signed
+  # by it. Clients verify against the CA; `just neon-compute-demo` copies it to
+  # .cheladb/neon/proxy-ca.crt.
+  proxy-tls:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: "no"
+    user: "0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        cd /tls
+        if [ -s tls.crt ] && openssl x509 -in tls.crt -noout -subject | grep -qF '*.localtest.me'; then
+          echo "certificate for *.localtest.me exists"; exit 0
+        fi
+        [ -s ca.key ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+          -keyout ca.key -out ca.crt -days 3650 -subj "/CN=Cheladb local CA"
+        openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out tls.csr \
+          -subj "/CN=*.localtest.me"
+        printf 'subjectAltName=DNS:*.localtest.me\n' > ext.cnf
+        openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 \
+          -extfile ext.cnf -out tls.crt
+        rm -f tls.csr ext.cnf
+        chown 1000:1000 tls.key tls.crt ca.crt
+        chmod 600 ca.key tls.key
+        echo "issued a certificate for *.localtest.me"
+    volumes: ["neon_proxy_tls:/tls"]
+    network_mode: none
+
+  # Neon's proxy. Clients connect to <endpoint-id>.localtest.me (which resolves to 127.0.0.1):
+  # Postgres wire on 4432; WebSocket and SQL over HTTP on 4444. It asks the orchestrator's
+  # internal listener for role secrets and compute addresses, and reaches computes on this
+  # network. Role secrets are cached for at most a minute, and dropped at once when the
+  # control plane publishes /password_updated to Valkey.
+  proxy:
+    image: *neon-image
+    profiles: ["neon"]
+    restart: unless-stopped
+    command:
+      - proxy
+      - --auth-backend=control-plane
+      - --auth-endpoint=http://host.docker.internal:8083/proxy/api/v1
+      - --proxy=0.0.0.0:4432
+      - --wss=0.0.0.0:4444
+      # The proxy takes the endpoint domain from the certificate's CN.
+      - --tls-cert=/tls/tls.crt
+      - --tls-key=/tls/tls.key
+      - --project-info-cache=size=10000,ttl=1m,max_roles=10,gc_interval=60m
+      - --redis-auth-type=plain
+      - --redis-plain=redis://valkey:6379
+    environment:
+      NEON_PROXY_TO_CONTROLPLANE_TOKEN: ${CHELADB_PROXY_API_TOKEN:-cheladb-dev-proxy-api}
+    ports:
+      - "127.0.0.1:4432:4432"
+      - "127.0.0.1:4444:4444"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["neon_proxy_tls:/tls:ro"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/4432"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      proxy-tls:
+        condition: service_completed_successfully
+      # The proxy exits if it can't reach Redis at startup.
+      valkey:
+        condition: service_healthy
+
 volumes:
   metadata_pg_data:
   nats_data:
+  valkey_data:
   zitadel_pg_data:
   neon_seaweedfs_data:
   neon_pageserver_data:
   neon_safekeeper1_data:
   neon_storcon_pg_data:
+  neon_proxy_tls:

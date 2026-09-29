@@ -152,6 +152,24 @@ This is the Supabase/Neon pattern: near-full control for you, while the platform
 
 Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.cheladb/zitadel/demo.env` after bootstrap.
 
+## Neon
+
+Opt-in storage stack (`just neon-up`); provisioning doesn't use it yet.
+
+### Proxy and computes (step 3)
+
+- **Ports.**
+  - The orchestrator's internal listener is on `127.0.0.1:8083`, for the proxy, compute_ctl and the storage controller. Each has its own token, and nothing goes through the gateway.
+  - Neon's proxy is on `127.0.0.1:4432` (Postgres) and `127.0.0.1:4444` (WebSocket and SQL over HTTP), for `<endpoint>.localtest.me`.
+- **`just neon-compute-demo`** (needs `just neon-up` and a running orchestrator) makes a hand-made compute: a tenant and timeline in the storage controller, an endpoint with a `postgres` role and database in metadata, and a compute container that pulls its spec from the internal listener. The password goes to `.cheladb/neon/demo-compute.env` and the proxy's CA to `.cheladb/neon/proxy-ca.crt`. `just neon-compute-demo --down` removes the container, the metadata rows and the tenant.
+- **`just neon-e2e`** replaces any demo compute with a fresh one and proves that it answers through the proxy over Postgres wire, SQL over HTTP and the serverless driver; that a wrong password is refused; that query cancel works; and that a changed password works at once.
+- **Valkey** (`127.0.0.1:6379`, base profile):
+  - it's what makes query cancel work through the proxy;
+  - the proxy caches role secrets for at most a minute, so a password change must publish `/password_updated` (`cheladb neon password-updated`) after reconfiguring the compute;
+  - the roadmap's "Valkey: where else it helps" lists later uses.
+- **Native Linux Docker.** `host.docker.internal` resolves to the bridge gateway, which can't reach a listener on `127.0.0.1`. There, set `CHELADB_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`). Only the host part may change: the port stays 8083, because Compose and the compute use it. The scripts derive their internal URL from the same variable. Docker Desktop (WSL2) works as is.
+- **`just neon-smoke`** now needs the orchestrator running (`just dev`).
+
 ## Still out of scope
 
 Postgres wire proxy (`services/pgproxy` later), gateway TLS, per-signup organizations, API keys, protocol-admin RBAC, delete/reconcile, CI.

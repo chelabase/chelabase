@@ -20,23 +20,32 @@ On `main`:
 
 Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 
-## Resume here (handoff, 2026-09-28)
+## Resume here (handoff, 2026-09-29)
 
 **State of the repo:**
-- `main` has the dependency refresh, Zitadel v4 with our own login (`auth`), `CHELADB_MODE`, `just cleanup`, the repo layout (`services/`, `tools/cli`, `cheladb dev …`), and every minor finding from the two reviews fixed. There are no open review findings.
-- Branch `neon-control-plane-listener`: step 3 spec and plan, rebased onto `main` after the layout merge; paths updated to `services/` / `tools/cli` / `cheladb dev …`.
-- **Last green run:**
-  - `cargo test --workspace`: 312/312, three runs in a row;
-  - clippy: clean;
-  - `just neon-test`: all passed;
-  - Studio: 72/72, plus typecheck and build;
-  - `just auth-e2e`: ok, live;
-  - a real browser pass (Playwright) of sign-up, the taken-email redirect, sign-in, reset from the Mailpit link, sign-out, and verify-mode sign-up.
-- The local state is clean after `just cleanup`. There is one account, `clean-start@example.com` / `Clean-pass1!`, and no tenant databases.
+- `main` has the dependency refresh, Zitadel v4 with our own login (`auth`), `CHELADB_MODE`, `just cleanup`, the repo layout (`services/`, `tools/cli`, `cheladb dev …`) and **step 3**: the internal listener, Valkey and Neon's proxy. Step 3 was merged locally on 2026-09-29 and isn't pushed yet. Every review finding from step 3 is fixed, minors included, except the step 4 notes below.
+- **Last green run (2026-09-29, after the step 3 minors):**
+  - `cargo test --workspace`: 393 passed;
+  - clippy (`-D warnings`): clean;
+  - the ignored live tests: `neon_live` (3) and `proxy_cache_live` (1);
+  - `just neon-test` (53 checks), `just neon-smoke`, `just neon-e2e` and `just auth-e2e`: all passed.
+  - Studio (72/72, typecheck, build) and the Playwright pass were last run before step 3. Step 3 didn't touch Studio.
+- The deps, Neon and dev stacks may still be running. No demo compute is left.
 
-**Next session, in order:**
-1. ~~After `repo-layout` merges: rebase `neon-control-plane-listener` onto `main` and update the step 3 spec and plan paths.~~ Done (on `neon-control-plane-listener`).
-2. Continue on `neon-control-plane-listener`: that branch has the step 3 spec, plan, Valkey/proxy-cache decision, and the living "Resume here" handoff. Re-check the spec, then execute the plan once approved.
+**Next session: step 4 (switch provisioning to Neon). Starting points:**
+1. Provisioning into `neon_endpoints`: apply the mapping in "Mapping our model to Neon's", using the tables and CLI from step 3.
+2. The Docker `ComputeBackend`: port the old repo's implementation. `scripts/neon-compute-demo.sh` is the working recipe (tenant, timeline, endpoint rows, compute container on `cheladb_default` pulling its spec from `:8083`).
+3. Reset password, in the step 3 order: rewrite `neon_roles`, reconfigure the compute, then `ProxyCache::password_updated`. Fail when no proxy received it.
+4. Step 3 is done and verified; see "Progress" and "Next steps, in order".
+5. The hooks read shard placement from the storage controller (`/debug/v1/tenant/{id}/locate`) rather than the notify body, and no storage-controller-originated notify with a running compute has been exercised yet: test a real pageserver migration, or use the body's shard/node data.
+6. `ProxyCache::password_updated` has a built-in 5 s timeout for connect and publish together, so callers need no extra wrapper. Still consider pushing reconfigures concurrently or with a shorter per-compute timeout than the 30 s client.
+
+**Findings from step 3 (Tasks 8-10):**
+- **No extra proxy flags were needed.** `@neondatabase/serverless` 1.1.0 works with `wsProxy = <ep>.localtest.me:4444/v2` and `fetchEndpoint = https://<ep>.localtest.me:4444/sql`, the proxy CA through `NODE_EXTRA_CA_CERTS`, and Node 24's built-in `WebSocket`.
+- **`localtest.me` also resolves to `::1`.** The proxy publishes on 127.0.0.1 only, so psql is refused before it falls back; use `hostaddr=127.0.0.1` (the hostname still drives SNI and certificate checks).
+- **`host.docker.internal` differs by host.** Docker Desktop (WSL2) reaches the host's 127.0.0.1. On native Linux Docker it is the bridge gateway, so set `CHELADB_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`).
+- **Refusals:** a wrong password gets `password authentication failed for user 'postgres'` on 4432 and HTTP 400 with the same message on `/sql`; an unknown endpoint answers the same way. Tests assert the message, since a downed proxy would also "not return 200".
+- **Cache-TTL timing in `just neon-e2e`.** The check that the proxy still serves the cached secret must run within the 1-minute TTL of the first connect, so the script builds `cheladb` and computes the new verifier before creating the compute. A full run takes about 10 s after the build.
 
 **Findings to carry forward (environment and tooling):**
 - **Ephemeral ports run out on this machine.** WSL's `net.ipv4.ip_local_port_range` is `44620 48715`, about 4,000 ports. Many test and e2e runs in a row leave around 10,000 sockets in TIME-WAIT, and then `bind("127.0.0.1:0")` fails in the gateway and `auth` tests. It looks like flakiness but isn't. To fix it:
@@ -83,10 +92,12 @@ Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 | `GET wake_compute?endpointish=` | `address` (host:port of the compute), `server_name` |
 | `GET /endpoints/{id}/jwks` | JWKS; only needed for the proxy's JWT path |
 
-- The proxy's SQL-over-HTTP, WebSocket and REST features stay **off**. HTTP traffic goes through our gateway only.
-- That gives two front doors, one per protocol:
-  - **Postgres wire** goes through Neon's proxy.
-  - **HTTP** goes through the Pingora gateway.
+- The proxy's **serverless side is on, in password mode** (`--wss`: WebSocket and SQL-over-HTTP), so Neon's serverless driver (`@neondatabase/serverless`) works against Cheladb. It needs nothing beyond the two calls above. (Changed 2026-09-28 during step 3; the first draft kept it off. We'll be patching Neon anyway, so splitting HTTP between Pingora and the proxy is acceptable.)
+- The proxy's **JWT mode** (`--is-auth-broker`) stays off until step 6. At the pinned ref it replaces password auth on HTTP rather than adding to it, and it needs the `/jwks` call, `local_proxy` on the compute and `pg_session_jwt`. It depends on the data API's end-user identity decision.
+- The proxy's **REST broker** (`--is-rest-broker`) stays off for good: its engine is closed (see the data API section).
+- That gives these front doors:
+  - **Postgres wire and Postgres-over-HTTP/WebSocket** go through Neon's proxy (`:4432` and `:4444` locally).
+  - **Everything else over HTTP** (Studio, the platform API, the data API) goes through the Pingora gateway.
 
 ### Upstream Neon is effectively frozen
 
@@ -151,9 +162,25 @@ It's your own public Apache-2.0 code, and it already implements a working Neon c
 | Worker | The plain `postgres:17` + named-volume provisioning goes away. Computes run through `ComputeBackend` (Docker). |
 | `cheladb_platform` role | Removed. `compute_ctl` manages its own admin role. |
 | Reveal | Still works. The sealed owner password stays, and we derive a SCRAM verifier from it for the proxy. |
-| Reset password | New verifier in the spec, then reconfigure the compute, instead of `ALTER ROLE`. |
+| Reset password | Instead of `ALTER ROLE`: new verifier in metadata, reconfigure the compute, then publish `/password_updated` to Valkey so the proxy drops its cached secret (step 3 builds `ProxyCache::password_updated`). Fail or retry when no proxy received it. |
 | Delete | Also deletes the Neon tenant. |
 | Carries over | Tombstones, conditional writes, reconcile and the NATS jobs. |
+
+### Valkey: where else it helps
+
+Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon's proxy: clearing its role-secret cache, and query cancel. Once it's in the base Compose profile, these places in the current code could use it. None of them are scheduled; each needs its own decision.
+
+| Where | Today | With Valkey |
+|---|---|---|
+| `ui-auth` rate limits (`apps/ui-auth/src/guard.rs`, `RateLimiter`) | A `Mutex<HashMap>` in one process. Limits reset when ui-auth restarts, and two replicas would each allow the full limit. | `INCR` + `EXPIRE` counters shared by every replica, surviving restarts. **Needed before platform mode runs more than one ui-auth.** |
+| Gateway (`apps/gateway`) | No request rate limits or per-tenant quotas at all. | Per-tenant and per-key limits on the API, shared across gateway replicas. The same pattern would later cover the data API (step 6). |
+| Password reset, step 4 (`apps/orchestrator`, `reset_password`) | `ALTER ROLE` through the worker. | Publishes `/password_updated` after reconfiguring the compute (required once the proxy caches secrets). |
+| Scale to zero, step 7 | Not built. | Last-activity timestamps per endpoint, so an idle-compute reaper can stop computes without scanning metadata. |
+| Sign-out everywhere / session revocation (`ui-auth`) | The login cookies are sealed and stateless; Zitadel ends sessions itself. | A denylist of revoked login steps or sessions, e.g. to kill pending sign-ins after a password reset. Only worth it if a real need shows up. |
+
+**Where it doesn't help:**
+- **NATS** stays the job queue and request/reply bus; Valkey doesn't replace it.
+- **The JWKS cache in `cheladb-auth`** is per process with a 10-minute TTL, and should stay that way; sharing it gains nothing.
 
 ## Next steps, in order
 
@@ -164,11 +191,12 @@ It's your own public Apache-2.0 code, and it already implements a working Neon c
    - Done when the storage stack comes up healthy next to the existing services.
 2. **`crates/cheladb-neon`.** ✅ Done 2026-09-28; see "Progress".
    - A straight port with its tests: storcon client, compute-spec builder, `scram`, `lsn`, compute JWKS.
-3. **Internal control-plane listener and Neon's proxy.**
-   - Endpoints: `proxy_api`, `compute_spec`, storage-controller hooks.
+3. **Internal control-plane listener and Neon's proxy.** ✅ Done 2026-09-29: the orchestrator's internal listener, Valkey and Neon's proxy, verified end to end by `just neon-e2e`. Spec: `docs/superpowers/specs/2026-09-28-neon-control-plane-listener-design.md`.
+   - A second listener in the orchestrator (`127.0.0.1:8083`). Endpoints: `proxy_api`, `compute_spec`, storage-controller hooks with a full reconfigure.
    - Replace the `storcon-hook` stand-in: point the storage controller's `--control-plane-url` at the listener (`host.docker.internal:8083`, with `extra_hosts: host-gateway`) and delete the stub service.
-   - Add the proxy and its TLS setup (local CA, `*.localtest.me` certificate) to Compose.
-   - Done when `psql` connects through `<id>.localtest.me:4432` to a hand-made compute.
+   - Add the proxy and its TLS setup (local CA, `*.localtest.me` certificate) to Compose, with its serverless side on in password mode.
+   - Add Valkey (base profile) for the proxy's cache clearing and query cancel; the role-secret cache is on, cleared on every password change.
+   - Done when `psql` connects through `<id>.localtest.me:4432`, and SQL-over-HTTP and the serverless driver through `:4444`, to a hand-made compute; query cancel works; and a changed password works at once.
 4. **Switch provisioning to Neon.**
    - Make the storage stack part of `just deps-up`/`just dev`: remove the `profiles: ["neon"]` lines.
    - Apply the mapping above and port the `ComputeBackend` Docker implementation.
@@ -321,6 +349,8 @@ Branch `zitadel-v4`. Plan: `docs/superpowers/plans/2026-09-28-zitadel-v4-and-own
 
 Nothing exists anywhere yet:
 - **Neon's Data API is closed.** It's a Rust rewrite of PostgREST inside their proxy (`proxy/src/serverless/rest.rs`, feature `rest_broker`). Its query engine, `subzero-core`, is a **stub** in the public repo; the real crate isn't public or on crates.io.
+  - Rechecked 2026-09-28: `neondatabase/subzero` (the commented-out git dependency in `proxy/Cargo.toml`) and `subzerocloud/subzero` both 404. The parser, SQL generator, schema introspection and error mapping all come from that crate; rest.rs is only the glue around it.
+  - So patching Neon doesn't make its REST broker usable: we'd still write the whole engine, against an unpublished API. We build `cheladb-rest` and use rest.rs as a reference for the glue (the `set_config` order, the config cache, Postgres error → HTTP status).
 - **The old repo deferred it.**
 - **The scaffold has nothing either.**
 

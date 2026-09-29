@@ -8,28 +8,9 @@ STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
 PAGESERVER="${PAGESERVER_URL:-http://127.0.0.1:9898}"
 # Per-request limit, so a stack that accepts connections but never answers can't hang this.
 MAX_TIME="${NEON_SMOKE_MAX_TIME:-60}"
-
-say() { echo "[neon-smoke] $*"; }
-die() {
-  echo "[neon-smoke] FAIL: $*" >&2
-  exit 1
-}
-hexid() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
-
-# call <method> <url> [json body]: prints the response body; dies on no answer or non-2xx.
-call() {
-  local method="$1" url="$2" body="${3:-}" out status
-  local args=(-sS --max-time "$MAX_TIME" -o /dev/stdout -w '\n%{http_code}' -X "$method")
-  if [[ -n "$body" ]]; then
-    args+=(-H 'content-type: application/json' -d "$body")
-  fi
-  # On failure, curl's own error (one line) comes before the status line (000).
-  out="$(curl "${args[@]}" "$url" 2>&1)" || die "$method $url: no answer (${out%%$'\n'*})"
-  status="${out##*$'\n'}"
-  out="${out%$'\n'*}"
-  [[ "$status" == 2* ]] || die "$method $url: $status $out"
-  printf '%s' "$out"
-}
+LOG_PREFIX=neon-smoke
+# shellcheck source=lib/neon-common.sh
+. "$(dirname "$0")/lib/neon-common.sh"
 
 # Deletion is asynchronous: 202 while in progress, 200 (or 404) once gone.
 delete_until_gone() {
@@ -46,8 +27,8 @@ delete_until_gone() {
   die "DELETE $url: still in progress after 60 s"
 }
 
-tenant="$(hexid)"
-timeline="$(hexid)"
+tenant="$(hex 16)"
+timeline="$(hex 16)"
 created=""
 cleanup() {
   local status
@@ -77,10 +58,10 @@ call POST "$STORCON/v1/tenant" \
 say "created tenant $tenant"
 
 # Creating a tenant attaches it, so the storage controller notifies the control-plane hook.
-# A hook that doesn't answer leaves the notification pending (and the create ~15 s slow).
+# The orchestrator's internal listener answers the hook; without it the notification stays pending.
 shard="$(call GET "$STORCON/control/v1/tenant/$tenant" | jq -c '.shards[0]')"
 jq -e '.is_pending_compute_notification == false' <<<"$shard" >/dev/null ||
-  die "tenant $tenant's compute notification is still pending (is the hook answering?): $shard"
+  die "tenant $tenant's compute notification is still pending (is the orchestrator running? just dev): $shard"
 say "the control-plane hook was notified"
 
 call POST "$STORCON/v1/tenant/$tenant/timeline" \

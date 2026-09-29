@@ -69,6 +69,14 @@ pub fn auth_dir() -> std::io::Result<PathBuf> {
     migrate_auth_dir(&repo_root())
 }
 
+/// Where `cheladb dev bootstrap` keeps the compute-JWT key pair and the step 3 demo files.
+pub fn neon_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELADB_NEON_DIR") {
+        return PathBuf::from(dir);
+    }
+    repo_root().join(".cheladb/neon")
+}
+
 pub fn gateway_dir() -> PathBuf {
     if let Ok(dir) = env::var("CHELADB_GATEWAY_DIR") {
         return PathBuf::from(dir);

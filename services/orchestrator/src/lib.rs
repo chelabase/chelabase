@@ -23,6 +23,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
+pub mod internal;
+
 /// Abstraction over tenant/database metadata lookups, so tests can inject an
 /// in-memory fake instead of a real Postgres-backed `MetadataClient`.
 pub trait MetadataPort: Send + Sync + 'static {

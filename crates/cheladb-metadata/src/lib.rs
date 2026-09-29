@@ -8,6 +8,9 @@ use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
 
+mod neon;
+pub use neon::{NeonDatabase, NeonEndpoint, NeonRole};
+
 /// Fixed seed tenant for local demos (`slug = demo`).
 pub const DEMO_TENANT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001);
 /// Fixed seed project for local demos (`slug = default`).

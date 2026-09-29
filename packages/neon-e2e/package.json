@@ -1,0 +1,11 @@
+{
+  "name": "@cheladb/neon-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node check.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0"
+  }
+}
