@@ -1,10 +1,10 @@
-//! `cheladb auth bootstrap`: idempotent local IAM setup on a fresh Zitadel v4 instance.
+//! `cheladb dev bootstrap`: idempotent local IAM setup on a fresh Zitadel v4 instance.
 
-use crate::auth::env_files::{DemoEnv, render_demo_env, render_studio_env};
-use crate::auth::zitadel::HttpZitadel;
-use crate::auth::{internal_keys, secrets_key, steps, tenant};
+use crate::dev::env_files::{DemoEnv, render_demo_env, render_studio_env};
+use crate::dev::zitadel::HttpZitadel;
+use crate::dev::{internal_keys, secrets_key, steps, tenant};
 use crate::paths::{
-    demo_tenant_id, gateway_dir, issuer, secrets_dir, studio_env_file, ui_auth_dir, zitadel_dir,
+    auth_dir, demo_tenant_id, gateway_dir, issuer, secrets_dir, studio_env_file, zitadel_dir,
 };
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -23,7 +23,14 @@ pub async fn run() -> Result<()> {
     // Local files first, so they exist even if Zitadel isn't up.
     let internal = internal_keys::ensure(&gateway_dir())?;
     let secrets = secrets_key::ensure(&secrets_dir())?;
-    let cookie_key = secrets_key::ensure_file(&ui_auth_dir(), "cookie.key")?;
+    let cookie_dir = auth_dir().with_context(|| {
+        format!(
+            "migrate auth cookie dir from {} to {}",
+            crate::paths::repo_root().join(".cheladb/auth").display(),
+            crate::paths::repo_root().join(".cheladb/auth").display()
+        )
+    })?;
+    let cookie_key = secrets_key::ensure_file(&cookie_dir, "cookie.key")?;
 
     let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat", 45, TOKEN_POLL).await?;
     let login_client = zdir.join("login-client.pat");
@@ -56,8 +63,8 @@ pub async fn run() -> Result<()> {
             signing_key: &path(&internal.signing),
             verify_key: &path(&internal.verify),
             secrets_key: &path(&secrets),
-            ui_auth_token_file: &path(&login_client.canonicalize()?),
-            ui_auth_cookie_key: &path(&cookie_key),
+            auth_token_file: &path(&login_client.canonicalize()?),
+            auth_cookie_key: &path(&cookie_key),
         }),
     )
     .with_context(|| format!("write {}", demo_env.display()))?;
@@ -151,7 +158,7 @@ mod tests {
         assert!(err.contains("just zitadel-reset"), "{err}");
     }
 
-    // ui-auth's SameSite=Strict cookies are dropped on cross-site fetches: Studio and the
+    // auth's SameSite=Strict cookies are dropped on cross-site fetches: Studio and the
     // gateway must be the same site (localhost vs 127.0.0.1 are different sites).
     #[test]
     fn studio_and_the_gateway_are_the_same_site() {

@@ -1,4 +1,4 @@
-/** Studio's sign-in pages talk to ui-auth through the gateway, with its HttpOnly cookies. */
+/** Studio's sign-in pages talk to auth through the gateway, with its HttpOnly cookies. */
 
 export type LoginNext = { next: "done"; redirect: string } | { next: "verify" };
 

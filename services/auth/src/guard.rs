@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Fixed-window counters in memory (one ui-auth process).
+/// Fixed-window counters in memory (one auth process).
 #[derive(Default)]
 pub struct RateLimiter {
     windows: Mutex<HashMap<String, (Instant, u32)>>,

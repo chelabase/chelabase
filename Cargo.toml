@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
-    "apps/orchestrator",
-    "apps/worker",
-    "apps/gateway",
-    "apps/cheladb",
-    "apps/ui-auth",
+    "services/orchestrator",
+    "services/worker",
+    "services/gateway",
+    "services/auth",
+    "tools/cli",
     "crates/cheladb-types",
     "crates/cheladb-metadata",
     "crates/cheladb-nats",

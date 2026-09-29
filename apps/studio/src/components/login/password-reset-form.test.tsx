@@ -28,7 +28,7 @@ describe("PasswordResetForm", () => {
     expect(api.confirmPasswordReset).toHaveBeenCalledWith({ userId: "u1", code: "654321", password: "New-pass-12" });
   });
 
-  it("shows ui-auth's message when the code is bad", async () => {
+  it("shows auth's message when the code is bad", async () => {
     const api = base({ confirmPasswordReset: vi.fn().mockRejectedValue(new LoginApiError(400, "Code is invalid or expired")) });
     render(<PasswordResetForm api={api} userId="u1" code="bad" />);
     await userEvent.type(screen.getByLabelText("New password"), "New-pass-12");

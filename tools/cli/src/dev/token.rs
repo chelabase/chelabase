@@ -35,7 +35,7 @@ pub async fn run() -> Result<()> {
 
     if !sa_path.is_file() {
         bail!(
-            "missing {} — run: just zitadel-bootstrap (or cargo run -p cheladb -- auth bootstrap)",
+            "missing {} — run: just zitadel-bootstrap (or cargo run -p cheladb -- dev bootstrap)",
             sa_path.display()
         );
     }

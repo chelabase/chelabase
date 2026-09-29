@@ -11,7 +11,7 @@ export interface FormProps {
   go: (url: string) => void;
   toVerify: () => void;
   toRegister?: () => void;
-  /** Sign-up found the email taken: go to sign-in with ui-auth's message. */
+  /** Sign-up found the email taken: go to sign-in with auth's message. */
   toLogin?: (notice: string) => void;
   /** Shown above the sign-in form; also keeps it from forwarding to sign-up. */
   notice?: string;

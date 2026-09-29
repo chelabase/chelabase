@@ -16,7 +16,7 @@ function LogoutPage() {
   const env = useStudioEnv();
   useEffect(() => {
     const target = safeRedirect(post_logout_redirect, window.location.origin);
-    // Leave even if ui-auth is unreachable: the Zitadel tokens are already ended.
+    // Leave even if auth is unreachable: the Zitadel tokens are already ended.
     void createLoginApi(env.apiUrl).logout().catch(() => undefined).finally(() => window.location.replace(target));
   }, [env.apiUrl, post_logout_redirect]);
   return <main className="p-8 text-muted-foreground">Signing you out…</main>;

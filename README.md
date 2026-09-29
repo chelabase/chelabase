@@ -4,28 +4,14 @@ Local-only DBaaS control-plane monorepo.
 
 Apache-2.0. Tooling: [proto](https://moonrepo.dev/proto) + [moon](https://moonrepo.dev/moon) + [just](https://github.com/casey/just). Rust workspace for the control plane; pnpm workspace for Studio and shared TS packages. Use **`just`** for day-to-day lifecycle.
 
-## Layout
+## Repository layout
 
 ```
-apps/
-  orchestrator/   Axum API (create DB → JetStream; JWKS auth)
-  worker/         JetStream consumer + Docker Postgres provisioner
-  gateway/        HTTP API gateway (Pingora): routing, Zitadel JWT → internal identity
-  ui-auth/        Sign-in backend for Studio's login pages; holds Zitadel's login-client token
-  cheladb/        Local CLI (auth bootstrap / token mint; future control-plane commands)
-  studio/         Vite + TanStack Router + Tailwind + shadcn (Base UI); Zitadel sign-in (oidc-client-ts)
-crates/
-  cheladb-types/
-  cheladb-metadata/   sqlx migrations + client
-  cheladb-nats/       JetStream helpers
-  cheladb-auth/       Zitadel JWKS JWT verify + internal identity tokens
-  cheladb-routes/     Public endpoint declarations shared by gateway + services
-packages/
-  types/          @cheladb/types
-infra/compose/    metadata Postgres, NATS JetStream, Zitadel
-scripts/          zitadel-reset (Compose volume escape hatch only)
-docs/superpowers/specs/
-justfile
+apps/studio          the only user-facing app
+services/            gateway, orchestrator, worker, auth (was ui-auth); later rest
+tools/cli            the `cheladb` binary (binary and package name unchanged)
+crates/, packages/   shared Rust and TypeScript libraries, unchanged
+infra/compose/       metadata Postgres, NATS JetStream, Zitadel
 ```
 
 ## Prerequisites
@@ -47,7 +33,7 @@ pnpm install
 | `just` | List recipes |
 | `just deps-up` / `up` | Compose up `-d` |
 | `just deps-down` / `down` | Compose down **only** |
-| `just zitadel-bootstrap` | `cargo run -p cheladb -- auth bootstrap` |
+| `just zitadel-bootstrap` | `cargo run -p cheladb -- dev bootstrap` |
 | `just auth-token` | Mint demo JWT access token (stdout) |
 | `just zitadel-reset` | Wipe **only** Zitadel volume so FirstInstance rewrites `admin.pat` |
 | `just dev` | Compose up + bootstrap + **detached** apps; prints seed IDs |
@@ -56,7 +42,7 @@ pnpm install
 | `just create-db-demo` | Authenticated `POST /v1/databases` through the gateway (:8000) |
 | `just sweep-dbs` | Dev reset: remove every worker-provisioned container and data volume (+ all metadata rows if deps up) |
 | `just check` | Rust + TS typechecks |
-| `just orchestrator` / `worker` / `gateway` / `ui-auth` / `studio` | Foreground one process |
+| `just orchestrator` / `worker` / `gateway` / `auth` / `studio` | Foreground one process |
 | `just cleanup` | Fresh start: stops dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps (keeps keys and the seeded tenant). Asks first |
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
 
@@ -64,7 +50,7 @@ pnpm install
 just dev                 # deps + IAM bootstrap + background processes
 just create-db-demo      # → 202 + database_id (mints JWT via cheladb CLI)
 # poll (with minted token):
-#   TOKEN=$(cargo run -q -p cheladb -- auth token)
+#   TOKEN=$(cargo run -q -p cheladb -- dev token)
 #   curl -sS -H "Authorization: Bearer $TOKEN" \
 #     http://127.0.0.1:8000/v1/databases/<database_id>
 just stop
@@ -76,7 +62,7 @@ If bootstrap fails with missing `admin.pat` (old Zitadel volume before FirstInst
 just zitadel-reset && just zitadel-bootstrap
 ```
 
-Logs for detached processes: `.cheladb/dev/*.log`. IAM artifacts: `.cheladb/zitadel/` (gitignored). Zitadel PATs are opaque — demo calls use **JWT profile** access tokens from `cheladb auth token`.
+Logs for detached processes: `.cheladb/dev/*.log`. IAM artifacts: `.cheladb/zitadel/` (gitignored). Zitadel PATs are opaque — demo calls use **JWT profile** access tokens from `cheladb dev token`.
 
 ## Seed tenant / project (local demo)
 
@@ -92,7 +78,7 @@ Bootstrap sets `tenants.zitadel_org_id` for the demo tenant from the local Zitad
 - All API traffic goes through the gateway on `:8000`. Endpoints and their policy are declared once in `crates/cheladb-routes`.
 - Platform endpoints (`/v1/*`) require `Authorization: Bearer <Zitadel JWT>`. The gateway verifies it via JWKS, then forwards a 60-second EdDSA **internal identity token** (`x-cheladb-identity`) signed for the target service. It never forwards `Authorization` or a client-supplied identity header.
 - The orchestrator trusts only the internal token (`CHELADB_INTERNAL_VERIFY_KEY`) and maps its `org_id` to a tenant (soft-bind via `tenants.zitadel_org_id`). Calling `:8081` directly returns `401`.
-- `cheladb auth bootstrap` creates the gateway keypair in `.cheladb/gateway/` (once; never overwritten) and writes both key paths into `.cheladb/zitadel/demo.env`.
+- `cheladb dev bootstrap` creates the gateway keypair in `.cheladb/gateway/` (once; never overwritten) and writes both key paths into `.cheladb/zitadel/demo.env`.
 - `GET /health` is public; `GET /_gateway/health` is the gateway's own liveness check.
 - Forwarding headers: the gateway appends the client IP to `X-Forwarded-For` (never trust it for authorization) and sets `X-Forwarded-Proto: http` only when a TLS-terminating proxy in front hasn't already set it.
 - Gateway env: `CHELADB_GATEWAY_ADDR` (default `127.0.0.1:8000`), `CHELADB_ORCHESTRATOR_URL` (default `http://127.0.0.1:8081`), `CHELADB_PLATFORM_HOSTS` (comma-separated; empty = any host), `CHELADB_STUDIO_ORIGINS` (default `http://localhost:3000`), `CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS` (default `60`).
@@ -106,7 +92,7 @@ Design notes:
 
 ## Studio sign-in
 
-Studio has its own sign-in pages (`/login`, `/register`, `/verify`, `/password-reset`, `/logout`). Zitadel v4 sends every sign-in there; the pages call `ui-auth` through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login-client token and keeps step state in encrypted HttpOnly cookies. In platform mode, answers don't reveal whether an account exists (with one known limit: signing up and then signing in with the same email and password tells a new email from a taken one). In self-hosted mode, a sign-up for a taken email says so and sends you to sign in.
+Studio has its own sign-in pages (`/login`, `/register`, `/verify`, `/password-reset`, `/logout`). Zitadel v4 sends every sign-in there; the pages call `auth` through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login-client token and keeps step state in encrypted HttpOnly cookies. In platform mode, answers don't reveal whether an account exists (with one known limit: signing up and then signing in with the same email and password tells a new email from a taken one). In self-hosted mode, a sign-up for a taken email says so and sends you to sign in.
 
 1. `just dev`, then open http://localhost:3000 and choose **Create account** (or **Sign in**).
 2. You land in Studio straight away (email verification is off in self-hosted mode). Emails such as password resets land in **Mailpit**: http://localhost:8025.
@@ -114,7 +100,7 @@ Studio has its own sign-in pages (`/login`, `/register`, `/verify`, `/password-r
 
 How it's wired:
 
-- `cheladb auth bootstrap` (idempotent) registers the `cheladb-studio` OIDC app (PKCE, JWT access tokens; drifted redirect settings are corrected in place), points Zitadel's SMTP at Mailpit, creates `.cheladb/ui-auth/cookie.key`, and writes `apps/studio/.env.local` (gitignored). It needs `.cheladb/zitadel/login-client.pat`, which Zitadel writes only on a fresh instance (`just zitadel-reset`).
+- `cheladb dev bootstrap` (idempotent) registers the `cheladb-studio` OIDC app (PKCE, JWT access tokens; drifted redirect settings are corrected in place), points Zitadel's SMTP at Mailpit, creates `.cheladb/auth/cookie.key`, and writes `apps/studio/.env.local` (gitignored). It needs `.cheladb/zitadel/login-client.pat`, which Zitadel writes only on a fresh instance (`just zitadel-reset`).
 - `CHELADB_MODE` is `self-hosted` (the default, the dev mode) or `platform` (the hosted cloud, not built yet). Email verification follows it: off in self-hosted mode (sign-ups are created with the email already verified), required in platform mode. `CHELADB_REQUIRE_EMAIL_VERIFICATION=true` or `=false` overrides it; codes land in Mailpit.
 - Everyone who signs up joins the same organization, tenant and project (a shared team workspace, by design for self-hosting). Per-signup isolation is the "one org per signup" option in the spec.
 - Open Studio at `http://localhost:3000`; visits to `127.0.0.1:3000` are redirected there, since the Zitadel redirect URI and gateway CORS are registered for `localhost`.
@@ -162,10 +148,10 @@ This is the Supabase/Neon pattern: near-full control for you, while the platform
 | Orchestrator | 8081 | Internal HTTP API (via gateway) |
 | Worker health | 8082 | `/health` |
 | Gateway | 8000 | HTTP front door (Pingora) |
-| ui-auth | 8084 | Sign-in backend (via gateway at `/auth/v1`) |
+| auth | 8084 | Sign-in backend (via gateway at `/auth/v1`) |
 
 Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.cheladb/zitadel/demo.env` after bootstrap.
 
 ## Still out of scope
 
-Postgres wire proxy (apps/pgproxy), gateway TLS, per-signup organizations, API keys, protocol-admin RBAC, delete/reconcile, CI, git remote.
+Postgres wire proxy (`services/pgproxy` later), gateway TLS, per-signup organizations, API keys, protocol-admin RBAC, delete/reconcile, CI.

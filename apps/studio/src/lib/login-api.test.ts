@@ -20,7 +20,7 @@ describe("createLoginApi", () => {
     expect(JSON.parse(init.body)).toEqual({ authRequest: "V2_1", email: "a@b.c", password: "p" });
   });
 
-  it("turns an error answer into LoginApiError with ui-auth's message", async () => {
+  it("turns an error answer into LoginApiError with auth's message", async () => {
     const api = createLoginApi("http://x", fakeFetch(401, { error: "Email or password is incorrect" }));
     const err = await api.signIn({ authRequest: "V2_1", email: "a", password: "b" }).catch((e) => e);
     expect(err).toBeInstanceOf(LoginApiError);

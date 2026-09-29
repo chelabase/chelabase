@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use cheladb_routes::ui_auth as routes;
+use cheladb_routes::auth as routes;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;

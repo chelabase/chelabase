@@ -1,0 +1,14 @@
+language: "rust"
+
+tasks:
+  check:
+    command: "cargo"
+    args: ["check", "-p", "auth"]
+  build:
+    command: "cargo"
+    args: ["build", "-p", "auth"]
+  run:
+    command: "cargo"
+    args: ["run", "-p", "auth"]
+    options:
+      persistent: true

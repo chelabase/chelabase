@@ -1,4 +1,4 @@
-//! ui-auth settings from the environment (`demo.env` in local dev).
+//! auth settings from the environment (`demo.env` in local dev).
 
 use anyhow::{Context, Result};
 use cheladb_secrets::SecretKey;
@@ -54,7 +54,7 @@ fn requires_email_verification(mode: Mode, overridden: Option<&str>) -> bool {
 }
 
 /// Cookies get `Secure` on platform (served over TLS), not in self-hosted local dev; a non-blank
-/// `CHELADB_UI_AUTH_SECURE_COOKIES` overrides.
+/// `CHELADB_AUTH_SECURE_COOKIES` overrides.
 fn secure_cookies(mode: Mode, overridden: Option<&str>) -> bool {
     match overridden.map(str::trim).filter(|v| !v.is_empty()) {
         Some(value) => truthy(Some(value)),
@@ -62,8 +62,8 @@ fn secure_cookies(mode: Mode, overridden: Option<&str>) -> bool {
     }
 }
 
-/// ui-auth rate-limits on the rightmost `X-Forwarded-For` entry, which only the gateway can
-/// set if nothing else can reach ui-auth: a non-loopback address needs an explicit opt-in.
+/// auth rate-limits on the rightmost `X-Forwarded-For` entry, which only the gateway can
+/// set if nothing else can reach auth: a non-loopback address needs an explicit opt-in.
 fn check_listen(listen: &str, trusted_proxy: bool) -> Result<()> {
     let host = listen.rsplit_once(':').map_or(listen, |(h, _)| h);
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -75,8 +75,8 @@ fn check_listen(listen: &str, trusted_proxy: bool) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "CHELADB_UI_AUTH_ADDR={listen} is reachable without the gateway, so clients could forge \
-         X-Forwarded-For. Bind to loopback, or set CHELADB_UI_AUTH_TRUSTED_PROXY=true if only a \
+        "CHELADB_AUTH_ADDR={listen} is reachable without the gateway, so clients could forge \
+         X-Forwarded-For. Bind to loopback, or set CHELADB_AUTH_TRUSTED_PROXY=true if only a \
          proxy that appends X-Forwarded-For can reach it."
     )
 }
@@ -103,11 +103,11 @@ fn warn_if_open(path: &str) {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
-        let token_file = var("CHELADB_UI_AUTH_TOKEN_FILE")?;
+        let token_file = var("CHELADB_AUTH_TOKEN_FILE")?;
         warn_if_open(&token_file);
         let token =
             std::fs::read_to_string(&token_file).with_context(|| format!("read {token_file}"))?;
-        let cookie_key_file = var("CHELADB_UI_AUTH_COOKIE_KEY")?;
+        let cookie_key_file = var("CHELADB_AUTH_COOKIE_KEY")?;
         warn_if_open(&cookie_key_file);
         let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file))
             .map_err(|e| anyhow::anyhow!("cookie key: {e}"))?;
@@ -118,13 +118,13 @@ impl Config {
             .find(|o| !o.is_empty() && *o != "*")
             .unwrap_or("http://localhost:3000")
             .to_string();
-        let min_ms: u64 = std::env::var("CHELADB_UI_AUTH_MIN_RESPONSE_MS")
+        let min_ms: u64 = std::env::var("CHELADB_AUTH_MIN_RESPONSE_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MIN_RESPONSE_MS);
         let listen =
-            std::env::var("CHELADB_UI_AUTH_ADDR").unwrap_or_else(|_| "127.0.0.1:8084".into());
-        check_listen(&listen, flag("CHELADB_UI_AUTH_TRUSTED_PROXY"))?;
+            std::env::var("CHELADB_AUTH_ADDR").unwrap_or_else(|_| "127.0.0.1:8084".into());
+        check_listen(&listen, flag("CHELADB_AUTH_TRUSTED_PROXY"))?;
         Ok(Self {
             listen,
             issuer: var("CHELADB_ZITADEL_ISSUER")?,
@@ -141,7 +141,7 @@ impl Config {
             mode,
             secure_cookies: secure_cookies(
                 mode,
-                std::env::var("CHELADB_UI_AUTH_SECURE_COOKIES")
+                std::env::var("CHELADB_AUTH_SECURE_COOKIES")
                     .ok()
                     .as_deref(),
             ),
@@ -169,7 +169,7 @@ mod tests {
         assert!(check_listen("[::1]:8084", false).is_ok());
         assert!(check_listen("localhost:8084", false).is_ok());
         let err = check_listen("0.0.0.0:8084", false).unwrap_err().to_string();
-        assert!(err.contains("CHELADB_UI_AUTH_TRUSTED_PROXY"), "{err}");
+        assert!(err.contains("CHELADB_AUTH_TRUSTED_PROXY"), "{err}");
         assert!(check_listen("0.0.0.0:8084", true).is_ok());
     }
 

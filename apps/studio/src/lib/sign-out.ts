@@ -1,7 +1,7 @@
 import type { LoginApi } from "./login-api";
 
 /**
- * Sign out everywhere: ui-auth's session cookie first (best effort), then Zitadel's
+ * Sign out everywhere: auth's session cookie first (best effort), then Zitadel's
  * end-session redirect, which ends the Zitadel session and returns to Studio.
  */
 export async function signOut(api: Pick<LoginApi, "logout">, redirect: () => Promise<void>): Promise<void> {

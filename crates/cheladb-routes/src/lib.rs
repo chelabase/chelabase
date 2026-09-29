@@ -41,7 +41,7 @@ impl Method {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Service {
     Orchestrator,
-    UiAuth,
+    Auth,
 }
 
 impl Service {
@@ -49,7 +49,7 @@ impl Service {
     pub const fn name(self) -> &'static str {
         match self {
             Service::Orchestrator => "orchestrator",
-            Service::UiAuth => "ui-auth",
+            Service::Auth => "auth",
         }
     }
 }
@@ -184,8 +184,8 @@ pub mod orchestrator {
     };
 }
 
-/// Studio's sign-in pages, served by `ui-auth`.
-pub mod ui_auth {
+/// Studio's sign-in pages, served by `auth`.
+pub mod auth {
     use super::{Auth, Cors, Endpoint, Method, Policy, Scope, Service};
 
     const POLICY: Policy = Policy {
@@ -199,20 +199,20 @@ pub mod ui_auth {
             method: Method::Post,
             path,
             scope: Scope::Platform,
-            service: Service::UiAuth,
+            service: Service::Auth,
             policy: POLICY,
         }
     }
 
-    pub const AUTH_REQUEST: Endpoint = post("ui_auth.auth_request", "/auth/v1/auth-request");
-    pub const SIGN_IN: Endpoint = post("ui_auth.sign_in", "/auth/v1/sign-in");
-    pub const SIGN_UP: Endpoint = post("ui_auth.sign_up", "/auth/v1/sign-up");
-    pub const VERIFY_EMAIL: Endpoint = post("ui_auth.verify_email", "/auth/v1/verify-email");
-    pub const RESEND_CODE: Endpoint = post("ui_auth.resend_code", "/auth/v1/resend-code");
-    pub const PASSWORD_RESET: Endpoint = post("ui_auth.password_reset", "/auth/v1/password-reset");
+    pub const AUTH_REQUEST: Endpoint = post("auth.auth_request", "/auth/v1/auth-request");
+    pub const SIGN_IN: Endpoint = post("auth.sign_in", "/auth/v1/sign-in");
+    pub const SIGN_UP: Endpoint = post("auth.sign_up", "/auth/v1/sign-up");
+    pub const VERIFY_EMAIL: Endpoint = post("auth.verify_email", "/auth/v1/verify-email");
+    pub const RESEND_CODE: Endpoint = post("auth.resend_code", "/auth/v1/resend-code");
+    pub const PASSWORD_RESET: Endpoint = post("auth.password_reset", "/auth/v1/password-reset");
     pub const PASSWORD_RESET_CONFIRM: Endpoint =
-        post("ui_auth.password_reset_confirm", "/auth/v1/password-reset/confirm");
-    pub const LOGOUT: Endpoint = post("ui_auth.logout", "/auth/v1/logout");
+        post("auth.password_reset_confirm", "/auth/v1/password-reset/confirm");
+    pub const LOGOUT: Endpoint = post("auth.logout", "/auth/v1/logout");
 }
 
 /// Every public endpoint the gateway exposes.
@@ -224,14 +224,14 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::DATABASE_CONNECTION,
     orchestrator::RESET_PASSWORD,
     orchestrator::DELETE_DATABASE,
-    ui_auth::AUTH_REQUEST,
-    ui_auth::SIGN_IN,
-    ui_auth::SIGN_UP,
-    ui_auth::VERIFY_EMAIL,
-    ui_auth::RESEND_CODE,
-    ui_auth::PASSWORD_RESET,
-    ui_auth::PASSWORD_RESET_CONFIRM,
-    ui_auth::LOGOUT,
+    auth::AUTH_REQUEST,
+    auth::SIGN_IN,
+    auth::SIGN_UP,
+    auth::VERIFY_EMAIL,
+    auth::RESEND_CODE,
+    auth::PASSWORD_RESET,
+    auth::PASSWORD_RESET_CONFIRM,
+    auth::LOGOUT,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,15 +420,15 @@ mod tests {
     }
 
     #[test]
-    fn ui_auth_endpoints_are_public_posts_with_credentialed_cors() {
-        for ep in ENDPOINTS.iter().filter(|e| e.service == Service::UiAuth) {
+    fn auth_endpoints_are_public_posts_with_credentialed_cors() {
+        for ep in ENDPOINTS.iter().filter(|e| e.service == Service::Auth) {
             assert_eq!(ep.method, Method::Post, "{}", ep.path);
             assert_eq!(ep.policy.auth, Auth::Public, "{}", ep.path);
             assert_eq!(ep.policy.cors, Cors::StudioCredentials, "{}", ep.path);
             assert!(ep.path.starts_with("/auth/v1/"), "{}", ep.path);
         }
-        assert_eq!(ENDPOINTS.iter().filter(|e| e.service == Service::UiAuth).count(), 8);
+        assert_eq!(ENDPOINTS.iter().filter(|e| e.service == Service::Auth).count(), 8);
         assert!(matches!(match_endpoint(Scope::Platform, "POST", "/auth/v1/password-reset/confirm"),
-            Match::Found(ep) if ep.name == "ui_auth.password_reset_confirm"));
+            Match::Found(ep) if ep.name == "auth.password_reset_confirm"));
     }
 }

@@ -1,16 +1,16 @@
 [package]
-name = "ui-auth"
+name = "auth"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Cheladb's login backend: holds Zitadel's login-client token for Studio's sign-in pages"
 
 [lib]
-name = "ui_auth"
+name = "auth"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ui-auth"
+name = "auth"
 path = "src/main.rs"
 
 [dependencies]

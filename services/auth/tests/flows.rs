@@ -6,10 +6,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::*;
-use ui_auth::app::{AppState, messages, router};
-use ui_auth::config::Config;
-use ui_auth::guard::RateLimiter;
-use ui_auth::zitadel::Zitadel;
+use auth::app::{AppState, messages, router};
+use auth::config::Config;
+use auth::guard::RateLimiter;
+use auth::zitadel::Zitadel;
 
 pub struct Harness {
     pub mock: MockZitadel,
@@ -29,7 +29,7 @@ pub async fn harness_with(skip: bool, min_ms: u64) -> Harness {
         skip_email_verification: skip,
         secure_cookies: false,
         min_response: Duration::from_millis(min_ms),
-        mode: ui_auth::config::Mode::SelfHosted,
+        mode: auth::config::Mode::SelfHosted,
     };
     let state = Arc::new(AppState {
         zitadel: Zitadel::new(&mock.base, TOKEN),

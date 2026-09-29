@@ -1,6 +1,6 @@
-//! Cheladb local CLI — auth bootstrap / token mint (foundation for a fuller control-plane CLI).
+//! Cheladb local CLI — local development setup / token mint (foundation for a fuller control-plane CLI).
 
-mod auth;
+mod dev;
 mod paths;
 
 use clap::{Parser, Subcommand};
@@ -14,15 +14,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Local Zitadel IAM helpers
-    Auth {
+    /// Local development setup: Zitadel, keys and env files
+    Dev {
         #[command(subcommand)]
-        command: AuthCommands,
+        command: DevCommands,
     },
 }
 
 #[derive(Subcommand, Debug)]
-enum AuthCommands {
+enum DevCommands {
     /// Idempotent ensure: project, API app, demo machine key, tenant org bind
     Bootstrap,
     /// Mint a short-lived JWT access token (stdout) via JWT profile
@@ -41,9 +41,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Auth { command } => match command {
-            AuthCommands::Bootstrap => auth::bootstrap::run().await,
-            AuthCommands::Token => auth::token::run().await,
+        Commands::Dev { command } => match command {
+            DevCommands::Bootstrap => dev::bootstrap::run().await,
+            DevCommands::Token => dev::token::run().await,
         },
     }
 }

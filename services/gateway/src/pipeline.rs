@@ -694,10 +694,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ui_auth_allows_credentials_for_studio_only() {
+    async fn auth_allows_credentials_for_studio_only() {
         let h = harness(&[]).await;
         let plan = expect_plan(run(&h.pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", STUDIO)]).await.outcome);
-        assert_eq!(plan.endpoint.service, Service::UiAuth);
+        assert_eq!(plan.endpoint.service, Service::Auth);
         assert_eq!(plan.identity, None);
         assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), Some(STUDIO));
         assert_eq!(header(&plan.response_headers, "access-control-allow-credentials"), Some("true"));
@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ui_auth_preflight_allows_credentials() {
+    async fn auth_preflight_allows_credentials() {
         let h = harness(&[]).await;
         let resp = expect_response(run(&h.pipeline, "OPTIONS", "/auth/v1/sign-in", None,
             &[("origin", STUDIO), ("access-control-request-method", "POST")]).await.outcome);

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use tracing::info;
-use ui_auth::app::{AppState, router};
-use ui_auth::config::Config;
-use ui_auth::guard::RateLimiter;
-use ui_auth::zitadel::Zitadel;
+use auth::app::{AppState, router};
+use auth::config::Config;
+use auth::guard::RateLimiter;
+use auth::zitadel::Zitadel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ui_auth=info".into()),
+                .unwrap_or_else(|_| "auth=info".into()),
         )
         .init();
     let config = Config::from_env()?;
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
         }
     );
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
-    info!("ui-auth listening on {}", config.listen);
+    info!("auth listening on {}", config.listen);
     let state = Arc::new(AppState {
         zitadel: Zitadel::new(&config.issuer, &config.token),
         config,

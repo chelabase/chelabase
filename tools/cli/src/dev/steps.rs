@@ -1,7 +1,7 @@
 //! Idempotent bootstrap steps: each finds what exists and creates only what's missing.
 
-use crate::auth::requests::*;
-use crate::auth::zitadel::ZitadelApi;
+use crate::dev::requests::*;
+use crate::dev::zitadel::ZitadelApi;
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -184,7 +184,7 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::requests::studio_app_config;
+    use crate::dev::requests::studio_app_config;
     use reqwest::Method;
     use serde_json::{Value, json};
     use std::collections::HashMap;

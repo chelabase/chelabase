@@ -45,7 +45,7 @@ down: deps-down
 
 # Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind)
 zitadel-bootstrap:
-    cargo run -q -p cheladb -- auth bootstrap
+    cargo run -q -p cheladb -- dev bootstrap
 
 # Wipe Zitadel volume only so FirstInstance rewrites admin.pat
 zitadel-reset:
@@ -53,7 +53,7 @@ zitadel-reset:
 
 # Mint a short-lived demo access token (stdout)
 auth-token:
-    @cargo run -q -p cheladb -- auth token
+    @cargo run -q -p cheladb -- dev token
 
 # --- Individual processes (foreground) ---
 
@@ -90,7 +90,7 @@ gateway:
     fi
     cargo run -p gateway
 
-ui-auth:
+auth:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -f .cheladb/zitadel/demo.env ]]; then
@@ -99,7 +99,7 @@ ui-auth:
       source .cheladb/zitadel/demo.env
       set +a
     fi
-    cargo run -p ui-auth
+    cargo run -p auth
 
 studio:
     pnpm --filter @cheladb/studio dev
@@ -125,7 +125,7 @@ dev: deps-up
     done
 
     echo "bootstrapping Zitadel IAM…"
-    if ! cargo run -q -p cheladb -- auth bootstrap; then
+    if ! cargo run -q -p cheladb -- dev bootstrap; then
       echo ""
       echo "Zitadel bootstrap failed (often missing admin.pat on an old volume)."
       echo "Run: just zitadel-reset && just zitadel-bootstrap"
@@ -141,16 +141,16 @@ dev: deps-up
       set +a
     fi
 
-    cargo build -p orchestrator -p worker -p gateway -p ui-auth -p cheladb
+    cargo build -p orchestrator -p worker -p gateway -p auth -p cheladb
 
     # Start orchestrator first so migrations add tenants.zitadel_org_id, then re-bind.
     nohup setsid cargo run -p orchestrator >"{{dev_dir}}/orchestrator.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     sleep 3
-    cargo run -q -p cheladb -- auth bootstrap >/dev/null || true
+    cargo run -q -p cheladb -- dev bootstrap >/dev/null || true
 
     nohup setsid cargo run -p worker >"{{dev_dir}}/worker.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid cargo run -p gateway >"{{dev_dir}}/gateway.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
-    nohup setsid cargo run -p ui-auth >"{{dev_dir}}/ui-auth.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid cargo run -p auth >"{{dev_dir}}/auth.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid pnpm --filter @cheladb/studio dev >"{{dev_dir}}/studio.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
 
     sleep 2
@@ -161,11 +161,11 @@ dev: deps-up
     echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
     echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
     echo "Worker health:   http://127.0.0.1:8082/health"
-    echo "ui-auth:         http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
+    echo "auth:            http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
     echo "Studio:          http://localhost:3000  (sign in / create account)"
     echo "Mailpit (email): http://localhost:8025  (signup verification codes)"
     echo "Zitadel console: http://localhost:8080/ui/console"
-    echo "Demo IAM:        .cheladb/zitadel/ (cargo run -p cheladb -- auth token)"
+    echo "Demo IAM:        .cheladb/zitadel/ (cargo run -p cheladb -- dev token)"
     echo "Logs:            {{dev_dir}}/*.log"
     echo ""
     echo "Create a DB:"
@@ -216,7 +216,7 @@ cleanup:
     for port in 8000 8081 8082 8084 3000; do
       for pid in $(ss -ltnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
         cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
-        if [[ "$cmd" =~ (gateway|orchestrator|worker|ui-auth|vite|node) ]]; then
+        if [[ "$cmd" =~ (gateway|orchestrator|worker|auth|vite|node) ]]; then
           echo "stopping pid $pid on :$port ($cmd)"
           kill "$pid" 2>/dev/null || true
         fi
@@ -243,7 +243,7 @@ create-db-demo name="demo1":
       source .cheladb/zitadel/demo.env
       set +a
     fi
-    TOKEN="$(cargo run -q -p cheladb -- auth token)"
+    TOKEN="$(cargo run -q -p cheladb -- dev token)"
     curl -sS -X POST "http://127.0.0.1:8000/v1/databases" \
       -H "content-type: application/json" \
       -H "Authorization: Bearer ${TOKEN}" \
@@ -332,6 +332,6 @@ neon-test:
 neon-test-live:
     cargo test -p cheladb-neon --test storcon_live -- --ignored
 
-# Live sign-up/sign-in/reset/logout through the gateway and ui-auth (needs just dev)
+# Live sign-up/sign-in/reset/logout through the gateway and auth (needs just dev)
 auth-e2e:
     scripts/auth-e2e.sh

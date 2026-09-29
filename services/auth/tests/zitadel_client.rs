@@ -1,7 +1,7 @@
 mod support;
 
 use support::*;
-use ui_auth::zitadel::{NewUser, ZError, Zitadel};
+use auth::zitadel::{NewUser, ZError, Zitadel};
 
 async fn setup() -> (MockZitadel, Zitadel) {
     let mock = MockZitadel::start().await;

@@ -10,8 +10,8 @@ pub const LOGIN_COOKIE: &str = "cheladb_login";
 pub const SESSION_COOKIE: &str = "cheladb_session";
 pub const LOGIN_TTL_SECS: u64 = 900;
 pub const SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
-const LOGIN_AAD: &str = "cheladb:ui-auth:login";
-const SESSION_AAD: &str = "cheladb:ui-auth:session";
+const LOGIN_AAD: &str = "cheladb:auth:login";
+const SESSION_AAD: &str = "cheladb:auth:session";
 /// Plaintext is padded to this size so a decoy cookie looks like a real one.
 const LOGIN_PLAINTEXT_LEN: usize = 640;
 

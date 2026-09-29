@@ -1,4 +1,4 @@
-/** Studio configuration, written to apps/studio/.env.local by `cheladb auth bootstrap`. */
+/** Studio configuration, written to apps/studio/.env.local by `cheladb dev bootstrap`. */
 export interface StudioEnv {
   issuer: string;
   clientId: string;

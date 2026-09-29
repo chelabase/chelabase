@@ -5,21 +5,21 @@ use cheladb_routes::Service;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstreams {
     orchestrator: String,
-    ui_auth: String,
+    auth: String,
 }
 
 impl Upstreams {
-    pub fn new(orchestrator_url: &str, ui_auth_url: &str) -> Result<Self, String> {
+    pub fn new(orchestrator_url: &str, auth_url: &str) -> Result<Self, String> {
         Ok(Self {
             orchestrator: authority_from_url(orchestrator_url)?,
-            ui_auth: authority_from_url(ui_auth_url)?,
+            auth: authority_from_url(auth_url)?,
         })
     }
 
     pub fn addr(&self, service: Service) -> &str {
         match service {
             Service::Orchestrator => &self.orchestrator,
-            Service::UiAuth => &self.ui_auth,
+            Service::Auth => &self.auth,
         }
     }
 }
@@ -74,8 +74,8 @@ mod tests {
     }
 
     #[test]
-    fn ui_auth_has_its_own_upstream() {
+    fn auth_has_its_own_upstream() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(Service::UiAuth), "127.0.0.1:8084");
+        assert_eq!(upstreams.addr(Service::Auth), "127.0.0.1:8084");
     }
 }

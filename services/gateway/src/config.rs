@@ -19,7 +19,7 @@ impl GatewayConfig {
             listen: env_or("CHELADB_GATEWAY_ADDR", "127.0.0.1:8000"),
             upstreams: Upstreams::new(
                 &env_or("CHELADB_ORCHESTRATOR_URL", "http://127.0.0.1:8081"),
-                &env_or("CHELADB_UI_AUTH_URL", "http://127.0.0.1:8084"),
+                &env_or("CHELADB_AUTH_URL", "http://127.0.0.1:8084"),
             )
             .map_err(anyhow::Error::msg)?,
             platform_hosts: split_csv(&env_or("CHELADB_PLATFORM_HOSTS", "")),

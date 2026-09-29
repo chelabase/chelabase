@@ -16,7 +16,7 @@ function api(overrides: Partial<LoginApi>): LoginApi {
 }
 
 describe("SignInForm", () => {
-  it("signs in and follows ui-auth's redirect", async () => {
+  it("signs in and follows auth's redirect", async () => {
     const go = vi.fn();
     const signIn = vi.fn().mockResolvedValue({ next: "done", redirect: "http://localhost:3000/callback?code=c" });
     render(<SignInForm api={api({ signIn })} authRequest="V2_1" go={go} toVerify={vi.fn()} toRegister={vi.fn()} />);
@@ -27,7 +27,7 @@ describe("SignInForm", () => {
     expect(signIn).toHaveBeenCalledWith({ authRequest: "V2_1", email: "ada@example.com", password: "Secret-pass1" });
   });
 
-  it("shows ui-auth's message on failure and stays put", async () => {
+  it("shows auth's message on failure and stays put", async () => {
     const go = vi.fn();
     const signIn = vi.fn().mockRejectedValue(new LoginApiError(401, "Email or password is incorrect"));
     render(<SignInForm api={api({ signIn })} authRequest="V2_1" go={go} toVerify={vi.fn()} toRegister={vi.fn()} />);
@@ -100,7 +100,7 @@ describe("VerifyEmailForm", () => {
 });
 
 describe("taken email (self-hosted)", () => {
-  it("sign-up sends the user to sign in with ui-auth's message", async () => {
+  it("sign-up sends the user to sign in with auth's message", async () => {
     const toLogin = vi.fn();
     const signUp = vi.fn().mockRejectedValue(new LoginApiError(409, "An account with this email already exists"));
     render(<SignUpForm api={api({ signUp })} authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toLogin={toLogin} />);

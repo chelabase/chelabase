@@ -1,6 +1,8 @@
 # Configures all projects within the workspace to create a project graph.
 projects:
   - "apps/*"
+  - "services/*"
+  - "tools/*"
   - "crates/*"
   - "packages/*"
   - "infra/compose"

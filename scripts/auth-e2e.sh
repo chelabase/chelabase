@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live check of Zitadel v4 + ui-auth + the gateway (needs `just dev`): sign-up with a code
+# Live check of Zitadel v4 + auth + the gateway (needs `just dev`): sign-up with a code
 # from Mailpit, token exchange, /v1/me, sign-in, identical failures, password reset, logout.
 set -euo pipefail
 
