@@ -3,15 +3,12 @@
 //! is stored. compute_ctl retries 503.
 
 use super::{InternalState, NeonMetadataPort, bearer, constant_time_eq};
-use anyhow::Context;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use cheladb_metadata::NeonEndpoint;
 use cheladb_neon::ComputeLocator;
-use cheladb_neon::NeonId;
-use cheladb_neon::spec::{DatabaseSpec, RoleSpec, SpecInputs, config_response};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -27,34 +24,16 @@ pub(crate) async fn endpoint_config<M: NeonMetadataPort, L: ComputeLocator>(
     state: &InternalState<M, L>,
     endpoint: &NeonEndpoint,
 ) -> anyhow::Result<Value> {
-    let tenant: NeonId = endpoint.tenant_id.parse().context("stored tenant id")?;
-    let timeline: NeonId = endpoint.timeline_id.parse().context("stored timeline id")?;
-    let pageserver_connstring = state.storcon.pageserver_connstring(&tenant).await?;
-    let safekeeper_connstrings = state.storcon.active_safekeepers().await?;
     let roles = state.metadata.neon_roles(&endpoint.id).await?;
     let databases = state.metadata.neon_databases(&endpoint.id).await?;
-    Ok(config_response(&SpecInputs {
-        endpoint_id: &endpoint.id,
-        tenant_id: &tenant,
-        timeline_id: &timeline,
-        pageserver_connstring,
-        safekeeper_connstrings,
-        roles: roles
-            .into_iter()
-            .map(|r| RoleSpec {
-                name: r.name,
-                scram_verifier: r.scram_verifier,
-            })
-            .collect(),
-        databases: databases
-            .into_iter()
-            .map(|d| DatabaseSpec {
-                name: d.name,
-                owner: d.owner,
-            })
-            .collect(),
-        jwks: state.signer.jwks(),
-    }))
+    cheladb_neon::spec::stored_endpoint_config(
+        &state.storcon,
+        endpoint,
+        roles,
+        databases,
+        state.signer.jwks(),
+    )
+    .await
 }
 
 pub async fn compute_spec<M: NeonMetadataPort, L: ComputeLocator>(

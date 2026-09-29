@@ -102,7 +102,7 @@ pub fn published_control_addr(inspect: &ContainerInspectResponse) -> Option<Sock
 
 /// [`ComputeLocator`] over the Docker Engine API.
 pub struct DockerLocator {
-    docker: Docker,
+    pub(crate) docker: Docker,
     network: String,
 }
 
@@ -116,7 +116,10 @@ impl DockerLocator {
         })
     }
 
-    async fn inspect(&self, endpoint_id: &str) -> anyhow::Result<Option<ContainerInspectResponse>> {
+    pub(crate) async fn inspect(
+        &self,
+        endpoint_id: &str,
+    ) -> anyhow::Result<Option<ContainerInspectResponse>> {
         match self
             .docker
             .inspect_container(

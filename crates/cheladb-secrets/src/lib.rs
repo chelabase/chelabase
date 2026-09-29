@@ -93,14 +93,12 @@ pub fn verify_key_check(key: &SecretKey, stored: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Owner,
-    Platform,
 }
 
 impl Purpose {
     fn as_str(self) -> &'static str {
         match self {
             Purpose::Owner => "owner",
-            Purpose::Platform => "platform",
         }
     }
 }
@@ -262,17 +260,6 @@ mod credential_tests {
         let sealed = seal_credential(&key, "db-1", Purpose::Owner, "pw");
         assert!(sealed.starts_with("v1:"));
         assert_eq!(open_credential(&key, "db-1", Purpose::Owner, &sealed).unwrap(), "pw");
-    }
-
-    // Swapping the owner and platform columns must not reveal the superuser password.
-    #[test]
-    fn an_owner_value_does_not_open_as_platform_or_vice_versa() {
-        let key = SecretKey::generate();
-        let owner = seal_credential(&key, "db-1", Purpose::Owner, "owner-pw");
-        let platform = seal_credential(&key, "db-1", Purpose::Platform, "platform-pw");
-        assert!(open_credential(&key, "db-1", Purpose::Platform, &owner).is_err());
-        assert!(open_credential(&key, "db-1", Purpose::Owner, &platform).is_err());
-        assert!(open_credential(&key, "db-2", Purpose::Owner, &owner).is_err());
     }
 
     // One format only: a value bound to the database id alone doesn't open as a credential.

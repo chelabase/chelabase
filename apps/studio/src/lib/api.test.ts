@@ -35,7 +35,7 @@ describe("createApiClient", () => {
   });
 
   it("reveals connection details", async () => {
-    const details = { host: "h", port: 5, database: "d", user: "postgres", password: "p", uri: "postgres://…" };
+    const details = { host: "h", port: 5, database: "d", user: "postgres", password: "p", uri: "postgres://…", http_url: "https://h:4444/sql" };
     const { api, fetchImpl } = client(jsonResponse(200, details));
     await expect(api.getConnection("d1")).resolves.toEqual(details);
     expect(fetchImpl.mock.calls[0][0]).toBe("http://gw/v1/databases/d1/connection");

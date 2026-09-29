@@ -30,7 +30,7 @@ pub fn verifier() -> Result<()> {
 pub fn receivers_line(receivers: u64) -> Result<String> {
     anyhow::ensure!(
         receivers > 0,
-        "no proxy is subscribed to Valkey, so none dropped the old secret (is `just neon-up` running?)"
+        "no proxy is subscribed to Valkey, so none dropped the old secret (is `just deps-up` running?)"
     );
     Ok(receivers.to_string())
 }

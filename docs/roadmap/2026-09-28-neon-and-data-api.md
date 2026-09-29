@@ -9,14 +9,15 @@ On `main`:
 - **HTTP gateway** (Pingora, `services/gateway`).
 - **Studio sign-in** through our own pages and `auth` on Zitadel v4.19.1, with a landing page and create-database.
 - **Repo layout** (merged): `apps/studio` only; backends under `services/` (gateway, orchestrator, worker, auth); CLI at `tools/cli`; `cheladb dev bootstrap` / `dev token`.
-- **Database lifecycle** on plain `postgres:17` containers:
-  - two roles
+- **Database lifecycle** on Neon (step 4): one tenant, timeline and compute container per database, reached through Neon's proxy:
+  - owner role `postgres` plus the data API roles `anon`, `authenticated` and `authenticator`
   - encrypted, re-revealable credentials
-  - reset password
+  - reset password in step 3's order, serialized per endpoint
   - delete by tombstone
-  - reconcile
-- **Neon storage stack** (step 1, done): opt-in with `just neon-up`. Nothing uses it yet. See "Progress" below.
-- **`crates/cheladb-neon`** (step 2, done): the storage-controller client, compute spec, SCRAM, LSNs, compute JWTs and Neon ids. Nothing calls it yet.
+  - reconcile over endpoints, computes and tenants
+- **Neon storage stack** (step 1, done): starts with `just deps-up` and backs every database since step 4.
+- **`crates/cheladb-neon`** (step 2, done): the storage-controller client, compute spec, SCRAM, LSNs, compute JWTs and Neon ids. The worker and the orchestrator use it.
+- **Provisioning on Neon** (step 4, done): merged into local `main` on 2026-09-30, not pushed.
 
 Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 
@@ -32,13 +33,21 @@ Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
   - Studio (72/72, typecheck, build) and the Playwright pass were last run before step 3. Step 3 didn't touch Studio.
 - The deps, Neon and dev stacks may still be running. No demo compute is left.
 
-**Next session: step 4 (switch provisioning to Neon). Starting points:**
+**Step 4 status (2026-09-29): plan approved; Task 1 done (`17da720`), Task 2 done (`72c6699`), Task 3 done (`6d64a7a`..`edd1951`), Task 4 done (`59c1219`), Task 5 done (`a034d56`), Task 6 done (`159137d`), Task 7 done (`053cc1a`), Task 8 done (`4313f44`), Task 9 done (`4be187c`); end-of-step review (opus) returned with fixes; fix batch `7b8a2b0`, `88aba48` (re-review: all addressed); full verification run passed 2026-09-30; the last minors fixed in `aae92e4`; merged into local `main` (not pushed).** Work happens in `.worktrees/neon-provisioning`. The build-speed chore (`bd61377`: dev debug info, `just test` on nextest, `just sweep-builds`, `just wt-add`/`wt-remove`) is on local `main` (not pushed) and merged into this branch. A possible race in two gateway tests (`incoming_forwarded_proto_is_preserved`, `incoming_request_id_is_propagated_both_ways`) failed once in a full `cargo test` run and passed on rerun; worth a look. See the plan's Status block. Spec: `docs/superpowers/specs/2026-09-29-neon-provisioning-design.md`. Plan (9 tasks, with a Status block and rulings): `docs/superpowers/plans/2026-09-29-neon-provisioning.md`, on branch `neon-provisioning`. Next: the data API step (its first operation subset must be raised with the user before the spec). Decisions made while brainstorming (details in the spec):
+- The old `postgres:17` databases are dropped, not migrated. None existed on this machine; a migration tombstones leftovers.
+- `CHELADB_DB_OWNER_SUPERUSER` is kept, but only in self-hosted mode.
+- Superuser SQL goes through `ComputeBackend::admin_sql`: `docker exec` psql as `cloud_admin`. `compute_ctl` can't do it, since spec roles get `BYPASSRLS` and `LOGIN` and it has no SQL hook. That settles item 7 below.
+- The worker owns the lifecycle. The data API roles are created through `admin_sql`, not the spec.
+
+**Step 4 starting points (from the step 3 handoff; the spec covers them):**
 1. Provisioning into `neon_endpoints`: apply the mapping in "Mapping our model to Neon's", using the tables and CLI from step 3.
 2. The Docker `ComputeBackend`: port the old repo's implementation. `scripts/neon-compute-demo.sh` is the working recipe (tenant, timeline, endpoint rows, compute container on `cheladb_default` pulling its spec from `:8083`).
 3. Reset password, in the step 3 order: rewrite `neon_roles`, reconfigure the compute, then `ProxyCache::password_updated`. Fail when no proxy received it.
 4. Step 3 is done and verified; see "Progress" and "Next steps, in order".
 5. The hooks read shard placement from the storage controller (`/debug/v1/tenant/{id}/locate`) rather than the notify body, and no storage-controller-originated notify with a running compute has been exercised yet: test a real pageserver migration, or use the body's shard/node data.
 6. `ProxyCache::password_updated` has a built-in 5 s timeout for connect and publish together, so callers need no extra wrapper. Still consider pushing reconfigures concurrently or with a shorter per-compute timeout than the 30 s client.
+7. Before dropping `cheladb_platform`, the spec must confirm two things. First, that the data API roles' grants and default privileges, and the users table's column privileges and event trigger, can be applied through `compute_ctl`, or through a narrow platform path. Second, that no planned platform feature needs its own superuser login inside a user's database.
+8. The first thing to do is write the step 4 spec (brainstorming, then the spec), then pause for approval. See "How each roadmap step runs" under Working rules.
 
 **Findings from step 3 (Tasks 8-10):**
 - **No extra proxy flags were needed.** `@neondatabase/serverless` 1.1.0 works with `wsProxy = <ep>.localtest.me:4444/v2` and `fetchEndpoint = https://<ep>.localtest.me:4444/sql`, the proxy CA through `NODE_EXTRA_CA_CERTS`, and Node 24's built-in `WebSocket`.
@@ -110,7 +119,7 @@ Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 We build them from source at a pinned commit, with pulling as a shortcut:
 - Port a trimmed `infra/neon/` from the old repo: `NEON_REF` plus a build script for the `neon` and `compute-node` images only, with no NeonVM.
 - `just neon-build` shallow-clones upstream at `NEON_REF` and builds. The first build needs about 40 GB of free disk and about 40 minutes.
-- `just neon-up` (until step 4; then `just dev`) uses local images when they exist, and otherwise pulls the matching `ghcr.io/cheladb/{neon,compute-node-v17}` images pinned by digest.
+- `just deps-up` uses local images when they exist, and otherwise pulls the matching `ghcr.io/cheladb/{neon,compute-node-v17}` images pinned by digest.
 - We don't vendor or fork the Neon source.
 
 ### Reuse the old repo (`<repo root>`)
@@ -172,11 +181,11 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
 
 | Where | Today | With Valkey |
 |---|---|---|
-| `ui-auth` rate limits (`apps/ui-auth/src/guard.rs`, `RateLimiter`) | A `Mutex<HashMap>` in one process. Limits reset when ui-auth restarts, and two replicas would each allow the full limit. | `INCR` + `EXPIRE` counters shared by every replica, surviving restarts. **Needed before platform mode runs more than one ui-auth.** |
-| Gateway (`apps/gateway`) | No request rate limits or per-tenant quotas at all. | Per-tenant and per-key limits on the API, shared across gateway replicas. The same pattern would later cover the data API (step 6). |
-| Password reset, step 4 (`apps/orchestrator`, `reset_password`) | `ALTER ROLE` through the worker. | Publishes `/password_updated` after reconfiguring the compute (required once the proxy caches secrets). |
+| `auth` rate limits (`services/auth/src/guard.rs`, `RateLimiter`) | A `Mutex<HashMap>` in one process. Limits reset when `auth` restarts, and two replicas would each allow the full limit. | `INCR` + `EXPIRE` counters shared by every replica, surviving restarts. **Needed before platform mode runs more than one ui-auth.** |
+| Gateway (`services/gateway`) | No request rate limits or per-tenant quotas at all. | Per-tenant and per-key limits on the API, shared across gateway replicas. The same pattern would later cover the data API (step 6). |
+| Password reset, step 4 (`services/orchestrator`, `reset_password`) | `ALTER ROLE` through the worker. | Publishes `/password_updated` after reconfiguring the compute (required once the proxy caches secrets). |
 | Scale to zero, step 7 | Not built. | Last-activity timestamps per endpoint, so an idle-compute reaper can stop computes without scanning metadata. |
-| Sign-out everywhere / session revocation (`ui-auth`) | The login cookies are sealed and stateless; Zitadel ends sessions itself. | A denylist of revoked login steps or sessions, e.g. to kill pending sign-ins after a password reset. Only worth it if a real need shows up. |
+| Sign-out everywhere / session revocation (`auth`) | The login cookies are sealed and stateless; Zitadel ends sessions itself. | A denylist of revoked login steps or sessions, e.g. to kill pending sign-ins after a password reset. Only worth it if a real need shows up. |
 
 **Where it doesn't help:**
 - **NATS** stays the job queue and request/reply bus; Valkey doesn't replace it.
@@ -203,8 +212,15 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
    - Adapt reveal, reset, delete and reconcile.
    - Studio shows the proxy connection string.
    - Also create the data API roles (`anon`, `authenticated`, `authenticator`) in the compute spec now, so step 6 doesn't need a migration.
+4a. **Compute image extensions** (after step 4, before step 6; its own spec, plan and image build). The user wants **pgvector** and **pgsodium** for sure, and others later.
+   - **Checked 2026-09-29:** the image we run (`ghcr.io/cheladb/compute-node-v17:0.1.0`) has neither. It ships timescaledb, pg_cron, pg_partman, pgcrypto, pg_trgm, pg_stat_statements, hstore, citext, ltree, the rag extensions and Postgres's contrib modules.
+   - **First, find out why pgvector is missing.** Upstream's `compute/compute-node.Dockerfile` builds many extensions, some as remote extensions downloaded at run time. If our trimmed `infra/neon/build.sh` just skips a stage or target, adding pgvector is a build change. Only an extension upstream doesn't build needs a `patches/` file. The first patch also triggers the steps in `infra/neon/patches/README.md`: apply patches in `build.sh`, add a patch-hash suffix to the tag, publish new images, and update the digests.
+   - **pgsodium needs more than a build.** It must be in `shared_preload_libraries` (a setting in the compute spec) and needs a root key from `pgsodium.getkey_script`. That key should come from our secrets store, one per database, and get to the compute without landing in argv or the spec's logs. That design ties into the planned vault feature.
+   - **Decision for the user:** Supabase marks pgsodium "pending deprecation" and is moving Supabase Vault off it, keeping Vault's API. Decide whether our vault is built on pgsodium, on pgcrypto (already in the image) plus our own key handling, or on something else. Decide that before paying for the patch.
+   - **An extension policy:** record which extensions are supported and upgraded, so users don't depend on whatever the image happens to contain.
+   - Step 6 doesn't need either extension, so 4a can also run after step 5 if that suits better.
 5. **Branching.** Create a branch from `main`, optionally at a point in time. Each branch gets its own endpoint and appears in Studio.
-6. **Data API (the PostgREST equivalent).** See below.
+6. **Data API (`cheladb-rest`).** Our own design, not a PostgREST or Supabase clone; see below.
 7. **Compute runtime work.** This is where we improve on NeonVM:
    - scale to zero: stop idle computes, and `wake_compute` starts them again (the proxy already retries using `retry_ms`)
    - resize running containers (the old repo has a fixed 1 CPU / 2 GiB)
@@ -212,7 +228,56 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
 
 Steps 5, 6 and 7 are independent once step 4 lands, so they can be reordered. Branching comes first because it's why we adopted Neon.
 
-**Can be done at any point:** NATS auth, TLS, restart policies, running more than one worker, CI.
+**Order decided 2026-09-29:** step 4 comes before the data API. The data API's compute lookup, its roles (`anon`, `authenticated`, `authenticator`) and the users table's protections all depend on the compute model step 4 settles, so building it first would mean building those parts twice.
+
+**Can be done at any point:** NATS auth, restart policies, running more than one worker, CI.
+
+**Later, once the MVP is built: size a server for an early alpha (noted 2026-09-29).** The user wants to find out what server the Docker deployment needs for an alpha with about 20 organizations giving early feedback. Do the analysis once everything in the MVP exists, not before.
+
+Inputs to gather then:
+- **What each compute costs** at idle and under light load. Today's cap is 1 CPU / 2 GiB per compute.
+- **How many computes run at once**, and whether scale to zero (step 7) is in by then. That decides whether 20 organizations means 20 always-on computes or a handful.
+- **The fixed stack:** pageserver, safekeepers, storage broker, storage controller, SeaweedFS, proxy, Valkey, NATS, Zitadel and its database, the metadata database, and our services. Measure their idle footprint with `docker stats`.
+- **Disk:** the pageserver's local layer cache, plus the safekeepers' WAL, plus SeaweedFS as the S3 store, or an external S3 to keep data off the box.
+- **Backups and recovery** for a one-server setup.
+- **Encryption in transit**, at least the edges (see the next note), before anyone outside uses it.
+
+The output should be a recommended server spec, a cost range, and the limits at which the alpha needs a second server.
+
+**Encryption in transit (its own step; the user wants it for end users; checked 2026-09-29).**
+
+**Today only the client connection to Neon's proxy is encrypted.** Ports 4432 and 4444 use TLS with a local CA and a `*.localtest.me` certificate. Everything else is unencrypted, and is safe only because it stays on loopback or the Docker network:
+
+| Link | Today |
+|---|---|
+| Browser → gateway (Studio, platform API, later the data API) | plain HTTP on `localhost:8000` |
+| Proxy → compute (Postgres) | plain |
+| Compute ↔ pageserver (page service) and safekeepers (WAL) | plain |
+| Pageserver and safekeepers → S3 (SeaweedFS) | plain HTTP |
+| Proxy, `compute_ctl` and storage controller → internal listener `:8083` | plain HTTP with bearer tokens or JWTs |
+| Worker → `compute_ctl` `/configure` (`:3080`) | plain HTTP with JWTs |
+| Services → metadata database, NATS, Valkey, Zitadel | plain (Zitadel runs `--tlsMode disabled`) |
+
+**Neon at `NEON_REF` supports TLS on most of its links already, so this likely needs no patches:**
+- the pageserver has `listen_https_addr`, `ssl_cert_file`, `ssl_key_file` and `ssl_ca_file`, and `enable_tls_page_service_api`;
+- the safekeepers, the storage broker and the storage controller have `listen_https` and SSL cert/key/CA flags;
+- the compute has `ComputeCtlConfig.tls` and `PgComputeTlsSettings`, behind the `TlsExperimental` feature;
+- the proxy has a client config with root certificates for its connections to computes.
+
+To confirm in the spec: TLS on the safekeepers' WAL service port, and whether `TlsExperimental` is stable enough at our pinned commit.
+
+**Suggested order:**
+1. **The edges**, needed for any deploy beyond localhost:
+   - HTTPS on the gateway (Pingora supports it);
+   - real certificates for the proxy and the gateway, either supplied by the user or from ACME;
+   - Zitadel behind TLS.
+2. **Inside:**
+   - an internal CA, extending the `proxy-tls` setup, that issues and rotates per-service certificates;
+   - then TLS on proxy → compute, compute ↔ storage, the storage services' APIs, `:8083` and `:3080`, the metadata database (sqlx has `tls-rustls-aws-lc-rs`), NATS, Valkey and S3.
+3. **Verify** with a check like `just neon-test`'s published-port check: no plain listener outside loopback, unless it's explicitly allowed.
+
+**Step 4 doesn't do any of this.** Its spec builder leaves room for `compute_ctl_config.tls`.
+
 
 **Dependency follow-up:** ✅ Done 2026-09-28 by the dependency refresh (see "Progress"). Every crate uses workspace pins at the latest releases.
 
@@ -220,7 +285,7 @@ Steps 5, 6 and 7 are independent once step 4 lands, so they can be reordered. Br
 
 **Security follow-ups found during the refresh:**
 - ✅ Every published port is bound to `127.0.0.1` (metadata-db, zitadel-db, NATS, Zitadel and Mailpit were on all interfaces); `just neon-test` checks it.
-- No TLS to the metadata database or NATS yet (the "TLS" item above). sqlx has `tls-rustls-aws-lc-rs`, so turning it on is a server-side and connection-string change.
+- No TLS to the metadata database or NATS yet (see "Encryption in transit" above). sqlx has `tls-rustls-aws-lc-rs`, so turning it on is a server-side and connection-string change.
 
 ## Progress
 
@@ -343,7 +408,7 @@ Branch `zitadel-v4`. Plan: `docs/superpowers/plans/2026-09-28-zitadel-v4-and-own
   - Zitadel escapes `_` and `%` in email queries (checked live), so ui-auth needs no escaping.
 - **Studio's sign-out ends the Zitadel session itself:** `end_session` with `id_token_hint` returns straight to Studio. Zitadel only goes through our `/logout` page when it has no hint.
 
-## The data API (PostgREST equivalent)
+## The data API (`cheladb-rest`)
 
 ### Where it stands
 
@@ -360,7 +425,7 @@ Nothing exists anywhere yet:
 client ──HTTPS + JWT──► data API
    1. validate the JWT against the project's JWKS
    2. load the schema and config from a per-database cache; on a miss, introspect the database
-   3. parse the PostgREST URL grammar and generate SQL
+   3. parse the request and generate SQL
    4. wake the compute, then connect as `authenticator`
    5. run in one transaction:
         set_config('role', <jwt role | anon role>, true)
@@ -371,31 +436,133 @@ client ──HTTPS + JWT──► data API
 
 Settings, read from the database and cached: `db_schemas`, `db_anon_role`, `db_max_rows`, `role_claim_key`. With no anonymous role, unauthenticated requests are refused.
 
-### Proposed design (still to be approved)
+### Agreed direction (2026-09-28)
 
-- A multi-tenant Rust service, `cheladb-rest`, that serves every database from one process. It is not one PostgREST per database.
-- It sits **behind the Pingora gateway**, because it's HTTP. That's where Neon differs: they put it in the Postgres proxy.
-- It asks our control plane for the compute's address and keeps its own connection pool.
-- We write the parser and SQL generator ourselves, test-first against PostgREST's documented behaviour.
+Our own design, aimed at speed, security and developer experience. It deliberately doesn't mirror PostgREST or Supabase: no URL grammar, no postgrest-js compatibility.
 
-### Open decisions (to settle before its spec)
+**Service**
+- `cheladb-rest`: one multi-tenant Rust service for every database, behind the Pingora gateway.
+- It asks our control plane for each compute's address.
+- One sqlx `PgPool` per database: capped, closed when idle, dropped when the compute stops (step 7).
 
-1. **End-user identity.** Early on the plan was for Zitadel to handle end users as well as platform users. The data API needs a JWT issuer or JWKS for each project's app users, separate from the Studio/platform tokens. Do we allow bring-your-own JWKS (Auth0, Clerk, …) from the start?
-2. **How claims reach SQL.**
-   - `set_config('request.jwt.claims', …)`: PostgREST-style, works on any Postgres, and the default.
-   - The `pg_session_jwt` extension (neondatabase/pg_session_jwt, Apache-2.0). We haven't checked whether our `EXTENSIONS=minimal` compute image includes it.
-3. **First subset of the grammar:**
-   - reads with filters, `select`, order and limit
-   - single-table insert, update and delete
-   - `rpc`
+**Wire format**
+- `POST /v1/query` with a structured JSON query: `{ from, select, where, orderBy, limit }`, plus insert, update, delete and function-call nodes.
+- serde parses it into a strict typed syntax tree and rejects unknown fields. There's no string grammar to parse or escape.
+- The contract is ours and versioned.
 
-   Resource embedding (joins) and upsert come in a second pass.
+**Engine** (the user's design)
+- One generated query per request, wrapped in `coalesce(json_agg(t), '[]')::text`. The bytes go to the client unparsed, with no JSON round trip in Rust.
+- Writes use `WITH r AS (INSERT/UPDATE/DELETE … RETURNING *) SELECT json_agg(r)::text FROM r`.
+- **Safety:**
+  - Values are always bind parameters (`query_scalar_with`), cast to the column's real type from the schema cache (`CAST($1 AS int4)`), which keeps index use.
+  - Table and column names are accepted only if they exist in that database's cached schema, then quoted. No user text reaches the SQL any other way.
+- **Per-request transaction:**
+  - role and claims set with `set_config(…, true)`, local to the transaction;
+  - `statement_timeout`;
+  - a row cap (`LIMIT` from settings);
+  - row-level security does the authorization.
+- **Errors:** SQLSTATE maps to HTTP status (42501 to 401/403, 23505 to 409, P0001 to 400).
+
+**Speed: a shape cache**
+- Every value is a parameter, so the generated SQL depends only on the query's shape.
+- It's cached per database, schema version and shape hash. Repeat queries skip generation, and prepared statements get reused instead of churning sqlx's statement cache.
+
+**Developer experience**
+- `cheladb gen types` introspects the database and writes TypeScript types. The SDK (`@cheladb/client`) is fully typed: column names, filter value types and result shapes. It builds the same JSON tree the server parses.
+- Batches: several operations in one request, run atomically in one transaction.
+- **Relations (second pass):** `select` can take related tables through foreign keys, each generated as a nested `json_agg` subquery, so one round trip returns nested JSON.
+
+**Considered and rejected**
+- **GraphQL:** more machinery, and easier to write a slow query.
+- **Raw SQL from browsers:** row-level security would be the only guard. The proxy's SQL over HTTP (port 4444) stays for server-side use.
+- **A process per database:** it defeats the shared pools and the shape cache.
+
+### App users: Zitadel identity, an app-owned users table (decided 2026-09-28)
+
+This settles the former open decisions 1 (end-user identity) and 2 (how claims reach SQL).
+
+**Identity: one Zitadel organization per Cheladb project**
+- Platform users (people using Studio) stay in the Cheladb organization.
+- Each project gets its own organization and app registration for its app users, so users of different projects never mix.
+- The SDK's `db.auth.signUp()`, `signIn()` and the rest call our auth service. That's `auth` made project-aware, reusing its password rules, response padding, rate limits and email codes.
+- The data API verifies each token and checks that its organization and audience match the database's project.
+- **Claims reach SQL through `set_config('request.jwt.claims', …, true)`**, local to the request's transaction. That works on any Postgres.
+- Bring-your-own identity providers (Auth0, Clerk, …) can come later, through one trust setting per project.
+
+**The users table belongs to the app.** This avoids the locked, read-only auth table that forces a metadata blob or a second profile table.
+- We create it in the app's schema (default `public.users`, name configurable). It has a few **managed** columns: `id`, `email`, `email_verified`, `created_at`.
+- Developers add their own columns with normal migrations. It's an ordinary table: foreign keys, joins, indexes, row-level security, and the typed SDK sees every column.
+- **Column-level privileges:** only our sync role writes the managed columns; app roles can write every other column. "Users edit their own profile" is one row-level-security policy.
+- **An event trigger** blocks dropping or renaming a managed column, with a clear error. Computes run with a superuser we control.
+- A helper, e.g. `cheladb_auth.user_id()`, reads the current user's id from the claims for row-level-security policies. The names are ours, not copied from anywhere.
+
+**Atomic sign-up with the app's own columns**
+- `db.auth.signUp({ email, password, data: { display_name: "Ada" } })`: `data` maps to the app's columns, and the typed SDK knows which ones exist.
+- The order:
+  1. generate the user id;
+  2. insert the row inside a transaction, where the app's constraints validate the sign-up;
+  3. create the Zitadel user with that same id;
+  4. commit.
+
+  If a constraint fails, nothing is created in Zitadel. If the commit fails after Zitadel succeeded, the Zitadel user is deleted. There are no orphans on either side.
+- **Verified live on Zitadel v4.19.1:** `/v2/users/new` accepts a caller-chosen `userId`.
+
+**Keeping managed columns in sync**
+- Zitadel Actions v2 (`/v2/actions`, verified present) sends user events to a webhook on the orchestrator's internal listener. That catches changes made in Zitadel's console, verifications and deletions.
+- Event types (verified in our instance):
+  - `user.human.added`, `user.human.selfregistered`;
+  - `user.human.email.changed`, `user.human.email.verified`;
+  - `user.removed`, `user.deactivated`, `user.reactivated`, `user.locked`.
+- To check in the spec: how Actions v2 signs webhook payloads, and how we verify the signature.
+- A periodic reconcile catches missed events.
+- **Deleting a user deletes the row**, cascading to the app's data. A per-project option only marks it deleted, for apps that must keep records.
+- **Branches (step 5):** sync updates the users table on every branch of the project, since users belong to the project, not to a branch.
+
+### First subset of operations (decided 2026-09-29)
+
+**First subset of operations:**
+- reads with `select`, `where`, `orderBy` and `limit`
+- single-table insert, update and delete, returning rows
+- function calls
+- batches
+- `db.auth` sign-up, sign-in and sign-out, with the app-owned users table
+
+Relations and upsert come in a second pass.
 
 ## Working rules (still apply)
 
-- Feature branches only. Merge only when the user says. There's no remote; don't push.
+**How each roadmap step runs (decided 2026-09-29):**
+- **Order of work:** a spec, then a plan, then execution task by task. Each task goes to a subagent on a model sized to it (Haiku for transcription, Sonnet for moderate work, Opus for design-heavy or live-debugging tasks), and a review subagent checks it.
+- **Checkpoints:** a checkpoint means everything is committed, and a fresh session can resume from files alone. Nothing lives only in chat or in git-ignored folders.
+- **The plan's Status block** sits at the top of each plan and is updated and committed at every checkpoint. It holds:
+  - the current task, and the tasks done with their commit ranges;
+  - every ruling made on the user's behalf, with what it costs if wrong;
+  - the deferred minor findings;
+  - what's left running.
+- **Pauses:** execution stops for the user at these points:
+  - after the spec, for approval;
+  - after the plan and its pre-flight scan, for approval;
+  - after the end-of-step review and its fixes, before merging.
+- **Checkpoints:** after every task (once its review and any fix rounds are done) and at each pause, the plan's Status and this roadmap's "Resume here" are updated and committed. Execution then continues into the next task. Suggest "safe to `/clear`; resume with `continue step N`" only when context is heavy (roughly past 40%) or at the end of a step; a fresh session rebuilding its state costs more than a light context (changed 2026-09-29).
+- **Resuming:** read "Resume here", then the plan's Status, then confirm with `git status` and `git log`. Continue at the next task, and never redo a task the Status marks done.
+- **Trivial reviews wait for the end.**
+  - Tasks that are docs only, or small mechanical edits, get no review of their own. They're checked once, in the end-of-step review.
+  - Minor findings from any review are recorded in the Status and fixed together in one batch at the end, before the merge.
+  - Only spec failures and Critical or Important findings are fixed inside a task.
+- **The end of a step:**
+  - a whole-branch review on the most capable model, covering the deferred minors and the unreviewed trivial tasks;
+  - one fix batch, and a scoped re-review of it;
+  - a full verification run;
+  - then a pause for the user's go-ahead to merge.
+
+- **Worktrees (decided 2026-09-29):**
+  - The main checkout stays on `main` and only coordinates.
+  - Each branch lives in `.worktrees/<branch>` (`just wt-add`), and subagents work there with absolute paths and `git -C`.
+  - Worktrees share `.worktrees/target`, and `.cheladb` is symlinked from the main checkout.
+  - Never use the harness's `isolation: "worktree"`.
+- **TDD is strict:** implementers show the failing test run (RED) before writing code, and a report without it goes back.
+- Feature branches only. Merge only when the user says. Push to the remote (`ChelaDB/cheladb-v1`) only when asked.
 - Commit as `git commit`, with `Co-Authored-By` and `Claude-Session` trailers.
-- Never run `just sweep-dbs` or touch the user's databases (demo1/demo2/demo3).
 - Never run `cargo fmt` across the workspace.
 - Never overwrite `.cheladb/secrets/secrets.key` or the gateway key pair.
 - The skip-email-verification switch and Mailpit's insecure SMTP auth are for local dev only.

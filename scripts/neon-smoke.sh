@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the running Neon storage stack (`just neon-up`): safekeeper 1 is Active, the
+# Checks the running Neon storage stack (`just deps-up`): safekeeper 1 is Active, the
 # pageserver answers, and a throwaway tenant with a timeline can be created, read back and
 # deleted. Touches nothing else: no metadata database, no user databases.
 set -euo pipefail

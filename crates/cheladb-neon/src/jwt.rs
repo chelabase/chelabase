@@ -102,6 +102,26 @@ pub fn generate_keypair() -> (String, String) {
     (pem, URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()))
 }
 
+/// The key pair `cheladb dev bootstrap` writes into `dir`.
+pub fn load_signer(dir: &std::path::Path) -> anyhow::Result<ComputeSigner> {
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "read {} (the compute-JWT key pair; run just zitadel-bootstrap)",
+                path.display()
+            )
+        })
+    };
+    ComputeSigner::new(&read(PRIVATE_KEY_FILE)?, &read(PUBLIC_KEY_FILE)?).with_context(|| {
+        format!(
+            "the compute-JWT key pair in {} is corrupt; delete both files and run \
+             just zitadel-bootstrap",
+            dir.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +170,31 @@ mod tests {
         assert_ne!(x_a, x_b);
         assert_eq!(x_a.len(), 43, "32 bytes, base64url without padding");
         assert!(ComputeSigner::new(&pem_a, &x_a).is_ok());
+    }
+
+    #[test]
+    fn load_signer_missing_keys_say_to_run_the_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = format!("{:#}", load_signer(dir.path()).err().expect("no keys"));
+        assert!(err.contains("just zitadel-bootstrap"), "{err}");
+    }
+
+    #[test]
+    fn load_signer_corrupt_keys_say_to_delete_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(PRIVATE_KEY_FILE), "not a key").unwrap();
+        std::fs::write(dir.path().join(PUBLIC_KEY_FILE), "not a key").unwrap();
+        let err = format!("{:#}", load_signer(dir.path()).err().expect("corrupt keys"));
+        assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("just zitadel-bootstrap"), "{err}");
+    }
+
+    #[test]
+    fn load_signer_reads_the_bootstrap_key_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, x) = generate_keypair();
+        std::fs::write(dir.path().join(PRIVATE_KEY_FILE), pem).unwrap();
+        std::fs::write(dir.path().join(PUBLIC_KEY_FILE), format!("{x}\n")).unwrap();
+        assert!(load_signer(dir.path()).is_ok());
     }
 }

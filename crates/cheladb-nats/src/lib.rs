@@ -53,6 +53,9 @@ pub struct ResetPasswordRequest {
     pub database_id: DatabaseId,
 }
 
+/// The worker's reply error when the new password is stored but the compute doesn't have it yet.
+pub const RESET_NOT_APPLIED: &str = "the password was changed but not yet applied; it will be retried";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetPasswordReply {
     pub ok: bool,
@@ -197,6 +200,19 @@ where
     run_consumer(js, CONSUMER_PROVISION, SUBJECT_PROVISION, handler).await
 }
 
+/// How long a job may run before NATS redelivers it. The worst case is a provision that fails
+/// late and tears down: two storage-controller calls (10 s each), the 60 s readiness wait, up
+/// to 30 s of admin SQL, then the teardown (a tenant delete waits up to 60 s, plus 10 s per
+/// request), about 180 s. A redelivery in the middle would run a second copy of the job.
+///
+/// Limits:
+/// - Docker calls (bollard) have no timeout of their own, so a hung Docker can outlast it.
+/// - The consumer prefetches messages and handles them one at a time. Each one's timer starts
+///   when it's delivered, so a job queued behind slow ones can be redelivered before it runs.
+/// - A redelivered provision whose first copy failed provisions again: `failed` rows aren't
+///   skipped, so the database can still become ready.
+const ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Pull `subject` with durable consumer `durable`, acking handled jobs and
 /// nak-ing failures for redelivery. Unparseable payloads are acked (dropped).
 async fn run_consumer<T, F, Fut>(
@@ -220,7 +236,7 @@ where
             durable_name: Some(durable.to_string()),
             filter_subject: subject.to_string(),
             ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-            ack_wait: std::time::Duration::from_secs(120),
+            ack_wait: ACK_WAIT,
             ..Default::default()
         })
         .await

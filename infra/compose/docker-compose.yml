@@ -3,12 +3,12 @@
 
 name: cheladb
 
-# --- Neon storage (profile "neon": `just neon-up`; opt-in until provisioning moves to Neon) ---
-# Pinned by digest; `just neon-up` overrides these with a local `just neon-build` when present.
+# --- Neon storage (part of the base stack: `just deps-up`) ---
+# Pinned by digest; `just deps-up` overrides these with a local `just neon-build` when present.
 # The packages are private: `docker login ghcr.io` first (infra/neon/README.md).
 x-neon-images:
   neon: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a}
-  # Not run until roadmap step 4; recorded here so the pin lives in one place.
+  # The image of the compute containers the worker starts (CHELADB_COMPUTE_IMAGE); pinned here.
   compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/cheladb/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93}
 
 # S3 credentials for SeaweedFS. Local dev only.
@@ -132,14 +132,13 @@ services:
     ports:
       - "127.0.0.1:8025:8025"
 
-  # --- Neon storage (profile "neon") ------------------------------------------------------
+  # --- Neon storage ------------------------------------------------------
   # Flags and health checks come from the old cheladb repo's core/docker/docker-compose.yml,
   # checked there against the pinned Neon source.
 
   # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL.
   seaweedfs:
     image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
-    profiles: ["neon"]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -159,7 +158,6 @@ services:
 
   create-bucket:
     image: *neon-image
-    profiles: ["neon"]
     restart: "no"
     environment: *neon-s3-env
     entrypoint: ["/bin/sh", "-c"]
@@ -177,7 +175,6 @@ services:
 
   storage-broker:
     image: *neon-image
-    profiles: ["neon"]
     restart: unless-stopped
     command: ["storage_broker", "--listen-addr=0.0.0.0:50051"]
     healthcheck:
@@ -188,7 +185,6 @@ services:
   # One safekeeper keeps WAL on one disk; enough for local dev.
   safekeeper1:
     image: *neon-image
-    profiles: ["neon"]
     restart: unless-stopped
     environment: *neon-s3-env
     command:
@@ -216,7 +212,6 @@ services:
 
   storcon-db:
     image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
-    profiles: ["neon"]
     restart: unless-stopped
     environment:
       # Local dev only.
@@ -232,7 +227,6 @@ services:
 
   storage-controller:
     image: *neon-image
-    profiles: ["neon"]
     restart: unless-stopped
     command:
       - storage_controller
@@ -261,7 +255,6 @@ services:
   # Registers with the storage controller from metadata.json at startup.
   pageserver:
     image: *neon-image
-    profiles: ["neon"]
     restart: unless-stopped
     environment: *neon-s3-env
     entrypoint: ["/bin/sh", "-c"]
@@ -301,7 +294,6 @@ services:
   # One-shot: registers the safekeepers with the storage controller and marks them Active.
   register-safekeepers:
     image: *neon-image
-    profiles: ["neon"]
     restart: "no"
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -322,11 +314,10 @@ services:
         condition: service_healthy
 
   # Writes the proxy's TLS certificate once: a local CA and a *.localtest.me certificate signed
-  # by it. Clients verify against the CA; `just neon-compute-demo` copies it to
+  # by it. Clients verify against the CA; `just deps-up` copies it to
   # .cheladb/neon/proxy-ca.crt.
   proxy-tls:
     image: *neon-image
-    profiles: ["neon"]
     restart: "no"
     user: "0"
     entrypoint: ["/bin/sh", "-c"]
@@ -358,7 +349,6 @@ services:
   # control plane publishes /password_updated to Valkey.
   proxy:
     image: *neon-image
-    profiles: ["neon"]
     restart: unless-stopped
     command:
       - proxy

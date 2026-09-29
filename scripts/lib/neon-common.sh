@@ -1,6 +1,22 @@
-# Helpers shared by scripts/neon-smoke.sh, neon-compute-demo.sh and neon-e2e.sh. Sourced, not run.
+# Helpers shared by scripts/neon-smoke.sh, neon-e2e.sh and the justfile's sweep-dbs. Sourced, not run.
 # Set LOG_PREFIX (the script's name) before sourcing. The scripts that use metadata_sql or
 # check_internal_addr must be in the repo root (they cd there first).
+
+# delete_tenant <tenant id>: deletes it from the storage controller ($STORCON, default
+# http://127.0.0.1:1234). Deletion is asynchronous (202): polls until the tenant is gone, 60 s at most.
+delete_tenant() {
+  local tenant="$1" status="" url="${STORCON:-http://127.0.0.1:1234}"
+  for _ in $(seq 120); do
+    status="$(curl -sS --max-time 60 -o /dev/null -w '%{http_code}' -X DELETE "$url/v1/tenant/$tenant")" ||
+      die "DELETE tenant $tenant: no answer"
+    case "$status" in
+      202) sleep 0.5 ;;
+      2* | 404) break ;;
+      *) die "DELETE tenant $tenant: HTTP $status" ;;
+    esac
+  done
+  [[ "$status" != 202 ]] || die "tenant $tenant is still being deleted after 60 s"
+}
 
 compose=(docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env.example)
 

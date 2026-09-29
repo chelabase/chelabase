@@ -222,6 +222,24 @@ impl StorconClient {
         ))
     }
 
+    /// Every tenant the controller knows: `GET /control/v1/tenant` without a query lists all.
+    pub async fn list_tenant_ids(&self) -> Result<Vec<NeonId>, StorconError> {
+        #[derive(Deserialize)]
+        struct Listed {
+            tenant_id: String,
+        }
+        let resp = self.http.get(self.url("/control/v1/tenant")).send().await?;
+        let listed: Vec<Listed> = check(resp).await?.json().await?;
+        listed
+            .into_iter()
+            .map(|t| {
+                t.tenant_id.parse::<NeonId>().map_err(|e| {
+                    StorconError::Other(anyhow::anyhow!("tenant id {:?}: {e}", t.tenant_id))
+                })
+            })
+            .collect()
+    }
+
     /// `host:port` of every active safekeeper.
     pub async fn active_safekeepers(&self) -> Result<Vec<String>, StorconError> {
         let resp = self

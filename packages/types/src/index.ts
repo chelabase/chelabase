@@ -76,6 +76,7 @@ export interface ConnectionDetails {
   user: string;
   password: string;
   uri: string;
+  http_url: string;
 }
 
 export interface DatabaseDetail {

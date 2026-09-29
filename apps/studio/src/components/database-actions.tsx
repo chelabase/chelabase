@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { ConnectionDetails, DatabaseSummary } from "@cheladb/types";
 import { Button } from "@/components/ui/button";
-import type { ApiClient } from "@/lib/api";
+import { ApiError, type ApiClient } from "@/lib/api";
 
 type Panel = "none" | "connection" | "reset" | "delete";
 
@@ -13,6 +13,13 @@ export interface DatabaseActionsProps {
 }
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+/** The orchestrator's 503 when a reset stored the new password but couldn't apply it yet. */
+const RESET_NOT_APPLIED = "the password was changed but not yet applied; it will be retried";
+const notApplied = (err: unknown) =>
+  err instanceof ApiError && err.status === 503 && err.message === RESET_NOT_APPLIED;
+/** What a not-applied reset tells the user, instead of both "reset" and the 503. */
+const NOT_APPLIED_NOTICE = "The new password is stored but not yet applied; it will be retried.";
 
 export function DatabaseActions({ api, database, onChanged }: DatabaseActionsProps) {
   const [panel, setPanel] = useState<Panel>("none");
@@ -37,16 +44,24 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
     setPanel(target);
   }
 
-  async function reveal(afterReset = false) {
+  /** `pending`: the reset stored the new password but couldn't apply it yet. */
+  async function reveal(afterReset = false, pending = false) {
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
       setDetails(await api.getConnection(id));
       setShowPassword(false);
-      setNotice(afterReset ? "The password was reset. Update anything using the old one." : null);
+      setNotice(
+        pending
+          ? NOT_APPLIED_NOTICE
+          : afterReset
+            ? "The password was reset. Update anything using the old one."
+            : null,
+      );
       setPanel("connection");
     } catch (err) {
-      setError(message(err));
+      setError(pending ? `${NOT_APPLIED_NOTICE} (${message(err)})` : message(err));
     } finally {
       setBusy(false);
     }
@@ -58,6 +73,11 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
     try {
       await api.resetPassword(id);
     } catch (err) {
+      if (notApplied(err)) {
+        // The new password is stored and shown by reveal; it starts working once applied.
+        await reveal(true, true);
+        return;
+      }
       setError(message(err));
       setBusy(false);
       return;
@@ -135,6 +155,7 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
               shown={showPassword ? details.password : "••••••••"}
               onCopy={copy}
             />
+            <Field label="HTTP URL" field="HTTP URL" value={details.http_url} shown={details.http_url} onCopy={copy} />
             {showPassword && (
               <Field label="URI" field="URI" value={details.uri} shown={details.uri} onCopy={copy} />
             )}
@@ -147,6 +168,11 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
               Copy URI
             </Button>
           </div>
+          <p className="text-xs text-muted-foreground">
+            Local dev: pass the proxy&apos;s CA with <code>sslrootcert=.cheladb/neon/proxy-ca.crt</code>. If{" "}
+            <code>localtest.me</code> resolves to <code>::1</code> first on your machine, add{" "}
+            <code>hostaddr=127.0.0.1</code>.
+          </p>
         </div>
       )}
 
@@ -187,7 +213,11 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
         </div>
       )}
 
-      {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
+      {notice && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {notice}
+        </p>
+      )}
       {error && (
         <p role="alert" className="text-sm text-destructive">
           {error}

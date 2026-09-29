@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use cheladb_neon::ComputeSigner;
-use cheladb_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -42,22 +41,7 @@ impl InternalConfig {
 
     /// The key pair `cheladb dev bootstrap` writes.
     pub fn load_signer(&self) -> Result<ComputeSigner> {
-        let read = |name: &str| {
-            let path = self.compute_jwt_dir.join(name);
-            std::fs::read_to_string(&path).with_context(|| {
-                format!(
-                    "read {} (the compute-JWT key pair; run just zitadel-bootstrap)",
-                    path.display()
-                )
-            })
-        };
-        ComputeSigner::new(&read(PRIVATE_KEY_FILE)?, &read(PUBLIC_KEY_FILE)?).with_context(|| {
-            format!(
-                "the compute-JWT key pair in {} is corrupt; delete both files and run \
-                 just zitadel-bootstrap",
-                self.compute_jwt_dir.display()
-            )
-        })
+        cheladb_neon::jwt::load_signer(&self.compute_jwt_dir)
     }
 }
 
@@ -78,6 +62,7 @@ impl std::fmt::Debug for InternalConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cheladb_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
 
     #[test]
     fn defaults_are_for_local_dev() {

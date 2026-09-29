@@ -1,5 +1,5 @@
 //! Opt-in round trip through `StorconClient` against a running storage controller
-//! (`just neon-up` first):
+//! (`just deps-up` and `just dev` first; the storage controller calls the orchestrator's internal listener on attach):
 //!
 //! ```sh
 //! just neon-test-live
@@ -16,7 +16,7 @@ fn client() -> StorconClient {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon storage stack: just neon-up"]
+#[ignore = "needs the Neon storage stack and the internal listener: just deps-up, then just dev"]
 async fn tenant_and_timeline_round_trip() {
     let client = client();
     let tenant = NeonId::new();
@@ -34,7 +34,7 @@ async fn round_trip(client: StorconClient, tenant: NeonId) {
     let safekeepers = client
         .active_safekeepers()
         .await
-        .expect("storage controller reachable (just neon-up)");
+        .expect("storage controller reachable (just deps-up)");
     assert!(!safekeepers.is_empty(), "no Active safekeeper");
 
     client.create_tenant(&tenant).await.unwrap();

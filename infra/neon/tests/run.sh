@@ -46,13 +46,13 @@ if command -v docker >/dev/null; then
   # env -u: the check must hold with nothing set, as for a plain `just deps-up`.
   compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -f "$compose_file")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
-  check "without the profile, only the existing services" \
-    test "$(services)" = "mailpit metadata-db nats valkey zitadel zitadel-db "
-  check "the neon profile adds the storage services and the proxy" \
-    test "$(services --profile neon)" = "create-bucket mailpit metadata-db nats pageserver proxy proxy-tls register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db valkey zitadel zitadel-db "
-  neon_json="$("${compose[@]}" --profile neon config --format json)"
+  check "the base config has every service" \
+    test "$(services)" = "create-bucket mailpit metadata-db nats pageserver proxy proxy-tls register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db valkey zitadel zitadel-db "
+  neon_json="$("${compose[@]}" config --format json)"
   published="$(jq <<<"$neon_json" -r '
-    [.services[] | select((.profiles // []) | index("neon")) | .ports[]?
+    [.services | to_entries[]
+      | select(.key | IN("seaweedfs","storage-broker","safekeeper1","storcon-db","storage-controller","pageserver","proxy"))
+      | .value.ports[]?
       | "\(.host_ip // "0.0.0.0"):\(.published)"] | sort | join(" ")')"
   check "neon publishes only 1234, 4432, 4444 and 9898, on 127.0.0.1" \
     test "$published" = "127.0.0.1:1234 127.0.0.1:4432 127.0.0.1:4444 127.0.0.1:9898"
@@ -68,7 +68,7 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2' <<<"$zitadel")" = "http://localhost:3000/login?authRequest="
   check "zitadel writes the login-client token" \
     test "$(jq -r '.environment.ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH' <<<"$zitadel")" = "/zitadel-bootstrap/login-client.pat"
-  token="$(CHELADB_STORCON_HOOK_TOKEN=from-env "${compose[@]}" --profile neon config --format json |
+  token="$(CHELADB_STORCON_HOOK_TOKEN=from-env "${compose[@]}" config --format json |
     jq -r '.services["storage-controller"].command[]' | grep -- '--control-plane-jwt-token=' || true)"
   check "the hook token comes from CHELADB_STORCON_HOOK_TOKEN" \
     test "$token" = "--control-plane-jwt-token=from-env"
@@ -98,7 +98,7 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.depends_on.valkey.condition' <<<"$proxy")" = "service_healthy"
   check "valkey's healthcheck has an explicit timeout" \
     test "$(jq -r '.healthcheck.timeout // empty' <<<"$valkey")" != ""
-  ptoken="$(CHELADB_PROXY_API_TOKEN=from-env "${compose[@]}" --profile neon config --format json |
+  ptoken="$(CHELADB_PROXY_API_TOKEN=from-env "${compose[@]}" config --format json |
     jq -r '.services.proxy.environment.NEON_PROXY_TO_CONTROLPLANE_TOKEN')"
   check "the proxy's token comes from CHELADB_PROXY_API_TOKEN" test "$ptoken" = "from-env"
 else
@@ -251,7 +251,7 @@ else
 fi
 
 # --- CHELADB_INTERNAL_ADDR validation (fails before touching docker) -----------------------
-for script in neon-compute-demo neon-e2e; do
+for script in neon-e2e; do
   for bad in localhost 127.0.0.1: 127.0.0.1:http ":8083" "[::1]" "127.0.0.1:99999"; do
     status=0
     CHELADB_INTERNAL_ADDR="$bad" "$root/scripts/$script.sh" >/dev/null 2>"$stub/addr-err" || status=$?
@@ -268,8 +268,13 @@ check "CHELADB_INTERNAL_ADDR accepts a host name" addr_ok host.docker.internal:8
 
 # --- justfile -----------------------------------------------------------------------------
 check "neon-ps shows exited one-shots too" bash -c "just --justfile '$root/justfile' --show neon-ps | grep -q ' ps -a '"
-check "neon-down also removes demo computes" bash -c "just --justfile '$root/justfile' --show neon-down | grep -q 'cheladb-compute-'"
 check "deps-down also removes demo computes" bash -c "just --justfile '$root/justfile' --show deps-down | grep -q 'cheladb-compute-'"
+check "deps-up copies the proxy CA" \
+  bash -c "just --justfile '$root/justfile' --show deps-up | grep -q 'cp proxy:/tls/ca.crt'"
+check "dev exports CHELADB_COMPUTE_IMAGE" \
+  bash -c "just --justfile '$root/justfile' --show dev | grep -q 'export CHELADB_COMPUTE_IMAGE='"
+check "worker exports CHELADB_COMPUTE_IMAGE" \
+  bash -c "just --justfile '$root/justfile' --show worker | grep -q 'export CHELADB_COMPUTE_IMAGE='"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

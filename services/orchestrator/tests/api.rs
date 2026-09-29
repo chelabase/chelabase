@@ -5,7 +5,9 @@ use cheladb_auth::internal::{
 use cheladb_metadata::{
     DatabaseRecord, DatabaseStatus, MetadataError, ProjectOverview, TenantOverview,
 };
-use cheladb_nats::{DeleteDatabaseJob, JobEnvelope, ProvisionDatabaseJob, ResetPasswordReply};
+use cheladb_nats::{
+    DeleteDatabaseJob, JobEnvelope, ProvisionDatabaseJob, ResetPasswordReply, RESET_NOT_APPLIED,
+};
 use cheladb_routes::{Service, ENDPOINTS};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
 use cheladb_secrets::{seal_credential, Purpose, SecretKey};
@@ -56,13 +58,10 @@ fn sample_database(tenant_id: TenantId) -> DatabaseRecord {
         tenant_id,
         name: "demo-db".into(),
         status: DatabaseStatus::Ready,
-        container_id: None,
-        host: None,
-        port: None,
+        endpoint_id: Some("ep-0123456789ab".into()),
         database_name: None,
         owner_role: None,
         owner_password_enc: None,
-        platform_password_enc: None,
         error: None,
     }
 }
@@ -123,6 +122,8 @@ enum FakeReset {
     #[default]
     Ok,
     NotReady,
+    /// The worker stored the new password but couldn't apply it yet.
+    NotApplied,
     Timeout,
     /// The worker gave up on the database (its own deadline).
     WorkerTimedOut,
@@ -166,6 +167,7 @@ impl JobPort for FakeJobs {
         let answer = *self.reset.lock().unwrap();
         match answer {
             FakeReset::Ok => Ok(ResetPasswordReply { ok: true, error: None }),
+            FakeReset::NotApplied => Ok(ResetPasswordReply { ok: false, error: Some(RESET_NOT_APPLIED.into()) }),
             FakeReset::NotReady => Ok(ResetPasswordReply { ok: false, error: Some("not ready".into()) }),
             FakeReset::Timeout => Err(ResetError::Timeout),
             FakeReset::WorkerTimedOut => Ok(ResetPasswordReply { ok: false, error: Some("timed out".into()) }),
@@ -210,6 +212,7 @@ async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
         js: jobs,
         identity: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
         secrets: key.clone(),
+        proxy_domain: "localtest.me".into(),
     });
     let app: Router = build_router(state);
 
@@ -487,11 +490,7 @@ fn overview_with_database(tenant_id: TenantId) -> TenantOverview {
     let mut db = sample_database(tenant_id);
     db.project_id = project_id;
     db.name = "web1".into();
-    db.host = Some("127.0.0.1".into());
-    db.port = Some(49153);
-    db.container_id = Some("secret-container-id".into());
     db.owner_password_enc = Some("v1:secret-owner-sealed".into());
-    db.platform_password_enc = Some("v1:secret-platform-sealed".into());
     TenantOverview {
         id: tenant_id,
         slug: "demo".into(),
@@ -531,8 +530,8 @@ async fn me_for_bound_org_returns_tenant_projects_and_databases() {
     let db = &project["databases"][0];
     assert_eq!(db["name"], "web1");
     assert_eq!(db["status"], "ready");
-    assert_eq!(db["host"], "127.0.0.1");
-    assert_eq!(db["port"], 49153);
+    assert_eq!(db["host"], "ep-0123456789ab.localtest.me");
+    assert_eq!(db["port"], 4432);
     assert!(db["database_id"].is_string());
 }
 
@@ -578,11 +577,8 @@ async fn me_never_exposes_database_secrets() {
         .unwrap();
     for secret in [
         "secret-owner-sealed",
-        "secret-platform-sealed",
-        "secret-container-id",
         "owner_password_enc",
-        "platform_password_enc",
-        "container_id",
+        "endpoint_id",
     ] {
         assert!(!text.contains(secret), "/v1/me leaked {secret}: {text}");
     }
@@ -626,7 +622,7 @@ async fn get_database_never_exposes_secrets() {
         .text()
         .await
         .unwrap();
-    for secret in ["secret-owner-sealed", "secret-platform-sealed", "secret-container-id", "password"] {
+    for secret in ["secret-owner-sealed", "password", "endpoint_id"] {
         assert!(!text.contains(secret), "GET leaked {secret}: {text}");
     }
 }
@@ -639,12 +635,8 @@ fn ready_database(tenant: TenantId, key: &SecretKey) -> DatabaseRecord {
     db.name = "web1".into();
     db.database_name = Some("web1".into());
     db.owner_role = Some("postgres".into());
-    db.host = Some("127.0.0.1".into());
-    db.port = Some(49153);
     db.owner_password_enc =
         Some(seal_credential(key, &db.database_id.to_string(), Purpose::Owner, "s3cret"));
-    db.platform_password_enc =
-        Some(seal_credential(key, &db.database_id.to_string(), Purpose::Platform, "platform-pw"));
     db
 }
 
@@ -683,9 +675,13 @@ async fn reveal_ready_database_returns_decrypted_owner_credentials() {
     assert_eq!(body["user"], "postgres");
     assert_eq!(body["password"], "s3cret");
     assert_eq!(body["database"], "web1");
-    assert_eq!(body["host"], "127.0.0.1");
-    assert_eq!(body["port"], 49153);
-    assert_eq!(body["uri"], "postgres://postgres:s3cret@127.0.0.1:49153/web1");
+    assert_eq!(body["host"], "ep-0123456789ab.localtest.me");
+    assert_eq!(body["port"], 4432);
+    assert_eq!(
+        body["uri"],
+        "postgresql://postgres:s3cret@ep-0123456789ab.localtest.me:4432/web1?sslmode=verify-full"
+    );
+    assert_eq!(body["http_url"], "https://ep-0123456789ab.localtest.me:4444/sql");
 }
 
 // Review fix: a replaced secrets key gets an explicit message, not a bare 500.
@@ -704,20 +700,76 @@ async fn reveal_with_a_different_secrets_key_explains_the_key_mismatch() {
     assert!(body["error"].as_str().unwrap().contains("secrets key"), "{body}");
 }
 
-// Swapping the stored columns must never reveal the platform superuser password.
 #[tokio::test]
-async fn reveal_rejects_a_platform_credential_in_the_owner_column() {
+async fn reveal_without_an_endpoint_is_409() {
     let mut id = None;
     let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
         let mut db = ready_database(t, k);
-        db.owner_password_enc = db.platform_password_enc.clone();
+        db.endpoint_id = None;
         id = Some(db.database_id);
         m.insert_database(db);
     })
     .await;
     let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
-    assert_eq!(resp.status(), 500);
-    assert!(!resp.text().await.unwrap().contains("platform-pw"));
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
+}
+
+// /v1/me and GET show the proxy host and port when an endpoint is linked, nothing otherwise.
+#[tokio::test]
+async fn summaries_show_the_proxy_host() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let overview = overview_with_database(tenant);
+    let mut bare = sample_database(tenant);
+    bare.endpoint_id = None;
+    bare.project_id = overview.projects[0].id;
+    let (linked_id, bare_id) = (overview.projects[0].databases[0].database_id, bare.database_id);
+    metadata.insert_database(overview.projects[0].databases[0].clone());
+    metadata.insert_database(bare.clone());
+    let mut overview = overview;
+    overview.projects[0].databases.push(bare);
+    metadata.set_overview(overview);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+
+    let me: serde_json::Value = get_me(&app, Some(&app.token_for_org("org-1"))).await.json().await.unwrap();
+    let dbs = &me["tenant"]["projects"][0]["databases"];
+    assert_eq!(dbs[0]["host"], "ep-0123456789ab.localtest.me");
+    assert_eq!(dbs[0]["port"], 4432);
+    assert!(dbs[1]["host"].is_null() && dbs[1]["port"].is_null());
+
+    for (id, host, port) in [(linked_id, serde_json::json!("ep-0123456789ab.localtest.me"), serde_json::json!(4432)), (bare_id, serde_json::Value::Null, serde_json::Value::Null)] {
+        let body: serde_json::Value = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}", id.as_uuid()), "org-1").await.json().await.unwrap();
+        assert_eq!(body["host"], host);
+        assert_eq!(body["port"], port);
+    }
+}
+
+// A linked endpoint isn't reachable until the database is ready: no host or port before.
+#[tokio::test]
+async fn summaries_hide_the_proxy_host_until_ready() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let mut overview = overview_with_database(tenant);
+    let db = &mut overview.projects[0].databases[0];
+    db.status = DatabaseStatus::Provisioning;
+    assert!(db.endpoint_id.is_some());
+    let id = db.database_id;
+    metadata.insert_database(db.clone());
+    metadata.set_overview(overview);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+
+    let me: serde_json::Value = get_me(&app, Some(&app.token_for_org("org-1"))).await.json().await.unwrap();
+    let summary = &me["tenant"]["projects"][0]["databases"][0];
+    assert_eq!(summary["status"], "provisioning");
+    assert!(summary["host"].is_null() && summary["port"].is_null(), "{summary}");
+
+    let body: serde_json::Value = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}", id.as_uuid()), "org-1").await.json().await.unwrap();
+    assert_eq!(body["status"], "provisioning");
+    assert!(body["host"].is_null() && body["port"].is_null(), "{body}");
 }
 
 #[tokio::test]
@@ -870,14 +922,14 @@ async fn reset_password_with_no_worker_is_503() {
     assert_eq!(resp.status(), 503);
 }
 
-// Databases created before credentials were stored can't be reset either.
+// Databases with no endpoint (never provisioned on Neon) can't be reset.
 #[tokio::test]
-async fn reset_password_without_stored_credentials_is_409_with_recreate_hint() {
+async fn reset_without_an_endpoint_is_409() {
     let jobs = FakeJobs::default();
     let mut id = None;
     let app = lifecycle_app(jobs.clone(), |m, t, k| {
         let mut db = ready_database(t, k);
-        db.platform_password_enc = None;
+        db.endpoint_id = None;
         id = Some(db.database_id);
         m.insert_database(db);
     })
@@ -887,6 +939,23 @@ async fn reset_password_without_stored_credentials_is_409_with_recreate_hint() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
     assert!(jobs.resets.lock().unwrap().is_empty(), "worker must not be asked");
+}
+
+#[tokio::test]
+async fn reset_not_applied_is_503_with_the_message() {
+    let jobs = FakeJobs::default();
+    jobs.reset_answers(FakeReset::NotApplied);
+    let mut id = None;
+    let app = lifecycle_app(jobs, |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 503);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], RESET_NOT_APPLIED);
 }
 
 #[tokio::test]

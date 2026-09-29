@@ -42,6 +42,9 @@ pnpm install
 | `just create-db-demo` | Authenticated `POST /v1/databases` through the gateway (:8000) |
 | `just sweep-dbs` | Dev reset: remove every worker-provisioned container and data volume (+ all metadata rows if deps up) |
 | `just check` | Rust + TS typechecks |
+| `just test` | Rust tests with nextest, then doctests |
+| `just sweep-builds` | Delete build artifacts older than 14 days (`days=N` to change) from both target dirs |
+| `just wt-add <branch> [base]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/` |
 | `just orchestrator` / `worker` / `gateway` / `auth` / `studio` | Foreground one process |
 | `just cleanup` | Fresh start: stops dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps (keeps keys and the seeded tenant). Asks first |
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
@@ -61,6 +64,10 @@ If bootstrap fails with missing `admin.pat` (old Zitadel volume before FirstInst
 ```bash
 just zitadel-reset && just zitadel-bootstrap
 ```
+
+### Builds and worktrees
+
+`just test` runs the Rust tests with [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`) and then the doctests. Dev builds carry line tables only (no full debug info), which keeps test binaries small. `just sweep-builds` (needs `cargo install cargo-sweep --locked`) drops build artifacts older than 14 days from `target/` and `.worktrees/target`; `just cleanup` runs it too. `just wt-add <branch>` makes a worktree in `.worktrees/<branch>` with `.cheladb` and `apps/studio/.env.local` linked from the main checkout and dependencies installed; `just wt-remove <branch>` removes it and keeps the branch. All worktrees share one Cargo target dir, `.worktrees/target` (set in `.worktrees/.cargo/config.toml`), so dependencies build once. The main checkout stays on `main`.
 
 Logs for detached processes: `.cheladb/dev/*.log`. IAM artifacts: `.cheladb/zitadel/` (gitignored). Zitadel PATs are opaque — demo calls use **JWT profile** access tokens from `cheladb dev token`.
 
@@ -109,32 +116,34 @@ How it's wired:
 
 ## Create-database smoke test
 
-1. `just dev` (needs Docker; worker talks to the Docker socket)
+1. `just dev` (needs Docker; the worker starts each database's compute container)
 2. `just create-db-demo demo1` (positional; `name=demo1` would become the literal name)
 3. Poll `GET http://127.0.0.1:8000/v1/databases/<id>` with a minted Bearer token until `status` is `ready`
-4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgres://postgres:…` URI; `psql "<uri>"`
+4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.cheladb/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first
 5. `DELETE http://127.0.0.1:8000/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset.
 
 ## Database lifecycle
 
-Each database is its own `postgres:17` container with a named data volume (`cheladb-db-<id>`) and two roles:
+Each database gets a Neon tenant and timeline on the storage controller, plus one compute container (`cheladb-compute-<ep>`). The `postgres` role is a member of `neon_superuser`, and a real superuser only when `CHELADB_DB_OWNER_SUPERUSER` is on and `CHELADB_MODE` is self-hosted. Clients connect through Neon's proxy: Postgres wire at `<ep>.localtest.me:4432`; SQL over HTTP and WebSocket at `https://<ep>.localtest.me:4444/sql`. Use `sslrootcert=.cheladb/neon/proxy-ca.crt`; if `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`.
 
-| Role | Who uses it | Privileges |
-| --- | --- | --- |
-| `postgres` | You (revealed in Studio / `…/connection`) | Owns the database and `public` schema; `CREATEDB`, `CREATEROLE`, `BYPASSRLS`; `pg_read_all_data`, `pg_write_all_data`, `pg_monitor`, `pg_signal_backend`; installs trusted extensions. **Not** a superuser. |
-| `cheladb_platform` | The platform only (reset, delete, reconcile, later the Postgres proxy) | `SUPERUSER`. Never revealed. |
+The data API roles `anon` (NOLOGIN), `authenticated` (NOLOGIN) and `authenticator` (NOLOGIN NOINHERIT, granted both) are created in every database. The `cheladb_platform` role is gone.
 
-This is the Supabase/Neon pattern: near-full control for you, while the platform keeps access you can't break. Postgres 17 only lets `CREATEROLE` manage roles it created, so `postgres` can't alter or drop `cheladb_platform`.
+- **Connection details** (`GET /v1/databases/{id}/connection`, Studio → *Connection details*) can be revealed any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key at `CHELADB_SECRETS_KEY` (`.cheladb/secrets/secrets.key`, created by bootstrap). Keep that file: without it stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist (after `just sweep-dbs` a new key is simply adopted). Databases from before Neon provisioning became `deleted` tombstones when its migration ran; recreate them.
+- **Reset password** (`POST …/reset-password`) sets a new owner password. Existing sessions keep working until they reconnect. If the worker isn't running you get `503`. A `503` saying the password "was changed but not yet applied" means the new password is stored (reveal shows it; Studio shows it with the error) and the worker's reconcile applies it.
+- **Delete** (`DELETE /v1/databases/{id}`, Studio asks you to type the name) removes the compute and the tenant, with all its data. The row stays as a `deleted` tombstone (hidden from the API) and the name can be reused.
+- **Reconcile**: every 30 s the worker:
+  - fails databases stuck provisioning (> 10 min) and tears down what they built;
+  - retries deletes stuck for more than a minute;
+  - starts a new compute for a ready database whose container is gone (an exited container is left to Docker's restart policy);
+  - applies a password reset that was stored but not applied;
+  - removes compute containers that have no endpoint row;
+  - retries the teardown of an endpoint whose database is failed or deleted.
 
-- **Connection details** (`GET /v1/databases/{id}/connection`, Studio → *Connection details*) can be revealed any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key at `CHELADB_SECRETS_KEY` (`.cheladb/secrets/secrets.key`, created by bootstrap). Keep that file: without it stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist (after `just sweep-dbs` a new key is simply adopted). Databases created before this existed report "credentials unavailable; recreate this database".
-- **Reset password** (`POST …/reset-password`) sets a new owner password. Existing sessions keep working until they reconnect. If the worker isn't running you get `503`.
-- **Delete** (`DELETE /v1/databases/{id}`, Studio asks you to type the name) removes the container and its data. The row stays as a `deleted` tombstone (hidden from the API) and the name can be reused.
-- **Reconcile**: every 30 s the worker fails databases stuck provisioning (> 10 min) or whose container vanished, retries lost deletes, and removes the container/volume of deleted databases. A managed container or volume with *no* metadata row at all (e.g. after a metadata reset or restoring an old backup) is only reported in the worker log, never removed: it may hold the only copy of someone's data. Clear those deliberately with `just sweep-dbs`.
-- `CHELADB_DB_OWNER_SUPERUSER=true` makes the `postgres` role of *new* databases a real superuser (self-hosted opt-in). Users can then break reset/delete/reconcile for that database.
-- Connections currently go straight to `127.0.0.1:<port>`. A Postgres proxy (`pgproxy`) will replace that; it's a separate front door from the HTTP gateway because Postgres clients don't speak HTTP.
+  A storage-controller tenant with no endpoint row, or an endpoint row with no database, is only reported in the worker log, never removed: it may hold the only copy of someone's data. In local dev, `just sweep-dbs` removes every database, endpoint and endpoint tenant; delete an unknown tenant by hand.
+- `CHELADB_DB_OWNER_SUPERUSER=true` makes the `postgres` role of *new* databases a real superuser (self-hosted only; ignored in platform mode). Users can then alter `cloud_admin` or `neon_superuser` and break the compute's reconfigure and the worker's admin SQL for that database.
+- Connections go through Neon's proxy (above), never straight to a compute.
 - **Upgrading from before this feature is one-way.** The migration drops the old plaintext `admin_password` column, so older binaries can't run against the upgraded metadata database (and sqlx refuses to start with a migration it doesn't know). Existing databases keep running; recreate them to get revealable credentials.
-- **Security notes.** The password Postgres is initialised with (visible via `docker inspect`) is replaced right after init; only the encrypted replacement is stored. Because `postgres` has `pg_read_all_data`, it can read the platform role's SCRAM verifier in `pg_authid`; with 32 random characters that isn't practically crackable, but treat it as sensitive.
-- Metadata tests that need a real database are opt-in: `cargo test -p cheladb-metadata --test live_db -- --ignored --test-threads=1` (with `just deps-up`).
+- Metadata tests that need a real database are opt-in: `cargo test -p cheladb-metadata -- --ignored --test-threads=1` (with `just deps-up`).
 
 ## Local dependencies
 
@@ -149,20 +158,22 @@ This is the Supabase/Neon pattern: near-full control for you, while the platform
 | Worker health | 8082 | `/health` |
 | Gateway | 8000 | HTTP front door (Pingora) |
 | auth | 8084 | Sign-in backend (via gateway at `/auth/v1`) |
+| Neon storage controller | 1234 | Tenants and timelines |
+| Neon proxy | 4432, 4444 | Postgres wire; WebSocket and SQL over HTTP |
+| Valkey | 6379 | Proxy cache invalidation and query cancel |
 
 Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.cheladb/zitadel/demo.env` after bootstrap.
 
 ## Neon
 
-Opt-in storage stack (`just neon-up`); provisioning doesn't use it yet.
+The storage stack starts with `just deps-up` and backs every database.
 
 ### Proxy and computes (step 3)
 
 - **Ports.**
   - The orchestrator's internal listener is on `127.0.0.1:8083`, for the proxy, compute_ctl and the storage controller. Each has its own token, and nothing goes through the gateway.
   - Neon's proxy is on `127.0.0.1:4432` (Postgres) and `127.0.0.1:4444` (WebSocket and SQL over HTTP), for `<endpoint>.localtest.me`.
-- **`just neon-compute-demo`** (needs `just neon-up` and a running orchestrator) makes a hand-made compute: a tenant and timeline in the storage controller, an endpoint with a `postgres` role and database in metadata, and a compute container that pulls its spec from the internal listener. The password goes to `.cheladb/neon/demo-compute.env` and the proxy's CA to `.cheladb/neon/proxy-ca.crt`. `just neon-compute-demo --down` removes the container, the metadata rows and the tenant.
-- **`just neon-e2e`** replaces any demo compute with a fresh one and proves that it answers through the proxy over Postgres wire, SQL over HTTP and the serverless driver; that a wrong password is refused; that query cancel works; and that a changed password works at once.
+- **`just neon-e2e`** goes through the gateway API to create a test database, then proves that it answers through the proxy over Postgres wire, SQL over HTTP and the serverless driver; that a wrong password is refused; that query cancel works; and that a changed password works at once.
 - **Valkey** (`127.0.0.1:6379`, base profile):
   - it's what makes query cancel work through the proxy;
   - the proxy caches role secrets for at most a minute, so a password change must publish `/password_updated` (`cheladb neon password-updated`) after reconfiguring the compute;

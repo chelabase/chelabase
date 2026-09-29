@@ -12,27 +12,39 @@ dev_dir := ".cheladb/dev"
 demo_tenant_id := "00000000-0000-4000-8000-000000000001"
 demo_project_id := "00000000-0000-4000-8000-000000000002"
 
-# Neon storage services (Compose profile "neon").
+# Neon storage services (part of the base stack).
 neon_services := "seaweedfs create-bucket storage-broker safekeeper1 storcon-db storage-controller pageserver register-safekeepers proxy-tls proxy"
-# The long-running ones: `up --wait` fails on a one-shot that has exited, even with 0.
-neon_daemons := "seaweedfs storage-broker safekeeper1 storcon-db storage-controller pageserver proxy"
 
 # List available recipes
 default:
     @just --list
 
-# --- Dependencies (Compose: metadata Postgres, NATS, Zitadel) ---
+# --- Dependencies (Compose: metadata Postgres, NATS, Zitadel, Valkey, the Neon storage stack) ---
 
-# Start control-plane infrastructure containers
+# Start the infrastructure containers, including Neon (a local neon-build if present, else the pinned GHCR images)
 deps-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
     mkdir -p .cheladb/zitadel
     chmod 777 .cheladb/zitadel 2>/dev/null || true
-    docker compose -f {{compose_file}} --env-file {{compose_env}} up -d
+    images="$(scripts/neon-images.sh)"
+    # shellcheck disable=SC2086
+    export $images
+    compose=(docker compose -f {{compose_file}} --env-file {{compose_env}})
+    "${compose[@]}" up -d
+    # Provisioning needs an active safekeeper: fail here if registering one failed.
+    "${compose[@]}" wait register-safekeepers ||
+      { echo "register-safekeepers failed: ${compose[*]} logs register-safekeepers" >&2; exit 1; }
+    # The proxy's CA, for clients that verify its certificate.
+    # `compose cp` writes progress to stderr: show it only if the copy fails.
+    mkdir -p .cheladb/neon
+    cp_err="$("${compose[@]}" cp proxy:/tls/ca.crt .cheladb/neon/proxy-ca.crt 2>&1 >/dev/null)" ||
+      { echo "copying the proxy's CA certificate failed: $cp_err" >&2; exit 1; }
 
-# Stop control-plane infrastructure containers (and the Neon storage stack, if running)
+# Stop control-plane infrastructure containers, the Neon storage stack and any compute containers
 deps-down:
     docker ps -aq --filter name=^cheladb-compute- | xargs -r docker rm -f
-    docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon down
+    docker compose -f {{compose_file}} --env-file {{compose_env}} down
 
 # Show Compose service status
 deps-ps:
@@ -78,6 +90,8 @@ worker:
       source .cheladb/zitadel/demo.env
       set +a
     fi
+    eval "$(scripts/neon-images.sh)"
+    export CHELADB_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
     cargo run -p worker
 
 gateway:
@@ -141,6 +155,10 @@ dev: deps-up
       source .cheladb/zitadel/demo.env
       set +a
     fi
+
+    # The worker starts computes from this image (a local neon-build if present).
+    eval "$(scripts/neon-images.sh)"
+    export CHELADB_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
 
     cargo build -p orchestrator -p worker -p gateway -p auth -p cheladb
 
@@ -231,6 +249,9 @@ cleanup:
     for _ in $(seq 60); do [[ -s .cheladb/zitadel/login-client.pat ]] && break; sleep 1; done
     "$just" zitadel-bootstrap
     echo ""
+    echo "Sweeping old build artifacts..."
+    "$just" sweep-builds
+    echo ""
     echo "clean. Run: just dev"
 
 # --- Demo helpers ---
@@ -252,8 +273,9 @@ create-db-demo name="demo1":
       -d "{\"tenant_id\":\"{{demo_tenant_id}}\",\"project_id\":\"{{demo_project_id}}\",\"name\":\"{{name}}\"}"
     echo
 
-# Stop + remove worker-provisioned Postgres containers (label cheladb.managed=true).
-# Does not touch Compose deps. If metadata Postgres is up, also clears `databases` rows.
+# Remove worker-provisioned containers (label cheladb.managed=true) and Neon computes (label
+# cheladb.dev/endpoint-id), delete their storage-controller tenants, and clear the `databases`
+# and `neon_endpoints` rows. Does not touch Compose deps.
 sweep-dbs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -277,12 +299,28 @@ sweep-dbs:
       echo "removed $(echo "${volumes}" | wc -w | tr -d ' ') data volume(s)"
     fi
 
+    ids="$(docker ps -aq --filter 'label=cheladb.dev/endpoint-id' 2>/dev/null || true)"
+    if [[ -z "${ids}" ]]; then
+      echo "no Neon compute containers to remove"
+    else
+      echo "removing Neon compute containers:"
+      docker ps -a --filter 'label=cheladb.dev/endpoint-id' --format '  {{ "{{.Names}}" }}\t{{ "{{.Status}}" }}'
+      docker rm -f ${ids} >/dev/null
+      echo "removed $(echo "${ids}" | wc -w | tr -d ' ') compute container(s)"
+    fi
+
     if docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db \
          pg_isready -U cheladb -d cheladb_metadata >/dev/null 2>&1; then
-      deleted="$(docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db \
-        psql -U cheladb -d cheladb_metadata -tAc \
-        "WITH d AS (DELETE FROM databases RETURNING 1) SELECT count(*) FROM d;" | tr -d '[:space:]')"
-      echo "cleared ${deleted:-0} metadata database row(s)"
+      LOG_PREFIX=sweep-dbs
+      # shellcheck disable=SC1091
+      . scripts/lib/neon-common.sh
+      tenants="$(metadata_sql <<<"SELECT DISTINCT tenant_id FROM neon_endpoints;")"
+      for tenant in ${tenants}; do
+        delete_tenant "${tenant}"
+      done
+      echo "deleted $(echo "${tenants}" | wc -w | tr -d ' ') storage-controller tenant(s)"
+      counts="$(metadata_sql <<<"WITH e AS (DELETE FROM neon_endpoints RETURNING 1), d AS (DELETE FROM databases RETURNING 1) SELECT (SELECT count(*) FROM e) || ' ' || (SELECT count(*) FROM d);")"
+      echo "cleared ${counts% *} Neon endpoint row(s) and ${counts#* } metadata database row(s)"
     else
       echo "metadata Postgres not running — skipped clearing databases table (just up && just sweep-dbs)"
     fi
@@ -295,44 +333,83 @@ check:
     pnpm --filter @cheladb/studio typecheck
     pnpm --filter @cheladb/studio test
 
-# --- Neon storage (opt-in until provisioning moves to Neon) ---
+# Rust tests (nextest, one process per test) plus doctests, which nextest does not run.
+# The ignored live tests stay on `cargo test ... -- --ignored` (see neon-test-live).
+test:
+    cargo nextest run --workspace
+    cargo test --workspace --doc
+
+# Delete build artifacts older than `days` from the main checkout's target/ and the shared
+# .worktrees/target (needs cargo-sweep: cargo install cargo-sweep --locked)
+sweep-builds days="14":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    for dir in "$main/target" "$main/.worktrees/target"; do
+      if [[ -d "$dir" ]]; then
+        echo "sweeping $dir (older than {{days}} days)"
+        # cargo-sweep takes a project path; CARGO_TARGET_DIR says which target dir to clean.
+        CARGO_TARGET_DIR="$dir" cargo sweep --time {{days}} "$main"
+      else
+        echo "skipping $dir (does not exist)"
+      fi
+    done
+
+# New worktree at .worktrees/<branch with / as ->; creates the branch from base if it is new
+wt-add branch base="main":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    branch="{{branch}}"
+    dir="$main/.worktrees/${branch//\//-}"
+    if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$main" worktree add "$dir" "$branch"
+    else
+      git -C "$main" worktree add "$dir" -b "$branch" "{{base}}"
+    fi
+    # One target dir for every worktree, so dependencies build once.
+    if [[ ! -f "$main/.worktrees/.cargo/config.toml" ]]; then
+      mkdir -p "$main/.worktrees/.cargo"
+      printf '%s\n' \
+        '# Every worktree under .worktrees/ shares one target dir, so dependencies build once.' \
+        '[build]' \
+        "target-dir = \"$main/.worktrees/target\"" \
+        >"$main/.worktrees/.cargo/config.toml"
+    fi
+    ln -s "$main/.cheladb" "$dir/.cheladb"
+    if [[ -e "$main/apps/studio/.env.local" ]]; then
+      ln -s "$main/apps/studio/.env.local" "$dir/apps/studio/.env.local"
+    fi
+    (cd "$dir" && pnpm install --frozen-lockfile)
+    echo "$dir"
+
+# Remove the worktree (refuses if it has changes); the branch is kept
+wt-remove branch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    branch="{{branch}}"
+    git -C "$main" worktree remove "$main/.worktrees/${branch//\//-}"
+    echo "removed worktree; branch $branch kept (git branch -d $branch to delete it)"
+
+# --- Neon storage (part of the base stack; see deps-up) ---
 
 # Build the Neon images from source at infra/neon/NEON_REF (~40 min, ~40 GB free disk)
 neon-build:
     infra/neon/build.sh neon
     infra/neon/build.sh compute-node
 
-# Start the Neon storage stack (a local neon-build if present, else the pinned GHCR images)
-neon-up:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    images="$(scripts/neon-images.sh)"
-    # shellcheck disable=SC2086
-    export $images
-    compose=(docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon)
-    # create-bucket runs as a dependency; register-safekeepers is run last, with its own status.
-    "${compose[@]}" up -d --wait {{neon_daemons}}
-    "${compose[@]}" run --rm register-safekeepers
-
-# Stop and remove the Neon services (volumes kept) and any demo compute containers
-neon-down:
-    docker ps -aq --filter name=^cheladb-compute- | xargs -r docker rm -f
-    docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon rm -sf {{neon_services}}
-
 # Show the Neon storage containers
 neon-ps:
-    docker compose -f {{compose_file}} --env-file {{compose_env}} --profile neon ps -a {{neon_services}}
+    docker compose -f {{compose_file}} --env-file {{compose_env}} ps -a {{neon_services}}
 
 # Check the running Neon storage stack (creates and deletes a throwaway tenant)
 neon-smoke:
     scripts/neon-smoke.sh
 
-# A hand-made compute behind the proxy (needs just neon-up and just dev); --down removes it
-neon-compute-demo *args:
-    scripts/neon-compute-demo.sh {{args}}
-
-# Live check of step 3: psql, SQL over HTTP and the serverless driver through the proxy, query
-# cancel, and a password change that works at once (needs just neon-up and just dev)
+# Live check through the API: create a database, then psql, SQL over HTTP and the serverless
+# driver through the proxy, query cancel, a password reset that works at once, and delete
+# (needs just deps-up and just dev)
 neon-e2e:
     scripts/neon-e2e.sh
 
@@ -340,7 +417,7 @@ neon-e2e:
 neon-test:
     infra/neon/tests/run.sh
 
-# Round trip through the Rust storage-controller client (needs just neon-up)
+# Round trip through the Rust storage-controller client (needs just deps-up and just dev: attach notifies the internal listener)
 neon-test-live:
     cargo test -p cheladb-neon --test storcon_live -- --ignored
 

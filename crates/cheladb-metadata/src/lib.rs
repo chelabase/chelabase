@@ -9,7 +9,10 @@ use tracing::info;
 use uuid::Uuid;
 
 mod neon;
-pub use neon::{NeonDatabase, NeonEndpoint, NeonRole};
+pub use neon::{
+    ENDPOINT_LOCK_TIMEOUT, EndpointLock, EndpointState, NeonDatabase, NeonEndpoint, NeonRole,
+    NewEndpoint,
+};
 
 /// Fixed seed tenant for local demos (`slug = demo`).
 pub const DEMO_TENANT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001);
@@ -38,17 +41,14 @@ pub struct DatabaseRecord {
     pub tenant_id: TenantId,
     pub name: String,
     pub status: DatabaseStatus,
-    pub container_id: Option<String>,
-    pub host: Option<String>,
-    pub port: Option<u16>,
+    /// The Neon endpoint serving this database (`ep-` + 12 hex), once provisioning created one.
+    pub endpoint_id: Option<String>,
     /// Actual Postgres database name (sanitized from `name`).
     pub database_name: Option<String>,
     /// The revealed owner role (`postgres`).
     pub owner_role: Option<String>,
     /// Owner password, sealed with `cheladb-secrets` (aad = database id).
     pub owner_password_enc: Option<String>,
-    /// Platform superuser password, sealed the same way. Never revealed.
-    pub platform_password_enc: Option<String>,
     pub error: Option<String>,
 }
 
@@ -111,6 +111,9 @@ pub enum MetadataError {
     InvalidStatus(String),
     #[error("invalid database name: {0}")]
     InvalidDatabaseName(String),
+    /// [`MetadataClient::lock_endpoint`] waited [`ENDPOINT_LOCK_TIMEOUT`] in vain.
+    #[error("another password change for {0} is still being applied")]
+    EndpointLockTimeout(String),
 }
 
 /// Postgres limits identifiers to 63 bytes.
@@ -155,13 +158,9 @@ pub enum KeyCheck {
 /// Values stored when a database becomes ready.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadyDatabase<'a> {
-    pub container_id: &'a str,
-    pub host: &'a str,
-    pub port: u16,
     pub database_name: &'a str,
     pub owner_role: &'a str,
     pub owner_password_enc: &'a str,
-    pub platform_password_enc: &'a str,
 }
 
 /// A database that isn't deleted, as seen by the reconcile loop.
@@ -169,6 +168,7 @@ pub struct ReadyDatabase<'a> {
 pub struct LiveDatabase {
     pub id: DatabaseId,
     pub status: DatabaseStatus,
+    pub endpoint_id: Option<String>,
     /// Seconds since the row last changed.
     pub age_secs: i64,
 }
@@ -214,7 +214,15 @@ pub fn group_overview(
 #[derive(Debug, Clone)]
 pub struct MetadataClient {
     pool: PgPool,
+    /// Only for [`MetadataClient::lock_endpoint`]: each held lock keeps a connection, and
+    /// holders need `pool` for their own queries, so locks can never starve it.
+    locks: PgPool,
 }
+
+/// Connections for endpoint locks, held and waited for: a waiter keeps one while Postgres
+/// queues it, for up to [`ENDPOINT_LOCK_TIMEOUT`]. More lockers wait for a connection, for as
+/// long again at most; the worker's reset deadline and reconcile's next pass bound the rest.
+const LOCK_CONNECTIONS: u32 = 8;
 
 impl MetadataClient {
     pub async fn connect(config: &MetadataConfig) -> Result<Self, MetadataError> {
@@ -222,7 +230,29 @@ impl MetadataClient {
             .max_connections(10)
             .connect(&config.database_url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            locks: Self::lock_pool(config)?,
+        })
+    }
+
+    /// A client that connects on first use (tests that never reach the database).
+    pub fn connect_lazy(config: &MetadataConfig) -> Result<Self, MetadataError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
+            .connect_lazy(&config.database_url)?;
+        Ok(Self {
+            pool,
+            locks: Self::lock_pool(config)?,
+        })
+    }
+
+    /// Connects on first use: only the worker takes endpoint locks.
+    fn lock_pool(config: &MetadataConfig) -> Result<PgPool, MetadataError> {
+        Ok(PgPoolOptions::new()
+            .max_connections(LOCK_CONNECTIONS)
+            .acquire_timeout(ENDPOINT_LOCK_TIMEOUT)
+            .connect_lazy(&config.database_url)?)
     }
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
@@ -326,24 +356,22 @@ impl MetadataClient {
         Ok(updated == 1)
     }
 
-    /// Mark a live database ready. False (nothing written) once a delete has
-    /// begun; the caller must then tear down what it built.
+    /// Mark a live database ready and link it to its endpoint. False (nothing written) once a
+    /// delete has begun; the caller must then tear down what it built.
     pub async fn set_ready(
         &self,
         database_id: DatabaseId,
+        endpoint_id: &str,
         db: ReadyDatabase<'_>,
     ) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             r#"
             UPDATE databases
             SET status = $2,
-                container_id = $3,
-                host = $4,
-                port = $5,
-                database_name = $6,
-                owner_role = $7,
-                owner_password_enc = $8,
-                platform_password_enc = $9,
+                endpoint_id = $3,
+                database_name = $4,
+                owner_role = $5,
+                owner_password_enc = $6,
                 error = NULL,
                 updated_at = now()
             WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
@@ -351,13 +379,10 @@ impl MetadataClient {
         )
         .bind(database_id.as_uuid())
         .bind(DatabaseStatus::Ready.as_str())
-        .bind(db.container_id)
-        .bind(db.host)
-        .bind(i32::from(db.port))
+        .bind(endpoint_id)
         .bind(db.database_name)
         .bind(db.owner_role)
         .bind(db.owner_password_enc)
-        .bind(db.platform_password_enc)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -380,15 +405,13 @@ impl MetadataClient {
         Ok(moved.rows_affected() == 1)
     }
 
-    /// Turn the row into a tombstone and forget everything that pointed at
-    /// the (now removed) container and credentials.
+    /// Turn the row into a tombstone and forget its sealed credentials.
     pub async fn mark_deleted(&self, database_id: DatabaseId) -> Result<(), MetadataError> {
         sqlx::query(
             r#"
             UPDATE databases
             SET status = 'deleted', deleted_at = now(), updated_at = now(),
-                container_id = NULL, host = NULL, port = NULL,
-                owner_password_enc = NULL, platform_password_enc = NULL
+                owner_password_enc = NULL
             WHERE id = $1
             "#,
         )
@@ -396,24 +419,6 @@ impl MetadataClient {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Store a new owner password for a ready database. False (nothing
-    /// written) otherwise, e.g. when it was deleted while the reset ran.
-    pub async fn set_owner_password_enc(
-        &self,
-        database_id: DatabaseId,
-        owner_password_enc: &str,
-    ) -> Result<bool, MetadataError> {
-        let stored = sqlx::query(
-            "UPDATE databases SET owner_password_enc = $2, updated_at = now()
-             WHERE id = $1 AND status = 'ready'",
-        )
-        .bind(database_id.as_uuid())
-        .bind(owner_password_enc)
-        .execute(&self.pool)
-        .await?;
-        Ok(stored.rows_affected() == 1)
     }
 
     /// Fail a database stuck provisioning, but only if it is *still* pending or
@@ -469,7 +474,7 @@ impl MetadataClient {
         }
         let sealed_rows: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM databases
-             WHERE owner_password_enc IS NOT NULL OR platform_password_enc IS NOT NULL",
+             WHERE owner_password_enc IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -484,25 +489,11 @@ impl MetadataClient {
         Ok(KeyCheck::Replaced)
     }
 
-    /// Which of `ids` belong to `deleted` tombstones (ids with no row at all
-    /// are not returned).
-    pub async fn deleted_among(
-        &self,
-        ids: &[DatabaseId],
-    ) -> Result<std::collections::HashSet<DatabaseId>, MetadataError> {
-        let uuids: Vec<Uuid> = ids.iter().map(|id| id.as_uuid()).collect();
-        let rows = sqlx::query("SELECT id FROM databases WHERE status = 'deleted' AND id = ANY($1)")
-            .bind(&uuids)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.iter().map(|r| DatabaseId(r.get("id"))).collect())
-    }
-
     /// Every database that isn't deleted, with the age of its last change.
     pub async fn list_live_for_reconcile(&self) -> Result<Vec<LiveDatabase>, MetadataError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, status, EXTRACT(EPOCH FROM now() - updated_at)::BIGINT AS age_secs
+            SELECT id, status, endpoint_id, EXTRACT(EPOCH FROM now() - updated_at)::BIGINT AS age_secs
             FROM databases
             WHERE status <> 'deleted'
             "#,
@@ -514,6 +505,7 @@ impl MetadataClient {
                 Ok(LiveDatabase {
                     id: DatabaseId(r.get("id")),
                     status: DatabaseStatus::parse(r.get("status"))?,
+                    endpoint_id: r.get("endpoint_id"),
                     age_secs: r.get("age_secs"),
                 })
             })
@@ -587,13 +579,10 @@ impl MetadataClient {
                 p.tenant_id,
                 d.name,
                 d.status,
-                d.container_id,
-                d.host,
-                d.port,
+                d.endpoint_id,
                 d.database_name,
                 d.owner_role,
                 d.owner_password_enc,
-                d.platform_password_enc,
                 d.error
             FROM databases d
             JOIN projects p ON p.id = d.project_id
@@ -630,9 +619,8 @@ impl MetadataClient {
         .collect();
         let databases = sqlx::query(
             r#"
-            SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.container_id,
-                   d.host, d.port, d.database_name, d.owner_role, d.owner_password_enc,
-                   d.platform_password_enc, d.error
+            SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.endpoint_id,
+                   d.database_name, d.owner_role, d.owner_password_enc, d.error
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE p.tenant_id = $1 AND d.status <> 'deleted'
@@ -656,20 +644,16 @@ impl MetadataClient {
 
 /// Map a `databases ⋈ projects` row (see `get_database`) to a record.
 fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
-    let port: Option<i32> = r.try_get("port").ok().flatten();
     DatabaseRecord {
         database_id: DatabaseId(r.get("id")),
         project_id: ProjectId(r.get("project_id")),
         tenant_id: TenantId(r.get("tenant_id")),
         name: r.get("name"),
         status: DatabaseStatus::parse(r.get("status")).unwrap_or(DatabaseStatus::Failed),
-        container_id: r.get("container_id"),
-        host: r.get("host"),
-        port: port.and_then(|p| u16::try_from(p).ok()),
+        endpoint_id: r.get("endpoint_id"),
         database_name: r.get("database_name"),
         owner_role: r.get("owner_role"),
         owner_password_enc: r.get("owner_password_enc"),
-        platform_password_enc: r.get("platform_password_enc"),
         error: r.get("error"),
     }
 }
@@ -685,13 +669,10 @@ mod tests {
             tenant_id: TenantId(DEMO_TENANT_ID),
             name: name.into(),
             status: DatabaseStatus::Ready,
-            container_id: None,
-            host: None,
-            port: None,
+            endpoint_id: None,
             database_name: None,
             owner_role: None,
             owner_password_enc: None,
-            platform_password_enc: None,
             error: None,
         }
     }

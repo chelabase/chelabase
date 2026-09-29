@@ -12,7 +12,7 @@ use cheladb_metadata::{
 };
 use cheladb_nats::{
     DeleteDatabaseJob, JetStreamContext, JobEnvelope, ProvisionDatabaseJob, ResetPasswordReply,
-    ResetPasswordRequest, SUBJECT_RESET_PASSWORD,
+    ResetPasswordRequest, RESET_NOT_APPLIED, SUBJECT_RESET_PASSWORD,
 };
 use cheladb_secrets::{open_credential, Purpose, SecretKey};
 use cheladb_types::{DatabaseId, ProjectId, TenantId};
@@ -24,6 +24,16 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 pub mod internal;
+
+/// Port the Neon proxy serves the Postgres protocol on.
+pub const PROXY_PG_PORT: u16 = 4432;
+/// Port the Neon proxy serves SQL-over-HTTP on.
+pub const PROXY_HTTP_PORT: u16 = 4444;
+
+/// The proxy's host name for an endpoint.
+fn proxy_host(endpoint_id: &str, domain: &str) -> String {
+    format!("{endpoint_id}.{domain}")
+}
 
 /// Abstraction over tenant/database metadata lookups, so tests can inject an
 /// in-memory fake instead of a real Postgres-backed `MetadataClient`.
@@ -192,6 +202,8 @@ pub struct AppState<M, J> {
     pub identity: InternalVerifier,
     /// Decrypts stored database credentials for reveal.
     pub secrets: SecretKey,
+    /// Domain the Neon proxy serves endpoints under: `<ep>.<proxy_domain>`.
+    pub proxy_domain: String,
 }
 
 /// Caller verified from the gateway-minted internal identity token. Does not
@@ -334,16 +346,32 @@ struct DatabaseResponse {
     error: Option<String>,
 }
 
-impl From<DatabaseRecord> for DatabaseResponse {
-    fn from(r: DatabaseRecord) -> Self {
+/// The proxy's host and Postgres port, once the database is ready: until then its endpoint
+/// may have no compute yet, or be torn down.
+fn proxy_address(
+    status: DatabaseStatus,
+    endpoint_id: Option<&str>,
+    proxy_domain: &str,
+) -> Option<(String, u16)> {
+    match endpoint_id {
+        Some(ep) if status == DatabaseStatus::Ready => {
+            Some((proxy_host(ep, proxy_domain), PROXY_PG_PORT))
+        }
+        _ => None,
+    }
+}
+
+impl DatabaseResponse {
+    fn new(r: DatabaseRecord, proxy_domain: &str) -> Self {
+        let (host, port) = proxy_address(r.status, r.endpoint_id.as_deref(), proxy_domain).unzip();
         Self {
             database_id: r.database_id,
             project_id: r.project_id,
             tenant_id: r.tenant_id,
             name: r.name,
             status: r.status,
-            host: r.host,
-            port: r.port,
+            host,
+            port,
             error: r.error,
         }
     }
@@ -386,30 +414,38 @@ struct DatabaseSummary {
     port: Option<u16>,
 }
 
-impl From<TenantOverview> for TenantView {
-    fn from(t: TenantOverview) -> Self {
+impl TenantView {
+    fn new(t: TenantOverview, proxy_domain: &str) -> Self {
         Self {
             id: t.id,
             slug: t.slug,
-            projects: t.projects.into_iter().map(ProjectView::from).collect(),
+            projects: t
+                .projects
+                .into_iter()
+                .map(|p| ProjectView::new(p, proxy_domain))
+                .collect(),
         }
     }
 }
 
-impl From<ProjectOverview> for ProjectView {
-    fn from(p: ProjectOverview) -> Self {
+impl ProjectView {
+    fn new(p: ProjectOverview, proxy_domain: &str) -> Self {
         Self {
             id: p.id,
             slug: p.slug,
             databases: p
                 .databases
                 .into_iter()
-                .map(|d| DatabaseSummary {
-                    database_id: d.database_id,
-                    name: d.name,
-                    status: d.status,
-                    host: d.host,
-                    port: d.port,
+                .map(|d| {
+                    let (host, port) =
+                        proxy_address(d.status, d.endpoint_id.as_deref(), proxy_domain).unzip();
+                    DatabaseSummary {
+                        database_id: d.database_id,
+                        name: d.name,
+                        status: d.status,
+                        host,
+                        port,
+                    }
                 })
                 .collect(),
         }
@@ -450,7 +486,7 @@ where
         Err(_) => return internal_error(),
         Ok(None) => None,
         Ok(Some(tenant_id)) => match state.metadata.tenant_overview(tenant_id).await {
-            Ok(overview) => overview.map(TenantView::from),
+            Ok(overview) => overview.map(|o| TenantView::new(o, &state.proxy_domain)),
             Err(err) => {
                 error!("tenant overview: {err}");
                 return internal_error();
@@ -575,7 +611,7 @@ where
                 )
                     .into_response();
             }
-            (StatusCode::OK, Json(DatabaseResponse::from(record))).into_response()
+            (StatusCode::OK, Json(DatabaseResponse::new(record, &state.proxy_domain))).into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -631,6 +667,7 @@ struct ConnectionDetails {
     user: String,
     password: String,
     uri: String,
+    http_url: String,
 }
 
 /// Reveal the owner credentials of a ready database. Never cached, never logged.
@@ -657,8 +694,8 @@ where
         );
     }
     let sealed = record.owner_password_enc.filter(|s| !s.is_empty());
-    let (Some(host), Some(port), Some(database), Some(sealed)) =
-        (record.host, record.port, record.database_name, sealed)
+    let (Some(endpoint_id), Some(database), Some(sealed)) =
+        (record.endpoint_id, record.database_name, sealed)
     else {
         return json_error(
             StatusCode::CONFLICT,
@@ -688,7 +725,12 @@ where
         database_id = %record.database_id,
         "revealed connection details"
     );
-    let uri = format!("postgres://{user}:{password}@{host}:{port}/{database}");
+    let host = proxy_host(&endpoint_id, &state.proxy_domain);
+    let port = PROXY_PG_PORT;
+    let uri = format!(
+        "postgresql://{user}:{password}@{host}:{port}/{database}?sslmode=verify-full"
+    );
+    let http_url = format!("https://{host}:{PROXY_HTTP_PORT}/sql");
     (
         [(CACHE_CONTROL, "no-store")],
         Json(ConnectionDetails {
@@ -698,6 +740,7 @@ where
             user,
             password,
             uri,
+            http_url,
         }),
     )
         .into_response()
@@ -719,9 +762,9 @@ where
     if record.status != DatabaseStatus::Ready {
         return json_error(StatusCode::CONFLICT, "database is not ready");
     }
-    // Databases from before credentials were stored have no platform password
-    // to reset with; say so instead of failing inside the worker.
-    if record.platform_password_enc.as_deref().is_none_or(str::is_empty) {
+    // A database without an endpoint has nothing to reset; say so instead of failing
+    // inside the worker.
+    if record.endpoint_id.is_none() {
         return json_error(
             StatusCode::CONFLICT,
             "credentials unavailable; recreate this database",
@@ -734,6 +777,9 @@ where
         }
         Ok(reply) if reply.error.as_deref() == Some("not ready") => {
             json_error(StatusCode::CONFLICT, "database is not ready")
+        }
+        Ok(reply) if reply.error.as_deref() == Some(RESET_NOT_APPLIED) => {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, RESET_NOT_APPLIED)
         }
         Ok(reply) if reply.error.as_deref() == Some("timed out") => json_error(
             StatusCode::GATEWAY_TIMEOUT,

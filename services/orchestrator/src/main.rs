@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         js: NatsPorts { js, client: nats },
         identity,
         secrets,
+        proxy_domain: proxy_domain_from_env(),
     };
 
     let app = build_router(Arc::new(state));
@@ -94,4 +95,13 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
              remove every database with `just sweep-dbs`."
         ),
     }
+}
+
+/// `CHELADB_PROXY_DOMAIN`, or `localtest.me` when unset or blank.
+fn proxy_domain_from_env() -> String {
+    std::env::var("CHELADB_PROXY_DOMAIN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "localtest.me".to_string())
 }

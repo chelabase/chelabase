@@ -451,3 +451,30 @@ async fn hanging_server_times_out() {
     assert!(matches!(err, StorconError::Other(_)), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[tokio::test]
+async fn list_tenant_ids_reads_every_tenant() {
+    let m = mock(vec![(
+        200,
+        r#"[{"tenant_id":"00000000000000000000000000000001","shards":[]},
+            {"tenant_id":"00000000000000000000000000000002","extra":1}]"#,
+    )])
+    .await;
+    let ids = StorconClient::new(&m.base, 0)
+        .list_tenant_ids()
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![id(1), id(2)]);
+    assert_eq!(m.seen()[0].method, "GET");
+    assert_eq!(m.seen()[0].path, "/control/v1/tenant");
+}
+
+#[tokio::test]
+async fn list_tenant_ids_rejects_a_malformed_id() {
+    let m = mock(vec![(200, r#"[{"tenant_id":"not-an-id"}]"#)]).await;
+    let err = StorconClient::new(&m.base, 0)
+        .list_tenant_ids()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+}
