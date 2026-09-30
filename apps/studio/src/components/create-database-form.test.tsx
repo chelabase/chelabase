@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { DatabaseDetail } from "@cheladb/types";
 import { ApiError, type ApiClient } from "@/lib/api";
+import { fakeApi } from "@/test/fake-api";
 import { CreateDatabaseForm } from "./create-database-form";
 
 function detail(status: DatabaseDetail["status"], error: string | null = null): DatabaseDetail {
@@ -15,6 +16,9 @@ function detail(status: DatabaseDetail["status"], error: string | null = null): 
     host: null,
     port: null,
     error,
+    branch_count: 1,
+    history_window: 604800,
+    max_branches: 5,
   };
 }
 
@@ -22,15 +26,7 @@ function setup(api: Partial<ApiClient>) {
   const onSettled = vi.fn();
   render(
     <CreateDatabaseForm
-      api={{
-        me: vi.fn(),
-        createDatabase: vi.fn(),
-        getDatabase: vi.fn(),
-        getConnection: vi.fn(),
-        resetPassword: vi.fn(),
-        deleteDatabase: vi.fn(),
-        ...api,
-      }}
+      api={fakeApi(api)}
       tenantId={"t1" as never}
       projectId={"p1" as never}
       onSettled={onSettled}

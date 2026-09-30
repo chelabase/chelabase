@@ -1,5 +1,5 @@
-import { useState } from "react";
-import type { ConnectionDetails, DatabaseSummary } from "@cheladb/types";
+import { useState, type ReactNode } from "react";
+import type { BranchSummary, ConnectionDetails, DatabaseSummary } from "@cheladb/types";
 import { Button } from "@/components/ui/button";
 import { ApiError, type ApiClient } from "@/lib/api";
 
@@ -10,6 +10,19 @@ export interface DatabaseActionsProps {
   database: DatabaseSummary;
   /** Called after a change the database list should reflect (delete). */
   onChanged: () => void;
+  /**
+   * Act on one branch instead of the database: connection details and reset
+   * password go through the branch endpoints and Delete is left to the caller.
+   * `reasons` says why each of the two is unavailable (null when available).
+   */
+  branch?: BranchSummary;
+  reasons?: { connect: string | null; resetPassword: string | null };
+  /** Ids of the visible texts giving those reasons, for `aria-describedby`. */
+  describedBy?: { connect?: string; resetPassword?: string };
+  /** More buttons, in the same row. */
+  children?: ReactNode;
+  /** Shown right under the row of buttons (the reasons some are off). */
+  below?: ReactNode;
 }
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -21,7 +34,16 @@ const notApplied = (err: unknown) =>
 /** What a not-applied reset tells the user, instead of both "reset" and the 503. */
 const NOT_APPLIED_NOTICE = "The new password is stored but not yet applied; it will be retried.";
 
-export function DatabaseActions({ api, database, onChanged }: DatabaseActionsProps) {
+export function DatabaseActions({
+  api,
+  database,
+  onChanged,
+  branch,
+  reasons,
+  describedBy,
+  children,
+  below,
+}: DatabaseActionsProps) {
   const [panel, setPanel] = useState<Panel>("none");
   const [details, setDetails] = useState<ConnectionDetails | null>(null);
   const [showPassword, setShowPassword] = useState(false);
@@ -31,6 +53,11 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
   const [typedName, setTypedName] = useState("");
   const ready = database.status === "ready";
   const id = database.database_id;
+  const label = branch?.name ?? database.name;
+  const connectReason = reasons?.connect ?? null;
+  const passwordReason = reasons?.resetPassword ?? null;
+  const canConnect = branch ? connectReason === null : ready;
+  const canReset = branch ? passwordReason === null : ready;
 
   function open(next: Panel) {
     setError(null);
@@ -50,7 +77,7 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
     setError(null);
     setNotice(null);
     try {
-      setDetails(await api.getConnection(id));
+      setDetails(await (branch ? api.getBranchConnection(id, branch.id) : api.getConnection(id)));
       setShowPassword(false);
       setNotice(
         pending
@@ -71,7 +98,7 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
     setBusy(true);
     setError(null);
     try {
-      await api.resetPassword(id);
+      await (branch ? api.resetBranchPassword(id, branch.id) : api.resetPassword(id));
     } catch (err) {
       if (notApplied(err)) {
         // The new password is stored and shown by reveal; it starts working once applied.
@@ -114,26 +141,39 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
         <Button
           size="sm"
           variant="outline"
-          disabled={!ready || busy}
+          disabled={!canConnect || busy}
+          title={connectReason ?? undefined}
+          aria-describedby={connectReason ? describedBy?.connect : undefined}
           onClick={() => (panel === "connection" ? open("none") : void reveal())}
         >
           Connection details
         </Button>
-        <Button size="sm" variant="outline" disabled={!ready || busy} onClick={() => open("reset")}>
-          Reset password
-        </Button>
         <Button
           size="sm"
           variant="outline"
-          disabled={database.status === "deleting" || busy}
-          onClick={() => {
-            setTypedName("");
-            open("delete");
-          }}
+          disabled={!canReset || busy}
+          title={passwordReason ?? undefined}
+          aria-describedby={passwordReason ? describedBy?.resetPassword : undefined}
+          onClick={() => open("reset")}
         >
-          Delete
+          Reset password
         </Button>
+        {!branch && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={database.status === "deleting" || busy}
+            onClick={() => {
+              setTypedName("");
+              open("delete");
+            }}
+          >
+            Delete
+          </Button>
+        )}
+        {children}
       </div>
+      {below}
 
       {panel === "connection" && details && (
         <div className="space-y-2 rounded-lg border p-3 text-sm">
@@ -178,7 +218,7 @@ export function DatabaseActions({ api, database, onChanged }: DatabaseActionsPro
 
       {panel === "reset" && (
         <div className="space-y-2 rounded-lg border p-3 text-sm">
-          <p>Reset the password for {database.name}? The current password stops working for new connections.</p>
+          <p>Reset the password for {label}? The current password stops working for new connections.</p>
           <div className="flex gap-2">
             <Button size="sm" disabled={busy} onClick={() => void reset()}>
               Confirm reset

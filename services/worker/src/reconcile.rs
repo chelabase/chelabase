@@ -1,17 +1,20 @@
 //! Reconcile: compare metadata rows with the computes and tenants that actually exist, and
 //! repair what a lost job or a failed step left behind.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::Context;
-use cheladb_metadata::{DatabaseStatus, EndpointState, LiveDatabase};
-use cheladb_neon::ComputeBackend;
-use cheladb_types::DatabaseId;
+use cheladb_metadata::{
+    BranchKind, BranchStatus, DatabaseStatus, EndpointState, LiveBranch, LiveDatabase,
+};
+use cheladb_neon::{ComputeBackend, NeonId, StorconError};
+use cheladb_types::{BranchId, DatabaseId};
+use reqwest::StatusCode;
 use tracing::{info, warn};
 
 use crate::Worker;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
-use crate::provision::{new_compute_token, sha256_hex};
 
 pub const STALE_PROVISION_SECS: i64 = 600;
 pub const STALE_DELETE_SECS: i64 = 60;
@@ -21,30 +24,53 @@ pub const STALE_DELETE_SECS: i64 = 60;
 #[derive(Debug, Default)]
 pub struct Snapshot {
     pub databases: Vec<LiveDatabase>,
+    /// Every branch that isn't deleted, read alongside the databases.
+    pub branches: Vec<LiveBranch>,
     pub endpoints: Vec<EndpointState>,
     /// Endpoint ids of every labelled compute container, running or not.
     pub computes: HashSet<String>,
     /// Tenant ids on the storage controller.
     pub tenants: HashSet<String>,
+    /// Each tenant's timelines, listed with the tenants (so before the branches are read). A
+    /// tenant whose listing failed is absent, and none of its timelines is reported.
+    pub tenant_timelines: HashMap<String, HashSet<String>>,
+    /// The `pitr_interval` of each ready database's tenant. Absent when it was never set (or
+    /// couldn't be read), which counts as drift.
+    pub pitr: HashMap<String, Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Pending/provisioning for too long: fail it and tear down what it built.
     FailStale(DatabaseId),
+    /// A branch (not main) pending/provisioning for too long: fail it and tear it down.
+    FailStaleBranch(BranchId),
     /// Stuck in `deleting` (the delete job was lost): run the delete again.
     RetryDelete(DatabaseId),
-    /// A ready database's compute container is gone: start a new one.
-    RecreateCompute(String),
+    /// A branch (not main, database not deleting) stuck in `deleting`: run its delete again.
+    RetryBranchDelete(BranchId),
+    /// A branch `resetting` for too long: finish the reset or restore.
+    FinishSwitch(BranchId),
+    /// A ready `normal` branch's compute container is gone (main's included): start a new one.
+    RecreateBranchCompute(String),
     /// A reset stored a new password but didn't apply it: reset steps 2–4.
     ApplyPending(String),
     /// A compute with no endpoint row.
     RemoveCompute(String),
-    /// An endpoint row whose database is failed or deleted: a teardown that failed.
+    /// An endpoint row whose branch is failed or deleted: a teardown that failed.
     RetryTeardown(String),
+    /// A ready database's tenant has no `pitr_interval`, or not its `history_window`.
+    PatchHistoryWindow(DatabaseId),
+    /// A branch a restore failed while its detach was unresolved: it keeps its timeline,
+    /// endpoint and pending timeline (a detach may still be running on it). Logged; its
+    /// endpoint isn't torn down.
+    ReportStuckRestore(BranchId),
     /// A tenant no endpoint row records. Logged, never deleted: it may hold someone's data.
     ReportUnknownTenant(String),
-    /// An endpoint row no database links to. Logged only.
+    /// `(tenant, timeline)`: a timeline of a live database's tenant that no branch records
+    /// (as its timeline, pending or superseded). Logged, never deleted.
+    ReportUnknownTimeline(String, String),
+    /// An endpoint row no branch links to. Logged only.
     ReportEndpointWithoutDatabase(String),
 }
 
@@ -53,20 +79,33 @@ impl Action {
     fn rank(&self) -> u8 {
         match self {
             Action::FailStale(_) => 0,
-            Action::RetryDelete(_) => 1,
-            Action::RecreateCompute(_) => 2,
-            Action::ApplyPending(_) => 3,
-            Action::RemoveCompute(_) => 4,
-            Action::RetryTeardown(_) => 5,
-            Action::ReportUnknownTenant(_) => 6,
-            Action::ReportEndpointWithoutDatabase(_) => 7,
+            Action::FailStaleBranch(_) => 1,
+            Action::RetryDelete(_) => 2,
+            Action::RetryBranchDelete(_) => 3,
+            Action::FinishSwitch(_) => 4,
+            Action::RecreateBranchCompute(_) => 5,
+            Action::ApplyPending(_) => 6,
+            Action::RemoveCompute(_) => 7,
+            Action::RetryTeardown(_) => 8,
+            Action::PatchHistoryWindow(_) => 9,
+            Action::ReportStuckRestore(_) => 10,
+            Action::ReportUnknownTenant(_) => 11,
+            Action::ReportUnknownTimeline(..) => 12,
+            Action::ReportEndpointWithoutDatabase(_) => 13,
         }
     }
 
     fn subject(&self) -> String {
         match self {
-            Action::FailStale(id) | Action::RetryDelete(id) => id.to_string(),
-            Action::RecreateCompute(s)
+            Action::FailStale(id) | Action::RetryDelete(id) | Action::PatchHistoryWindow(id) => {
+                id.to_string()
+            }
+            Action::FailStaleBranch(id)
+            | Action::RetryBranchDelete(id)
+            | Action::FinishSwitch(id)
+            | Action::ReportStuckRestore(id) => id.to_string(),
+            Action::ReportUnknownTimeline(tenant, timeline) => format!("{tenant}/{timeline}"),
+            Action::RecreateBranchCompute(s)
             | Action::ApplyPending(s)
             | Action::RemoveCompute(s)
             | Action::RetryTeardown(s)
@@ -89,23 +128,75 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
             DatabaseStatus::Deleting if db.age_secs > STALE_DELETE_SECS => {
                 actions.push(Action::RetryDelete(db.id));
             }
+            // An unset `pitr_interval` counts as drift: that's how databases made before
+            // branching pick up the default window.
             DatabaseStatus::Ready => {
-                if let Some(ep) = &db.endpoint_id
-                    && !s.computes.contains(ep)
+                if let Some(tenant) = &db.neon_tenant_id
+                    && s.tenants.contains(tenant)
+                    && s.pitr.get(tenant) != Some(&db.history_window)
                 {
-                    actions.push(Action::RecreateCompute(ep.clone()));
+                    actions.push(Action::PatchHistoryWindow(db.id));
                 }
             }
             _ => {}
         }
     }
+    let deleting: HashSet<DatabaseId> = s
+        .databases
+        .iter()
+        .filter(|d| d.status == DatabaseStatus::Deleting)
+        .map(|d| d.id)
+        .collect();
+    for b in &s.branches {
+        // Main's provisioning and deletion are its database's (the rows above).
+        let is_main = b.id == BranchId::from(b.database_id);
+        match b.status {
+            BranchStatus::Pending | BranchStatus::Provisioning
+                if !is_main && b.age_secs > STALE_PROVISION_SECS =>
+            {
+                actions.push(Action::FailStaleBranch(b.id));
+            }
+            BranchStatus::Resetting if b.age_secs > STALE_PROVISION_SECS => {
+                actions.push(Action::FinishSwitch(b.id));
+            }
+            BranchStatus::Deleting
+                if !is_main
+                    && !deleting.contains(&b.database_id)
+                    && b.age_secs > STALE_DELETE_SECS =>
+            {
+                actions.push(Action::RetryBranchDelete(b.id));
+            }
+            BranchStatus::Failed if b.pending_timeline_id.is_some() => {
+                actions.push(Action::ReportStuckRestore(b.id));
+            }
+            // Backups have no compute.
+            BranchStatus::Ready if b.kind == BranchKind::Normal => {
+                if let Some(ep) = &b.endpoint_id
+                    && !s.computes.contains(ep)
+                {
+                    actions.push(Action::RecreateBranchCompute(ep.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    // A failed restore's branch still holds its data: its endpoint isn't a failed create's.
+    let kept: HashSet<BranchId> = s
+        .branches
+        .iter()
+        .filter(|b| b.status == BranchStatus::Failed && b.pending_timeline_id.is_some())
+        .map(|b| b.id)
+        .collect();
     for ep in &s.endpoints {
-        match ep.database_status {
+        if ep.branch_id.is_some_and(|b| kept.contains(&b)) {
+            continue;
+        }
+        match ep.branch_status {
             None => actions.push(Action::ReportEndpointWithoutDatabase(ep.id.clone())),
-            Some(DatabaseStatus::Ready) if ep.needs_reconfigure => {
+            Some(BranchStatus::Ready) if ep.needs_reconfigure => {
                 actions.push(Action::ApplyPending(ep.id.clone()));
             }
-            Some(DatabaseStatus::Failed | DatabaseStatus::Deleted) => {
+            Some(BranchStatus::Failed | BranchStatus::Deleted) => {
                 actions.push(Action::RetryTeardown(ep.id.clone()));
             }
             Some(_) => {}
@@ -123,6 +214,36 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
             actions.push(Action::ReportUnknownTenant(tenant.clone()));
         }
     }
+    // A timeline is known when any branch names it: as its timeline, or as the pending or
+    // superseded one of a reset or restore in flight.
+    let known_timelines: HashSet<&str> = s
+        .branches
+        .iter()
+        .flat_map(|b| {
+            [
+                b.timeline_id.as_deref(),
+                b.pending_timeline_id.as_deref(),
+                b.superseded_timeline_id.as_deref(),
+            ]
+        })
+        .flatten()
+        .collect();
+    let live_tenants: HashSet<&str> = s
+        .databases
+        .iter()
+        .filter(|d| d.status != DatabaseStatus::Deleting)
+        .filter_map(|d| d.neon_tenant_id.as_deref())
+        .collect();
+    for tenant in live_tenants {
+        for timeline in s.tenant_timelines.get(tenant).into_iter().flatten() {
+            if !known_timelines.contains(timeline.as_str()) {
+                actions.push(Action::ReportUnknownTimeline(
+                    tenant.to_string(),
+                    timeline.clone(),
+                ));
+            }
+        }
+    }
     actions.sort_by_cached_key(|a| (a.rank(), a.subject()));
     actions
 }
@@ -137,6 +258,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 {
     /// One reconcile pass. `Err` only when observing fails; each action's error is logged
     /// and the next action still runs.
+    ///
+    /// Serial on purpose. Each recreated compute (`RecreateBranchCompute`, `FinishSwitch`) is
+    /// waited for, up to `ready_timeout` (60 s in production), so after a mass outage one pass
+    /// can take minutes; the 30 s timer then fires the next pass straight after.
     pub async fn reconcile_once(&self) -> Result<(), String> {
         let snapshot = self.observe().await.map_err(|e| format!("{e:#}"))?;
         for action in plan(&snapshot) {
@@ -148,8 +273,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         Ok(())
     }
 
-    /// In this order: rows are written before their compute or tenant exists, so anything
-    /// seen first already has its row by the time the rows are read.
+    /// In this order: rows are written before their compute, tenant or timeline exists, so
+    /// anything seen first already has its row by the time the rows are read. A timeline is
+    /// dropped the other way round (cleared, then deleted), so one being dropped can be
+    /// reported once as unknown; that's only a log line.
     async fn observe(&self) -> anyhow::Result<Snapshot> {
         let computes = self.computes.list().await.context("listing computes")?;
         let tenants = self
@@ -157,21 +284,65 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .list_tenant_ids()
             .await
             .context("listing tenants")?;
+        // With the tenants, before the rows. One call per tenant, serially.
+        let mut tenant_timelines = HashMap::new();
+        for tenant in &tenants {
+            match self.storage.list_timelines(tenant).await {
+                Ok(timelines) => {
+                    let timelines = timelines.iter().map(|t| t.as_str().to_string()).collect();
+                    tenant_timelines.insert(tenant.as_str().to_string(), timelines);
+                }
+                // Deleted since it was listed.
+                Err(StorconError::Rejected { status, .. }) if status == StatusCode::NOT_FOUND => {}
+                Err(err) => {
+                    warn!(tenant_id = %tenant, "listing timelines: {err:#}; not checking them this pass");
+                }
+            }
+        }
         let databases = self
             .metadata
             .list_live_for_reconcile()
             .await
             .context("listing databases")?;
+        let branches = self
+            .metadata
+            .list_live_branches_for_reconcile()
+            .await
+            .context("listing branches")?;
         let endpoints = self
             .metadata
             .list_endpoints_for_reconcile()
             .await
             .context("listing endpoints")?;
+        let tenants: HashSet<String> = tenants.iter().map(|t| t.as_str().to_string()).collect();
+        // Only the tenants `plan` may patch: ready databases' tenants on the controller.
+        let mut pitr = HashMap::new();
+        for tenant in databases
+            .iter()
+            .filter(|d| d.status == DatabaseStatus::Ready)
+            .filter_map(|d| d.neon_tenant_id.as_deref())
+            .filter(|t| tenants.contains(*t))
+        {
+            let Ok(id) = tenant.parse::<NeonId>() else {
+                continue;
+            };
+            match self.storage.tenant_pitr_interval(&id).await {
+                Ok(Some(interval)) => {
+                    pitr.insert(tenant.to_string(), interval);
+                }
+                Ok(None) => {}
+                // Left absent: `plan` patches it, which is harmless if it was in sync.
+                Err(err) => warn!(tenant_id = %tenant, "reading pitr_interval: {err:#}"),
+            }
+        }
         Ok(Snapshot {
             databases,
+            branches,
             endpoints,
             computes: computes.into_iter().collect(),
-            tenants: tenants.iter().map(|t| t.as_str().to_string()).collect(),
+            tenants,
+            tenant_timelines,
+            pitr,
         })
     }
 
@@ -187,30 +358,23 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 if !failed {
                     return Ok(());
                 }
-                let record = self
+                let main = self
                     .metadata
-                    .get_database(*id)
+                    .get_branch(BranchId::from(*id))
                     .await
                     .map_err(|e| e.to_string())?;
-                match record.and_then(|r| r.endpoint_id) {
+                match main.and_then(|b| b.endpoint_id) {
                     Some(ep) => self.retry_teardown(&ep).await,
                     None => Ok(()),
                 }
             }
+            Action::FailStaleBranch(id) => self.fail_stale_branch(*id).await,
             Action::RetryDelete(id) => self.handle_delete(*id).await,
-            Action::RecreateCompute(ep) => {
-                // The hash first: the new compute's first spec request must already pass.
-                let token = new_compute_token();
-                self.metadata
-                    .replace_compute_token(ep, &sha256_hex(&token))
-                    .await
-                    .map_err(|e| format!("replacing the compute token: {e}"))?;
-                self.computes
-                    .create(ep, &token)
-                    .await
-                    .map_err(|e| format!("starting compute: {e:#}"))
-            }
-            // After a RecreateCompute in the same pass, the push can reach the new container
+            // Refused (the refusal recorded, the branch left as it is) while it has children.
+            Action::RetryBranchDelete(id) => self.handle_branch_delete(*id).await,
+            Action::FinishSwitch(id) => self.finish_switch(*id).await,
+            Action::RecreateBranchCompute(ep) => self.recreate_compute(ep).await,
+            // After a RecreateBranchCompute in the same pass, the push can reach the new container
             // before compute_ctl listens and fail. That heals itself: the flag stays set, the
             // next pass retries, and meanwhile the new compute boots with the current spec.
             Action::ApplyPending(ep) => self.apply_pending(ep).await.map_err(|e| format!("{e:#}")),
@@ -220,6 +384,27 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(|e| format!("removing compute: {e:#}")),
             Action::RetryTeardown(ep) => self.retry_teardown(ep).await,
+            Action::PatchHistoryWindow(db) => self.handle_database_settings(*db).await,
+            Action::ReportUnknownTimeline(tenant, timeline) => {
+                warn!(
+                    tenant_id = %tenant,
+                    timeline_id = %timeline,
+                    "timeline has no branch; keeping it. It may be left from a crash between \
+                     clearing a pending timeline and deleting it; delete it by hand once you're \
+                     sure nothing needs it"
+                );
+                Ok(())
+            }
+            Action::ReportStuckRestore(id) => {
+                info!(
+                    branch_id = %id,
+                    "a restore of this branch failed with its detach unresolved; keeping the \
+                     branch, its compute and its pending timeline. Once the storage controller \
+                     shows no detach running, delete the pending timeline by hand, or delete \
+                     the branch"
+                );
+                Ok(())
+            }
             Action::ReportUnknownTenant(tenant) => {
                 warn!(
                     tenant_id = %tenant,
@@ -240,59 +425,177 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
     }
 
-    /// Teardown for an endpoint row, if it's still there.
+    /// Fails a branch that's still stale when written (a job may have picked it up since the
+    /// snapshot), then tears down what its create built. Never the tenant.
+    async fn fail_stale_branch(&self, id: BranchId) -> Result<(), String> {
+        let failed = self
+            .metadata
+            .fail_branch_if_stale(id, STALE_PROVISION_SECS)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !failed {
+            return Ok(());
+        }
+        let branch = self
+            .metadata
+            .get_branch(id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(branch) = branch else {
+            return Ok(());
+        };
+        let tenant = self.tenant_of(branch.database_id).await?;
+        // A failure here leaves the endpoint row; `RetryTeardown` finishes it.
+        self.teardown_branch(&branch, tenant.as_ref()).await
+    }
+
+    /// Teardown for an endpoint row, if it's still there. The tenant goes with it only when
+    /// it holds no other timeline (main's failed provision); a branch's endpoint takes only its
+    /// own timeline, since main and the other branches live in the same tenant.
     async fn retry_teardown(&self, endpoint_id: &str) -> Result<(), String> {
         let endpoint = self
             .metadata
             .neon_endpoint(endpoint_id)
             .await
             .map_err(|e| e.to_string())?;
-        match endpoint {
-            Some(endpoint) => self.teardown(&endpoint.id, &endpoint.tenant_id).await,
-            None => Ok(()),
+        let Some(endpoint) = endpoint else {
+            return Ok(());
+        };
+        let tenant: NeonId = endpoint
+            .tenant_id
+            .parse()
+            .map_err(|e| format!("tenant id {:?}: {e}", endpoint.tenant_id))?;
+        let timelines = match self.storage.list_timelines(&tenant).await {
+            Ok(timelines) => timelines,
+            // The tenant is gone already.
+            Err(StorconError::Rejected { status, .. }) if status == StatusCode::NOT_FOUND => {
+                Vec::new()
+            }
+            Err(err) => return Err(format!("listing timelines: {err:#}")),
+        };
+        if timelines.iter().all(|t| t.as_str() == endpoint.timeline_id) {
+            self.teardown(&endpoint.id, &endpoint.tenant_id).await
+        } else {
+            self.teardown_branch_parts(
+                Some(&endpoint.id),
+                Some(&tenant),
+                &[endpoint.timeline_id.as_str()],
+            )
+            .await
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use cheladb_neon::NeonId;
+    use cheladb_metadata::BranchKind;
 
     use super::*;
-    use crate::fakes::{FakeWorker, Journal, entries, position, worker};
+    use crate::fakes::{
+        FRESH_HEAD, FakeWorker, Journal, entries, pending_branch, position, ready_branch,
+        ready_database, worker,
+    };
+    use crate::provision::sha256_hex;
 
     const EP: &str = "ep-0123456789ab";
     const EP2: &str = "ep-ba9876543210";
+    /// `dev`'s endpoint.
+    const EP3: &str = "ep-0000000000d1";
     const TENANT: &str = "0123456789abcdef0123456789abcdef";
+    const MAIN_TL: &str = "11111111111111111111111111111111";
+    const DEV_TL: &str = "22222222222222222222222222222222";
+    const PENDING_TL: &str = "33333333333333333333333333333333";
+    const WEEK: Duration = Duration::from_secs(7 * 24 * 3600);
 
+    /// A database in `TENANT` with the default history window.
     fn db(status: DatabaseStatus, endpoint_id: Option<&str>, age_secs: i64) -> LiveDatabase {
         LiveDatabase {
             id: DatabaseId::new(),
             status,
             endpoint_id: endpoint_id.map(str::to_string),
+            neon_tenant_id: Some(TENANT.to_string()),
+            history_window: WEEK,
             age_secs,
         }
     }
 
+    /// `id`, linked to `db`'s main branch (which has the database's status).
     fn endpoint(id: &str, db: Option<&LiveDatabase>, needs_reconfigure: bool) -> EndpointState {
         EndpointState {
             id: id.to_string(),
             tenant_id: TENANT.to_string(),
-            database_id: db.map(|d| d.id),
-            database_status: db.map(|d| d.status),
+            branch_id: db.map(|d| BranchId::from(d.id)),
+            branch_status: db.map(|d| BranchStatus::from(d.status)),
             needs_reconfigure,
         }
     }
 
-    /// `db` with its endpoint `EP`, its compute and its tenant.
+    /// `db`'s main branch on `MAIN_TL`, with the database's status, endpoint and age.
+    fn main_of(db: &LiveDatabase) -> LiveBranch {
+        LiveBranch {
+            id: BranchId::from(db.id),
+            database_id: db.id,
+            kind: BranchKind::Normal,
+            status: BranchStatus::from(db.status),
+            endpoint_id: db.endpoint_id.clone(),
+            timeline_id: Some(MAIN_TL.to_string()),
+            pending_timeline_id: None,
+            superseded_timeline_id: None,
+            age_secs: db.age_secs,
+        }
+    }
+
+    /// `db` with its main branch, its endpoint `EP`, its compute, its tenant (holding main's
+    /// timeline) and the tenant's history window in sync.
     fn linked(db: LiveDatabase, needs_reconfigure: bool) -> Snapshot {
         let ep = endpoint(EP, Some(&db), needs_reconfigure);
         Snapshot {
+            branches: vec![main_of(&db)],
             databases: vec![db],
             endpoints: vec![ep],
             computes: [EP.to_string()].into(),
             tenants: [TENANT.to_string()].into(),
+            tenant_timelines: [(TENANT.to_string(), [MAIN_TL.to_string()].into())].into(),
+            pitr: [(TENANT.to_string(), WEEK)].into(),
         }
+    }
+
+    /// A ready database, plus `dev`: a `normal` branch of main with the endpoint `EP3` (and its
+    /// compute) on `DEV_TL`.
+    fn with_dev(status: BranchStatus, age_secs: i64) -> (Snapshot, BranchId) {
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        let dev = LiveBranch {
+            id: BranchId::new(),
+            database_id: s.databases[0].id,
+            kind: BranchKind::Normal,
+            status,
+            endpoint_id: Some(EP3.to_string()),
+            timeline_id: Some(DEV_TL.to_string()),
+            pending_timeline_id: None,
+            superseded_timeline_id: None,
+            age_secs,
+        };
+        s.endpoints.push(EndpointState {
+            id: EP3.to_string(),
+            tenant_id: TENANT.to_string(),
+            branch_id: Some(dev.id),
+            branch_status: Some(status),
+            needs_reconfigure: false,
+        });
+        s.computes.insert(EP3.to_string());
+        timelines(&mut s).insert(DEV_TL.to_string());
+        let id = dev.id;
+        s.branches.push(dev);
+        (s, id)
+    }
+
+    fn branch_mut(s: &mut Snapshot, id: BranchId) -> &mut LiveBranch {
+        s.branches.iter_mut().find(|b| b.id == id).unwrap()
+    }
+
+    /// `TENANT`'s timelines.
+    fn timelines(s: &mut Snapshot) -> &mut HashSet<String> {
+        s.tenant_timelines.get_mut(TENANT).unwrap()
     }
 
     #[test]
@@ -331,7 +634,7 @@ mod tests {
     fn a_ready_database_without_its_compute_gets_a_new_one() {
         let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
         s.computes.clear();
-        assert_eq!(plan(&s), [Action::RecreateCompute(EP.to_string())]);
+        assert_eq!(plan(&s), [Action::RecreateBranchCompute(EP.to_string())]);
     }
 
     #[test]
@@ -422,20 +725,214 @@ mod tests {
         let stale_id = stale.id;
         let s = Snapshot {
             endpoints: vec![endpoint(EP, Some(&ready), true)],
+            branches: vec![main_of(&ready)],
             databases: vec![ready, stale],
             computes: [EP2.to_string()].into(),
             tenants: ["fedcba9876543210fedcba9876543210".to_string()].into(),
+            ..Default::default()
         };
         assert_eq!(
             plan(&s),
             [
                 Action::FailStale(stale_id),
-                Action::RecreateCompute(EP.to_string()),
+                Action::RecreateBranchCompute(EP.to_string()),
                 Action::ApplyPending(EP.to_string()),
                 Action::RemoveCompute(EP2.to_string()),
                 Action::ReportUnknownTenant("fedcba9876543210fedcba9876543210".to_string()),
             ]
         );
+    }
+
+    // --- Branches (step 5) ---------------------------------------------------------------
+
+    #[test]
+    fn a_stale_branch_create_fails() {
+        for status in [BranchStatus::Pending, BranchStatus::Provisioning] {
+            let (s, _) = with_dev(status, STALE_PROVISION_SECS);
+            assert!(plan(&s).is_empty(), "{status:?}");
+            // Its compute may not exist yet: failing it is all there is to do.
+            let (mut s, dev) = with_dev(status, STALE_PROVISION_SECS + 1);
+            s.computes.remove(EP3);
+            assert_eq!(plan(&s), [Action::FailStaleBranch(dev)], "{status:?}");
+        }
+        // Main's staleness is its database's.
+        let row = db(
+            DatabaseStatus::Provisioning,
+            Some(EP),
+            STALE_PROVISION_SECS + 1,
+        );
+        let id = row.id;
+        assert_eq!(plan(&linked(row, false)), [Action::FailStale(id)]);
+    }
+
+    #[test]
+    fn a_stale_reset_is_finished() {
+        let (mut s, dev) = with_dev(BranchStatus::Resetting, STALE_PROVISION_SECS);
+        // Its compute is stopped mid-switch: not a missing compute to recreate.
+        s.computes.remove(EP3);
+        assert!(plan(&s).is_empty());
+        branch_mut(&mut s, dev).age_secs = STALE_PROVISION_SECS + 1;
+        assert_eq!(plan(&s), [Action::FinishSwitch(dev)]);
+        // Main can be restored too.
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        let main = s.branches[0].id;
+        branch_mut(&mut s, main).status = BranchStatus::Resetting;
+        branch_mut(&mut s, main).age_secs = STALE_PROVISION_SECS + 1;
+        assert_eq!(plan(&s), [Action::FinishSwitch(main)]);
+    }
+
+    #[test]
+    fn a_lost_branch_delete_is_retried_after_a_minute() {
+        let (s, _) = with_dev(BranchStatus::Deleting, STALE_DELETE_SECS);
+        assert!(plan(&s).is_empty());
+        let (s, dev) = with_dev(BranchStatus::Deleting, STALE_DELETE_SECS + 1);
+        assert_eq!(plan(&s), [Action::RetryBranchDelete(dev)]);
+        // A deleting database's branches (main's included) go with the database's delete.
+        let (mut s, _) = with_dev(BranchStatus::Deleting, STALE_DELETE_SECS + 1);
+        s.databases[0].status = DatabaseStatus::Deleting;
+        s.databases[0].age_secs = STALE_DELETE_SECS + 1;
+        let main = s.branches[0].id;
+        branch_mut(&mut s, main).status = BranchStatus::Deleting;
+        branch_mut(&mut s, main).age_secs = STALE_DELETE_SECS + 1;
+        assert_eq!(plan(&s), [Action::RetryDelete(s.databases[0].id)]);
+    }
+
+    #[test]
+    fn a_ready_branch_without_its_compute_gets_a_new_one() {
+        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        s.computes.remove(EP3);
+        assert_eq!(plan(&s), [Action::RecreateBranchCompute(EP3.to_string())]);
+        // Main and a branch, both gone: one action each.
+        s.computes.remove(EP);
+        assert_eq!(
+            plan(&s),
+            [
+                Action::RecreateBranchCompute(EP3.to_string()),
+                Action::RecreateBranchCompute(EP.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_endpoint_of_a_failed_branch_is_torn_down() {
+        let (s, _) = with_dev(BranchStatus::Failed, 3600);
+        assert_eq!(plan(&s), [Action::RetryTeardown(EP3.to_string())]);
+    }
+
+    #[test]
+    fn a_failed_branch_with_a_pending_timeline_is_reported_not_torn_down() {
+        // A restore gave up on a detach that may still be running: its data is on DEV_TL.
+        let (mut s, dev) = with_dev(BranchStatus::Failed, 3600);
+        branch_mut(&mut s, dev).pending_timeline_id = Some(PENDING_TL.to_string());
+        timelines(&mut s).insert(PENDING_TL.to_string());
+        assert_eq!(plan(&s), [Action::ReportStuckRestore(dev)]);
+    }
+
+    #[test]
+    fn a_tenant_whose_history_window_drifted_is_patched() {
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        let id = s.databases[0].id;
+        s.pitr
+            .insert(TENANT.to_string(), Duration::from_secs(24 * 3600));
+        assert_eq!(plan(&s), [Action::PatchHistoryWindow(id)]);
+        // Never set, as on every tenant made before step 5.
+        s.pitr.clear();
+        assert_eq!(plan(&s), [Action::PatchHistoryWindow(id)]);
+        // The database's window changed.
+        s.pitr.insert(TENANT.to_string(), WEEK);
+        s.databases[0].history_window = Duration::from_secs(3600);
+        assert_eq!(plan(&s), [Action::PatchHistoryWindow(id)]);
+        // Provisioning applies it itself; a tenant that isn't there can't be patched.
+        let mut s = linked(db(DatabaseStatus::Provisioning, Some(EP), 5), false);
+        s.pitr.clear();
+        assert!(plan(&s).is_empty());
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        s.pitr.clear();
+        s.tenants.clear();
+        s.tenant_timelines.clear();
+        assert!(plan(&s).is_empty());
+    }
+
+    // Deleting storage on a guess can't be undone.
+    #[test]
+    fn unknown_timelines_are_reported_never_deleted() {
+        let stray = "33333333333333333333333333333333";
+        let (pending, superseded) = (
+            "44444444444444444444444444444444",
+            "55555555555555555555555555555555",
+        );
+        let (mut s, dev) = with_dev(BranchStatus::Resetting, 5);
+        branch_mut(&mut s, dev).pending_timeline_id = Some(pending.to_string());
+        branch_mut(&mut s, dev).superseded_timeline_id = Some(superseded.to_string());
+        timelines(&mut s).extend([stray, pending, superseded].map(str::to_string));
+        assert_eq!(
+            plan(&s),
+            [Action::ReportUnknownTimeline(
+                TENANT.to_string(),
+                stray.to_string()
+            )]
+        );
+        // A deleting database's tenant is on its way out; an unknown tenant is reported whole.
+        let (mut s, _) = with_dev(BranchStatus::Deleting, 5);
+        s.databases[0].status = DatabaseStatus::Deleting;
+        s.databases[0].age_secs = 5;
+        timelines(&mut s).insert(stray.to_string());
+        assert!(plan(&s).is_empty());
+        let other = "fedcba9876543210fedcba9876543210";
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        s.tenants.insert(other.to_string());
+        s.tenant_timelines
+            .insert(other.to_string(), [stray.to_string()].into());
+        assert_eq!(plan(&s), [Action::ReportUnknownTenant(other.to_string())]);
+    }
+
+    #[test]
+    fn a_fresh_branch_is_left_alone() {
+        // Before its endpoint and timeline are recorded.
+        let (mut s, dev) = with_dev(BranchStatus::Pending, 5);
+        s.endpoints.retain(|e| e.id != EP3);
+        s.computes.remove(EP3);
+        timelines(&mut s).remove(DEV_TL);
+        branch_mut(&mut s, dev).endpoint_id = None;
+        branch_mut(&mut s, dev).timeline_id = None;
+        assert!(plan(&s).is_empty());
+        // Recorded; the timeline is made but the compute isn't started yet.
+        let (mut s, _) = with_dev(BranchStatus::Provisioning, 5);
+        s.computes.remove(EP3);
+        assert!(plan(&s).is_empty());
+        // Recorded, not yet created: a listing taken before the row was written.
+        let (mut s, _) = with_dev(BranchStatus::Provisioning, 5);
+        timelines(&mut s).remove(DEV_TL);
+        assert!(plan(&s).is_empty());
+        // Mid-reset: the pending timeline exists and the compute is stopped.
+        let (mut s, dev) = with_dev(BranchStatus::Resetting, 5);
+        let pending = "44444444444444444444444444444444";
+        branch_mut(&mut s, dev).pending_timeline_id = Some(pending.to_string());
+        timelines(&mut s).insert(pending.to_string());
+        s.computes.remove(EP3);
+        assert!(plan(&s).is_empty());
+        // Being deleted by its job.
+        let (mut s, _) = with_dev(BranchStatus::Deleting, 5);
+        s.computes.remove(EP3);
+        assert!(plan(&s).is_empty());
+    }
+
+    #[test]
+    fn backups_have_no_compute_and_need_nothing() {
+        let backup_tl = "66666666666666666666666666666666";
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        let main = s.branches[0].clone();
+        s.branches.push(LiveBranch {
+            id: BranchId::new(),
+            kind: BranchKind::Backup,
+            status: BranchStatus::Ready,
+            endpoint_id: None,
+            timeline_id: Some(backup_tl.to_string()),
+            age_secs: 7 * 24 * 3600,
+            ..main
+        });
+        timelines(&mut s).insert(backup_tl.to_string());
+        assert!(plan(&s).is_empty());
     }
 
     #[test]
@@ -456,7 +953,7 @@ mod tests {
     async fn provision(w: &FakeWorker, journal: &Journal) -> (DatabaseId, String) {
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         w.handle_provision(id, "app").await.unwrap();
-        let ep = w.metadata.database(id).endpoint_id.unwrap();
+        let ep = w.metadata.main(id).endpoint_id.unwrap();
         journal.lock().unwrap().clear();
         (id, ep)
     }
@@ -491,7 +988,7 @@ mod tests {
         let (w, journal) = worker();
         let (id, ep) = provision(&w, &journal).await;
         *w.pusher.fail.lock().unwrap() = Some("compute_ctl said 500".into());
-        w.reset_password(id).await.unwrap_err();
+        w.reset_password(BranchId::from(id)).await.unwrap_err();
         assert!(w.metadata.state().endpoints[&ep].needs_reconfigure);
         *w.pusher.fail.lock().unwrap() = None;
         journal.lock().unwrap().clear();
@@ -512,7 +1009,7 @@ mod tests {
         let (w, journal) = worker();
         let (id, ep) = provision(&w, &journal).await;
         *w.pusher.fail.lock().unwrap() = Some("compute_ctl said 500".into());
-        w.reset_password(id).await.unwrap_err();
+        w.reset_password(BranchId::from(id)).await.unwrap_err();
         *w.pusher.fail.lock().unwrap() = None;
         w.computes.insert(EP2);
         let held = w.metadata.lock_endpoint(&ep).await.unwrap();
@@ -539,12 +1036,15 @@ mod tests {
         {
             let mut state = w.metadata.state();
             state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Provisioning;
+            state.branches.get_mut(&BranchId::from(id)).unwrap().status =
+                BranchStatus::Provisioning;
             state.ages.insert(id, STALE_PROVISION_SECS + 1);
         }
 
         w.reconcile_once().await.unwrap();
 
         assert_eq!(w.metadata.database(id).status, DatabaseStatus::Failed);
+        assert_eq!(w.metadata.main(id).status, BranchStatus::Failed);
         assert!(w.metadata.endpoint_ids().is_empty());
         assert!(!w.storage.has_tenant(&tenant));
         assert_eq!(w.computes.list().await.unwrap(), Vec::<String>::new());
@@ -603,5 +1103,557 @@ mod tests {
         let (w, _journal) = worker();
         w.metadata.state().fail = Some("list_endpoints_for_reconcile");
         assert!(w.reconcile_once().await.is_err());
+    }
+
+    // Ruling 3 (step 5): a branch's leftover endpoint is torn down with its timeline, never
+    // the tenant, which main and the other branches live in.
+    #[tokio::test]
+    async fn a_failed_branch_teardown_keeps_the_tenant() {
+        let (w, journal) = worker();
+        let db = crate::fakes::ready_database(&w).await;
+        let main = w.metadata.main(db);
+        let dev = crate::fakes::pending_branch(&w, db, "dev", main.id);
+        // The compute fails, and so does the teardown after it: the endpoint row stays.
+        *w.computes.fail_create.lock().unwrap() = Some("no docker".into());
+        *w.storage.fail.lock().unwrap() = Some("delete_timeline");
+        w.handle_branch_create(dev, None).await.unwrap();
+        let branch = w.metadata.branch(dev);
+        assert_eq!(branch.status, BranchStatus::Failed);
+        let (dev_ep, dev_timeline) = (branch.endpoint_id.unwrap(), branch.timeline_id.unwrap());
+        *w.computes.fail_create.lock().unwrap() = None;
+        *w.storage.fail.lock().unwrap() = None;
+        let tenant = w.metadata.database(db).neon_tenant_id.unwrap();
+        journal.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(w.storage.has_tenant(&tenant), "{:?}", entries(&journal));
+        assert!(position(&journal, "storage.delete_tenant").is_none());
+        assert!(position(&journal, &format!("storage.delete_timeline {dev_timeline}")).is_some());
+        let main_ep = main.endpoint_id.unwrap();
+        assert_eq!(w.metadata.endpoint_ids(), std::slice::from_ref(&main_ep));
+        assert_eq!(w.storage.timeline_ids(), [main.timeline_id.unwrap()]);
+        assert_eq!(w.computes.list().await.unwrap(), [main_ep]);
+        assert!(!w.computes.list().await.unwrap().contains(&dev_ep));
+        assert_eq!(w.metadata.database(db).status, DatabaseStatus::Ready);
+    }
+
+    // --- Branches, over the fakes (step 5) -----------------------------------------------
+
+    /// A ready database and a ready branch `dev` of main; the journal starts empty.
+    struct Dev {
+        db: DatabaseId,
+        dev: BranchId,
+        tenant: String,
+        main_timeline: String,
+        dev_timeline: String,
+        ep: String,
+    }
+
+    async fn dev_setup(w: &FakeWorker, journal: &Journal) -> Dev {
+        let db = ready_database(w).await;
+        let main = w.metadata.main(db);
+        let dev = ready_branch(w, db, "dev", main.id).await;
+        let b = w.metadata.branch(dev);
+        journal.lock().unwrap().clear();
+        Dev {
+            db,
+            dev,
+            tenant: w.metadata.database(db).neon_tenant_id.unwrap(),
+            main_timeline: main.timeline_id.unwrap(),
+            dev_timeline: b.timeline_id.unwrap(),
+            ep: b.endpoint_id.unwrap(),
+        }
+    }
+
+    fn set_branch(w: &FakeWorker, id: BranchId, status: BranchStatus, age_secs: i64) {
+        let mut state = w.metadata.state();
+        state.branches.get_mut(&id).unwrap().status = status;
+        state.branch_ages.insert(id, age_secs);
+    }
+
+    /// What a reset of `dev` leaves when it crashes after creating its pending timeline (from
+    /// main's head) and stopping the compute: returns the pending timeline.
+    fn crash_before_switch(w: &FakeWorker, d: &Dev) -> String {
+        let pending = NeonId::new();
+        w.storage
+            .insert_timeline(&d.tenant, pending.as_str(), FRESH_HEAD);
+        w.metadata
+            .state()
+            .branches
+            .get_mut(&d.dev)
+            .unwrap()
+            .pending_timeline_id = Some(pending.as_str().to_string());
+        w.computes.remove(&d.ep);
+        set_branch(w, d.dev, BranchStatus::Resetting, STALE_PROVISION_SECS + 1);
+        pending.as_str().to_string()
+    }
+
+    fn endpoint_timeline(w: &FakeWorker, ep: &str) -> String {
+        w.metadata.state().endpoints[ep]
+            .endpoint
+            .timeline_id
+            .clone()
+    }
+
+    // Review Focus 2: a crash between the switch and deleting the old timeline. Reconcile
+    // recreates the compute on the new timeline (if the crash came before that), deletes the
+    // superseded timeline, and only then clears it. No timeline leaks, and the branch never
+    // names a missing one.
+    #[tokio::test]
+    async fn finish_switch_after_a_crash_between_switch_and_delete() {
+        for compute_restarted in [false, true] {
+            let (w, journal) = worker();
+            let d = dev_setup(&w, &journal).await;
+            let old_hash = w.metadata.state().endpoints[&d.ep]
+                .endpoint
+                .compute_token_sha256
+                .clone();
+            let new = crash_before_switch(&w, &d);
+            let switched = futures_util::FutureExt::now_or_never(
+                w.metadata.switch_to_pending_timeline(d.dev, &new, None),
+            )
+            .expect("the fake never waits");
+            assert!(switched.unwrap());
+            if compute_restarted {
+                w.computes.insert(&d.ep);
+            }
+            set_branch(&w, d.dev, BranchStatus::Resetting, STALE_PROVISION_SECS + 1);
+            journal.lock().unwrap().clear();
+
+            w.reconcile_once().await.unwrap();
+
+            let dev = w.metadata.branch(d.dev);
+            let ctx = format!("{compute_restarted}: {:?}", entries(&journal));
+            assert_eq!(dev.status, BranchStatus::Ready, "{ctx}");
+            assert_eq!(dev.error, None, "{ctx}");
+            assert_eq!(dev.timeline_id.as_deref(), Some(new.as_str()), "{ctx}");
+            assert_eq!(dev.pending_timeline_id, None, "{ctx}");
+            assert_eq!(dev.superseded_timeline_id, None, "{ctx}");
+            assert_eq!(endpoint_timeline(&w, &d.ep), new, "{ctx}");
+            assert!(w.storage.timeline(&d.tenant, &new).is_some(), "{ctx}");
+            assert!(
+                w.storage.timeline(&d.tenant, &d.dev_timeline).is_none(),
+                "{ctx}"
+            );
+            assert!(w.computes.list().await.unwrap().contains(&d.ep), "{ctx}");
+            let delete_old = pos(
+                &journal,
+                &format!("storage.delete_timeline {}", d.dev_timeline),
+            );
+            assert!(
+                delete_old < pos(&journal, "metadata.clear_superseded_timeline"),
+                "{ctx}"
+            );
+            if compute_restarted {
+                assert!(position(&journal, "compute.create").is_none(), "{ctx}");
+            } else {
+                // On the new timeline before the old one goes, with a fresh token.
+                assert!(
+                    pos(&journal, &format!("compute.create {}", d.ep)) < delete_old,
+                    "{ctx}"
+                );
+                let token = w.computes.token_of(&d.ep).unwrap();
+                assert_eq!(
+                    sha256_hex(&token),
+                    w.metadata.state().endpoints[&d.ep]
+                        .endpoint
+                        .compute_token_sha256
+                );
+                assert_ne!(sha256_hex(&token), old_hash);
+            }
+            // Only main's and dev's timelines remain.
+            let mut expected = vec![d.main_timeline.clone(), new.clone()];
+            expected.sort();
+            assert_eq!(w.storage.timeline_ids(), expected, "{ctx}");
+        }
+    }
+
+    // A crash between creating the pending timeline and the switch: the pending timeline is
+    // cleared (compare-and-swap) before it's deleted, the compute comes back on the old
+    // timeline, and the branch is ready again.
+    #[tokio::test]
+    async fn finish_switch_after_a_crash_between_create_and_switch() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let pending = crash_before_switch(&w, &d);
+        w.metadata.state().branches.get_mut(&d.dev).unwrap().error =
+            Some("creating timeline: earlier".into());
+
+        w.reconcile_once().await.unwrap();
+
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", entries(&journal));
+        assert_eq!(dev.timeline_id.as_deref(), Some(d.dev_timeline.as_str()));
+        assert_eq!(dev.pending_timeline_id, None);
+        // The reset didn't happen: its error stays.
+        assert_eq!(dev.error.as_deref(), Some("creating timeline: earlier"));
+        assert!(w.storage.timeline(&d.tenant, &pending).is_none());
+        assert!(
+            pos(&journal, "metadata.swap_pending_timeline")
+                < pos(&journal, &format!("storage.delete_timeline {pending}"))
+        );
+        assert!(w.computes.list().await.unwrap().contains(&d.ep));
+        assert_eq!(endpoint_timeline(&w, &d.ep), d.dev_timeline);
+    }
+
+    // The common case: the interrupted attempt recorded no error of its own, so the branch
+    // says it was interrupted.
+    #[tokio::test]
+    async fn finish_switch_says_an_attempt_that_left_no_error_was_interrupted() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        crash_before_switch(&w, &d);
+
+        w.reconcile_once().await.unwrap();
+
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", entries(&journal));
+        assert_eq!(dev.timeline_id.as_deref(), Some(d.dev_timeline.as_str()));
+        assert_eq!(
+            dev.error.as_deref(),
+            Some(crate::branch_switch::INTERRUPTED)
+        );
+        assert_eq!(
+            crate::branch_switch::INTERRUPTED,
+            "The last reset or restore was interrupted before it switched timelines; the \
+             branch is unchanged. Try again."
+        );
+    }
+
+    // What the attempt left is read under the claim: an error recorded after the first read
+    // (here, just before the claim) is kept, not overwritten as an interruption.
+    #[tokio::test]
+    async fn finish_switch_reads_the_branch_again_under_its_claim() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        crash_before_switch(&w, &d);
+        let dev = d.dev;
+        w.metadata.state().before_claim_stale_reset = Some(Box::new(move |state| {
+            state.branches.get_mut(&dev).unwrap().error =
+                Some("creating timeline: recorded late".into());
+        }));
+
+        w.reconcile_once().await.unwrap();
+
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", entries(&journal));
+        assert_eq!(
+            dev.error.as_deref(),
+            Some("creating timeline: recorded late")
+        );
+    }
+
+    // Ruling 1: when the swap fails, another run (here a delete) owns the pending timeline,
+    // and reconcile leaves it alone.
+    #[tokio::test]
+    async fn finish_switch_leaves_a_pending_timeline_it_could_not_clear() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let pending = crash_before_switch(&w, &d);
+        w.metadata.state().delete_before_write = Some(("swap_pending_timeline", d.dev));
+
+        w.reconcile_once().await.unwrap();
+
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Deleting);
+        assert_eq!(dev.pending_timeline_id.as_deref(), Some(pending.as_str()));
+        assert!(w.storage.timeline(&d.tenant, &pending).is_some());
+        assert!(
+            position(&journal, &format!("storage.delete_timeline {pending}")).is_none(),
+            "{:?}",
+            entries(&journal)
+        );
+        assert!(position(&journal, "compute.create").is_none());
+    }
+
+    // A pending timeline that can't be deleted is recorded again (so the next pass retries
+    // it), the compute comes back on the old timeline, and the branch stays resetting.
+    #[tokio::test]
+    async fn finish_switch_keeps_a_pending_timeline_it_could_not_delete() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let pending = crash_before_switch(&w, &d);
+        *w.storage.fail.lock().unwrap() = Some("delete_timeline");
+
+        w.reconcile_once().await.unwrap();
+
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Resetting);
+        assert_eq!(dev.pending_timeline_id.as_deref(), Some(pending.as_str()));
+        let error = dev.error.unwrap_or_default();
+        assert!(error.starts_with("deleting timeline: "), "{error:?}");
+        assert!(error.contains(crate::fakes::STORAGE_CAUSE), "{error:?}");
+        assert!(w.storage.timeline(&d.tenant, &pending).is_some());
+        assert!(w.computes.list().await.unwrap().contains(&d.ep));
+
+        *w.storage.fail.lock().unwrap() = None;
+        set_branch(&w, d.dev, BranchStatus::Resetting, STALE_PROVISION_SECS + 1);
+        w.reconcile_once().await.unwrap();
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Ready);
+        assert_eq!(dev.pending_timeline_id, None);
+        assert!(w.storage.timeline(&d.tenant, &pending).is_none());
+    }
+
+    // Two passes (or a slow switch job and a pass) whose snapshots both saw the branch stale:
+    // only the first claims it. Here the branch's age is refreshed, as another run's claim
+    // would, before this run's `finish_switch`, which then does nothing.
+    #[tokio::test]
+    async fn finish_switch_leaves_a_branch_another_run_just_claimed() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let pending = crash_before_switch(&w, &d);
+        let hash = w.metadata.state().endpoints[&d.ep]
+            .endpoint
+            .compute_token_sha256
+            .clone();
+        set_branch(&w, d.dev, BranchStatus::Resetting, 0);
+        journal.lock().unwrap().clear();
+
+        w.finish_switch(d.dev).await.unwrap();
+
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Resetting);
+        assert_eq!(dev.pending_timeline_id.as_deref(), Some(pending.as_str()));
+        assert_eq!(dev.error, None);
+        assert!(w.storage.timeline(&d.tenant, &pending).is_some());
+        assert!(!w.computes.list().await.unwrap().contains(&d.ep));
+        assert_eq!(
+            w.metadata.state().endpoints[&d.ep]
+                .endpoint
+                .compute_token_sha256,
+            hash
+        );
+        let ctx = format!("{:?}", entries(&journal));
+        for step in [
+            "metadata.swap_pending_timeline",
+            "metadata.replace_compute_token",
+            "compute.create",
+            "storage.delete_timeline",
+        ] {
+            assert!(position(&journal, step).is_none(), "{step}: {ctx}");
+        }
+    }
+
+    // The claim refreshes the branch's age: a second run right after the first takes nothing.
+    #[tokio::test]
+    async fn finish_switch_claim_refreshes_the_branch() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        crash_before_switch(&w, &d);
+        *w.storage.fail.lock().unwrap() = Some("delete_timeline");
+
+        w.finish_switch(d.dev).await.unwrap_err();
+
+        assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Resetting);
+        assert_eq!(w.metadata.state().branch_ages.get(&d.dev).copied(), Some(0));
+    }
+
+    // Ruling 2: a crash between the API's claim and its publish leaves resetting with nothing
+    // pending or superseded.
+    #[tokio::test]
+    async fn finish_switch_readies_a_claimed_branch_that_never_started() {
+        for compute_missing in [false, true] {
+            let (w, journal) = worker();
+            let d = dev_setup(&w, &journal).await;
+            if compute_missing {
+                w.computes.remove(&d.ep);
+            }
+            set_branch(&w, d.dev, BranchStatus::Resetting, STALE_PROVISION_SECS + 1);
+
+            w.reconcile_once().await.unwrap();
+
+            let dev = w.metadata.branch(d.dev);
+            assert_eq!(dev.status, BranchStatus::Ready, "{compute_missing}");
+            assert_eq!(dev.timeline_id.as_deref(), Some(d.dev_timeline.as_str()));
+            assert!(w.computes.list().await.unwrap().contains(&d.ep));
+            assert_eq!(
+                position(&journal, "compute.create").is_some(),
+                compute_missing,
+                "{:?}",
+                entries(&journal)
+            );
+            assert!(position(&journal, "storage.delete_timeline").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_a_stale_branch_create_and_tears_it_down() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        set_branch(
+            &w,
+            d.dev,
+            BranchStatus::Provisioning,
+            STALE_PROVISION_SECS + 1,
+        );
+
+        w.reconcile_once().await.unwrap();
+
+        let dev = w.metadata.branch(d.dev);
+        assert_eq!(dev.status, BranchStatus::Failed, "{:?}", entries(&journal));
+        assert_eq!(dev.error.as_deref(), Some("provisioning timed out"));
+        assert!(!w.computes.list().await.unwrap().contains(&d.ep));
+        assert!(!w.metadata.endpoint_ids().contains(&d.ep));
+        assert_eq!(
+            w.storage.timeline_ids(),
+            std::slice::from_ref(&d.main_timeline)
+        );
+        assert!(w.storage.has_tenant(&d.tenant));
+        assert_eq!(w.metadata.database(d.db).status, DatabaseStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn reconcile_retries_a_lost_branch_delete() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        set_branch(&w, d.dev, BranchStatus::Deleting, STALE_DELETE_SECS + 1);
+
+        w.reconcile_once().await.unwrap();
+
+        assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Deleted);
+        assert!(!w.computes.list().await.unwrap().contains(&d.ep));
+        assert!(!w.metadata.endpoint_ids().contains(&d.ep));
+        assert_eq!(
+            w.storage.timeline_ids(),
+            std::slice::from_ref(&d.main_timeline)
+        );
+    }
+
+    // A deleting branch that still has a child: Neon refuses to delete its timeline, and the
+    // branch stays deleting, its timeline and its child untouched.
+    #[tokio::test]
+    async fn a_retried_branch_delete_leaves_a_branch_with_children() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let child = ready_branch(&w, d.db, "feature", d.dev).await;
+        let child_row = w.metadata.branch(child);
+        set_branch(&w, d.dev, BranchStatus::Deleting, STALE_DELETE_SECS + 1);
+
+        w.reconcile_once().await.unwrap();
+
+        assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Deleting);
+        assert!(w.storage.timeline(&d.tenant, &d.dev_timeline).is_some());
+        assert_eq!(w.metadata.branch(child).status, BranchStatus::Ready);
+        let child_timeline = child_row.timeline_id.unwrap();
+        assert!(w.storage.timeline(&d.tenant, &child_timeline).is_some());
+        let child_ep = child_row.endpoint_id.unwrap();
+        assert!(w.computes.list().await.unwrap().contains(&child_ep));
+    }
+
+    #[tokio::test]
+    async fn reconcile_recreates_a_missing_branch_compute() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.computes.remove(&d.ep);
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(w.computes.list().await.unwrap().contains(&d.ep));
+        assert!(
+            pos(&journal, "metadata.replace_compute_token")
+                < pos(&journal, &format!("compute.create {}", d.ep))
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_timelines_survive_reconcile() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let stray = NeonId::new();
+        w.storage
+            .insert_timeline(&d.tenant, stray.as_str(), FRESH_HEAD);
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(w.storage.timeline(&d.tenant, stray.as_str()).is_some());
+        assert!(
+            position(&journal, "storage.delete_timeline").is_none(),
+            "{:?}",
+            entries(&journal)
+        );
+    }
+
+    // Includes a tenant whose pitr_interval was never set (every tenant made before step 5).
+    #[tokio::test]
+    async fn history_window_drift_is_patched() {
+        let (w, journal) = worker();
+        let unset = ready_database(&w).await;
+        let changed = ready_database(&w).await;
+        let in_sync = ready_database(&w).await;
+        let tenant = |db| {
+            w.metadata
+                .database(db)
+                .neon_tenant_id
+                .unwrap()
+                .parse::<NeonId>()
+                .unwrap()
+        };
+        w.storage.pitr.lock().unwrap().remove(&tenant(unset));
+        let hour = Duration::from_secs(3600);
+        w.metadata
+            .state()
+            .databases
+            .get_mut(&changed)
+            .unwrap()
+            .history_window = hour;
+        journal.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        let pitr = w.storage.pitr.lock().unwrap().clone();
+        assert_eq!(pitr.get(&tenant(unset)), Some(&WEEK));
+        assert_eq!(pitr.get(&tenant(changed)), Some(&hour));
+        assert_eq!(pitr.get(&tenant(in_sync)), Some(&WEEK));
+        assert!(
+            position(
+                &journal,
+                &format!("storage.patch_tenant_config {}", tenant(unset))
+            )
+            .is_some()
+        );
+        assert!(
+            position(
+                &journal,
+                &format!("storage.patch_tenant_config {} 3600s", tenant(changed))
+            )
+            .is_some()
+        );
+        assert!(
+            position(
+                &journal,
+                &format!("storage.patch_tenant_config {}", tenant(in_sync))
+            )
+            .is_none(),
+            "{:?}",
+            entries(&journal)
+        );
+    }
+
+    // One tenant's listing failing doesn't stop the pass.
+    #[tokio::test]
+    async fn a_failed_timeline_listing_reports_nothing_and_carries_on() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.computes.remove(&d.ep);
+        *w.storage.fail.lock().unwrap() = Some("list_timelines");
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(w.computes.list().await.unwrap().contains(&d.ep));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_branch_create_is_not_failed() {
+        let (w, journal) = worker();
+        let db = ready_database(&w).await;
+        let dev = pending_branch(&w, db, "dev", BranchId::from(db));
+        journal.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        assert_eq!(w.metadata.branch(dev).status, BranchStatus::Pending);
+        assert!(position(&journal, "metadata.fail_branch_if_stale").is_none());
     }
 }

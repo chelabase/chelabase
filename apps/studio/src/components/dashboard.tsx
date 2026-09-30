@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import type { DatabaseSummary, MeResponse } from "@cheladb/types";
 import { Button } from "@/components/ui/button";
 import { ApiError, type ApiClient } from "@/lib/api";
 import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
+import { DatabaseBranches } from "./database-branches";
 
 type MeState =
   | { status: "loading" }
@@ -150,7 +151,12 @@ function Workspace({
             onSettled={() => void reload()}
             pollIntervalMs={pollIntervalMs}
           />
-          <DatabasesTable databases={project.databases} api={api} onChanged={() => void reload()} />
+          <DatabasesTable
+            databases={project.databases}
+            api={api}
+            onChanged={() => void reload()}
+            pollIntervalMs={pollIntervalMs}
+          />
         </section>
       ))}
     </>
@@ -167,11 +173,14 @@ function DatabasesTable({
   databases,
   api,
   onChanged,
+  pollIntervalMs,
 }: {
   databases: DatabaseSummary[];
   api: ApiClient;
   onChanged: () => void;
+  pollIntervalMs?: number;
 }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
   if (databases.length === 0) {
     return <p className="text-sm text-muted-foreground">No databases yet.</p>;
   }
@@ -187,14 +196,34 @@ function DatabasesTable({
       </thead>
       <tbody>
         {databases.map((db) => (
-          <tr key={db.database_id} className="border-b last:border-0">
-            <td className="py-2">{db.name}</td>
-            <td className="py-2">{db.status}</td>
-            <td className="py-2 font-mono">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
-            <td className="py-2">
-              <DatabaseActions api={api} database={db} onChanged={onChanged} />
-            </td>
-          </tr>
+          <Fragment key={db.database_id}>
+            <tr className="border-b last:border-0">
+              <td className="py-2">{db.name}</td>
+              <td className="py-2">{db.status}</td>
+              <td className="py-2 font-mono">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
+              <td className="py-2">
+                <div className="flex flex-wrap items-start gap-2">
+                  <DatabaseActions api={api} database={db} onChanged={onChanged} />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={db.status !== "ready"}
+                    aria-expanded={expanded === db.database_id}
+                    onClick={() => setExpanded(expanded === db.database_id ? null : db.database_id)}
+                  >
+                    Branches
+                  </Button>
+                </div>
+              </td>
+            </tr>
+            {expanded === db.database_id && db.status === "ready" && (
+              <tr className="border-b last:border-0">
+                <td colSpan={4}>
+                  <DatabaseBranches api={api} database={db} pollIntervalMs={pollIntervalMs} />
+                </td>
+              </tr>
+            )}
+          </Fragment>
         ))}
       </tbody>
     </table>

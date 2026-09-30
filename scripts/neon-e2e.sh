@@ -50,14 +50,6 @@ set +a
 ca="$root/.cheladb/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
 
-# api <method> <path> [json body]: prints the HTTP status; the body goes to $tmp/body.
-api() {
-  local token args
-  token="$(cargo run -q -p cheladb -- dev token)" || die "cheladb dev token"
-  args=(-sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -X "$1" "$GATEWAY$2" -H "Authorization: Bearer $token")
-  if [[ -n "${3:-}" ]]; then args+=(-H 'content-type: application/json' -d "$3"); fi
-  curl "${args[@]}" || true
-}
 trap cleanup EXIT
 
 # 1. Create a database through the gateway and wait until it is ready.

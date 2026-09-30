@@ -274,8 +274,8 @@ create-db-demo name="demo1":
     echo
 
 # Remove worker-provisioned containers (label cheladb.managed=true) and Neon computes (label
-# cheladb.dev/endpoint-id), delete their storage-controller tenants, and clear the `databases`
-# and `neon_endpoints` rows. Does not touch Compose deps.
+# cheladb.dev/endpoint-id), delete their storage-controller tenants, and clear the `databases`,
+# `branches` and `neon_endpoints` rows. Does not touch Compose deps.
 sweep-dbs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -319,7 +319,7 @@ sweep-dbs:
         delete_tenant "${tenant}"
       done
       echo "deleted $(echo "${tenants}" | wc -w | tr -d ' ') storage-controller tenant(s)"
-      counts="$(metadata_sql <<<"WITH e AS (DELETE FROM neon_endpoints RETURNING 1), d AS (DELETE FROM databases RETURNING 1) SELECT (SELECT count(*) FROM e) || ' ' || (SELECT count(*) FROM d);")"
+      counts="$(metadata_sql <<<"WITH e AS (DELETE FROM neon_endpoints RETURNING 1), b AS (DELETE FROM branches RETURNING 1), d AS (DELETE FROM databases RETURNING 1) SELECT (SELECT count(*) FROM e) || ' ' || (SELECT count(*) FROM d);")"
       echo "cleared ${counts% *} Neon endpoint row(s) and ${counts#* } metadata database row(s)"
     else
       echo "metadata Postgres not running — skipped clearing databases table (just up && just sweep-dbs)"
@@ -412,6 +412,11 @@ neon-smoke:
 # (needs just deps-up and just dev)
 neon-e2e:
     scripts/neon-e2e.sh
+
+# Live branching story through the API and the proxy: branch at a time, reset to parent, restore
+# with a backup, a point outside the history window, delete (needs just deps-up and just dev)
+branch-e2e:
+    scripts/branch-e2e.sh
 
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:

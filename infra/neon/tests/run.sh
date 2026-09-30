@@ -275,6 +275,8 @@ check "dev exports CHELADB_COMPUTE_IMAGE" \
   bash -c "just --justfile '$root/justfile' --show dev | grep -q 'export CHELADB_COMPUTE_IMAGE='"
 check "worker exports CHELADB_COMPUTE_IMAGE" \
   bash -c "just --justfile '$root/justfile' --show worker | grep -q 'export CHELADB_COMPUTE_IMAGE='"
+check "branch-e2e recipe exists" \
+  bash -c "just --justfile '$root/justfile' --show branch-e2e | grep -q 'scripts/branch-e2e.sh'"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

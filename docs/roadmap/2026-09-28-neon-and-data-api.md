@@ -17,6 +17,7 @@ On `main`:
   - reconcile over endpoints, computes and tenants
 - **Neon storage stack** (step 1, done): starts with `just deps-up` and backs every database since step 4.
 - **`crates/cheladb-neon`** (step 2, done): the storage-controller client, compute spec, SCRAM, LSNs, compute JWTs and Neon ids. The worker and the orchestrator use it.
+- **Internal control-plane listener and Neon's proxy** (step 3, done): the orchestrator's internal listener on `127.0.0.1:8083` (proxy API, compute specs, storage-controller hooks), Neon's proxy on `4432` (Postgres) and `4444` (WebSocket and SQL over HTTP), and Valkey for the proxy's cache and query cancel. Merged into local `main` on 2026-09-29, not pushed.
 - **Provisioning on Neon** (step 4, done): merged into local `main` on 2026-09-30, not pushed.
 
 Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
@@ -33,7 +34,7 @@ Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
   - Studio (72/72, typecheck, build) and the Playwright pass were last run before step 3. Step 3 didn't touch Studio.
 - The deps, Neon and dev stacks may still be running. No demo compute is left.
 
-**Step 4 status (2026-09-29): plan approved; Task 1 done (`17da720`), Task 2 done (`72c6699`), Task 3 done (`6d64a7a`..`edd1951`), Task 4 done (`59c1219`), Task 5 done (`a034d56`), Task 6 done (`159137d`), Task 7 done (`053cc1a`), Task 8 done (`4313f44`), Task 9 done (`4be187c`); end-of-step review (opus) returned with fixes; fix batch `7b8a2b0`, `88aba48` (re-review: all addressed); full verification run passed 2026-09-30; the last minors fixed in `aae92e4`; merged into local `main` (not pushed).** Work happens in `.worktrees/neon-provisioning`. The build-speed chore (`bd61377`: dev debug info, `just test` on nextest, `just sweep-builds`, `just wt-add`/`wt-remove`) is on local `main` (not pushed) and merged into this branch. A possible race in two gateway tests (`incoming_forwarded_proto_is_preserved`, `incoming_request_id_is_propagated_both_ways`) failed once in a full `cargo test` run and passed on rerun; worth a look. See the plan's Status block. Spec: `docs/superpowers/specs/2026-09-29-neon-provisioning-design.md`. Plan (9 tasks, with a Status block and rulings): `docs/superpowers/plans/2026-09-29-neon-provisioning.md`, on branch `neon-provisioning`. Next: the data API step (its first operation subset must be raised with the user before the spec). Decisions made while brainstorming (details in the spec):
+**Step 4 status (2026-09-29): plan approved; Task 1 done (`17da720`), Task 2 done (`72c6699`), Task 3 done (`6d64a7a`..`edd1951`), Task 4 done (`59c1219`), Task 5 done (`a034d56`), Task 6 done (`159137d`), Task 7 done (`053cc1a`), Task 8 done (`4313f44`), Task 9 done (`4be187c`); end-of-step review (opus) returned with fixes; fix batch `7b8a2b0`, `88aba48` (re-review: all addressed); full verification run passed 2026-09-30; the last minors fixed in `aae92e4`; merged into local `main` (not pushed).** Work happens in `.worktrees/neon-provisioning`. The build-speed chore (`bd61377`: dev debug info, `just test` on nextest, `just sweep-builds`, `just wt-add`/`wt-remove`) is on local `main` (not pushed) and merged into this branch. A possible race in two gateway tests (`incoming_forwarded_proto_is_preserved`, `incoming_request_id_is_propagated_both_ways`) failed once in a full `cargo test` run and passed on rerun; worth a look. See the plan's Status block. Spec: `docs/superpowers/specs/2026-09-29-neon-provisioning-design.md`. Plan (9 tasks, with a Status block and rulings): `docs/superpowers/plans/2026-09-29-neon-provisioning.md`, on branch `neon-provisioning`. **Step 5 (branching), 2026-09-30:** brainstormed with the user; spec approved 2026-09-30 (`docs/superpowers/specs/2026-09-30-branching-design.md`); plan approved (`docs/superpowers/plans/2026-09-30-branching.md`, 10 tasks). **Tasks 1–10 done; the end-of-step review returned With fixes; the fix batch is done (`47aefc2`..`770755a`) and its full run passed. 2026-10-01: the re-review found two new Important issues (a stuck detach, and the Studio picker bounds). Both are fixed, re-reviewed and approved, the last minors are fixed (`3b7a36c`), and the full verification run passed. **Merged into local `main` on 2026-10-01 (not pushed); step 5 is done.** Next: step 6 (data API) and the Neon hard fork in parallel. Each needs its own spec (brainstorming first), then a pause for approval.** After the merge: step 6 (data API) and the Neon hard fork run in parallel (see "Hard fork of Neon"). The plan's Status block is the source of truth, on branch `branching` (`.worktrees/branching`). Decisions: a `branches` table where main is a branch; each branch gets its own password and an always-on compute, with a per-database cap (default 5); a 7-day history window per database; branches form a tree; restore and reset-to-parent are included, and refused while the branch has children. The vault basis for step 4a is deferred until 4a starts. `main` isn't pushed yet (the user said not yet). Decisions made while brainstorming (details in the spec):
 - The old `postgres:17` databases are dropped, not migrated. None existed on this machine; a migration tombstones leftovers.
 - `CHELADB_DB_OWNER_SUPERUSER` is kept, but only in self-hosted mode.
 - Superuser SQL goes through `ComputeBackend::admin_sql`: `docker exec` psql as `cloud_admin`. `compute_ctl` can't do it, since spec roles get `BYPASSRLS` and `LOGIN` and it has no SQL hook. That settles item 7 below.
@@ -206,7 +207,7 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
    - Add the proxy and its TLS setup (local CA, `*.localtest.me` certificate) to Compose, with its serverless side on in password mode.
    - Add Valkey (base profile) for the proxy's cache clearing and query cancel; the role-secret cache is on, cleared on every password change.
    - Done when `psql` connects through `<id>.localtest.me:4432`, and SQL-over-HTTP and the serverless driver through `:4444`, to a hand-made compute; query cancel works; and a changed password works at once.
-4. **Switch provisioning to Neon.**
+4. **Switch provisioning to Neon.** ✅ Done 2026-09-30, merged into local `main` (`45291c1`); see "Progress".
    - Make the storage stack part of `just deps-up`/`just dev`: remove the `profiles: ["neon"]` lines.
    - Apply the mapping above and port the `ComputeBackend` Docker implementation.
    - Adapt reveal, reset, delete and reconcile.
@@ -219,18 +220,56 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
    - **Decision for the user:** Supabase marks pgsodium "pending deprecation" and is moving Supabase Vault off it, keeping Vault's API. Decide whether our vault is built on pgsodium, on pgcrypto (already in the image) plus our own key handling, or on something else. Decide that before paying for the patch.
    - **An extension policy:** record which extensions are supported and upgraded, so users don't depend on whatever the image happens to contain.
    - Step 6 doesn't need either extension, so 4a can also run after step 5 if that suits better.
-5. **Branching.** Create a branch from `main`, optionally at a point in time. Each branch gets its own endpoint and appears in Studio.
+5. **Branching.** 🚧 In progress on branch `branching` (see "Resume here"). Create a branch from `main`, optionally at a point in time. Each branch gets its own endpoint and appears in Studio.
 6. **Data API (`cheladb-rest`).** Our own design, not a PostgREST or Supabase clone; see below.
+6a. **Login roles (candidate, after step 6; agreed 2026-09-30).** Extra login roles per branch, managed through the platform API as Neon does it. The owner can already `CREATE ROLE` in SQL, but Neon's proxy gets each role's SCRAM secret from our internal listener, which answers only from `neon_roles`, so SQL-made roles can't log in through the proxy.
+   - **The control plane is the source of truth.** A role is a `neon_roles` row with a sealed password (AAD = branch id + role name), and it goes into the compute spec, so `compute_ctl` applies it at start and on every reconfigure. That heals drift: a role dropped in SQL, or rewound by a restore, comes back on the next reconfigure. A password change follows today's reset order: rewrite the row, reconfigure, then `ProxyCache::password_updated`.
+   - **Rejected: SQL as the source of truth** (the listener reads `pg_authid` through `admin_sql` on a cache miss). `ALTER ROLE … PASSWORD` fires no event (event triggers don't cover roles), so a changed or revoked password would keep working until the cache TTL expires. It also puts a query on the user's database on the proxy's auth path.
+   - **Scope:** list, create, delete and reset password per branch; a per-branch cap; roles copied when a branch is created (a restore keeps the endpoint's roles; deleting a branch deletes them); the owner can't be deleted; Studio's connection panel gains a role picker.
+   - **Known cost:** spec roles are created `IN ROLE neon_superuser`, so each login role is as privileged as the owner. For least privilege, grant `NOLOGIN` roles made in SQL and `SET ROLE` to them from a login role; document this.
+   - Needs its own spec, plan and approval, like every step. The old repo's `services/controlplane/src/api/roles.rs` is the reference to port from.
 7. **Compute runtime work.** This is where we improve on NeonVM:
    - scale to zero: stop idle computes, and `wake_compute` starts them again (the proxy already retries using `retry_ms`)
    - resize running containers (the old repo has a fixed 1 CPU / 2 GiB)
    - later, a Kubernetes pod backend using the same trait
+   - **To consider (noted 2026-09-30): KubeVirt instead of NeonVM** for the Kubernetes backend, but only if moving a running compute between nodes without dropping its connections becomes a requirement. That is the one thing containers and pods can't do: in-place resize, scale to zero and timeline switching all work without a VM. KubeVirt is actively maintained and does live migration; NeonVM's last code commit was September 2025, and the old repo's NeonVM setup (KVM, multus overlay, a patch series, finalizer ordering) was heavy for that one benefit. The user's reservation: running and scaling VMs on Kubernetes feels heretical, so the default stays plain pods (a restart drops connections; the proxy's `wake_compute` retry and driver reconnects cover it). A cheaper middle ground is a pause/resume pooler in transaction mode, which hides a move from clients between transactions.
 
 Steps 5, 6 and 7 are independent once step 4 lands, so they can be reordered. Branching comes first because it's why we adopted Neon.
 
 **Order decided 2026-09-29:** step 4 comes before the data API. The data API's compute lookup, its roles (`anon`, `authenticated`, `authenticator`) and the users table's protections all depend on the compute model step 4 settles, so building it first would mean building those parts twice.
 
 **Can be done at any point:** NATS auth, restart policies, running more than one worker, CI.
+
+**Hard fork of Neon (decided 2026-09-30).** Neon upstream is frozen, so we will own it: a hard fork of `neondatabase/neon` and `neondatabase/postgres` as `ChelaDB/neon` and `ChelaDB/postgres`, which `NEON_REF` then points at. We will never rewrite the engine (the pageserver, safekeepers and Neon's Postgres patches carry years of durability work), and we'll replace pieces only where our needs really differ (candidates: `compute_ctl`'s role handling, which we already work around with `admin_sql`; possibly the storage controller in single-host mode). There are no performance goals: Neon's server side is already Rust, and tuning waits for profiling evidence (see the alpha sizing note below). It needs its own spec, plan and approval. **Timing (user, 2026-09-30): runs in parallel with step 6**, starting after step 5 merges. The fork lives in its own repos with its own CI, so it doesn't touch the data API; the shared costs are this machine's single Compose stack (live tests and e2e run one at a time) and the full image build's disk and time (~40 GB, ~40 min). Constraints from the user:
+- **Keep the cloud features wherever the platform can use them;** each is discussed in the spec, not pruned by default (candidates listed below). Only what's tied to things we dropped (NeonVM: `vm_monitor`, the VM image specs) or to Neon's own SaaS (PostHog feature flags, console redirect) is a candidate for removal, and even those get discussed.
+- **Keep every Postgres major the fork supports** (v14–v17 today, then 18 and 19) in the platform images.
+- **Add a slim dev variant:** a v17-only (later: newest-only) stripped storage image, and a compute image with a small extension set, for fast local builds and pulls. Platform and dev images come from the same source with different build arguments. Today `ghcr.io/cheladb/neon` is 7.0 GB and `compute-node-v17` 1.2 GB, and a full build takes ~40 min.
+
+The work, in order:
+1. **The fork and CI:** Neon's Rust tests and Python regression suite (`test_runner/`) running in our CI before any real change. They're the only safety net for touching storage code.
+2. **Postgres minor releases (security).** The pinned Neon ships **Postgres 17.5** (May 2025, `vendor/revisions.json`; v16.9, v15.13, v14.18 likewise), while our metadata DB already runs 17.11. Merge the minors into each `REL_*_STABLE_neon` branch, then keep doing it every quarter. Decide who watches Postgres security releases before the alpha.
+3. **Images:** the slim dev variant; the platform images trimmed only of what the cloud-feature discussion drops.
+4. **Postgres 18, then 19.** State as of 2026-09-30:
+   - Neon's public `main` vendors only v14–v17, and `libs/postgres_ffi` has constants only up to v17.
+   - `neondatabase/postgres` has a `REL_18_STABLE_neon` branch (last commit 2026-04-08) and a few v18 hook branches, none wired into `neon`. PG 19 has nothing.
+   - For each new major:
+     - rebase Neon's Postgres patches (smgr, WAL and hooks) onto the new stable branch, starting from `REL_18_STABLE_neon` for 18 (PG 18's asynchronous I/O touches exactly the storage-manager paths Neon replaces);
+     - add `postgres_ffi` bindings, constants and WAL decoding in the pageserver and safekeeper;
+     - port `neon_walredo` and the `pgxn` extensions (`neon`, `neon_rmgr`, `neon_utils`);
+     - support the new major in `compute_ctl`;
+     - build a compute image with the extension set compiled for it;
+     - run the regression suite.
+   - A timeline is tied to one major, so a database stays on its major. Upgrading means a new tenant plus dump/restore or logical replication, not in-place `pg_upgrade`. `databases` gains a `pg_version` column (the old repo's `projects` had one) and Studio a version picker; the default stays v17 until 18 is proven.
+
+**Cloud features for the fork's spec** (at `fa504217`). First takes, agreed with the user 2026-09-30: keep usage/billing, import, faster starts, availability (turned on later), the proxy's rate limiter and cancellation, the scrubber, and the psql login through `console_redirect_proxy` (reworked to log in through Studio instead of Neon's console); discuss the auth broker / `local_proxy` / `pg_session_jwt` together with step 6; drop `vm_monitor` and the VM image specs; repoint PostHog feature flags at a source of our own rather than drop them. Details:
+- **Usage and billing:** `consumption_metrics` in the pageserver and proxy (`usage_metrics.rs`), and `tenant_size_model` (synthetic size): quotas, a usage page in Studio, later billing.
+- **Import:** `compute_tools` `fast_import` and the storage controller's `timeline_import`: import an existing Postgres database (for example a Supabase project) into a new timeline.
+- **Faster starts:** `endpoint_storage` (local file cache prewarm) and the pageserver's `basebackup_cache`: both cut cold-start time, which matters once step 7 adds scale to zero.
+- **Availability:** pageserver shard splitting, warm secondaries and heatmaps; the storage controller's leadership (HA) and safekeeper management; `disk_usage_eviction` (layers tiered out to S3).
+- **Proxy:** the auth broker, `local_proxy` and `pg_session_jwt` (JWT-authenticated SQL with row-level security). These overlap with our data API (step 6), so decide whether the data API uses them or ignores them. Also the proxy's rate limiter and Redis/Valkey cancellation, which we already partly use.
+- **Operations:** `storage_scrubber` (consistency checks and garbage collection of orphaned objects in S3).
+- **psql login:** `console_redirect_proxy` (a browser login for psql through the console): keep, reworked to go through Studio.
+- **Drop or repoint:** `vm_monitor` and the VM image specs (NeonVM is gone): drop. `posthog_client_lite` and the pageserver's `feature_resolver` (Neon's own PostHog feature flags): repoint at our own flag source.
 
 **Later, once the MVP is built: size a server for an early alpha (noted 2026-09-29).** The user wants to find out what server the Docker deployment needs for an alpha with about 20 organizations giving early feedback. Do the analysis once everything in the MVP exists, not before.
 
@@ -320,6 +359,24 @@ Spec: `docs/superpowers/specs/2026-09-28-neon-data-plane-design.md`. Plan: `docs
 - **Deletes are asynchronous:** `DELETE` answers 202 until the object is gone, then 200 or 404.
 - The Compose project's default network is `cheladb_default`. The existing demo databases are on `bridge` and aren't affected. Step 4's computes join `cheladb_default`.
 - The hook token is `CHELADB_STORCON_HOOK_TOKEN` (default `cheladb-dev-storcon-hook`), which Compose reads. Step 3's listener checks it.
+
+### Step 3: internal listener, Valkey and Neon's proxy (done 2026-09-29)
+
+- Spec: `docs/superpowers/specs/2026-09-28-neon-control-plane-listener-design.md`. Plan: `docs/superpowers/plans/2026-09-28-neon-control-plane-listener.md`.
+- The orchestrator's internal listener (`127.0.0.1:8083`) serves the proxy's control-plane calls, compute specs and the storage controller's hooks; the `storcon-hook` stand-in is gone.
+- Neon's proxy runs with a local CA and a `*.localtest.me` certificate, its serverless side on in password mode; Valkey clears its role-secret cache on every password change and carries query cancel.
+- Verified end to end by `just neon-e2e`; merged into local `main` on 2026-09-29, with every review finding fixed. The findings worth keeping are under "Resume here" → "Findings from step 3".
+
+### Step 4: provisioning on Neon (done 2026-09-30)
+
+- Spec: `docs/superpowers/specs/2026-09-29-neon-provisioning-design.md`. Plan, with its Status block and rulings: `docs/superpowers/plans/2026-09-29-neon-provisioning.md`.
+- Every database is a Neon tenant with one timeline and one Docker compute behind the proxy; the `postgres:17` provisioning and the `cheladb_platform` role are gone. The worker owns provision, delete, reset (serialized per endpoint with an advisory lock) and reconcile; the Neon services start with `just deps-up`.
+- Verified: `cargo test --workspace` 430 on `main` after the merge, clippy clean, every live test, `neon-test`, `neon-smoke`, `neon-e2e`, `auth-e2e`, Studio and a Playwright pass. Merged into local `main` on 2026-09-30 (`45291c1`), not pushed.
+
+### Step 5: branching (implemented 2026-09-30; end-of-step review pending)
+
+- Spec: `docs/superpowers/specs/2026-09-30-branching-design.md`. Plan, with its Status block and rulings: `docs/superpowers/plans/2026-09-30-branching.md`.
+- A database is a tree of branches (main included). Each branch is a Neon timeline with its own endpoint, compute and password. Branches can be created now or at a past point in time, reset to their parent's head, restored to a past point in place (keeping the connection string), and deleted. The migration backfills main for every live database, and the children rule prevents orphaning branches. Live timings (Task 7): provision 7.3 s, create at a time 2.2 s, reset to parent 3.9 s, restore 3.8 s, create from backup 1.9 s, out-of-window create 24 ms, delete branch 1.8 s, delete database 1.4 s. End-to-end story (Task 8): `just branch-e2e` 41 s. All 9 tasks verified with their tests, Playwright passes and e2e runs complete; end-of-step review and fix batch pending.
 
 ### Step 2: `crates/cheladb-neon` (done 2026-09-28)
 

@@ -15,6 +15,10 @@ use crate::id::NeonId;
 use crate::lsn::Lsn;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Creating a timeline (a branch of a large one included) may take longer than a request.
+pub const CREATE_TIMELINE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Detaching copies the ancestor's layers the timeline uses: minutes on a large one.
+pub const DETACH_TIMEOUT: Duration = Duration::from_secs(600);
 const DELETE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DELETE_POLL_ATTEMPTS: u32 = 120;
 
@@ -78,6 +82,21 @@ struct Safekeeper {
     scheduling_policy: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LsnKind {
+    Present,
+    Future,
+    Past,
+    Nodata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsnAtTime {
+    pub lsn: Lsn,
+    pub kind: LsnKind,
+}
+
 #[derive(Clone)]
 pub struct StorconClient {
     http: reqwest::Client,
@@ -86,6 +105,8 @@ pub struct StorconClient {
     /// one, the storage controller can move a tenant off a draining or failed pageserver.
     tenant_secondaries: u32,
     request_timeout: Duration,
+    create_timeline_timeout: Duration,
+    detach_timeout: Duration,
     delete_poll_interval: Duration,
     delete_poll_attempts: u32,
 }
@@ -104,6 +125,8 @@ impl StorconClient {
             base: base.trim_end_matches('/').to_string(),
             tenant_secondaries,
             request_timeout: REQUEST_TIMEOUT,
+            create_timeline_timeout: CREATE_TIMELINE_TIMEOUT,
+            detach_timeout: DETACH_TIMEOUT,
             delete_poll_interval: DELETE_POLL_INTERVAL,
             delete_poll_attempts: DELETE_POLL_ATTEMPTS,
         }
@@ -113,6 +136,15 @@ impl StorconClient {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http = http_client(timeout);
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Per-request timeouts of creating a timeline and of detaching one from its ancestor
+    /// (default [`CREATE_TIMELINE_TIMEOUT`] and [`DETACH_TIMEOUT`]), which replace the
+    /// request timeout for those two calls.
+    pub fn with_timeline_timeouts(mut self, create: Duration, detach: Duration) -> Self {
+        self.create_timeline_timeout = create;
+        self.detach_timeout = detach;
         self
     }
 
@@ -176,6 +208,7 @@ impl StorconClient {
         let resp = self
             .http
             .post(self.url(&format!("/v1/tenant/{tenant}/timeline")))
+            .timeout(self.create_timeline_timeout)
             .json(&body)
             .send()
             .await?;
@@ -253,6 +286,141 @@ impl StorconClient {
             .filter(|sk| sk.scheduling_policy == "Active")
             .map(|sk| format!("{}:{}", sk.host, sk.port))
             .collect())
+    }
+
+    /// GET /v1/tenant/{t}/timeline/{tl}/get_lsn_by_timestamp?timestamp=<rfc3339>&with_lease=true
+    pub async fn lsn_by_timestamp(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<LsnAtTime, StorconError> {
+        #[derive(Deserialize)]
+        struct Reply {
+            lsn: Lsn,
+            kind: LsnKind,
+        }
+        let ts = at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        let resp = self
+            .http
+            .get(self.url(&format!(
+                "/v1/tenant/{tenant}/timeline/{timeline}/get_lsn_by_timestamp?timestamp={}&with_lease=true",
+                urlencoding::encode(&ts)
+            )))
+            .send()
+            .await?;
+        let reply: Reply = check(resp).await?.json().await?;
+        Ok(LsnAtTime {
+            lsn: reply.lsn,
+            kind: reply.kind,
+        })
+    }
+
+    /// GET …/get_timestamp_of_lsn?lsn=<lsn>; None when no timestamp is known.
+    pub async fn timestamp_of_lsn(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+        lsn: Lsn,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorconError> {
+        let resp = self
+            .http
+            .get(self.url(&format!(
+                "/v1/tenant/{tenant}/timeline/{timeline}/get_timestamp_of_lsn?lsn={}",
+                urlencoding::encode(&lsn.to_string())
+            )))
+            .send()
+            .await?;
+        // The pageserver answers 412 when it knows no timestamp for the LSN.
+        if matches!(
+            resp.status(),
+            StatusCode::NOT_FOUND | StatusCode::PRECONDITION_FAILED
+        ) {
+            return Ok(None);
+        }
+        let text: String = check(resp).await?.json().await?;
+        let parsed = chrono::DateTime::parse_from_rfc3339(&text)
+            .map_err(|e| anyhow::anyhow!("timestamp {text:?}: {e}"))?;
+        Ok(Some(parsed.with_timezone(&chrono::Utc)))
+    }
+
+    /// PUT /v1/tenant/{t}/timeline/{tl}/detach_ancestor?detach_behavior=multi_level_and_no_reparent
+    pub async fn detach_ancestor(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<(), StorconError> {
+        let resp = self
+            .http
+            .put(self.url(&format!(
+                "/v1/tenant/{tenant}/timeline/{timeline}/detach_ancestor?detach_behavior=multi_level_and_no_reparent"
+            )))
+            .timeout(self.detach_timeout)
+            .send()
+            .await?;
+        check(resp).await.map(drop)
+    }
+
+    /// PATCH /v1/tenant/config {"tenant_id": t, "pitr_interval": "<secs>s"}
+    pub async fn patch_tenant_config(
+        &self,
+        tenant: &NeonId,
+        pitr_interval: Duration,
+    ) -> Result<(), StorconError> {
+        let resp = self
+            .http
+            .patch(self.url("/v1/tenant/config"))
+            .json(&json!({
+                "tenant_id": tenant,
+                "pitr_interval": format!("{}s", pitr_interval.as_secs()),
+            }))
+            .send()
+            .await?;
+        check(resp).await.map(drop)
+    }
+
+    /// The tenant's effective pitr_interval; None when it was never set.
+    pub async fn tenant_pitr_interval(
+        &self,
+        tenant: &NeonId,
+    ) -> Result<Option<Duration>, StorconError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/tenant/{tenant}/config")))
+            .send()
+            .await?;
+        let body: serde_json::Value = check(resp).await?.json().await?;
+        let Some(text) = body
+            .pointer("/effective_config/pitr_interval")
+            .and_then(|v| v.as_str())
+        else {
+            return Ok(None);
+        };
+        let parsed = humantime::parse_duration(text)
+            .map_err(|e| anyhow::anyhow!("pitr_interval {text:?}: {e}"))?;
+        Ok(Some(parsed))
+    }
+
+    /// GET /v1/tenant/{t}/timeline: every timeline id in the tenant.
+    pub async fn list_timelines(&self, tenant: &NeonId) -> Result<Vec<NeonId>, StorconError> {
+        #[derive(Deserialize)]
+        struct Listed {
+            timeline_id: String,
+        }
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/tenant/{tenant}/timeline")))
+            .send()
+            .await?;
+        let listed: Vec<Listed> = check(resp).await?.json().await?;
+        listed
+            .into_iter()
+            .map(|t| {
+                t.timeline_id.parse::<NeonId>().map_err(|e| {
+                    StorconError::Other(anyhow::anyhow!("timeline id {:?}: {e}", t.timeline_id))
+                })
+            })
+            .collect()
     }
 
     /// Deletion is asynchronous: the storage controller answers 202 while it is in

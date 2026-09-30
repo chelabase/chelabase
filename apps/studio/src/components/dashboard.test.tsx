@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { MeResponse } from "@cheladb/types";
 import { ApiError, type ApiClient } from "@/lib/api";
+import { fakeApi as baseFakeApi } from "@/test/fake-api";
 import { Dashboard } from "./dashboard";
 
 const bound: MeResponse = {
@@ -15,7 +16,7 @@ const bound: MeResponse = {
         id: "p1" as never,
         slug: "default",
         databases: [
-          { database_id: "d1" as never, name: "web1", status: "ready", host: "127.0.0.1", port: 49153 },
+          { database_id: "d1" as never, name: "web1", status: "ready", host: "127.0.0.1", port: 49153, branch_count: 1 },
         ],
       },
     ],
@@ -23,14 +24,7 @@ const bound: MeResponse = {
 };
 
 function fakeApi(me: () => Promise<MeResponse>): ApiClient {
-  return {
-    me: vi.fn(me),
-    createDatabase: vi.fn(),
-    getDatabase: vi.fn(),
-    getConnection: vi.fn(),
-    resetPassword: vi.fn(),
-    deleteDatabase: vi.fn(),
-  };
+  return baseFakeApi({ me: vi.fn(me) });
 }
 
 const profile = { name: "Ada Lovelace", email: "ada@example.com" };
@@ -123,5 +117,22 @@ describe("Dashboard", () => {
     render(<Dashboard api={fakeApi(async () => bound)} profile={profile} onSignOut={onSignOut} />);
     await userEvent.click(await screen.findByRole("button", { name: "Sign out" }));
     expect(onSignOut).toHaveBeenCalledTimes(1);
+  });
+
+  it("expands a database into its branches", async () => {
+    const api = fakeApi(async () => bound);
+    api.getDatabase = vi.fn().mockResolvedValue({ history_window: 86400, max_branches: 5, branch_count: 1 });
+    api.listBranches = vi.fn().mockResolvedValue([
+      {
+        id: "d1", name: "main", parent_branch_id: null, kind: "normal", status: "ready", host: "ep-aaaaaaaaaaaa.localtest.me",
+        port: 4432, branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
+      },
+    ]);
+    render(<Dashboard api={api} profile={profile} onSignOut={() => {}} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Branches" }));
+    expect(await screen.findByText("0 of 5 branches")).toBeInTheDocument();
+    expect(api.listBranches).toHaveBeenCalledWith("d1");
+    await userEvent.click(screen.getByRole("button", { name: "Branches" }));
+    expect(screen.queryByText("0 of 5 branches")).toBeNull();
   });
 });

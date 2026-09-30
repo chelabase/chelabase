@@ -170,6 +170,107 @@ pub mod orchestrator {
         },
     };
 
+    /// The database's branches (a flat list; `parent_branch_id` makes the tree).
+    pub const LIST_BRANCHES: Endpoint = Endpoint {
+        name: "orchestrator.list_branches",
+        method: Method::Get,
+        path: "/v1/databases/{id}/branches",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    /// A branch of an existing branch, at a point in its history.
+    pub const CREATE_BRANCH: Endpoint = Endpoint {
+        name: "orchestrator.create_branch",
+        method: Method::Post,
+        path: "/v1/databases/{id}/branches",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    /// Owner credentials of a ready branch.
+    pub const BRANCH_CONNECTION: Endpoint = Endpoint {
+        name: "orchestrator.branch_connection",
+        method: Method::Get,
+        path: "/v1/databases/{id}/branches/{branch_id}/connection",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    pub const BRANCH_RESET_PASSWORD: Endpoint = Endpoint {
+        name: "orchestrator.branch_reset_password",
+        method: Method::Post,
+        path: "/v1/databases/{id}/branches/{branch_id}/reset-password",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    pub const BRANCH_RESET_TO_PARENT: Endpoint = Endpoint {
+        name: "orchestrator.branch_reset_to_parent",
+        method: Method::Post,
+        path: "/v1/databases/{id}/branches/{branch_id}/reset-to-parent",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    /// Rewinds a branch to a point, keeping the old timeline as a backup branch.
+    pub const BRANCH_RESTORE: Endpoint = Endpoint {
+        name: "orchestrator.branch_restore",
+        method: Method::Post,
+        path: "/v1/databases/{id}/branches/{branch_id}/restore",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    pub const DELETE_BRANCH: Endpoint = Endpoint {
+        name: "orchestrator.delete_branch",
+        method: Method::Delete,
+        path: "/v1/databases/{id}/branches/{branch_id}",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
+    /// Database settings: the history window and the branch cap.
+    pub const UPDATE_DATABASE: Endpoint = Endpoint {
+        name: "orchestrator.update_database",
+        method: Method::Patch,
+        path: "/v1/databases/{id}",
+        scope: Scope::Platform,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Platform,
+            cors: Cors::Studio,
+        },
+    };
+
     /// The caller, their tenant, projects and databases (Studio landing page).
     pub const ME: Endpoint = Endpoint {
         name: "orchestrator.me",
@@ -224,6 +325,14 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::DATABASE_CONNECTION,
     orchestrator::RESET_PASSWORD,
     orchestrator::DELETE_DATABASE,
+    orchestrator::UPDATE_DATABASE,
+    orchestrator::LIST_BRANCHES,
+    orchestrator::CREATE_BRANCH,
+    orchestrator::BRANCH_CONNECTION,
+    orchestrator::BRANCH_RESET_PASSWORD,
+    orchestrator::BRANCH_RESET_TO_PARENT,
+    orchestrator::BRANCH_RESTORE,
+    orchestrator::DELETE_BRANCH,
     auth::AUTH_REQUEST,
     auth::SIGN_IN,
     auth::SIGN_UP,
@@ -416,6 +525,81 @@ mod tests {
                 let closes = segment.ends_with('}');
                 assert_eq!(opens, closes, "{} has a malformed param segment", ep.path);
             }
+        }
+    }
+
+    const BRANCHES: &str = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches";
+    const BRANCH: &str =
+        "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e";
+
+    fn found(method: &str, path: &str) -> &'static str {
+        match match_endpoint(Scope::Platform, method, path) {
+            Match::Found(ep) => ep.name,
+            other => panic!("{method} {path}: expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_endpoints_route_with_two_path_params() {
+        assert_eq!(found("GET", BRANCHES), "orchestrator.list_branches");
+        assert_eq!(found("POST", BRANCHES), "orchestrator.create_branch");
+        assert_eq!(found("DELETE", BRANCH), "orchestrator.delete_branch");
+        for (method, suffix, name) in [
+            ("GET", "connection", "orchestrator.branch_connection"),
+            ("POST", "reset-password", "orchestrator.branch_reset_password"),
+            ("POST", "reset-to-parent", "orchestrator.branch_reset_to_parent"),
+            ("POST", "restore", "orchestrator.branch_restore"),
+        ] {
+            assert_eq!(found(method, &format!("{BRANCH}/{suffix}")), name);
+        }
+    }
+
+    #[test]
+    fn patch_database_routes_and_is_distinct_from_get_and_delete() {
+        let db = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11";
+        assert_eq!(found("PATCH", db), "orchestrator.update_database");
+        assert_eq!(found("GET", db), "orchestrator.get_database");
+        assert_eq!(found("DELETE", db), "orchestrator.delete_database");
+        assert_eq!(
+            match_endpoint(Scope::Platform, "PUT", db),
+            Match::MethodNotAllowed(vec![Method::Get, Method::Delete, Method::Patch])
+        );
+    }
+
+    #[test]
+    fn branch_paths_reject_wrong_methods_and_extra_segments() {
+        assert_eq!(
+            match_endpoint(Scope::Platform, "PUT", BRANCH),
+            Match::MethodNotAllowed(vec![Method::Delete])
+        );
+        assert_eq!(
+            match_endpoint(Scope::Platform, "GET", &format!("{BRANCH}/restore")),
+            Match::MethodNotAllowed(vec![Method::Post])
+        );
+        assert_eq!(
+            match_endpoint(Scope::Platform, "GET", &format!("{BRANCH}/nope")),
+            Match::NotFound
+        );
+    }
+
+    #[test]
+    fn branch_endpoints_are_platform_auth_with_studio_cors() {
+        for name in [
+            "list_branches",
+            "create_branch",
+            "branch_connection",
+            "branch_reset_password",
+            "branch_reset_to_parent",
+            "branch_restore",
+            "delete_branch",
+            "update_database",
+        ] {
+            let ep = ENDPOINTS
+                .iter()
+                .find(|e| e.name == format!("orchestrator.{name}"))
+                .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
+            assert_eq!(ep.policy, Policy { auth: Auth::Platform, cors: Cors::Studio }, "{name}");
+            assert_eq!(ep.service, Service::Orchestrator, "{name}");
         }
     }
 

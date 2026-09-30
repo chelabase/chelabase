@@ -4,10 +4,12 @@
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use cheladb_metadata::DatabaseStatus;
+use cheladb_metadata::BranchStatus;
 use cheladb_nats::RESET_NOT_APPLIED;
 use cheladb_neon::ComputeBackend;
 use cheladb_secrets::{Purpose, seal_credential};
+use cheladb_types::BranchId;
+#[cfg(test)]
 use cheladb_types::DatabaseId;
 use tracing::{info, warn};
 
@@ -24,25 +26,26 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// Replaces the owner's password. The errors are the reply to the orchestrator and never
     /// contain a password. Once the new password is stored, a failure to apply it answers
     /// [`RESET_NOT_APPLIED`]: reveal already shows the new password, and reconcile retries.
-    pub async fn reset_password(&self, id: DatabaseId) -> Result<(), String> {
-        let record = self
+    /// The branch's own owner password; main's branch id is its database's.
+    pub async fn reset_password(&self, id: BranchId) -> Result<(), String> {
+        let main = self
             .metadata
-            .get_database(id)
+            .get_branch(id)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("not found")?;
-        if record.status != DatabaseStatus::Ready {
+        if main.status != BranchStatus::Ready {
             return Err("not ready".into());
         }
-        let endpoint_id = record.endpoint_id.ok_or("credentials unavailable")?;
+        let endpoint_id = main.endpoint_id.ok_or("credentials unavailable")?;
 
         // Step 1: the sealed password, the verifier and the flag, in one transaction.
         let password = credentials::generate_password();
         let verifier = cheladb_neon::scram::verifier(&password);
-        let sealed = seal_credential(&self.key, &id.to_string(), Purpose::Owner, &password);
+        let sealed = seal_credential(&self.key, &main.id.to_string(), Purpose::Owner, &password);
         let replaced = self
             .metadata
-            .replace_owner_secret(id, &endpoint_id, OWNER_ROLE, &verifier, &sealed)
+            .replace_owner_secret(main.id, &endpoint_id, OWNER_ROLE, &verifier, &sealed)
             .await
             .map_err(|e| e.to_string())?;
         if !replaced {
@@ -51,10 +54,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
         // Steps 2-4.
         if let Err(err) = self.apply_pending(&endpoint_id).await {
-            warn!(database_id = %id, %endpoint_id, "reset stored but not applied; reconcile will retry: {err:#}");
+            warn!(branch_id = %id, %endpoint_id, "reset stored but not applied; reconcile will retry: {err:#}");
             return Err(RESET_NOT_APPLIED.into());
         }
-        info!(database_id = %id, %endpoint_id, "owner password reset");
+        info!(branch_id = %id, %endpoint_id, "owner password reset");
         Ok(())
     }
 
@@ -155,6 +158,7 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use cheladb_metadata::DatabaseStatus;
     use cheladb_secrets::open_credential;
     use tokio::sync::oneshot;
 
@@ -170,14 +174,14 @@ mod tests {
     async fn ready(w: &FakeWorker, journal: &Journal) -> (DatabaseId, String) {
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         w.handle_provision(id, "app").await.unwrap();
-        let ep = w.metadata.database(id).endpoint_id.unwrap();
+        let ep = w.metadata.main(id).endpoint_id.unwrap();
         journal.lock().unwrap().clear();
         (id, ep)
     }
 
     /// `(sealed password, owner verifier, needs_reconfigure)` as metadata holds them.
     fn secret(w: &FakeWorker, id: DatabaseId, ep: &str) -> (String, String, bool) {
-        let sealed = w.metadata.database(id).owner_password_enc.unwrap();
+        let sealed = w.metadata.main(id).owner_password_enc.unwrap();
         let state = w.metadata.state();
         let endpoint = &state.endpoints[ep];
         let role = endpoint
@@ -195,7 +199,14 @@ mod tests {
     /// The stored sealed password opens, and hashes to the stored verifier under its salt.
     fn assert_consistent(w: &FakeWorker, id: DatabaseId, ep: &str) {
         let (sealed, verifier, _) = secret(w, id, ep);
-        let password = open_credential(&w.key, &id.to_string(), Purpose::Owner, &sealed).unwrap();
+        // AAD = main's id, which is the database's.
+        let password = open_credential(
+            &w.key,
+            &BranchId::from(id).to_string(),
+            Purpose::Owner,
+            &sealed,
+        )
+        .unwrap();
         let params = verifier.split('$').nth(1).unwrap();
         let (iterations, salt) = params.split_once(':').unwrap();
         let salt = STANDARD.decode(salt).unwrap();
@@ -211,7 +222,7 @@ mod tests {
         let (id, ep) = ready(&w, &journal).await;
         let (old_sealed, old_verifier, _) = secret(&w, id, &ep);
 
-        w.reset_password(id).await.unwrap();
+        w.reset_password(BranchId::from(id)).await.unwrap();
 
         let order = [
             pos(&journal, "metadata.replace_owner_secret"),
@@ -239,7 +250,7 @@ mod tests {
         let (id, ep) = ready(&w, &journal).await;
         w.computes.set_running(&ep, false);
 
-        w.reset_password(id).await.unwrap();
+        w.reset_password(BranchId::from(id)).await.unwrap();
 
         assert!(position(&journal, "pusher.push").is_none());
         assert!(
@@ -268,7 +279,7 @@ mod tests {
             let (old_sealed, old_verifier, _) = secret(&w, id, &ep);
             arrange(&w);
 
-            let err = w.reset_password(id).await.unwrap_err();
+            let err = w.reset_password(BranchId::from(id)).await.unwrap_err();
 
             assert_eq!(err, RESET_NOT_APPLIED, "{case}");
             let (sealed, verifier, flag) = secret(&w, id, &ep);
@@ -288,16 +299,16 @@ mod tests {
     async fn reset_refuses_missing_not_ready_and_unlinked() {
         let (w, journal) = worker();
         assert_eq!(
-            w.reset_password(DatabaseId::new()).await.unwrap_err(),
+            w.reset_password(BranchId::new()).await.unwrap_err(),
             "not found"
         );
 
         let pending = w.metadata.insert_database("p", DatabaseStatus::Pending);
-        assert_eq!(w.reset_password(pending).await.unwrap_err(), "not ready");
+        assert_eq!(w.reset_password(BranchId::from(pending)).await.unwrap_err(), "not ready");
 
         let unlinked = w.metadata.insert_database("u", DatabaseStatus::Ready);
         assert_eq!(
-            w.reset_password(unlinked).await.unwrap_err(),
+            w.reset_password(BranchId::from(unlinked)).await.unwrap_err(),
             "credentials unavailable"
         );
 
@@ -305,11 +316,11 @@ mod tests {
         let gone = w.metadata.insert_database("g", DatabaseStatus::Ready);
         w.metadata
             .state()
-            .databases
-            .get_mut(&gone)
+            .branches
+            .get_mut(&BranchId::from(gone))
             .unwrap()
             .endpoint_id = Some("ep-000000000000".into());
-        assert_eq!(w.reset_password(gone).await.unwrap_err(), "not ready");
+        assert_eq!(w.reset_password(BranchId::from(gone)).await.unwrap_err(), "not ready");
 
         assert!(position(&journal, "pusher.push").is_none());
         assert!(position(&journal, "cache.password_updated").is_none());
@@ -332,7 +343,7 @@ mod tests {
             Box::pin(async {})
         }));
 
-        w.reset_password(id).await.unwrap();
+        w.reset_password(BranchId::from(id)).await.unwrap();
 
         assert!(position(&journal, "metadata.clear_needs_reconfigure").is_some());
         assert!(secret(&w, id, &ep).2, "the newer reset's flag was cleared");
@@ -409,7 +420,7 @@ mod tests {
         let (id, ep) = ready(&w, &journal).await;
         *w.computes.hang_control_addr.lock().unwrap() = true;
 
-        let err = tokio::time::timeout(std::time::Duration::from_secs(60), w.reset_password(id))
+        let err = tokio::time::timeout(std::time::Duration::from_secs(60), w.reset_password(BranchId::from(id)))
             .await
             .expect("apply_pending gave up on Docker")
             .unwrap_err();

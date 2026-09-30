@@ -8,21 +8,25 @@ use axum::{
 use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
 use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{
-    DatabaseRecord, DatabaseStatus, MetadataClient, MetadataError, ProjectOverview, TenantOverview,
+    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseRecord, DatabaseStatus,
+    MetadataClient, MetadataError, NewBranch, ProjectOverview, TenantOverview,
 };
 use cheladb_nats::{
-    DeleteDatabaseJob, JetStreamContext, JobEnvelope, ProvisionDatabaseJob, ResetPasswordReply,
-    ResetPasswordRequest, RESET_NOT_APPLIED, SUBJECT_RESET_PASSWORD,
+    BranchJob, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
+    ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
+    SUBJECT_RESET_PASSWORD,
 };
 use cheladb_secrets::{open_credential, Purpose, SecretKey};
-use cheladb_types::{DatabaseId, ProjectId, TenantId};
+use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
+mod branches;
 pub mod internal;
 
 /// Port the Neon proxy serves the Postgres protocol on.
@@ -67,10 +71,76 @@ pub trait MetadataPort: Send + Sync + 'static {
         tenant_id: TenantId,
     ) -> impl Future<Output = Result<Option<TenantOverview>, MetadataError>> + Send;
 
+    /// A branch; a database's main has the database's id and holds its endpoint and password.
+    fn get_branch(
+        &self,
+        branch_id: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+
     /// Move to `deleting`; false when already deleting, deleted, or missing.
     fn begin_delete(
         &self,
         database_id: DatabaseId,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// The database's branches that aren't deleted, oldest first (backups included).
+    fn list_branches(
+        &self,
+        database_id: DatabaseId,
+    ) -> impl Future<Output = Result<Vec<BranchRecord>, MetadataError>> + Send;
+
+    /// Main of each of the tenant's databases with the database's live `normal` branch count
+    /// (main included), in one query.
+    fn main_branches_with_counts(
+        &self,
+        tenant_id: TenantId,
+    ) -> impl Future<Output = Result<Vec<(BranchRecord, i64)>, MetadataError>> + Send;
+
+    /// Inserts a pending branch, enforcing the name, the cap and a ready parent.
+    fn create_branch(
+        &self,
+        branch: &NewBranch<'_>,
+    ) -> impl Future<Output = Result<CreateBranchOutcome, MetadataError>> + Send;
+
+    /// Live `normal` children (backups excluded).
+    fn live_children(
+        &self,
+        branch_id: BranchId,
+    ) -> impl Future<Output = Result<Vec<BranchRecord>, MetadataError>> + Send;
+
+    /// Guarded status change; true when it happened.
+    fn set_branch_status(
+        &self,
+        branch_id: BranchId,
+        from: &[BranchStatus],
+        to: BranchStatus,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// ready → resetting, clearing the last error; true when it claimed the branch.
+    fn claim_branch_for_switch(
+        &self,
+        branch_id: BranchId,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    fn set_branch_failed(
+        &self,
+        branch_id: BranchId,
+        error: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
+    /// Move the branch and its backups to `deleting`; refused while the branch or one of its
+    /// backups has live `normal` children.
+    fn begin_branch_delete(
+        &self,
+        branch_id: BranchId,
+    ) -> impl Future<Output = Result<BranchDeleteOutcome, MetadataError>> + Send;
+
+    /// Changes the given settings; false once the database is deleting, or missing.
+    fn update_database_settings(
+        &self,
+        database_id: DatabaseId,
+        history_window: Option<std::time::Duration>,
+        max_branches: Option<i32>,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 }
 
@@ -115,8 +185,65 @@ impl MetadataPort for MetadataClient {
         MetadataClient::tenant_overview(self, tenant_id).await
     }
 
+    async fn get_branch(&self, branch_id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::get_branch(self, branch_id).await
+    }
+
     async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
         MetadataClient::begin_delete(self, database_id).await
+    }
+
+    async fn list_branches(&self, database_id: DatabaseId) -> Result<Vec<BranchRecord>, MetadataError> {
+        MetadataClient::list_branches(self, database_id).await
+    }
+
+    async fn main_branches_with_counts(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Vec<(BranchRecord, i64)>, MetadataError> {
+        MetadataClient::main_branches_with_counts(self, tenant_id).await
+    }
+
+    async fn create_branch(&self, branch: &NewBranch<'_>) -> Result<CreateBranchOutcome, MetadataError> {
+        MetadataClient::create_branch(self, branch).await
+    }
+
+    async fn live_children(&self, branch_id: BranchId) -> Result<Vec<BranchRecord>, MetadataError> {
+        MetadataClient::live_children(self, branch_id).await
+    }
+
+    async fn set_branch_status(
+        &self,
+        branch_id: BranchId,
+        from: &[BranchStatus],
+        to: BranchStatus,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::set_branch_status(self, branch_id, from, to).await
+    }
+
+    async fn claim_branch_for_switch(&self, branch_id: BranchId) -> Result<bool, MetadataError> {
+        MetadataClient::claim_branch_for_switch(self, branch_id).await
+    }
+
+    async fn set_branch_failed(&self, branch_id: BranchId, error: &str) -> Result<(), MetadataError> {
+        MetadataClient::set_branch_failed(self, branch_id, error).await
+    }
+
+    async fn begin_branch_delete(
+        &self,
+        branch_id: BranchId,
+    ) -> Result<BranchDeleteOutcome, MetadataError> {
+        MetadataClient::begin_branch_delete(self, branch_id).await
+    }
+
+    async fn update_database_settings(
+        &self,
+        database_id: DatabaseId,
+        history_window: Option<std::time::Duration>,
+        max_branches: Option<i32>,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::update_database_settings(self, database_id, history_window, max_branches)
+            .await
     }
 }
 
@@ -144,9 +271,21 @@ pub trait JobPort: Send + Sync + 'static {
         job: &JobEnvelope<DeleteDatabaseJob>,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
+    fn publish_branch(
+        &self,
+        job: &JobEnvelope<BranchJob>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    fn publish_database_settings(
+        &self,
+        job: &JobEnvelope<DatabaseSettingsJob>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    /// Resets the owner password of one branch (main's id is the database's).
     fn reset_password(
         &self,
         database_id: DatabaseId,
+        branch_id: BranchId,
     ) -> impl Future<Output = Result<ResetPasswordReply, ResetError>> + Send;
 }
 
@@ -173,9 +312,28 @@ impl JobPort for NatsPorts {
             .map_err(|e| Box::new(e) as BoxError)
     }
 
-    async fn reset_password(&self, database_id: DatabaseId) -> Result<ResetPasswordReply, ResetError> {
+    async fn publish_branch(&self, job: &JobEnvelope<BranchJob>) -> Result<(), BoxError> {
+        cheladb_nats::publish_branch(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_database_settings(
+        &self,
+        job: &JobEnvelope<DatabaseSettingsJob>,
+    ) -> Result<(), BoxError> {
+        cheladb_nats::publish_database_settings(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn reset_password(
+        &self,
+        database_id: DatabaseId,
+        branch_id: BranchId,
+    ) -> Result<ResetPasswordReply, ResetError> {
         use async_nats::RequestErrorKind;
-        let body = serde_json::to_vec(&ResetPasswordRequest { database_id })
+        let body = serde_json::to_vec(&ResetPasswordRequest { database_id, branch_id })
             .map_err(|e| ResetError::Transport(e.to_string()))?;
         // A per-request timeout: the client's default (10 s) would otherwise
         // cut the documented 15 s short.
@@ -344,6 +502,11 @@ struct DatabaseResponse {
     host: Option<String>,
     port: Option<u16>,
     error: Option<String>,
+    /// Live `normal` branches, main included (backups and deleted branches don't count).
+    branch_count: i64,
+    /// Seconds of history the database keeps.
+    history_window: u64,
+    max_branches: i32,
 }
 
 /// The proxy's host and Postgres port, once the database is ready: until then its endpoint
@@ -361,9 +524,32 @@ fn proxy_address(
     }
 }
 
+/// Main's endpoint, if main has one.
+fn main_endpoint(main: Option<&BranchRecord>) -> Option<&str> {
+    main.and_then(|b| b.endpoint_id.as_deref())
+}
+
+/// Each database's main branch and branch count, for the summaries: one query for the tenant.
+async fn main_branches<M: MetadataPort>(
+    metadata: &M,
+    tenant_id: TenantId,
+) -> Result<HashMap<DatabaseId, (BranchRecord, i64)>, MetadataError> {
+    Ok(metadata
+        .main_branches_with_counts(tenant_id)
+        .await?
+        .into_iter()
+        .map(|(main, count)| (main.database_id, (main, count)))
+        .collect())
+}
+
 impl DatabaseResponse {
-    fn new(r: DatabaseRecord, proxy_domain: &str) -> Self {
-        let (host, port) = proxy_address(r.status, r.endpoint_id.as_deref(), proxy_domain).unzip();
+    fn new(
+        r: DatabaseRecord,
+        main: Option<&BranchRecord>,
+        branch_count: i64,
+        proxy_domain: &str,
+    ) -> Self {
+        let (host, port) = proxy_address(r.status, main_endpoint(main), proxy_domain).unzip();
         Self {
             database_id: r.database_id,
             project_id: r.project_id,
@@ -373,6 +559,9 @@ impl DatabaseResponse {
             host,
             port,
             error: r.error,
+            branch_count,
+            history_window: r.history_window.as_secs(),
+            max_branches: r.max_branches,
         }
     }
 }
@@ -412,24 +601,34 @@ struct DatabaseSummary {
     status: DatabaseStatus,
     host: Option<String>,
     port: Option<u16>,
+    /// Live `normal` branches, main included.
+    branch_count: i64,
 }
 
 impl TenantView {
-    fn new(t: TenantOverview, proxy_domain: &str) -> Self {
+    fn new(
+        t: TenantOverview,
+        mains: &HashMap<DatabaseId, (BranchRecord, i64)>,
+        proxy_domain: &str,
+    ) -> Self {
         Self {
             id: t.id,
             slug: t.slug,
             projects: t
                 .projects
                 .into_iter()
-                .map(|p| ProjectView::new(p, proxy_domain))
+                .map(|p| ProjectView::new(p, mains, proxy_domain))
                 .collect(),
         }
     }
 }
 
 impl ProjectView {
-    fn new(p: ProjectOverview, proxy_domain: &str) -> Self {
+    fn new(
+        p: ProjectOverview,
+        mains: &HashMap<DatabaseId, (BranchRecord, i64)>,
+        proxy_domain: &str,
+    ) -> Self {
         Self {
             id: p.id,
             slug: p.slug,
@@ -437,14 +636,17 @@ impl ProjectView {
                 .databases
                 .into_iter()
                 .map(|d| {
+                    let main = mains.get(&d.database_id);
                     let (host, port) =
-                        proxy_address(d.status, d.endpoint_id.as_deref(), proxy_domain).unzip();
+                        proxy_address(d.status, main_endpoint(main.map(|m| &m.0)), proxy_domain)
+                            .unzip();
                     DatabaseSummary {
                         database_id: d.database_id,
                         name: d.name,
                         status: d.status,
                         host,
                         port,
+                        branch_count: main.map_or(0, |m| m.1),
                     }
                 })
                 .collect(),
@@ -464,11 +666,14 @@ where
         // GET and DELETE share one path (cheladb-routes GET_DATABASE / DELETE_DATABASE).
         .route(
             routes::GET_DATABASE.path,
-            get(get_database::<M, J>).delete(delete_database::<M, J>),
+            get(get_database::<M, J>)
+                .delete(delete_database::<M, J>)
+                .patch(branches::update_database::<M, J>),
         )
         .route(routes::DATABASE_CONNECTION.path, get(database_connection::<M, J>))
         .route(routes::RESET_PASSWORD.path, post(reset_password::<M, J>))
         .route(routes::ME.path, get(me::<M, J>))
+        .merge(branches::routes::<M, J>())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -486,7 +691,14 @@ where
         Err(_) => return internal_error(),
         Ok(None) => None,
         Ok(Some(tenant_id)) => match state.metadata.tenant_overview(tenant_id).await {
-            Ok(overview) => overview.map(|o| TenantView::new(o, &state.proxy_domain)),
+            Ok(None) => None,
+            Ok(Some(overview)) => match main_branches(&state.metadata, overview.id).await {
+                Ok(mains) => Some(TenantView::new(overview, &mains, &state.proxy_domain)),
+                Err(err) => {
+                    error!("main branches: {err}");
+                    return internal_error();
+                }
+            },
             Err(err) => {
                 error!("tenant overview: {err}");
                 return internal_error();
@@ -611,7 +823,20 @@ where
                 )
                     .into_response();
             }
-            (StatusCode::OK, Json(DatabaseResponse::new(record, &state.proxy_domain))).into_response()
+            let branches = match state.metadata.list_branches(database_id).await {
+                Ok(branches) => branches,
+                Err(err) => {
+                    error!("list branches: {err}");
+                    return internal_error();
+                }
+            };
+            let count = branches.iter().filter(|b| b.kind == BranchKind::Normal).count() as i64;
+            let main = branches.iter().find(|b| b.id == BranchId::from(database_id));
+            (
+                StatusCode::OK,
+                Json(DatabaseResponse::new(record, main, count, &state.proxy_domain)),
+            )
+                .into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -659,6 +884,25 @@ where
     }
 }
 
+/// The database's main branch, if it has one.
+async fn load_main<M, J>(
+    state: &AppState<M, J>,
+    database_id: DatabaseId,
+) -> Result<Option<BranchRecord>, Box<Response>>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    state
+        .metadata
+        .get_branch(BranchId::from(database_id))
+        .await
+        .map_err(|err| {
+            error!("load main branch: {err}");
+            Box::new(internal_error())
+        })
+}
+
 #[derive(Debug, Serialize)]
 struct ConnectionDetails {
     host: String,
@@ -670,7 +914,11 @@ struct ConnectionDetails {
     http_url: String,
 }
 
-/// Reveal the owner credentials of a ready database. Never cached, never logged.
+/// What a backup answers to reveal, reset-password, reset-to-parent and restore.
+const BACKUP_REFUSAL: &str =
+    "this is a restore backup with no compute; create a branch from it to connect";
+
+/// Reveal the owner credentials of a ready database (main's). Never cached, never logged.
 async fn database_connection<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
@@ -693,9 +941,46 @@ where
             ),
         );
     }
-    let sealed = record.owner_password_enc.filter(|s| !s.is_empty());
+    // Main holds the database's endpoint and sealed password (AAD = its id = the database's).
+    let main = match load_main(&state, record.database_id).await {
+        Ok(main) => main,
+        Err(resp) => return *resp,
+    };
+    reveal(&state, &principal, &record, main).await
+}
+
+/// The owner credentials of `branch`, a branch of `record`'s database.
+async fn reveal<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    record: &DatabaseRecord,
+    branch: Option<BranchRecord>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let Some(branch) = branch else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "credentials unavailable; recreate this database",
+        );
+    };
+    if branch.kind == BranchKind::Backup {
+        return json_error(StatusCode::CONFLICT, BACKUP_REFUSAL);
+    }
+    if branch.status != BranchStatus::Ready {
+        return json_error(
+            StatusCode::CONFLICT,
+            &format!(
+                "branch is {}; connection details are available once it is ready",
+                branch.status.as_str()
+            ),
+        );
+    }
+    let sealed = branch.owner_password_enc.filter(|s| !s.is_empty());
     let (Some(endpoint_id), Some(database), Some(sealed)) =
-        (record.endpoint_id, record.database_name, sealed)
+        (branch.endpoint_id, record.database_name.clone(), sealed)
     else {
         return json_error(
             StatusCode::CONFLICT,
@@ -704,13 +989,13 @@ where
     };
     let password = match open_credential(
         &state.secrets,
-        &record.database_id.to_string(),
+        &branch.id.to_string(),
         Purpose::Owner,
         &sealed,
     ) {
         Ok(password) => password,
         Err(err) => {
-            error!(database_id = %record.database_id, "decrypt owner password: {err}");
+            error!(database_id = %record.database_id, branch_id = %branch.id, "decrypt owner password: {err}");
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "stored credentials can't be decrypted with the current secrets key; \
@@ -718,11 +1003,12 @@ where
             );
         }
     };
-    let user = record.owner_role.unwrap_or_else(|| "postgres".to_string());
+    let user = record.owner_role.clone().unwrap_or_else(|| "postgres".to_string());
     info!(
         request_id = %principal.request_id,
         sub = %principal.sub,
         database_id = %record.database_id,
+        branch_id = %branch.id,
         "revealed connection details"
     );
     let host = proxy_host(&endpoint_id, &state.proxy_domain);
@@ -762,21 +1048,52 @@ where
     if record.status != DatabaseStatus::Ready {
         return json_error(StatusCode::CONFLICT, "database is not ready");
     }
-    // A database without an endpoint has nothing to reset; say so instead of failing
-    // inside the worker.
-    if record.endpoint_id.is_none() {
+    let main = match load_main(&state, record.database_id).await {
+        Ok(main) => main,
+        Err(resp) => return *resp,
+    };
+    reset_branch_password(&state, &principal, &record, main).await
+}
+
+/// Resets the owner password of `branch`, a branch of `record`'s database, through the worker.
+async fn reset_branch_password<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    record: &DatabaseRecord,
+    branch: Option<BranchRecord>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    // A branch without an endpoint has nothing to reset; say so instead of failing inside
+    // the worker.
+    let Some(branch) = branch else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "credentials unavailable; recreate this database",
+        );
+    };
+    if branch.kind == BranchKind::Backup {
+        return json_error(StatusCode::CONFLICT, BACKUP_REFUSAL);
+    }
+    if branch.status != BranchStatus::Ready {
+        return json_error(StatusCode::CONFLICT, "branch is not ready");
+    }
+    if branch.endpoint_id.is_none() {
         return json_error(
             StatusCode::CONFLICT,
             "credentials unavailable; recreate this database",
         );
     }
-    match state.js.reset_password(record.database_id).await {
+    let (database_id, branch_id) = (record.database_id, branch.id);
+    match state.js.reset_password(database_id, branch_id).await {
         Ok(reply) if reply.ok => {
-            info!(request_id = %principal.request_id, database_id = %record.database_id, "owner password reset");
+            info!(request_id = %principal.request_id, %database_id, %branch_id, "owner password reset");
             (StatusCode::OK, Json(serde_json::json!({}))).into_response()
         }
         Ok(reply) if reply.error.as_deref() == Some("not ready") => {
-            json_error(StatusCode::CONFLICT, "database is not ready")
+            json_error(StatusCode::CONFLICT, "branch is not ready")
         }
         Ok(reply) if reply.error.as_deref() == Some(RESET_NOT_APPLIED) => {
             json_error(StatusCode::SERVICE_UNAVAILABLE, RESET_NOT_APPLIED)
@@ -786,7 +1103,7 @@ where
             "the database did not respond; try again",
         ),
         Ok(reply) => {
-            error!(database_id = %record.database_id, "reset password failed: {:?}", reply.error);
+            error!(%database_id, %branch_id, "reset password failed: {:?}", reply.error);
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "password reset failed")
         }
         Err(ResetError::Timeout) => json_error(
@@ -794,7 +1111,7 @@ where
             "worker did not respond; try again",
         ),
         Err(ResetError::Transport(err)) => {
-            error!(database_id = %record.database_id, "reset password: {err}");
+            error!(%database_id, %branch_id, "reset password: {err}");
             json_error(StatusCode::SERVICE_UNAVAILABLE, "worker unavailable")
         }
     }

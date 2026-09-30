@@ -9,7 +9,7 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::StatusCode as AxumStatus;
 use axum::response::{IntoResponse, Response};
-use cheladb_neon::storcon::TimelineInfo;
+use cheladb_neon::storcon::{LsnAtTime, LsnKind, TimelineInfo};
 use cheladb_neon::{Lsn, NeonId, StorconClient, StorconError};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 struct Seen {
     method: String,
     path: String,
+    query: String,
     body: Value,
 }
 
@@ -70,6 +71,7 @@ async fn answer(State(script): State<Arc<Script>>, req: Request) -> Response {
     script.seen.lock().unwrap().push(Seen {
         method: parts.method.to_string(),
         path: parts.uri.path().to_string(),
+        query: parts.uri.query().unwrap_or_default().to_string(),
         body,
     });
     let (status, reply) = script
@@ -474,6 +476,228 @@ async fn list_tenant_ids_rejects_a_malformed_id() {
     let m = mock(vec![(200, r#"[{"tenant_id":"not-an-id"}]"#)]).await;
     let err = StorconClient::new(&m.base, 0)
         .list_tenant_ids()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+}
+
+fn at() -> chrono::DateTime<chrono::Utc> {
+    "2026-09-30T12:34:56Z".parse().unwrap()
+}
+
+#[tokio::test]
+async fn lsn_by_timestamp_parses_each_kind() {
+    let m = mock(vec![
+        (200, r#"{"lsn":"0/16B3748","kind":"present","valid_until":"2026-09-30T12:40:00.000Z"}"#),
+        (200, r#"{"lsn":"0/16B3749","kind":"future"}"#),
+        (200, r#"{"lsn":"0/16B374A","kind":"past"}"#),
+        (200, r#"{"lsn":"0/0","kind":"nodata"}"#),
+    ])
+    .await;
+    let client = StorconClient::new(&m.base, 0);
+    let (t, tl) = (id(1), id(2));
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(client.lsn_by_timestamp(&t, &tl, at()).await.unwrap());
+    }
+    assert_eq!(
+        got,
+        vec![
+            LsnAtTime { lsn: lsn("0/16B3748"), kind: LsnKind::Present },
+            LsnAtTime { lsn: lsn("0/16B3749"), kind: LsnKind::Future },
+            LsnAtTime { lsn: lsn("0/16B374A"), kind: LsnKind::Past },
+            LsnAtTime { lsn: lsn("0/0"), kind: LsnKind::Nodata },
+        ]
+    );
+    let seen = m.seen();
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(
+        seen[0].path,
+        format!("/v1/tenant/{}/timeline/{}/get_lsn_by_timestamp", t.as_str(), tl.as_str())
+    );
+    assert!(seen[0].query.contains("with_lease=true"), "{}", seen[0].query);
+    assert!(
+        seen[0].query.contains("timestamp=2026-09-30T12%3A34%3A56Z"),
+        "{}",
+        seen[0].query
+    );
+}
+
+#[tokio::test]
+async fn timestamp_of_lsn_none_on_404() {
+    let m = mock(vec![
+        (200, r#""2026-09-30T12:34:56.123456Z""#),
+        (404, r#"{"msg":"not found"}"#),
+        (412, r#"{"msg":"Timestamp for lsn 0/1 not found"}"#),
+        (400, r#"{"msg":"bad lsn"}"#),
+    ])
+    .await;
+    let client = StorconClient::new(&m.base, 0);
+    let (t, tl) = (id(1), id(2));
+    let some = client.timestamp_of_lsn(&t, &tl, lsn("0/16B3748")).await.unwrap();
+    assert_eq!(some, Some("2026-09-30T12:34:56.123456Z".parse().unwrap()));
+    assert_eq!(client.timestamp_of_lsn(&t, &tl, lsn("0/1")).await.unwrap(), None);
+    assert_eq!(client.timestamp_of_lsn(&t, &tl, lsn("0/1")).await.unwrap(), None);
+    assert!(matches!(
+        client.timestamp_of_lsn(&t, &tl, lsn("0/1")).await,
+        Err(StorconError::Rejected { .. })
+    ));
+    let seen = m.seen();
+    assert_eq!(
+        seen[0].path,
+        format!("/v1/tenant/{}/timeline/{}/get_timestamp_of_lsn", t.as_str(), tl.as_str())
+    );
+    assert_eq!(seen[0].query, "lsn=0%2F16B3748");
+}
+
+#[tokio::test]
+async fn detach_ancestor_sends_multi_level_no_reparent() {
+    let m = mock(vec![(200, r#"{"reparented_timelines":[]}"#), (202, "{}")]).await;
+    let client = StorconClient::new(&m.base, 0);
+    let (t, tl) = (id(1), id(2));
+    client.detach_ancestor(&t, &tl).await.unwrap();
+    client.detach_ancestor(&t, &tl).await.unwrap();
+    let seen = m.seen();
+    assert_eq!(seen[0].method, "PUT");
+    assert_eq!(
+        seen[0].path,
+        format!("/v1/tenant/{}/timeline/{}/detach_ancestor", t.as_str(), tl.as_str())
+    );
+    assert_eq!(seen[0].query, "detach_behavior=multi_level_and_no_reparent");
+}
+
+#[tokio::test]
+async fn patch_tenant_config_sends_seconds() {
+    let m = mock(vec![(200, "{}")]).await;
+    let t = id(1);
+    StorconClient::new(&m.base, 0)
+        .patch_tenant_config(&t, Duration::from_secs(604_800))
+        .await
+        .unwrap();
+    let seen = m.seen();
+    assert_eq!(seen[0].method, "PATCH");
+    assert_eq!(seen[0].path, "/v1/tenant/config");
+    assert_eq!(
+        seen[0].body,
+        json!({ "tenant_id": t.as_str(), "pitr_interval": "604800s" })
+    );
+}
+
+#[tokio::test]
+async fn tenant_pitr_interval_parses_humantime() {
+    let m = mock(vec![
+        (200, r#"{"tenant_specific_overrides":{},"effective_config":{"pitr_interval":"7days"}}"#),
+        (200, r#"{"effective_config":{"pitr_interval":"604800s"}}"#),
+        (200, r#"{"effective_config":{"pitr_interval":"1h 30m"}}"#),
+        (200, r#"{"effective_config":{"pitr_interval":"garbage"}}"#),
+    ])
+    .await;
+    let client = StorconClient::new(&m.base, 0);
+    let t = id(1);
+    assert_eq!(client.tenant_pitr_interval(&t).await.unwrap(), Some(Duration::from_secs(604_800)));
+    assert_eq!(client.tenant_pitr_interval(&t).await.unwrap(), Some(Duration::from_secs(604_800)));
+    assert_eq!(client.tenant_pitr_interval(&t).await.unwrap(), Some(Duration::from_secs(5_400)));
+    assert!(matches!(
+        client.tenant_pitr_interval(&t).await,
+        Err(StorconError::Other(_))
+    ));
+    let seen = m.seen();
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(seen[0].path, format!("/v1/tenant/{}/config", t.as_str()));
+}
+
+#[tokio::test]
+async fn tenant_pitr_interval_none_when_unset() {
+    let m = mock(vec![
+        (200, r#"{"effective_config":{}}"#),
+        (200, r#"{"effective_config":{"pitr_interval":null}}"#),
+        (200, r#"{}"#),
+    ])
+    .await;
+    let client = StorconClient::new(&m.base, 0);
+    for _ in 0..3 {
+        assert_eq!(client.tenant_pitr_interval(&id(1)).await.unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn list_timelines_returns_ids() {
+    let m = mock(vec![(
+        200,
+        r#"[{"tenant_id":"x-0000","timeline_id":"00000000000000000000000000000002","last_record_lsn":"0/1"},
+            {"tenant_id":"x-0000","timeline_id":"00000000000000000000000000000003","last_record_lsn":"0/2"}]"#,
+    )])
+    .await;
+    let t = id(1);
+    let got = StorconClient::new(&m.base, 0).list_timelines(&t).await.unwrap();
+    assert_eq!(got, vec![id(2), id(3)]);
+    assert_eq!(m.seen()[0].path, format!("/v1/tenant/{}/timeline", t.as_str()));
+}
+
+#[tokio::test]
+async fn new_calls_map_a_500_with_its_body() {
+    let m = mock(vec![(500, r#"{"msg":"pageserver on fire"}"#)]).await;
+    let err = StorconClient::new(&m.base, 0)
+        .lsn_by_timestamp(&id(1), &id(2), at())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)));
+    let text = err.to_string();
+    assert!(text.contains("500") && text.contains("pageserver on fire"), "{text}");
+}
+
+/// Answers every request after `delay` with a timeline description.
+async fn slow(delay: Duration) -> String {
+    let app = Router::new().fallback(move || async move {
+        tokio::time::sleep(delay).await;
+        (
+            [("content-type", "application/json")],
+            r#"{"ancestor_lsn": null, "last_record_lsn": "0/16B3748"}"#,
+        )
+    });
+    serve(app).await
+}
+
+#[tokio::test]
+async fn timeline_create_and_detach_have_their_own_longer_timeouts() {
+    assert_eq!(
+        cheladb_neon::storcon::CREATE_TIMELINE_TIMEOUT,
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        cheladb_neon::storcon::DETACH_TIMEOUT,
+        Duration::from_secs(600)
+    );
+    let base = slow(Duration::from_millis(400)).await;
+    let client = StorconClient::new(&base, 0)
+        .with_timeout(Duration::from_millis(100))
+        .with_timeline_timeouts(Duration::from_secs(5), Duration::from_secs(5));
+    let (t, tl) = (id(1), id(2));
+
+    client
+        .create_timeline(&t, &tl, 17, Some((&id(3), None)))
+        .await
+        .expect("create outlasts the request timeout");
+    client
+        .detach_ancestor(&t, &tl)
+        .await
+        .expect("detach outlasts the request timeout");
+    let err = client.get_timeline(&t, &tl).await.unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_detach_that_outlasts_its_timeout_is_other() {
+    let base = slow(Duration::from_millis(400)).await;
+    let client = StorconClient::new(&base, 0)
+        .with_timeline_timeouts(Duration::from_secs(5), Duration::from_millis(100));
+    let started = Instant::now();
+    let err = client.detach_ancestor(&id(1), &id(2)).await.unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+    assert!(started.elapsed() < Duration::from_millis(390));
+    let err = StorconClient::new(&base, 0)
+        .with_timeline_timeouts(Duration::from_millis(100), Duration::from_secs(5))
+        .create_timeline(&id(1), &id(2), 17, None)
         .await
         .unwrap_err();
     assert!(matches!(err, StorconError::Other(_)), "{err:?}");

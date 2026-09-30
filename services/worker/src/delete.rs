@@ -1,4 +1,5 @@
-//! Deleting a database: its compute, its tenant, its endpoint row, then the tombstone.
+//! Deleting a database: every branch's compute, the tenant, the endpoint rows, then the
+//! tombstones.
 
 use cheladb_neon::{ComputeBackend, NeonId};
 use cheladb_types::DatabaseId;
@@ -10,30 +11,80 @@ use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
 {
-    /// Tears down whatever the database has, then marks it `deleted`. `Err` (the job is
-    /// retried, and the row stays `deleting`) when any of that fails.
+    /// Tears down whatever the database's branches have (backups included): every compute,
+    /// then the tenant (which takes every timeline with it), then the endpoint rows. Then marks
+    /// each branch and the database `deleted`. `Err` (the job is retried, and the rows stay
+    /// `deleting`) when any of that fails.
     pub async fn handle_delete(&self, id: DatabaseId) -> Result<(), String> {
-        let record = self
+        let branches = self
+            .metadata
+            .list_branches(id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut endpoints = Vec::new();
+        for branch in &branches {
+            let Some(endpoint_id) = &branch.endpoint_id else {
+                continue;
+            };
+            let endpoint = self
+                .metadata
+                .neon_endpoint(endpoint_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            endpoints.extend(endpoint);
+        }
+        for endpoint in &endpoints {
+            self.computes
+                .delete(&endpoint.id)
+                .await
+                .map_err(|e| format!("removing compute: {e:#}"))?;
+        }
+        // The database's tenant, and any other an endpoint names (a provision that recorded
+        // its endpoint but not yet its tenant when the delete began).
+        let mut tenants: Vec<String> = self
             .metadata
             .get_database(id)
             .await
-            .map_err(|e| e.to_string())?;
-        if let Some(endpoint_id) = record.and_then(|r| r.endpoint_id) {
-            let endpoint = self
-                .metadata
-                .neon_endpoint(&endpoint_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|d| d.neon_tenant_id)
+            .into_iter()
+            .collect();
+        for endpoint in &endpoints {
+            if !tenants.contains(&endpoint.tenant_id) {
+                tenants.push(endpoint.tenant_id.clone());
+            }
+        }
+        for tenant in &tenants {
+            self.delete_tenant(tenant).await?;
+        }
+        for endpoint in &endpoints {
+            self.metadata
+                .delete_endpoint(&endpoint.id)
+                .await
+                .map_err(|e| format!("deleting endpoint: {e}"))?;
+        }
+        for branch in &branches {
+            self.metadata
+                .mark_branch_deleted(branch.id)
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Some(endpoint) = endpoint {
-                self.teardown(&endpoint.id, &endpoint.tenant_id).await?;
-            }
         }
         self.metadata
             .mark_deleted(id)
             .await
             .map_err(|e| e.to_string())?;
-        info!(database_id = %id, "database deleted");
+        info!(database_id = %id, branches = branches.len(), "database deleted");
         Ok(())
+    }
+
+    async fn delete_tenant(&self, tenant_id: &str) -> Result<(), String> {
+        let tenant: NeonId = tenant_id
+            .parse()
+            .map_err(|e| format!("deleting tenant: {e}"))?;
+        self.storage
+            .delete_tenant(&tenant)
+            .await
+            .map_err(|e| format!("deleting tenant: {e:#}"))
     }
 
     /// Removes the compute, the tenant and the endpoint row, in that order, stopping at the
@@ -43,13 +94,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .delete(endpoint_id)
             .await
             .map_err(|e| format!("removing compute: {e:#}"))?;
-        let tenant: NeonId = tenant_id
-            .parse()
-            .map_err(|e| format!("deleting tenant: {e}"))?;
-        self.storage
-            .delete_tenant(&tenant)
-            .await
-            .map_err(|e| format!("deleting tenant: {e:#}"))?;
+        self.delete_tenant(tenant_id).await?;
         self.metadata
             .delete_endpoint(endpoint_id)
             .await
@@ -59,10 +104,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::DatabaseStatus;
+    use cheladb_metadata::{BranchStatus, DatabaseStatus};
 
     use super::*;
-    use crate::fakes::{FakeWorker, Journal, STORAGE_CAUSE, entries, position, worker};
+    use crate::fakes::{
+        FakeWorker, Journal, STORAGE_CAUSE, entries, position, ready_branch, restored_by_hand,
+        worker,
+    };
 
     fn pos(journal: &Journal, prefix: &str) -> usize {
         position(journal, prefix)
@@ -73,9 +121,17 @@ mod tests {
     async fn ready(w: &FakeWorker, journal: &Journal) -> (DatabaseId, String, String) {
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         w.handle_provision(id, "app").await.unwrap();
-        let ep = w.metadata.database(id).endpoint_id.unwrap();
+        let ep = w.metadata.main(id).endpoint_id.unwrap();
         let tenant = w.metadata.state().endpoints[&ep].endpoint.tenant_id.clone();
-        w.metadata.state().databases.get_mut(&id).unwrap().status = DatabaseStatus::Deleting;
+        {
+            let mut state = w.metadata.state();
+            state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Deleting;
+            state
+                .branches
+                .get_mut(&cheladb_types::BranchId::from(id))
+                .unwrap()
+                .status = BranchStatus::Deleting;
+        }
         journal.lock().unwrap().clear();
         (id, ep, tenant)
     }
@@ -86,8 +142,10 @@ mod tests {
         let (id, ep, tenant) = ready(&w, &journal).await;
         w.handle_delete(id).await.unwrap();
         let db = w.metadata.database(id);
+        let main = w.metadata.main(id);
         assert_eq!(db.status, DatabaseStatus::Deleted);
-        assert_eq!(db.owner_password_enc, None);
+        assert_eq!(main.status, BranchStatus::Deleted);
+        assert_eq!(main.owner_password_enc, None);
         assert!(w.metadata.endpoint_ids().is_empty());
         assert!(!w.storage.has_tenant(&tenant));
         assert_eq!(w.computes.status(&ep).await.unwrap(), None);
@@ -95,6 +153,7 @@ mod tests {
             pos(&journal, &format!("compute.delete {ep}")),
             pos(&journal, "storage.delete_tenant"),
             pos(&journal, "metadata.delete_endpoint"),
+            pos(&journal, "metadata.mark_branch_deleted"),
             pos(&journal, "metadata.mark_deleted"),
         ];
         assert!(order.is_sorted(), "{:?}", entries(&journal));
@@ -106,7 +165,11 @@ mod tests {
         let id = w.metadata.insert_database("app", DatabaseStatus::Deleting);
         w.handle_delete(id).await.unwrap();
         assert_eq!(w.metadata.database(id).status, DatabaseStatus::Deleted);
-        assert_eq!(entries(&journal), ["metadata.mark_deleted"]);
+        assert_eq!(w.metadata.main(id).status, BranchStatus::Deleted);
+        assert_eq!(
+            entries(&journal),
+            ["metadata.mark_branch_deleted", "metadata.mark_deleted"]
+        );
     }
 
     #[tokio::test]
@@ -144,10 +207,85 @@ mod tests {
                 "{step}"
             );
             assert_eq!(w.metadata.endpoint_ids(), [ep], "{step}");
+            assert_eq!(w.metadata.main(id).status, BranchStatus::Deleting, "{step}");
             assert!(
                 position(&journal, "metadata.mark_deleted").is_none(),
                 "{step}"
             );
+            assert!(
+                position(&journal, "metadata.mark_branch_deleted").is_none(),
+                "{step}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn database_delete_removes_every_branch_compute_first() {
+        let (w, journal) = worker();
+        let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
+        w.handle_provision(id, "app").await.unwrap();
+        let main = cheladb_types::BranchId::from(id);
+        let dev = ready_branch(&w, id, "dev", main).await;
+        let backup = restored_by_hand(&w, dev, "dev-before-restore-20260930T120000Z");
+        let other = ready_branch(&w, id, "other", main).await;
+        let tenant = w.metadata.database(id).neon_tenant_id.unwrap();
+        let eps: Vec<String> = [main, dev, other]
+            .map(|b| w.metadata.branch(b).endpoint_id.unwrap())
+            .to_vec();
+        assert_eq!(
+            w.storage.timeline_ids().len(),
+            4,
+            "main, dev (restored), its backup, other"
+        );
+        {
+            let mut state = w.metadata.state();
+            state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Deleting;
+            for b in state.branches.values_mut() {
+                b.status = BranchStatus::Deleting;
+            }
+        }
+        journal.lock().unwrap().clear();
+
+        w.handle_delete(id).await.unwrap();
+
+        assert_eq!(w.metadata.database(id).status, DatabaseStatus::Deleted);
+        for b in [main, dev, backup, other] {
+            let row = w.metadata.branch(b);
+            assert_eq!(row.status, BranchStatus::Deleted, "{}", row.name);
+            assert_eq!(row.owner_password_enc, None, "{}", row.name);
+        }
+        assert!(w.metadata.endpoint_ids().is_empty());
+        assert!(w.computes.list().await.unwrap().is_empty());
+        assert!(!w.storage.has_tenant(&tenant));
+        assert!(w.storage.timeline_ids().is_empty());
+        let journal_entries = entries(&journal);
+        let count = |prefix: &str| {
+            journal_entries
+                .iter()
+                .filter(|e| e.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(count("storage.delete_tenant"), 1, "{journal_entries:?}");
+        assert_eq!(
+            count("storage.delete_timeline"),
+            0,
+            "the tenant takes every timeline"
+        );
+        assert_eq!(count("metadata.delete_endpoint"), 3);
+        assert_eq!(count("metadata.mark_branch_deleted"), 4);
+        let tenant_at = pos(&journal, "storage.delete_tenant");
+        for ep in &eps {
+            assert!(
+                pos(&journal, &format!("compute.delete {ep}")) < tenant_at,
+                "{journal_entries:?}"
+            );
+        }
+        let order = [
+            tenant_at,
+            pos(&journal, "metadata.delete_endpoint"),
+            pos(&journal, "metadata.mark_branch_deleted"),
+            pos(&journal, "metadata.mark_deleted"),
+        ];
+        assert!(order.is_sorted(), "{journal_entries:?}");
     }
 }

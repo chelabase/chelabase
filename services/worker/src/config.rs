@@ -131,6 +131,7 @@ pub fn build(
         owner_superuser: config.owner_superuser(),
         ready_poll: Duration::from_millis(500),
         ready_timeout: Duration::from_secs(60),
+        claim_refresh: Duration::from_secs(60),
     })
 }
 

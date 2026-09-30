@@ -2,8 +2,8 @@ use axum::{Json, Router, routing::get};
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{
     NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply, ResetPasswordRequest,
-    SUBJECT_RESET_PASSWORD, connect, ensure_control_stream, run_delete_consumer,
-    run_provision_consumer,
+    SUBJECT_RESET_PASSWORD, connect, ensure_control_stream, run_branch_consumer,
+    run_delete_consumer, run_provision_consumer, run_settings_consumer,
 };
 use cheladb_secrets::{SecretKey, key_check_value, verify_key_check};
 use cheladb_types::mode::Mode;
@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
+use worker::branch_job::Attempt;
 use worker::config::{RealWorker, WorkerConfig, build};
 
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
@@ -83,7 +84,37 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("worker consuming provision and delete jobs");
+    let branch_worker = worker.clone();
+    let branch_js = js.clone();
+    tokio::spawn(async move {
+        let result = run_branch_consumer(branch_js, move |job, attempt| {
+            let worker = branch_worker.clone();
+            async move {
+                worker
+                    .handle_branch_job_attempt(job.payload, Attempt(attempt))
+                    .await
+            }
+        })
+        .await;
+        if let Err(err) = result {
+            warn!("branch consumer exited: {err}");
+        }
+    });
+
+    let settings_worker = worker.clone();
+    let settings_js = js.clone();
+    tokio::spawn(async move {
+        let result = run_settings_consumer(settings_js, move |job| {
+            let worker = settings_worker.clone();
+            async move { worker.handle_database_settings(job.payload.database_id).await }
+        })
+        .await;
+        if let Err(err) = result {
+            warn!("settings consumer exited: {err}");
+        }
+    });
+
+    info!("worker consuming provision, delete, branch and settings jobs");
     run_provision_consumer(js, move |job| {
         let worker = worker.clone();
         async move {
@@ -150,14 +181,14 @@ async fn serve_reset_password(worker: Arc<RealWorker>, client: async_nats::Clien
         tokio::spawn(async move {
             let reply = match serde_json::from_slice::<ResetPasswordRequest>(&message.payload) {
                 Ok(request) => {
-                    let id = request.database_id;
+                    let id = request.branch_id;
                     match tokio::time::timeout(RESET_DEADLINE, worker.reset_password(id)).await {
                         Ok(Ok(())) => ResetPasswordReply {
                             ok: true,
                             error: None,
                         },
                         Ok(Err(err)) => {
-                            warn!(database_id = %id, "reset password failed: {err}");
+                            warn!(branch_id = %id, "reset password failed: {err}");
                             ResetPasswordReply {
                                 ok: false,
                                 error: Some(err),
@@ -166,7 +197,7 @@ async fn serve_reset_password(worker: Arc<RealWorker>, client: async_nats::Clien
                         // The metadata transaction almost always committed before the slow
                         // push or publish, so the password is changed but not yet applied.
                         Err(_) => {
-                            warn!(database_id = %id, "reset password timed out");
+                            warn!(branch_id = %id, "reset password timed out");
                             ResetPasswordReply {
                                 ok: false,
                                 error: Some(RESET_NOT_APPLIED.into()),

@@ -44,6 +44,17 @@ macro_rules! id_newtype {
 id_newtype!(TenantId, "Stable identifier for a tenant (organization).");
 id_newtype!(ProjectId, "Stable identifier for a project within a tenant.");
 id_newtype!(DatabaseId, "Stable identifier for a provisioned database instance.");
+id_newtype!(
+    BranchId,
+    "Stable identifier for a branch of a database; main's equals its database id."
+);
+
+/// A database's main branch: its id is the database's.
+impl From<DatabaseId> for BranchId {
+    fn from(value: DatabaseId) -> Self {
+        Self(value.0)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -54,6 +65,12 @@ mod tests {
         let id = DatabaseId::new();
         let parsed: Uuid = id.to_string().parse().unwrap();
         assert_eq!(id.as_uuid(), parsed);
+    }
+
+    #[test]
+    fn main_branch_id_is_the_database_id() {
+        let db = DatabaseId::new();
+        assert_eq!(BranchId::from(db).as_uuid(), db.as_uuid());
     }
 }
 pub mod mode;

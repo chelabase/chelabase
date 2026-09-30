@@ -1,9 +1,15 @@
 import type {
+  BranchSummary,
   ConnectionDetails,
+  CreateBranchRequest,
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
   DatabaseDetail,
+  DatabaseSettings,
   MeResponse,
+  RestoreAccepted,
+  RestoreRequest,
+  UpdateDatabaseRequest,
 } from "@cheladb/types";
 
 export class ApiError extends Error {
@@ -39,6 +45,21 @@ export interface ApiClient {
   resetPassword(id: string): Promise<void>;
   /** Starts deletion (202); the database then shows `deleting` until gone. */
   deleteDatabase(id: string): Promise<void>;
+  /** History window (seconds) and branch cap. */
+  updateDatabase(id: string, request: UpdateDatabaseRequest): Promise<DatabaseSettings>;
+  /** A bare array; `parent_branch_id` makes the tree. */
+  listBranches(databaseId: string): Promise<BranchSummary[]>;
+  /** 202: the new branch is `provisioning` until its compute is up. */
+  createBranch(databaseId: string, request: CreateBranchRequest): Promise<BranchSummary>;
+  /** Owner credentials of a ready `normal` branch. */
+  getBranchConnection(databaseId: string, branchId: string): Promise<ConnectionDetails>;
+  resetBranchPassword(databaseId: string, branchId: string): Promise<void>;
+  /** 202: the branch is `resetting` until it matches its parent again. */
+  resetBranchToParent(databaseId: string, branchId: string): Promise<void>;
+  /** 202: the branch is `resetting`; its old data becomes the backup branch. */
+  restoreBranch(databaseId: string, branchId: string, request: RestoreRequest): Promise<RestoreAccepted>;
+  /** 202: the branch (and its backups) show `deleting` until gone. */
+  deleteBranch(databaseId: string, branchId: string): Promise<void>;
 }
 
 export function createApiClient(options: ApiClientOptions): ApiClient {
@@ -66,6 +87,9 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
 
   const databasePath = (id: string) => `/v1/databases/${encodeURIComponent(id)}`;
 
+  const branchesPath = (id: string) => `${databasePath(id)}/branches`;
+  const branchPath = (id: string, branchId: string) => `${branchesPath(id)}/${encodeURIComponent(branchId)}`;
+
   return {
     me: () => request<MeResponse>("GET", "/v1/me"),
     createDatabase: (req) => request<CreateDatabaseAccepted>("POST", "/v1/databases", req),
@@ -76,6 +100,22 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
     },
     deleteDatabase: async (id) => {
       await request<unknown>("DELETE", databasePath(id));
+    },
+    updateDatabase: (id, req) => request<DatabaseSettings>("PATCH", databasePath(id), req),
+    listBranches: (id) => request<BranchSummary[]>("GET", branchesPath(id)),
+    createBranch: (id, req) => request<BranchSummary>("POST", branchesPath(id), req),
+    getBranchConnection: (id, branchId) =>
+      request<ConnectionDetails>("GET", `${branchPath(id, branchId)}/connection`),
+    resetBranchPassword: async (id, branchId) => {
+      await request<unknown>("POST", `${branchPath(id, branchId)}/reset-password`);
+    },
+    resetBranchToParent: async (id, branchId) => {
+      await request<unknown>("POST", `${branchPath(id, branchId)}/reset-to-parent`);
+    },
+    restoreBranch: (id, branchId, req) =>
+      request<RestoreAccepted>("POST", `${branchPath(id, branchId)}/restore`, req),
+    deleteBranch: async (id, branchId) => {
+      await request<unknown>("DELETE", branchPath(id, branchId));
     },
   };
 }

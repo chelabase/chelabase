@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use crate::{DatabaseStatus, MetadataClient, MetadataError};
-use cheladb_types::DatabaseId;
+use crate::{BranchStatus, MetadataClient, MetadataError};
+use cheladb_types::BranchId;
 use sqlx::{Postgres, Row, Transaction};
 
 /// The first key of every endpoint lock (`pg_advisory_xact_lock(int, int)`), so they
@@ -31,7 +31,7 @@ pub struct NeonEndpoint {
     pub compute_token_sha256: String,
 }
 
-/// Everything `create_endpoint_for_database` writes.
+/// Everything `create_endpoint_for_branch` writes.
 #[derive(Debug, Clone, Copy)]
 pub struct NewEndpoint<'a> {
     pub id: &'a str,
@@ -43,13 +43,13 @@ pub struct NewEndpoint<'a> {
     pub database_name: &'a str,
 }
 
-/// An endpoint and the database linked to it, as seen by the reconcile loop.
+/// An endpoint and the branch linked to it, as seen by the reconcile loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointState {
     pub id: String,
     pub tenant_id: String,
-    pub database_id: Option<DatabaseId>,
-    pub database_status: Option<DatabaseStatus>,
+    pub branch_id: Option<BranchId>,
+    pub branch_status: Option<BranchStatus>,
     pub needs_reconfigure: bool,
 }
 
@@ -212,57 +212,7 @@ impl MetadataClient {
         }
     }
 
-    /// One transaction: endpoint, role, database, then link. False (and nothing written) when the
-    /// database is deleting/deleted/missing or already linked.
-    pub async fn create_endpoint_for_database(
-        &self,
-        id: DatabaseId,
-        ep: &NewEndpoint<'_>,
-    ) -> Result<bool, MetadataError> {
-        let mut tx = self.pool.begin().await?;
-        let claimed = sqlx::query(
-            "SELECT 1 FROM databases
-             WHERE id = $1 AND status NOT IN ('deleting', 'deleted') AND endpoint_id IS NULL
-             FOR UPDATE",
-        )
-        .bind(id.as_uuid())
-        .fetch_optional(&mut *tx)
-        .await?;
-        if claimed.is_none() {
-            return Ok(false);
-        }
-        sqlx::query(
-            "INSERT INTO neon_endpoints (id, tenant_id, timeline_id, compute_token_sha256)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(ep.id)
-        .bind(ep.tenant_id)
-        .bind(ep.timeline_id)
-        .bind(ep.compute_token_sha256)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier) VALUES ($1, $2, $3)")
-            .bind(ep.id)
-            .bind(ep.owner_role)
-            .bind(ep.owner_verifier)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("INSERT INTO neon_databases (endpoint_id, name, owner) VALUES ($1, $2, $3)")
-            .bind(ep.id)
-            .bind(ep.database_name)
-            .bind(ep.owner_role)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE databases SET endpoint_id = $2, updated_at = now() WHERE id = $1")
-            .bind(id.as_uuid())
-            .bind(ep.id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(true)
-    }
-
-    /// Roles and databases cascade; databases.endpoint_id becomes NULL. Missing is fine.
+    /// Roles and databases cascade; branches.endpoint_id becomes NULL. Missing is fine.
     pub async fn delete_endpoint(&self, endpoint_id: &str) -> Result<(), MetadataError> {
         sqlx::query("DELETE FROM neon_endpoints WHERE id = $1")
             .bind(endpoint_id)
@@ -271,11 +221,12 @@ impl MetadataClient {
         Ok(())
     }
 
-    /// One transaction: sealed password (only while ready and linked to endpoint_id), the role's
-    /// verifier, needs_reconfigure = true. False (nothing written) otherwise.
+    /// One transaction: sealed password (only while the branch is ready, `normal` and linked to
+    /// endpoint_id), the role's verifier, needs_reconfigure = true. False (nothing written)
+    /// otherwise.
     pub async fn replace_owner_secret(
         &self,
-        id: DatabaseId,
+        id: BranchId,
         endpoint_id: &str,
         role: &str,
         verifier: &str,
@@ -283,8 +234,8 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
         let sealed = sqlx::query(
-            "UPDATE databases SET owner_password_enc = $3, updated_at = now()
-             WHERE id = $1 AND endpoint_id = $2 AND status = 'ready'",
+            "UPDATE branches SET owner_password_enc = $3, updated_at = now()
+             WHERE id = $1 AND endpoint_id = $2 AND status = 'ready' AND kind = 'normal'",
         )
         .bind(id.as_uuid())
         .bind(endpoint_id)
@@ -356,12 +307,12 @@ impl MetadataClient {
         Ok(())
     }
 
-    /// Every endpoint, left-joined to the database linked to it.
+    /// Every endpoint, left-joined to the branch linked to it.
     pub async fn list_endpoints_for_reconcile(&self) -> Result<Vec<EndpointState>, MetadataError> {
         let rows = sqlx::query(
-            "SELECT e.id, e.tenant_id, e.needs_reconfigure, d.id AS database_id, d.status
+            "SELECT e.id, e.tenant_id, e.needs_reconfigure, b.id AS branch_id, b.status
              FROM neon_endpoints e
-             LEFT JOIN databases d ON d.endpoint_id = e.id
+             LEFT JOIN branches b ON b.endpoint_id = e.id
              ORDER BY e.id",
         )
         .fetch_all(&self.pool)
@@ -372,8 +323,8 @@ impl MetadataClient {
                 Ok(EndpointState {
                     id: r.get("id"),
                     tenant_id: r.get("tenant_id"),
-                    database_id: r.get::<Option<uuid::Uuid>, _>("database_id").map(DatabaseId),
-                    database_status: status.as_deref().map(DatabaseStatus::parse).transpose()?,
+                    branch_id: r.get::<Option<uuid::Uuid>, _>("branch_id").map(BranchId),
+                    branch_status: status.as_deref().map(BranchStatus::parse).transpose()?,
                     needs_reconfigure: r.get("needs_reconfigure"),
                 })
             })

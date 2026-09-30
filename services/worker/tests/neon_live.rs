@@ -10,64 +10,18 @@
 //!   cargo test -p worker --test neon_live -- --ignored --test-threads=1 --nocapture
 //! ```
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cheladb_metadata::{
-    DEMO_PROJECT_ID, DEMO_TENANT_ID, DatabaseStatus, MetadataClient, MetadataConfig,
+    DEMO_PROJECT_ID, DEMO_TENANT_ID, DatabaseStatus, MetadataClient,
 };
 use cheladb_neon::{ComputeBackend, NeonId, StorconClient, StorconError};
-use cheladb_secrets::SecretKey;
-use cheladb_types::DatabaseId;
-use worker::config::{RealWorker, WorkerConfig, build};
+use cheladb_types::{BranchId, DatabaseId};
+use worker::config::{RealWorker, WorkerConfig};
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
-    let mut config =
-        WorkerConfig::from_env().expect("worker config (is CHELADB_COMPUTE_IMAGE set?)");
-    if config.compute_jwt_dir.is_relative() {
-        config.compute_jwt_dir = workspace_root().join(&config.compute_jwt_dir);
-    }
-    let metadata = MetadataClient::connect(&MetadataConfig {
-        database_url: std::env::var("CHELADB_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into()
-        }),
-    })
-    .await
-    .expect("metadata database");
-    let key =
-        SecretKey::from_env().expect("CHELADB_SECRETS_KEY (source .cheladb/zitadel/demo.env)");
-    let worker = build(&config, metadata.clone(), key).expect("worker");
-    (worker, metadata, config)
-}
-
-/// Best-effort cleanup for a failed run: the compute, the tenant, and the rows.
-async fn cleanup(worker: &RealWorker, metadata: &MetadataClient, id: DatabaseId) {
-    if let Ok(Some(record)) = metadata.get_database(id).await
-        && let Some(ep) = record.endpoint_id
-    {
-        let _ = worker.computes.delete(&ep).await;
-        if let Ok(Some(endpoint)) = metadata.neon_endpoint(&ep).await
-            && let Ok(tenant) = endpoint.tenant_id.parse::<NeonId>()
-        {
-            let _ = worker.storage.delete_tenant(&tenant).await;
-        }
-        let _ = metadata.delete_endpoint(&ep).await;
-    }
-    let _ = sqlx_delete(metadata, id).await;
-}
-
-async fn sqlx_delete(metadata: &MetadataClient, id: DatabaseId) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM databases WHERE id = $1")
-        .bind(id.as_uuid())
-        .execute(metadata.pool())
-        .await
-        .map(drop)
-}
+mod common;
+use common::{cleanup, setup, sqlx_delete};
 
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
@@ -115,7 +69,12 @@ async fn lifecycle(
         record.status,
         record.error
     );
-    let ep = record.endpoint_id.clone().expect("endpoint id");
+    let main = metadata
+        .get_branch(BranchId::from(id))
+        .await
+        .unwrap()
+        .expect("main branch");
+    let ep = main.endpoint_id.clone().expect("endpoint id");
     let database_name = record.database_name.clone().expect("database name");
     let endpoint = metadata.neon_endpoint(&ep).await.unwrap().unwrap();
     let tenant: NeonId = endpoint.tenant_id.parse().unwrap();
@@ -162,7 +121,7 @@ async fn lifecycle(
         .scram_verifier
         .clone();
     let started = Instant::now();
-    worker.reset_password(id).await.expect("reset_password");
+    worker.reset_password(cheladb_types::BranchId::from(id)).await.expect("reset_password");
     println!("reset took {:?}", started.elapsed());
     let after = metadata.neon_roles(&ep).await.unwrap();
     let after = after
@@ -194,6 +153,8 @@ async fn lifecycle(
     );
     let record = metadata.get_database(id).await.unwrap().unwrap();
     assert_eq!(record.status, DatabaseStatus::Deleted);
+    let main = metadata.get_branch(BranchId::from(id)).await.unwrap().unwrap();
+    assert_eq!(main.status, cheladb_metadata::BranchStatus::Deleted);
     // The tombstone of a test database isn't worth keeping.
     sqlx_delete(metadata, id).await.unwrap();
 }

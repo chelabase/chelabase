@@ -8,16 +8,22 @@ use std::time::Duration;
 
 use cheladb_secrets::SecretKey;
 
+pub mod branch_create;
+pub mod branch_delete;
+pub mod branch_job;
+pub mod branch_switch;
 pub mod config;
 pub mod credentials;
 pub mod delete;
 #[cfg(test)]
 mod fakes;
 pub mod names;
+pub mod point;
 pub mod ports;
 pub mod provision;
 pub mod reconcile;
 pub mod reset;
+pub mod settings;
 
 /// The role that owns every database, and whose password is revealed.
 pub const OWNER_ROLE: &str = "postgres";
@@ -36,4 +42,7 @@ pub struct Worker<M, S, C, N, P> {
     pub ready_poll: Duration,
     /// How long provisioning waits for a new compute (60 s in production).
     pub ready_timeout: Duration,
+    /// How often a long reset or restore step refreshes the branch's claim (60 s in
+    /// production), well inside reconcile's stale threshold.
+    pub claim_refresh: Duration,
 }

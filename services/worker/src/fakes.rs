@@ -7,15 +7,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use cheladb_metadata::{
-    DatabaseRecord, DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState, LiveDatabase,
-    MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewEndpoint, ReadyDatabase,
+    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome,
+    DatabaseRecord, DatabaseSettings, DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState,
+    LiveBranch, LiveDatabase, MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewBranch,
+    NewEndpoint,
 };
 use cheladb_neon::backend::fake::FakeBackend;
 pub use cheladb_neon::backend::fake::Journal;
 use cheladb_neon::spec::Placement;
-use cheladb_neon::{NeonId, StorconError};
+use cheladb_neon::storcon::{LsnAtTime, LsnKind};
+use cheladb_neon::{Lsn, NeonId, StorconError};
 use cheladb_secrets::SecretKey;
-use cheladb_types::{DatabaseId, ProjectId, TenantId};
+use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
+use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 
 use crate::Worker;
@@ -45,19 +49,152 @@ pub struct FakeEndpoint {
     pub needs_reconfigure: bool,
 }
 
+/// A one-off change to the fake's state, run from inside a write.
+pub type StateHook = Box<dyn FnOnce(&mut FakeState) + Send>;
+
 #[derive(Default)]
 pub struct FakeState {
     pub databases: HashMap<DatabaseId, DatabaseRecord>,
+    pub branches: HashMap<BranchId, BranchRecord>,
     pub endpoints: HashMap<String, FakeEndpoint>,
     /// Seconds since a database's row last changed (0 when absent).
     pub ages: HashMap<DatabaseId, i64>,
-    /// The method that fails, e.g. `"set_ready"`.
+    /// The method that fails, e.g. `"set_branch_ready"`.
     pub fail: Option<&'static str>,
     /// The Nth `get_database` call (1-based) first flips the row to `deleting`.
     pub deleting_on_get: Option<u32>,
-    /// `set_ready` first flips the row to `deleting`, as a delete landing just before it.
+    /// `set_branch_ready` first flips the row to `deleting`, as a delete landing just before it
+    /// (the database's delete for main, the branch's own for any other branch).
     pub deleting_before_set_ready: bool,
+    /// The Nth `get_branch` call (1-based) of that branch first begins its delete.
+    pub deleting_on_get_branch: Option<(BranchId, u32)>,
+    /// Seconds since a branch's row last changed (0 when absent).
+    pub branch_ages: HashMap<BranchId, i64>,
+    /// `(method, branch)`: that branch's delete begins just before the named write runs, as
+    /// another run or a delete landing between a read and a guarded write.
+    pub delete_before_write: Option<(&'static str, BranchId)>,
+    /// Runs once, just before the next `claim_stale_reset`: a write landing between a run's
+    /// first read and its claim.
+    pub before_claim_stale_reset: Option<StateHook>,
     get_calls: u32,
+    get_branch_calls: HashMap<BranchId, u32>,
+}
+
+impl FakeState {
+    /// Begins `id`'s delete at its `n`th `get_branch` (1-based) counted from now.
+    pub fn delete_at_get_branch(&mut self, id: BranchId, n: u32) {
+        let seen = self.get_branch_calls.get(&id).copied().unwrap_or(0);
+        self.deleting_on_get_branch = Some((id, seen + n));
+    }
+
+    /// What `begin_delete` does: the database and its live branches to `deleting`.
+    fn begin_delete(&mut self, id: DatabaseId) {
+        if let Some(db) = self.databases.get_mut(&id)
+            && live(db.status)
+        {
+            db.status = DatabaseStatus::Deleting;
+            for b in self.branches.values_mut() {
+                if b.database_id == id && branch_live(b.status) {
+                    b.status = BranchStatus::Deleting;
+                }
+            }
+        }
+    }
+
+    /// What `begin_branch_delete` does: the branch to `deleting` unless it's already deleting
+    /// or deleted, then its live backups too once it is deleting. True when the branch moved.
+    fn begin_branch_delete(&mut self, id: BranchId) -> bool {
+        let moved = match self.branches.get_mut(&id) {
+            Some(b) if branch_live(b.status) => {
+                b.status = BranchStatus::Deleting;
+                true
+            }
+            _ => false,
+        };
+        if self.branches.get(&id).map(|b| b.status) == Some(BranchStatus::Deleting) {
+            for b in self.branches.values_mut() {
+                if b.parent_branch_id == Some(id)
+                    && b.kind == BranchKind::Backup
+                    && branch_live(b.status)
+                {
+                    b.status = BranchStatus::Deleting;
+                }
+            }
+        }
+        moved
+    }
+
+    /// `begin_branch_delete`'s guard: while the branch is live, its own live `normal`
+    /// children, else those of its live backups (oldest first), refuse the delete.
+    fn children_blocking_delete(&self, id: BranchId) -> Option<BranchDeleteOutcome> {
+        if !self
+            .branches
+            .get(&id)
+            .is_some_and(|b| branch_live(b.status))
+        {
+            return None;
+        }
+        let children_of = |parent: BranchId| {
+            let mut names: Vec<String> = self
+                .branches
+                .values()
+                .filter(|c| {
+                    c.parent_branch_id == Some(parent)
+                        && c.kind == BranchKind::Normal
+                        && c.status != BranchStatus::Deleted
+                })
+                .map(|c| c.name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        let own = children_of(id);
+        if !own.is_empty() {
+            return Some(BranchDeleteOutcome::HasChildren {
+                backup: None,
+                children: own,
+            });
+        }
+        let backups = sorted(self.branches.values().filter(|b| {
+            b.parent_branch_id == Some(id)
+                && b.kind == BranchKind::Backup
+                && b.status != BranchStatus::Deleted
+        }));
+        backups.into_iter().find_map(|backup| {
+            let children = children_of(backup.id);
+            (!children.is_empty()).then_some(BranchDeleteOutcome::HasChildren {
+                backup: Some(backup.name),
+                children,
+            })
+        })
+    }
+
+    fn name_taken(&self, db: DatabaseId, name: &str) -> bool {
+        self.branches
+            .values()
+            .any(|b| b.database_id == db && b.name == name && b.status != BranchStatus::Deleted)
+    }
+
+    /// Points `endpoint_id`'s row (if any) at `timeline_id`.
+    fn move_endpoint(&mut self, endpoint_id: Option<&str>, timeline_id: &str) {
+        if let Some(ep) = endpoint_id.and_then(|ep| self.endpoints.get_mut(ep)) {
+            ep.endpoint.timeline_id = timeline_id.to_string();
+        }
+    }
+
+    /// Main follows its database while provisioning (ruling 4), only while it is itself
+    /// pending, provisioning or failed.
+    fn mirror_on_main(&mut self, id: DatabaseId, status: BranchStatus, error: Option<&str>) {
+        if let Some(main) = self.branches.get_mut(&BranchId::from(id))
+            && matches!(
+                main.status,
+                BranchStatus::Pending | BranchStatus::Provisioning | BranchStatus::Failed
+            )
+        {
+            main.status = status;
+            main.error = error.map(str::to_string);
+        }
+    }
 }
 
 /// Mirrors the SQL guards of `MetadataClient`.
@@ -73,15 +210,22 @@ fn live(status: DatabaseStatus) -> bool {
     !matches!(status, DatabaseStatus::Deleting | DatabaseStatus::Deleted)
 }
 
+fn branch_live(status: BranchStatus) -> bool {
+    !matches!(status, BranchStatus::Deleting | BranchStatus::Deleted)
+}
+
 impl FakeMetadata {
     pub fn state(&self) -> MutexGuard<'_, FakeState> {
         lock(&self.state)
     }
 
-    /// A database row with the given status and nothing else.
+    /// A database row with the given status and nothing else, and its main branch (same id
+    /// and status), as `insert_database_pending` makes them.
     pub fn insert_database(&self, name: &str, status: DatabaseStatus) -> DatabaseId {
         let id = DatabaseId::new();
-        self.state().databases.insert(
+        let now = chrono::Utc::now();
+        let mut state = self.state();
+        state.databases.insert(
             id,
             DatabaseRecord {
                 database_id: id,
@@ -89,11 +233,35 @@ impl FakeMetadata {
                 tenant_id: TenantId::new(),
                 name: name.to_string(),
                 status,
-                endpoint_id: None,
                 database_name: None,
                 owner_role: None,
-                owner_password_enc: None,
                 error: None,
+                neon_tenant_id: None,
+                history_window: Duration::from_secs(7 * 24 * 3600),
+                max_branches: 5,
+            },
+        );
+        state.branches.insert(
+            BranchId::from(id),
+            BranchRecord {
+                id: BranchId::from(id),
+                database_id: id,
+                name: "main".to_string(),
+                parent_branch_id: None,
+                kind: BranchKind::Normal,
+                status: BranchStatus::from(status),
+                timeline_id: None,
+                pending_timeline_id: None,
+                pending_timeline_at: None,
+                superseded_timeline_id: None,
+                endpoint_id: None,
+                owner_password_enc: None,
+                branched_at_time: None,
+                branched_at_lsn: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+                history_start: None,
             },
         );
         id
@@ -101,6 +269,73 @@ impl FakeMetadata {
 
     pub fn database(&self, id: DatabaseId) -> DatabaseRecord {
         self.state().databases[&id].clone()
+    }
+
+    /// The database's main branch.
+    pub fn main(&self, id: DatabaseId) -> BranchRecord {
+        self.state().branches[&BranchId::from(id)].clone()
+    }
+
+    pub fn branch(&self, id: BranchId) -> BranchRecord {
+        self.state().branches[&id].clone()
+    }
+
+    /// What `create_branch` does, with its guards: a live database, a ready parent of the same
+    /// database, a free name, and the cap on live `normal` branches besides main.
+    pub fn create_branch(&self, b: &NewBranch<'_>) -> CreateBranchOutcome {
+        let mut state = self.state();
+        let max = match state.databases.get(&b.database_id) {
+            Some(db) if live(db.status) => db.max_branches,
+            _ => return CreateBranchOutcome::DatabaseNotLive,
+        };
+        let parent_ready = state
+            .branches
+            .get(&b.parent_branch_id)
+            .is_some_and(|p| p.database_id == b.database_id && p.status == BranchStatus::Ready);
+        if !parent_ready {
+            return CreateBranchOutcome::ParentNotReady;
+        }
+        if state.name_taken(b.database_id, b.name) {
+            return CreateBranchOutcome::NameTaken;
+        }
+        let live_normal = state
+            .branches
+            .values()
+            .filter(|x| {
+                x.database_id == b.database_id
+                    && x.status != BranchStatus::Deleted
+                    && x.kind == BranchKind::Normal
+                    && x.parent_branch_id.is_some()
+            })
+            .count();
+        if live_normal >= usize::try_from(max).unwrap_or(0) {
+            return CreateBranchOutcome::CapReached { max };
+        }
+        let now = chrono::Utc::now();
+        state.branches.insert(
+            b.id,
+            BranchRecord {
+                id: b.id,
+                database_id: b.database_id,
+                name: b.name.to_string(),
+                parent_branch_id: Some(b.parent_branch_id),
+                kind: BranchKind::Normal,
+                status: BranchStatus::Pending,
+                timeline_id: None,
+                pending_timeline_id: None,
+                pending_timeline_at: None,
+                superseded_timeline_id: None,
+                endpoint_id: None,
+                owner_password_enc: None,
+                branched_at_time: b.branched_at_time,
+                branched_at_lsn: b.branched_at_lsn.map(str::to_string),
+                error: None,
+                created_at: now,
+                updated_at: now,
+                history_start: None,
+            },
+        );
+        CreateBranchOutcome::Created
     }
 
     pub fn endpoint_ids(&self) -> Vec<String> {
@@ -111,7 +346,14 @@ impl FakeMetadata {
 
     fn write(&self, method: &'static str) -> Result<MutexGuard<'_, FakeState>, MetadataError> {
         record(&self.journal, format!("metadata.{method}"));
-        self.read(method)
+        let mut state = self.read(method)?;
+        if let Some((m, id)) = state.delete_before_write
+            && m == method
+        {
+            state.delete_before_write = None;
+            state.begin_branch_delete(id);
+        }
+        Ok(state)
     }
 
     fn read(&self, method: &'static str) -> Result<MutexGuard<'_, FakeState>, MetadataError> {
@@ -144,13 +386,33 @@ impl WorkerMetadata for FakeMetadata {
     async fn get_database(&self, id: DatabaseId) -> Result<Option<DatabaseRecord>, MetadataError> {
         let mut state = self.read("get_database")?;
         state.get_calls += 1;
-        if state.deleting_on_get == Some(state.get_calls)
-            && let Some(db) = state.databases.get_mut(&id)
-            && live(db.status)
-        {
-            db.status = DatabaseStatus::Deleting;
+        if state.deleting_on_get == Some(state.get_calls) {
+            state.begin_delete(id);
         }
         Ok(state.databases.get(&id).cloned())
+    }
+
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        let mut state = self.read("get_branch")?;
+        let calls = state.get_branch_calls.entry(id).or_default();
+        *calls += 1;
+        let calls = *calls;
+        if state.deleting_on_get_branch == Some((id, calls)) {
+            state.begin_branch_delete(id);
+        }
+        Ok(state.branches.get(&id).cloned())
+    }
+
+    async fn list_branches(&self, db: DatabaseId) -> Result<Vec<BranchRecord>, MetadataError> {
+        let state = self.read("list_branches")?;
+        let mut branches: Vec<BranchRecord> = state
+            .branches
+            .values()
+            .filter(|b| b.database_id == db && b.status != BranchStatus::Deleted)
+            .cloned()
+            .collect();
+        branches.sort_by_key(|b| (b.created_at, b.id.to_string()));
+        Ok(branches)
     }
 
     async fn set_status(
@@ -163,23 +425,33 @@ impl WorkerMetadata for FakeMetadata {
             Some(db) if live(db.status) => {
                 db.status = status;
                 db.error = None;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn create_endpoint_for_database(
-        &self,
-        id: DatabaseId,
-        ep: &NewEndpoint<'_>,
-    ) -> Result<bool, MetadataError> {
-        let mut state = self.write("create_endpoint_for_database")?;
-        match state.databases.get_mut(&id) {
-            Some(db) if live(db.status) && db.endpoint_id.is_none() => {
-                db.endpoint_id = Some(ep.id.to_string());
             }
             _ => return Ok(false),
+        }
+        state.mirror_on_main(id, BranchStatus::from(status), None);
+        Ok(true)
+    }
+
+    async fn create_endpoint_for_branch(
+        &self,
+        id: BranchId,
+        timeline_id: &str,
+        ep: &NewEndpoint<'_>,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("create_endpoint_for_branch")?;
+        let database_id = match state.branches.get_mut(&id) {
+            Some(b) if branch_live(b.status) && b.endpoint_id.is_none() => {
+                b.endpoint_id = Some(ep.id.to_string());
+                b.timeline_id = Some(timeline_id.to_string());
+                b.database_id
+            }
+            _ => return Ok(false),
+        };
+        if BranchId::from(database_id) == id
+            && let Some(db) = state.databases.get_mut(&database_id)
+        {
+            db.database_name = Some(ep.database_name.to_string());
+            db.owner_role = Some(ep.owner_role.to_string());
         }
         state.endpoints.insert(
             ep.id.to_string(),
@@ -202,6 +474,17 @@ impl WorkerMetadata for FakeMetadata {
             },
         );
         Ok(true)
+    }
+
+    async fn set_neon_tenant(&self, db: DatabaseId, tenant: &str) -> Result<bool, MetadataError> {
+        let mut state = self.write("set_neon_tenant")?;
+        match state.databases.get_mut(&db) {
+            Some(row) if live(row.status) => {
+                row.neon_tenant_id = Some(tenant.to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn neon_endpoint(
@@ -230,32 +513,43 @@ impl WorkerMetadata for FakeMetadata {
             .unwrap_or_default())
     }
 
-    async fn set_ready(
+    async fn set_branch_ready(
         &self,
-        id: DatabaseId,
-        endpoint_id: &str,
-        db: ReadyDatabase<'_>,
+        id: BranchId,
+        sealed_password: &str,
+        branched_at_lsn: Option<&str>,
+        history_start: Option<DateTime<Utc>>,
     ) -> Result<bool, MetadataError> {
-        let mut state = self.write("set_ready")?;
-        let flip = state.deleting_before_set_ready;
-        match state.databases.get_mut(&id) {
-            Some(row) => {
-                if flip && live(row.status) {
-                    row.status = DatabaseStatus::Deleting;
-                }
-                if !live(row.status) {
-                    return Ok(false);
-                }
-                row.status = DatabaseStatus::Ready;
-                row.endpoint_id = Some(endpoint_id.to_string());
-                row.database_name = Some(db.database_name.to_string());
-                row.owner_role = Some(db.owner_role.to_string());
-                row.owner_password_enc = Some(db.owner_password_enc.to_string());
-                row.error = None;
-                Ok(true)
+        let mut state = self.write("set_branch_ready")?;
+        let Some(database_id) = state.branches.get(&id).map(|b| b.database_id) else {
+            return Ok(false);
+        };
+        let is_main = BranchId::from(database_id) == id;
+        if state.deleting_before_set_ready {
+            if is_main {
+                state.begin_delete(database_id);
+            } else {
+                state.begin_branch_delete(id);
             }
-            None => Ok(false),
         }
+        let database_live = state
+            .databases
+            .get(&database_id)
+            .is_some_and(|db| live(db.status));
+        let branch = state.branches.get_mut(&id).expect("looked up above");
+        if branch.status != BranchStatus::Provisioning || (is_main && !database_live) {
+            return Ok(false);
+        }
+        branch.status = BranchStatus::Ready;
+        branch.owner_password_enc = Some(sealed_password.to_string());
+        branch.branched_at_lsn = branched_at_lsn.map(str::to_string);
+        branch.error = None;
+        branch.history_start = Some(history_start.unwrap_or(branch.created_at));
+        if is_main && let Some(db) = state.databases.get_mut(&database_id) {
+            db.status = DatabaseStatus::Ready;
+            db.error = None;
+        }
+        Ok(true)
     }
 
     async fn set_failed(&self, id: DatabaseId, error: &str) -> Result<(), MetadataError> {
@@ -265,6 +559,7 @@ impl WorkerMetadata for FakeMetadata {
         {
             db.status = DatabaseStatus::Failed;
             db.error = Some(error.to_string());
+            state.mirror_on_main(id, BranchStatus::Failed, Some(error));
         }
         Ok(())
     }
@@ -273,7 +568,15 @@ impl WorkerMetadata for FakeMetadata {
         let mut state = self.write("mark_deleted")?;
         if let Some(db) = state.databases.get_mut(&id) {
             db.status = DatabaseStatus::Deleted;
-            db.owner_password_enc = None;
+        }
+        Ok(())
+    }
+
+    async fn mark_branch_deleted(&self, id: BranchId) -> Result<(), MetadataError> {
+        let mut state = self.write("mark_branch_deleted")?;
+        if let Some(b) = state.branches.get_mut(&id) {
+            b.status = BranchStatus::Deleted;
+            b.owner_password_enc = None;
         }
         Ok(())
     }
@@ -281,9 +584,9 @@ impl WorkerMetadata for FakeMetadata {
     async fn delete_endpoint(&self, endpoint_id: &str) -> Result<(), MetadataError> {
         let mut state = self.write("delete_endpoint")?;
         state.endpoints.remove(endpoint_id);
-        for db in state.databases.values_mut() {
-            if db.endpoint_id.as_deref() == Some(endpoint_id) {
-                db.endpoint_id = None;
+        for b in state.branches.values_mut() {
+            if b.endpoint_id.as_deref() == Some(endpoint_id) {
+                b.endpoint_id = None;
             }
         }
         Ok(())
@@ -291,7 +594,7 @@ impl WorkerMetadata for FakeMetadata {
 
     async fn replace_owner_secret(
         &self,
-        id: DatabaseId,
+        id: BranchId,
         endpoint_id: &str,
         role: &str,
         verifier: &str,
@@ -299,10 +602,13 @@ impl WorkerMetadata for FakeMetadata {
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("replace_owner_secret")?;
         let state = &mut *state;
-        let Some(db) = state.databases.get_mut(&id) else {
+        let Some(branch) = state.branches.get_mut(&id) else {
             return Ok(false);
         };
-        if db.status != DatabaseStatus::Ready || db.endpoint_id.as_deref() != Some(endpoint_id) {
+        if branch.status != BranchStatus::Ready
+            || branch.kind != BranchKind::Normal
+            || branch.endpoint_id.as_deref() != Some(endpoint_id)
+        {
             return Ok(false);
         }
         let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
@@ -311,7 +617,7 @@ impl WorkerMetadata for FakeMetadata {
         let Some(r) = ep.roles.iter_mut().find(|r| r.name == role) else {
             return Ok(false);
         };
-        db.owner_password_enc = Some(sealed.to_string());
+        branch.owner_password_enc = Some(sealed.to_string());
         r.scram_verifier = verifier.to_string();
         ep.needs_reconfigure = true;
         Ok(true)
@@ -355,6 +661,7 @@ impl WorkerMetadata for FakeMetadata {
         id: DatabaseId,
         max_age_secs: i64,
     ) -> Result<bool, MetadataError> {
+        const TIMED_OUT: &str = "provisioning timed out";
         let mut state = self.write("fail_if_stale")?;
         let age = state.ages.get(&id).copied().unwrap_or(0);
         match state.databases.get_mut(&id) {
@@ -365,11 +672,12 @@ impl WorkerMetadata for FakeMetadata {
                 ) && age > max_age_secs =>
             {
                 db.status = DatabaseStatus::Failed;
-                db.error = Some("provisioning timed out".to_string());
-                Ok(true)
+                db.error = Some(TIMED_OUT.to_string());
             }
-            _ => Ok(false),
+            _ => return Ok(false),
         }
+        state.mirror_on_main(id, BranchStatus::Failed, Some(TIMED_OUT));
+        Ok(true)
     }
 
     async fn list_live_for_reconcile(&self) -> Result<Vec<LiveDatabase>, MetadataError> {
@@ -381,7 +689,12 @@ impl WorkerMetadata for FakeMetadata {
             .map(|db| LiveDatabase {
                 id: db.database_id,
                 status: db.status,
-                endpoint_id: db.endpoint_id.clone(),
+                endpoint_id: state
+                    .branches
+                    .get(&BranchId::from(db.database_id))
+                    .and_then(|main| main.endpoint_id.clone()),
+                neon_tenant_id: db.neon_tenant_id.clone(),
+                history_window: db.history_window,
                 age_secs: state.ages.get(&db.database_id).copied().unwrap_or(0),
             })
             .collect();
@@ -395,15 +708,15 @@ impl WorkerMetadata for FakeMetadata {
             .endpoints
             .values()
             .map(|ep| {
-                let db = state
-                    .databases
+                let branch = state
+                    .branches
                     .values()
-                    .find(|db| db.endpoint_id.as_deref() == Some(ep.endpoint.id.as_str()));
+                    .find(|b| b.endpoint_id.as_deref() == Some(ep.endpoint.id.as_str()));
                 EndpointState {
                     id: ep.endpoint.id.clone(),
                     tenant_id: ep.endpoint.tenant_id.clone(),
-                    database_id: db.map(|db| db.database_id),
-                    database_status: db.map(|db| db.status),
+                    branch_id: branch.map(|b| b.id),
+                    branch_status: branch.map(|b| b.status),
                     needs_reconfigure: ep.needs_reconfigure,
                 }
             })
@@ -411,25 +724,384 @@ impl WorkerMetadata for FakeMetadata {
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(rows)
     }
+
+    async fn set_branch_status(
+        &self,
+        id: BranchId,
+        from: &[BranchStatus],
+        to: BranchStatus,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("set_branch_status")?;
+        match state.branches.get_mut(&id) {
+            Some(b) if from.contains(&b.status) && branch_live(b.status) => {
+                b.status = to;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn set_branch_failed(&self, id: BranchId, error: &str) -> Result<(), MetadataError> {
+        let mut state = self.write("set_branch_failed")?;
+        if let Some(b) = state.branches.get_mut(&id)
+            && branch_live(b.status)
+        {
+            b.status = BranchStatus::Failed;
+            b.error = Some(error.to_string());
+        }
+        Ok(())
+    }
+
+    async fn set_branch_error(
+        &self,
+        id: BranchId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("set_branch_error")?;
+        if let Some(b) = state.branches.get_mut(&id)
+            && branch_live(b.status)
+        {
+            b.error = error.map(str::to_string);
+        }
+        Ok(())
+    }
+
+    async fn begin_branch_delete(
+        &self,
+        id: BranchId,
+    ) -> Result<BranchDeleteOutcome, MetadataError> {
+        let mut state = self.write("begin_branch_delete")?;
+        if let Some(refused) = state.children_blocking_delete(id) {
+            return Ok(refused);
+        }
+        Ok(if state.begin_branch_delete(id) {
+            BranchDeleteOutcome::Started
+        } else {
+            BranchDeleteOutcome::NotMoved
+        })
+    }
+
+    async fn live_children(&self, id: BranchId) -> Result<Vec<BranchRecord>, MetadataError> {
+        let state = self.read("live_children")?;
+        Ok(sorted(state.branches.values().filter(|b| {
+            b.parent_branch_id == Some(id)
+                && b.kind == BranchKind::Normal
+                && b.status != BranchStatus::Deleted
+        })))
+    }
+
+    async fn live_backups_of(&self, id: BranchId) -> Result<Vec<BranchRecord>, MetadataError> {
+        let state = self.read("live_backups_of")?;
+        Ok(sorted(state.branches.values().filter(|b| {
+            b.parent_branch_id == Some(id)
+                && b.kind == BranchKind::Backup
+                && b.status != BranchStatus::Deleted
+        })))
+    }
+
+    async fn set_pending_timeline(
+        &self,
+        id: BranchId,
+        timeline_id: Option<&str>,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("set_pending_timeline")?;
+        match state.branches.get_mut(&id) {
+            Some(b) if branch_live(b.status) => {
+                b.pending_timeline_id = timeline_id.map(str::to_string);
+                b.pending_timeline_at = timeline_id.map(|_| chrono::Utc::now());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn switch_to_pending_timeline(
+        &self,
+        id: BranchId,
+        expected_pending: &str,
+        history_start: Option<DateTime<Utc>>,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("switch_to_pending_timeline")?;
+        let (endpoint_id, timeline_id) = match state.branches.get_mut(&id) {
+            Some(b)
+                if b.status == BranchStatus::Resetting
+                    && b.pending_timeline_id.as_deref() == Some(expected_pending) =>
+            {
+                b.superseded_timeline_id = b.timeline_id.take();
+                b.timeline_id = b.pending_timeline_id.take();
+                b.pending_timeline_at = None;
+                b.history_start = Some(history_start.unwrap_or_else(chrono::Utc::now));
+                (b.endpoint_id.clone(), b.timeline_id.clone().unwrap())
+            }
+            _ => return Ok(false),
+        };
+        state.move_endpoint(endpoint_id.as_deref(), &timeline_id);
+        Ok(true)
+    }
+
+    async fn switch_to_restored_timeline(
+        &self,
+        id: BranchId,
+        expected_pending: &str,
+        backup: BranchId,
+        backup_name: &str,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("switch_to_restored_timeline")?;
+        let Some(b) = state.branches.get(&id).cloned() else {
+            return Ok(false);
+        };
+        if b.status != BranchStatus::Resetting
+            || b.pending_timeline_id.as_deref() != Some(expected_pending)
+        {
+            return Ok(false);
+        }
+        // The real insert fails on the live-name index, and nothing is written.
+        if state.name_taken(b.database_id, backup_name) {
+            return Err(MetadataError::BranchNameTaken(backup_name.to_string()));
+        }
+        let now = chrono::Utc::now();
+        state.branches.insert(
+            backup,
+            BranchRecord {
+                id: backup,
+                database_id: b.database_id,
+                name: backup_name.to_string(),
+                parent_branch_id: Some(id),
+                kind: BranchKind::Backup,
+                status: BranchStatus::Ready,
+                timeline_id: b.timeline_id.clone(),
+                pending_timeline_id: None,
+                pending_timeline_at: None,
+                superseded_timeline_id: None,
+                endpoint_id: None,
+                owner_password_enc: None,
+                branched_at_time: None,
+                branched_at_lsn: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+                history_start: b.history_start,
+            },
+        );
+        let branch = state.branches.get_mut(&id).expect("looked up above");
+        branch.timeline_id = branch.pending_timeline_id.take();
+        branch.pending_timeline_at = None;
+        let timeline_id = branch.timeline_id.clone().unwrap();
+        state.move_endpoint(b.endpoint_id.as_deref(), &timeline_id);
+        Ok(true)
+    }
+
+    async fn clear_superseded_timeline(&self, id: BranchId) -> Result<(), MetadataError> {
+        let mut state = self.write("clear_superseded_timeline")?;
+        if let Some(b) = state.branches.get_mut(&id) {
+            b.superseded_timeline_id = None;
+        }
+        Ok(())
+    }
+
+    async fn swap_pending_timeline(
+        &self,
+        id: BranchId,
+        expected: Option<&str>,
+        new: Option<&str>,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("swap_pending_timeline")?;
+        match state.branches.get_mut(&id) {
+            Some(b) if branch_live(b.status) && b.pending_timeline_id.as_deref() == expected => {
+                b.pending_timeline_id = new.map(str::to_string);
+                b.pending_timeline_at = new.map(|_| chrono::Utc::now());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn claim_stale_reset(
+        &self,
+        id: BranchId,
+        max_age_secs: i64,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("claim_stale_reset")?;
+        if let Some(hook) = state.before_claim_stale_reset.take() {
+            hook(&mut state);
+        }
+        let age = state.branch_ages.get(&id).copied().unwrap_or(0);
+        match state.branches.get(&id) {
+            Some(b) if b.status == BranchStatus::Resetting && age > max_age_secs => {
+                state.branch_ages.insert(id, 0);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn fail_stuck_restore(
+        &self,
+        id: BranchId,
+        max_age_secs: i64,
+        error: &str,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("fail_stuck_restore")?;
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_secs);
+        match state.branches.get_mut(&id) {
+            Some(b)
+                if b.status == BranchStatus::Resetting
+                    && b.pending_timeline_id.is_some()
+                    && b.pending_timeline_at.is_some_and(|at| at < cutoff) =>
+            {
+                b.status = BranchStatus::Failed;
+                b.error = Some(error.to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn fail_branch_if_stale(
+        &self,
+        id: BranchId,
+        max_age_secs: i64,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("fail_branch_if_stale")?;
+        let age = state.branch_ages.get(&id).copied().unwrap_or(0);
+        match state.branches.get_mut(&id) {
+            Some(b)
+                if b.parent_branch_id.is_some()
+                    && matches!(b.status, BranchStatus::Pending | BranchStatus::Provisioning)
+                    && age > max_age_secs =>
+            {
+                b.status = BranchStatus::Failed;
+                b.error = Some("provisioning timed out".to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn database_settings(
+        &self,
+        db: DatabaseId,
+    ) -> Result<Option<DatabaseSettings>, MetadataError> {
+        let state = self.read("database_settings")?;
+        Ok(state.databases.get(&db).map(|d| DatabaseSettings {
+            history_window: d.history_window,
+            max_branches: d.max_branches,
+        }))
+    }
+
+    async fn list_live_branches_for_reconcile(&self) -> Result<Vec<LiveBranch>, MetadataError> {
+        let state = self.read("list_live_branches_for_reconcile")?;
+        let mut rows: Vec<LiveBranch> = state
+            .branches
+            .values()
+            .filter(|b| b.status != BranchStatus::Deleted)
+            .map(|b| LiveBranch {
+                id: b.id,
+                database_id: b.database_id,
+                kind: b.kind,
+                status: b.status,
+                endpoint_id: b.endpoint_id.clone(),
+                timeline_id: b.timeline_id.clone(),
+                pending_timeline_id: b.pending_timeline_id.clone(),
+                superseded_timeline_id: b.superseded_timeline_id.clone(),
+                age_secs: state.branch_ages.get(&b.id).copied().unwrap_or(0),
+            })
+            .collect();
+        rows.sort_by_key(|r| r.id.to_string());
+        Ok(rows)
+    }
+}
+
+/// Oldest first, like the real queries.
+fn sorted<'a>(branches: impl Iterator<Item = &'a BranchRecord>) -> Vec<BranchRecord> {
+    let mut branches: Vec<BranchRecord> = branches.cloned().collect();
+    branches.sort_by_key(|b| (b.created_at, b.id.to_string()));
+    branches
 }
 
 /// The cause under every injected storage failure.
+/// How the fake's `detach_ancestor` ends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FakeDetach {
+    #[default]
+    Works,
+    /// The request times out with the detach still running (the ancestor stays).
+    TimesOut,
+    /// The request times out, but the detach finished just before.
+    TimesOutAfterFinishing,
+}
+
 pub const STORAGE_CAUSE: &str = "connection refused";
+/// The cause a 503 from [`FakeStorage::unavailable`] carries.
+pub const UNAVAILABLE_CAUSE: &str = "shard is reconfiguring";
+
+/// A timeline in memory: what it branched from, and its head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeTimeline {
+    /// `(parent timeline, LSN)`; `None` for a fresh timeline or once detached.
+    pub ancestor: Option<(NeonId, Lsn)>,
+    pub head: Lsn,
+}
+
+/// The head of every fresh timeline.
+pub const FRESH_HEAD: Lsn = Lsn(0x0200_0000);
 
 /// Tenants and timelines in memory.
 pub struct FakeStorage {
     pub tenants: Mutex<HashSet<NeonId>>,
-    pub timelines: Mutex<HashSet<(NeonId, NeonId)>>,
+    /// Per `(tenant, timeline)`.
+    pub timelines: Mutex<HashMap<(NeonId, NeonId), FakeTimeline>>,
+    /// Each tenant's `pitr_interval`, once patched.
+    pub pitr: Mutex<HashMap<NeonId, Duration>>,
     /// The method that fails, e.g. `"create_timeline"`.
     pub fail: Mutex<Option<&'static str>>,
+    /// Methods that answer 503 (a transient failure), each the given number of times.
+    pub unavailable: Mutex<HashMap<&'static str, u32>>,
+    /// The method the storage controller refuses (400).
+    pub reject: Mutex<Option<&'static str>>,
+    /// How `detach_ancestor` ends.
+    pub detach: Mutex<FakeDetach>,
+    /// How long `detach_ancestor` takes.
+    pub detach_delay: Mutex<Duration>,
     /// Runs once, at the start of the next `create_tenant` (e.g. to land a delete).
     pub on_create_tenant: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, at the start of the next `create_branch_timeline`.
+    pub on_create_branch_timeline: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// What `lsn_by_timestamp` answers; `None` answers `present` at the timeline's head.
+    pub lsn_at: Mutex<Option<LsnAtTime>>,
+    /// What `timestamp_of_lsn` answers.
+    pub timestamp_at: Mutex<Option<DateTime<Utc>>>,
     pub journal: Journal,
 }
 
 impl FakeStorage {
-    fn call(&self, method: &'static str) -> Result<(), StorconError> {
-        record(&self.journal, format!("storage.{method}"));
+    fn call(&self, method: &'static str, args: String) -> Result<(), StorconError> {
+        let entry = if args.is_empty() {
+            format!("storage.{method}")
+        } else {
+            format!("storage.{method} {args}")
+        };
+        record(&self.journal, entry);
+        self.check(method)
+    }
+
+    /// Fails when `method` is the one set to fail; not journaled (reads).
+    fn check(&self, method: &'static str) -> Result<(), StorconError> {
+        if let Some(left) = lock(&self.unavailable).get_mut(method)
+            && *left > 0
+        {
+            *left -= 1;
+            // What `check` in cheladb-neon makes of a 5xx.
+            return Err(StorconError::Other(anyhow::anyhow!(
+                "storage controller returned 503 Service Unavailable: {UNAVAILABLE_CAUSE}"
+            )));
+        }
+        if *lock(&self.reject) == Some(method) {
+            return Err(StorconError::Rejected {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                message: format!("{method} refused"),
+            });
+        }
         if *lock(&self.fail) == Some(method) {
             // With a cause, so tests see whether the whole chain is kept.
             return Err(StorconError::Other(
@@ -439,8 +1111,50 @@ impl FakeStorage {
         Ok(())
     }
 
+    fn not_found(what: String) -> StorconError {
+        StorconError::Rejected {
+            status: reqwest::StatusCode::NOT_FOUND,
+            message: format!("{what} not found"),
+        }
+    }
+
     pub fn has_tenant(&self, tenant: &str) -> bool {
         lock(&self.tenants).contains(&tenant.parse::<NeonId>().unwrap())
+    }
+
+    pub fn timeline(&self, tenant: &str, timeline: &str) -> Option<FakeTimeline> {
+        let key = (tenant.parse().unwrap(), timeline.parse().unwrap());
+        lock(&self.timelines).get(&key).cloned()
+    }
+
+    /// Every timeline id, in any tenant.
+    pub fn timeline_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock(&self.timelines)
+            .keys()
+            .map(|(_, t)| t.as_str().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A timeline that exists behind the metadata's back (e.g. main's, made by a provision).
+    pub fn insert_timeline(&self, tenant: &str, timeline: &str, head: Lsn) {
+        let tenant: NeonId = tenant.parse().unwrap();
+        lock(&self.tenants).insert(tenant.clone());
+        lock(&self.timelines).insert(
+            (tenant, timeline.parse().unwrap()),
+            FakeTimeline {
+                ancestor: None,
+                head,
+            },
+        );
+    }
+
+    fn head(&self, tenant: &NeonId, timeline: &NeonId) -> Result<Lsn, StorconError> {
+        lock(&self.timelines)
+            .get(&(tenant.clone(), timeline.clone()))
+            .map(|t| t.head)
+            .ok_or_else(|| Self::not_found(format!("timeline {timeline}")))
     }
 }
 
@@ -460,7 +1174,7 @@ impl Storage for FakeStorage {
         if let Some(hook) = hook {
             hook();
         }
-        self.call("create_tenant")?;
+        self.call("create_tenant", String::new())?;
         lock(&self.tenants).insert(tenant.clone());
         Ok(())
     }
@@ -470,16 +1184,22 @@ impl Storage for FakeStorage {
         tenant: &NeonId,
         timeline: &NeonId,
     ) -> Result<(), StorconError> {
-        self.call("create_timeline")?;
-        lock(&self.timelines).insert((tenant.clone(), timeline.clone()));
+        self.call("create_timeline", String::new())?;
+        lock(&self.timelines).insert(
+            (tenant.clone(), timeline.clone()),
+            FakeTimeline {
+                ancestor: None,
+                head: FRESH_HEAD,
+            },
+        );
         Ok(())
     }
 
     async fn delete_tenant(&self, tenant: &NeonId) -> Result<(), StorconError> {
-        self.call("delete_tenant")?;
+        self.call("delete_tenant", tenant.to_string())?;
         // A tenant that's already gone counts as deleted, like the controller's 404.
         lock(&self.tenants).remove(tenant);
-        lock(&self.timelines).retain(|(t, _)| t != tenant);
+        lock(&self.timelines).retain(|(t, _), _| t != tenant);
         Ok(())
     }
 
@@ -490,6 +1210,167 @@ impl Storage for FakeStorage {
             )));
         }
         let mut ids: Vec<NeonId> = lock(&self.tenants).iter().cloned().collect();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(ids)
+    }
+
+    async fn create_branch_timeline(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+        parent: &NeonId,
+        lsn: Lsn,
+    ) -> Result<(), StorconError> {
+        let hook = lock(&self.on_create_branch_timeline).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.call(
+            "create_branch_timeline",
+            format!("{timeline} from {parent} at {lsn}"),
+        )?;
+        if !lock(&self.tenants).contains(tenant) {
+            return Err(Self::not_found(format!("tenant {tenant}")));
+        }
+        let parent_head = self.head(tenant, parent)?;
+        // Like the pageserver: a branch point must already be written on the parent.
+        if lsn > parent_head {
+            return Err(StorconError::Rejected {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                message: format!(
+                    "invalid branch start lsn: {lsn} is ahead of the ancestor's last record lsn \
+                     {parent_head}"
+                ),
+            });
+        }
+        lock(&self.timelines).insert(
+            (tenant.clone(), timeline.clone()),
+            FakeTimeline {
+                ancestor: Some((parent.clone(), lsn)),
+                head: lsn,
+            },
+        );
+        Ok(())
+    }
+
+    async fn delete_timeline(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<(), StorconError> {
+        self.call("delete_timeline", timeline.to_string())?;
+        let mut timelines = lock(&self.timelines);
+        // Like Neon: a timeline that others branch from can't go (412) until they do.
+        let has_children = timelines.iter().any(|((t, _), tl)| {
+            t == tenant && tl.ancestor.as_ref().is_some_and(|(a, _)| a == timeline)
+        });
+        if has_children {
+            return Err(StorconError::Rejected {
+                status: reqwest::StatusCode::PRECONDITION_FAILED,
+                message: format!("timeline {timeline} has child timelines"),
+            });
+        }
+        // Already gone (404) counts as deleted.
+        timelines.remove(&(tenant.clone(), timeline.clone()));
+        Ok(())
+    }
+
+    async fn get_timeline(&self, tenant: &NeonId, timeline: &NeonId) -> Result<Lsn, StorconError> {
+        self.check("get_timeline")?;
+        self.head(tenant, timeline)
+    }
+
+    async fn ancestor_lsn(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<Option<Lsn>, StorconError> {
+        self.check("ancestor_lsn")?;
+        match lock(&self.timelines).get(&(tenant.clone(), timeline.clone())) {
+            Some(t) => Ok(t.ancestor.as_ref().map(|(_, lsn)| *lsn)),
+            None => Err(Self::not_found(format!("timeline {timeline}"))),
+        }
+    }
+
+    async fn lsn_by_timestamp(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+        _at: DateTime<Utc>,
+    ) -> Result<LsnAtTime, StorconError> {
+        self.check("lsn_by_timestamp")?;
+        let head = self.head(tenant, timeline)?;
+        Ok(lock(&self.lsn_at).clone().unwrap_or(LsnAtTime {
+            lsn: head,
+            kind: LsnKind::Present,
+        }))
+    }
+
+    async fn timestamp_of_lsn(
+        &self,
+        _tenant: &NeonId,
+        _timeline: &NeonId,
+        _lsn: Lsn,
+    ) -> Result<Option<DateTime<Utc>>, StorconError> {
+        self.check("timestamp_of_lsn")?;
+        Ok(*lock(&self.timestamp_at))
+    }
+
+    async fn detach_ancestor(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<(), StorconError> {
+        self.call("detach_ancestor", timeline.to_string())?;
+        let delay = *lock(&self.detach_delay);
+        tokio::time::sleep(delay).await;
+        let behavior = *lock(&self.detach);
+        let timed_out = || {
+            StorconError::Other(
+                anyhow::anyhow!("operation timed out").context("error sending request"),
+            )
+        };
+        if behavior == FakeDetach::TimesOut {
+            return Err(timed_out());
+        }
+        match lock(&self.timelines).get_mut(&(tenant.clone(), timeline.clone())) {
+            Some(t) => t.ancestor = None,
+            None => return Err(Self::not_found(format!("timeline {timeline}"))),
+        }
+        match behavior {
+            FakeDetach::TimesOutAfterFinishing => Err(timed_out()),
+            _ => Ok(()),
+        }
+    }
+
+    async fn patch_tenant_config(
+        &self,
+        tenant: &NeonId,
+        pitr_interval: Duration,
+    ) -> Result<(), StorconError> {
+        self.call(
+            "patch_tenant_config",
+            format!("{tenant} {}s", pitr_interval.as_secs()),
+        )?;
+        lock(&self.pitr).insert(tenant.clone(), pitr_interval);
+        Ok(())
+    }
+
+    async fn tenant_pitr_interval(
+        &self,
+        tenant: &NeonId,
+    ) -> Result<Option<Duration>, StorconError> {
+        self.check("tenant_pitr_interval")?;
+        Ok(lock(&self.pitr).get(tenant).copied())
+    }
+
+    async fn list_timelines(&self, tenant: &NeonId) -> Result<Vec<NeonId>, StorconError> {
+        self.check("list_timelines")?;
+        let mut ids: Vec<NeonId> = lock(&self.timelines)
+            .keys()
+            .filter(|(t, _)| t == tenant)
+            .map(|(_, tl)| tl.clone())
+            .collect();
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(ids)
     }
@@ -564,8 +1445,16 @@ pub fn worker() -> (FakeWorker, Journal) {
         storage: FakeStorage {
             tenants: Mutex::default(),
             timelines: Mutex::default(),
+            pitr: Mutex::default(),
             fail: Mutex::default(),
+            unavailable: Mutex::default(),
+            reject: Mutex::default(),
+            detach: Mutex::default(),
+            detach_delay: Mutex::default(),
             on_create_tenant: Mutex::default(),
+            on_create_branch_timeline: Mutex::default(),
+            lsn_at: Mutex::default(),
+            timestamp_at: Mutex::default(),
             journal: journal.clone(),
         },
         computes: FakeBackend::with_journal(journal.clone()),
@@ -584,6 +1473,149 @@ pub fn worker() -> (FakeWorker, Journal) {
         owner_superuser: false,
         ready_poll: Duration::from_millis(1),
         ready_timeout: Duration::from_millis(20),
+        claim_refresh: Duration::from_millis(5),
     };
     (worker, journal)
+}
+
+/// A ready database named `app`, provisioned through the fakes.
+pub async fn ready_database(w: &FakeWorker) -> DatabaseId {
+    let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
+    w.handle_provision(id, "app").await.unwrap();
+    assert_eq!(w.metadata.database(id).status, DatabaseStatus::Ready);
+    id
+}
+
+/// A pending branch of `db` under `parent`, as the API inserts it.
+pub fn pending_branch(w: &FakeWorker, db: DatabaseId, name: &str, parent: BranchId) -> BranchId {
+    let id = BranchId::new();
+    let outcome = w.metadata.create_branch(&NewBranch {
+        id,
+        database_id: db,
+        name,
+        parent_branch_id: parent,
+        branched_at_time: None,
+        branched_at_lsn: None,
+    });
+    assert_eq!(outcome, CreateBranchOutcome::Created);
+    id
+}
+
+/// A ready branch of `db` under `parent`, built through the fakes at the parent's head.
+pub async fn ready_branch(
+    w: &FakeWorker,
+    db: DatabaseId,
+    name: &str,
+    parent: BranchId,
+) -> BranchId {
+    let id = pending_branch(w, db, name, parent);
+    w.handle_branch_create(id, None).await.unwrap();
+    let branch = w.metadata.branch(id);
+    assert_eq!(branch.status, BranchStatus::Ready, "{:?}", branch.error);
+    id
+}
+
+/// What a restore of `branch` leaves (without its compute work): a new timeline for the
+/// branch (and its endpoint), and a ready backup holding the old one. Returns the backup.
+pub fn restored_by_hand(w: &FakeWorker, branch: BranchId, backup_name: &str) -> BranchId {
+    let b = w.metadata.branch(branch);
+    let tenant = w
+        .metadata
+        .database(b.database_id)
+        .neon_tenant_id
+        .expect("the database has a tenant");
+    let restored = NeonId::new();
+    w.storage
+        .insert_timeline(&tenant, restored.as_str(), FRESH_HEAD);
+    let backup = BranchId::new();
+    let mut state = w.metadata.state();
+    let row = state.branches.get_mut(&branch).unwrap();
+    row.status = BranchStatus::Resetting;
+    row.pending_timeline_id = Some(restored.as_str().to_string());
+    drop(state);
+    let switched = futures_util::FutureExt::now_or_never(w.metadata.switch_to_restored_timeline(
+        branch,
+        restored.as_str(),
+        backup,
+        backup_name,
+    ))
+    .expect("the fake never waits");
+    assert!(switched.unwrap(), "switched");
+    w.metadata.state().branches.get_mut(&branch).unwrap().status = BranchStatus::Ready;
+    backup
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn storage() -> (FakeStorage, NeonId, NeonId) {
+        let (w, _journal) = worker();
+        let (tenant, root) = (NeonId::new(), NeonId::new());
+        w.storage
+            .insert_timeline(tenant.as_str(), root.as_str(), FRESH_HEAD);
+        (w.storage, tenant, root)
+    }
+
+    fn status_of(err: StorconError) -> reqwest::StatusCode {
+        match err {
+            StorconError::Rejected { status, .. } => status,
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    // Neon refuses to delete a timeline that other timelines branch from (412).
+    #[tokio::test]
+    async fn deleting_an_ancestor_is_refused_until_its_children_are_gone() {
+        let (s, tenant, root) = storage();
+        let child = NeonId::new();
+        s.create_branch_timeline(&tenant, &child, &root, FRESH_HEAD)
+            .await
+            .unwrap();
+
+        let err = s.delete_timeline(&tenant, &root).await.unwrap_err();
+        assert!(err.to_string().contains("has child timelines"), "{err}");
+        assert_eq!(status_of(err), reqwest::StatusCode::PRECONDITION_FAILED);
+        assert!(s.timeline(tenant.as_str(), root.as_str()).is_some());
+
+        s.delete_timeline(&tenant, &child).await.unwrap();
+        s.delete_timeline(&tenant, &root).await.unwrap();
+        assert!(s.timeline_ids().is_empty());
+    }
+
+    // A detached timeline no longer holds its ancestor.
+    #[tokio::test]
+    async fn a_detached_child_no_longer_blocks_its_ancestor() {
+        let (s, tenant, root) = storage();
+        let child = NeonId::new();
+        s.create_branch_timeline(&tenant, &child, &root, FRESH_HEAD)
+            .await
+            .unwrap();
+        s.detach_ancestor(&tenant, &child).await.unwrap();
+        assert_eq!(
+            s.timeline(tenant.as_str(), child.as_str())
+                .unwrap()
+                .ancestor,
+            None
+        );
+        s.delete_timeline(&tenant, &root).await.unwrap();
+        assert_eq!(s.timeline_ids(), [child.as_str().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn branching_ahead_of_the_parents_head_is_refused() {
+        let (s, tenant, root) = storage();
+        let child = NeonId::new();
+        let ahead = Lsn(FRESH_HEAD.0 + 1);
+        let err = s
+            .create_branch_timeline(&tenant, &child, &root, ahead)
+            .await
+            .unwrap_err();
+        assert_eq!(status_of(err), reqwest::StatusCode::BAD_REQUEST);
+        assert!(s.timeline(tenant.as_str(), child.as_str()).is_none());
+        // At the head itself is fine.
+        s.create_branch_timeline(&tenant, &child, &root, FRESH_HEAD)
+            .await
+            .unwrap();
+    }
 }

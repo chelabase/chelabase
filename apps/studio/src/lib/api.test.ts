@@ -88,3 +88,72 @@ describe("createApiClient", () => {
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("branch calls", () => {
+  const call = (fetchImpl: ReturnType<typeof vi.fn>) => {
+    const [url, init] = fetchImpl.mock.calls[0];
+    return { url, method: init.method, body: init.body ? JSON.parse(init.body as string) : undefined };
+  };
+
+  it("lists branches (a bare array)", async () => {
+    const { api, fetchImpl } = client(jsonResponse(200, [{ id: "b1" }]));
+    await expect(api.listBranches("d1")).resolves.toEqual([{ id: "b1" }]);
+    expect(call(fetchImpl)).toMatchObject({ url: "http://gw/v1/databases/d1/branches", method: "GET" });
+  });
+
+  it("creates a branch with a parent and a timestamp", async () => {
+    const { api, fetchImpl } = client(jsonResponse(202, { id: "b2" }));
+    await api.createBranch("d1", { name: "dev", parent_branch_id: "p" as never, at: { timestamp: "2026-09-30T10:00:00.000Z" } });
+    expect(call(fetchImpl)).toEqual({
+      url: "http://gw/v1/databases/d1/branches",
+      method: "POST",
+      body: { name: "dev", parent_branch_id: "p", at: { timestamp: "2026-09-30T10:00:00.000Z" } },
+    });
+  });
+
+  it("reveals a branch's connection and resets its password", async () => {
+    const { api, fetchImpl } = client(jsonResponse(200, { host: "h" }));
+    await api.getBranchConnection("d1", "b1");
+    expect(call(fetchImpl)).toMatchObject({ url: "http://gw/v1/databases/d1/branches/b1/connection", method: "GET" });
+    const second = client(jsonResponse(200, {}));
+    await second.api.resetBranchPassword("d1", "b1");
+    expect(call(second.fetchImpl)).toMatchObject({
+      url: "http://gw/v1/databases/d1/branches/b1/reset-password",
+      method: "POST",
+    });
+  });
+
+  it("resets to parent, restores and deletes", async () => {
+    const a = client(jsonResponse(202, { status: "resetting" }));
+    await a.api.resetBranchToParent("d1", "b1");
+    expect(call(a.fetchImpl)).toMatchObject({
+      url: "http://gw/v1/databases/d1/branches/b1/reset-to-parent",
+      method: "POST",
+    });
+    const b = client(jsonResponse(202, { status: "resetting", backup_branch_id: "bk", backup_name: "main-before-restore-x" }));
+    await expect(b.api.restoreBranch("d1", "b1", { at: { timestamp: "2026-09-30T10:00:00.000Z" } })).resolves.toMatchObject({
+      backup_branch_id: "bk",
+    });
+    expect(call(b.fetchImpl)).toEqual({
+      url: "http://gw/v1/databases/d1/branches/b1/restore",
+      method: "POST",
+      body: { at: { timestamp: "2026-09-30T10:00:00.000Z" } },
+    });
+    const c = client(jsonResponse(202, { status: "deleting" }));
+    await c.api.deleteBranch("d1", "b1");
+    expect(call(c.fetchImpl)).toMatchObject({ url: "http://gw/v1/databases/d1/branches/b1", method: "DELETE" });
+  });
+
+  it("patches the database settings in seconds", async () => {
+    const { api, fetchImpl } = client(jsonResponse(200, { history_window: 3600, max_branches: 3 }));
+    await expect(api.updateDatabase("d1", { history_window: 3600, max_branches: 3 })).resolves.toEqual({
+      history_window: 3600,
+      max_branches: 3,
+    });
+    expect(call(fetchImpl)).toEqual({
+      url: "http://gw/v1/databases/d1",
+      method: "PATCH",
+      body: { history_window: 3600, max_branches: 3 },
+    });
+  });
+});

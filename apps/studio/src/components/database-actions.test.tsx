@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionDetails, DatabaseSummary } from "@cheladb/types";
 import { ApiError, type ApiClient } from "@/lib/api";
+import { fakeApi } from "@/test/fake-api";
 import { DatabaseActions } from "./database-actions";
 
 const ready: DatabaseSummary = {
@@ -11,6 +12,7 @@ const ready: DatabaseSummary = {
   status: "ready",
   host: "127.0.0.1",
   port: 49153,
+  branch_count: 1,
 };
 
 const EP = "ep-0123456789ab.localtest.me";
@@ -29,15 +31,7 @@ const details = (password: string): ConnectionDetails => ({
 
 function setup(api: Partial<ApiClient>, database: DatabaseSummary = ready) {
   const onChanged = vi.fn();
-  const full: ApiClient = {
-    me: vi.fn(),
-    createDatabase: vi.fn(),
-    getDatabase: vi.fn(),
-    getConnection: vi.fn(),
-    resetPassword: vi.fn(),
-    deleteDatabase: vi.fn(),
-    ...api,
-  };
+  const full: ApiClient = fakeApi(api);
   render(<DatabaseActions api={full} database={database} onChanged={onChanged} />);
   return { api: full, onChanged };
 }

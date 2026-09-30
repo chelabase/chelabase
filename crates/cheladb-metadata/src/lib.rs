@@ -8,7 +8,12 @@ use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
 
+mod branches;
 mod neon;
+pub use branches::{
+    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome,
+    DatabaseSettings, LiveBranch, NewBranch,
+};
 pub use neon::{
     ENDPOINT_LOCK_TIMEOUT, EndpointLock, EndpointState, NeonDatabase, NeonEndpoint, NeonRole,
     NewEndpoint,
@@ -41,15 +46,17 @@ pub struct DatabaseRecord {
     pub tenant_id: TenantId,
     pub name: String,
     pub status: DatabaseStatus,
-    /// The Neon endpoint serving this database (`ep-` + 12 hex), once provisioning created one.
-    pub endpoint_id: Option<String>,
     /// Actual Postgres database name (sanitized from `name`).
     pub database_name: Option<String>,
     /// The revealed owner role (`postgres`).
     pub owner_role: Option<String>,
-    /// Owner password, sealed with `cheladb-secrets` (aad = database id).
-    pub owner_password_enc: Option<String>,
     pub error: Option<String>,
+    /// The Neon tenant holding every branch's timeline (32 hex), once provisioning chose one.
+    pub neon_tenant_id: Option<String>,
+    /// How far back branches can be made from; the tenant's `pitr_interval`.
+    pub history_window: std::time::Duration,
+    /// Live `normal` branches allowed besides main.
+    pub max_branches: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +116,11 @@ pub enum MetadataError {
     DuplicateDatabaseName,
     #[error("invalid status: {0}")]
     InvalidStatus(String),
+    #[error("invalid branch kind: {0}")]
+    InvalidBranchKind(String),
+    /// A branch this write would insert has the name of a live one (`branches_live_name`).
+    #[error("a live branch named {0:?} already exists")]
+    BranchNameTaken(String),
     #[error("invalid database name: {0}")]
     InvalidDatabaseName(String),
     /// [`MetadataClient::lock_endpoint`] waited [`ENDPOINT_LOCK_TIMEOUT`] in vain.
@@ -155,20 +167,17 @@ pub enum KeyCheck {
     Mismatch { sealed_rows: i64 },
 }
 
-/// Values stored when a database becomes ready.
-#[derive(Debug, Clone, Copy)]
-pub struct ReadyDatabase<'a> {
-    pub database_name: &'a str,
-    pub owner_role: &'a str,
-    pub owner_password_enc: &'a str,
-}
-
 /// A database that isn't deleted, as seen by the reconcile loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveDatabase {
     pub id: DatabaseId,
     pub status: DatabaseStatus,
+    /// Main's endpoint.
     pub endpoint_id: Option<String>,
+    /// The Neon tenant every branch lives in, once provisioning chose one.
+    pub neon_tenant_id: Option<String>,
+    /// The tenant's intended `pitr_interval`.
+    pub history_window: std::time::Duration,
     /// Seconds since the row last changed.
     pub age_secs: i64,
 }
@@ -310,6 +319,8 @@ impl MetadataClient {
     ) -> Result<(), MetadataError> {
         self.ensure_project_in_tenant(tenant_id, project_id).await?;
 
+        // The database and its main branch (same id, no parent), together.
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             INSERT INTO databases (id, project_id, name, status)
@@ -320,27 +331,38 @@ impl MetadataClient {
         .bind(project_id.as_uuid())
         .bind(name)
         .bind(DatabaseStatus::Pending.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             Err(sqlx::Error::Database(err))
                 if err.constraint() == Some("databases_live_name_key") =>
             {
-                Err(MetadataError::DuplicateDatabaseName)
+                return Err(MetadataError::DuplicateDatabaseName);
             }
-            Err(err) => Err(err.into()),
+            Err(err) => return Err(err.into()),
         }
+        sqlx::query(
+            "INSERT INTO branches (id, database_id, name, parent_branch_id, kind, status)
+             VALUES ($1, $1, 'main', NULL, 'normal', 'pending')",
+        )
+        .bind(database_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
-    /// Update a live database's status. False (nothing written) once a delete
-    /// has begun: provisioning must never overwrite `deleting`/`deleted`.
+    /// Update a live database's status, and its main branch's with it (ruling 4). False
+    /// (nothing written) once a delete has begun: provisioning must never overwrite
+    /// `deleting`/`deleted`.
     pub async fn set_status(
         &self,
         database_id: DatabaseId,
         status: DatabaseStatus,
     ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             r#"
             UPDATE databases
@@ -350,48 +372,21 @@ impl MetadataClient {
         )
         .bind(database_id.as_uuid())
         .bind(status.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
-        Ok(updated == 1)
+        if updated != 1 {
+            return Ok(false);
+        }
+        mirror_on_main(&mut tx, database_id, BranchStatus::from(status), None).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
-    /// Mark a live database ready and link it to its endpoint. False (nothing written) once a
-    /// delete has begun; the caller must then tear down what it built.
-    pub async fn set_ready(
-        &self,
-        database_id: DatabaseId,
-        endpoint_id: &str,
-        db: ReadyDatabase<'_>,
-    ) -> Result<bool, MetadataError> {
-        let updated = sqlx::query(
-            r#"
-            UPDATE databases
-            SET status = $2,
-                endpoint_id = $3,
-                database_name = $4,
-                owner_role = $5,
-                owner_password_enc = $6,
-                error = NULL,
-                updated_at = now()
-            WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
-            "#,
-        )
-        .bind(database_id.as_uuid())
-        .bind(DatabaseStatus::Ready.as_str())
-        .bind(endpoint_id)
-        .bind(db.database_name)
-        .bind(db.owner_role)
-        .bind(db.owner_password_enc)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(updated == 1)
-    }
-
-    /// Move a database to `deleting`. False when it's already deleting,
-    /// deleted, or missing.
+    /// Move a database and every live branch of it to `deleting`, in one transaction. False
+    /// when it's already deleting, deleted, or missing.
     pub async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
         let moved = sqlx::query(
             r#"
             UPDATE databases
@@ -400,18 +395,30 @@ impl MetadataClient {
             "#,
         )
         .bind(database_id.as_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if moved != 1 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE branches SET status = 'deleting', updated_at = now()
+             WHERE database_id = $1 AND status NOT IN ('deleting', 'deleted')",
+        )
+        .bind(database_id.as_uuid())
+        .execute(&mut *tx)
         .await?;
-        Ok(moved.rows_affected() == 1)
+        tx.commit().await?;
+        Ok(true)
     }
 
-    /// Turn the row into a tombstone and forget its sealed credentials.
+    /// Turn the database row into a tombstone. Its branches are marked deleted one by one
+    /// ([`MetadataClient::mark_branch_deleted`]), each once its resources are gone.
     pub async fn mark_deleted(&self, database_id: DatabaseId) -> Result<(), MetadataError> {
         sqlx::query(
             r#"
             UPDATE databases
-            SET status = 'deleted', deleted_at = now(), updated_at = now(),
-                owner_password_enc = NULL
+            SET status = 'deleted', deleted_at = now(), updated_at = now()
             WHERE id = $1
             "#,
         )
@@ -424,16 +431,18 @@ impl MetadataClient {
     /// Fail a database stuck provisioning, but only if it is *still* pending or
     /// provisioning and untouched for `max_age_secs` at write time. Reconcile
     /// acts on a snapshot; this re-check keeps it from failing a database the
-    /// provision consumer just picked up. True when it was failed.
+    /// provision consumer just picked up. True when it was failed; main fails with it.
     pub async fn fail_if_stale(
         &self,
         database_id: DatabaseId,
         max_age_secs: i64,
     ) -> Result<bool, MetadataError> {
+        const TIMED_OUT: &str = "provisioning timed out";
+        let mut tx = self.pool.begin().await?;
         let failed = sqlx::query(
             r#"
             UPDATE databases
-            SET status = 'failed', error = 'provisioning timed out', updated_at = now()
+            SET status = 'failed', error = $3, updated_at = now()
             WHERE id = $1
               AND status IN ('pending', 'provisioning')
               AND updated_at < now() - make_interval(secs => $2)
@@ -441,9 +450,16 @@ impl MetadataClient {
         )
         .bind(database_id.as_uuid())
         .bind(max_age_secs as f64)
-        .execute(&self.pool)
-        .await?;
-        Ok(failed.rows_affected() == 1)
+        .bind(TIMED_OUT)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if failed != 1 {
+            return Ok(false);
+        }
+        mirror_on_main(&mut tx, database_id, BranchStatus::Failed, Some(TIMED_OUT)).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Compare the current secrets key with the one existing credentials were
@@ -473,7 +489,7 @@ impl MetadataClient {
             return Ok(KeyCheck::Matches);
         }
         let sealed_rows: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM databases
+            "SELECT count(*) FROM branches
              WHERE owner_password_enc IS NOT NULL",
         )
         .fetch_one(&self.pool)
@@ -489,13 +505,17 @@ impl MetadataClient {
         Ok(KeyCheck::Replaced)
     }
 
-    /// Every database that isn't deleted, with the age of its last change.
+    /// Every database that isn't deleted, with its main branch's endpoint and the age of its
+    /// last change.
     pub async fn list_live_for_reconcile(&self) -> Result<Vec<LiveDatabase>, MetadataError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, status, endpoint_id, EXTRACT(EPOCH FROM now() - updated_at)::BIGINT AS age_secs
-            FROM databases
-            WHERE status <> 'deleted'
+            SELECT d.id, d.status, b.endpoint_id, d.neon_tenant_id,
+                   EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
+                   EXTRACT(EPOCH FROM now() - d.updated_at)::BIGINT AS age_secs
+            FROM databases d
+            LEFT JOIN branches b ON b.id = d.id
+            WHERE d.status <> 'deleted'
             "#,
         )
         .fetch_all(&self.pool)
@@ -506,19 +526,24 @@ impl MetadataClient {
                     id: DatabaseId(r.get("id")),
                     status: DatabaseStatus::parse(r.get("status"))?,
                     endpoint_id: r.get("endpoint_id"),
+                    neon_tenant_id: r.get("neon_tenant_id"),
+                    history_window: std::time::Duration::from_secs(
+                        r.get::<i64, _>("history_window_secs").max(0) as u64,
+                    ),
                     age_secs: r.get("age_secs"),
                 })
             })
             .collect()
     }
 
-    /// Record a failure (ignored once a delete has begun).
+    /// Record a failure on the database and its main branch (ignored once a delete has begun).
     pub async fn set_failed(
         &self,
         database_id: DatabaseId,
         error: &str,
     ) -> Result<(), MetadataError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let failed = sqlx::query(
             r#"
             UPDATE databases
             SET status = $2, error = $3, updated_at = now()
@@ -528,8 +553,13 @@ impl MetadataClient {
         .bind(database_id.as_uuid())
         .bind(DatabaseStatus::Failed.as_str())
         .bind(error)
-        .execute(&self.pool)
-        .await?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if failed == 1 {
+            mirror_on_main(&mut tx, database_id, BranchStatus::Failed, Some(error)).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -579,11 +609,12 @@ impl MetadataClient {
                 p.tenant_id,
                 d.name,
                 d.status,
-                d.endpoint_id,
                 d.database_name,
                 d.owner_role,
-                d.owner_password_enc,
-                d.error
+                d.error,
+                d.neon_tenant_id,
+                EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
+                d.max_branches
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE d.id = $1
@@ -619,8 +650,10 @@ impl MetadataClient {
         .collect();
         let databases = sqlx::query(
             r#"
-            SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.endpoint_id,
-                   d.database_name, d.owner_role, d.owner_password_enc, d.error
+            SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.database_name,
+                   d.owner_role, d.error, d.neon_tenant_id,
+                   EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
+                   d.max_branches
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE p.tenant_id = $1 AND d.status <> 'deleted'
@@ -642,6 +675,30 @@ impl MetadataClient {
     }
 }
 
+/// Main follows its database while provisioning (ruling 4): the same status and error, but
+/// only while main is itself pending, provisioning or failed. A main that moved on (ready,
+/// resetting, deleting, deleted) is never overwritten by a database write.
+///
+/// Lock order (see `branches.rs`): callers have already updated the `databases` row, so it is
+/// locked before main's branch row, as in every transaction touching both tables.
+async fn mirror_on_main(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    database_id: DatabaseId,
+    status: BranchStatus,
+    error: Option<&str>,
+) -> Result<(), MetadataError> {
+    sqlx::query(
+        "UPDATE branches SET status = $2, error = $3, updated_at = now()
+         WHERE id = $1 AND status IN ('pending', 'provisioning', 'failed')",
+    )
+    .bind(database_id.as_uuid())
+    .bind(status.as_str())
+    .bind(error)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Map a `databases ⋈ projects` row (see `get_database`) to a record.
 fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
     DatabaseRecord {
@@ -650,11 +707,14 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
         tenant_id: TenantId(r.get("tenant_id")),
         name: r.get("name"),
         status: DatabaseStatus::parse(r.get("status")).unwrap_or(DatabaseStatus::Failed),
-        endpoint_id: r.get("endpoint_id"),
         database_name: r.get("database_name"),
         owner_role: r.get("owner_role"),
-        owner_password_enc: r.get("owner_password_enc"),
         error: r.get("error"),
+        neon_tenant_id: r.get("neon_tenant_id"),
+        history_window: std::time::Duration::from_secs(
+            r.get::<i64, _>("history_window_secs").max(0) as u64,
+        ),
+        max_branches: r.get("max_branches"),
     }
 }
 
@@ -669,11 +729,12 @@ mod tests {
             tenant_id: TenantId(DEMO_TENANT_ID),
             name: name.into(),
             status: DatabaseStatus::Ready,
-            endpoint_id: None,
             database_name: None,
             owner_role: None,
-            owner_password_enc: None,
             error: None,
+            neon_tenant_id: None,
+            history_window: std::time::Duration::from_secs(7 * 24 * 3600),
+            max_branches: 5,
         }
     }
 

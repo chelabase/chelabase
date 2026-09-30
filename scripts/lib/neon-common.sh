@@ -56,3 +56,14 @@ check_internal_addr() {
   ((10#$port >= 1 && 10#$port <= 65535)) ||
     die "CHELADB_INTERNAL_ADDR='$addr': port $port is out of range (1-65535)"
 }
+
+# api <method> <path> [json body]: a gateway call as the demo tenant's user (needs $GATEWAY, $tmp and
+# the built cheladb). Prints the HTTP status; the body goes to $tmp/body. The token is minted per
+# request: it is short-lived.
+api() {
+  local token args
+  token="$(cargo run -q -p cheladb -- dev token)" || die "cheladb dev token"
+  args=(-sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -X "$1" "$GATEWAY$2" -H "Authorization: Bearer $token")
+  if [[ -n "${3:-}" ]]; then args+=(-H 'content-type: application/json' -d "$3"); fi
+  curl "${args[@]}" || true
+}

@@ -1,10 +1,10 @@
 //! Provisioning a database on Neon: an endpoint row, a tenant and timeline on the storage
 //! controller, a compute, and the data API roles inside it.
 
-use cheladb_metadata::{DatabaseStatus, NewEndpoint, ReadyDatabase};
+use cheladb_metadata::{DatabaseStatus, NewEndpoint};
 use cheladb_neon::{ComputeBackend, NeonId};
 use cheladb_secrets::{Purpose, seal_credential};
-use cheladb_types::DatabaseId;
+use cheladb_types::{BranchId, DatabaseId};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -117,7 +117,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Err(err) => return self.fail(id, &err).await,
         };
         // Steps 3-6.
-        match self.build(&rec).await {
+        match self.build(id, &rec).await {
             Ok(Built::Compute) => self.finish(id, &rec).await,
             Ok(Built::EndpointGone) => {
                 info!(database_id = %id, "endpoint row gone while provisioning; tearing down");
@@ -140,8 +140,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .map_err(|e| e.to_string())
     }
 
-    /// Step 2: ids and secrets; the endpoint, its role and database, and the link, in one
-    /// transaction.
+    /// Step 2: ids and secrets; the endpoint, its role and database, and the link to main, in
+    /// one transaction.
     async fn record_endpoint(
         &self,
         id: DatabaseId,
@@ -168,7 +168,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         match self
             .metadata
-            .create_endpoint_for_database(id, &endpoint)
+            .create_endpoint_for_branch(BranchId::from(id), rec.timeline.as_str(), &endpoint)
             .await
         {
             Ok(true) => Ok(rec),
@@ -185,12 +185,22 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Steps 3-6: tenant, timeline, compute, readiness, bootstrap.
-    async fn build(&self, rec: &Recorded) -> Result<Built, String> {
+    async fn build(&self, id: DatabaseId, rec: &Recorded) -> Result<Built, String> {
         let ep = rec.endpoint_id.as_str();
+        // The database's branches all live in this tenant. False means a delete began: the
+        // checks below and in step 7 notice it.
+        self.metadata
+            .set_neon_tenant(id, rec.tenant.as_str())
+            .await
+            .map_err(|e| format!("recording the tenant: {e}"))?;
         self.storage
             .create_tenant(&rec.tenant)
             .await
             .map_err(|e| format!("creating tenant: {e:#}"))?;
+        // The history window (`pitr_interval`). Reconcile patches it if this fails.
+        if let Err(err) = self.handle_database_settings(id).await {
+            warn!(database_id = %id, "applying the history window failed; reconcile retries: {err}");
+        }
         self.storage
             .create_timeline(&rec.tenant, &rec.timeline)
             .await
@@ -218,7 +228,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Step 5: the compute has applied its spec once the new database answers.
-    async fn wait_until_ready(&self, ep: &str, database_name: &str) -> Result<(), String> {
+    pub(crate) async fn wait_until_ready(&self, ep: &str, database_name: &str) -> Result<(), String> {
         let deadline = Instant::now() + self.ready_timeout;
         loop {
             match self.computes.admin_sql(ep, database_name, "SELECT 1").await {
@@ -243,7 +253,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
     }
 
-    /// Step 7: re-check for a delete that landed meanwhile, then `set_ready`.
+    /// Step 7: re-check for a delete that landed meanwhile, then `set_branch_ready` (which sets
+    /// the database ready too).
     async fn finish(&self, id: DatabaseId, rec: &Recorded) -> Result<(), String> {
         let current = match self.metadata.get_database(id).await {
             Ok(current) => current,
@@ -261,30 +272,30 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             info!(database_id = %id, "deleted while provisioning; tearing down");
             return self.abandon(id, rec).await;
         }
-        let sealed = seal_credential(&self.key, &id.to_string(), Purpose::Owner, &rec.password);
-        let ready = ReadyDatabase {
-            database_name: &rec.database_name,
-            owner_role: OWNER_ROLE,
-            owner_password_enc: &sealed,
-        };
+        // Main's id is the database's: the AAD is the branch id, as for every branch.
+        let main = BranchId::from(id);
+        let sealed = seal_credential(&self.key, &main.to_string(), Purpose::Owner, &rec.password);
         // An error here may hide a commit, so nothing is torn down: the retried job either
         // skips a ready row, or fails to record a second endpoint and reconcile cleans up.
         let set = self
             .metadata
-            .set_ready(id, &rec.endpoint_id, ready)
+            .set_branch_ready(main, &sealed, None, None)
             .await
             .map_err(|e| e.to_string())?;
         if !set {
-            info!(database_id = %id, "deleted just before ready; tearing down");
-            return self.abandon(id, rec).await;
+            // A delete landed just before, or reconcile failed a stale provision: tear down,
+            // and mark the rows deleted only for a delete.
+            info!(database_id = %id, "no longer provisioning just before ready; tearing down");
+            return self.abandon_gone(id, rec).await;
         }
         info!(database_id = %id, endpoint_id = %rec.endpoint_id, "database ready");
         Ok(())
     }
 
-    /// The endpoint row vanished after step 2: a delete finished, or reconcile failed a
-    /// stalled provision and tore its endpoint down. Tear down what this provision built since;
-    /// mark the row deleted only for a delete. A failed row stays as reconcile left it.
+    /// The endpoint row vanished after step 2, or `set_branch_ready` refused: a delete landed,
+    /// or reconcile failed a stalled provision (and may have torn its endpoint down). Tear down
+    /// what this provision built; mark the rows deleted only for a delete. A failed row stays
+    /// as reconcile left it.
     async fn abandon_gone(&self, id: DatabaseId, rec: &Recorded) -> Result<(), String> {
         if !self.teardown_logged(rec).await {
             return Ok(());
@@ -307,22 +318,27 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 );
                 Ok(())
             }
-            _ => self
-                .metadata
-                .mark_deleted(id)
-                .await
-                .map_err(|e| e.to_string()),
+            _ => self.mark_all_deleted(id).await,
         }
+    }
+
+    /// Main (the only branch a provisioning database has), then the database.
+    async fn mark_all_deleted(&self, id: DatabaseId) -> Result<(), String> {
+        self.metadata
+            .mark_branch_deleted(BranchId::from(id))
+            .await
+            .map_err(|e| e.to_string())?;
+        self.metadata
+            .mark_deleted(id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// A delete won the race: tear down, then mark the row deleted. A failed teardown leaves
     /// the row `deleting` for the delete job or reconcile to finish.
     async fn abandon(&self, id: DatabaseId, rec: &Recorded) -> Result<(), String> {
         if self.teardown_logged(rec).await {
-            self.metadata
-                .mark_deleted(id)
-                .await
-                .map_err(|e| e.to_string())?;
+            self.mark_all_deleted(id).await?;
         }
         Ok(())
     }
@@ -401,10 +417,12 @@ GRANT anon, authenticated TO authenticator;
         let id = provision(&w, "web-1 prod").await;
 
         let db = w.metadata.database(id);
+        let main = w.metadata.main(id);
         assert_eq!(db.status, DatabaseStatus::Ready, "{:?}", db.error);
         assert_eq!(db.database_name.as_deref(), Some("web_1_prod"));
         assert_eq!(db.owner_role.as_deref(), Some("postgres"));
-        let ep = db.endpoint_id.clone().unwrap();
+        assert_eq!(main.status, cheladb_metadata::BranchStatus::Ready);
+        let ep = main.endpoint_id.clone().unwrap();
         assert_eq!(w.metadata.endpoint_ids(), std::slice::from_ref(&ep));
 
         let state = w.metadata.state();
@@ -416,6 +434,8 @@ GRANT anon, authenticated TO authenticator;
         assert_eq!(stored.databases[0].name, "web_1_prod");
         assert_eq!(stored.databases[0].owner, "postgres");
         assert!(w.storage.has_tenant(&stored.endpoint.tenant_id));
+        assert_eq!(db.neon_tenant_id.as_ref(), Some(&stored.endpoint.tenant_id));
+        assert_eq!(main.timeline_id.as_ref(), Some(&stored.endpoint.timeline_id));
         let token = w.computes.token_of(&ep).unwrap();
         assert_eq!(sha256_hex(&token), stored.endpoint.compute_token_sha256);
         drop(state);
@@ -430,22 +450,22 @@ GRANT anon, authenticated TO authenticator;
 
         let password = open_credential(
             &w.key,
-            &id.to_string(),
+            &main.id.to_string(),
             Purpose::Owner,
-            db.owner_password_enc.as_deref().unwrap(),
+            main.owner_password_enc.as_deref().unwrap(),
         )
         .unwrap();
         assert_eq!(password.len(), 32);
         assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
 
         let order = [
-            pos(&journal, "metadata.create_endpoint_for_database"),
+            pos(&journal, "metadata.create_endpoint_for_branch"),
             pos(&journal, "storage.create_tenant"),
             pos(&journal, "storage.create_timeline"),
             pos(&journal, "compute.create"),
             pos(&journal, &format!("compute.sql {ep} web_1_prod SELECT 1")),
             pos(&journal, &format!("compute.sql {ep} web_1_prod DO $$")),
-            pos(&journal, "metadata.set_ready"),
+            pos(&journal, "metadata.set_branch_ready"),
         ];
         assert!(order.is_sorted(), "{:?}", entries(&journal));
     }
@@ -477,7 +497,7 @@ GRANT anon, authenticated TO authenticator;
         let cases: [(&str, Arrange, &str); 6] = [
             (
                 "create_endpoint",
-                |w| w.metadata.state().fail = Some("create_endpoint_for_database"),
+                |w| w.metadata.state().fail = Some("create_endpoint_for_branch"),
                 "recording the endpoint: ",
             ),
             (
@@ -545,7 +565,7 @@ GRANT anon, authenticated TO authenticator;
                     "{step}"
                 );
             }
-            assert!(!has(&journal, "metadata.set_ready"), "{step}");
+            assert!(!has(&journal, "metadata.set_branch_ready"), "{step}");
         }
     }
 
@@ -564,14 +584,17 @@ GRANT anon, authenticated TO authenticator;
 
     fn assert_torn_down_and_deleted(w: &FakeWorker, journal: &Journal, id: DatabaseId) {
         let db = w.metadata.database(id);
+        let main = w.metadata.main(id);
         assert_eq!(db.status, DatabaseStatus::Deleted);
-        assert_eq!(db.owner_password_enc, None);
+        assert_eq!(main.status, cheladb_metadata::BranchStatus::Deleted);
+        assert_eq!(main.owner_password_enc, None);
         assert!(w.metadata.endpoint_ids().is_empty());
         assert!(w.storage.tenants.lock().unwrap().is_empty());
         let order = [
             pos(journal, "compute.delete"),
             pos(journal, "storage.delete_tenant"),
             pos(journal, "metadata.delete_endpoint"),
+            pos(journal, "metadata.mark_branch_deleted"),
             pos(journal, "metadata.mark_deleted"),
         ];
         assert!(order.is_sorted(), "{:?}", entries(journal));
@@ -581,12 +604,13 @@ GRANT anon, authenticated TO authenticator;
     #[tokio::test]
     async fn a_delete_seen_at_the_recheck_tears_down_and_marks_deleted() {
         let (w, journal) = worker();
-        // The first get_database is the skip check; the second is step 7's re-check.
-        w.metadata.state().deleting_on_get = Some(2);
+        // The first get_database is the skip check, the second the history window's read after
+        // create_tenant, and the third step 7's re-check.
+        w.metadata.state().deleting_on_get = Some(3);
         let id = provision(&w, "app").await;
         assert!(w.computes.list().await.unwrap().is_empty());
         assert_torn_down_and_deleted(&w, &journal, id);
-        assert!(!has(&journal, "metadata.set_ready"));
+        assert!(!has(&journal, "metadata.set_branch_ready"));
     }
 
     #[tokio::test]
@@ -596,7 +620,7 @@ GRANT anon, authenticated TO authenticator;
         let id = provision(&w, "app").await;
         assert!(w.computes.list().await.unwrap().is_empty());
         assert_torn_down_and_deleted(&w, &journal, id);
-        assert!(pos(&journal, "metadata.set_ready") < pos(&journal, "compute.delete"));
+        assert!(pos(&journal, "metadata.set_branch_ready") < pos(&journal, "compute.delete"));
     }
 
     // A failed teardown inside abandon leaves the row `deleting` and the endpoint row, for the
@@ -605,7 +629,7 @@ GRANT anon, authenticated TO authenticator;
     async fn a_teardown_failure_while_abandoning_leaves_the_row_deleting() {
         type Arrange = fn(&FakeWorker);
         let cases: [(&str, Arrange); 2] = [
-            ("re-check", |w| w.metadata.state().deleting_on_get = Some(2)),
+            ("re-check", |w| w.metadata.state().deleting_on_get = Some(3)),
             ("set_ready", |w| {
                 w.metadata.state().deleting_before_set_ready = true
             }),
@@ -636,13 +660,13 @@ GRANT anon, authenticated TO authenticator;
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         let state = w.metadata.state.clone();
         *w.storage.on_create_tenant.lock().unwrap() = Some(Box::new(move || {
-            // What handle_delete leaves: no endpoint row, the row a tombstone.
+            // What handle_delete leaves: no endpoint row, the rows tombstones.
             let mut state = state.lock().unwrap();
-            let ep = state.databases[&id].endpoint_id.clone().unwrap();
+            let main = state.branches.get_mut(&BranchId::from(id)).unwrap();
+            let ep = main.endpoint_id.take().unwrap();
+            main.status = cheladb_metadata::BranchStatus::Deleted;
             state.endpoints.remove(&ep);
-            let db = state.databases.get_mut(&id).unwrap();
-            db.endpoint_id = None;
-            db.status = DatabaseStatus::Deleted;
+            state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Deleted;
         }));
 
         w.handle_provision(id, "app").await.unwrap();
@@ -662,7 +686,7 @@ GRANT anon, authenticated TO authenticator;
         assert!(has(&journal, "metadata.mark_deleted"));
         assert!(!has(&journal, "metadata.set_failed"));
         assert!(!has(&journal, "compute.create"));
-        assert!(!has(&journal, "metadata.set_ready"));
+        assert!(!has(&journal, "metadata.set_branch_ready"));
     }
 
     // Reconcile failed a stalled provision and tore down its endpoint row before the
@@ -673,12 +697,13 @@ GRANT anon, authenticated TO authenticator;
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         let state = w.metadata.state.clone();
         *w.storage.on_create_tenant.lock().unwrap() = Some(Box::new(move || {
-            // What FailStale then RetryTeardown leave: the row failed, no endpoint row.
+            // What FailStale then RetryTeardown leave: the rows failed, no endpoint row.
             let mut state = state.lock().unwrap();
-            let ep = state.databases[&id].endpoint_id.clone().unwrap();
+            let main = state.branches.get_mut(&BranchId::from(id)).unwrap();
+            let ep = main.endpoint_id.take().unwrap();
+            main.status = cheladb_metadata::BranchStatus::Failed;
             state.endpoints.remove(&ep);
             let db = state.databases.get_mut(&id).unwrap();
-            db.endpoint_id = None;
             db.status = DatabaseStatus::Failed;
             db.error = Some("provisioning timed out".into());
         }));
@@ -701,15 +726,57 @@ GRANT anon, authenticated TO authenticator;
         assert!(!has(&journal, "compute.create"));
     }
 
+    // Fix round 1, I1: reconcile failed a provision that ran past the stale limit after its
+    // endpoint check (the endpoint row still there). set_branch_ready then refuses because main
+    // is failed, not because of a delete: provision tears down what it built, and the rows stay
+    // failed instead of becoming tombstones.
+    #[tokio::test]
+    async fn a_stale_failure_before_set_ready_keeps_the_row_failed() {
+        let (w, journal) = worker();
+        let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
+        let state = w.metadata.state.clone();
+        *w.storage.on_create_tenant.lock().unwrap() = Some(Box::new(move || {
+            // What FailStale does (before its teardown reaches this endpoint).
+            let mut state = state.lock().unwrap();
+            let db = state.databases.get_mut(&id).unwrap();
+            db.status = DatabaseStatus::Failed;
+            db.error = Some("provisioning timed out".into());
+            let main = state.branches.get_mut(&BranchId::from(id)).unwrap();
+            main.status = cheladb_metadata::BranchStatus::Failed;
+            main.error = Some("provisioning timed out".into());
+        }));
+
+        w.handle_provision(id, "app").await.unwrap();
+
+        let (db, main) = (w.metadata.database(id), w.metadata.main(id));
+        assert_eq!(db.status, DatabaseStatus::Failed, "{:?}", entries(&journal));
+        assert_eq!(db.error.as_deref(), Some("provisioning timed out"));
+        assert_eq!(main.status, cheladb_metadata::BranchStatus::Failed);
+        assert!(has(&journal, "metadata.set_branch_ready"));
+        assert!(!has(&journal, "metadata.mark_deleted"));
+        assert!(!has(&journal, "metadata.mark_branch_deleted"));
+        assert!(!has(&journal, "metadata.set_failed"));
+        // What it built is gone.
+        assert!(w.computes.list().await.unwrap().is_empty());
+        assert!(w.storage.tenants.lock().unwrap().is_empty());
+        assert!(w.metadata.endpoint_ids().is_empty());
+    }
+
     // A job redelivered after an interrupted attempt finds the row already linked.
     #[tokio::test]
     async fn a_retried_provision_says_the_previous_attempt_is_cleaned_up() {
         let (w, _journal) = worker();
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         w.handle_provision(id, "app").await.unwrap();
-        let ep = w.metadata.database(id).endpoint_id.unwrap();
-        // The first attempt's set_ready error hid no commit: the row is still provisioning.
-        w.metadata.state().databases.get_mut(&id).unwrap().status = DatabaseStatus::Provisioning;
+        let ep = w.metadata.main(id).endpoint_id.unwrap();
+        // The first attempt's set_branch_ready error hid no commit: the rows are still
+        // provisioning.
+        {
+            let mut state = w.metadata.state();
+            state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Provisioning;
+            state.branches.get_mut(&BranchId::from(id)).unwrap().status =
+                cheladb_metadata::BranchStatus::Provisioning;
+        }
 
         w.handle_provision(id, "app").await.unwrap();
 
@@ -755,7 +822,7 @@ GRANT anon, authenticated TO authenticator;
         let db = w.metadata.database(id);
         assert_eq!(db.status, DatabaseStatus::Failed);
         assert!(db.error.unwrap().contains("reserved"));
-        assert!(!has(&journal, "metadata.create_endpoint_for_database"));
+        assert!(!has(&journal, "metadata.create_endpoint_for_branch"));
         assert!(!has(&journal, "storage."));
         assert!(!has(&journal, "compute."));
     }
