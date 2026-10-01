@@ -38,7 +38,6 @@ import type {
   ErrorEnvelope,
   Me,
   OperationAccepted,
-  PasswordResetResult,
   RestoreAccepted,
   RestoreRequest,
   UpdateDatabaseRequest
@@ -1277,9 +1276,9 @@ export const getResetBranchPasswordUrl = (id: string,
  * @summary Reset a branch's owner password
  */
 export const resetBranchPassword = async (id: string,
-    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<PasswordResetResult> => {
+    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
 
-  return customFetch<PasswordResetResult>(getResetBranchPasswordUrl(id,branchId),
+  return customFetch<void>(getResetBranchPasswordUrl(id,branchId),
   {
     ...options,
     method: 'POST'
@@ -1620,9 +1619,9 @@ export const getResetDatabasePasswordUrl = (id: string,) => {
 /**
  * @summary Reset a database's owner password
  */
-export const resetDatabasePassword = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<PasswordResetResult> => {
+export const resetDatabasePassword = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
 
-  return customFetch<PasswordResetResult>(getResetDatabasePasswordUrl(id),
+  return customFetch<void>(getResetDatabasePasswordUrl(id),
   {
     ...options,
     method: 'POST'

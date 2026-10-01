@@ -38,7 +38,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: the name is missing or invalid, or the JSON is malformed",
+            "description": "`invalid_request`: the body isn't well-formed JSON",
             "content": {
               "application/json": {
                 "schema": {
@@ -108,7 +108,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body is valid JSON but a field is missing or has the wrong type",
+            "description": "`invalid_request`: the body is valid JSON but a field is missing, has the wrong type, or the name is blank or invalid",
             "content": {
               "application/json": {
                 "schema": {
@@ -369,7 +369,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: a path id isn't a valid UUID, or the body couldn't be read",
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
             "content": {
               "application/json": {
                 "schema": {
@@ -429,7 +429,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body isn't valid JSON of the right shape, or a setting is out of range",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or a setting is out of range",
             "content": {
               "application/json": {
                 "schema": {
@@ -588,7 +588,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: a path id isn't a valid UUID, or the body couldn't be read",
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
             "content": {
               "application/json": {
                 "schema": {
@@ -648,7 +648,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body isn't valid JSON of the right shape, the name is invalid, or the point in time is invalid",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, the name is invalid, or the point in time is invalid",
             "content": {
               "application/json": {
                 "schema": {
@@ -1190,7 +1190,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: a path id isn't a valid UUID, or the body couldn't be read",
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
             "content": {
               "application/json": {
                 "schema": {
@@ -1250,7 +1250,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body isn't valid JSON of the right shape, or the name or role is invalid; `role_refused`: the worker refused the role (the message says why)",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the name or role is invalid; `role_refused`: the worker refused the role (the message says why)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1556,15 +1556,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The password was reset; read the new one from the connection details",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PasswordResetResult"
-                }
-              }
-            }
+          "204": {
+            "description": "The password was reset; read the new one from the connection details"
           },
           "400": {
             "description": "`invalid_request`: a path id isn't a valid UUID",
@@ -1823,7 +1816,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: a path id isn't a valid UUID, or the body couldn't be read",
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
             "content": {
               "application/json": {
                 "schema": {
@@ -1883,7 +1876,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body isn't valid JSON of the right shape, or the point in time is invalid",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the point in time is invalid",
             "content": {
               "application/json": {
                 "schema": {
@@ -2039,15 +2032,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The password was reset; read the new one from the connection details",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PasswordResetResult"
-                }
-              }
-            }
+          "204": {
+            "description": "The password was reset; read the new one from the connection details"
           },
           "400": {
             "description": "`invalid_request`: a path id isn't a valid UUID",
@@ -2912,10 +2898,6 @@
             "type": "string"
           }
         }
-      },
-      "PasswordResetResult": {
-        "type": "object",
-        "description": "The body of a successful password reset (nothing to return; the new password is read from\nthe connection details)."
       },
       "PointInTime": {
         "oneOf": [

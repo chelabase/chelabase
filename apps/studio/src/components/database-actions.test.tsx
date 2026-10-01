@@ -141,7 +141,7 @@ describe("DatabaseActions", () => {
   });
 
   it("resets the password after confirmation and shows the new details", async () => {
-    const { fetch } = setup({ [RESET]: () => jsonResponse({}), [CONNECTION]: connection("n3w") });
+    const { fetch } = setup({ [RESET]: () => new Response(null, { status: 204 }), [CONNECTION]: connection("n3w") });
 
     await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
     expect(count(fetch, RESET)).toBe(0);
@@ -247,7 +247,7 @@ describe("DatabaseActions", () => {
 
   it("reveals and resets a branch through the branch endpoints", async () => {
     const f = fakeFetch({
-      "POST /v1/databases/d1/branches/b2/reset-password": () => jsonResponse({}),
+      "POST /v1/databases/d1/branches/b2/reset-password": () => new Response(null, { status: 204 }),
       "GET /v1/databases/d1/branches/b2/connection": connection("br4nch"),
     });
     const branch = {

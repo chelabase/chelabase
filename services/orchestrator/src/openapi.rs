@@ -431,7 +431,6 @@ mod tests {
             "Me",
             "MeUser",
             "OperationAccepted",
-            "PasswordResetResult",
             "PointInTime",
             "Privilege",
             "Project",

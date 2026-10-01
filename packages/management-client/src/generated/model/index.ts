@@ -33,7 +33,6 @@ export * from './functionDesc.ts';
 export * from './me.ts';
 export * from './meUser.ts';
 export * from './operationAccepted.ts';
-export * from './passwordResetResult.ts';
 export * from './pointInTime.ts';
 export * from './privilege.ts';
 export * from './project.ts';

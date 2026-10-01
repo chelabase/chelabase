@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState, ApiBytes, AuthPrincipal, BACKUP_REFUSAL, ConnectionDetails, JobPort, MetadataPort, OperationAccepted,
-    PasswordResetResult, load_owned, proxy_address, reset_branch_password, reveal,
+    load_owned, proxy_address, reset_branch_password, reveal,
 };
 
 /// Longest branch name, and what a backup's name must fit in.
@@ -112,10 +112,16 @@ impl Branch {
     }
 }
 
-/// Parses a JSON body; an empty, malformed or wrongly typed one is a 422 with the reason.
+/// Parses a JSON body with the reason on failure: text that isn't JSON (syntax error, empty or
+/// cut off) is a 400; well-formed JSON of the wrong shape or with a wrong type is a 422.
 pub(crate) fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
-    serde_json::from_slice(body)
-        .map_err(|err| unprocessable(&format!("invalid request body: {err}")))
+    serde_json::from_slice(body).map_err(|err| {
+        let message = format!("invalid request body: {err}");
+        match err.classify() {
+            serde_json::error::Category::Data => unprocessable(&message),
+            _ => ApiError::invalid_request(400, message),
+        }
+    })
 }
 
 pub(crate) fn unprocessable(message: &str) -> ApiError {
@@ -290,13 +296,13 @@ struct CreateBranchRequest {
     request_body = CreateBranchRequest,
     responses(
         (status = 202, description = "Accepted; the branch is created in the background (poll it until `ready`)", body = Branch),
-        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body couldn't be read", body = ErrorEnvelope),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the parent branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`name_taken`: a branch with this name exists; `branch_cap_reached`: the database has `max_branches`; `branch_not_ready`: the parent isn't ready; `database_not_ready`: the database is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body isn't valid JSON of the right shape, the name is invalid, or the point in time is invalid", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, the name is invalid, or the point in time is invalid", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
     ),
@@ -463,7 +469,7 @@ where
     summary = "Reset a branch's owner password",
     params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id")),
     responses(
-        (status = 200, description = "The password was reset; read the new one from the connection details", body = PasswordResetResult),
+        (status = 204, description = "The password was reset; read the new one from the connection details"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
@@ -682,13 +688,13 @@ fn backup_name(name: &str, now: DateTime<Utc>) -> String {
     request_body = RestoreRequest,
     responses(
         (status = 202, description = "Accepted; the branch moves to `resetting`, and a backup of its current state is kept as a new branch", body = RestoreAccepted),
-        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body couldn't be read", body = ErrorEnvelope),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body isn't valid JSON of the right shape, or the point in time is invalid", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the point in time is invalid", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
     ),
@@ -937,13 +943,13 @@ fn in_range(
     request_body = UpdateDatabaseRequest,
     responses(
         (status = 200, description = "The settings after the change", body = DatabaseSettings),
-        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body couldn't be read", body = ErrorEnvelope),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`database_not_ready`: the database is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body isn't valid JSON of the right shape, or a setting is out of range", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or a setting is out of range", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]

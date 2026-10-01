@@ -173,7 +173,7 @@ describe("BranchActions", () => {
   });
 
   it("resets the branch's password", async () => {
-    const f = fakeFetch({ "POST /v1/databases/db/branches/d/reset-password": () => jsonResponse({}) });
+    const f = fakeFetch({ "POST /v1/databases/db/branches/d/reset-password": () => new Response(null, { status: 204 }) });
     renderWithQuery(
       <BranchActions databaseId="db" databaseName="web1" branch={dev} branches={[main, dev]} historyWindow={86400} />,
       { fetch: f },

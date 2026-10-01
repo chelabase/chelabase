@@ -864,14 +864,14 @@ where
     request_body = CreateDatabaseRequest,
     responses(
         (status = 202, description = "Accepted; the database is provisioned in the background (poll it until `ready`)", body = CreateDatabaseAccepted),
-        (status = 400, description = "`invalid_request`: the name is missing or invalid, or the JSON is malformed", body = ErrorEnvelope),
+        (status = 400, description = "`invalid_request`: the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `forbidden`: `tenant_id` isn't the caller's tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the tenant or project doesn't exist (another tenant's project answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`name_taken`: a database with this name exists in the project", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body is valid JSON but a field is missing or has the wrong type", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but a field is missing, has the wrong type, or the name is blank or invalid", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
     ),
@@ -895,10 +895,10 @@ where
     }
 
     if body.name.trim().is_empty() {
-        return ApiError::invalid_request(400, "name is required").into_response();
+        return ApiError::invalid_request(422, "name is required").into_response();
     }
     if let Err(err) = cheladb_metadata::postgres_database_name(&body.name) {
-        return ApiError::invalid_request(400, err.to_string()).into_response();
+        return ApiError::invalid_request(422, err.to_string()).into_response();
     }
 
     let job_id = Uuid::new_v4();
@@ -1064,11 +1064,6 @@ where
 pub(crate) struct OperationAccepted {
     pub(crate) status: &'static str,
 }
-
-/// The body of a successful password reset (nothing to return; the new password is read from
-/// the connection details).
-#[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct PasswordResetResult {}
 
 /// The owner credentials of a branch.
 #[derive(Debug, Serialize, ToSchema)]
@@ -1236,7 +1231,7 @@ where
     summary = "Reset a database's owner password",
     params(("id" = Uuid, Path, description = "Database id")),
     responses(
-        (status = 200, description = "The password was reset; read the new one from the connection details", body = PasswordResetResult),
+        (status = 204, description = "The password was reset; read the new one from the connection details"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
@@ -1310,7 +1305,7 @@ where
     match state.js.reset_password(database_id, branch_id).await {
         Ok(reply) if reply.ok => {
             info!(request_id = %principal.request_id, %database_id, %branch_id, "owner password reset");
-            (StatusCode::OK, Json(PasswordResetResult {})).into_response()
+            StatusCode::NO_CONTENT.into_response()
         }
         Ok(reply) if reply.error.as_deref() == Some("not ready") => {
             ApiError::new(409, ErrorCode::BranchNotReady, "branch is not ready").into_response()

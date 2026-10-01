@@ -100,7 +100,7 @@ async fn spawn_gateway_with(
         .current_dir(workdir.path())
         .env("CHELADB_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
         .env("CHELADB_ORCHESTRATOR_URL", upstream_url)
-        .env("CHELADB_MANAGEMENT_HOSTS", "")
+        .env("CHELADB_API_HOSTS", "")
         .env("CHELADB_STUDIO_ORIGINS", STUDIO)
         .env("CHELADB_ZITADEL_ISSUER", jwks.issuer())
         .env("CHELADB_ZITADEL_JWKS_URL", jwks.jwks_url())

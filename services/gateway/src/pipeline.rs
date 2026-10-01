@@ -441,10 +441,10 @@ mod tests {
         verify: InternalVerifier,
     }
 
-    async fn harness(management_hosts: &[&str]) -> Harness {
+    async fn harness(api_hosts: &[&str]) -> Harness {
         let jwks = MockJwks::start().await;
         let verifier = JwtVerifier::new(jwks.config(vec![]));
-        let (pipeline, verify) = pipeline_with(management_hosts, verifier);
+        let (pipeline, verify) = pipeline_with(api_hosts, verifier);
         Harness {
             pipeline,
             jwks,
@@ -452,10 +452,10 @@ mod tests {
         }
     }
 
-    fn pipeline_with(management_hosts: &[&str], verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
+    fn pipeline_with(api_hosts: &[&str], verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
         let (private_pem, public_pem) = generate_keypair_pem();
         let pipeline = Pipeline::new(
-            Arc::new(SharedRegistry::new(Registry::new(management_hosts))),
+            Arc::new(SharedRegistry::new(Registry::new(api_hosts))),
             vec![STUDIO.to_string()],
             verifier,
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_host_is_404_when_management_hosts_are_configured() {
+    async fn unknown_host_is_404_when_api_hosts_are_configured() {
         let h = harness(&["api.example.com"]).await;
         let handled = run(&h.pipeline, "GET", "/health", Some("other.example.com"), &[]).await;
         let resp = expect_response(handled.outcome);

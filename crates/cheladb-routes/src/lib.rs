@@ -59,7 +59,8 @@ impl Service {
 /// Which family of hostnames an endpoint is served on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
-    Management,
+    /// The API hostname family (`CHELADB_API_HOSTS`): management, login and data routes.
+    Api,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +110,7 @@ pub mod orchestrator {
         name: "orchestrator.health",
         method: Method::Get,
         path: "/health",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Public,
@@ -131,7 +132,7 @@ pub mod orchestrator {
             name,
             method: Method::Get,
             path,
-            scope: Scope::Management,
+            scope: Scope::Api,
             service: Service::Orchestrator,
             policy: Policy {
                 auth: Auth::Public,
@@ -144,7 +145,7 @@ pub mod orchestrator {
         name: "orchestrator.create_database",
         method: Method::Post,
         path: "/v1/databases",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -156,7 +157,7 @@ pub mod orchestrator {
         name: "orchestrator.get_database",
         method: Method::Get,
         path: "/v1/databases/{id}",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -169,7 +170,7 @@ pub mod orchestrator {
         name: "orchestrator.database_connection",
         method: Method::Get,
         path: "/v1/databases/{id}/connection",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -181,7 +182,7 @@ pub mod orchestrator {
         name: "orchestrator.reset_password",
         method: Method::Post,
         path: "/v1/databases/{id}/reset-password",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -193,7 +194,7 @@ pub mod orchestrator {
         name: "orchestrator.delete_database",
         method: Method::Delete,
         path: "/v1/databases/{id}",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -206,7 +207,7 @@ pub mod orchestrator {
         name: "orchestrator.list_branches",
         method: Method::Get,
         path: "/v1/databases/{id}/branches",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -219,7 +220,7 @@ pub mod orchestrator {
         name: "orchestrator.create_branch",
         method: Method::Post,
         path: "/v1/databases/{id}/branches",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -232,7 +233,7 @@ pub mod orchestrator {
         name: "orchestrator.branch_connection",
         method: Method::Get,
         path: "/v1/databases/{id}/branches/{branch_id}/connection",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -244,7 +245,7 @@ pub mod orchestrator {
         name: "orchestrator.branch_reset_password",
         method: Method::Post,
         path: "/v1/databases/{id}/branches/{branch_id}/reset-password",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -256,7 +257,7 @@ pub mod orchestrator {
         name: "orchestrator.branch_reset_to_parent",
         method: Method::Post,
         path: "/v1/databases/{id}/branches/{branch_id}/reset-to-parent",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -269,7 +270,7 @@ pub mod orchestrator {
         name: "orchestrator.branch_restore",
         method: Method::Post,
         path: "/v1/databases/{id}/branches/{branch_id}/restore",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -281,7 +282,7 @@ pub mod orchestrator {
         name: "orchestrator.delete_branch",
         method: Method::Delete,
         path: "/v1/databases/{id}/branches/{branch_id}",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -294,7 +295,7 @@ pub mod orchestrator {
         name: "orchestrator.update_database",
         method: Method::Patch,
         path: "/v1/databases/{id}",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -307,7 +308,7 @@ pub mod orchestrator {
         name: "orchestrator.me",
         method: Method::Get,
         path: "/v1/me",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Orchestrator,
         policy: Policy {
             auth: Auth::Management,
@@ -353,7 +354,7 @@ pub mod orchestrator {
             name,
             method,
             path,
-            scope: Scope::Management,
+            scope: Scope::Api,
             service: Service::Orchestrator,
             policy: Policy {
                 auth: Auth::Management,
@@ -371,7 +372,7 @@ pub mod rest {
         name: "rest.query",
         method: Method::Post,
         path: "/data/v1/query",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Rest,
         policy: Policy {
             auth: Auth::DataKey,
@@ -383,7 +384,7 @@ pub mod rest {
         name: "rest.schema",
         method: Method::Get,
         path: "/data/v1/schema",
-        scope: Scope::Management,
+        scope: Scope::Api,
         service: Service::Rest,
         policy: Policy {
             auth: Auth::SecretDataKey,
@@ -406,7 +407,7 @@ pub mod auth {
             name,
             method: Method::Post,
             path,
-            scope: Scope::Management,
+            scope: Scope::Api,
             service: Service::Auth,
             policy: POLICY,
         }
@@ -535,7 +536,7 @@ mod tests {
             ("/v1/docs/scalar.js", "orchestrator.api_docs_script"),
             ("/v1/openapi.json", "orchestrator.openapi_json"),
         ] {
-            match match_endpoint(Scope::Management, "GET", path) {
+            match match_endpoint(Scope::Api, "GET", path) {
                 Match::Found(ep) => {
                     assert_eq!(ep.name, name);
                     assert_eq!(ep.policy.auth, Auth::Public, "{path}");
@@ -549,7 +550,7 @@ mod tests {
     #[test]
     fn literal_path_is_found() {
         assert_eq!(
-            match_endpoint(Scope::Management, "POST", "/v1/databases"),
+            match_endpoint(Scope::Api, "POST", "/v1/databases"),
             Match::Found(&orchestrator::CREATE_DATABASE)
         );
     }
@@ -558,7 +559,7 @@ mod tests {
     fn param_segment_matches_any_non_empty_value() {
         assert_eq!(
             match_endpoint(
-                Scope::Management,
+                Scope::Api,
                 "GET",
                 "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11"
             ),
@@ -569,7 +570,7 @@ mod tests {
     #[test]
     fn known_path_with_wrong_method_lists_allowed_methods() {
         assert_eq!(
-            match_endpoint(Scope::Management, "DELETE", "/v1/databases"),
+            match_endpoint(Scope::Api, "DELETE", "/v1/databases"),
             Match::MethodNotAllowed(vec![Method::Post])
         );
     }
@@ -577,7 +578,7 @@ mod tests {
     #[test]
     fn undeclarable_method_token_on_known_path_is_method_not_allowed() {
         assert_eq!(
-            match_endpoint(Scope::Management, "OPTIONS", "/v1/databases"),
+            match_endpoint(Scope::Api, "OPTIONS", "/v1/databases"),
             Match::MethodNotAllowed(vec![Method::Post])
         );
     }
@@ -585,7 +586,7 @@ mod tests {
     #[test]
     fn unknown_path_is_not_found() {
         assert_eq!(
-            match_endpoint(Scope::Management, "GET", "/v1/other"),
+            match_endpoint(Scope::Api, "GET", "/v1/other"),
             Match::NotFound
         );
     }
@@ -593,7 +594,7 @@ mod tests {
     #[test]
     fn trailing_slash_is_not_found() {
         assert_eq!(
-            match_endpoint(Scope::Management, "POST", "/v1/databases/"),
+            match_endpoint(Scope::Api, "POST", "/v1/databases/"),
             Match::NotFound
         );
     }
@@ -601,14 +602,14 @@ mod tests {
     #[test]
     fn empty_param_segment_is_not_found() {
         assert_eq!(
-            match_endpoint(Scope::Management, "GET", "/v1/databases//"),
+            match_endpoint(Scope::Api, "GET", "/v1/databases//"),
             Match::NotFound
         );
     }
 
     #[test]
     fn prefix_of_a_path_is_not_found() {
-        assert_eq!(match_endpoint(Scope::Management, "GET", "/v1"), Match::NotFound);
+        assert_eq!(match_endpoint(Scope::Api, "GET", "/v1"), Match::NotFound);
     }
 
     const LITERAL_VS_PARAM: &[Endpoint] = &[
@@ -628,11 +629,11 @@ mod tests {
 
     #[test]
     fn literal_segment_beats_param_segment() {
-        match match_in(LITERAL_VS_PARAM, Scope::Management, "GET", "/things/search") {
+        match match_in(LITERAL_VS_PARAM, Scope::Api, "GET", "/things/search") {
             Match::Found(ep) => assert_eq!(ep.name, "test.search"),
             other => panic!("expected Found, got {other:?}"),
         }
-        match match_in(LITERAL_VS_PARAM, Scope::Management, "GET", "/things/42") {
+        match match_in(LITERAL_VS_PARAM, Scope::Api, "GET", "/things/42") {
             Match::Found(ep) => assert_eq!(ep.name, "test.by_id"),
             other => panic!("expected Found, got {other:?}"),
         }
@@ -668,7 +669,7 @@ mod tests {
         "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e";
 
     fn found(method: &str, path: &str) -> &'static str {
-        match match_endpoint(Scope::Management, method, path) {
+        match match_endpoint(Scope::Api, method, path) {
             Match::Found(ep) => ep.name,
             other => panic!("{method} {path}: expected Found, got {other:?}"),
         }
@@ -696,7 +697,7 @@ mod tests {
         assert_eq!(found("GET", db), "orchestrator.get_database");
         assert_eq!(found("DELETE", db), "orchestrator.delete_database");
         assert_eq!(
-            match_endpoint(Scope::Management, "PUT", db),
+            match_endpoint(Scope::Api, "PUT", db),
             Match::MethodNotAllowed(vec![Method::Get, Method::Delete, Method::Patch])
         );
     }
@@ -704,15 +705,15 @@ mod tests {
     #[test]
     fn branch_paths_reject_wrong_methods_and_extra_segments() {
         assert_eq!(
-            match_endpoint(Scope::Management, "PUT", BRANCH),
+            match_endpoint(Scope::Api, "PUT", BRANCH),
             Match::MethodNotAllowed(vec![Method::Delete])
         );
         assert_eq!(
-            match_endpoint(Scope::Management, "GET", &format!("{BRANCH}/restore")),
+            match_endpoint(Scope::Api, "GET", &format!("{BRANCH}/restore")),
             Match::MethodNotAllowed(vec![Method::Post])
         );
         assert_eq!(
-            match_endpoint(Scope::Management, "GET", &format!("{BRANCH}/nope")),
+            match_endpoint(Scope::Api, "GET", &format!("{BRANCH}/nope")),
             Match::NotFound
         );
     }
@@ -747,7 +748,7 @@ mod tests {
             assert!(ep.path.starts_with("/auth/v1/"), "{}", ep.path);
         }
         assert_eq!(ENDPOINTS.iter().filter(|e| e.service == Service::Auth).count(), 8);
-        assert!(matches!(match_endpoint(Scope::Management, "POST", "/auth/v1/password-reset/confirm"),
+        assert!(matches!(match_endpoint(Scope::Api, "POST", "/auth/v1/password-reset/confirm"),
             Match::Found(ep) if ep.name == "auth.password_reset_confirm"));
     }
 
@@ -761,7 +762,7 @@ mod tests {
         assert_eq!(rest::SCHEMA.policy, Policy { auth: Auth::SecretDataKey, cors: Cors::Any });
         for ep in [rest::QUERY, rest::SCHEMA] {
             assert_eq!(ep.service, Service::Rest);
-            assert_eq!(ep.scope, Scope::Management);
+            assert_eq!(ep.scope, Scope::Api);
             assert!(ENDPOINTS.contains(&ep));
         }
         assert_eq!(found("GET", KEYS), "orchestrator.list_keys");
@@ -788,11 +789,11 @@ mod tests {
         assert_eq!(found("DELETE", &format!("{KEYS}/{id}")), "orchestrator.revoke_key");
         // `rotate` in the key-id position is a key id, not the rotate action.
         assert_eq!(
-            match_endpoint(Scope::Management, "POST", &format!("{KEYS}/rotate")),
+            match_endpoint(Scope::Api, "POST", &format!("{KEYS}/rotate")),
             Match::MethodNotAllowed(vec![Method::Delete])
         );
         assert_eq!(
-            match_endpoint(Scope::Management, "GET", &format!("{KEYS}/{id}/rotate")),
+            match_endpoint(Scope::Api, "GET", &format!("{KEYS}/{id}/rotate")),
             Match::MethodNotAllowed(vec![Method::Post])
         );
     }

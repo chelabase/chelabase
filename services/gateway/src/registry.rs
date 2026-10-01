@@ -10,18 +10,18 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registry {
-    management_hosts: HashSet<String>,
+    api_hosts: HashSet<String>,
 }
 
 impl Registry {
-    /// An empty `management_hosts` means every host is Management (the dev default).
-    pub fn new<I, S>(management_hosts: I) -> Self
+    /// An empty `api_hosts` means every host is Api (the dev default).
+    pub fn new<I, S>(api_hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         Self {
-            management_hosts: management_hosts
+            api_hosts: api_hosts
                 .into_iter()
                 .map(|h| normalize_host(h.as_ref()))
                 .filter(|h| !h.is_empty())
@@ -31,12 +31,12 @@ impl Registry {
 
     /// Like [`Registry::new`], but rejects entries that can never match a
     /// request, so a typo fails at startup instead of 404-ing every request.
-    pub fn from_config<I, S>(management_hosts: I) -> Result<Self, String>
+    pub fn from_config<I, S>(api_hosts: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let hosts = management_hosts
+        let hosts = api_hosts
             .into_iter()
             .map(|h| h.as_ref().trim().to_string())
             .filter(|h| !h.is_empty())
@@ -46,41 +46,41 @@ impl Registry {
     }
 
     pub fn scope_for(&self, host: Option<&str>) -> Option<Scope> {
-        if self.management_hosts.is_empty() {
-            return Some(Scope::Management);
+        if self.api_hosts.is_empty() {
+            return Some(Scope::Api);
         }
         let host = normalize_host(host?);
-        self.management_hosts
+        self.api_hosts
             .contains(&host)
-            .then_some(Scope::Management)
+            .then_some(Scope::Api)
     }
 }
 
-/// Check one `CHELADB_MANAGEMENT_HOSTS` entry: a hostname or IPv4 address, or a
+/// Check one `CHELADB_API_HOSTS` entry: a hostname or IPv4 address, or a
 /// bracketed IPv6 address, optionally with `:port`.
 fn validate_host_entry(entry: &str) -> Result<(), String> {
     let port_ok = |port: &str| port.parse::<u16>().is_ok();
     if let Some(rest) = entry.strip_prefix('[') {
         let (addr, after) = rest
             .split_once(']')
-            .ok_or_else(|| format!("management host {entry:?}: missing closing ]"))?;
+            .ok_or_else(|| format!("api host {entry:?}: missing closing ]"))?;
         let addr_ok = !addr.is_empty()
             && addr.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
         let after_ok = after.is_empty() || after.strip_prefix(':').is_some_and(port_ok);
         return if addr_ok && after_ok {
             Ok(())
         } else {
-            Err(format!("management host {entry:?} is not a valid [IPv6]:port"))
+            Err(format!("api host {entry:?} is not a valid [IPv6]:port"))
         };
     }
     if entry.matches(':').count() > 1 {
         return Err(format!(
-            "management host {entry:?} looks like an IPv6 address; bracket it, e.g. [{entry}]"
+            "api host {entry:?} looks like an IPv6 address; bracket it, e.g. [{entry}]"
         ));
     }
     let host = match entry.split_once(':') {
         Some((host, port)) if port_ok(port) => host,
-        Some(_) => return Err(format!("management host {entry:?} has an invalid port")),
+        Some(_) => return Err(format!("api host {entry:?} has an invalid port")),
         None => entry,
     };
     let host = host.strip_suffix('.').unwrap_or(host);
@@ -89,7 +89,7 @@ fn validate_host_entry(entry: &str) -> Result<(), String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     {
-        return Err(format!("management host {entry:?} is not a valid hostname"));
+        return Err(format!("api host {entry:?} is not a valid hostname"));
     }
     Ok(())
 }
@@ -132,17 +132,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_registry_treats_every_host_as_management() {
+    fn empty_registry_treats_every_host_as_api() {
         let registry = Registry::new(Vec::<String>::new());
-        assert_eq!(registry.scope_for(Some("anything:8000")), Some(Scope::Management));
-        assert_eq!(registry.scope_for(None), Some(Scope::Management));
+        assert_eq!(registry.scope_for(Some("anything:8000")), Some(Scope::Api));
+        assert_eq!(registry.scope_for(None), Some(Scope::Api));
     }
 
     #[test]
     fn listed_host_matches_regardless_of_port_and_case() {
         let registry = Registry::new(["api.example.com"]);
-        assert_eq!(registry.scope_for(Some("API.Example.com:8000")), Some(Scope::Management));
-        assert_eq!(registry.scope_for(Some("api.example.com")), Some(Scope::Management));
+        assert_eq!(registry.scope_for(Some("API.Example.com:8000")), Some(Scope::Api));
+        assert_eq!(registry.scope_for(Some("api.example.com")), Some(Scope::Api));
     }
 
     #[test]
@@ -161,20 +161,20 @@ mod tests {
     fn ipv6_literal_keeps_brackets_and_drops_port() {
         assert_eq!(normalize_host("[::1]:8000"), "[::1]");
         let registry = Registry::new(["[::1]"]);
-        assert_eq!(registry.scope_for(Some("[::1]:8000")), Some(Scope::Management));
+        assert_eq!(registry.scope_for(Some("[::1]:8000")), Some(Scope::Api));
     }
 
     #[test]
     fn configured_hosts_are_normalized_too() {
         let registry = Registry::new(["API.example.com:443", " "]);
-        assert_eq!(registry.scope_for(Some("api.example.com")), Some(Scope::Management));
+        assert_eq!(registry.scope_for(Some("api.example.com")), Some(Scope::Api));
     }
 
     #[test]
     fn trailing_dot_in_host_is_ignored() {
         assert_eq!(normalize_host("API.example.com.:8000"), "api.example.com");
         let registry = Registry::new(["api.example.com"]);
-        assert_eq!(registry.scope_for(Some("api.example.com.")), Some(Scope::Management));
+        assert_eq!(registry.scope_for(Some("api.example.com.")), Some(Scope::Api));
     }
 
     #[test]
@@ -182,8 +182,8 @@ mod tests {
         let registry =
             Registry::from_config(["api.example.com", "API.example.com:443", "[::1]", "127.0.0.1"])
                 .unwrap();
-        assert_eq!(registry.scope_for(Some("[::1]:8000")), Some(Scope::Management));
-        assert_eq!(registry.scope_for(Some("127.0.0.1:8000")), Some(Scope::Management));
+        assert_eq!(registry.scope_for(Some("[::1]:8000")), Some(Scope::Api));
+        assert_eq!(registry.scope_for(Some("127.0.0.1:8000")), Some(Scope::Api));
     }
 
     #[test]
@@ -212,7 +212,7 @@ mod tests {
         shared.replace(Registry::new(["b.example.com"]));
         assert_eq!(
             shared.load().scope_for(Some("b.example.com")),
-            Some(Scope::Management)
+            Some(Scope::Api)
         );
     }
 }

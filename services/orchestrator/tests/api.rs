@@ -958,46 +958,71 @@ async fn valid_request_is_202_accepted_and_publishes_job() {
     assert_eq!(published[0].payload.name, "demo-db");
 }
 
+// A name that parses but is invalid (blank, reserved, too long) is a 422 on every operation
+// that takes one; reserved or over-long database names would otherwise hand the owner a
+// system database or fail provisioning with a confusing timeout.
 #[tokio::test]
-async fn empty_name_is_400() {
-    let metadata = FakeMetadata::default();
-    let bound_tenant = TenantId::new();
-    metadata.bind_org("org-1", bound_tenant);
-    let app = spawn_app(metadata, FakeJobs::default()).await;
-    let token = app.token_for_org("org-1");
-    let resp = post_create(
-        &app,
-        Some(&token),
-        serde_json::json!({
-            "tenant_id": bound_tenant,
-            "project_id": ProjectId::new(),
-            "name": "   ",
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), 400);
-}
-
-// Review fix: reserved or over-long names would hand the owner a system
-// database or fail provisioning with a confusing timeout.
-#[tokio::test]
-async fn reserved_or_too_long_database_names_are_400() {
+async fn invalid_names_are_422_everywhere() {
     let metadata = FakeMetadata::default();
     let bound_tenant = TenantId::new();
     metadata.bind_org("org-1", bound_tenant);
     let jobs = FakeJobs::default();
     let app = spawn_app(metadata, jobs.clone()).await;
     let token = app.token_for_org("org-1");
-    for name in ["postgres".to_string(), "template1".to_string(), "x".repeat(64)] {
+    for name in ["   ".to_string(), "postgres".to_string(), "template1".to_string(), "x".repeat(64)] {
         let resp = post_create(
             &app,
             Some(&token),
             serde_json::json!({ "tenant_id": bound_tenant, "project_id": ProjectId::new(), "name": name }),
         )
         .await;
-        assert_eq!(resp.status(), 400, "{name}");
+        let err = error_of(resp, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "database {name:?}");
     }
     assert!(jobs.published.lock().unwrap().is_empty());
+    let t = branching().await;
+    for name in ["", "Dev", "a b", "main"] {
+        let resp = t.send(Method::POST, &t.branches(), Some(json!({ "name": name }))).await;
+        let err = error_of(resp, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "branch {name:?}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_json_is_400() {
+    let metadata = FakeMetadata::default();
+    metadata.bind_org("org-1", TenantId::new());
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/databases", app.base))
+        .header(IDENTITY_HEADER, app.token_for_org("org-1"))
+        .header("content-type", "application/json")
+        .body("{nope")
+        .send()
+        .await
+        .unwrap();
+    let err = error_of(resp, 400).await;
+    assert_eq!(code_of(&err), "invalid_request");
+}
+
+#[tokio::test]
+async fn password_resets_are_204() {
+    let jobs = FakeJobs::default();
+    let mut id = None;
+    let app = lifecycle_app(jobs.clone(), |m, t, k| {
+        let db = ready_database(t, k);
+        id = Some(db.database_id);
+        m.insert_database(db);
+    })
+    .await;
+    let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 204);
+    assert!(resp.bytes().await.unwrap().is_empty());
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let resp = t.send(Method::POST, &format!("{}/reset-password", t.branch(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    assert!(resp.bytes().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1487,7 +1512,7 @@ async fn reveal_deleted_is_404() {
 }
 
 #[tokio::test]
-async fn reset_password_ok_is_200() {
+async fn reset_password_ok_is_204() {
     let jobs = FakeJobs::default();
     let mut id = None;
     let app = lifecycle_app(jobs.clone(), |m, t, k| {
@@ -1497,7 +1522,7 @@ async fn reset_password_ok_is_200() {
     })
     .await;
     let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 204);
     assert_eq!(*jobs.resets.lock().unwrap(), vec![(id.unwrap(), BranchId::from(id.unwrap()))]);
 }
 
@@ -2111,7 +2136,7 @@ async fn branch_reset_password_asks_the_worker_for_that_branch() {
     let t = branching().await;
     let dev = t.ready("dev");
     let resp = t.send(Method::POST, &format!("{}/reset-password", t.branch(dev)), None).await;
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 204);
     assert_eq!(*t.jobs.resets.lock().unwrap(), vec![(t.db, dev)]);
     t.jobs.reset_answers(FakeReset::NotApplied);
     let resp = t.send(Method::POST, &format!("{}/reset-password", t.branch(dev)), None).await;
@@ -2132,8 +2157,8 @@ async fn old_routes_are_aliases_for_main() {
     let new: Value = t.send(Method::GET, &format!("{}/connection", t.branch(main)), None).await.json().await.unwrap();
     assert_eq!(old, new);
     assert_eq!(old["password"], "s3cret");
-    assert_eq!(t.send(Method::POST, &format!("/v1/databases/{}/reset-password", t.db.as_uuid()), None).await.status(), 200);
-    assert_eq!(t.send(Method::POST, &format!("{}/reset-password", t.branch(main)), None).await.status(), 200);
+    assert_eq!(t.send(Method::POST, &format!("/v1/databases/{}/reset-password", t.db.as_uuid()), None).await.status(), 204);
+    assert_eq!(t.send(Method::POST, &format!("{}/reset-password", t.branch(main)), None).await.status(), 204);
     assert_eq!(*t.jobs.resets.lock().unwrap(), vec![(t.db, main), (t.db, main)]);
 }
 
@@ -2288,9 +2313,9 @@ async fn restore_refusals() {
     assert_eq!(code_of(&err), "has_children");
     assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
     assert_eq!(t.send(Method::POST, &path(BranchId::new()), at()).await.status(), 404);
-    // Bad bodies: 422 before anything changes.
+    // Bad bodies before anything changes: an empty one isn't JSON (400), the rest are 422.
+    assert_eq!(t.send(Method::POST, &path(child), None).await.status(), 400);
     for body in [
-        None,
         Some(json!({})),
         Some(json!({ "at": {} })),
         Some(json!({ "at": { "lsn": "nope" } })),
