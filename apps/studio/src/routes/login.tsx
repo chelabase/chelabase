@@ -1,8 +1,6 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { LoginProviders } from "@/components/login/login-providers";
 import { SignInForm } from "@/components/login/sign-in-form";
-import { useStudioEnv } from "@/lib/env-context";
-import { createLoginApi } from "@/lib/login-api";
 
 export const Route = createFileRoute("/login")({
   validateSearch: (search: Record<string, unknown>) => ({
@@ -14,13 +12,13 @@ export const Route = createFileRoute("/login")({
 
 function LoginPage() {
   const { authRequest, notice } = Route.useSearch();
-  const env = useStudioEnv();
   const navigate = useNavigate();
-  const api = useMemo(() => createLoginApi(env.apiUrl), [env.apiUrl]);
   return (
-    <SignInForm api={api} authRequest={authRequest} notice={notice}
-      go={(url) => window.location.assign(url)}
-      toVerify={() => void navigate({ to: "/verify", search: { code: "" } })}
-      toRegister={() => void navigate({ to: "/register", search: { authRequest }, replace: true })} />
+    <LoginProviders>
+      <SignInForm authRequest={authRequest} notice={notice}
+        go={(url) => window.location.assign(url)}
+        toVerify={() => void navigate({ to: "/verify", search: { code: "" } })}
+        toRegister={() => void navigate({ to: "/register", search: { authRequest }, replace: true })} />
+    </LoginProviders>
   );
 }

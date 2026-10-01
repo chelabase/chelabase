@@ -1,75 +1,78 @@
-import { useState, type FormEvent } from "react";
-import type { DatabaseStatus, ProjectId, TenantId } from "@cheladb/types";
+import { useEffect, useState, type FormEvent } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { getGetMeQueryKey, useCreateDatabase, useGetDatabase, type Database } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import type { ApiClient } from "@/lib/api";
-
-type FormState =
-  | { status: "idle" }
-  | { status: "working"; name: string; phase: DatabaseStatus }
-  | { status: "done"; name: string }
-  | { status: "error"; message: string };
+import { errorText } from "@/lib/errors";
+import { pollWhile, TRANSITIONAL } from "@/lib/query";
 
 export interface CreateDatabaseFormProps {
-  api: ApiClient;
-  tenantId: TenantId;
-  projectId: ProjectId;
-  /** Called whenever the database list should be refreshed. */
-  onSettled: () => void;
-  pollIntervalMs?: number;
-  maxPolls?: number;
+  tenantId: string;
+  projectId: string;
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-export function CreateDatabaseForm({
-  api,
-  tenantId,
-  projectId,
-  onSettled,
-  pollIntervalMs = 2000,
-  maxPolls = 90,
-}: CreateDatabaseFormProps) {
+export function CreateDatabaseForm({ tenantId, projectId }: CreateDatabaseFormProps) {
+  const queryClient = useQueryClient();
   const [name, setName] = useState("");
-  const [state, setState] = useState<FormState>({ status: "idle" });
+  /** The database this form last created, followed until it settles. */
+  const [created, setCreated] = useState<{ id: string; name: string } | null>(null);
+  /** How it settled; once set, the form stops following the database (a later `deleting` isn't "Creating …"). */
+  const [outcome, setOutcome] = useState<{ ready: true } | { ready: false; error: string } | null>(null);
   const trimmed = name.trim();
-  const busy = state.status === "working";
 
-  async function submit(event: FormEvent) {
+  const create = useCreateDatabase({
+    mutation: {
+      onSuccess: (accepted, { data }) => {
+        setCreated({ id: accepted.database_id, name: data.name });
+        // The dashboard lists it (and polls while it's provisioning). Returned so
+        // the mutation (and `busy`) waits for the refetch.
+        return queryClient.invalidateQueries({ queryKey: getGetMeQueryKey() });
+      },
+    },
+  });
+  const database = useGetDatabase(created?.id ?? "", {
+    query: {
+      enabled: created !== null && outcome === null,
+      refetchInterval: pollWhile<Database>((db) => TRANSITIONAL.has(db.status)),
+    },
+  });
+
+  const db = created && outcome === null ? database.data : undefined;
+  const following = created !== null && outcome === null && (db === undefined ? !database.error : TRANSITIONAL.has(db.status));
+  const busy = create.isPending || following;
+  // Snapshot how it settled. As before, the name clears once it's ready (a failure keeps it for a retry).
+  const settledStatus = db?.status === "ready" || db?.status === "failed" ? db.status : null;
+  const settledError = db?.error ?? null;
+  useEffect(() => {
+    if (settledStatus === "ready") {
+      setOutcome({ ready: true });
+      setName("");
+    } else if (settledStatus === "failed") {
+      setOutcome({ ready: false, error: settledError ?? "Provisioning failed." });
+    }
+  }, [settledStatus, settledError]);
+  const ready = outcome?.ready === true;
+  const failure = outcome && !outcome.ready ? outcome.error : null;
+
+  function submit(event: FormEvent) {
     event.preventDefault();
     if (!trimmed || busy) return;
-    setState({ status: "working", name: trimmed, phase: "pending" });
-    try {
-      const accepted = await api.createDatabase({
-        tenant_id: tenantId,
-        project_id: projectId,
-        name: trimmed,
-      });
-      onSettled();
-      for (let i = 0; i < maxPolls; i++) {
-        await sleep(pollIntervalMs);
-        const db = await api.getDatabase(accepted.database_id);
-        if (db.status === "ready") {
-          setState({ status: "done", name: trimmed });
-          setName("");
-          onSettled();
-          return;
-        }
-        if (db.status === "failed") {
-          setState({ status: "error", message: db.error ?? "Provisioning failed." });
-          onSettled();
-          return;
-        }
-        setState({ status: "working", name: trimmed, phase: db.status });
-      }
-      setState({
-        status: "error",
-        message: `${trimmed} is still provisioning; check the list again shortly.`,
-      });
-      onSettled();
-    } catch (err) {
-      setState({ status: "error", message: err instanceof Error ? err.message : String(err) });
-    }
+    setCreated(null);
+    setOutcome(null);
+    create.mutate({ data: { tenant_id: tenantId, project_id: projectId, name: trimmed } });
   }
+
+  const working = create.isPending
+    ? { name: create.variables.data.name, phase: "pending" }
+    : following && created
+      ? { name: created.name, phase: db?.status ?? "pending" }
+      : null;
+  const error = create.error
+    ? errorText(create.error)
+    : failure
+      ? failure
+      : created && outcome === null && database.error && !db
+        ? errorText(database.error)
+        : null;
 
   return (
     <form onSubmit={submit} className="flex flex-wrap items-end gap-3">
@@ -86,15 +89,15 @@ export function CreateDatabaseForm({
       <Button type="submit" disabled={!trimmed || busy}>
         Create database
       </Button>
-      {state.status === "working" && (
+      {working && (
         <p className="text-sm text-muted-foreground">
-          Creating {state.name}… ({state.phase})
+          Creating {working.name}… ({working.phase})
         </p>
       )}
-      {state.status === "done" && <p className="text-sm">{state.name} is ready</p>}
-      {state.status === "error" && (
+      {created && ready && <p className="text-sm">{created.name} is ready</p>}
+      {error && (
         <p role="alert" className="text-sm text-destructive">
-          {state.message}
+          {error}
         </p>
       )}
     </form>

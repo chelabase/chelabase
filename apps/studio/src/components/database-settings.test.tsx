@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react";
+import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { ApiError, type ApiClient } from "@/lib/api";
-import { fakeApi } from "@/test/fake-api";
+import { getGetDatabaseQueryKey } from "@cheladb/management-client";
+import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
+import { renderWithQuery } from "@/test/render";
 import { DatabaseSettings } from "./database-settings";
 
 const DEFAULTS = {
@@ -14,12 +15,17 @@ const DEFAULTS = {
   default_schema: "public",
 };
 
-function setup(api: Partial<ApiClient> = {}, settings = DEFAULTS) {
+const PATCH = "PATCH /v1/databases/db";
+
+function setup(patch?: FakeHandler, settings = DEFAULTS) {
   const onSaved = vi.fn();
-  const full = fakeApi(api);
-  render(<DatabaseSettings api={full} databaseId="db" settings={settings} onSaved={onSaved} />);
-  return { api: full, onSaved };
+  const f = fakeFetch(patch ? { [PATCH]: patch } : {});
+  const result = renderWithQuery(<DatabaseSettings databaseId="db" settings={settings} onSaved={onSaved} />, { fetch: f });
+  return { ...result, fetch: f, onSaved };
 }
+/** The bodies of the PATCH requests sent so far. */
+const patches = (f: FakeFetch) =>
+  Promise.all(f.calls.filter((r) => `${r.method} ${new URL(r.url).pathname}` === PATCH).map((r) => r.clone().json()));
 const save = () => screen.getByRole("button", { name: "Save settings" });
 
 describe("DatabaseSettings", () => {
@@ -32,14 +38,13 @@ describe("DatabaseSettings", () => {
   });
 
   it("uses hours when the window isn't a whole number of days", () => {
-    setup({}, { ...DEFAULTS, history_window: 36 * 3600, max_branches: 2 });
+    setup(undefined, { ...DEFAULTS, history_window: 36 * 3600, max_branches: 2 });
     expect(screen.getByLabelText("History window")).toHaveValue(36);
     expect(screen.getByLabelText("Window unit")).toHaveValue("hours");
   });
 
   it("saves the window in seconds", async () => {
-    const updateDatabase = vi.fn().mockResolvedValue({ ...DEFAULTS, history_window: 43200, max_branches: 3 });
-    const { onSaved } = setup({ updateDatabase });
+    const { fetch, onSaved } = setup(() => jsonResponse({ ...DEFAULTS, history_window: 43200, max_branches: 3 }));
     await userEvent.selectOptions(screen.getByLabelText("Window unit"), "hours");
     const win = screen.getByLabelText("History window");
     await userEvent.clear(win);
@@ -48,13 +53,13 @@ describe("DatabaseSettings", () => {
     await userEvent.clear(cap);
     await userEvent.type(cap, "3");
     await userEvent.click(save());
-    expect(updateDatabase).toHaveBeenCalledWith("db", { ...DEFAULTS, history_window: 43200, max_branches: 3 });
-    expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, history_window: 43200, max_branches: 3 });
+    await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, history_window: 43200, max_branches: 3 }));
+    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, history_window: 43200, max_branches: 3 }]);
+    expect(await screen.findByRole("status")).toHaveTextContent("Saved.");
   });
 
   it("refuses values outside the limits", async () => {
-    const updateDatabase = vi.fn();
-    setup({ updateDatabase });
+    const { fetch } = setup();
     const win = screen.getByLabelText("History window");
     await userEvent.clear(win);
     await userEvent.type(win, "31");
@@ -67,18 +72,19 @@ describe("DatabaseSettings", () => {
     await userEvent.type(cap, "21");
     expect(save()).toBeDisabled();
     expect(screen.getByText(/between 0 and 20/i)).toBeInTheDocument();
-    expect(updateDatabase).not.toHaveBeenCalled();
+    expect(fetch.calls).toHaveLength(0);
   });
 
   it("shows the API's refusal", async () => {
-    const updateDatabase = vi.fn().mockRejectedValue(new ApiError(422, "history_window must be between 1 hour and 30 days"));
-    setup({ updateDatabase });
+    setup(() =>
+      jsonResponse({ error: { code: "invalid_request", message: "history_window must be between 1 hour and 30 days" } }, 422),
+    );
     await userEvent.click(save());
     expect(await screen.findByRole("alert")).toHaveTextContent("history_window must be");
   });
 
   it("says why Save settings is disabled: an invalid field, or a save in flight", async () => {
-    setup({ updateDatabase: vi.fn().mockReturnValue(new Promise<never>(() => {})) });
+    setup(() => new Promise<never>(() => {}));
     expect(save()).not.toHaveAttribute("aria-describedby");
     const rows = screen.getByLabelText("Max rows");
     await userEvent.clear(rows);
@@ -104,8 +110,7 @@ describe("DatabaseSettings", () => {
   });
 
   it("saves changed data API settings", async () => {
-    const updateDatabase = vi.fn().mockResolvedValue({ ...DEFAULTS, max_rows: 50, default_schema: "app" });
-    const { onSaved } = setup({ updateDatabase });
+    const { fetch, onSaved } = setup(() => jsonResponse({ ...DEFAULTS, max_rows: 50, default_schema: "app" }));
     const rows = screen.getByLabelText("Max rows");
     await userEvent.clear(rows);
     await userEvent.type(rows, "50");
@@ -113,13 +118,12 @@ describe("DatabaseSettings", () => {
     await userEvent.clear(schema);
     await userEvent.type(schema, "app");
     await userEvent.click(save());
-    expect(updateDatabase).toHaveBeenCalledWith("db", { ...DEFAULTS, max_rows: 50, default_schema: "app" });
-    expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, max_rows: 50, default_schema: "app" });
+    await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, max_rows: 50, default_schema: "app" }));
+    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, max_rows: 50, default_schema: "app" }]);
   });
 
   it("refuses data API settings outside their bounds", async () => {
-    const updateDatabase = vi.fn();
-    setup({ updateDatabase });
+    const { fetch } = setup();
     const cases: [string, string, RegExp][] = [
       ["Max rows", "100001", /Max rows must be a whole number between 1 and 100000/],
       ["Statement timeout (ms)", "99", /Statement timeout must be a whole number between 100 and 120000/],
@@ -137,6 +141,22 @@ describe("DatabaseSettings", () => {
       await userEvent.type(input, before);
       expect(save()).toBeEnabled();
     }
-    expect(updateDatabase).not.toHaveBeenCalled();
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  it("update_database_invalidates_get_database", async () => {
+    const { queryClient, onSaved } = setup(() => jsonResponse(DEFAULTS));
+    queryClient.setQueryData(getGetDatabaseQueryKey("db"), { name: "web1" });
+    queryClient.setQueryData(getGetDatabaseQueryKey("other"), { name: "web2" });
+    await userEvent.click(save());
+    await vi.waitFor(() => expect(onSaved).toHaveBeenCalled());
+    expect(queryClient.getQueryState(getGetDatabaseQueryKey("db"))?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(getGetDatabaseQueryKey("other"))?.isInvalidated).toBe(false);
+  });
+
+  it("saves_without_an_on_saved_callback", async () => {
+    renderWithQuery(<DatabaseSettings databaseId="db" settings={DEFAULTS} />, { fetch: fakeFetch({ [PATCH]: () => jsonResponse(DEFAULTS) }) });
+    await userEvent.click(save());
+    expect(await screen.findByRole("status")).toHaveTextContent("Saved.");
   });
 });

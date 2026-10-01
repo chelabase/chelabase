@@ -1,12 +1,15 @@
 import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
-import { EXPIRED, Field, LoginLayout, Problem, follow, messageOf, type FormProps } from "./sign-in-form";
+import { useResendCode, useVerifyEmail } from "@/lib/login-client/generated/endpoints";
+import { Field, LoginLayout, Problem, follow, problemOf, type FormProps, type LoginProblem } from "./sign-in-form";
 
-export function VerifyEmailForm({ api, initialCode = "", go, toVerify }: FormProps) {
+export function VerifyEmailForm({ initialCode = "", go, toVerify }: FormProps) {
   const [code, setCode] = useState(initialCode);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<LoginProblem | null>(null);
   const [resent, setResent] = useState(false);
+  const verifyEmail = useVerifyEmail();
+  const resendCode = useResendCode();
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -14,15 +17,15 @@ export function VerifyEmailForm({ api, initialCode = "", go, toVerify }: FormPro
     setBusy(true);
     setError(null);
     try {
-      follow(await api.verifyEmail(code.trim()), go, toVerify);
+      follow(await verifyEmail.mutateAsync({ data: { code: code.trim() } }), go, toVerify);
     } catch (err) {
-      setError(messageOf(err));
+      setError(problemOf(err));
       setBusy(false);
     }
   }
 
   async function resend() {
-    await api.resendCode().catch(() => undefined);
+    await resendCode.mutateAsync({ data: {} }).catch(() => undefined);
     setResent(true);
   }
 
@@ -31,7 +34,7 @@ export function VerifyEmailForm({ api, initialCode = "", go, toVerify }: FormPro
       <p className="text-sm text-muted-foreground">Enter the code we sent to your email.</p>
       <form onSubmit={submit} className="space-y-4">
         <Field label="Code" value={code} onChange={setCode} autoComplete="one-time-code" />
-        {error && <Problem message={error} restart={error === EXPIRED} />}
+        {error && <Problem message={error.message} restart={error.restart} />}
         <Button type="submit" disabled={busy} className="w-full">Verify</Button>
       </form>
       <Button variant="outline" onClick={() => void resend()} className="w-full">Send a new code</Button>

@@ -1,8 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { LoginProviders } from "@/components/login/login-providers";
 import { PasswordResetForm } from "@/components/login/password-reset-form";
-import { useStudioEnv } from "@/lib/env-context";
-import { createLoginApi } from "@/lib/login-api";
 
 const str = (v: unknown) => (typeof v === "string" ? v : "");
 
@@ -13,7 +11,9 @@ export const Route = createFileRoute("/password-reset")({
 
 function PasswordResetPage() {
   const { userId, code } = Route.useSearch();
-  const env = useStudioEnv();
-  const api = useMemo(() => createLoginApi(env.apiUrl), [env.apiUrl]);
-  return <PasswordResetForm api={api} userId={userId} code={code} />;
+  return (
+    <LoginProviders>
+      <PasswordResetForm userId={userId} code={code} />
+    </LoginProviders>
+  );
 }

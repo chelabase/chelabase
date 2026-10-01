@@ -1,6 +1,15 @@
 //! Shared domain identifiers for Cheladb control plane.
 
+pub mod data_api_schema;
 pub mod data_key;
+pub mod api_error;
+#[cfg(feature = "axum")]
+pub mod api_extract;
+pub use api_error::{ErrorBody, ErrorCode, ErrorEnvelope};
+#[cfg(feature = "axum")]
+pub use api_error::ApiError;
+#[cfg(feature = "axum")]
+pub use api_extract::{ApiJson, ApiPath};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -11,6 +20,7 @@ macro_rules! id_newtype {
         #[doc = $doc]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
+        #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
         pub struct $name(pub Uuid);
 
         impl $name {

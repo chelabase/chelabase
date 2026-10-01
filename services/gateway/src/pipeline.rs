@@ -129,7 +129,7 @@ impl Pipeline {
         }
 
         let Some(scope) = self.registry.load().scope_for(req.host) else {
-            return respond(404, Vec::new(), json!({ "error": "unknown host" }));
+            return respond(404, Vec::new(), error_json("not_found", "unknown host"));
         };
 
         if let Some(preflight) = self.preflight(scope, req) {
@@ -147,7 +147,7 @@ impl Pipeline {
                 ));
             }
             Match::NotFound => {
-                return respond(404, Vec::new(), json!({ "error": "no route" }));
+                return respond(404, Vec::new(), error_json("not_found", "no route"));
             }
             Match::MethodNotAllowed(allowed) => {
                 let allow = allowed
@@ -167,7 +167,7 @@ impl Pipeline {
                 return respond(
                     405,
                     vec![("allow", allow)],
-                    json!({ "error": "method not allowed" }),
+                    error_json("method_not_allowed", "method not allowed"),
                 );
             }
         };
@@ -189,7 +189,7 @@ impl Pipeline {
                     }
                 }
             }
-            Auth::Platform => {
+            Auth::Management => {
                 match self
                     .authenticate(endpoint.service, req.headers, request_id)
                     .await
@@ -321,7 +321,7 @@ impl Pipeline {
         })
     }
 
-    /// Verify the platform JWT and mint an internal identity for `service`.
+    /// Verify the management token and mint an internal identity for `service`.
     async fn authenticate(
         &self,
         service: Service,
@@ -333,19 +333,19 @@ impl Pipeline {
             AuthError::Unauthorized | AuthError::InvalidToken(_) => unauthorized(&err),
             AuthError::Jwks(_) | AuthError::Config(_) => {
                 error!("auth infrastructure error: {err}");
-                json_response(503, json!({ "error": "auth unavailable" }))
+                json_response(503, error_json("unavailable", "auth unavailable"))
             }
         })?;
         let identity = Identity {
             sub: claims.sub,
             org_id: claims.org_id,
-            auth: AuthMethod::PlatformJwt,
+            auth: AuthMethod::ManagementJwt,
             request_id: request_id.to_string(),
             data: None,
         };
         self.signer.sign(service.name(), &identity).map_err(|err| {
             error!("mint internal identity: {err}");
-            json_response(500, json!({ "error": "internal error" }))
+            json_response(500, error_json("internal", "internal error"))
         })
     }
 }
@@ -380,9 +380,15 @@ fn json_response(status: u16, body: Value) -> GatewayResponse {
     }
 }
 
+/// The shared error body, `{"error":{"code","message"}}`, written to match `cheladb_types`'
+/// `ApiError::body` (the gateway doesn't depend on that type's axum feature).
+pub(crate) fn error_json(code: &str, message: &str) -> Value {
+    json!({ "error": { "code": code, "message": message } })
+}
+
 /// The data API error body: `{"error":{"code","message"}}`.
 fn data_error(status: u16, code: &str, message: &str) -> GatewayResponse {
-    let mut resp = json_response(status, json!({ "error": { "code": code, "message": message } }));
+    let mut resp = json_response(status, error_json(code, message));
     if status == 503 {
         resp.headers.push(("retry-after", "1".to_string()));
     }
@@ -403,7 +409,7 @@ fn key_error(err: KeyError) -> GatewayResponse {
 }
 
 fn unauthorized(err: &AuthError) -> GatewayResponse {
-    json_response(401, json!({ "error": err.to_string() }))
+    json_response(401, error_json("unauthorized", &err.to_string()))
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -435,10 +441,10 @@ mod tests {
         verify: InternalVerifier,
     }
 
-    async fn harness(platform_hosts: &[&str]) -> Harness {
+    async fn harness(management_hosts: &[&str]) -> Harness {
         let jwks = MockJwks::start().await;
         let verifier = JwtVerifier::new(jwks.config(vec![]));
-        let (pipeline, verify) = pipeline_with(platform_hosts, verifier);
+        let (pipeline, verify) = pipeline_with(management_hosts, verifier);
         Harness {
             pipeline,
             jwks,
@@ -446,10 +452,10 @@ mod tests {
         }
     }
 
-    fn pipeline_with(platform_hosts: &[&str], verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
+    fn pipeline_with(management_hosts: &[&str], verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
         let (private_pem, public_pem) = generate_keypair_pem();
         let pipeline = Pipeline::new(
-            Arc::new(SharedRegistry::new(Registry::new(platform_hosts))),
+            Arc::new(SharedRegistry::new(Registry::new(management_hosts))),
             vec![STUDIO.to_string()],
             verifier,
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
@@ -528,13 +534,17 @@ mod tests {
         assert_eq!(resp.body, Some(json!({ "status": "ok" })));
     }
 
+    fn shape(code: &str, message: &str) -> Value {
+        json!({ "error": { "code": code, "message": message } })
+    }
+
     #[tokio::test]
-    async fn unknown_host_is_404_when_platform_hosts_are_configured() {
+    async fn unknown_host_is_404_when_management_hosts_are_configured() {
         let h = harness(&["api.example.com"]).await;
         let handled = run(&h.pipeline, "GET", "/health", Some("other.example.com"), &[]).await;
         let resp = expect_response(handled.outcome);
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, Some(json!({ "error": "unknown host" })));
+        assert_eq!(resp.body, Some(shape("not_found", "unknown host")));
     }
 
     #[tokio::test]
@@ -542,7 +552,7 @@ mod tests {
         let h = harness(&[]).await;
         let resp = expect_response(run(&h.pipeline, "GET", "/v1/other", None, &[]).await.outcome);
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, Some(json!({ "error": "no route" })));
+        assert_eq!(resp.body, Some(shape("not_found", "no route")));
     }
 
     #[tokio::test]
@@ -551,6 +561,7 @@ mod tests {
         let resp = expect_response(run(&h.pipeline, "DELETE", "/v1/databases", None, &[]).await.outcome);
         assert_eq!(resp.status, 405);
         assert_eq!(header(&resp.headers, "allow"), Some("POST"));
+        assert_eq!(resp.body, Some(shape("method_not_allowed", "method not allowed")));
     }
 
     /// Under /data/ the gateway's own 404 and 405 use the data API's error body.
@@ -568,9 +579,9 @@ mod tests {
         let body = resp.body.unwrap();
         assert_eq!(body["error"]["code"], "invalid_query");
         assert!(body["error"]["message"].as_str().unwrap().contains("POST"), "{body}");
-        // Elsewhere the platform's body stays.
+        // Elsewhere the management API's body stays.
         let resp = expect_response(run(&h.pipeline, "GET", "/database/x", None, &[]).await.outcome);
-        assert_eq!(resp.body, Some(json!({ "error": "no route" })));
+        assert_eq!(resp.body, Some(shape("not_found", "no route")));
     }
 
     #[tokio::test]
@@ -582,14 +593,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn platform_endpoint_without_bearer_is_401() {
+    async fn management_endpoint_without_bearer_is_401() {
         let h = harness(&[]).await;
         let resp = expect_response(run(&h.pipeline, "POST", "/v1/databases", None, &[]).await.outcome);
         assert_eq!(resp.status, 401);
+        assert_eq!(error_code(&resp), Some("unauthorized"));
     }
 
     #[tokio::test]
-    async fn platform_endpoint_with_invalid_bearer_is_401() {
+    async fn management_endpoint_with_invalid_bearer_is_401() {
         let h = harness(&[]).await;
         let resp = expect_response(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", "Bearer not-a-jwt")])
@@ -597,6 +609,7 @@ mod tests {
                 .outcome,
         );
         assert_eq!(resp.status, 401);
+        assert_eq!(error_code(&resp), Some("unauthorized"));
     }
 
     #[tokio::test]
@@ -622,7 +635,7 @@ mod tests {
         assert_eq!(claims.sub, "user-1");
         assert_eq!(claims.org_id, "org-1");
         assert_eq!(claims.rid, "rid-42");
-        assert_eq!(claims.auth, AuthMethod::PlatformJwt);
+        assert_eq!(claims.auth, AuthMethod::ManagementJwt);
     }
 
     #[tokio::test]
@@ -657,7 +670,7 @@ mod tests {
                 .outcome,
         );
         assert_eq!(resp.status, 503);
-        assert_eq!(resp.body, Some(json!({ "error": "auth unavailable" })));
+        assert_eq!(resp.body, Some(shape("unavailable", "auth unavailable")));
     }
 
     #[tokio::test]
@@ -794,7 +807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_headers_set_the_minted_identity_on_platform_routes() {
+    async fn upstream_headers_set_the_minted_identity_on_management_routes() {
         let h = harness(&[]).await;
         let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
         let plan = expect_plan(

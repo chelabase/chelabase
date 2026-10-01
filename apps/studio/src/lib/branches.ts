@@ -1,20 +1,27 @@
-import type { BranchSummary, DatabaseSettings } from "@cheladb/types";
+import {
+  getGetDatabaseQueryKey,
+  getListBranchesQueryKey,
+  type Branch,
+  type DatabaseSettings,
+} from "@cheladb/management-client";
+import type { QueryClient } from "@tanstack/react-query";
+import { TRANSITIONAL } from "@/lib/query";
 
 export const BACKUP_CONNECT_REASON = "restore backup: create a branch from it to connect";
 const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
 export interface TreeRow {
-  branch: BranchSummary;
+  branch: Branch;
   depth: number;
   /** null for main. */
   parentName: string | null;
 }
 
 /** Depth-first: main first, then each branch's children (oldest first) under it. */
-export function buildTree(branches: BranchSummary[]): TreeRow[] {
+export function buildTree(branches: Branch[]): TreeRow[] {
   const live = branches.filter((b) => b.status !== "deleted");
   const byId = new Map(live.map((b) => [b.id as string, b]));
-  const children = new Map<string | null, BranchSummary[]>();
+  const children = new Map<string | null, Branch[]>();
   for (const b of live) {
     // A branch whose parent isn't listed is shown as a root rather than lost.
     const key = b.parent_branch_id !== null && byId.has(b.parent_branch_id) ? b.parent_branch_id : null;
@@ -25,7 +32,7 @@ export function buildTree(branches: BranchSummary[]): TreeRow[] {
     (a, b) => Number(b.parent_branch_id === null) - Number(a.parent_branch_id === null),
   );
   const rows: TreeRow[] = [];
-  const visit = (b: BranchSummary, depth: number) => {
+  const visit = (b: Branch, depth: number) => {
     const parent = b.parent_branch_id === null ? undefined : byId.get(b.parent_branch_id);
     rows.push({ branch: b, depth, parentName: parent?.name ?? null });
     for (const c of children.get(b.id) ?? []) visit(c, depth + 1);
@@ -34,11 +41,21 @@ export function buildTree(branches: BranchSummary[]): TreeRow[] {
   return rows;
 }
 
-const TRANSITIONAL = new Set(["pending", "provisioning", "resetting", "deleting"]);
-export const isTransitional = (b: BranchSummary) => TRANSITIONAL.has(b.status);
+/**
+ * After a branch create, delete, reset to parent or restore: that database's branch list and
+ * its details (the branch count). Returned by the mutations' `onSuccess`, so they wait for it.
+ */
+export function invalidateBranches(queryClient: QueryClient, databaseId: string): Promise<unknown> {
+  return Promise.all([
+    queryClient.invalidateQueries({ queryKey: getListBranchesQueryKey(databaseId) }),
+    queryClient.invalidateQueries({ queryKey: getGetDatabaseQueryKey(databaseId) }),
+  ]);
+}
+
+export const isTransitional = (b: Branch) => TRANSITIONAL.has(b.status);
 
 /** Live `normal` children; backups never count. */
-export function liveNormalChildren(branch: BranchSummary, all: BranchSummary[]): BranchSummary[] {
+export function liveNormalChildren(branch: Branch, all: Branch[]): Branch[] {
   return all.filter(
     (b) => b.parent_branch_id === branch.id && b.kind === "normal" && b.status !== "deleted",
   );
@@ -47,7 +64,7 @@ export function liveNormalChildren(branch: BranchSummary, all: BranchSummary[]):
 export type ActionKey = "connect" | "resetPassword" | "resetToParent" | "restore" | "delete";
 
 /** Why each action is unavailable (null when it is available). */
-export function actionReasons(branch: BranchSummary, all: BranchSummary[]): Record<ActionKey, string | null> {
+export function actionReasons(branch: Branch, all: Branch[]): Record<ActionKey, string | null> {
   const isMain = branch.kind === "normal" && branch.parent_branch_id === null;
   const kids = liveNormalChildren(branch, all);
   const childReason = kids.length > 0 ? `has child branches: ${kids.map((k) => k.name).join(", ")}` : null;

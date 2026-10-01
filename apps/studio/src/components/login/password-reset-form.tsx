@@ -1,15 +1,17 @@
 import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
-import type { LoginApi } from "@/lib/login-api";
-import { Field, LoginLayout, Problem, messageOf } from "./sign-in-form";
+import { useConfirmPasswordReset, useRequestPasswordReset } from "@/lib/login-client/generated/endpoints";
+import { Field, LoginLayout, Problem, SECRET, messageOf } from "./sign-in-form";
 
-export function PasswordResetForm({ api, userId = "", code = "" }: { api: LoginApi; userId?: string; code?: string }) {
+export function PasswordResetForm({ userId = "", code = "" }: { userId?: string; code?: string }) {
   const confirming = userId !== "" && code !== "";
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const requestReset = useRequestPasswordReset();
+  const confirmReset = useConfirmPasswordReset(SECRET);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -17,12 +19,14 @@ export function PasswordResetForm({ api, userId = "", code = "" }: { api: LoginA
     setBusy(true);
     setError(null);
     try {
-      if (confirming) await api.confirmPasswordReset({ userId, code, password });
-      else await api.requestPasswordReset(email);
+      if (confirming) await confirmReset.mutateAsync({ data: { userId, code, password } });
+      else await requestReset.mutateAsync({ data: { email } });
       setDone(true);
     } catch (err) {
       setError(messageOf(err));
     } finally {
+      confirmReset.reset();
+      requestReset.reset();
       setBusy(false);
     }
   }

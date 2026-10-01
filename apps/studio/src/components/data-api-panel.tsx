@@ -1,51 +1,33 @@
-import { useCallback, useEffect, useId, useState } from "react";
-import type { BranchSummary, DataApiSchema, DataKey } from "@cheladb/types";
+import { useId, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { getListKeysQueryKey, rotateKey, useGetDataApiSchema, useListKeys, type Branch } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import type { ApiClient } from "@/lib/api";
+import { errorText } from "@/lib/errors";
 import { CopyButton } from "./copy-button";
 import { DataApiKeys } from "./data-api-keys";
 import { RlsWarning } from "./rls-warning";
 
 export interface DataApiPanelProps {
-  api: ApiClient;
   databaseId: string;
-  branch: BranchSummary;
+  branch: Branch;
   /** The gateway's base URL (`VITE_API_URL`); the endpoint is `${apiUrl}/data/v1/query`. */
   apiUrl: string;
 }
 
-const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
-
 /** One branch's data API: endpoint, public key, secret keys and the RLS warning. */
-export function DataApiPanel({ api, databaseId, branch, apiUrl }: DataApiPanelProps) {
-  const [keys, setKeys] = useState<DataKey[] | null>(null);
-  const [schema, setSchema] = useState<DataApiSchema | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [schemaError, setSchemaError] = useState<string | null>(null);
+export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) {
+  const queryClient = useQueryClient();
+  const branchId = branch.id;
+  const keyList = useListKeys(databaseId, branchId);
+  const schemaQuery = useGetDataApiSchema(databaseId, branchId);
   const [rotating, setRotating] = useState(false);
   const [busy, setBusy] = useState(false);
-  const branchId = branch.id as string;
+  const [rotateError, setRotateError] = useState<string | null>(null);
+  const keys = keyList.data ?? null;
+  const schema = schemaQuery.data ?? null;
+  const error = keyList.error ? errorText(keyList.error) : rotateError;
+  const schemaError = schemaQuery.error ? `Couldn't check RLS: ${errorText(schemaQuery.error)}` : null;
   const endpoint = `${apiUrl.replace(/\/+$/, "")}/data/v1/query`;
-
-  const loadKeys = useCallback(async () => {
-    try {
-      setKeys(await api.listKeys(databaseId, branchId));
-      setError(null);
-    } catch (err) {
-      setError(message(err));
-    }
-  }, [api, databaseId, branchId]);
-
-  useEffect(() => {
-    void loadKeys();
-    api
-      .getDataApiSchema(databaseId, branchId)
-      .then((s) => {
-        setSchema(s);
-        setSchemaError(null);
-      })
-      .catch((err) => setSchemaError(`Couldn't check RLS: ${message(err)}`));
-  }, [api, databaseId, branchId, loadKeys]);
 
   const publicKey = keys?.find((k) => k.kind === "public");
   const reasonId = useId();
@@ -60,12 +42,14 @@ export function DataApiPanel({ api, databaseId, branch, apiUrl }: DataApiPanelPr
   async function rotatePublic() {
     if (!publicKey) return;
     setBusy(true);
+    setRotateError(null);
     try {
-      await api.rotateKey(databaseId, branchId, publicKey.id);
+      // The plain function, so the new key never sits in the mutation cache.
+      await rotateKey(databaseId, branchId, publicKey.id);
       setRotating(false);
-      await loadKeys();
+      await queryClient.invalidateQueries({ queryKey: getListKeysQueryKey(databaseId, branchId) });
     } catch (err) {
-      setError(message(err));
+      setRotateError(errorText(err));
     } finally {
       setBusy(false);
     }
@@ -120,7 +104,7 @@ export function DataApiPanel({ api, databaseId, branch, apiUrl }: DataApiPanelPr
       )}
       {keys === null && !error && <p className="text-muted-foreground">Loading keys…</p>}
       {keys !== null && (
-        <DataApiKeys api={api} databaseId={databaseId} branchId={branchId} keys={keys} onChanged={() => void loadKeys()} />
+        <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} />
       )}
       {schemaError && (
         <p role="alert" className="text-destructive">

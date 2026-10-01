@@ -1,20 +1,17 @@
-import type { BranchSummary } from "@cheladb/types";
-import type { ApiClient } from "@/lib/api";
+import type { Branch } from "@cheladb/management-client";
 import { buildTree } from "@/lib/branches";
 import { BranchActions } from "./branch-actions";
 
 export interface BranchTreeProps {
-  api: ApiClient;
   databaseId: string;
   databaseName: string;
-  branches: BranchSummary[];
+  branches: Branch[];
   historyWindow: number;
-  onChanged: () => void;
 }
 
 const utc = (iso: string) => `${new Date(iso).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 
-export function BranchTree({ api, databaseId, databaseName, branches, historyWindow, onChanged }: BranchTreeProps) {
+export function BranchTree({ databaseId, databaseName, branches, historyWindow }: BranchTreeProps) {
   const rows = buildTree(branches);
   return (
     <table className="w-full text-left text-sm">
@@ -58,13 +55,11 @@ export function BranchTree({ api, databaseId, databaseName, branches, historyWin
               <td className="py-2 font-mono">{branch.host && branch.port ? `${branch.host}:${branch.port}` : "—"}</td>
               <td className="py-2">
                 <BranchActions
-                  api={api}
                   databaseId={databaseId}
                   databaseName={databaseName}
                   branch={branch}
                   branches={branches}
                   historyWindow={historyWindow}
-                  onChanged={onChanged}
                 />
               </td>
             </tr>

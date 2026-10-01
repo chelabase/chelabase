@@ -24,7 +24,7 @@ const LEEWAY_SECS: u64 = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
-    PlatformJwt,
+    ManagementJwt,
     DataKey,
 }
 

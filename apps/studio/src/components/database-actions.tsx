@@ -1,21 +1,30 @@
 import { useState, type ReactNode } from "react";
-import type { BranchSummary, ConnectionDetails, DatabaseSummary } from "@cheladb/types";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  ApiError,
+  getBranchConnection,
+  getDatabaseConnection,
+  getGetMeQueryKey,
+  useDeleteDatabase,
+  useResetBranchPassword,
+  useResetDatabasePassword,
+  type Branch,
+  type ConnectionDetails,
+  type DatabaseSummary,
+} from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import { ApiError, type ApiClient } from "@/lib/api";
+import { errorText } from "@/lib/errors";
 
 type Panel = "none" | "connection" | "reset" | "delete";
 
 export interface DatabaseActionsProps {
-  api: ApiClient;
   database: DatabaseSummary;
-  /** Called after a change the database list should reflect (delete). */
-  onChanged: () => void;
   /**
    * Act on one branch instead of the database: connection details and reset
    * password go through the branch endpoints and Delete is left to the caller.
    * `reasons` says why each of the two is unavailable (null when available).
    */
-  branch?: BranchSummary;
+  branch?: Branch;
   reasons?: { connect: string | null; resetPassword: string | null };
   /** Ids of the visible texts giving those reasons, for `aria-describedby`. */
   describedBy?: { connect?: string; resetPassword?: string };
@@ -25,25 +34,25 @@ export interface DatabaseActionsProps {
   below?: ReactNode;
 }
 
-const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
-
-/** The orchestrator's 503 when a reset stored the new password but couldn't apply it yet. */
-const RESET_NOT_APPLIED = "the password was changed but not yet applied; it will be retried";
-const notApplied = (err: unknown) =>
-  err instanceof ApiError && err.status === 503 && err.message === RESET_NOT_APPLIED;
+/** The orchestrator's answer when a reset stored the new password but couldn't apply it yet. */
+const notApplied = (err: unknown) => err instanceof ApiError && err.code === "not_applied";
 /** What a not-applied reset tells the user, instead of both "reset" and the 503. */
 const NOT_APPLIED_NOTICE = "The new password is stored but not yet applied; it will be retried.";
 
 export function DatabaseActions({
-  api,
   database,
-  onChanged,
   branch,
   reasons,
   describedBy,
   children,
   below,
 }: DatabaseActionsProps) {
+  const queryClient = useQueryClient();
+  const resetDatabasePassword = useResetDatabasePassword();
+  const resetBranchPassword = useResetBranchPassword();
+  const deleteDatabase = useDeleteDatabase({
+    mutation: { onSuccess: () => queryClient.invalidateQueries({ queryKey: getGetMeQueryKey() }) },
+  });
   const [panel, setPanel] = useState<Panel>("none");
   const [details, setDetails] = useState<ConnectionDetails | null>(null);
   const [showPassword, setShowPassword] = useState(false);
@@ -77,7 +86,8 @@ export function DatabaseActions({
     setError(null);
     setNotice(null);
     try {
-      setDetails(await (branch ? api.getBranchConnection(id, branch.id) : api.getConnection(id)));
+      // Secrets stay out of the query cache: the plain functions, into component state.
+      setDetails(await (branch ? getBranchConnection(id, branch.id) : getDatabaseConnection(id)));
       setShowPassword(false);
       setNotice(
         pending
@@ -88,7 +98,7 @@ export function DatabaseActions({
       );
       setPanel("connection");
     } catch (err) {
-      setError(pending ? `${NOT_APPLIED_NOTICE} (${message(err)})` : message(err));
+      setError(pending ? `${NOT_APPLIED_NOTICE} (${errorText(err)})` : errorText(err));
     } finally {
       setBusy(false);
     }
@@ -98,14 +108,17 @@ export function DatabaseActions({
     setBusy(true);
     setError(null);
     try {
-      await (branch ? api.resetBranchPassword(id, branch.id) : api.resetPassword(id));
+      // Nothing cached to invalidate: passwords aren't cached.
+      await (branch
+        ? resetBranchPassword.mutateAsync({ id, branchId: branch.id })
+        : resetDatabasePassword.mutateAsync({ id }));
     } catch (err) {
       if (notApplied(err)) {
         // The new password is stored and shown by reveal; it starts working once applied.
         await reveal(true, true);
         return;
       }
-      setError(message(err));
+      setError(errorText(err));
       setBusy(false);
       return;
     }
@@ -116,11 +129,11 @@ export function DatabaseActions({
     setBusy(true);
     setError(null);
     try {
-      await api.deleteDatabase(id);
+      // Invalidates getMe: the list shows `deleting` and polls until it's gone.
+      await deleteDatabase.mutateAsync({ id });
       setPanel("none");
-      onChanged();
     } catch (err) {
-      setError(message(err));
+      setError(errorText(err));
     } finally {
       setBusy(false);
     }

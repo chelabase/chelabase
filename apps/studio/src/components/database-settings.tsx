@@ -1,17 +1,28 @@
 import { useId, useState, type FormEvent } from "react";
-import type { DatabaseSettings as Settings } from "@cheladb/types";
+import { useQueryClient } from "@tanstack/react-query";
+import { getGetDatabaseQueryKey, useUpdateDatabase, type DatabaseSettings as Settings } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import type { ApiClient } from "@/lib/api";
+import { errorText } from "@/lib/errors";
 import { parseSettings, windowParts, type WindowUnit } from "@/lib/branches";
 
 export interface DatabaseSettingsProps {
-  api: ApiClient;
   databaseId: string;
   settings: Settings;
-  onSaved: (settings: Settings) => void;
+  /** Called after the save and the refetch of getDatabase(id). */
+  onSaved?: (settings: Settings) => void;
 }
 
-export function DatabaseSettings({ api, databaseId, settings, onSaved }: DatabaseSettingsProps) {
+export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSettingsProps) {
+  const queryClient = useQueryClient();
+  const update = useUpdateDatabase({
+    mutation: {
+      // Awaited, so the mutation (and `busy`) waits for the refetch.
+      onSuccess: async (done, { id }) => {
+        await queryClient.invalidateQueries({ queryKey: getGetDatabaseQueryKey(id) });
+        onSaved?.(done);
+      },
+    },
+  });
   const initial = windowParts(settings.history_window);
   const [window, setWindow] = useState(String(initial.value));
   const [unit, setUnit] = useState<WindowUnit>(initial.unit);
@@ -20,9 +31,9 @@ export function DatabaseSettings({ api, databaseId, settings, onSaved }: Databas
   const [timeoutMs, setTimeoutMs] = useState(String(settings.statement_timeout_ms));
   const [maxConnections, setMaxConnections] = useState(String(settings.max_connections));
   const [defaultSchema, setDefaultSchema] = useState(settings.default_schema);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
+  const busy = update.isPending;
+  const error = update.error ? errorText(update.error) : null;
+  const saved = update.isSuccess;
   const reasonId = useId();
   const parsed = parseSettings({
     window,
@@ -34,21 +45,10 @@ export function DatabaseSettings({ api, databaseId, settings, onSaved }: Databas
     defaultSchema,
   });
 
-  async function submit(event: FormEvent) {
+  function submit(event: FormEvent) {
     event.preventDefault();
     if (!parsed.ok || busy) return;
-    setBusy(true);
-    setError(null);
-    setSaved(false);
-    try {
-      const done = await api.updateDatabase(databaseId, parsed.settings);
-      setSaved(true);
-      onSaved(done);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
+    update.mutate({ id: databaseId, data: parsed.settings });
   }
 
   const field = "h-8 rounded-lg border border-input bg-background px-2 text-sm";

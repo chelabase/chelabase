@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DataApiSchema, DataApiTable, Priv } from "@cheladb/types";
+import type { DataApiSchema, Privilege as Priv, TableDesc as DataApiTable } from "@cheladb/management-client";
 import { RlsWarning } from "./rls-warning";
 
 type Privs = { anon?: Priv[]; authenticated?: Priv[] };
@@ -158,6 +158,18 @@ describe("RlsWarning", () => {
     ).toBeInTheDocument();
     render(<RlsWarning schema={one(table(false, { anon: ["select"] }, "view"), 'v"', 's"')} />);
     expect(screen.getByText('ALTER VIEW "s"""."v""" SET (security_invoker = true);')).toBeInTheDocument();
+  });
+
+  it("reads the privilege map as the API sends it: a missing role, or no map, is no access", () => {
+    const anonOnly: DataApiTable = { kind: "table", rls: false, security_invoker: false, privileges: { anon: ["select"] }, columns: {} };
+    const authOnly: DataApiTable = { ...anonOnly, privileges: { authenticated: ["update"] } };
+    const noMap: DataApiTable = { kind: "table", rls: false, security_invoker: false, columns: {} };
+    render(<RlsWarning schema={schemaOf({ public: { a: anonOnly, b: authOnly, c: noMap, d: { ...noMap, privileges: null } } })} />);
+    const items = screen.getAllByRole("listitem").map((li) => li.getAttribute("data-table"));
+    expect(items.sort()).toEqual(["public.a", "public.b"]);
+    expect(
+      screen.getByText("Anyone with a secret key for the authenticated role can read these rows and change them. Enable RLS before production."),
+    ).toBeInTheDocument();
   });
 
   it("renders nothing when no reachable relation bypasses RLS", () => {

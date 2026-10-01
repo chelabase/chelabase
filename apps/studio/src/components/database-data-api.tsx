@@ -1,28 +1,21 @@
-import { useEffect, useState } from "react";
-import type { BranchSummary, DatabaseSummary } from "@cheladb/types";
-import type { ApiClient } from "@/lib/api";
+import { useState } from "react";
+import { useListBranches, type DatabaseSummary } from "@cheladb/management-client";
+import { errorText } from "@/lib/errors";
 import { DataApiPanel } from "./data-api-panel";
 
 export interface DatabaseDataApiProps {
-  api: ApiClient;
   database: DatabaseSummary;
   /** The gateway's base URL, for the data API endpoint. */
   apiUrl: string;
 }
 
 /** A database's Data API view: pick a ready branch (main by default), then its panel. */
-export function DatabaseDataApi({ api, database, apiUrl }: DatabaseDataApiProps) {
+export function DatabaseDataApi({ database, apiUrl }: DatabaseDataApiProps) {
   const id = database.database_id;
-  const [branches, setBranches] = useState<BranchSummary[] | null>(null);
+  const list = useListBranches(id);
   const [picked, setPicked] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    api
-      .listBranches(id)
-      .then(setBranches)
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [api, id]);
+  const branches = list.data ?? null;
+  const error = list.error ? errorText(list.error) : null;
 
   // The data API runs on `normal` branches that are ready.
   const ready = (branches ?? []).filter((b) => b.kind === "normal" && b.status === "ready");
@@ -53,7 +46,7 @@ export function DatabaseDataApi({ api, database, apiUrl }: DatabaseDataApiProps)
               ))}
             </select>
           </label>
-          <DataApiPanel key={current.id} api={api} databaseId={id} branch={current} apiUrl={apiUrl} />
+          <DataApiPanel key={current.id} databaseId={id} branch={current} apiUrl={apiUrl} />
         </>
       )}
     </div>

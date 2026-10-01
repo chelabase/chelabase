@@ -6,3 +6,4 @@ allowBuilds:
   "@scarf/scarf": true
   esbuild: true
   lightningcss: true
+  vue-demi: false

@@ -84,12 +84,12 @@ Bootstrap sets `tenants.zitadel_org_id` for the demo tenant from the local Zitad
 ## Auth
 
 - All API traffic goes through the gateway on `:8000`. Endpoints and their policy are declared once in `crates/cheladb-routes`.
-- Platform endpoints (`/v1/*`) require `Authorization: Bearer <Zitadel JWT>`. The gateway verifies it via JWKS, then forwards a 60-second EdDSA **internal identity token** (`x-cheladb-identity`) signed for the target service. It never forwards `Authorization` or a client-supplied identity header.
+- Management API endpoints (`/v1/*`) require `Authorization: Bearer <Zitadel JWT>`. The gateway verifies it via JWKS, then forwards a 60-second EdDSA **internal identity token** (`x-cheladb-identity`) signed for the target service. It never forwards `Authorization` or a client-supplied identity header.
 - The orchestrator trusts only the internal token (`CHELADB_INTERNAL_VERIFY_KEY`) and maps its `org_id` to a tenant (soft-bind via `tenants.zitadel_org_id`). Calling `:8081` directly returns `401`.
 - `cheladb dev bootstrap` creates the gateway keypair in `.cheladb/gateway/` (once; never overwritten) and writes both key paths into `.cheladb/zitadel/demo.env`.
 - `GET /health` is public; `GET /_gateway/health` is the gateway's own liveness check.
 - Forwarding headers: the gateway appends the client IP to `X-Forwarded-For` (never trust it for authorization) and sets `X-Forwarded-Proto: http` only when a TLS-terminating proxy in front hasn't already set it.
-- Gateway env: `CHELADB_GATEWAY_ADDR` (default `127.0.0.1:8000`), `CHELADB_ORCHESTRATOR_URL` (default `http://127.0.0.1:8081`), `CHELADB_PLATFORM_HOSTS` (comma-separated; empty = any host), `CHELADB_STUDIO_ORIGINS` (default `http://localhost:3000`), `CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS` (default `60`).
+- Gateway env: `CHELADB_GATEWAY_ADDR` (default `127.0.0.1:8000`), `CHELADB_ORCHESTRATOR_URL` (default `http://127.0.0.1:8081`), `CHELADB_MANAGEMENT_HOSTS` (comma-separated; empty = any host), `CHELADB_STUDIO_ORIGINS` (default `http://localhost:3000`), `CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS` (default `60`).
 
 Design notes:
 
@@ -98,9 +98,11 @@ Design notes:
 - [API gateway](docs/superpowers/specs/2026-09-27-gateway-design.md)
 - [Studio auth](docs/superpowers/specs/2026-09-27-studio-auth-design.md)
 
-## Studio sign-in
+## Studio sign-in and data fetching
 
 Studio has its own sign-in pages (`/login`, `/register`, `/verify`, `/password-reset`, `/logout`). Zitadel v4 sends every sign-in there; the pages call `auth` through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login-client token and keeps step state in encrypted HttpOnly cookies. In platform mode, answers don't reveal whether an account exists (with one known limit: signing up and then signing in with the same email and password tells a new email from a taken one). In self-hosted mode, a sign-up for a taken email says so and sends you to sign in.
+
+Studio uses TanStack Query for all data fetching. Lists poll every 2 seconds while a database or branch is pending, provisioning, resetting or deleting; polling stops when the status settles. Writes invalidate exactly the queries they change (not whole cache keys, only the affected entities). Secrets—connection details, passwords, created or rotated API keys—never enter the query or mutation cache; they live in component state and disappear when the panel closes. In dev builds, TanStack Query DevTools are available for inspection.
 
 1. `just dev`, then open http://localhost:3000 and choose **Create account** (or **Sign in**).
 2. You land in Studio straight away (email verification is off in self-hosted mode). Emails such as password resets land in **Mailpit**: http://localhost:8025.
@@ -157,6 +159,26 @@ Every database can have branches: copies of another branch's data, each with its
 - **Reset to parent** (`POST /v1/databases/{id}/branches/{bid}/reset-to-parent`): moves a branch's timeline to the parent's latest state, keeping the same connection string and password.
 - **Children rule:** Delete, reset-to-parent and restore are refused if the branch has live normal child branches. Each child's timeline branches from its parent's, and Neon refuses (412) to delete a timeline that others branch from; v1 doesn't re-parent children onto another timeline, so the children go first. Backup branches never count as children; a branch's backups are deleted when the branch itself is deleted.
 - **`just branch-e2e`** runs the story end to end through the gateway, checking the data with psql through the proxy: a database whose main gets rows A and then B; a branch at a time between the two (it has only A); C on main and a reset to parent (the branch has A, B and C); a refused restore of main while it has that child, then deleting the branch; a restore of main to the noted time (main has A; the backup has no compute, and a branch of it has A, B and C); a 1 hour window and a point 2 hours back, which fails with the oldest available point; and finally deleting the database, checking that every compute, the tenant, the endpoint rows and the branch rows are gone. It takes about 40 s.
+
+## Management API
+
+OpenAPI documents are generated from the Rust route handlers in `crates/cheladb-routes` using utoipa 6 and utoipa-axum. Two documents are maintained: `openapi/management.json` (the Management API, the orchestrator's `/v1`, meant to go public later) and `openapi/login.json` (the auth `/auth/v1` login API for Studio only). The route tests fail when the documents are stale or when a route isn't documented.
+
+After changing any management or login route, its request/response structs, or error codes, run `just api-gen`. This command:
+- Rewrites both OpenAPI documents with `CHELADB_BLESS=1` on the document tests
+- Runs orval 8 to regenerate the TypeScript clients
+- Syncs the Scalar API reference UI bundle with `just scalar-sync`
+- Commit the result; `just check` will fail if the documents, generated code or Scalar bundle are out of date.
+
+**Generated clients.** Two packages are generated from the documents using orval 8:
+- `packages/management-client`: `@cheladb/management-client` (private for now) with TanStack Query hooks (`useGetDatabase`, `useCreateBranch`), plain functions (`getDatabase(id)`), and query key helpers (`getGetDatabaseQueryKey(id)`). Configure it once with `configureManagementClient({ baseUrl, getToken, onUnauthorized })`.
+- `apps/studio/src/lib/login-client`: Studio's internal login client, generated the same way.
+
+Generated files are never edited by hand. Errors from these clients are thrown as `ApiError { status, code, message, extra }`, so clients can switch on the stable `code` field rather than the message.
+
+**Error shape.** All management, login and gateway errors use one shape: `{"error": {"code": "<code>", "message": "<sentence>", ...}}`. The `code` is stable snake_case (e.g. `not_found`, `branch_not_ready`, `has_children`, `name_taken`, `tenant_not_bound`, `invalid_request`, `too_large`, `rate_limited`, `unavailable`, `worker_unavailable`, `not_applied`, `sign_in_expired`, `invalid_credentials`). The full list is in the `ErrorCode` enum (`crates/cheladb-types/src/api_error.rs`) and the OpenAPI documents. Another tenant's database answers 404 `not_found`, exactly like a missing one. The data API keeps its own codes and extra fields (`detail`, `hint`, `sqlstate`).
+
+**API reference.** Scalar provides a self-hosted API reference UI at `GET /v1/docs` behind the gateway (public; the orchestrator serves the page plus `/v1/docs/scalar.js`, the embedded bundle) and queries `GET /v1/openapi.json`. Studio has an **API** page (`/app/api`, linked next to Sign out) rendering the same document with "Try it out" sending the signed-in user's token automatically. Scalar is configured to never contact scalar.com: telemetry off, default fonts off, no request proxy (`proxyUrl: ""`), external URLs empty, agent/MCP off, developer tools never. Scalar is versioned via pnpm pinning: root `@scalar/api-reference` (exact) and Studio `@scalar/api-reference-react` (exact). To update: bump both with pnpm (minimum release age applies), run `just scalar-sync` to copy `dist/browser/standalone.js` into `services/orchestrator/assets/scalar/` with a `VERSION` file, then commit. The orchestrator embeds Scalar at compile time, so Rust builds need no Node.
 
 ## Local dependencies
 
@@ -215,7 +237,7 @@ The gateway answers its own 404 and 405 under `/data/` with the data API's error
 
 Each branch has exactly one live **public key** (role `anon`, safe for browsers) and zero or more **secret keys** (chosen role, server only). Both start with a prefix (`chk_pub_` or `chk_sec_`) and are 51 characters total.
 
-- **What is stored:** the SHA-256 of every key and its first 12 characters (shown in lists). A secret key is returned once and the platform keeps no copy (Studio shows it in a copy-once box). The public key is also stored encrypted, so Studio can show it again.
+- **What is stored:** the SHA-256 of every key and its first 12 characters (shown in lists). A secret key is returned once and Cheladb keeps no copy (Studio shows it in a copy-once box). The public key is also stored encrypted, so Studio can show it again.
 - **Public key:** created when the branch first becomes ready. It can't be revoked (409: rotate it instead). Rotating creates a new key with the same role and name and revokes the old one in one transaction; the old key keeps working until the gateway's 30-second cache expires.
 - **Secret key:** choose a role when creating one (`POST /v1/databases/{id}/branches/{bid}/keys`; the default is `authenticated`). The role is checked and granted to `authenticator` at creation; a refused role is a 422 saying why. A role is refused when it:
   - isn't a valid role name (a letter or `_`, then letters, digits, `_` or `$`; at most 63 characters);

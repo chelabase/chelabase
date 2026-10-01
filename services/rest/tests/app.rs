@@ -74,7 +74,7 @@ fn identity(kind: Option<DataKeyKind>) -> Identity {
         auth: if kind.is_some() {
             AuthMethod::DataKey
         } else {
-            AuthMethod::PlatformJwt
+            AuthMethod::ManagementJwt
         },
         request_id: "req-1".into(),
         data: kind.map(|kind| DataIdentity {
@@ -145,12 +145,12 @@ fn unknown() -> Result<ConnInfo, ConnError> {
 #[tokio::test]
 async fn missing_identity_is_401() {
     let h = harness(not_ready).await;
-    let platform = h.token("rest", None);
+    let management = h.token("rest", None);
     let other_audience = h.token("orchestrator", Some(DataKeyKind::Secret));
     for token in [
         None,
         Some("garbage"),
-        Some(platform.as_str()),
+        Some(management.as_str()),
         Some(other_audience.as_str()),
     ] {
         let (status, _, body) = h.post(token, SELECT.to_vec()).await;

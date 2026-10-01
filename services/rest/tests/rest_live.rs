@@ -2,7 +2,7 @@
 //!
 //! Each test provisions its own database with the real worker (as the worker's own live
 //! tests do: `handle_provision` straight on the metadata database and the Neon stack, so
-//! no platform token is needed), serves rest's router in-process on `127.0.0.1:0` and
+//! no management token is needed), serves rest's router in-process on `127.0.0.1:0` and
 //! talks to it with identity tokens it mints itself (a fresh key pair; the gateway is out
 //! of the picture). Connection info comes from the orchestrator's internal listener, so
 //! `just dev` must be up. Owner DDL runs through `admin_sql` after `SET ROLE postgres`,
@@ -1098,10 +1098,10 @@ async fn untrusted_cheladb_is_quarantined_and_runs_nothing_as_superuser() {
     .await;
 }
 
-/// The platform's extension trigger must never run the owner's own event triggers with a
+/// Cheladb's extension trigger must never run the owner's own event triggers with a
 /// superuser current_user: its GRANTs run as whoever ran CREATE EXTENSION.
 ///
-/// The owner's trigger acts only on GRANT (what the platform's trigger issues; the
+/// The owner's trigger acts only on GRANT (what Cheladb's trigger issues; the
 /// extension scripts here have none). A trusted extension's script itself runs as the
 /// bootstrap superuser and fires the owner's event triggers for its own commands on Neon
 /// (session user not a superuser, so neon_fmgr_hook lets them run): that is Postgres and
@@ -1138,7 +1138,7 @@ async fn owner_event_triggers_never_run_as_superuser() {
         assert_eq!(
             superuser.trim(),
             "f",
-            "the platform's GRANT ran the owner's event trigger as superuser"
+            "Cheladb's GRANT ran the owner's event trigger as superuser"
         );
         // The extension's functions work for the API's roles.
         l.owner("CREATE TABLE e (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), h text DEFAULT encode(digest('x', 'sha256'), 'hex'));")
@@ -1151,7 +1151,7 @@ async fn owner_event_triggers_never_run_as_superuser() {
 }
 
 /// A superuser's CREATE EXTENSION (compute_ctl, Neon's privileged path) must keep the
-/// extension's own revokes: the platform's trigger grants only the owner role's functions.
+/// extension's own revokes: Cheladb's trigger grants only the owner role's functions.
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
 async fn a_superusers_extension_keeps_its_revokes() {

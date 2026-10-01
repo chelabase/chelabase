@@ -7,14 +7,17 @@ use crate::zitadel::{NewUser, Session, ZError, Zitadel};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
 use axum::{Json, Router};
-use cheladb_routes::auth as routes;
-use serde::Deserialize;
+use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use cheladb_types::api_extract::ApiJson;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+use utoipa::ToSchema;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 pub mod messages {
     pub const BAD_CREDENTIALS: &str = "Email or password is incorrect";
@@ -36,22 +39,67 @@ pub struct AppState {
 
 type S = State<Arc<AppState>>;
 
+/// The documented routes; `openapi()` reads the document from here.
+pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(auth_request))
+        .routes(routes!(sign_in))
+        .routes(routes!(sign_up))
+        .routes(routes!(verify_email))
+        .routes(routes!(resend_code))
+        .routes(routes!(password_reset))
+        .routes(routes!(password_reset_confirm))
+        .routes(routes!(logout))
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route(routes::AUTH_REQUEST.path, post(auth_request))
-        .route(routes::SIGN_IN.path, post(sign_in))
-        .route(routes::SIGN_UP.path, post(sign_up))
-        .route(routes::VERIFY_EMAIL.path, post(verify_email))
-        .route(routes::RESEND_CODE.path, post(resend_code))
-        .route(routes::PASSWORD_RESET.path, post(password_reset))
-        .route(
-            routes::PASSWORD_RESET_CONFIRM.path,
-            post(password_reset_confirm),
-        )
-        .route(routes::LOGOUT.path, post(logout))
+    let (router, _) = api_router().split_for_parts();
+    router
         // Every body here is a few short fields; this also bounds rate-limit keys.
         .layer(DefaultBodyLimit::max(8 * 1024))
         .with_state(state)
+}
+
+/// What the sign-in pages do next, as `{"next": "done", "redirect": …}` or `{"next": "verify"}`.
+#[derive(Serialize, ToSchema)]
+#[serde(tag = "next", rename_all = "lowercase")]
+enum NextStep {
+    /// Signed in: send the browser to `redirect` (Zitadel's callback for the pending sign-in).
+    Done { redirect: String },
+    /// The email isn't verified: show the code step.
+    Verify,
+}
+
+fn next_step(step: &NextStep) -> Value {
+    serde_json::to_value(step).expect("NextStep serialises")
+}
+
+// Documentation only: the handler answers through `finish`, which serialises `NextStep::Done`
+// to the same JSON.
+/// The signed-in answer: `next` is always `done`.
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+struct SignedIn {
+    next: DoneTag,
+    redirect: String,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum DoneTag {
+    Done,
+}
+
+/// An empty JSON object.
+#[derive(Serialize, ToSchema)]
+struct EmptyResponse {}
+
+/// Whether the pending sign-in's instance allows sign-up.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AuthRequestInfo {
+    sign_up: bool,
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -99,19 +147,19 @@ fn reply(status: StatusCode, body: Value, cookies: Vec<String>) -> Response {
     response
 }
 
-fn error(status: StatusCode, message: &str) -> Response {
-    reply(status, json!({ "error": message }), Vec::new())
+fn error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
+    ApiError::new(status.as_u16(), code, message).into_response()
 }
 
 fn unavailable(e: &ZError) -> Response {
     warn!(error = %e, "zitadel call failed");
-    error(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE)
+    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
 }
 
 /// A pending sign-in that Zitadel no longer knows is gone; anything else is unavailability.
 fn pending_sign_in_error(e: ZError) -> Response {
     match e {
-        ZError::Rejected { .. } => error(StatusCode::GONE, GONE),
+        ZError::Rejected { .. } => error(StatusCode::GONE, ErrorCode::SignInExpired, GONE),
         e => unavailable(&e),
     }
 }
@@ -142,7 +190,7 @@ async fn finish(s: &AppState, auth_request: &str, session: Session) -> Response 
             let secure = s.config.secure_cookies;
             reply(
                 StatusCode::OK,
-                json!({"next": "done", "redirect": redirect}),
+                next_step(&NextStep::Done { redirect }),
                 vec![
                     set_cookie(
                         SESSION_COOKIE,
@@ -175,32 +223,50 @@ async fn verify_step(
     };
     reply(
         StatusCode::OK,
-        json!({"next": "verify"}),
+        next_step(&NextStep::Verify),
         vec![login_cookie(s, &state)],
     )
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct AuthRequestBody {
     auth_request: String,
 }
 
-async fn auth_request(State(s): S, headers: HeaderMap, Json(b): Json<AuthRequestBody>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/auth/v1/auth-request",
+    operation_id = "getAuthRequest",
+    tag = "login",
+    description = "Looks up a pending sign-in and reports whether sign-up is offered. Sets no cookie.",
+    request_body = AuthRequestBody,
+    responses(
+        (status = 200, description = "The pending sign-in is valid", body = AuthRequestInfo),
+        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthRequestBody>) -> Response {
     let ip = client_ip(&headers);
     if !allowed(&s, &[(format!("auth-request:ip:{ip}"), 60, MINUTE)]) {
-        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     if !is_auth_request_id(&b.auth_request) {
-        return error(StatusCode::GONE, GONE);
+        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
     match s.zitadel.auth_request(&b.auth_request).await {
-        Ok(sign_up) => reply(StatusCode::OK, json!({"signUp": sign_up}), Vec::new()),
+        Ok(sign_up) => reply(StatusCode::OK, json!(AuthRequestInfo { sign_up }), Vec::new()),
         Err(e) => pending_sign_in_error(e),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SignInBody {
     auth_request: String,
@@ -208,7 +274,26 @@ struct SignInBody {
     password: String,
 }
 
-async fn sign_in(State(s): S, headers: HeaderMap, Json(b): Json<SignInBody>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/auth/v1/sign-in",
+    operation_id = "signIn",
+    tag = "login",
+    description = "Signs in with email and password. On success sets the HttpOnly session cookie, or, when the email still needs verifying, the HttpOnly step cookie that the code step reads.",
+    request_body = SignInBody,
+    responses(
+        (status = 200, description = "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)", body = NextStep),
+        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 401, description = "Wrong email or password: `invalid_credentials`", body = ErrorEnvelope),
+        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn sign_in(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignInBody>) -> Response {
     let start = Instant::now();
     let answer = sign_in_inner(&s, &headers, b).await;
     pad(start, s.config.min_response).await;
@@ -224,14 +309,14 @@ async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Resp
     if !allowed(s, &[(format!("sign-in:ip:{ip}"), 10, MINUTE)])
         || s.limiter.over(&email_key, 5, MINUTE)
     {
-        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     let refused = || {
         s.limiter.hit(&email_key, MINUTE);
-        error(StatusCode::UNAUTHORIZED, BAD_CREDENTIALS)
+        error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS)
     };
     if !is_auth_request_id(&b.auth_request) {
-        return error(StatusCode::GONE, GONE);
+        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
         return pending_sign_in_error(e);
@@ -261,7 +346,7 @@ async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Resp
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SignUpBody {
     auth_request: String,
@@ -271,7 +356,26 @@ struct SignUpBody {
     family_name: String,
 }
 
-async fn sign_up(State(s): S, headers: HeaderMap, Json(b): Json<SignUpBody>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/auth/v1/sign-up",
+    operation_id = "signUp",
+    tag = "login",
+    description = "Creates an account. Sets the HttpOnly session cookie when email verification is off, otherwise the HttpOnly step cookie that the code step reads.",
+    request_body = SignUpBody,
+    responses(
+        (status = 200, description = "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)", body = NextStep),
+        (status = 400, description = "The body is malformed (`invalid_request`) or the password is too weak (`weak_password`)", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 409, description = "An account with this email exists (`email_taken`); only when email verification is off", body = ErrorEnvelope),
+        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn sign_up(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignUpBody>) -> Response {
     let start = Instant::now();
     let answer = sign_up_inner(&s, &headers, b).await;
     pad(start, s.config.min_response + SIGN_UP_EXTRA).await;
@@ -288,13 +392,13 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
             (format!("sign-up:email:{}", email_tag(&email)), 5, HOUR),
         ],
     ) {
-        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     if !is_auth_request_id(&b.auth_request) {
-        return error(StatusCode::GONE, GONE);
+        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
     if !strong_password(&b.password) {
-        return error(StatusCode::BAD_REQUEST, WEAK_PASSWORD);
+        return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
         return pending_sign_in_error(e);
@@ -320,7 +424,7 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         Ok(id) => id,
         Err(ZError::Rejected { status: 409, .. }) => return taken(s, &email, b.auth_request),
         Err(ZError::Rejected { status: 400, .. }) => {
-            return error(StatusCode::BAD_REQUEST, WEAK_PASSWORD);
+            return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
         }
         Err(e) => return unavailable(&e),
     };
@@ -340,7 +444,7 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
 fn taken(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
     if s.config.skip_email_verification {
         info!(email = %email_tag(email), "sign-up for a taken email");
-        return error(StatusCode::CONFLICT, ACCOUNT_EXISTS);
+        return error(StatusCode::CONFLICT, ErrorCode::EmailTaken, ACCOUNT_EXISTS);
     }
     decoy(s, email, auth_request)
 }
@@ -362,7 +466,7 @@ fn decoy(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
     };
     reply(
         StatusCode::OK,
-        json!({"next": "verify"}),
+        next_step(&NextStep::Verify),
         vec![login_cookie(s, &decoy)],
     )
 }
@@ -395,12 +499,30 @@ fn current_login(s: &AppState, headers: &HeaderMap) -> Option<LoginState> {
         .and_then(|raw| open_login(&s.config.cookie_key, raw, now_secs()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct CodeBody {
     code: String,
 }
 
-async fn verify_email(State(s): S, headers: HeaderMap, Json(b): Json<CodeBody>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/auth/v1/verify-email",
+    operation_id = "verifyEmail",
+    tag = "login",
+    description = "Checks the emailed code. Reads the HttpOnly step cookie; on success sets the HttpOnly session cookie and clears the step cookie.",
+    request_body = CodeBody,
+    responses(
+        (status = 200, description = "Email verified and signed in: `next` is `done`, the session cookie is set and the step cookie cleared", body = SignedIn),
+        (status = 400, description = "The body is malformed (`invalid_request`) or the code is wrong (`invalid_code`)", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn verify_email(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<CodeBody>) -> Response {
     let start = Instant::now();
     let answer = verify_email_inner(&s, &headers, b).await;
     pad(start, s.config.min_response).await;
@@ -414,11 +536,11 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
         checks.push((format!("verify:step:{}", step_key(st)), 10, HOUR));
     }
     if !allowed(s, &checks) {
-        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     // No (or an expired) step cookie: the sign-in is over, whatever the code.
     let Some(state) = state else {
-        return error(StatusCode::GONE, GONE);
+        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     };
     let (Some(user_id), Some(session_id), Some(session_token), false) = (
         state.user_id,
@@ -426,7 +548,7 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
         state.session_token,
         state.decoy,
     ) else {
-        return error(StatusCode::BAD_REQUEST, BAD_CODE);
+        return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE);
     };
     match s.zitadel.verify_email(&user_id, b.code.trim()).await {
         Ok(()) => {
@@ -440,15 +562,31 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
             )
             .await
         }
-        Err(ZError::Rejected { .. }) => error(StatusCode::BAD_REQUEST, BAD_CODE),
+        Err(ZError::Rejected { .. }) => error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE),
         Err(e) => unavailable(&e),
     }
 }
 
-#[derive(Deserialize)]
-struct Empty {}
+#[derive(Deserialize, ToSchema)]
+struct EmptyRequest {}
 
-async fn resend_code(State(s): S, headers: HeaderMap, Json(_): Json<Empty>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/auth/v1/resend-code",
+    operation_id = "resendCode",
+    tag = "login",
+    description = "Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent.",
+    request_body = EmptyRequest,
+    responses(
+        (status = 200, description = "Done", body = EmptyResponse),
+        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+    ),
+)]
+async fn resend_code(State(s): S, headers: HeaderMap, ApiJson(_): ApiJson<EmptyRequest>) -> Response {
     let start = Instant::now();
     let answer = resend_code_inner(&s, &headers).await;
     pad(start, s.config.min_response).await;
@@ -462,22 +600,38 @@ async fn resend_code_inner(s: &AppState, headers: &HeaderMap) -> Response {
         checks.push((format!("resend:step:{}", step_key(st)), 5, HOUR));
     }
     if !allowed(s, &checks) {
-        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     if let Some(user) = state.and_then(|st| st.user_id)
         && let Err(e) = s.zitadel.resend_code(&user, &verify_template(s)).await
     {
         warn!(error = %e, "resending the verification code failed");
     }
-    reply(StatusCode::OK, json!({}), Vec::new())
+    reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct EmailBody {
     email: String,
 }
 
-async fn password_reset(State(s): S, headers: HeaderMap, Json(b): Json<EmailBody>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/auth/v1/password-reset",
+    operation_id = "requestPasswordReset",
+    tag = "login",
+    description = "Emails a password-reset link if the account exists. Always answers the same, whether or not it does.",
+    request_body = EmailBody,
+    responses(
+        (status = 200, description = "Done", body = EmptyResponse),
+        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+    ),
+)]
+async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<EmailBody>) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(&headers);
     if !allowed(
@@ -487,10 +641,10 @@ async fn password_reset(State(s): S, headers: HeaderMap, Json(b): Json<EmailBody
             (format!("reset:email:{}", email_tag(&email)), 5, HOUR),
         ],
     ) {
-        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     spawn_reset_email(&s, email);
-    reply(StatusCode::OK, json!({}), Vec::new())
+    reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
 }
 
 /// Send a reset link to `email`'s account, if it has one, in the background, so the answer
@@ -518,7 +672,7 @@ fn spawn_reset_email(s: &Arc<AppState>, email: String) {
     });
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct ConfirmBody {
     user_id: String,
@@ -526,10 +680,27 @@ struct ConfirmBody {
     password: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/auth/v1/password-reset/confirm",
+    operation_id = "confirmPasswordReset",
+    tag = "login",
+    description = "Sets a new password with the code from the reset email.",
+    request_body = ConfirmBody,
+    responses(
+        (status = 200, description = "Done", body = EmptyResponse),
+        (status = 400, description = "The body is malformed (`invalid_request`), the password is too weak (`weak_password`) or the code is wrong (`invalid_code`)", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
 async fn password_reset_confirm(
     State(s): S,
     headers: HeaderMap,
-    Json(b): Json<ConfirmBody>,
+    ApiJson(b): ApiJson<ConfirmBody>,
 ) -> Response {
     let start = Instant::now();
     let answer = confirm_inner(&s, &headers, b).await;
@@ -544,27 +715,42 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
         checks.push((format!("confirm:user:{user_id}"), 10, HOUR));
     }
     if !allowed(s, &checks) {
-        return error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     // Checked before Zitadel sees the user id, so this answer can't tell ids apart.
     if !strong_password(&b.password) {
-        return error(StatusCode::BAD_REQUEST, WEAK_PASSWORD);
+        return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
     if !is_user_id(user_id) {
-        return error(StatusCode::BAD_REQUEST, BAD_CODE);
+        return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE);
     }
     match s
         .zitadel
         .set_password(user_id, b.code.trim(), &b.password)
         .await
     {
-        Ok(()) => reply(StatusCode::OK, json!({}), Vec::new()),
-        Err(ZError::Rejected { .. }) => error(StatusCode::BAD_REQUEST, BAD_CODE),
+        Ok(()) => reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new()),
+        Err(ZError::Rejected { .. }) => error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE),
         Err(e) => unavailable(&e),
     }
 }
 
-async fn logout(State(s): S, headers: HeaderMap, Json(_): Json<Empty>) -> Response {
+#[utoipa::path(
+    post,
+    path = "/auth/v1/logout",
+    operation_id = "logout",
+    tag = "login",
+    description = "Ends the session and clears the HttpOnly session and step cookies.",
+    request_body = EmptyRequest,
+    responses(
+        (status = 200, description = "Done", body = EmptyResponse),
+        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+    ),
+)]
+async fn logout(State(s): S, headers: HeaderMap, ApiJson(_): ApiJson<EmptyRequest>) -> Response {
     if let Some(kept) = read_cookie(&headers, SESSION_COOKIE)
         .and_then(|raw| open_session(&s.config.cookie_key, raw, now_secs()))
         && let Err(e) = s
@@ -580,7 +766,7 @@ async fn logout(State(s): S, headers: HeaderMap, Json(_): Json<Empty>) -> Respon
     let secure = s.config.secure_cookies;
     reply(
         StatusCode::OK,
-        json!({}),
+        json!(EmptyResponse {}),
         vec![
             clear_cookie(LOGIN_COOKIE, secure),
             clear_cookie(SESSION_COOKIE, secure),

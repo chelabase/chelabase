@@ -340,9 +340,26 @@ sweep-dbs:
 
 # --- Checks ---
 
+# Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
+api-gen:
+    CHELADB_BLESS=1 cargo test -p orchestrator -p auth document_is_current
+    pnpm --filter @cheladb/management-client generate
+    pnpm --filter @cheladb/studio generate:login
+    just scalar-sync
+
+# Copy the pnpm-installed Scalar bundle to the orchestrator's assets (pnpm is the single source of the version)
+scalar-sync:
+    scripts/scalar.sh sync
+
 check:
     cargo check --workspace
-    pnpm --filter @cheladb/types typecheck
+    cargo test -p orchestrator -p auth openapi::tests
+    pnpm --filter @cheladb/management-client generate
+    pnpm --filter @cheladb/studio generate:login
+    test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
+    scripts/scalar.sh check
+    pnpm --filter @cheladb/management-client typecheck
+    pnpm --filter @cheladb/management-client test
     pnpm --filter @cheladb/studio typecheck
     pnpm --filter @cheladb/studio test
     pnpm --filter @cheladb/client typecheck

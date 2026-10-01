@@ -93,6 +93,10 @@ impl Harness {
     }
 }
 
+fn err(code: &str, message: &str) -> Value {
+    json!({"error": {"code": code, "message": message}})
+}
+
 fn signin(ar: &str, email: &str, pw: &str) -> Value {
     json!({"authRequest": ar, "email": email, "password": pw})
 }
@@ -125,7 +129,7 @@ async fn auth_request_says_whether_to_show_sign_up() {
         .await;
     assert_eq!(
         (gone.status, gone.body),
-        (StatusCode::GONE, json!({"error": messages::GONE}))
+        (StatusCode::GONE, err("sign_in_expired", messages::GONE))
     );
 }
 
@@ -182,7 +186,7 @@ async fn unknown_user_wrong_password_and_locked_give_identical_401s() {
     assert!(
         bodies
             .iter()
-            .all(|b| *b == format!(r#"{{"error":"{}"}}"#, messages::BAD_CREDENTIALS)),
+            .all(|b| *b == serde_json::to_string(&err("invalid_credentials", messages::BAD_CREDENTIALS)).unwrap()),
         "{bodies:?}"
     );
 }
@@ -251,7 +255,7 @@ async fn sign_up_then_verify_finishes() {
         (bad.status, bad.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::BAD_CODE})
+            err("invalid_code", messages::BAD_CODE)
         )
     );
     let done = h
@@ -312,7 +316,7 @@ async fn a_taken_email_looks_the_same_and_its_code_never_works() {
         (a.status, a.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::BAD_CODE})
+            err("invalid_code", messages::BAD_CODE)
         )
     );
 }
@@ -332,7 +336,7 @@ async fn a_weak_password_at_sign_up_says_so() {
         (a.status, a.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::WEAK_PASSWORD})
+            err("weak_password", messages::WEAK_PASSWORD)
         )
     );
 }
@@ -406,7 +410,7 @@ async fn the_sixth_sign_in_per_email_per_minute_is_refused_even_from_new_ips() {
         (a.status, a.body),
         (
             StatusCode::TOO_MANY_REQUESTS,
-            json!({"error": messages::TOO_MANY})
+            err("rate_limited", messages::TOO_MANY)
         )
     );
 }
@@ -461,7 +465,7 @@ async fn zitadel_down_is_503_and_an_expired_sign_in_is_410() {
         .await;
     assert_eq!(
         (a.status, a.body),
-        (StatusCode::GONE, json!({"error": messages::GONE}))
+        (StatusCode::GONE, err("sign_in_expired", messages::GONE))
     );
     h.mock.set_down(true);
     let a = h
@@ -476,7 +480,7 @@ async fn zitadel_down_is_503_and_an_expired_sign_in_is_410() {
         (a.status, a.body),
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": messages::UNAVAILABLE})
+            err("unavailable", messages::UNAVAILABLE)
         )
     );
 }
@@ -493,6 +497,8 @@ async fn a_non_json_request_is_refused() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
 }
 
 #[tokio::test]
@@ -546,7 +552,7 @@ async fn confirm_sets_the_new_password() {
         (bad.status, bad.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::BAD_CODE})
+            err("invalid_code", messages::BAD_CODE)
         )
     );
     let ok = h
@@ -581,7 +587,7 @@ async fn confirm_with_a_weak_password_says_so() {
         (a.status, a.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::WEAK_PASSWORD})
+            err("weak_password", messages::WEAK_PASSWORD)
         )
     );
 }
@@ -665,7 +671,7 @@ async fn ids_that_are_not_zitadel_ids_never_reach_zitadel() {
         .await;
     assert_eq!(
         (probe.status, probe.body),
-        (StatusCode::GONE, json!({"error": messages::GONE}))
+        (StatusCode::GONE, err("sign_in_expired", messages::GONE))
     );
     let sign_in = h
         .post(
@@ -681,7 +687,7 @@ async fn ids_that_are_not_zitadel_ids_never_reach_zitadel() {
         (confirm.status, confirm.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::BAD_CODE})
+            err("invalid_code", messages::BAD_CODE)
         )
     );
     assert_eq!(
@@ -812,6 +818,7 @@ async fn oversized_bodies_are_refused() {
         )
         .await;
     assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(a.body["error"]["code"], "too_large");
 }
 
 // I4: an email that already has an account never gets a second one.
@@ -855,7 +862,7 @@ async fn a_weak_password_is_refused_before_the_user_is_looked_up() {
         (a.status, a.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::WEAK_PASSWORD})
+            err("weak_password", messages::WEAK_PASSWORD)
         )
     );
     let b = h
@@ -874,7 +881,7 @@ async fn a_weak_password_is_refused_before_the_user_is_looked_up() {
         (b.status, b.body),
         (
             StatusCode::BAD_REQUEST,
-            json!({"error": messages::WEAK_PASSWORD})
+            err("weak_password", messages::WEAK_PASSWORD)
         )
     );
 }
@@ -925,7 +932,7 @@ async fn a_taken_email_without_verification_says_it_exists() {
         (a.status, a.body),
         (
             StatusCode::CONFLICT,
-            json!({"error": messages::ACCOUNT_EXISTS})
+            err("email_taken", messages::ACCOUNT_EXISTS)
         )
     );
     assert!(a.cookies.is_empty());
@@ -952,7 +959,7 @@ async fn verify_without_a_step_cookie_is_gone() {
         .await;
     assert_eq!(
         (a.status, a.body),
-        (StatusCode::GONE, json!({"error": messages::GONE}))
+        (StatusCode::GONE, err("sign_in_expired", messages::GONE))
     );
 }
 

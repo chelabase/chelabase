@@ -240,27 +240,27 @@ pub fn quarantined(output: &str) -> Option<&str> {
 }
 
 /// Roles a secret key's role must not be a member of, at any depth (besides superusers):
-/// they reach the compute itself or the platform's machinery.
-const PLATFORM_ROLES: &str = "'cheladb_admin', 'pg_execute_server_program', \
+/// they reach the compute itself or Cheladb's own machinery.
+const SYSTEM_ROLES: &str = "'cheladb_admin', 'pg_execute_server_program', \
      'pg_read_server_files', 'pg_write_server_files'";
 
 /// One row for an existing role: `superuser`, `neon_superuser` (a member, at any depth),
-/// `platform` (a member of a superuser role or of [`PLATFORM_ROLES`]) or `ok`. No row when it
-/// doesn't exist. Membership goes by oid over `pg_roles`, so a platform role missing from the
+/// `system` (a member of a superuser role or of [`SYSTEM_ROLES`]) or `ok`. No row when it
+/// doesn't exist. Membership goes by oid over `pg_roles`, so a system role missing from the
 /// image matches nothing instead of failing.
 fn role_check_sql(role: &str) -> String {
     format!(
         "SET search_path = pg_catalog, pg_temp; SELECT CASE WHEN r.rolsuper THEN 'superuser' \
          WHEN EXISTS (SELECT FROM pg_roles s WHERE s.rolname = 'neon_superuser' \
          AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'neon_superuser' \
-         WHEN EXISTS (SELECT FROM pg_roles s WHERE (s.rolsuper OR s.rolname IN ({PLATFORM_ROLES})) \
-         AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'platform' \
+         WHEN EXISTS (SELECT FROM pg_roles s WHERE (s.rolsuper OR s.rolname IN ({SYSTEM_ROLES})) \
+         AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'system' \
          ELSE 'ok' END FROM pg_roles r WHERE r.rolname = {};",
         quote_literal(role)
     )
 }
 
-/// Roles the platform owns; never a secret key's.
+/// Roles Cheladb owns; never a secret key's.
 const RESERVED_ROLES: [&str; 2] = [AUTHENTICATOR, "cheladb_admin"];
 
 /// What [`Worker::check_data_role`] found.
@@ -308,7 +308,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, database_name, &data_api_sql(OWNER_ROLE, &password))
             .await?;
         if let Some(aside) = quarantined(&output) {
-            warn!(branch_id = %branch, %ep, "a cheladb schema the platform didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
+            warn!(branch_id = %branch, %ep, "a cheladb schema Cheladb didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
         }
         self.regrant_secret_key_roles(branch, ep, database_name)
             .await?;
@@ -476,7 +476,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Whether `role` may back a secret key on `branch`: a valid name, not reserved or
     /// built-in (`pg_*`), existing, not a superuser, and not a member (at any depth) of a
-    /// superuser role, `neon_superuser` or the other platform roles. On success it's granted
+    /// superuser role, `neon_superuser` or the other system roles. On success it's granted
     /// to `authenticator` (`set_config('role', …)` needs the membership).
     pub async fn check_data_role(&self, branch: BranchId, role: &str) -> RoleCheck {
         if let Some(refusal) = refuse_by_name(role) {
@@ -537,7 +537,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             "" => return refused("does not exist"),
             "superuser" => return refused("is a superuser"),
             "neon_superuser" => return refused("is a member of neon_superuser"),
-            "platform" => return refused("has platform privileges"),
+            "system" => return refused("has system privileges"),
             other => {
                 warn!(branch_id = %branch, "checking role {role}: unexpected answer {other:?}");
                 return RoleCheck::Failed(format!(
@@ -1301,8 +1301,8 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             ),
             (
                 "shell",
-                "platform\n",
-                "the role shell has platform privileges",
+                "system\n",
+                "the role shell has system privileges",
             ),
         ];
         for (role, stdout, message) in cases {
@@ -1329,7 +1329,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     }
 
     #[test]
-    fn the_check_sql_covers_every_platform_role_by_oid() {
+    fn the_check_sql_covers_every_system_role_by_oid() {
         let sql = role_check_sql("app");
         assert!(
             sql.contains("FROM pg_roles r WHERE r.rolname = 'app'"),
@@ -1341,7 +1341,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             !sql.contains("pg_has_role(r.oid, 'neon_superuser'"),
             "{sql}"
         );
-        for platform in [
+        for system in [
             "s.rolsuper",
             "'neon_superuser'",
             "'cheladb_admin'",
@@ -1349,7 +1349,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             "'pg_read_server_files'",
             "'pg_write_server_files'",
         ] {
-            assert!(sql.contains(platform), "{platform} in {sql}");
+            assert!(sql.contains(system), "{system} in {sql}");
         }
         assert!(sql.contains("WHEN r.rolsuper THEN 'superuser'"), "{sql}");
     }

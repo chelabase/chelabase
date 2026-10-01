@@ -1,8 +1,0 @@
-language: "typescript"
-
-tasks:
-  typecheck:
-    command: "pnpm"
-    args: ["typecheck"]
-    options:
-      envFile: false

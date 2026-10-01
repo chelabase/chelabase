@@ -1,10 +1,11 @@
-import { render, screen, within } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import type { Branch as BranchSummary } from "@cheladb/management-client";
+// The actions in each row (DatabaseActions, the branch mutations) need a QueryClient.
+import { renderWithQuery } from "@/test/render";
+import { BranchTree } from "./branch-tree";
 
 const rowOf = (name: string) => document.querySelector(`tr[data-branch="${name}"]`) as HTMLElement;
-import { describe, expect, it } from "vitest";
-import type { BranchSummary } from "@cheladb/types";
-import { fakeApi } from "@/test/fake-api";
-import { BranchTree } from "./branch-tree";
 
 const base = {
   kind: "normal" as const,
@@ -17,7 +18,7 @@ const base = {
 };
 const main: BranchSummary = {
   ...base,
-  id: "m" as never,
+  id: "m",
   name: "main",
   parent_branch_id: null,
   host: "ep-aaaaaaaaaaaa.localtest.me",
@@ -25,7 +26,7 @@ const main: BranchSummary = {
 };
 const dev: BranchSummary = {
   ...base,
-  id: "d" as never,
+  id: "d",
   name: "dev",
   parent_branch_id: main.id,
   host: "ep-bbbbbbbbbbbb.localtest.me",
@@ -33,10 +34,10 @@ const dev: BranchSummary = {
   branched_at_lsn: "0/16B3748",
   created_at: "2026-09-30T10:01:00Z",
 };
-const feat: BranchSummary = { ...dev, id: "f" as never, name: "feat", parent_branch_id: dev.id, branched_at_time: null, created_at: "2026-09-30T10:02:00Z" };
+const feat: BranchSummary = { ...dev, id: "f", name: "feat", parent_branch_id: dev.id, branched_at_time: null, created_at: "2026-09-30T10:02:00Z" };
 const backup: BranchSummary = {
   ...base,
-  id: "b" as never,
+  id: "b",
   name: "main-before-restore-20260930T101000Z",
   kind: "backup",
   parent_branch_id: main.id,
@@ -46,15 +47,8 @@ const backup: BranchSummary = {
 };
 
 function renderTree(branches: BranchSummary[]) {
-  return render(
-    <BranchTree
-      api={fakeApi()}
-      databaseId="db"
-      databaseName="web1"
-      branches={branches}
-      historyWindow={604800}
-      onChanged={() => {}}
-    />,
+  return renderWithQuery(
+    <BranchTree databaseId="db" databaseName="web1" branches={branches} historyWindow={604800} />,
   );
 }
 

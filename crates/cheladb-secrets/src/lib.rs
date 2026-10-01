@@ -3,7 +3,7 @@
 //! AES-256-GCM with a random 96-bit nonce. The database id is authenticated
 //! associated data, so a ciphertext only opens for the row it was made for.
 //! Stored as `v1:` + base64(nonce ‖ ciphertext). Database credentials bind
-//! their purpose (owner vs platform) too, so the two can't be swapped.
+//! their purpose (owner vs authenticator) too, so the two can't be swapped.
 
 use aes_gcm::aead::{Aead, Generate, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};

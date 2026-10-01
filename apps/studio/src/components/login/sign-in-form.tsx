@@ -1,11 +1,19 @@
+import { ApiError } from "@cheladb/management-client";
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
-import { LoginApiError, type LoginApi, type LoginNext } from "@/lib/login-api";
+import { useGetAuthRequest, useSignIn } from "@/lib/login-client/generated/endpoints";
+import type { NextStep, SignedIn } from "@/lib/login-client/generated/model";
 
 export const EXPIRED = "This sign-in has expired, start again";
+const UNAVAILABLE = "Sign-in is unavailable, try again";
+
+/**
+ * Options for mutations whose variables hold a password: dropped from the
+ * mutation cache as soon as nothing observes them (pair with `reset()`).
+ */
+export const SECRET = { mutation: { gcTime: 0 } };
 
 export interface FormProps {
-  api: LoginApi;
   authRequest?: string;
   initialCode?: string;
   go: (url: string) => void;
@@ -17,11 +25,26 @@ export interface FormProps {
   notice?: string;
 }
 
+/** Codes for "auth or the way to it is down": the gateway's or the client's wording, not auth's. */
+const UNAVAILABLE_CODES: ReadonlySet<string> = new Set(["network", "unavailable", "timeout", "internal"]);
+
 export function messageOf(err: unknown): string {
-  return err instanceof LoginApiError ? err.message : "Sign-in is unavailable, try again";
+  return err instanceof ApiError && !UNAVAILABLE_CODES.has(err.code) ? err.message : UNAVAILABLE;
 }
 
-export function follow(next: LoginNext, go: (url: string) => void, toVerify: () => void) {
+/** What a failed login call shows: auth's message, plus a restart link when the sign-in is over. */
+export interface LoginProblem {
+  message: string;
+  restart: boolean;
+}
+
+export const EXPIRED_PROBLEM: LoginProblem = { message: EXPIRED, restart: true };
+
+export function problemOf(err: unknown): LoginProblem {
+  return { message: messageOf(err), restart: err instanceof ApiError && err.code === "sign_in_expired" };
+}
+
+export function follow(next: NextStep | SignedIn, go: (url: string) => void, toVerify: () => void) {
   if (next.next === "done") go(next.redirect);
   else toVerify();
 }
@@ -60,19 +83,21 @@ export function Problem({ message, restart }: { message: string; restart?: boole
   );
 }
 
-export function SignInForm({ api, authRequest = "", go, toVerify, toRegister, notice }: FormProps) {
+export function SignInForm({ authRequest = "", go, toVerify, toRegister, notice }: FormProps) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(authRequest ? null : EXPIRED);
+  const [error, setError] = useState<LoginProblem | null>(authRequest ? null : EXPIRED_PROBLEM);
+  const { mutate: lookUp } = useGetAuthRequest();
+  const signIn = useSignIn(SECRET);
 
   useEffect(() => {
     if (!authRequest) return;
-    api.authRequest(authRequest).then(
-      ({ signUp }) => { if (signUp && !notice) toRegister?.(); },
-      (err) => setError(messageOf(err)),
-    );
-  }, [api, authRequest, toRegister, notice]);
+    lookUp({ data: { authRequest } }, {
+      onSuccess: ({ signUp }) => { if (signUp && !notice) toRegister?.(); },
+      onError: (err) => setError(problemOf(err)),
+    });
+  }, [lookUp, authRequest, toRegister, notice]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -80,10 +105,12 @@ export function SignInForm({ api, authRequest = "", go, toVerify, toRegister, no
     setBusy(true);
     setError(null);
     try {
-      follow(await api.signIn({ authRequest, email, password }), go, toVerify);
+      follow(await signIn.mutateAsync({ data: { authRequest, email, password } }), go, toVerify);
     } catch (err) {
-      setError(messageOf(err));
+      setError(problemOf(err));
       setBusy(false);
+    } finally {
+      signIn.reset();
     }
   }
 
@@ -93,7 +120,7 @@ export function SignInForm({ api, authRequest = "", go, toVerify, toRegister, no
       <form onSubmit={submit} className="space-y-4">
         <Field label="Email" type="email" value={email} onChange={setEmail} autoComplete="username" />
         <Field label="Password" type="password" value={password} onChange={setPassword} autoComplete="current-password" />
-        {error && <Problem message={error} restart={error === EXPIRED} />}
+        {error && <Problem message={error.message} restart={error.restart} />}
         <Button type="submit" disabled={busy || !authRequest} className="w-full">Sign in</Button>
       </form>
       <p className="text-sm text-muted-foreground">

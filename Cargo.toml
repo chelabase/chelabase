@@ -32,6 +32,8 @@ cheladb-secrets = { path = "crates/cheladb-secrets" }
 cheladb-neon = { path = "crates/cheladb-neon" }
 
 axum = "0.8.9"
+utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }
+utoipa-axum = "0.3.0"
 tokio = { version = "1.53.1", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors"] }
 tracing = "0.1.44"

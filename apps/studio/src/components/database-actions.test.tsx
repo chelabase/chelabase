@@ -1,13 +1,13 @@
-import { render, screen } from "@testing-library/react";
+import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ConnectionDetails, DatabaseSummary } from "@cheladb/types";
-import { ApiError, type ApiClient } from "@/lib/api";
-import { fakeApi } from "@/test/fake-api";
+import { getGetMeQueryKey, type ConnectionDetails, type DatabaseSummary } from "@cheladb/management-client";
+import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
+import { renderWithQuery } from "@/test/render";
 import { DatabaseActions } from "./database-actions";
 
 const ready: DatabaseSummary = {
-  database_id: "d1" as never,
+  database_id: "d1",
   name: "web1",
   status: "ready",
   host: "127.0.0.1",
@@ -29,18 +29,29 @@ const details = (password: string): ConnectionDetails => ({
   http_url: HTTP_URL,
 });
 
-function setup(api: Partial<ApiClient>, database: DatabaseSummary = ready) {
-  const onChanged = vi.fn();
-  const full: ApiClient = fakeApi(api);
-  render(<DatabaseActions api={full} database={database} onChanged={onChanged} />);
-  return { api: full, onChanged };
+const CONNECTION = "GET /v1/databases/d1/connection";
+const RESET = "POST /v1/databases/d1/reset-password";
+const DELETE = "DELETE /v1/databases/d1";
+
+const connection = (password: string) => () => jsonResponse(details(password));
+const fail = (status: number, code: string, message: string) => () =>
+  jsonResponse({ error: { code, message } }, status);
+/** The orchestrator's 503 when a reset stored the new password but couldn't apply it yet. */
+const notApplied = fail(503, "not_applied", "the password was changed but not yet applied; it will be retried");
+
+function setup(routes: Record<string, FakeHandler>, database: DatabaseSummary = ready) {
+  const f = fakeFetch(routes);
+  const result = renderWithQuery(<DatabaseActions database={database} />, { fetch: f });
+  return { ...result, fetch: f };
 }
+const count = (f: FakeFetch, key: string) =>
+  f.calls.filter((r) => `${r.method} ${new URL(r.url).pathname}` === key).length;
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("DatabaseActions", () => {
   it("reveals details with the password masked until asked", async () => {
-    setup({ getConnection: vi.fn().mockResolvedValue(details("s3cret")) });
+    setup({ [CONNECTION]: connection("s3cret") });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
 
     expect(await screen.findByText("postgres")).toBeInTheDocument();
@@ -56,14 +67,14 @@ describe("DatabaseActions", () => {
   it("copies the connection URI", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    setup({ getConnection: vi.fn().mockResolvedValue(details("s3cret")) });
+    setup({ [CONNECTION]: connection("s3cret") });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     await userEvent.click(await screen.findByRole("button", { name: "Copy URI" }));
     expect(writeText).toHaveBeenCalledWith(uriFor("s3cret"));
   });
 
   it("shows_the_http_url_without_the_password", async () => {
-    setup({ getConnection: vi.fn().mockResolvedValue(details("s3cret")) });
+    setup({ [CONNECTION]: connection("s3cret") });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     expect(await screen.findByText(HTTP_URL)).toBeInTheDocument();
     expect(screen.getByText("HTTP URL")).toBeInTheDocument();
@@ -74,14 +85,14 @@ describe("DatabaseActions", () => {
   it("copies_the_http_url", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    setup({ getConnection: vi.fn().mockResolvedValue(details("s3cret")) });
+    setup({ [CONNECTION]: connection("s3cret") });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     await userEvent.click(await screen.findByRole("button", { name: "Copy HTTP URL" }));
     expect(writeText).toHaveBeenCalledWith(HTTP_URL);
   });
 
   it("shows_the_local_dev_note", async () => {
-    setup({ getConnection: vi.fn().mockResolvedValue(details("s3cret")) });
+    setup({ [CONNECTION]: connection("s3cret") });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     const note = await screen.findByText(/Local dev: pass the proxy's CA with/);
     expect(note).toHaveTextContent(
@@ -90,8 +101,7 @@ describe("DatabaseActions", () => {
   });
 
   it("forgets revealed details when the panel is closed", async () => {
-    const getConnection = vi.fn().mockResolvedValue(details("s3cret"));
-    setup({ getConnection });
+    const { fetch } = setup({ [CONNECTION]: connection("s3cret") });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     await userEvent.click(await screen.findByRole("button", { name: "Show password" }));
     expect(screen.getByText("s3cret")).toBeInTheDocument();
@@ -103,13 +113,13 @@ describe("DatabaseActions", () => {
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     expect(await screen.findByRole("button", { name: "Show password" })).toBeInTheDocument();
     expect(screen.queryByText("s3cret")).toBeNull();
-    expect(getConnection).toHaveBeenCalledTimes(2);
+    expect(count(fetch, CONNECTION)).toBe(2);
   });
 
   it("has a copy button for every field", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    setup({ getConnection: vi.fn().mockResolvedValue(details("s3cret")) });
+    setup({ [CONNECTION]: connection("s3cret") });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     for (const [field, value] of [
       ["host", EP],
@@ -131,40 +141,34 @@ describe("DatabaseActions", () => {
   });
 
   it("resets the password after confirmation and shows the new details", async () => {
-    const resetPassword = vi.fn().mockResolvedValue(undefined);
-    const getConnection = vi.fn().mockResolvedValue(details("n3w"));
-    setup({ resetPassword, getConnection });
+    const { fetch } = setup({ [RESET]: () => jsonResponse({}), [CONNECTION]: connection("n3w") });
 
     await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
-    expect(resetPassword).not.toHaveBeenCalled();
+    expect(count(fetch, RESET)).toBe(0);
     await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
 
-    expect(resetPassword).toHaveBeenCalledWith("d1");
+    expect(count(fetch, RESET)).toBe(1);
     expect(await screen.findByText(/password was reset/i)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Show password" }));
     expect(screen.getByText("n3w")).toBeInTheDocument();
   });
 
   it("shows a reset failure", async () => {
-    const resetPassword = vi.fn().mockRejectedValue(new ApiError(504, "worker did not respond; try again"));
-    setup({ resetPassword });
+    setup({ [RESET]: fail(504, "timeout", "worker did not respond; try again") });
     await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
     await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("worker did not respond");
   });
 
   it("shows one message and the stored password after a reset that isn't applied yet", async () => {
-    const pending = "the password was changed but not yet applied; it will be retried";
-    const resetPassword = vi.fn().mockRejectedValue(new ApiError(503, pending));
-    const getConnection = vi.fn().mockResolvedValue(details("n3w"));
-    setup({ resetPassword, getConnection });
+    const { fetch } = setup({ [RESET]: notApplied, [CONNECTION]: connection("n3w") });
 
     await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
     await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
 
     const notice = "The new password is stored but not yet applied; it will be retried.";
     expect(await screen.findByRole("status")).toHaveTextContent(notice);
-    expect(getConnection).toHaveBeenCalledWith("d1");
+    expect(count(fetch, CONNECTION)).toBe(1);
     // Not "reset" beside "not applied": one coherent message.
     expect(screen.queryByText(/password was reset/i)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
@@ -174,10 +178,7 @@ describe("DatabaseActions", () => {
   });
 
   it("keeps the not-applied message when the details can't be loaded", async () => {
-    const pending = "the password was changed but not yet applied; it will be retried";
-    const resetPassword = vi.fn().mockRejectedValue(new ApiError(503, pending));
-    const getConnection = vi.fn().mockRejectedValue(new ApiError(500, "boom"));
-    setup({ resetPassword, getConnection });
+    setup({ [RESET]: notApplied, [CONNECTION]: fail(500, "internal", "boom") });
 
     await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
     await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
@@ -188,18 +189,16 @@ describe("DatabaseActions", () => {
   });
 
   it("doesn't reveal after other reset failures", async () => {
-    const resetPassword = vi.fn().mockRejectedValue(new ApiError(503, "worker unavailable"));
-    const getConnection = vi.fn();
-    setup({ resetPassword, getConnection });
+    const { fetch } = setup({ [RESET]: fail(503, "worker_unavailable", "worker unavailable"), [CONNECTION]: connection("x") });
     await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
     await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("worker unavailable");
-    expect(getConnection).not.toHaveBeenCalled();
+    expect(count(fetch, CONNECTION)).toBe(0);
   });
 
   it("deletes only after the name is typed", async () => {
-    const deleteDatabase = vi.fn().mockResolvedValue(undefined);
-    const { onChanged } = setup({ deleteDatabase });
+    const { fetch, queryClient } = setup({ [DELETE]: () => jsonResponse({ status: "deleting" }, 202) });
+    queryClient.setQueryData(getGetMeQueryKey(), { user: { sub: "u", org_id: "o" }, tenant: null });
 
     await userEvent.click(screen.getByRole("button", { name: "Delete" }));
     const confirm = screen.getByRole("button", { name: "Delete permanently" });
@@ -211,7 +210,58 @@ describe("DatabaseActions", () => {
     expect(confirm).toBeEnabled();
 
     await userEvent.click(confirm);
-    expect(deleteDatabase).toHaveBeenCalledWith("d1");
-    expect(onChanged).toHaveBeenCalled();
+    await vi.waitFor(() => expect(queryClient.getQueryState(getGetMeQueryKey())?.isInvalidated).toBe(true));
+    expect(count(fetch, DELETE)).toBe(1);
+  });
+
+  it("reveal_is_never_cached", async () => {
+    const { queryClient } = setup({ [CONNECTION]: connection("s3cret") });
+    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
+    expect(await screen.findByRole("button", { name: "Show password" })).toBeInTheDocument();
+    const keys = queryClient.getQueryCache().findAll().map((q) => JSON.stringify(q.queryKey));
+    expect(keys.filter((k) => k.includes("connection"))).toEqual([]);
+    expect(JSON.stringify(queryClient.getQueryCache().findAll().map((q) => q.state.data))).not.toContain("s3cret");
+  });
+
+  it("reset_not_applied_switches_on_code", async () => {
+    // The code decides, not the wording: a reworded not_applied still gets the notice...
+    setup({ [RESET]: fail(503, "not_applied", "reworded by the server"), [CONNECTION]: connection("n3w") });
+    await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "The new password is stored but not yet applied; it will be retried.",
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("treats today's not-applied wording under another code as a failure", async () => {
+    const { fetch } = setup({
+      [RESET]: fail(503, "unavailable", "the password was changed but not yet applied; it will be retried"),
+      [CONNECTION]: connection("n3w"),
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("not yet applied");
+    expect(count(fetch, CONNECTION)).toBe(0);
+  });
+
+  it("reveals and resets a branch through the branch endpoints", async () => {
+    const f = fakeFetch({
+      "POST /v1/databases/d1/branches/b2/reset-password": () => jsonResponse({}),
+      "GET /v1/databases/d1/branches/b2/connection": connection("br4nch"),
+    });
+    const branch = {
+      id: "b2", name: "dev", parent_branch_id: "d1", kind: "normal", status: "ready", host: EP, port: 4432,
+      branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
+    } as const;
+    const { queryClient } = renderWithQuery(<DatabaseActions database={ready} branch={branch} />, { fetch: f });
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Reset password" }));
+    expect(screen.getByText(/Reset the password for dev\?/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Confirm reset" }));
+    expect(await screen.findByText(/password was reset/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(screen.getByText("br4nch")).toBeInTheDocument();
+    expect(queryClient.getQueryCache().findAll()).toHaveLength(0);
   });
 });

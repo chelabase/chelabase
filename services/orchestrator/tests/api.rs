@@ -28,6 +28,11 @@ type KeyRow = (DataKeyRecord, [u8; 32]);
 struct FakeMetadata {
     tenants_by_org: Arc<Mutex<HashMap<String, TenantId>>>,
     fail_insert: Arc<Mutex<bool>>,
+    /// Project ids that belong to another tenant / that do not exist, for `insert_database_pending`.
+    foreign_projects: Arc<Mutex<Vec<ProjectId>>>,
+    missing_projects: Arc<Mutex<Vec<ProjectId>>>,
+    /// The next `get_branch` fails with a database error.
+    fail_get_branch: Arc<Mutex<bool>>,
     databases: Arc<Mutex<HashMap<DatabaseId, DatabaseRecord>>>,
     branches: Arc<Mutex<HashMap<BranchId, BranchRecord>>>,
     overviews: Arc<Mutex<HashMap<TenantId, TenantOverview>>>,
@@ -205,10 +210,16 @@ impl MetadataPort for FakeMetadata {
     async fn insert_database_pending(
         &self,
         _database_id: DatabaseId,
-        _tenant_id: TenantId,
-        _project_id: ProjectId,
+        tenant_id: TenantId,
+        project_id: ProjectId,
         _name: &str,
     ) -> Result<(), MetadataError> {
+        if self.foreign_projects.lock().unwrap().contains(&project_id) {
+            return Err(MetadataError::ProjectTenantMismatch { project_id, tenant_id });
+        }
+        if self.missing_projects.lock().unwrap().contains(&project_id) {
+            return Err(MetadataError::ProjectNotFound(project_id));
+        }
         if *self.fail_insert.lock().unwrap() {
             return Err(MetadataError::DuplicateDatabaseName);
         }
@@ -234,6 +245,9 @@ impl MetadataPort for FakeMetadata {
     }
 
     async fn get_branch(&self, branch_id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        if std::mem::take(&mut *self.fail_get_branch.lock().unwrap()) {
+            return Err(MetadataError::Config("injected".into()));
+        }
         Ok(self.branches.lock().unwrap().get(&branch_id).cloned())
     }
 
@@ -589,6 +603,8 @@ struct FakeJobs {
     reset: Arc<Mutex<FakeReset>>,
     branch_jobs: Arc<Mutex<Vec<JobEnvelope<BranchJob>>>>,
     settings_jobs: Arc<Mutex<Vec<DatabaseId>>>,
+    /// Provision jobs can't be published.
+    fail_provision_publish: Arc<Mutex<bool>>,
     /// Branch jobs can't be published.
     fail_branch_publish: Arc<Mutex<bool>>,
     /// (branch, role) of each check-role request.
@@ -607,6 +623,9 @@ impl JobPort for FakeJobs {
         &self,
         job: &JobEnvelope<ProvisionDatabaseJob>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if *self.fail_provision_publish.lock().unwrap() {
+            return Err("nats is down".into());
+        }
         self.published.lock().unwrap().push(job.clone());
         Ok(())
     }
@@ -689,7 +708,7 @@ fn identity(org_id: &str) -> Identity {
     Identity {
         sub: "user-1".into(),
         org_id: org_id.into(),
-        auth: AuthMethod::PlatformJwt,
+        auth: AuthMethod::ManagementJwt,
         request_id: "test-rid".into(),
         data: None,
     }
@@ -760,12 +779,76 @@ async fn health_is_public() {
 }
 
 #[tokio::test]
+async fn openapi_json_route_serves_the_document() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let resp = reqwest::get(format!("{}/v1/openapi.json", app.base)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    assert_eq!(resp.headers()["cache-control"], "no-cache");
+    let served: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(served, serde_json::to_value(orchestrator::openapi()).unwrap());
+    let committed = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../openapi/management.json")).unwrap();
+    assert_eq!(served, serde_json::from_str::<serde_json::Value>(&committed).unwrap());
+}
+
+#[tokio::test]
+async fn docs_page_configures_scalar_offline() {
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let resp = reqwest::get(format!("{}/v1/docs", app.base)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("Cheladb Management API"), "{html}");
+    // The script URL carries the first 12 hex of the bundle's sha256 (from VERSION), so a
+    // Scalar upgrade is never served stale from the day-long cache.
+    let version = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/scalar/VERSION")).unwrap();
+    let sha = version.lines().nth(1).unwrap().strip_prefix("sha256 ").unwrap();
+    assert!(html.contains(&format!("src=\"/v1/docs/scalar.js?v={}\"", &sha[..12])), "{html}");
+    assert!(html.contains("url: \"/v1/openapi.json\""), "{html}");
+    assert!(html.contains("telemetry: false"), "{html}");
+    assert!(html.contains("withDefaultFonts: false"), "{html}");
+    assert!(html.contains("authentication: { preferredSecurityScheme: \"bearer\" }"), "{html}");
+    // Omitting these leaves Scalar's scalar.com defaults active, so they are set to "".
+    assert!(html.contains("proxyUrl: \"\""), "{html}");
+    assert!(html.contains("showDeveloperTools: \"never\""), "{html}");
+    assert!(html.contains("agent: { disabled: true }"), "{html}");
+    assert!(html.contains("mcp: { disabled: true }"), "{html}");
+    for key in ["dashboardUrl", "registryUrl", "proxyUrl", "apiBaseUrl"] {
+        assert!(html.contains(&format!("{key}: \"\"")), "{key} in {html}");
+    }
+    for host in ["cdn.jsdelivr.net", "scalar.com", "unpkg.com"] {
+        assert!(!html.contains(host), "{host} in {html}");
+    }
+}
+
+#[tokio::test]
+async fn scalar_bundle_matches_version_file() {
+    use sha2::{Digest, Sha256};
+    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
+    let resp = reqwest::get(format!("{}/v1/docs/scalar.js?v=abc", app.base)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/javascript; charset=utf-8");
+    assert_eq!(resp.headers()["cache-control"], "public, max-age=86400");
+    let bytes = resp.bytes().await.unwrap();
+    let version = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/scalar/VERSION")).unwrap();
+    let mut lines = version.lines();
+    assert!(lines.next().unwrap().starts_with("@scalar/api-reference "));
+    let expected = lines.next().unwrap().strip_prefix("sha256 ").unwrap();
+    assert_eq!(hex::encode(Sha256::digest(&bytes)), expected);
+    let missing = reqwest::get(format!("{}/v1/docs/nope.js", app.base)).await.unwrap();
+    assert_eq!(missing.status(), 404);
+    let body: serde_json::Value = missing.json().await.unwrap();
+    assert_eq!(code_of(&body), "not_found");
+}
+
+#[tokio::test]
 async fn missing_identity_is_401() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
     let resp = post_create(&app, None, create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("gateway"));
+    assert_eq!(code_of(&body), "unauthorized");
+    assert!(message_of(&body).contains("gateway"));
 }
 
 #[tokio::test]
@@ -821,13 +904,14 @@ async fn identity_from_untrusted_key_is_401() {
 }
 
 #[tokio::test]
-async fn unbound_org_is_403_with_bootstrap_hint() {
+async fn unbound_org_is_tenant_not_bound() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
     let token = app.token_for_org("org-not-bound");
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 403);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("zitadel-bootstrap"));
+    assert_eq!(code_of(&body), "tenant_not_bound");
+    assert!(message_of(&body).contains("zitadel-bootstrap"));
 }
 
 #[tokio::test]
@@ -952,7 +1036,7 @@ async fn get_database_own_tenant_is_200() {
 }
 
 #[tokio::test]
-async fn get_database_other_tenant_is_403_forbidden() {
+async fn other_tenants_database_is_404_like_a_missing_one() {
     let metadata = FakeMetadata::default();
     metadata.bind_org("org-1", TenantId::new());
     let record = sample_database(TenantId::new());
@@ -968,9 +1052,19 @@ async fn get_database_other_tenant_is_403_forbidden() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 404);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "forbidden");
+    assert_eq!(code_of(&body), "not_found");
+    // Byte for byte what a database that doesn't exist answers.
+    let missing = reqwest::Client::new()
+        .get(format!("{}/v1/databases/{}", app.base, uuid::Uuid::new_v4()))
+        .header(IDENTITY_HEADER, app.token_for_org("org-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let missing_body: serde_json::Value = missing.json().await.unwrap();
+    assert_eq!(body, missing_body);
 }
 
 #[tokio::test]
@@ -1201,7 +1295,7 @@ async fn reveal_with_a_different_secrets_key_explains_the_key_mismatch() {
     let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
     assert_eq!(resp.status(), 500);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("secrets key"), "{body}");
+    assert_eq!(code_of(&body), "credentials_unavailable");
 }
 
 #[tokio::test]
@@ -1217,7 +1311,7 @@ async fn reveal_without_an_endpoint_is_409() {
     let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
     assert_eq!(resp.status(), 409);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
+    assert_eq!(code_of(&body), "credentials_unavailable");
 }
 
 // /v1/me and GET show the proxy host and port when an endpoint is linked, nothing otherwise.
@@ -1329,7 +1423,7 @@ async fn reveal_and_reset_without_a_main_branch_are_409() {
         let resp = call(&app, method, &path, "org-1").await;
         assert_eq!(resp.status(), 409, "{path}");
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
+        assert_eq!(code_of(&body), "credentials_unavailable");
     }
     assert!(jobs.resets.lock().unwrap().is_empty());
 }
@@ -1362,11 +1456,11 @@ async fn reveal_without_stored_credentials_is_409_with_recreate_hint() {
     let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
     assert_eq!(resp.status(), 409);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
+    assert_eq!(code_of(&body), "credentials_unavailable");
 }
 
 #[tokio::test]
-async fn reveal_other_tenant_is_403() {
+async fn reveal_other_tenant_is_404() {
     let mut id = None;
     let app = lifecycle_app(FakeJobs::default(), |m, _t, k| {
         let db = ready_database(TenantId::new(), k);
@@ -1375,7 +1469,7 @@ async fn reveal_other_tenant_is_403() {
     })
     .await;
     let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]
@@ -1499,7 +1593,7 @@ async fn reset_without_an_endpoint_is_409() {
     let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
     assert_eq!(resp.status(), 409);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("recreate"), "{body}");
+    assert_eq!(code_of(&body), "credentials_unavailable");
     assert!(jobs.resets.lock().unwrap().is_empty(), "worker must not be asked");
 }
 
@@ -1517,7 +1611,8 @@ async fn reset_not_applied_is_503_with_the_message() {
     let resp = call(&app, reqwest::Method::POST, &format!("/v1/databases/{}/reset-password", id.unwrap().as_uuid()), "org-1").await;
     assert_eq!(resp.status(), 503);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], RESET_NOT_APPLIED);
+    assert_eq!(code_of(&body), "not_applied");
+    assert_eq!(message_of(&body), RESET_NOT_APPLIED);
 }
 
 #[tokio::test]
@@ -1566,7 +1661,7 @@ async fn delete_deleted_is_404() {
 }
 
 #[tokio::test]
-async fn delete_other_tenant_is_403() {
+async fn delete_other_tenant_is_404() {
     let jobs = FakeJobs::default();
     let mut id = None;
     let app = lifecycle_app(jobs.clone(), |m, _t, k| {
@@ -1576,7 +1671,7 @@ async fn delete_other_tenant_is_403() {
     })
     .await;
     let resp = call(&app, reqwest::Method::DELETE, &format!("/v1/databases/{}", id.unwrap().as_uuid()), "org-1").await;
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 404);
     assert!(jobs.deleted.lock().unwrap().is_empty());
 }
 
@@ -1685,10 +1780,18 @@ async fn branching() -> Branching {
     Branching { app, metadata, jobs, db: id }
 }
 
-async fn error_of(resp: reqwest::Response, status: u16) -> String {
+/// The error body of a response with the expected status.
+async fn error_of(resp: reqwest::Response, status: u16) -> Value {
     assert_eq!(resp.status(), status);
-    let body: Value = resp.json().await.unwrap();
-    body["error"].as_str().unwrap_or_else(|| panic!("no error in {body}")).to_string()
+    resp.json().await.unwrap()
+}
+
+fn code_of(body: &Value) -> &str {
+    body["error"]["code"].as_str().unwrap_or_else(|| panic!("no error code in {body}"))
+}
+
+fn message_of(body: &Value) -> &str {
+    body["error"]["message"].as_str().unwrap_or_else(|| panic!("no error message in {body}"))
 }
 
 // ---- list
@@ -1767,7 +1870,7 @@ async fn list_branches_hides_deleted_and_refuses_strangers() {
     })
     .await;
     let path = format!("/v1/databases/{}/branches", other_id.unwrap().as_uuid());
-    assert_eq!(call(&other, Method::GET, &path, "org-1").await.status(), 403);
+    assert_eq!(call(&other, Method::GET, &path, "org-1").await.status(), 404);
 }
 
 
@@ -1835,9 +1938,9 @@ async fn create_branch_with_a_taken_name_is_409() {
     let t = branching().await;
     t.ready("dev");
     let err = error_of(t.send(Method::POST, &t.branches(), Some(json!({ "name": "dev" }))).await, 409).await;
-    assert!(err.contains("dev"), "{err}");
+    assert_eq!(code_of(&err), "name_taken");
     let err = error_of(t.send(Method::POST, &t.branches(), Some(json!({ "name": "main" }))).await, 422).await;
-    assert!(err.contains("main"), "{err}");
+    assert_eq!(code_of(&err), "invalid_request");
     assert!(t.published().is_empty());
 }
 
@@ -1847,7 +1950,8 @@ async fn create_branch_at_the_cap_is_409_naming_the_cap_and_the_patch() {
     t.metadata.databases.lock().unwrap().get_mut(&t.db).unwrap().max_branches = 1;
     t.ready("dev");
     let err = error_of(t.send(Method::POST, &t.branches(), Some(json!({ "name": "b" }))).await, 409).await;
-    assert!(err.contains('1') && err.contains("max_branches") && err.contains("PATCH"), "{err}");
+    assert_eq!(code_of(&err), "branch_cap_reached");
+    assert!(message_of(&err).contains("max_branches"), "{err}");
     assert!(t.published().is_empty());
 }
 
@@ -1856,7 +1960,7 @@ async fn create_branch_needs_a_ready_parent_that_exists() {
     let t = branching().await;
     let pending = t.add("p", t.main(), BranchKind::Normal, BranchStatus::Pending);
     let err = error_of(t.send(Method::POST, &t.branches(), Some(json!({ "name": "x", "parent_branch_id": pending }))).await, 409).await;
-    assert!(err.contains("not ready"), "{err}");
+    assert_eq!(code_of(&err), "branch_not_ready");
     let unknown = BranchId::new();
     assert_eq!(t.send(Method::POST, &t.branches(), Some(json!({ "name": "x", "parent_branch_id": unknown }))).await.status(), 404);
     let deleted = t.add("d", t.main(), BranchKind::Normal, BranchStatus::Deleted);
@@ -1869,7 +1973,7 @@ async fn create_branch_on_a_database_that_is_not_ready_is_409() {
     let t = branching().await;
     t.metadata.branches.lock().unwrap().get_mut(&t.main()).unwrap().status = BranchStatus::Provisioning;
     let err = error_of(t.send(Method::POST, &t.branches(), Some(json!({ "name": "x" }))).await, 409).await;
-    assert!(err.contains("not ready"), "{err}");
+    assert_eq!(code_of(&err), "branch_not_ready");
 }
 
 #[tokio::test]
@@ -1901,10 +2005,10 @@ async fn create_branch_rejects_bad_input_with_422() {
 }
 
 #[tokio::test]
-async fn create_branch_publish_failure_is_502_and_fails_the_branch() {
+async fn create_branch_publish_failure_is_503_and_fails_the_branch() {
     let t = branching().await;
     *t.jobs.fail_branch_publish.lock().unwrap() = true;
-    assert_eq!(t.send(Method::POST, &t.branches(), Some(json!({ "name": "dev" }))).await.status(), 502);
+    assert_eq!(t.send(Method::POST, &t.branches(), Some(json!({ "name": "dev" }))).await.status(), 503);
     let branches = t.metadata.branches.lock().unwrap();
     let dev = branches.values().find(|b| b.name == "dev").unwrap();
     assert_eq!(dev.status, BranchStatus::Failed);
@@ -1912,7 +2016,7 @@ async fn create_branch_publish_failure_is_502_and_fails_the_branch() {
 }
 
 #[tokio::test]
-async fn create_branch_on_another_tenants_database_is_403_and_unknown_is_404() {
+async fn create_branch_on_another_tenants_database_is_404_like_an_unknown_one() {
     let jobs = FakeJobs::default();
     let mut id = None;
     let app = lifecycle_app(jobs.clone(), |m, _t, k| {
@@ -1929,7 +2033,7 @@ async fn create_branch_on_another_tenants_database_is_403_and_unknown_is_404() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 404);
     let resp = reqwest::Client::new()
         .post(format!("{}/v1/databases/{}/branches", app.base, uuid::Uuid::new_v4()))
         .header(IDENTITY_HEADER, app.token_for_org("org-1"))
@@ -1973,10 +2077,10 @@ async fn branch_connection_and_reset_refuse_backups_unready_and_unknown_branches
     let gone = t.add("g", t.main(), BranchKind::Normal, BranchStatus::Deleted);
     for (method, suffix) in [(Method::GET, "connection"), (Method::POST, "reset-password")] {
         let err = error_of(t.send(method.clone(), &format!("{}/{suffix}", t.branch(backup)), None).await, 409).await;
-        assert!(err.contains("restore backup") && err.contains("no compute"), "{err}");
+        assert_eq!(code_of(&err), "backup_branch");
         for id in [pending, resetting] {
             let err = error_of(t.send(method.clone(), &format!("{}/{suffix}", t.branch(id)), None).await, 409).await;
-            assert!(err.contains("not ready") || err.contains("ready"), "{err}");
+            assert_eq!(code_of(&err), "branch_not_ready");
         }
         for id in [BranchId::new(), gone] {
             assert_eq!(t.send(method.clone(), &format!("{}/{suffix}", t.branch(id)), None).await.status(), 404);
@@ -2011,7 +2115,9 @@ async fn branch_reset_password_asks_the_worker_for_that_branch() {
     assert_eq!(*t.jobs.resets.lock().unwrap(), vec![(t.db, dev)]);
     t.jobs.reset_answers(FakeReset::NotApplied);
     let resp = t.send(Method::POST, &format!("{}/reset-password", t.branch(dev)), None).await;
-    assert_eq!(error_of(resp, 503).await, RESET_NOT_APPLIED);
+    let body = error_of(resp, 503).await;
+    assert_eq!(code_of(&body), "not_applied");
+    assert_eq!(message_of(&body), RESET_NOT_APPLIED);
     t.jobs.reset_answers(FakeReset::Timeout);
     assert_eq!(t.send(Method::POST, &format!("{}/reset-password", t.branch(dev)), None).await.status(), 504);
     t.jobs.reset_answers(FakeReset::Unavailable);
@@ -2045,7 +2151,7 @@ async fn reset_to_parent_is_202_and_publishes_the_job() {
     assert_eq!(t.published(), vec![BranchJob::ResetToParent { branch_id: dev }]);
     // Twice: no longer ready.
     let err = error_of(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await, 409).await;
-    assert!(err.contains("not ready"), "{err}");
+    assert_eq!(code_of(&err), "branch_not_ready");
     assert_eq!(t.published().len(), 1);
 }
 
@@ -2077,13 +2183,14 @@ async fn reset_to_parent_refusals() {
     let path = |id| format!("{}/reset-to-parent", t.branch(id));
 
     let err = error_of(t.send(Method::POST, &path(t.main()), None).await, 409).await;
-    assert!(err.contains("main"), "{err}");
+    assert_eq!(code_of(&err), "main_branch");
     let err = error_of(t.send(Method::POST, &path(backup), None).await, 409).await;
-    assert!(err.contains("restore backup"), "{err}");
+    assert_eq!(code_of(&err), "backup_branch");
     let err = error_of(t.send(Method::POST, &path(other_child), None).await, 409).await;
-    assert!(err.contains("not ready"), "{err}");
+    assert_eq!(code_of(&err), "branch_not_ready");
     let err = error_of(t.send(Method::POST, &path(dev), None).await, 409).await;
-    assert!(err.contains("child") && err.contains("child2"), "{err}");
+    assert_eq!(code_of(&err), "has_children");
+    assert!(message_of(&err).contains("child") && message_of(&err).contains("child2"), "{err}");
     assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready, "a refused reset leaves the branch ready");
     assert_eq!(t.send(Method::POST, &path(BranchId::new()), None).await.status(), 404);
     assert!(t.published().is_empty());
@@ -2098,11 +2205,11 @@ async fn backups_do_not_block_reset_to_parent() {
 }
 
 #[tokio::test]
-async fn reset_to_parent_publish_failure_is_502_and_the_branch_stays_ready() {
+async fn reset_to_parent_publish_failure_is_503_and_the_branch_stays_ready() {
     let t = branching().await;
     let dev = t.ready("dev");
     *t.jobs.fail_branch_publish.lock().unwrap() = true;
-    assert_eq!(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await.status(), 502);
+    assert_eq!(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await.status(), 503);
     assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
 }
 
@@ -2174,11 +2281,11 @@ async fn restore_refusals() {
     let at = || Some(json!({ "at": { "lsn": "0/1" } }));
 
     let err = error_of(t.send(Method::POST, &path(backup), at()).await, 409).await;
-    assert!(err.contains("restore backup"), "{err}");
+    assert_eq!(code_of(&err), "backup_branch");
     let err = error_of(t.send(Method::POST, &path(pending), at()).await, 409).await;
-    assert!(err.contains("not ready"), "{err}");
+    assert_eq!(code_of(&err), "branch_not_ready");
     let err = error_of(t.send(Method::POST, &path(dev), at()).await, 409).await;
-    assert!(err.contains("child"), "{err}");
+    assert_eq!(code_of(&err), "has_children");
     assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
     assert_eq!(t.send(Method::POST, &path(BranchId::new()), at()).await.status(), 404);
     // Bad bodies: 422 before anything changes.
@@ -2211,7 +2318,7 @@ async fn delete_branch_is_202_and_takes_its_backups_along() {
     assert_eq!(t.published(), vec![BranchJob::Delete { branch_id: dev }]);
     // Twice.
     let err = error_of(t.send(Method::DELETE, &t.branch(dev), None).await, 409).await;
-    assert!(err.contains("already"), "{err}");
+    assert_eq!(code_of(&err), "already_deleting");
 }
 
 #[tokio::test]
@@ -2221,9 +2328,10 @@ async fn delete_branch_refusals() {
     t.add("kid", dev, BranchKind::Normal, BranchStatus::Provisioning);
     t.add("kid2", dev, BranchKind::Normal, BranchStatus::Failed);
     let err = error_of(t.send(Method::DELETE, &t.branch(t.main()), None).await, 409).await;
-    assert!(err.contains("main"), "{err}");
+    assert_eq!(code_of(&err), "main_branch");
     let err = error_of(t.send(Method::DELETE, &t.branch(dev), None).await, 409).await;
-    assert!(err.contains("kid") && err.contains("kid2"), "{err}");
+    assert_eq!(code_of(&err), "has_children");
+    assert!(message_of(&err).contains("kid") && message_of(&err).contains("kid2"), "{err}");
     assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready, "a refused delete leaves the branch ready");
     let gone = t.add("g", t.main(), BranchKind::Normal, BranchStatus::Deleted);
     assert_eq!(t.send(Method::DELETE, &t.branch(gone), None).await.status(), 404);
@@ -2241,8 +2349,9 @@ async fn delete_branch_refuses_while_a_backup_has_children() {
     let backup_name = t.metadata.branch(backup).name;
     t.add("x", backup, BranchKind::Normal, BranchStatus::Ready);
     let err = error_of(t.send(Method::DELETE, &t.branch(dev), None).await, 409).await;
+    assert_eq!(code_of(&err), "has_children");
     assert_eq!(
-        err,
+        message_of(&err),
         format!("cannot delete dev: its backup {backup_name} has child branches (x); delete them first")
     );
     assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready, "released");
@@ -2352,12 +2461,12 @@ async fn patch_refusals() {
     assert_eq!(t.send(Method::PATCH, &unknown, Some(json!({ "max_branches": 1 }))).await.status(), 404);
     t.metadata.databases.lock().unwrap().get_mut(&t.db).unwrap().status = DatabaseStatus::Deleting;
     let err = error_of(t.send(Method::PATCH, &database_path(&t), Some(json!({ "max_branches": 1 }))).await, 409).await;
-    assert!(err.contains("deleting") || err.contains("deleted"), "{err}");
+    assert_eq!(code_of(&err), "database_not_ready");
     assert!(t.jobs.settings_jobs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn patch_on_another_tenants_database_is_403() {
+async fn patch_on_another_tenants_database_is_404() {
     let mut id = None;
     let app = lifecycle_app(FakeJobs::default(), |m, _t, k| {
         let db = ready_database(TenantId::new(), k);
@@ -2372,7 +2481,7 @@ async fn patch_on_another_tenants_database_is_403() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 404);
 }
 
 // ---- branch_count
@@ -2549,21 +2658,23 @@ async fn create_validates_the_body() {
 async fn create_maps_check_role_refusal_to_422() {
     let t = branching().await;
     let body = || Some(json!({ "name": "ci", "role": "boss" }));
-    let cases: [(Result<CheckDataRoleReply, ResetError>, u16, Option<&str>); 6] = [
-        (Ok(CheckDataRoleReply::refused("the role boss is a superuser")), 422, Some("the role boss is a superuser")),
-        (Ok(CheckDataRoleReply::not_ready()), 409, None),
-        (Ok(CheckDataRoleReply::failed("grant failed: secret detail")), 500, None),
-        (Err(ResetError::Timeout), 504, None),
-        (Err(ResetError::Transport("no worker listening".into())), 503, None),
+    #[allow(clippy::type_complexity)]
+    let cases: [(Result<CheckDataRoleReply, ResetError>, u16, &str, Option<&str>); 6] = [
+        (Ok(CheckDataRoleReply::refused("the role boss is a superuser")), 422, "role_refused", Some("the role boss is a superuser")),
+        (Ok(CheckDataRoleReply::not_ready()), 409, "branch_not_ready", None),
+        (Ok(CheckDataRoleReply::failed("grant failed: secret detail")), 500, "internal", None),
+        (Err(ResetError::Timeout), 504, "timeout", None),
+        (Err(ResetError::Transport("no worker listening".into())), 503, "worker_unavailable", None),
         // A reply that says no without saying why is our failure.
-        (Ok(CheckDataRoleReply { ok: false, error: None, kind: None }), 500, None),
+        (Ok(CheckDataRoleReply { ok: false, error: None, kind: None }), 500, "internal", None),
     ];
-    for (answer, status, message) in cases {
+    for (answer, status, code, message) in cases {
         *t.jobs.role_check.lock().unwrap() = Some(answer);
         let resp = t.send(Method::POST, &t.keys(t.main()), body()).await;
         assert_eq!(resp.status(), status);
         let err: Value = resp.json().await.unwrap();
-        let text = err["error"].as_str().unwrap();
+        let text = message_of(&err);
+        assert_eq!(code_of(&err), code);
         if let Some(message) = message {
             assert_eq!(text, message);
         }
@@ -2578,7 +2689,8 @@ async fn create_maps_check_role_refusal_to_422() {
     let resp = t.send(Method::POST, &t.keys(resetting), body()).await;
     assert_eq!(resp.status(), 409);
     let backup = t.backup(t.main());
-    assert_eq!(t.send(Method::POST, &t.keys(backup), body()).await.status(), 409);
+    let err = error_of(t.send(Method::POST, &t.keys(backup), body()).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
     assert_eq!(t.jobs.role_checks.lock().unwrap().len(), before);
 }
 
@@ -2590,7 +2702,8 @@ async fn revoke_public_is_409() {
     let resp = t.send(Method::DELETE, &path, None).await;
     assert_eq!(resp.status(), 409);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({ "error": "rotate the public key instead" }));
+    assert_eq!(code_of(&body), "public_key_not_revocable");
+    assert_eq!(message_of(&body), "rotate the public key instead");
     assert_eq!(t.list_keys(t.main()).await.len(), 1);
 }
 
@@ -2672,7 +2785,7 @@ async fn rotate_secret_keeps_name_and_role() {
 }
 
 #[tokio::test]
-async fn another_tenant_gets_403() {
+async fn another_tenant_gets_404() {
     let t = branching().await;
     let mut other_db = None;
     let other = lifecycle_app(FakeJobs::default(), |m, _t, k| {
@@ -2697,7 +2810,7 @@ async fn another_tenant_gets_403() {
         if let Some(body) = body {
             req = req.json(&body);
         }
-        assert_eq!(req.send().await.unwrap().status(), 403, "{method} {path}");
+        assert_eq!(req.send().await.unwrap().status(), 404, "{method} {path}");
     }
     drop(t);
 }
@@ -2811,6 +2924,8 @@ async fn data_api_schema_is_503_when_rest_is_down() {
     assert_eq!(resp.status(), 503);
     let text = resp.text().await.unwrap();
     assert!(!text.contains("127.0.0.1"), "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(code_of(&body), "unavailable");
 }
 
 /// Rest answering 503 (the branch's database is unreachable, the schema is being
@@ -2846,4 +2961,172 @@ async fn data_api_schema_passes_rests_503_through() {
     assert_eq!(resp.headers()["retry-after"], "2");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "unavailable");
+    assert_eq!(body["error"]["message"], "try again");
+}
+
+// ---- error shape rulings
+
+#[tokio::test]
+async fn parent_lookup_error_is_500() {
+    let t = branching().await;
+    // Only the parent lookup reads a branch before the create.
+    *t.metadata.fail_get_branch.lock().unwrap() = true;
+    let err = error_of(t.send(Method::POST, &t.branches(), Some(json!({ "name": "x" }))).await, 500).await;
+    assert_eq!(code_of(&err), "internal");
+    assert!(t.published().is_empty());
+}
+
+#[tokio::test]
+async fn publish_failure_is_503_worker_unavailable() {
+    let t = branching().await;
+    *t.jobs.fail_branch_publish.lock().unwrap() = true;
+    let err = error_of(t.send(Method::POST, &t.branches(), Some(json!({ "name": "dev" }))).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    let dev = t.ready("qa");
+    let err = error_of(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    let err = error_of(
+        t.send(Method::POST, &format!("{}/restore", t.branch(dev)), Some(json!({ "at": { "lsn": "0/1" } }))).await,
+        503,
+    )
+    .await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+
+    // Provisioning a database too.
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    *jobs.fail_provision_publish.lock().unwrap() = true;
+    let app = spawn_app(metadata, jobs).await;
+    let token = app.token_for_org("org-1");
+    let resp = post_create(&app, Some(&token), create_body(tenant)).await;
+    let err = error_of(resp, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+}
+
+#[tokio::test]
+async fn backup_branch_key_create_is_backup_branch() {
+    let t = branching().await;
+    let backup = t.backup(t.main());
+    let err = error_of(t.send(Method::POST, &t.keys(backup), Some(json!({ "name": "ci" }))).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
+    assert!(t.jobs.role_checks.lock().unwrap().is_empty());
+}
+
+// Another tenant's project looks exactly like a missing one: same status, same body.
+#[tokio::test]
+async fn create_database_in_another_tenants_project_is_the_missing_project_answer() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let (foreign, missing) = (ProjectId::new(), ProjectId::new());
+    metadata.foreign_projects.lock().unwrap().push(foreign);
+    metadata.missing_projects.lock().unwrap().push(missing);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let token = app.token_for_org("org-1");
+    let body = |project: ProjectId| json!({ "tenant_id": tenant, "project_id": project, "name": "demo" });
+
+    let resp = post_create(&app, Some(&token), body(foreign)).await;
+    let foreign_err = error_of(resp, 404).await;
+    let resp = post_create(&app, Some(&token), body(missing)).await;
+    let missing_err = error_of(resp, 404).await;
+    assert_eq!(code_of(&foreign_err), "not_found");
+    assert_eq!(code_of(&missing_err), "not_found");
+    // Only the id differs; the message must not name a tenant or say "belong".
+    assert_eq!(
+        message_of(&foreign_err),
+        message_of(&missing_err).replace(&missing.to_string(), &foreign.to_string())
+    );
+    assert!(!message_of(&foreign_err).contains("belong"), "{foreign_err}");
+}
+
+#[tokio::test]
+async fn bad_json_body_is_json_invalid_request() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let url = format!("{}/v1/databases", app.base);
+    for (content_type, body, status) in [
+        ("application/json", "{nope", 400),
+        ("text/plain", "{}", 415),
+        ("application/json", r#"{"tenant_id": 5}"#, 422),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .header(IDENTITY_HEADER, app.token_for_org("org-1"))
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.headers()["content-type"], "application/json", "{body}");
+        let err = error_of(resp, status).await;
+        assert_eq!(code_of(&err), "invalid_request", "{body}");
+        assert!(!message_of(&err).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn non_uuid_path_is_json_invalid_request() {
+    let t = branching().await;
+    for path in [
+        "/v1/databases/not-a-uuid".to_string(),
+        "/v1/databases/not-a-uuid/branches".to_string(),
+        format!("/v1/databases/{}/branches/not-a-uuid/connection", t.db.as_uuid()),
+        format!("/v1/databases/{}/branches/not-a-uuid/keys", t.db.as_uuid()),
+    ] {
+        let resp = t.send(Method::GET, &path, None).await;
+        assert_eq!(resp.status(), 400, "{path}");
+        assert_eq!(resp.headers()["content-type"], "application/json", "{path}");
+        let err = error_of(resp, 400).await;
+        assert_eq!(code_of(&err), "invalid_request", "{path}");
+    }
+}
+
+/// Starts a mock rest answering the schema route with `status` and `body`.
+async fn rest_answering(status: u16, body: Value) -> Branching {
+    use axum::routing::get;
+    let app = Router::new().route(
+        "/internal/schema/{branch}",
+        get(move || {
+            let body = body.clone();
+            async move { (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(body)) }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app_with_rest(metadata.clone(), jobs.clone(), &rest).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    Branching { app, metadata, jobs, db: id }
+}
+
+#[tokio::test]
+async fn schema_409_is_branch_not_ready() {
+    let t = rest_answering(409, json!({ "status": "resetting" })).await;
+    let resp = t.send(Method::GET, &format!("{}/data-api/schema", t.branch(t.main())), None).await;
+    let err = error_of(resp, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    assert_eq!(message_of(&err), "branch is not ready");
+    assert_eq!(err["error"].as_object().unwrap().len(), 2, "{err}");
+}
+
+#[tokio::test]
+async fn schema_404_is_not_found_and_unexpected_answers_are_unavailable() {
+    let t = rest_answering(404, json!({ "error": { "code": "unknown_branch", "message": "no such branch" } })).await;
+    let resp = t.send(Method::GET, &format!("{}/data-api/schema", t.branch(t.main())), None).await;
+    let err = error_of(resp, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let t = rest_answering(500, json!({ "oops": true })).await;
+    let resp = t.send(Method::GET, &format!("{}/data-api/schema", t.branch(t.main())), None).await;
+    let err = error_of(resp, 502).await;
+    assert_eq!(code_of(&err), "unavailable");
 }

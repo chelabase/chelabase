@@ -1,57 +1,37 @@
-import { useCallback, useEffect, useState } from "react";
-import type { BranchSummary, DatabaseSettings as Settings, DatabaseSummary } from "@cheladb/types";
-import type { ApiClient } from "@/lib/api";
+import { useGetDatabase, useListBranches, type Branch, type DatabaseSettings as Settings, type DatabaseSummary } from "@cheladb/management-client";
 import { isTransitional } from "@/lib/branches";
+import { errorText } from "@/lib/errors";
+import { pollWhile } from "@/lib/query";
 import { BranchTree } from "./branch-tree";
 import { DatabaseSettings } from "./database-settings";
 import { NewBranchForm } from "./new-branch-form";
 
 export interface DatabaseBranchesProps {
-  api: ApiClient;
   database: DatabaseSummary;
-  pollIntervalMs?: number;
 }
 
 const DEFAULT_WINDOW = 7 * 86400;
 
 /** One database's branches: the tree, the new-branch form and the settings. */
-export function DatabaseBranches({ api, database, pollIntervalMs = 2000 }: DatabaseBranchesProps) {
+export function DatabaseBranches({ database }: DatabaseBranchesProps) {
   const id = database.database_id;
-  const [branches, setBranches] = useState<BranchSummary[] | null>(null);
-  const [settings, setSettings] = useState<Settings | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      setBranches(await api.listBranches(id));
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }, [api, id]);
-
-  useEffect(() => {
-    void load();
-    api
-      .getDatabase(id)
-      .then((d) =>
-        setSettings({
-          history_window: d.history_window,
-          max_branches: d.max_branches,
-          max_rows: d.max_rows,
-          statement_timeout_ms: d.statement_timeout_ms,
-          max_connections: d.max_connections,
-          default_schema: d.default_schema,
-        }),
-      )
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [api, id, load]);
-
-  useEffect(() => {
-    if (!branches?.some(isTransitional)) return;
-    const timer = setTimeout(() => void load(), pollIntervalMs);
-    return () => clearTimeout(timer);
-  }, [branches, load, pollIntervalMs]);
+  // While a branch is being created, reset, restored or deleted, keep the list fresh.
+  const list = useListBranches(id, { query: { refetchInterval: pollWhile<Branch[]>((bs) => bs.some(isTransitional)) } });
+  const detail = useGetDatabase(id);
+  const branches = list.data ?? null;
+  const d = detail.data;
+  const settings: Settings | null = d
+    ? {
+        history_window: d.history_window,
+        max_branches: d.max_branches,
+        max_rows: d.max_rows,
+        statement_timeout_ms: d.statement_timeout_ms,
+        max_connections: d.max_connections,
+        default_schema: d.default_schema,
+      }
+    : null;
+  const failed = list.error ?? detail.error;
+  const error = failed ? errorText(failed) : null;
 
   const window = settings?.history_window ?? DEFAULT_WINDOW;
   // `normal` branches other than main, as the cap counts them.
@@ -70,31 +50,13 @@ export function DatabaseBranches({ api, database, pollIntervalMs = 2000 }: Datab
           <p className="text-sm text-muted-foreground">
             {settings ? `${used} of ${settings.max_branches} branches` : `${used} branches`}
           </p>
-          <BranchTree
-            api={api}
-            databaseId={id}
-            databaseName={database.name}
-            branches={branches}
-            historyWindow={window}
-            onChanged={() => void load()}
-          />
-          <NewBranchForm
-            api={api}
-            databaseId={id}
-            branches={branches}
-            historyWindow={window}
-            onCreated={() => void load()}
-          />
+          <BranchTree databaseId={id} databaseName={database.name} branches={branches} historyWindow={window} />
+          <NewBranchForm databaseId={id} branches={branches} historyWindow={window} />
         </>
       )}
       {settings && (
-        <DatabaseSettings
-          key={Object.values(settings).join("-")}
-          api={api}
-          databaseId={id}
-          settings={settings}
-          onSaved={setSettings}
-        />
+        // Saving invalidates getDatabase(id); the refetch brings the new settings here.
+        <DatabaseSettings key={Object.values(settings).join("-")} databaseId={id} settings={settings} />
       )}
     </div>
   );

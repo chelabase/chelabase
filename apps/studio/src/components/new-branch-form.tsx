@@ -1,19 +1,24 @@
 import { useState, type FormEvent } from "react";
-import type { BranchSummary, CreateBranchRequest } from "@cheladb/types";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCreateBranch, type Branch, type CreateBranchRequest } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import type { ApiClient } from "@/lib/api";
-import { pointToUtc, restoreBounds, validateBranchName } from "@/lib/branches";
+import { invalidateBranches, pointToUtc, restoreBounds, validateBranchName } from "@/lib/branches";
+import { errorText } from "@/lib/errors";
 
 export interface NewBranchFormProps {
-  api: ApiClient;
   databaseId: string;
-  branches: BranchSummary[];
+  branches: Branch[];
   historyWindow: number;
-  /** Called once the API accepted the branch. */
-  onCreated: () => void;
 }
 
-export function NewBranchForm({ api, databaseId, branches, historyWindow, onCreated }: NewBranchFormProps) {
+export function NewBranchForm({ databaseId, branches, historyWindow }: NewBranchFormProps) {
+  const queryClient = useQueryClient();
+  const createBranch = useCreateBranch({
+    mutation: {
+      // Returned, so the mutation (and `busy`) waits for the refetch.
+      onSuccess: (_, { id }) => invalidateBranches(queryClient, id),
+    },
+  });
   // Any ready branch can be a parent, restore backups included (they're marked).
   const parents = branches.filter((b) => b.status === "ready");
   const main = parents.find((b) => b.kind === "normal" && b.parent_branch_id === null);
@@ -21,8 +26,8 @@ export function NewBranchForm({ api, databaseId, branches, historyWindow, onCrea
   const [parent, setParent] = useState<string>(main?.id ?? parents[0]?.id ?? "");
   const [mode, setMode] = useState<"now" | "time">("now");
   const [time, setTime] = useState("");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const busy = createBranch.isPending;
   const nameError = name === "" ? null : validateBranchName(name);
   const since = parents.find((b) => b.id === parent)?.history_start;
   const bounds = restoreBounds(new Date(), historyWindow, since);
@@ -30,7 +35,7 @@ export function NewBranchForm({ api, databaseId, branches, historyWindow, onCrea
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy || name === "" || nameError || !parent) return;
-    const request: CreateBranchRequest = { name, parent_branch_id: parent as never };
+    const request: CreateBranchRequest = { name, parent_branch_id: parent };
     if (mode === "time") {
       const at = pointToUtc(time, new Date(), historyWindow, since);
       if (!at.ok) {
@@ -39,18 +44,14 @@ export function NewBranchForm({ api, databaseId, branches, historyWindow, onCrea
       }
       request.at = { timestamp: at.iso };
     }
-    setBusy(true);
     setError(null);
     try {
-      await api.createBranch(databaseId, request);
+      await createBranch.mutateAsync({ id: databaseId, data: request });
       setName("");
       setTime("");
       setMode("now");
-      onCreated();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
+      setError(errorText(err));
     }
   }
 

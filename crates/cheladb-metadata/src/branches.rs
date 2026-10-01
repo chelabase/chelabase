@@ -23,6 +23,7 @@ use crate::{DatabaseStatus, MetadataClient, MetadataError, NewEndpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum BranchStatus {
     Pending,
     Provisioning,
@@ -76,6 +77,7 @@ impl From<DatabaseStatus> for BranchStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum BranchKind {
     Normal,
     /// Made by a restore: the timeline the branch had before. No endpoint, no compute.

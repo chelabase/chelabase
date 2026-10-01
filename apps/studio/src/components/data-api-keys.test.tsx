@@ -1,9 +1,9 @@
-import { render, screen, within } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CreatedDataKey, DataKey } from "@cheladb/types";
-import { ApiError, type ApiClient } from "@/lib/api";
-import { fakeApi } from "@/test/fake-api";
+import { getListKeysQueryKey, type CreatedDataKey, type DataKey } from "@cheladb/management-client";
+import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
+import { renderWithQuery } from "@/test/render";
 import { DataApiKeys } from "./data-api-keys";
 
 const key = (over: Partial<DataKey> & { id: string; name: string }): DataKey => ({
@@ -28,11 +28,38 @@ const created = (over: Partial<CreatedDataKey> = {}): CreatedDataKey => ({
   ...over,
 });
 
-function setup(api: Partial<ApiClient> = {}, keys: DataKey[] = [publicKey, reporting, worker]) {
-  const onChanged = vi.fn();
-  const full = fakeApi(api);
-  render(<DataApiKeys api={full} databaseId="db" branchId="br" keys={keys} onChanged={onChanged} />);
-  return { api: full, onChanged };
+const KEYS = "/v1/databases/db/branches/br/keys";
+const CREATE = `POST ${KEYS}`;
+const revokeRoute = (id: string) => `DELETE ${KEYS}/${id}`;
+const rotateRoute = (id: string) => `POST ${KEYS}/${id}/rotate`;
+const revoked: FakeHandler = () => new Response(null, { status: 204 });
+const never: FakeHandler = () => new Promise<never>(() => {});
+const refused = (status: number, code: string, message: string): FakeHandler => () =>
+  jsonResponse({ error: { code, message } }, status);
+
+function setup(routes: Record<string, FakeHandler> = {}, keys: DataKey[] = [publicKey, reporting, worker]) {
+  const f = fakeFetch(routes);
+  const result = renderWithQuery(<DataApiKeys databaseId="db" branchId="br" keys={keys} />, { fetch: f });
+  // Seeded as the panel would have it: every change must invalidate it.
+  result.queryClient.setQueryData(getListKeysQueryKey("db", "br"), keys);
+  result.queryClient.setQueryData(getListKeysQueryKey("db", "other"), keys);
+  return { ...result, fetch: f };
+}
+const sent = (f: FakeFetch) => f.calls.map((r) => `${r.method} ${new URL(r.url).pathname}`);
+async function bodyOf(f: FakeFetch, route: string): Promise<unknown> {
+  await vi.waitFor(() => expect(sent(f)).toContain(route));
+  return f.calls[sent(f).indexOf(route)].clone().json();
+}
+async function expectKeysInvalidated(queryClient: ReturnType<typeof setup>["queryClient"]) {
+  await vi.waitFor(() => expect(queryClient.getQueryState(getListKeysQueryKey("db", "br"))?.isInvalidated).toBe(true));
+  expect(queryClient.getQueryState(getListKeysQueryKey("db", "other"))?.isInvalidated).toBe(false);
+}
+/** Every piece of state TanStack Query holds: queries and mutations. */
+function cachedState(queryClient: ReturnType<typeof setup>["queryClient"]): string {
+  return JSON.stringify([
+    queryClient.getQueryCache().findAll().map((q) => q.state),
+    queryClient.getMutationCache().getAll().map((m) => m.state),
+  ]);
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -56,31 +83,29 @@ describe("DataApiKeys", () => {
   it("creates a key with the default role and shows it once, with copy", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    const createKey = vi.fn().mockResolvedValue(created());
-    const { onChanged } = setup({ createKey });
+    const { fetch, queryClient } = setup({ [CREATE]: () => jsonResponse(created(), 201) });
     expect(screen.getByLabelText("Role")).toHaveValue("authenticated");
     await userEvent.type(screen.getByLabelText("Key name"), "ci");
     await userEvent.click(screen.getByRole("button", { name: "Create key" }));
-    expect(createKey).toHaveBeenCalledWith("db", "br", { name: "ci", role: "authenticated" });
+    expect(await bodyOf(fetch, CREATE)).toEqual({ name: "ci", role: "authenticated" });
     const box = await screen.findByRole("region", { name: "New key" });
     expect(within(box).getByText(FULL)).toBeInTheDocument();
     expect(within(box).getByText("Copy this key now. It won't be shown again.")).toBeInTheDocument();
     await userEvent.click(within(box).getByRole("button", { name: "Copy key" }));
     expect(writeText).toHaveBeenCalledWith(FULL);
-    expect(onChanged).toHaveBeenCalled();
+    await expectKeysInvalidated(queryClient);
     expect(screen.getByLabelText("Key name")).toHaveValue("");
     await userEvent.click(within(box).getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByText(FULL)).not.toBeInTheDocument();
   });
 
   it("sends the role the user picked", async () => {
-    const createKey = vi.fn().mockResolvedValue(created({ role: "service" }));
-    setup({ createKey });
+    const { fetch } = setup({ [CREATE]: () => jsonResponse(created({ role: "service" }), 201) });
     await userEvent.type(screen.getByLabelText("Key name"), "ci");
     await userEvent.clear(screen.getByLabelText("Role"));
     await userEvent.type(screen.getByLabelText("Role"), "service");
     await userEvent.click(screen.getByRole("button", { name: "Create key" }));
-    expect(createKey).toHaveBeenCalledWith("db", "br", { name: "ci", role: "service" });
+    expect(await bodyOf(fetch, CREATE)).toEqual({ name: "ci", role: "service" });
   });
 
   it("disables Create until there is a name, and says why", async () => {
@@ -95,18 +120,17 @@ describe("DataApiKeys", () => {
   });
 
   it("shows the worker's message on a 422 and no key", async () => {
-    const createKey = vi.fn().mockRejectedValue(new ApiError(422, "role \"postgres\" is a superuser"));
-    const { onChanged } = setup({ createKey });
+    const { queryClient } = setup({ [CREATE]: refused(422, "role_refused", 'role "postgres" is a superuser') });
     await userEvent.type(screen.getByLabelText("Key name"), "ci");
     await userEvent.click(screen.getByRole("button", { name: "Create key" }));
     expect(await screen.findByRole("alert")).toHaveTextContent('role "postgres" is a superuser');
     expect(screen.queryByRole("region", { name: "New key" })).not.toBeInTheDocument();
-    expect(onChanged).not.toHaveBeenCalled();
+    expect(queryClient.getQueryState(getListKeysQueryKey("db", "br"))?.isInvalidated).toBe(false);
     expect(screen.getByLabelText("Key name")).toHaveValue("ci");
   });
 
   it("says why Revoke and Rotate are disabled while a key change runs", async () => {
-    setup({ revokeKey: vi.fn().mockReturnValue(new Promise<never>(() => {})) });
+    setup({ [revokeRoute("k1")]: never });
     const revoke = () => screen.getByRole("button", { name: "Revoke worker" });
     const rotate = () => screen.getByRole("button", { name: "Rotate reporting" });
     expect(revoke()).not.toHaveAttribute("aria-describedby");
@@ -119,42 +143,65 @@ describe("DataApiKeys", () => {
   });
 
   it("revokes only after a confirm", async () => {
-    const revokeKey = vi.fn().mockResolvedValue(undefined);
-    const { onChanged } = setup({ revokeKey });
+    const { fetch, queryClient } = setup({ [revokeRoute("k1")]: revoked });
     await userEvent.click(screen.getByRole("button", { name: "Revoke reporting" }));
-    expect(revokeKey).not.toHaveBeenCalled();
+    expect(fetch.calls).toHaveLength(0);
     expect(screen.getByText(/Revoke reporting\? Anything using it stops working within 30 seconds\./)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Confirm revoke" }));
-    expect(revokeKey).toHaveBeenCalledWith("db", "br", "k1");
-    await vi.waitFor(() => expect(onChanged).toHaveBeenCalled());
+    await vi.waitFor(() => expect(sent(fetch)).toEqual([revokeRoute("k1")]));
+    await expectKeysInvalidated(queryClient);
+    await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Confirm revoke" })).not.toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Confirm revoke" })).not.toBeInTheDocument();
   });
 
   it("cancel leaves the key alone", async () => {
-    const revokeKey = vi.fn();
-    setup({ revokeKey });
+    const { fetch } = setup({ [revokeRoute("k1")]: revoked });
     await userEvent.click(screen.getByRole("button", { name: "Revoke reporting" }));
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(revokeKey).not.toHaveBeenCalled();
+    expect(fetch.calls).toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Confirm revoke" })).not.toBeInTheDocument();
   });
 
   it("rotates after a confirm and shows the new key once", async () => {
-    const rotateKey = vi.fn().mockResolvedValue(created({ id: "k9", name: "reporting" }));
-    const { onChanged } = setup({ rotateKey });
+    const { fetch, queryClient } = setup({ [rotateRoute("k1")]: () => jsonResponse(created({ id: "k9", name: "reporting" })) });
     await userEvent.click(screen.getByRole("button", { name: "Rotate reporting" }));
-    expect(rotateKey).not.toHaveBeenCalled();
+    expect(fetch.calls).toHaveLength(0);
     await userEvent.click(screen.getByRole("button", { name: "Confirm rotate" }));
-    expect(rotateKey).toHaveBeenCalledWith("db", "br", "k1");
     expect(await screen.findByRole("region", { name: "New key" })).toHaveTextContent(FULL);
-    expect(onChanged).toHaveBeenCalled();
+    expect(sent(fetch)).toEqual([rotateRoute("k1")]);
+    await expectKeysInvalidated(queryClient);
   });
 
   it("shows a revoke failure", async () => {
-    const revokeKey = vi.fn().mockRejectedValue(new ApiError(404, "key not found"));
-    setup({ revokeKey });
+    setup({ [revokeRoute("k1")]: refused(404, "not_found", "key not found") });
     await userEvent.click(screen.getByRole("button", { name: "Revoke reporting" }));
     await userEvent.click(screen.getByRole("button", { name: "Confirm revoke" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("key not found");
+  });
+
+  it("disables Create while the key is being created", async () => {
+    setup({ [CREATE]: never });
+    await userEvent.type(screen.getByLabelText("Key name"), "ci");
+    await userEvent.click(screen.getByRole("button", { name: "Create key" }));
+    expect(screen.getByRole("button", { name: "Create key" })).toBeDisabled();
+  });
+
+  it("created_key_is_never_cached: a created or rotated key stays out of the query and mutation caches", async () => {
+    const ROTATED = "chk_sec_ROTATEDROTATEDROTATEDROTATEDROTATEDROTATED";
+    const { queryClient, unmount } = setup({
+      [CREATE]: () => jsonResponse(created(), 201),
+      [rotateRoute("k1")]: () => jsonResponse(created({ id: "k9", name: "reporting", key: ROTATED })),
+    });
+    await userEvent.type(screen.getByLabelText("Key name"), "ci");
+    await userEvent.click(screen.getByRole("button", { name: "Create key" }));
+    expect(await screen.findByText(FULL)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Rotate reporting" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm rotate" }));
+    expect(await screen.findByText(ROTATED)).toBeInTheDocument();
+    await expectKeysInvalidated(queryClient);
+    for (const secret of [FULL, ROTATED]) expect(cachedState(queryClient)).not.toContain(secret);
+    // Nor after the screen goes away (a mutation's data would outlive it for gcTime).
+    unmount();
+    for (const secret of [FULL, ROTATED]) expect(cachedState(queryClient)).not.toContain(secret);
   });
 });

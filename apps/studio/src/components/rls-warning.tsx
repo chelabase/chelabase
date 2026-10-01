@@ -1,7 +1,7 @@
-import type { DataApiSchema, Priv } from "@cheladb/types";
+import type { DataApiSchema, Privilege } from "@cheladb/management-client";
 import { CopyButton } from "./copy-button";
 
-const WRITES: Priv[] = ["insert", "update", "delete"];
+const WRITES: Privilege[] = ["insert", "update", "delete"];
 const quote = (name: string) => `"${name.replaceAll('"', '""')}"`;
 
 interface Exposed {
@@ -23,8 +23,9 @@ function exposed(schema: DataApiSchema): Exposed[] {
   const found: Exposed[] = [];
   for (const [schemaName, entry] of Object.entries(schema.schemas)) {
     for (const [name, info] of Object.entries(entry.tables)) {
-      if (info.privileges === null) continue;
-      const { anon, authenticated } = info.privileges;
+      // A role missing from the map (or no map at all) has no access.
+      const anon = info.privileges?.anon ?? [];
+      const authenticated = info.privileges?.authenticated ?? [];
       if (anon.length === 0 && authenticated.length === 0) continue;
       const id = `${quote(schemaName)}.${quote(name)}`;
       const anonReach = anon.length > 0;

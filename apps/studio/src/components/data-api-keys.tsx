@@ -1,25 +1,34 @@
 import { useId, useState, type FormEvent } from "react";
-import type { CreatedDataKey, DataKey } from "@cheladb/types";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  createKey,
+  getListKeysQueryKey,
+  rotateKey,
+  useRevokeKey,
+  type CreatedDataKey,
+  type DataKey,
+} from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import type { ApiClient } from "@/lib/api";
+import { errorText } from "@/lib/errors";
 import { CopyButton } from "./copy-button";
 
 export interface DataApiKeysProps {
-  api: ApiClient;
   databaseId: string;
   branchId: string;
   /** Every live key of the branch; the public key is left to the panel. */
   keys: DataKey[];
-  /** Called after a change the key list should reflect. */
-  onChanged: () => void;
 }
 
 type Pending = { kind: "revoke" | "rotate"; key: DataKey } | null;
 
-const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 const utc = (iso: string) => `${new Date(iso).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 
-export function DataApiKeys({ api, databaseId, branchId, keys, onChanged }: DataApiKeysProps) {
+export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
+  const queryClient = useQueryClient();
+  const refreshKeys = (id: string, branch: string) =>
+    queryClient.invalidateQueries({ queryKey: getListKeysQueryKey(id, branch) });
+  // Revoking returns no secret, so it can be an ordinary mutation.
+  const revoke = useRevokeKey({ mutation: { onSuccess: (_, { id, branchId: branch }) => refreshKeys(id, branch) } });
   const [name, setName] = useState("");
   const [role, setRole] = useState("authenticated");
   const [shown, setShown] = useState<CreatedDataKey | null>(null);
@@ -37,11 +46,13 @@ export function DataApiKeys({ api, databaseId, branchId, keys, onChanged }: Data
     setBusy(true);
     setError(null);
     try {
-      setShown(await api.createKey(databaseId, branchId, { name: name.trim(), role: role.trim() }));
+      // A new key is a secret: the plain function keeps it out of the mutation cache; it
+      // lives only in this component's state.
+      setShown(await createKey(databaseId, branchId, { name: name.trim(), role: role.trim() }));
       setName("");
-      onChanged();
+      await refreshKeys(databaseId, branchId);
     } catch (err) {
-      setError(message(err));
+      setError(errorText(err));
     } finally {
       setBusy(false);
     }
@@ -53,14 +64,15 @@ export function DataApiKeys({ api, databaseId, branchId, keys, onChanged }: Data
     setError(null);
     try {
       if (pending.kind === "revoke") {
-        await api.revokeKey(databaseId, branchId, pending.key.id);
+        await revoke.mutateAsync({ id: databaseId, branchId, keyId: pending.key.id });
       } else {
-        setShown(await api.rotateKey(databaseId, branchId, pending.key.id));
+        // Like a created key: never through the mutation cache.
+        setShown(await rotateKey(databaseId, branchId, pending.key.id));
+        await refreshKeys(databaseId, branchId);
       }
       setPending(null);
-      onChanged();
     } catch (err) {
-      setError(message(err));
+      setError(errorText(err));
     } finally {
       setBusy(false);
     }

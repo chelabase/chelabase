@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
     let verifier = JwtVerifier::from_env()?;
     let signer = InternalSigner::from_env()?;
     let registry = Arc::new(SharedRegistry::new(
-        Registry::from_config(&config.platform_hosts).map_err(anyhow::Error::msg)?,
+        Registry::from_config(&config.management_hosts).map_err(anyhow::Error::msg)?,
     ));
     let keys = Arc::new(DataKeyResolver::new(&config.internal_url, &config.data_keys_token));
     let pipeline = Pipeline::new(registry, config.studio_origins.clone(), verifier, signer, keys);

@@ -1,36 +1,38 @@
 import { useEffect, useId, useRef, useState } from "react";
-import type { BranchSummary } from "@cheladb/types";
+import { useQueryClient } from "@tanstack/react-query";
+import { useDeleteBranch, useResetBranchToParent, useRestoreBranch, type Branch } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import type { ApiClient } from "@/lib/api";
-import { actionReasons, isTransitional, pointToUtc, restoreBounds, toLocalInput, type ActionKey } from "@/lib/branches";
+import {
+  actionReasons,
+  invalidateBranches,
+  isTransitional,
+  pointToUtc,
+  restoreBounds,
+  toLocalInput,
+  type ActionKey,
+} from "@/lib/branches";
+import { errorText } from "@/lib/errors";
 import { DatabaseActions } from "./database-actions";
 
 type Panel = "none" | "reset-to-parent" | "restore" | "delete";
 
 export interface BranchActionsProps {
-  api: ApiClient;
   databaseId: string;
   databaseName: string;
-  branch: BranchSummary;
+  branch: Branch;
   /** Every branch of the database, for the children rule. */
-  branches: BranchSummary[];
+  branches: Branch[];
   /** Seconds of history kept; bounds the restore picker. */
   historyWindow: number;
-  /** Called after a change the branch list should reflect. */
-  onChanged: () => void;
 }
 
-const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
-
-export function BranchActions({
-  api,
-  databaseId,
-  databaseName,
-  branch,
-  branches,
-  historyWindow,
-  onChanged,
-}: BranchActionsProps) {
+export function BranchActions({ databaseId, databaseName, branch, branches, historyWindow }: BranchActionsProps) {
+  const queryClient = useQueryClient();
+  // Each one refreshes the branch list and the database (returned, so `busy` waits for it).
+  const invalidate = { mutation: { onSuccess: (_: unknown, { id }: { id: string }) => invalidateBranches(queryClient, id) } };
+  const resetBranch = useResetBranchToParent(invalidate);
+  const deleteBranch = useDeleteBranch(invalidate);
+  const restoreBranch = useRestoreBranch(invalidate);
   const [panel, setPanel] = useState<Panel>("none");
   const [point, setPoint] = useState("");
   const [busy, setBusy] = useState(false);
@@ -69,9 +71,8 @@ export function BranchActions({
     try {
       setNotice(await action());
       setPanel("none");
-      onChanged();
     } catch (err) {
-      setError(message(err));
+      setError(errorText(err));
     } finally {
       setBusy(false);
     }
@@ -79,12 +80,12 @@ export function BranchActions({
 
   const resetToParent = () =>
     run(async () => {
-      await api.resetBranchToParent(databaseId, branch.id);
+      await resetBranch.mutateAsync({ id: databaseId, branchId: branch.id });
       return null;
     });
   const remove = () =>
     run(async () => {
-      await api.deleteBranch(databaseId, branch.id);
+      await deleteBranch.mutateAsync({ id: databaseId, branchId: branch.id });
       return null;
     });
   function restore() {
@@ -94,7 +95,11 @@ export function BranchActions({
       return;
     }
     void run(async () => {
-      const done = await api.restoreBranch(databaseId, branch.id, { at: { timestamp: at.iso } });
+      const done = await restoreBranch.mutateAsync({
+        id: databaseId,
+        branchId: branch.id,
+        data: { at: { timestamp: at.iso } },
+      });
       return `Restoring ${branch.name}. Its old data is kept in ${done.backup_name}.`;
     });
   }
@@ -108,9 +113,8 @@ export function BranchActions({
   return (
     <div className="space-y-2">
       <DatabaseActions
-        api={api}
         database={{
-          database_id: databaseId as never,
+          database_id: databaseId,
           name: databaseName,
           status: "ready",
           host: branch.host,
@@ -120,7 +124,6 @@ export function BranchActions({
         branch={branch}
         reasons={reasons}
         describedBy={{ connect: reasonId("connect"), resetPassword: reasonId("resetPassword") }}
-        onChanged={onChanged}
         below={
           reasonTexts.length > 0 && (
             <ul className="space-y-0.5 text-xs text-muted-foreground">

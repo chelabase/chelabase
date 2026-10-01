@@ -1,5 +1,3 @@
-import type { ApiClient } from "./api";
-
 const KEY = "cheladb.reauth-attempted";
 
 type FlagStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
@@ -29,14 +27,16 @@ export function createReauthGuard(storage: FlagStorage): ReauthGuard {
   };
 }
 
-/** Wrap `api` so a successful `/v1/me` re-arms the guard. */
-export function resetOnLoad(api: ApiClient, guard: ReauthGuard): ApiClient {
-  return {
-    ...api,
-    me: async () => {
-      const me = await api.me();
-      guard.reset();
-      return me;
-    },
+/**
+ * The management client's `onUnauthorized`: restart sign-in once (returns true so
+ * the 401 carries `signInRestarted`); if a fresh token is refused too, return
+ * false so the screen shows the error instead of looping through Zitadel. The
+ * dashboard re-arms the guard on its first successful `getMe`.
+ */
+export function restartSignInOnce(guard: ReauthGuard, restart: () => void): () => boolean {
+  return () => {
+    if (!guard.shouldRedirect()) return false;
+    restart();
+    return true;
   };
 }

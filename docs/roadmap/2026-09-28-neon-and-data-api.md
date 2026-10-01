@@ -24,7 +24,7 @@ Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 
 ## Resume here (handoff, 2026-09-29)
 
-> **Step 6 (data API engine, 2026-10-01): Tasks 1–11 plus 10b done; the end-of-step review (opus) and its fix batch are done. Next: the full verification run, then the user's merge pause. Not merged.** Branch `data-api` (`.worktrees/data-api`). Plan with Status block: `docs/superpowers/plans/2026-10-01-data-api.md`. `CLAUDE.md` has the working preferences.
+> **Step 6 (data API engine) is done: merged into `main` on 2026-10-01 (`01283de`) after the full verification run.** Its plan and Status block: `docs/superpowers/plans/2026-10-01-data-api.md`. **API-client chore: done 2026-10-01, at the user's merge pause** (branch `api-client`; plan Status lists the decisions, the verification run and four questions for the user). It was, before 6a by the user's decision: OpenAPI documents from the Rust handlers (utoipa), a generated client with TanStack Query hooks (orval), all of Studio on TanStack Query, and one error shape with codes. Spec approved 2026-10-01: `docs/superpowers/specs/2026-10-01-api-client-design.md`; plan approved 2026-10-01 (parallel waves; see its Status): `docs/superpowers/plans/2026-10-01-api-client.md`, branch `api-client` (`.worktrees/api-client`). **Step 6a (login roles)** is paused with its plan written (branch `login-roles`; its plan's Status says what changes once this chore is merged). 6b and 7 remain. The Neon hard fork runs in its own session (fork Task 11a fixes the event-trigger escalation). `CLAUDE.md` has the working preferences.
 
 **State of the repo:**
 - `main` has the dependency refresh, Zitadel v4 with our own login (`auth`), `CHELADB_MODE`, `just cleanup`, the repo layout (`services/`, `tools/cli`, `cheladb dev …`) and **step 3**: the internal listener, Valkey and Neon's proxy. Step 3 was merged locally on 2026-09-29 and isn't pushed yet. Every review finding from step 3 is fixed, minors included, except the step 4 notes below.
@@ -209,6 +209,10 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
 - **NATS** stays the job queue and request/reply bus; Valkey doesn't replace it.
 - **The JWKS cache in `cheladb-auth`** is per process with a 10-minute TTL, and should stay that way; sharing it gains nothing.
 
+### Platform mode: notes for later
+
+- **API reference UI (user, 2026-10-01):** self-hosted mode serves Swagger UI with its assets embedded (`utoipa-swagger-ui`, `vendored`; works offline), at `/v1/docs` behind the gateway and on Studio's API page (the API-client chore, branch `api-client`). When platform mode is built, consider offering **Scalar** (`utoipa-scalar`, or `@scalar/api-reference-react` in Studio) as the reference UI there: platform mode is always online, so Scalar loading its JavaScript from a CDN no longer matters, and it gives a more modern reference with code samples. A decision for that step, not made yet.
+
 ## Next steps, in order
 
 1. **Neon build and data plane in Compose.** ✅ Done 2026-09-28; see "Progress".
@@ -238,7 +242,7 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
    - **An extension policy:** record which extensions are supported and upgraded, so users don't depend on whatever the image happens to contain.
    - Step 6 doesn't need either extension, so 4a can also run after step 5 if that suits better.
 5. **Branching.** ✅ Done 2026-10-01, merged into local `main` (see "Progress"). Create a branch from `main`, optionally at a point in time. Each branch gets its own endpoint and appears in Studio.
-6. **Data API (`cheladb-rest`).** 🚧 Built on branch `data-api`, pending merge (see "Resume here"). Our own design, not a PostgREST or Supabase clone; see below.
+6. **Data API (`cheladb-rest`).** ✅ Merged 2026-10-01. Deferred to platform mode (from its end-of-step review): a CancelRequest when a request is dropped, a per-database share of rest's global connection permits, a SCRAM verifier instead of a plaintext authenticator password, a guard on dev tokens bound off loopback, the orchestrator's `AuthMethod` check, a global miss-limiter cap, and 42501/23503 messages that can name hidden tables. Our own design, not a PostgREST or Supabase clone; see below.
    - **Split 2026-10-01:** step 6 is the engine, SDK and type generation, with per-branch public/secret keys; spec `docs/superpowers/specs/2026-10-01-data-api-design.md` (branch `data-api`). Also decided then: the key names the branch; the gateway checks keys; a direct connection as `authenticator`; a schema version uuid; one reserved `cheladb` schema for machinery only, with exposure by `USAGE` privileges and no exposed-schemas list; RLS off by default with a Studio warning; `anon` read-only and `authenticated` CRUD by default.
 6b. **App users** (after step 6): the "App users" section below (an org per project, the app-owned users table, sync, `db.auth`). It plugs a user's JWT into the gateway's data-key step; the claim helpers go in the `cheladb` schema. Needs projects in Studio first. Its own spec, plan and approval.
 6a. **Login roles (candidate, after step 6; agreed 2026-09-30).** Extra login roles per branch, managed through the platform API as Neon does it. The owner can already `CREATE ROLE` in SQL, but Neon's proxy gets each role's SCRAM secret from our internal listener, which answers only from `neon_roles`, so SQL-made roles can't log in through the proxy.
@@ -622,6 +626,7 @@ Relations and upsert come in a second pass.
 
 **How each roadmap step runs (decided 2026-09-29):**
 - **Order of work:** a spec, then a plan, then execution task by task. Each task goes to a subagent on a model sized to it (Haiku for transcription, Sonnet for moderate work, Opus for design-heavy or live-debugging tasks), and a review subagent checks it.
+- **Run in parallel whenever possible (user's standing rule, 2026-10-01):** every plan maps its task dependencies and schedules independent work concurrently (waves or any other shape): implementers, reviews, research and verification runs. Parallel implementers each get their own short-lived branch and worktree from the step's branch (`just wt-add <branch>-tN`), are reviewed there, then merged back (`--no-ff`) and removed; only work that touches disjoint files runs side by side. Live tests and e2e runs stay one at a time (one Compose stack per machine).
 - **Checkpoints:** a checkpoint means everything is committed, and a fresh session can resume from files alone. Nothing lives only in chat or in git-ignored folders.
 - **The plan's Status block** sits at the top of each plan and is updated and committed at every checkpoint. It holds:
   - the current task, and the tasks done with their commit ranges;

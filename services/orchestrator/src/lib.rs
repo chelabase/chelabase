@@ -1,8 +1,8 @@
 use axum::{
-    extract::{FromRequestParts, Path, State},
+    extract::{FromRequestParts, State},
     http::{header::CACHE_CONTROL, request::Parts, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
@@ -18,8 +18,12 @@ use cheladb_nats::{
     SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD,
 };
 use cheladb_secrets::{open_credential, Purpose, SecretKey};
-use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
+use cheladb_types::api_error::{ApiError, ErrorCode};
+use cheladb_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
+use cheladb_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -29,7 +33,10 @@ use uuid::Uuid;
 
 mod branches;
 mod data_keys;
+mod docs;
 pub mod internal;
+mod openapi;
+pub use openapi::openapi;
 
 /// Port the Neon proxy serves the Postgres protocol on.
 pub const PROXY_PG_PORT: u16 = 4432;
@@ -470,7 +477,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    type Rejection = Response;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -481,13 +488,13 @@ where
             .get(IDENTITY_HEADER)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| {
-                unauthorized("missing internal identity; call the API through the gateway")
+                ApiError::unauthorized("missing internal identity; call the API through the gateway")
             })?;
 
         let claims = state
             .identity
             .verify(token, Service::Orchestrator.name())
-            .map_err(|err| unauthorized(&err.to_string()))?;
+            .map_err(|err| ApiError::unauthorized(err.to_string()))?;
 
         Ok(Caller {
             sub: claims.sub,
@@ -513,7 +520,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    type Rejection = Response;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -522,16 +529,14 @@ where
         let caller = Caller::from_request_parts(parts, state).await?;
         let tenant_id = lookup_tenant(state, &caller.org_id)
             .await
-            .map_err(|_| internal_error())?
+            .map_err(|_| ApiError::internal())?
             .ok_or_else(|| {
-            (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "no Cheladb tenant bound to this Zitadel org; run just zitadel-bootstrap"
-                })),
-            )
-                .into_response()
-        })?;
+                ApiError::new(
+                    403,
+                    ErrorCode::TenantNotBound,
+                    "no Cheladb tenant bound to this Zitadel org; run just zitadel-bootstrap",
+                )
+            })?;
 
         Ok(AuthPrincipal {
             sub: caller.sub,
@@ -554,45 +559,55 @@ async fn lookup_tenant<M: MetadataPort, J>(
         .inspect_err(|err| error!("tenant lookup by zitadel org: {err}"))
 }
 
-fn internal_error() -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": "internal error" })),
-    )
-        .into_response()
+/// The body of a JSON route that parses it by hand: the extractor only reads the bytes, so
+/// a body over the limit answers in our shape instead of axum's plain text.
+pub(crate) struct ApiBytes(pub(crate) axum::body::Bytes);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for ApiBytes {
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
+        match axum::body::Bytes::from_request(req, state).await {
+            Ok(bytes) => Ok(Self(bytes)),
+            Err(rej) => {
+                let status = rej.status();
+                let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    ErrorCode::TooLarge
+                } else {
+                    ErrorCode::InvalidRequest
+                };
+                Err(ApiError::new(status.as_u16(), code, rej.body_text()))
+            }
+        }
+    }
 }
 
-fn unauthorized(message: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "error": message })),
-    )
-        .into_response()
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateDatabaseRequest {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub name: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CreateDatabaseAccepted {
     pub job_id: Uuid,
     pub database_id: DatabaseId,
     pub status: DatabaseStatus,
 }
 
-#[derive(Debug, Serialize)]
-struct DatabaseResponse {
+#[derive(Debug, Serialize, ToSchema)]
+struct Database {
     database_id: DatabaseId,
     project_id: ProjectId,
     tenant_id: TenantId,
     name: String,
     status: DatabaseStatus,
+    #[schema(required = true)]
     host: Option<String>,
+    #[schema(required = true)]
     port: Option<u16>,
+    #[schema(required = true)]
     error: Option<String>,
     /// Live `normal` branches, main included (backups and deleted branches don't count).
     branch_count: i64,
@@ -638,7 +653,7 @@ async fn main_branches<M: MetadataPort>(
         .collect())
 }
 
-impl DatabaseResponse {
+impl Database {
     fn new(
         r: DatabaseRecord,
         main: Option<&BranchRecord>,
@@ -666,46 +681,49 @@ impl DatabaseResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct MeResponse {
+#[derive(Debug, Serialize, ToSchema)]
+struct Me {
     user: MeUser,
     /// `None` when the caller's org isn't bound to a Cheladb tenant yet.
-    tenant: Option<TenantView>,
+    #[schema(required = true)]
+    tenant: Option<Tenant>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct MeUser {
     sub: String,
     org_id: String,
 }
 
-#[derive(Debug, Serialize)]
-struct TenantView {
+#[derive(Debug, Serialize, ToSchema)]
+struct Tenant {
     id: TenantId,
     slug: String,
-    projects: Vec<ProjectView>,
+    projects: Vec<Project>,
 }
 
-#[derive(Debug, Serialize)]
-struct ProjectView {
+#[derive(Debug, Serialize, ToSchema)]
+struct Project {
     id: ProjectId,
     slug: String,
     databases: Vec<DatabaseSummary>,
 }
 
 /// Public database fields only: never credentials or container ids.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct DatabaseSummary {
     database_id: DatabaseId,
     name: String,
     status: DatabaseStatus,
+    #[schema(required = true)]
     host: Option<String>,
+    #[schema(required = true)]
     port: Option<u16>,
     /// Live `normal` branches, main included.
     branch_count: i64,
 }
 
-impl TenantView {
+impl Tenant {
     fn new(
         t: TenantOverview,
         mains: &HashMap<DatabaseId, (BranchRecord, i64)>,
@@ -717,13 +735,13 @@ impl TenantView {
             projects: t
                 .projects
                 .into_iter()
-                .map(|p| ProjectView::new(p, mains, proxy_domain))
+                .map(|p| Project::new(p, mains, proxy_domain))
                 .collect(),
         }
     }
 }
 
-impl ProjectView {
+impl Project {
     fn new(
         p: ProjectOverview,
         mains: &HashMap<DatabaseId, (BranchRecord, i64)>,
@@ -754,27 +772,35 @@ impl ProjectView {
     }
 }
 
+/// The documented routes: everything but `/health`. `build_router` serves them and
+/// `openapi()` describes them.
+pub(crate) fn api_router<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    OpenApiRouter::new()
+        .routes(routes!(create_database))
+        // GET, PATCH and DELETE share one path (cheladb-routes GET_DATABASE / UPDATE_DATABASE /
+        // DELETE_DATABASE).
+        .routes(routes!(get_database, branches::update_database, delete_database))
+        .routes(routes!(database_connection))
+        .routes(routes!(reset_password))
+        .routes(routes!(me))
+        .merge(branches::routes())
+        .merge(data_keys::routes())
+}
+
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
 pub fn build_router<M, J>(state: Arc<AppState<M, J>>) -> Router
 where
     M: MetadataPort,
     J: JobPort,
 {
-    Router::new()
+    let (router, _) = api_router().split_for_parts();
+    router
         .route(routes::HEALTH.path, get(health))
-        .route(routes::CREATE_DATABASE.path, post(create_database::<M, J>))
-        // GET and DELETE share one path (cheladb-routes GET_DATABASE / DELETE_DATABASE).
-        .route(
-            routes::GET_DATABASE.path,
-            get(get_database::<M, J>)
-                .delete(delete_database::<M, J>)
-                .patch(branches::update_database::<M, J>),
-        )
-        .route(routes::DATABASE_CONNECTION.path, get(database_connection::<M, J>))
-        .route(routes::RESET_PASSWORD.path, post(reset_password::<M, J>))
-        .route(routes::ME.path, get(me::<M, J>))
-        .merge(branches::routes::<M, J>())
-        .merge(data_keys::routes::<M, J>())
+        .merge(docs::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -783,30 +809,42 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "service": "orchestrator" }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/me",
+    operation_id = "getMe",
+    tag = "me",
+    summary = "The caller and their tenant",
+    responses(
+        (status = 200, description = "The signed-in user and, once their org is bound, the tenant with its projects and databases", body = Me),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+    ),
+)]
 async fn me<M, J>(State(state): State<Arc<AppState<M, J>>>, caller: Caller) -> Response
 where
     M: MetadataPort,
     J: JobPort,
 {
     let tenant = match lookup_tenant(&state, &caller.org_id).await {
-        Err(_) => return internal_error(),
+        Err(_) => return ApiError::internal().into_response(),
         Ok(None) => None,
         Ok(Some(tenant_id)) => match state.metadata.tenant_overview(tenant_id).await {
             Ok(None) => None,
             Ok(Some(overview)) => match main_branches(&state.metadata, overview.id).await {
-                Ok(mains) => Some(TenantView::new(overview, &mains, &state.proxy_domain)),
+                Ok(mains) => Some(Tenant::new(overview, &mains, &state.proxy_domain)),
                 Err(err) => {
                     error!("main branches: {err}");
-                    return internal_error();
+                    return ApiError::internal().into_response();
                 }
             },
             Err(err) => {
                 error!("tenant overview: {err}");
-                return internal_error();
+                return ApiError::internal().into_response();
             }
         },
     };
-    Json(MeResponse {
+    Json(Me {
         user: MeUser {
             sub: caller.sub,
             org_id: caller.org_id,
@@ -816,34 +854,51 @@ where
     .into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/databases",
+    operation_id = "createDatabase",
+    tag = "databases",
+    summary = "Create a database",
+    description = "Returns 202 at once. The database is provisioned by a background job.",
+    request_body = CreateDatabaseRequest,
+    responses(
+        (status = 202, description = "Accepted; the database is provisioned in the background (poll it until `ready`)", body = CreateDatabaseAccepted),
+        (status = 400, description = "`invalid_request`: the name is missing or invalid, or the JSON is malformed", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `forbidden`: `tenant_id` isn't the caller's tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the tenant or project doesn't exist (another tenant's project answers the same)", body = ErrorEnvelope),
+        (status = 409, description = "`name_taken`: a database with this name exists in the project", body = ErrorEnvelope),
+        (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
+        (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but a field is missing or has the wrong type", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+        (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
+    ),
+)]
 async fn create_database<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
-    Json(body): Json<CreateDatabaseRequest>,
+    ApiJson(body): ApiJson<CreateDatabaseRequest>,
 ) -> Response
 where
     M: MetadataPort,
     J: JobPort,
 {
     if body.tenant_id != principal.tenant_id {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "tenant_id does not match authenticated Zitadel org binding"
-            })),
+        return ApiError::new(
+            403,
+            ErrorCode::Forbidden,
+            "tenant_id does not match authenticated Zitadel org binding",
         )
-            .into_response();
+        .into_response();
     }
 
     if body.name.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "name is required" })),
-        )
-            .into_response();
+        return ApiError::invalid_request(400, "name is required").into_response();
     }
     if let Err(err) = cheladb_metadata::postgres_database_name(&body.name) {
-        return json_error(StatusCode::BAD_REQUEST, &err.to_string());
+        return ApiError::invalid_request(400, err.to_string()).into_response();
     }
 
     let job_id = Uuid::new_v4();
@@ -873,11 +928,12 @@ where
             .metadata
             .set_failed(database_id, &format!("publish failed: {err}"))
             .await;
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": "failed to enqueue provision job" })),
+        return ApiError::new(
+            503,
+            ErrorCode::WorkerUnavailable,
+            "failed to enqueue provision job",
         )
-            .into_response();
+        .into_response();
     }
 
     info!(
@@ -899,10 +955,26 @@ where
         .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/databases/{id}",
+    operation_id = "getDatabase",
+    tag = "databases",
+    summary = "Get a database",
+    params(("id" = Uuid, Path, description = "Database id")),
+    responses(
+        (status = 200, description = "The database with its settings and main endpoint", body = Database),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+    ),
+)]
 async fn get_database<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Response
 where
     M: MetadataPort,
@@ -911,52 +983,35 @@ where
     let database_id = DatabaseId(id);
     match state.metadata.get_database(database_id).await {
         // Tombstones are invisible through the API.
-        Ok(Some(record)) if record.status == DatabaseStatus::Deleted => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "database not found" })),
-        )
-            .into_response(),
+        Ok(Some(record)) if record.status == DatabaseStatus::Deleted => {
+            ApiError::not_found("database not found").into_response()
+        }
         Ok(Some(record)) => {
+            // Another tenant's database answers exactly what a missing one does.
             if record.tenant_id != principal.tenant_id {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({ "error": "forbidden" })),
-                )
-                    .into_response();
+                return ApiError::not_found("database not found").into_response();
             }
             let branches = match state.metadata.list_branches(database_id).await {
                 Ok(branches) => branches,
                 Err(err) => {
                     error!("list branches: {err}");
-                    return internal_error();
+                    return ApiError::internal().into_response();
                 }
             };
             let count = branches.iter().filter(|b| b.kind == BranchKind::Normal).count() as i64;
             let main = branches.iter().find(|b| b.id == BranchId::from(database_id));
             (
                 StatusCode::OK,
-                Json(DatabaseResponse::new(record, main, count, &state.proxy_domain)),
+                Json(Database::new(record, main, count, &state.proxy_domain)),
             )
                 .into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "database not found" })),
-        )
-            .into_response(),
+        Ok(None) => ApiError::not_found("database not found").into_response(),
         Err(err) => {
             error!("get_database: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-                .into_response()
+            ApiError::internal().into_response()
         }
     }
-}
-
-fn json_error(status: StatusCode, message: &str) -> Response {
-    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 /// The caller's own, non-deleted database, or the response to send instead.
@@ -964,23 +1019,23 @@ async fn load_owned<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
     id: Uuid,
-) -> Result<DatabaseRecord, Box<Response>>
+) -> Result<DatabaseRecord, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
     match state.metadata.get_database(DatabaseId(id)).await {
         Ok(Some(record)) if record.status == DatabaseStatus::Deleted => {
-            Err(Box::new(json_error(StatusCode::NOT_FOUND, "database not found")))
+            Err(ApiError::not_found("database not found"))
         }
         Ok(Some(record)) if record.tenant_id != principal.tenant_id => {
-            Err(Box::new(json_error(StatusCode::FORBIDDEN, "forbidden")))
+            Err(ApiError::not_found("database not found"))
         }
         Ok(Some(record)) => Ok(record),
-        Ok(None) => Err(Box::new(json_error(StatusCode::NOT_FOUND, "database not found"))),
+        Ok(None) => Err(ApiError::not_found("database not found")),
         Err(err) => {
             error!("load database: {err}");
-            Err(Box::new(internal_error()))
+            Err(ApiError::internal())
         }
     }
 }
@@ -989,7 +1044,7 @@ where
 async fn load_main<M, J>(
     state: &AppState<M, J>,
     database_id: DatabaseId,
-) -> Result<Option<BranchRecord>, Box<Response>>
+) -> Result<Option<BranchRecord>, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
@@ -1000,12 +1055,24 @@ where
         .await
         .map_err(|err| {
             error!("load main branch: {err}");
-            Box::new(internal_error())
+            ApiError::internal()
         })
 }
 
-#[derive(Debug, Serialize)]
-struct ConnectionDetails {
+/// The 202 body of the routes that start background work: the status the row moved to.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct OperationAccepted {
+    pub(crate) status: &'static str,
+}
+
+/// The body of a successful password reset (nothing to return; the new password is read from
+/// the connection details).
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PasswordResetResult {}
+
+/// The owner credentials of a branch.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ConnectionDetails {
     host: String,
     port: u16,
     database: String,
@@ -1020,10 +1087,28 @@ const BACKUP_REFUSAL: &str =
     "this is a restore backup with no compute; create a branch from it to connect";
 
 /// Reveal the owner credentials of a ready database (main's). Never cached, never logged.
+#[utoipa::path(
+    get,
+    path = "/v1/databases/{id}/connection",
+    operation_id = "getDatabaseConnection",
+    tag = "databases",
+    summary = "Reveal a database's connection details",
+    description = "The owner credentials of the database's main branch. Never cached (`Cache-Control: no-store`) and never logged.",
+    params(("id" = Uuid, Path, description = "Database id")),
+    responses(
+        (status = 200, description = "The owner credentials; never cached", body = ConnectionDetails),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
+        (status = 409, description = "`database_not_ready`: the database isn't ready; `branch_not_ready`: its main isn't ready; `credentials_unavailable`: the owner credentials are missing", body = ErrorEnvelope),
+        (status = 500, description = "`credentials_unavailable`: the stored credentials can't be opened with the current secrets key; `internal`: unexpected", body = ErrorEnvelope),
+    ),
+)]
 async fn database_connection<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Response
 where
     M: MetadataPort,
@@ -1031,21 +1116,23 @@ where
 {
     let record = match load_owned(&state, &principal, id).await {
         Ok(record) => record,
-        Err(resp) => return *resp,
+        Err(resp) => return resp.into_response(),
     };
     if record.status != DatabaseStatus::Ready {
-        return json_error(
-            StatusCode::CONFLICT,
-            &format!(
+        return ApiError::new(
+            409,
+            ErrorCode::DatabaseNotReady,
+            format!(
                 "database is {}; connection details are available once it is ready",
                 record.status.as_str()
             ),
-        );
+        )
+        .into_response();
     }
     // Main holds the database's endpoint and sealed password (AAD = its id = the database's).
     let main = match load_main(&state, record.database_id).await {
         Ok(main) => main,
-        Err(resp) => return *resp,
+        Err(resp) => return resp.into_response(),
     };
     reveal(&state, &principal, &record, main).await
 }
@@ -1062,31 +1149,37 @@ where
     J: JobPort,
 {
     let Some(branch) = branch else {
-        return json_error(
-            StatusCode::CONFLICT,
+        return ApiError::new(
+            409,
+            ErrorCode::CredentialsUnavailable,
             "credentials unavailable; recreate this database",
-        );
+        )
+        .into_response();
     };
     if branch.kind == BranchKind::Backup {
-        return json_error(StatusCode::CONFLICT, BACKUP_REFUSAL);
+        return ApiError::new(409, ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
     }
     if branch.status != BranchStatus::Ready {
-        return json_error(
-            StatusCode::CONFLICT,
-            &format!(
+        return ApiError::new(
+            409,
+            ErrorCode::BranchNotReady,
+            format!(
                 "branch is {}; connection details are available once it is ready",
                 branch.status.as_str()
             ),
-        );
+        )
+        .into_response();
     }
     let sealed = branch.owner_password_enc.filter(|s| !s.is_empty());
     let (Some(endpoint_id), Some(database), Some(sealed)) =
         (branch.endpoint_id, record.database_name.clone(), sealed)
     else {
-        return json_error(
-            StatusCode::CONFLICT,
+        return ApiError::new(
+            409,
+            ErrorCode::CredentialsUnavailable,
             "credentials unavailable; recreate this database",
-        );
+        )
+        .into_response();
     };
     let password = match open_credential(
         &state.secrets,
@@ -1097,11 +1190,13 @@ where
         Ok(password) => password,
         Err(err) => {
             error!(database_id = %record.database_id, branch_id = %branch.id, "decrypt owner password: {err}");
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+            return ApiError::new(
+                500,
+                ErrorCode::CredentialsUnavailable,
                 "stored credentials can't be decrypted with the current secrets key; \
                  restore the original CHELADB_SECRETS_KEY file",
-            );
+            )
+            .into_response();
         }
     };
     let user = record.owner_role.clone().unwrap_or_else(|| "postgres".to_string());
@@ -1133,10 +1228,29 @@ where
         .into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/databases/{id}/reset-password",
+    operation_id = "resetDatabasePassword",
+    tag = "databases",
+    summary = "Reset a database's owner password",
+    params(("id" = Uuid, Path, description = "Database id")),
+    responses(
+        (status = 200, description = "The password was reset; read the new one from the connection details", body = PasswordResetResult),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
+        (status = 409, description = "`database_not_ready`: the database isn't ready; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the owner credentials are missing", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: the worker failed to reset the password", body = ErrorEnvelope),
+        (status = 503, description = "`not_applied`: the new password is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope),
+        (status = 504, description = "`timeout`: the worker or database didn't answer in time", body = ErrorEnvelope),
+    ),
+)]
 async fn reset_password<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Response
 where
     M: MetadataPort,
@@ -1144,14 +1258,15 @@ where
 {
     let record = match load_owned(&state, &principal, id).await {
         Ok(record) => record,
-        Err(resp) => return *resp,
+        Err(resp) => return resp.into_response(),
     };
     if record.status != DatabaseStatus::Ready {
-        return json_error(StatusCode::CONFLICT, "database is not ready");
+        return ApiError::new(409, ErrorCode::DatabaseNotReady, "database is not ready")
+            .into_response();
     }
     let main = match load_main(&state, record.database_id).await {
         Ok(main) => main,
-        Err(resp) => return *resp,
+        Err(resp) => return resp.into_response(),
     };
     reset_branch_password(&state, &principal, &record, main).await
 }
@@ -1170,60 +1285,83 @@ where
     // A branch without an endpoint has nothing to reset; say so instead of failing inside
     // the worker.
     let Some(branch) = branch else {
-        return json_error(
-            StatusCode::CONFLICT,
+        return ApiError::new(
+            409,
+            ErrorCode::CredentialsUnavailable,
             "credentials unavailable; recreate this database",
-        );
+        )
+        .into_response();
     };
     if branch.kind == BranchKind::Backup {
-        return json_error(StatusCode::CONFLICT, BACKUP_REFUSAL);
+        return ApiError::new(409, ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
     }
     if branch.status != BranchStatus::Ready {
-        return json_error(StatusCode::CONFLICT, "branch is not ready");
+        return ApiError::new(409, ErrorCode::BranchNotReady, "branch is not ready").into_response();
     }
     if branch.endpoint_id.is_none() {
-        return json_error(
-            StatusCode::CONFLICT,
+        return ApiError::new(
+            409,
+            ErrorCode::CredentialsUnavailable,
             "credentials unavailable; recreate this database",
-        );
+        )
+        .into_response();
     }
     let (database_id, branch_id) = (record.database_id, branch.id);
     match state.js.reset_password(database_id, branch_id).await {
         Ok(reply) if reply.ok => {
             info!(request_id = %principal.request_id, %database_id, %branch_id, "owner password reset");
-            (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+            (StatusCode::OK, Json(PasswordResetResult {})).into_response()
         }
         Ok(reply) if reply.error.as_deref() == Some("not ready") => {
-            json_error(StatusCode::CONFLICT, "branch is not ready")
+            ApiError::new(409, ErrorCode::BranchNotReady, "branch is not ready").into_response()
         }
         Ok(reply) if reply.error.as_deref() == Some(RESET_NOT_APPLIED) => {
-            json_error(StatusCode::SERVICE_UNAVAILABLE, RESET_NOT_APPLIED)
+            ApiError::new(503, ErrorCode::NotApplied, RESET_NOT_APPLIED).into_response()
         }
-        Ok(reply) if reply.error.as_deref() == Some("timed out") => json_error(
-            StatusCode::GATEWAY_TIMEOUT,
+        Ok(reply) if reply.error.as_deref() == Some("timed out") => ApiError::new(
+            504,
+            ErrorCode::Timeout,
             "the database did not respond; try again",
-        ),
+        )
+        .into_response(),
         Ok(reply) => {
             error!(%database_id, %branch_id, "reset password failed: {:?}", reply.error);
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "password reset failed")
+            ApiError::new(500, ErrorCode::Internal, "password reset failed").into_response()
         }
-        Err(ResetError::Timeout) => json_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "worker did not respond; try again",
-        ),
+        Err(ResetError::Timeout) => {
+            ApiError::new(504, ErrorCode::Timeout, "worker did not respond; try again")
+                .into_response()
+        }
         Err(ResetError::Transport(err)) => {
             error!(%database_id, %branch_id, "reset password: {err}");
-            json_error(StatusCode::SERVICE_UNAVAILABLE, "worker unavailable")
+            ApiError::new(503, ErrorCode::WorkerUnavailable, "worker unavailable").into_response()
         }
     }
 }
 
 /// Start deleting a database (tombstone). The worker removes the container and
 /// its data; a lost job is retried by the worker's reconcile loop.
+#[utoipa::path(
+    delete,
+    path = "/v1/databases/{id}",
+    operation_id = "deleteDatabase",
+    tag = "databases",
+    summary = "Delete a database",
+    params(("id" = Uuid, Path, description = "Database id")),
+    responses(
+        (status = 202, description = "Accepted; the database moves to `deleting` and is removed in the background", body = OperationAccepted),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
+        (status = 409, description = "`already_deleting`: the database is already being deleted", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+    ),
+)]
 async fn delete_database<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Response
 where
     M: MetadataPort,
@@ -1231,16 +1369,17 @@ where
 {
     let record = match load_owned(&state, &principal, id).await {
         Ok(record) => record,
-        Err(resp) => return *resp,
+        Err(resp) => return resp.into_response(),
     };
     match state.metadata.begin_delete(record.database_id).await {
         Ok(true) => {}
         Ok(false) => {
-            return json_error(StatusCode::CONFLICT, "database is already being deleted")
+            return ApiError::new(409, ErrorCode::AlreadyDeleting, "database is already being deleted")
+                .into_response()
         }
         Err(err) => {
             error!("begin delete: {err}");
-            return internal_error();
+            return ApiError::internal().into_response();
         }
     }
     let job = JobEnvelope {
@@ -1255,35 +1394,30 @@ where
     info!(request_id = %principal.request_id, database_id = %record.database_id, "delete requested");
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "status": "deleting" })),
+        Json(OperationAccepted { status: "deleting" }),
     )
         .into_response()
 }
 
 fn map_metadata_error(err: MetadataError) -> Response {
     match err {
-        MetadataError::TenantNotFound(_) | MetadataError::ProjectNotFound(_) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": err.to_string() })),
+        MetadataError::TenantNotFound(_) | MetadataError::ProjectNotFound(_) => {
+            ApiError::not_found(err.to_string()).into_response()
+        }
+        // Another tenant's project looks exactly like a missing one.
+        MetadataError::ProjectTenantMismatch { project_id, .. } => {
+            ApiError::not_found(MetadataError::ProjectNotFound(project_id).to_string())
+                .into_response()
+        }
+        MetadataError::DuplicateDatabaseName => ApiError::new(
+            409,
+            ErrorCode::NameTaken,
+            "database name already exists in project",
         )
-            .into_response(),
-        MetadataError::ProjectTenantMismatch { .. } => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-        MetadataError::DuplicateDatabaseName => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "database name already exists in project" })),
-        )
-            .into_response(),
+        .into_response(),
         other => {
             error!("metadata error: {other}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-                .into_response()
+            ApiError::internal().into_response()
         }
     }
 }

@@ -1,59 +1,36 @@
-import { Fragment, useCallback, useEffect, useState } from "react";
-import type { DatabaseSummary, MeResponse } from "@cheladb/types";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useGetMe, type DatabaseSummary, type Me } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
-import { ApiError, type ApiClient } from "@/lib/api";
+import { errorText } from "@/lib/errors";
+import { pollWhile, TRANSITIONAL } from "@/lib/query";
 import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
 import { DatabaseDataApi } from "./database-data-api";
 
-type MeState =
-  | { status: "loading" }
-  | { status: "error"; message: string }
-  | { status: "restarting" }
-  | { status: "ready"; me: MeResponse; refreshError?: string };
-
 export interface DashboardProps {
-  api: ApiClient;
   /** The gateway's base URL (shown as the data API endpoint). */
   apiUrl: string;
   profile: { name?: string; email?: string };
   onSignOut: () => void;
-  pollIntervalMs?: number;
+  /** Called on the first successful `getMe` (and again after a failed one recovers): re-arms the re-auth guard. */
+  onLoaded?: () => void;
+  /** Extra header links, shown before "Sign out". */
+  nav?: ReactNode;
 }
 
-export function Dashboard({ api, apiUrl, profile, onSignOut, pollIntervalMs }: DashboardProps) {
-  const [state, setState] = useState<MeState>({ status: "loading" });
-
-  const load = useCallback(async () => {
-    try {
-      setState({ status: "ready", me: await api.me() });
-    } catch (err) {
-      if (err instanceof ApiError && err.signInRestarted) {
-        setState({ status: "restarting" });
-        return;
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      // A failed *refresh* keeps showing the last good workspace (and polling
-      // continues); only a failed first load becomes the error view.
-      setState((previous) =>
-        previous.status === "ready"
-          ? { ...previous, refreshError: message }
-          : { status: "error", message },
-      );
-    }
-  }, [api]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
+export function Dashboard({ apiUrl, profile, onSignOut, onLoaded, nav }: DashboardProps) {
+  const queryClient = useQueryClient();
   // While anything is being created or deleted, keep the list fresh.
+  const me = useGetMe({ query: { refetchInterval: pollWhile<Me>(hasTransitional) } });
+  const loaded = me.isSuccess;
+  // Once per transition into success (not per poll): re-arm the re-auth guard.
   useEffect(() => {
-    if (state.status !== "ready" || !hasTransitional(state.me)) return;
-    const timer = setTimeout(() => void load(), pollIntervalMs ?? 2000);
-    return () => clearTimeout(timer);
-  }, [state, load, pollIntervalMs]);
+    if (loaded) onLoaded?.();
+  }, [loaded]);
+
+  const restarting = me.error?.signInRestarted === true;
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -64,48 +41,49 @@ export function Dashboard({ api, apiUrl, profile, onSignOut, pollIntervalMs }: D
             {profile.name && <span>{profile.name}</span>}
             {profile.email && <span className="text-muted-foreground">{profile.email}</span>}
           </span>
-          <Button variant="outline" size="sm" onClick={onSignOut}>
+          {nav}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              // Nothing of this session may outlive it in the cache.
+              queryClient.clear();
+              onSignOut();
+            }}
+          >
             Sign out
           </Button>
         </div>
       </header>
       <main className="mx-auto max-w-4xl space-y-8 p-8">
-        {state.status === "loading" && (
-          <p className="text-muted-foreground">Loading your workspace…</p>
-        )}
-        {state.status === "restarting" && (
+        {restarting ? (
           <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
+        ) : me.data === undefined ? (
+          me.error ? (
+            <div className="space-y-3">
+              <p role="alert" className="text-destructive">
+                Couldn't load your workspace: {errorText(me.error)}
+              </p>
+              <Button onClick={() => void me.refetch()}>Retry</Button>
+            </div>
+          ) : (
+            <p className="text-muted-foreground">Loading your workspace…</p>
+          )
+        ) : (
+          <>
+            {/* A failed *refresh* keeps showing the last good workspace; polling continues. */}
+            {me.error && (
+              <p className="text-sm text-muted-foreground">Couldn't refresh ({errorText(me.error)}); retrying…</p>
+            )}
+            <Workspace me={me.data} apiUrl={apiUrl} />
+          </>
         )}
-        {state.status === "error" && (
-          <div className="space-y-3">
-            <p role="alert" className="text-destructive">
-              Couldn't load your workspace: {state.message}
-            </p>
-            <Button onClick={() => void load()}>Retry</Button>
-          </div>
-        )}
-        {state.status === "ready" && state.refreshError && (
-          <p className="text-sm text-muted-foreground">Couldn't refresh ({state.refreshError}); retrying…</p>
-        )}
-        {state.status === "ready" && <Workspace me={state.me} api={api} apiUrl={apiUrl} reload={load} pollIntervalMs={pollIntervalMs} />}
       </main>
     </div>
   );
 }
 
-function Workspace({
-  me,
-  api,
-  apiUrl,
-  reload,
-  pollIntervalMs,
-}: {
-  me: MeResponse;
-  api: ApiClient;
-  apiUrl: string;
-  reload: () => Promise<void>;
-  pollIntervalMs?: number;
-}) {
+function Workspace({ me, apiUrl }: { me: Me; apiUrl: string }) {
   const { tenant } = me;
   if (tenant === null) {
     return (
@@ -149,45 +127,19 @@ function Workspace({
               </dd>
             </dl>
           </div>
-          <CreateDatabaseForm
-            api={api}
-            tenantId={tenant.id}
-            projectId={project.id}
-            onSettled={() => void reload()}
-            pollIntervalMs={pollIntervalMs}
-          />
-          <DatabasesTable
-            databases={project.databases}
-            api={api}
-            apiUrl={apiUrl}
-            onChanged={() => void reload()}
-            pollIntervalMs={pollIntervalMs}
-          />
+          <CreateDatabaseForm tenantId={tenant.id} projectId={project.id} />
+          <DatabasesTable databases={project.databases} apiUrl={apiUrl} />
         </section>
       ))}
     </>
   );
 }
 
-const TRANSITIONAL = new Set(["pending", "provisioning", "deleting"]);
-
-function hasTransitional(me: MeResponse): boolean {
+function hasTransitional(me: Me): boolean {
   return (me.tenant?.projects ?? []).some((p) => p.databases.some((d) => TRANSITIONAL.has(d.status)));
 }
 
-function DatabasesTable({
-  databases,
-  api,
-  apiUrl,
-  onChanged,
-  pollIntervalMs,
-}: {
-  databases: DatabaseSummary[];
-  api: ApiClient;
-  apiUrl: string;
-  onChanged: () => void;
-  pollIntervalMs?: number;
-}) {
+function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; apiUrl: string }) {
   const [open, setOpen] = useState<{ id: string; view: "branches" | "data-api" } | null>(null);
   const toggle = (id: string, view: "branches" | "data-api") =>
     setOpen(open?.id === id && open.view === view ? null : { id, view });
@@ -213,7 +165,7 @@ function DatabasesTable({
               <td className="py-2 font-mono">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
               <td className="py-2">
                 <div className="flex flex-wrap items-start gap-2">
-                  <DatabaseActions api={api} database={db} onChanged={onChanged} />
+                  <DatabaseActions database={db} />
                   <Button
                     size="sm"
                     variant="outline"
@@ -239,9 +191,9 @@ function DatabasesTable({
               <tr className="border-b last:border-0">
                 <td colSpan={4}>
                   {open.view === "branches" ? (
-                    <DatabaseBranches api={api} database={db} pollIntervalMs={pollIntervalMs} />
+                    <DatabaseBranches database={db} />
                   ) : (
-                    <DatabaseDataApi api={api} apiUrl={apiUrl} database={db} />
+                    <DatabaseDataApi apiUrl={apiUrl} database={db} />
                   )}
                 </td>
               </tr>

@@ -78,7 +78,7 @@ mod tests {
         let identity = Identity {
             sub: "u".into(),
             org_id: "o".into(),
-            auth: AuthMethod::PlatformJwt,
+            auth: AuthMethod::ManagementJwt,
             request_id: "r".into(),
             data: None,
         };

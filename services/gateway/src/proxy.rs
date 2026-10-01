@@ -1,7 +1,7 @@
 //! Pingora adapter. Only this module and `main.rs` touch Pingora types; the
 //! decisions live in `pipeline`.
 
-use crate::pipeline::{GatewayResponse, Outcome, Pipeline, ProxyPlan, RequestParts, REQUEST_ID_HEADER};
+use crate::pipeline::{error_json, GatewayResponse, Outcome, Pipeline, ProxyPlan, RequestParts, REQUEST_ID_HEADER};
 use crate::upstreams::Upstreams;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -9,7 +9,6 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
-use serde_json::json;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -208,12 +207,13 @@ impl ProxyHttp for Gateway {
         // upgraded), writing our own error would splice JSON into it. Let the
         // connection close so the client sees a truncated response instead.
         if status > 0 && session.response_written().is_none() {
-            let message = match status {
-                502 => "upstream unavailable",
-                504 => "upstream timed out",
-                400 => "bad request",
-                408 => "request timed out",
-                _ => "internal error",
+            let (code, message) = match status {
+                502 => ("unavailable", "upstream unavailable"),
+                504 => ("timeout", "upstream timed out"),
+                400 => ("invalid_request", "bad request"),
+                408 => ("timeout", "request timed out"),
+                413 => ("too_large", "request body too large"),
+                _ => ("internal", "internal error"),
             };
             let headers = ctx
                 .plan
@@ -223,7 +223,7 @@ impl ProxyHttp for Gateway {
             let resp = GatewayResponse {
                 status,
                 headers,
-                body: Some(json!({ "error": message })),
+                body: Some(error_json(code, message)),
             };
             let _ = write_gateway_response(session, &resp, &ctx.request_id).await;
         }

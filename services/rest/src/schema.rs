@@ -16,14 +16,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use cheladb_types::data_api_schema::{
+    ArgDesc, ColumnDesc, DataApiSchema, FunctionDesc, Privilege, ReturnDesc, SchemaEntry, TableDesc,
+    TableKind,
+};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use sqlx::PgConnection;
 
 use crate::query::Name;
 use crate::sql::{Catalog, ColumnInfo, FnLookupError, FunctionInfo, TableInfo, quote_ident};
 
-/// Schemas never exposed, whatever the grants: the platform's machinery, Postgres's and
+/// Schemas never exposed, whatever the grants: Cheladb's own machinery, Postgres's and
 /// Neon's own. `pg_temp_*` and `pg_toast_temp_*` are hidden too ([`is_reserved`]).
 pub const RESERVED_SCHEMAS: &[&str] = &[
     "cheladb",
@@ -37,7 +41,10 @@ pub const RESERVED_SCHEMAS: &[&str] = &[
 /// Each overload of one function, with the names of its arguments that have no default.
 type Overloads = Vec<(FunctionInfo, Vec<String>)>;
 /// A schema's tables and its functions' overloads, for the JSON.
-type SchemaJson = (Map<String, Value>, BTreeMap<String, Vec<Value>>);
+type SchemaJson = (
+    BTreeMap<String, TableDesc>,
+    BTreeMap<String, Vec<FunctionDesc>>,
+);
 
 /// Roles cached per schema version; past this many, the oldest are dropped.
 const ROLE_VIEWS: u64 = 64;
@@ -165,7 +172,7 @@ pub struct Table {
     pub schema: String,
     pub name: String,
     /// `table` (`r`, `p`), `view`, `materialized_view` or `foreign_table`.
-    pub kind: &'static str,
+    pub kind: TableKind,
     pub rls: bool,
     /// A view that runs with the caller's privileges (and so under its RLS).
     pub security_invoker: bool,
@@ -209,6 +216,18 @@ pub struct Privileges {
 impl Privileges {
     pub fn any(&self) -> bool {
         self.select || self.insert || self.update || self.delete
+    }
+
+    pub fn held(&self) -> Vec<Privilege> {
+        [
+            (self.select, Privilege::Select),
+            (self.insert, Privilege::Insert),
+            (self.update, Privilege::Update),
+            (self.delete, Privilege::Delete),
+        ]
+        .into_iter()
+        .filter_map(|(held, p)| held.then_some(p))
+        .collect()
     }
 
     pub fn names(&self) -> Vec<&'static str> {
@@ -371,10 +390,10 @@ impl Schema {
                     schema,
                     name,
                     kind: match relkind.as_str() {
-                        "v" => "view",
-                        "m" => "materialized_view",
-                        "f" => "foreign_table",
-                        _ => "table",
+                        "v" => TableKind::View,
+                        "m" => TableKind::MaterializedView,
+                        "f" => TableKind::ForeignTable,
+                        _ => TableKind::Table,
                     },
                     rls,
                     security_invoker,
@@ -499,39 +518,35 @@ impl Schema {
             if !held.iter().any(|(_, p)| p.any()) {
                 continue;
             }
-            let mut columns = Map::new();
+            let mut columns = BTreeMap::new();
             for c in &t.columns {
                 note(&c.ty);
-                let mut column = json!({
-                    "type": c.ty.name,
-                    "array": c.ty.array,
-                    "nullable": c.nullable,
-                    "has_default": c.has_default,
-                    "generated": c.info.generated,
-                });
-                if let Some(e) = &c.ty.enum_ref {
-                    column["enum"] = json!(e);
-                }
-                columns.insert(c.info.name.clone(), column);
+                columns.insert(
+                    c.info.name.clone(),
+                    ColumnDesc {
+                        ty: c.ty.name.clone(),
+                        array: c.ty.array,
+                        nullable: c.nullable,
+                        has_default: c.has_default,
+                        generated: c.info.generated,
+                        r#enum: c.ty.enum_ref.clone(),
+                    },
+                );
             }
-            let privileges = if privileges {
-                Value::Object(
-                    held.iter()
-                        .map(|(role, p)| ((*role).to_owned(), json!(p.names())))
-                        .collect(),
-                )
-            } else {
-                Value::Null
-            };
+            let privileges = privileges.then(|| {
+                held.iter()
+                    .map(|(role, p)| ((*role).to_owned(), p.held()))
+                    .collect()
+            });
             schemas.entry(t.schema.clone()).or_default().0.insert(
                 t.name.clone(),
-                json!({
-                    "kind": t.kind,
-                    "rls": t.rls,
-                    "security_invoker": t.security_invoker,
-                    "privileges": privileges,
-                    "columns": columns,
-                }),
+                TableDesc {
+                    kind: t.kind,
+                    rls: t.rls,
+                    security_invoker: t.security_invoker,
+                    privileges,
+                    columns,
+                },
             );
         }
         for f in &self.functions {
@@ -539,12 +554,17 @@ impl Schema {
                 continue;
             }
             note(&f.returns);
-            let args: Vec<Value> = f
+            let args: Vec<ArgDesc> = f
                 .args
                 .iter()
                 .map(|a| {
                     note(&a.ty);
-                    json!({ "name": a.name, "type": a.ty.name, "array": a.ty.array, "has_default": a.has_default })
+                    ArgDesc {
+                        name: a.name.clone(),
+                        ty: a.ty.name.clone(),
+                        array: a.ty.array,
+                        has_default: a.has_default,
+                    }
                 })
                 .collect();
             schemas
@@ -553,12 +573,16 @@ impl Schema {
                 .1
                 .entry(f.info.name.clone())
                 .or_default()
-                .push(json!({
-                    "args": args,
-                    "returns": { "type": f.returns.name, "array": f.returns.array, "set": f.info.returns_set },
-                }));
+                .push(FunctionDesc {
+                    args,
+                    returns: ReturnDesc {
+                        ty: f.returns.name.clone(),
+                        array: f.returns.array,
+                        set: f.info.returns_set,
+                    },
+                });
         }
-        let mut enums: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+        let mut enums: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
         for (schema, name, labels) in self.enums.values() {
             let qualified = format!("{schema}.{name}");
             if (schemas.contains_key(schema) || referenced.contains(&qualified))
@@ -567,23 +591,32 @@ impl Schema {
                 enums
                     .entry(schema.clone())
                     .or_default()
-                    .insert(name.clone(), json!(labels));
+                    .insert(name.clone(), labels.clone());
             }
         }
         for schema in enums.keys() {
             schemas.entry(schema.clone()).or_default();
         }
-        let out: Map<String, Value> = schemas
+        let out: BTreeMap<String, SchemaEntry> = schemas
             .into_iter()
             .map(|(name, (tables, functions))| {
-                let e = enums.remove(&name).unwrap_or_default();
+                let enums = enums.remove(&name).unwrap_or_default();
                 (
                     name,
-                    json!({ "tables": tables, "functions": functions, "enums": e }),
+                    SchemaEntry {
+                        tables,
+                        functions,
+                        enums,
+                    },
                 )
             })
             .collect();
-        json!({ "version": self.version, "default_schema": default_schema, "schemas": out })
+        serde_json::to_value(DataApiSchema {
+            version: self.version.clone(),
+            default_schema: default_schema.to_owned(),
+            schemas: out,
+        })
+        .expect("the schema document serialises")
     }
 }
 
@@ -727,4 +760,160 @@ pub async fn role_view(
     }
     let visibility = visibility(conn, role).await?;
     Ok(schema.insert_view(role, visibility))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn td(name: &str, array: bool, enum_ref: Option<&str>) -> TypeDesc {
+        TypeDesc {
+            name: name.into(),
+            array,
+            enum_ref: enum_ref.map(Into::into),
+        }
+    }
+
+    fn column(name: &str, ty: TypeDesc, nullable: bool, has_default: bool, generated: bool) -> Column {
+        Column {
+            info: ColumnInfo {
+                name: name.into(),
+                type_sql: ty.name.clone(),
+                array: ty.array,
+                text_like: false,
+                generated,
+            },
+            ty,
+            nullable,
+            has_default,
+        }
+    }
+
+    fn table(oid: u32, schema: &str, name: &str, kind: TableKind, invoker: bool, columns: Vec<Column>) -> Table {
+        Table {
+            oid,
+            schema: schema.into(),
+            name: name.into(),
+            kind,
+            rls: !invoker,
+            security_invoker: invoker,
+            columns,
+        }
+    }
+
+    fn fixture() -> Schema {
+        let search = Function {
+            oid: 20,
+            info: FunctionInfo {
+                schema: "public".into(),
+                name: "search".into(),
+                args: vec![("q".into(), "text".into()), ("lim".into(), "integer".into())],
+                returns_set: true,
+                returns_void: false,
+            },
+            args: vec![
+                Arg { name: "q".into(), ty: td("text", false, None), has_default: false },
+                Arg { name: "lim".into(), ty: td("int4", false, None), has_default: true },
+            ],
+            returns: td("text", true, None),
+        };
+        let mut enums = HashMap::new();
+        enums.insert(100, ("billing".to_owned(), "mood".to_owned(), vec!["sad".to_owned(), "happy".to_owned()]));
+        enums.insert(101, ("extra".to_owned(), "level".to_owned(), vec!["low".to_owned(), "high".to_owned()]));
+        enums.insert(102, ("other".to_owned(), "unused".to_owned(), vec!["x".to_owned()]));
+        Schema {
+            version: "17.2".into(),
+            namespaces: vec![(1, "public".into()), (2, "billing".into())],
+            tables: vec![
+                table(
+                    10,
+                    "public",
+                    "items",
+                    TableKind::Table,
+                    false,
+                    vec![
+                        column("id", td("int8", false, None), false, true, true),
+                        column("tags", td("text", true, None), true, false, false),
+                        column("mood", td("mood", false, Some("billing.mood")), false, false, false),
+                        column("level", td("level", false, Some("extra.level")), true, false, false),
+                    ],
+                ),
+                table(
+                    11,
+                    "billing",
+                    "v",
+                    TableKind::View,
+                    true,
+                    vec![column("amount", td("numeric", false, None), true, false, false)],
+                ),
+            ],
+            functions: vec![search],
+            enums,
+            views: moka::sync::Cache::new(ROLE_VIEWS),
+        }
+    }
+
+    fn visibility(tables: &[(u32, Privileges)]) -> Visibility {
+        Visibility {
+            schemas: HashSet::from([1, 2]),
+            tables: tables.iter().copied().collect(),
+            functions: HashSet::from([20]),
+        }
+    }
+
+    fn expected(anon: Value, v_privs: Value) -> Value {
+        json!({
+            "version": "17.2",
+            "default_schema": "public",
+            "schemas": {
+                "public": {
+                    "tables": {"items": {
+                        "kind": "table", "rls": true, "security_invoker": false, "privileges": anon,
+                        "columns": {
+                            "id": {"type": "int8", "array": false, "nullable": false, "has_default": true, "generated": true},
+                            "tags": {"type": "text", "array": true, "nullable": true, "has_default": false, "generated": false},
+                            "mood": {"type": "mood", "array": false, "nullable": false, "has_default": false, "generated": false, "enum": "billing.mood"},
+                            "level": {"type": "level", "array": false, "nullable": true, "has_default": false, "generated": false, "enum": "extra.level"}
+                        }
+                    }},
+                    "functions": {"search": [{
+                        "args": [
+                            {"name": "q", "type": "text", "array": false, "has_default": false},
+                            {"name": "lim", "type": "int4", "array": false, "has_default": true}
+                        ],
+                        "returns": {"type": "text", "array": true, "set": true}
+                    }]},
+                    "enums": {}
+                },
+                "billing": {
+                    "tables": {"v": {
+                        "kind": "view", "rls": false, "security_invoker": true, "privileges": v_privs,
+                        "columns": {"amount": {"type": "numeric", "array": false, "nullable": true, "has_default": false, "generated": false}}
+                    }},
+                    "functions": {},
+                    "enums": {"mood": ["sad", "happy"]}
+                },
+                "extra": {"tables": {}, "functions": {}, "enums": {"level": ["low", "high"]}}
+            }
+        })
+    }
+
+    #[test]
+    fn to_json_matches_the_documented_document() {
+        let s = fixture();
+        let select = Privileges { select: true, ..Default::default() };
+        let all = Privileges { select: true, insert: true, update: true, delete: true };
+        let anon = visibility(&[(10, select)]);
+        let auth = visibility(&[(10, all), (11, select)]);
+        let roles = [("anon", &anon), ("authenticated", &auth)];
+
+        let without = s.to_json("public", &roles, false);
+        assert_eq!(without, expected(Value::Null, Value::Null), "{without}");
+
+        let with = s.to_json("public", &roles, true);
+        let items = json!({"anon": ["select"], "authenticated": ["select", "insert", "update", "delete"]});
+        let v = json!({"anon": [], "authenticated": ["select"]});
+        assert_eq!(with, expected(items, v), "{with}");
+    }
 }

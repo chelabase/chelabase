@@ -19,7 +19,7 @@ fn identity() -> Identity {
     Identity {
         sub: "user-1".into(),
         org_id: "org-1".into(),
-        auth: AuthMethod::PlatformJwt,
+        auth: AuthMethod::ManagementJwt,
         request_id: "rid-1".into(),
         data: None,
     }
@@ -42,7 +42,7 @@ fn signed_token_verifies_and_carries_identity() {
     assert_eq!(claims.aud, "orchestrator");
     assert_eq!(claims.sub, "user-1");
     assert_eq!(claims.org_id, "org-1");
-    assert_eq!(claims.auth, AuthMethod::PlatformJwt);
+    assert_eq!(claims.auth, AuthMethod::ManagementJwt);
     assert_eq!(claims.rid, "rid-1");
     assert_eq!(claims.exp - claims.iat, INTERNAL_TOKEN_TTL_SECS);
 }
@@ -124,7 +124,7 @@ fn token_with_another_issuer_is_rejected() {
         "exp": now() + 60,
         "sub": "user-1",
         "org_id": "org-1",
-        "auth": "platform_jwt",
+        "auth": "management_jwt",
         "rid": "rid-1",
     });
     let token = jsonwebtoken::encode(
@@ -163,7 +163,7 @@ fn data_identity_round_trips_in_claims() {
 }
 
 #[test]
-fn platform_claims_without_data_still_verify() {
+fn management_claims_without_data_still_verify() {
     let (private_pem, public_pem) = generate_keypair_pem();
     let verifier = InternalVerifier::from_pem(public_pem.as_bytes()).unwrap();
     let key = jsonwebtoken::EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap();
@@ -175,7 +175,7 @@ fn platform_claims_without_data_still_verify() {
         "exp": now() + 60,
         "sub": "user-1",
         "org_id": "org-1",
-        "auth": "platform_jwt",
+        "auth": "management_jwt",
         "rid": "rid-1",
     });
     let token = jsonwebtoken::encode(
@@ -186,9 +186,9 @@ fn platform_claims_without_data_still_verify() {
     .unwrap();
     let verified = verifier.verify(&token, "orchestrator").unwrap();
     assert_eq!(verified.data, None);
-    assert_eq!(verified.auth, AuthMethod::PlatformJwt);
+    assert_eq!(verified.auth, AuthMethod::ManagementJwt);
 
-    // And a platform identity signs without a `data` field at all.
+    // And a management identity signs without a `data` field at all.
     let (signer, _) = keypair();
     let token = signer.sign("orchestrator", &identity()).unwrap();
     let payload = token.split('.').nth(1).unwrap();

@@ -4,7 +4,9 @@
   "packageManager": "pnpm@12.6.0",
   "scripts": {
     "studio:dev": "pnpm --filter @cheladb/studio dev",
-    "studio:build": "pnpm --filter @cheladb/studio build",
-    "types:check": "pnpm --filter @cheladb/types typecheck"
+    "studio:build": "pnpm --filter @cheladb/studio build"
+  },
+  "devDependencies": {
+    "@scalar/api-reference": "1.72.2"
   }
 }

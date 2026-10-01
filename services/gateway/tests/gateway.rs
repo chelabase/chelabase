@@ -100,7 +100,7 @@ async fn spawn_gateway_with(
         .current_dir(workdir.path())
         .env("CHELADB_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
         .env("CHELADB_ORCHESTRATOR_URL", upstream_url)
-        .env("CHELADB_PLATFORM_HOSTS", "")
+        .env("CHELADB_MANAGEMENT_HOSTS", "")
         .env("CHELADB_STUDIO_ORIGINS", STUDIO)
         .env("CHELADB_ZITADEL_ISSUER", jwks.issuer())
         .env("CHELADB_ZITADEL_JWKS_URL", jwks.jwks_url())
@@ -248,7 +248,7 @@ async fn undeclared_path_is_404_and_never_proxied() {
     assert_eq!(resp.status(), 404);
     assert!(resp.headers().contains_key("x-request-id"));
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "no route");
+    assert_eq!(body, serde_json::json!({"error": {"code": "not_found", "message": "no route"}}));
     assert!(stack.upstream_saw().is_none());
 }
 
@@ -262,6 +262,23 @@ async fn wrong_method_is_405_with_allow() {
         .unwrap();
     assert_eq!(resp.status(), 405);
     assert_eq!(resp.headers()["allow"], "POST");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn method_not_allowed_keeps_allow() {
+    let stack = start_stack().await;
+    let resp = reqwest::Client::new()
+        .delete(format!("{}/v1/databases", stack.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.headers()["allow"], "POST");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"error": {"code": "method_not_allowed", "message": "method not allowed"}})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -333,7 +350,10 @@ async fn upstream_down_is_502_json() {
     assert_eq!(resp.status(), 502);
     assert!(resp.headers().contains_key("x-request-id"));
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "upstream unavailable");
+    assert_eq!(
+        body,
+        serde_json::json!({"error": {"code": "unavailable", "message": "upstream unavailable"}})
+    );
 }
 
 /// An upstream that starts a chunked 200 response, then drops the connection.
@@ -423,7 +443,10 @@ async fn upstream_that_never_answers_is_504_json() {
         .expect("gateway must answer within its configured upstream timeout");
     assert_eq!(resp.status(), 504);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "upstream timed out");
+    assert_eq!(
+        body,
+        serde_json::json!({"error": {"code": "timeout", "message": "upstream timed out"}})
+    );
 }
 
 // Hostname upstreams (Compose/k8s service names) resolve asynchronously.
@@ -496,4 +519,37 @@ async fn client_authorization_header_is_not_forwarded_to_rest() {
     assert!(!saw.contains_key("authorization"), "the key must not reach rest");
     let claims = verify.verify(&saw[IDENTITY_HEADER], "rest").unwrap();
     assert_eq!(claims.data.unwrap().role, "anon");
+}
+
+// The gateway's own flat errors (here a failed proxy) use the shared shape on data routes too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_failures_are_json_on_data_routes_too() {
+    let jwks = MockJwks::start().await;
+    let dead_rest = format!("http://127.0.0.1:{}", free_port());
+    let internal = spawn_internal_listener().await;
+    let (base, _verify, _gateway) = spawn_gateway_with(
+        &dead_rest,
+        &jwks,
+        &[
+            ("CHELADB_REST_URL", &dead_rest),
+            ("CHELADB_INTERNAL_URL", &internal),
+            ("CHELADB_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+        ],
+    )
+    .await;
+    let key = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Public).key;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/data/v1/query"))
+        .header("authorization", format!("Bearer {key}"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"error": {"code": "unavailable", "message": "upstream unavailable"}})
+    );
 }

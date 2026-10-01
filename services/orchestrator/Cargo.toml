@@ -15,12 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 cheladb-auth = { workspace = true }
-cheladb-metadata = { workspace = true }
+cheladb-metadata = { workspace = true, features = ["openapi"] }
 cheladb-nats = { workspace = true }
 cheladb-routes = { workspace = true }
 cheladb-secrets = { workspace = true }
 async-nats = { workspace = true }
-cheladb-types = { workspace = true }
+cheladb-types = { workspace = true, features = ["axum", "openapi"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
@@ -37,6 +37,8 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
 
 [dev-dependencies]
 cheladb-auth = { workspace = true, features = ["test-support"] }

@@ -7,7 +7,7 @@ use std::time::Duration;
 pub struct GatewayConfig {
     pub listen: String,
     pub upstreams: Upstreams,
-    pub platform_hosts: Vec<String>,
+    pub management_hosts: Vec<String>,
     pub studio_origins: Vec<String>,
     /// Orchestrator's internal listener (`CHELADB_INTERNAL_URL`), for key lookups.
     pub internal_url: String,
@@ -23,7 +23,7 @@ impl std::fmt::Debug for GatewayConfig {
         f.debug_struct("GatewayConfig")
             .field("listen", &self.listen)
             .field("upstreams", &self.upstreams)
-            .field("platform_hosts", &self.platform_hosts)
+            .field("management_hosts", &self.management_hosts)
             .field("studio_origins", &self.studio_origins)
             .field("internal_url", &self.internal_url)
             .field("data_keys_token", &"<redacted>")
@@ -42,7 +42,7 @@ impl GatewayConfig {
             )
             .and_then(|u| u.with_rest(&env_or("CHELADB_REST_URL", "http://127.0.0.1:8085")))
             .map_err(anyhow::Error::msg)?,
-            platform_hosts: split_csv(&env_or("CHELADB_PLATFORM_HOSTS", "")),
+            management_hosts: split_csv(&env_or("CHELADB_MANAGEMENT_HOSTS", "")),
             studio_origins: split_csv(&env_or("CHELADB_STUDIO_ORIGINS", "http://localhost:3000")),
             internal_url: env_or("CHELADB_INTERNAL_URL", "http://127.0.0.1:8083"),
             data_keys_token: env_or("CHELADB_DATA_KEYS_TOKEN", "cheladb-dev-data-keys"),
@@ -85,7 +85,7 @@ mod tests {
         let config = GatewayConfig {
             listen: "127.0.0.1:0".into(),
             upstreams: Upstreams::new("http://127.0.0.1:1", "http://127.0.0.1:2").unwrap(),
-            platform_hosts: vec![],
+            management_hosts: vec![],
             studio_origins: vec![],
             internal_url: "http://127.0.0.1:3".into(),
             data_keys_token: "super-secret-token".into(),

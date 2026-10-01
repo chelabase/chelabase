@@ -1,12 +1,12 @@
-import { render, screen } from "@testing-library/react";
+import { screen } from "@testing-library/react";
+import { renderWithQuery } from "@/test/render";
+import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { BranchSummary } from "@cheladb/types";
-import { ApiError, type ApiClient } from "@/lib/api";
-import { fakeApi } from "@/test/fake-api";
+import { getGetDatabaseQueryKey, getListBranchesQueryKey, type Branch as BranchSummary } from "@cheladb/management-client";
 import { BranchActions } from "./branch-actions";
 
-const mk = (over: Omit<Partial<BranchSummary>, "id"> & { name: string; id: string }): BranchSummary => ({
+const mk = (over: Partial<BranchSummary> & { name: string; id: string }): BranchSummary => ({
   parent_branch_id: null,
   kind: "normal",
   status: "ready",
@@ -18,28 +18,38 @@ const mk = (over: Omit<Partial<BranchSummary>, "id"> & { name: string; id: strin
   history_start: null,
   error: null,
   ...over,
-  id: over.id as never,
 });
 const main = mk({ id: "m", name: "main" });
-const dev = mk({ id: "d", name: "dev", parent_branch_id: main.id as never });
+const dev = mk({ id: "d", name: "dev", parent_branch_id: main.id });
 
-function setup(branch: BranchSummary, all: BranchSummary[], api: Partial<ApiClient> = {}, window = 7 * 86400) {
-  const onChanged = vi.fn();
-  const full = fakeApi(api);
-  render(
+const accepted: FakeHandler = () => jsonResponse({ status: "resetting" }, 202);
+const restored: FakeHandler = () =>
+  jsonResponse({ status: "resetting", backup_branch_id: "bk", backup_name: "main-before-restore-20260930T101000Z" }, 202);
+
+function setup(
+  branch: BranchSummary,
+  all: BranchSummary[],
+  routes: Record<string, FakeHandler> = {},
+  window = 7 * 86400,
+) {
+  const f = fakeFetch(routes);
+  const result = renderWithQuery(
     <BranchActions
-      api={full}
       databaseId="db"
       databaseName="web1"
       branch={branch}
       branches={all}
       historyWindow={window}
-      onChanged={onChanged}
     />,
+    { fetch: f },
   );
-  return { api: full, onChanged };
+  return { ...result, fetch: f };
 }
 const btn = (name: string) => screen.getByRole("button", { name });
+const sent = (f: FakeFetch) => f.calls.map((r) => `${r.method} ${new URL(r.url).pathname}`);
+const pad = (n: number) => String(n).padStart(2, "0");
+const local = (d: Date) =>
+  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 
 describe("BranchActions disabled reasons", () => {
   it("main can't be reset to a parent or deleted", () => {
@@ -51,7 +61,7 @@ describe("BranchActions disabled reasons", () => {
   });
 
   it("names the child branches that block an action", () => {
-    const kid = mk({ id: "k", name: "kid", parent_branch_id: dev.id as never });
+    const kid = mk({ id: "k", name: "kid", parent_branch_id: dev.id });
     setup(dev, [main, dev, kid]);
     for (const name of ["Reset to parent", "Restore", "Delete branch"]) {
       expect(btn(name)).toBeDisabled();
@@ -60,7 +70,7 @@ describe("BranchActions disabled reasons", () => {
   });
 
   it("a restore backup can't connect", () => {
-    const backup = mk({ id: "b", name: "main-before-restore-x", kind: "backup", parent_branch_id: main.id as never, host: null });
+    const backup = mk({ id: "b", name: "main-before-restore-x", kind: "backup", parent_branch_id: main.id, host: null });
     setup(backup, [main, backup]);
     expect(btn("Connection details")).toBeDisabled();
     expect(btn("Connection details")).toHaveAttribute("title", "restore backup: create a branch from it to connect");
@@ -69,7 +79,7 @@ describe("BranchActions disabled reasons", () => {
 });
 
 describe("BranchActions disabled reasons, visible and linked", () => {
-  const backup = mk({ id: "b", name: "main-before-restore-x", kind: "backup", parent_branch_id: main.id as never, host: null });
+  const backup = mk({ id: "b", name: "main-before-restore-x", kind: "backup", parent_branch_id: main.id, host: null });
   const cases: [string, BranchSummary, BranchSummary[], [string, string][]][] = [
     [
       "main",
@@ -94,7 +104,7 @@ describe("BranchActions disabled reasons, visible and linked", () => {
     [
       "a parent",
       dev,
-      [main, dev, mk({ id: "k", name: "kid", parent_branch_id: dev.id as never })],
+      [main, dev, mk({ id: "k", name: "kid", parent_branch_id: dev.id })],
       [
         ["Reset to parent", "has child branches: kid"],
         ["Restore", "has child branches: kid"],
@@ -139,57 +149,106 @@ describe("BranchActions disabled reasons, visible and linked", () => {
 });
 
 describe("BranchActions", () => {
+  // Connection details and the password reset go through DatabaseActions, already on the management client.
   it("reveals a branch's connection through the branch endpoint", async () => {
-    const getBranchConnection = vi.fn().mockResolvedValue({
-      host: "ep-aaaaaaaaaaaa.localtest.me",
-      port: 4432,
-      database: "web1",
-      user: "postgres",
-      password: "pw",
-      uri: "postgresql://postgres:pw@ep-aaaaaaaaaaaa.localtest.me:4432/web1",
-      http_url: "https://ep-aaaaaaaaaaaa.localtest.me:4444/sql",
+    const f = fakeFetch({
+      "GET /v1/databases/db/branches/d/connection": () =>
+        jsonResponse({
+          host: "ep-aaaaaaaaaaaa.localtest.me",
+          port: 4432,
+          database: "web1",
+          user: "postgres",
+          password: "pw",
+          uri: "postgresql://postgres:pw@ep-aaaaaaaaaaaa.localtest.me:4432/web1",
+          http_url: "https://ep-aaaaaaaaaaaa.localtest.me:4444/sql",
+        }),
     });
-    setup(dev, [main, dev], { getBranchConnection });
+    renderWithQuery(
+      <BranchActions databaseId="db" databaseName="web1" branch={dev} branches={[main, dev]} historyWindow={86400} />,
+      { fetch: f },
+    );
     await userEvent.click(btn("Connection details"));
     expect(await screen.findByText("postgres")).toBeInTheDocument();
-    expect(getBranchConnection).toHaveBeenCalledWith("db", "d");
+    expect(f.calls.map((r) => new URL(r.url).pathname)).toEqual(["/v1/databases/db/branches/d/connection"]);
   });
 
   it("resets the branch's password", async () => {
-    const resetBranchPassword = vi.fn().mockResolvedValue(undefined);
-    const getBranchConnection = vi.fn().mockRejectedValue(new Error("nope"));
-    setup(dev, [main, dev], { resetBranchPassword, getBranchConnection });
+    const f = fakeFetch({ "POST /v1/databases/db/branches/d/reset-password": () => jsonResponse({}) });
+    renderWithQuery(
+      <BranchActions databaseId="db" databaseName="web1" branch={dev} branches={[main, dev]} historyWindow={86400} />,
+      { fetch: f },
+    );
     await userEvent.click(btn("Reset password"));
     await userEvent.click(btn("Confirm reset"));
-    expect(resetBranchPassword).toHaveBeenCalledWith("db", "d");
+    await vi.waitFor(() =>
+      expect(f.calls.map((r) => `${r.method} ${new URL(r.url).pathname}`)).toContain(
+        "POST /v1/databases/db/branches/d/reset-password",
+      ),
+    );
   });
 
   it("resets to parent after a confirm", async () => {
-    const resetBranchToParent = vi.fn().mockResolvedValue(undefined);
-    const { onChanged } = setup(dev, [main, dev], { resetBranchToParent });
+    const { fetch } = setup(dev, [main, dev], { "POST /v1/databases/db/branches/d/reset-to-parent": accepted });
     await userEvent.click(btn("Reset to parent"));
-    expect(resetBranchToParent).not.toHaveBeenCalled();
+    expect(fetch.calls).toHaveLength(0);
     await userEvent.click(btn("Confirm reset to parent"));
-    expect(resetBranchToParent).toHaveBeenCalledWith("db", "d");
-    expect(onChanged).toHaveBeenCalled();
+    await vi.waitFor(() => expect(sent(fetch)).toEqual(["POST /v1/databases/db/branches/d/reset-to-parent"]));
+    await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Confirm reset to parent" })).toBeNull());
   });
 
   it("deletes after a confirm", async () => {
-    const deleteBranch = vi.fn().mockResolvedValue(undefined);
-    const { onChanged } = setup(dev, [main, dev], { deleteBranch });
+    const { fetch } = setup(dev, [main, dev], { "DELETE /v1/databases/db/branches/d": accepted });
     await userEvent.click(btn("Delete branch"));
     await userEvent.click(btn("Confirm delete branch"));
-    expect(deleteBranch).toHaveBeenCalledWith("db", "d");
-    expect(onChanged).toHaveBeenCalled();
+    await vi.waitFor(() => expect(sent(fetch)).toEqual(["DELETE /v1/databases/db/branches/d"]));
+    await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Confirm delete branch" })).toBeNull());
   });
 
   it("shows the API's message when an action is refused", async () => {
-    const deleteBranch = vi.fn().mockRejectedValue(new ApiError(409, "branch is already being deleted"));
-    setup(dev, [main, dev], { deleteBranch });
+    setup(dev, [main, dev], {
+      "DELETE /v1/databases/db/branches/d": () =>
+        jsonResponse({ error: { code: "already_deleting", message: "branch is already being deleted" } }, 409),
+    });
     await userEvent.click(btn("Delete branch"));
     await userEvent.click(btn("Confirm delete branch"));
     expect(await screen.findByRole("alert")).toHaveTextContent("branch is already being deleted");
   });
+
+  it("disables the confirm while an action runs", async () => {
+    setup(dev, [main, dev], { "DELETE /v1/databases/db/branches/d": () => new Promise<never>(() => {}) });
+    await userEvent.click(btn("Delete branch"));
+    await userEvent.click(btn("Confirm delete branch"));
+    expect(btn("Confirm delete branch")).toBeDisabled();
+  });
+
+  const actions: [string, string, string, FakeHandler, (b: BranchSummary) => Promise<void>][] = [
+    ["reset to parent", "POST /v1/databases/db/branches/d/reset-to-parent", "Reset to parent", accepted, async () => {
+      await userEvent.click(btn("Confirm reset to parent"));
+    }],
+    ["restore", "POST /v1/databases/db/branches/d/restore", "Restore", restored, async () => {
+      await userEvent.type(screen.getByLabelText("Restore to"), local(new Date(Date.now() - 5 * 60_000)));
+      await userEvent.click(btn("Confirm restore"));
+    }],
+    ["delete", "DELETE /v1/databases/db/branches/d", "Delete branch", accepted, async () => {
+      await userEvent.click(btn("Confirm delete branch"));
+    }],
+  ];
+  for (const [what, route, open, answer, confirm] of actions) {
+    it(`branch_mutations_invalidate_list_and_database: ${what}`, async () => {
+      const { fetch, queryClient } = setup(dev, [main, dev], { [route]: answer });
+      queryClient.setQueryData(getListBranchesQueryKey("db"), [main, dev]);
+      queryClient.setQueryData(getGetDatabaseQueryKey("db"), { name: "web1" });
+      queryClient.setQueryData(getListBranchesQueryKey("other"), [main]);
+      await userEvent.click(btn(open));
+      await confirm(dev);
+      await vi.waitFor(() => expect(sent(fetch)).toContain(route));
+      await vi.waitFor(() => {
+        expect(queryClient.getQueryState(getListBranchesQueryKey("db"))?.isInvalidated).toBe(true);
+        expect(queryClient.getQueryState(getGetDatabaseQueryKey("db"))?.isInvalidated).toBe(true);
+      });
+      expect(queryClient.getQueryState(getListBranchesQueryKey("other"))?.isInvalidated).toBe(false);
+    });
+  }
 
   describe("restore picker", () => {
     it("is bounded from now minus the history window to now", async () => {
@@ -227,7 +286,7 @@ describe("BranchActions", () => {
       const child = mk({
         id: "p",
         name: "past",
-        parent_branch_id: main.id as never,
+        parent_branch_id: main.id,
         created_at: new Date(Date.now() - 60_000).toISOString(),
         history_start: start.toISOString(),
       });
@@ -246,39 +305,25 @@ describe("BranchActions", () => {
     });
 
     it("sends the chosen time as a UTC timestamp and shows the backup", async () => {
-      const restoreBranch = vi
-        .fn()
-        .mockResolvedValue({ status: "resetting", backup_branch_id: "bk", backup_name: "main-before-restore-20260930T101000Z" });
-      const { onChanged } = setup(main, [main], { restoreBranch });
+      const { fetch } = setup(main, [main], { "POST /v1/databases/db/branches/m/restore": restored });
       await userEvent.click(btn("Restore"));
-      const target = new Date(Date.now() - 5 * 60_000);
-      const pad = (n: number) => String(n).padStart(2, "0");
-      const local = `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())}T${pad(target.getHours())}:${pad(target.getMinutes())}`;
+      const at = local(new Date(Date.now() - 5 * 60_000));
       const input = screen.getByLabelText("Restore to");
       await userEvent.clear(input);
-      await userEvent.type(input, local);
+      await userEvent.type(input, at);
       await userEvent.click(btn("Confirm restore"));
-      const [db, id, req] = restoreBranch.mock.calls[0];
-      expect([db, id]).toEqual(["db", "m"]);
-      expect(req.at.timestamp).toBe(new Date(local).toISOString());
+      await vi.waitFor(() => expect(sent(fetch)).toEqual(["POST /v1/databases/db/branches/m/restore"]));
+      expect(await fetch.calls[0].clone().json()).toEqual({ at: { timestamp: new Date(at).toISOString() } });
       expect(await screen.findByRole("status")).toHaveTextContent("main-before-restore-20260930T101000Z");
-      expect(onChanged).toHaveBeenCalled();
     });
 
     it("drops the restore notice once a refresh shows the restore finished", async () => {
-      const restoreBranch = vi
-        .fn()
-        .mockResolvedValue({ status: "resetting", backup_branch_id: "bk", backup_name: "main-before-restore-20260930T101000Z" });
-      const full = fakeApi({ restoreBranch });
-      const props = { api: full, databaseId: "db", databaseName: "web1", historyWindow: 7 * 86400, onChanged: vi.fn() };
-      const { rerender } = render(<BranchActions {...props} branch={main} branches={[main]} />);
+      const props = { databaseId: "db", databaseName: "web1", historyWindow: 7 * 86400 };
+      const { rerender } = renderWithQuery(<BranchActions {...props} branch={main} branches={[main]} />, {
+        fetch: fakeFetch({ "POST /v1/databases/db/branches/m/restore": restored }),
+      });
       await userEvent.click(btn("Restore"));
-      const target = new Date(Date.now() - 5 * 60_000);
-      const pad = (n: number) => String(n).padStart(2, "0");
-      await userEvent.type(
-        screen.getByLabelText("Restore to"),
-        `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())}T${pad(target.getHours())}:${pad(target.getMinutes())}`,
-      );
+      await userEvent.type(screen.getByLabelText("Restore to"), local(new Date(Date.now() - 5 * 60_000)));
       await userEvent.click(btn("Confirm restore"));
       expect(await screen.findByRole("status")).toHaveTextContent("main-before-restore-20260930T101000Z");
       // The refresh right after: still restoring, so the notice stays.
@@ -290,15 +335,14 @@ describe("BranchActions", () => {
     });
 
     it("refuses a time outside the window without calling the API", async () => {
-      const restoreBranch = vi.fn();
-      setup(main, [main], { restoreBranch }, 3600);
+      const { fetch } = setup(main, [main], {}, 3600);
       await userEvent.click(btn("Restore"));
       const input = screen.getByLabelText("Restore to");
       await userEvent.clear(input);
       await userEvent.type(input, "2020-01-01T00:00");
       await userEvent.click(btn("Confirm restore"));
       expect(await screen.findByRole("alert")).toHaveTextContent(/history window/i);
-      expect(restoreBranch).not.toHaveBeenCalled();
+      expect(fetch.calls).toHaveLength(0);
     });
   });
 });

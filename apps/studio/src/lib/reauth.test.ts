@@ -1,7 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { MeResponse } from "@cheladb/types";
-import type { ApiClient } from "./api";
-import { createReauthGuard, resetOnLoad } from "./reauth";
+import { createReauthGuard, restartSignInOnce } from "./reauth";
 
 function memoryStorage() {
   const data = new Map<string, string>();
@@ -36,23 +34,20 @@ describe("createReauthGuard", () => {
   });
 });
 
-describe("resetOnLoad", () => {
-  it("clears the guard when /v1/me succeeds", async () => {
-    const guard = { shouldRedirect: vi.fn(), reset: vi.fn() };
-    const me: MeResponse = { user: { sub: "u", org_id: "o" }, tenant: null };
-    const api = { me: vi.fn().mockResolvedValue(me), createDatabase: vi.fn(), getDatabase: vi.fn() } as unknown as ApiClient;
-    await expect(resetOnLoad(api, guard).me()).resolves.toEqual(me);
-    expect(guard.reset).toHaveBeenCalledTimes(1);
+describe("restartSignInOnce", () => {
+  it("restarts sign-in on the first 401 and reports it", () => {
+    const restart = vi.fn();
+    const onUnauthorized = restartSignInOnce(createReauthGuard(memoryStorage()), restart);
+    expect(onUnauthorized()).toBe(true);
+    expect(restart).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the guard when /v1/me fails", async () => {
-    const guard = { shouldRedirect: vi.fn(), reset: vi.fn() };
-    const api = {
-      me: vi.fn().mockRejectedValue(new Error("missing org claim")),
-      createDatabase: vi.fn(),
-      getDatabase: vi.fn(),
-    } as unknown as ApiClient;
-    await expect(resetOnLoad(api, guard).me()).rejects.toThrow("missing org claim");
-    expect(guard.reset).not.toHaveBeenCalled();
+  it("lets a second 401 through without restarting again", () => {
+    const storage = memoryStorage();
+    const restart = vi.fn();
+    expect(restartSignInOnce(createReauthGuard(storage), restart)()).toBe(true);
+    // Back from Zitadel; the fresh token is refused too.
+    expect(restartSignInOnce(createReauthGuard(storage), restart)()).toBe(false);
+    expect(restart).toHaveBeenCalledTimes(1);
   });
 });

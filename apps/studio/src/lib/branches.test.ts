@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { BranchSummary } from "@cheladb/types";
+import type { Branch } from "@cheladb/management-client";
 import {
   actionReasons,
   buildTree,
@@ -10,10 +10,10 @@ import {
 } from "./branches";
 
 let n = 0;
-function branch(over: Partial<BranchSummary> & { name: string }): BranchSummary {
+function branch(over: Partial<Branch> & { name: string }): Branch {
   n += 1;
   return {
-    id: `b-${over.name}` as never,
+    id: `b-${over.name}`,
     parent_branch_id: null,
     kind: "normal",
     status: "ready",
@@ -28,7 +28,7 @@ function branch(over: Partial<BranchSummary> & { name: string }): BranchSummary 
   };
 }
 const main = branch({ name: "main" });
-const child = (name: string, parent: BranchSummary, over: Partial<BranchSummary> = {}) =>
+const child = (name: string, parent: Branch, over: Partial<Branch> = {}) =>
   branch({ name, parent_branch_id: parent.id, ...over });
 
 describe("buildTree", () => {

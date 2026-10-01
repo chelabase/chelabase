@@ -1,0 +1,27 @@
+{
+  "name": "@cheladb/management-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Typed client for the Cheladb Management API (orval-generated TanStack Query hooks over a fetch mutator)",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "generate": "orval --config orval.config.ts"
+  },
+  "devDependencies": {
+    "@tanstack/react-query": "^5.104.0",
+    "@types/node": "^24.19.0",
+    "orval": "^8.38.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  },
+  "peerDependencies": {
+    "@tanstack/react-query": "^5.104.0"
+  }
+}
