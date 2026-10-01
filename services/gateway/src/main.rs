@@ -3,6 +3,7 @@
 use cheladb_auth::internal::InternalSigner;
 use cheladb_auth::JwtVerifier;
 use gateway::config::GatewayConfig;
+use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
 use gateway::proxy::Gateway;
 use gateway::registry::{Registry, SharedRegistry};
@@ -26,7 +27,8 @@ fn main() -> anyhow::Result<()> {
     let registry = Arc::new(SharedRegistry::new(
         Registry::from_config(&config.platform_hosts).map_err(anyhow::Error::msg)?,
     ));
-    let pipeline = Pipeline::new(registry, config.studio_origins.clone(), verifier, signer);
+    let keys = Arc::new(DataKeyResolver::new(&config.internal_url, &config.data_keys_token));
+    let pipeline = Pipeline::new(registry, config.studio_origins.clone(), verifier, signer, keys);
 
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
     // periods. Under `just dev`, Compose, or k8s a process manager restarts us,

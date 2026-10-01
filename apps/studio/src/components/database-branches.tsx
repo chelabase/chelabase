@@ -34,7 +34,16 @@ export function DatabaseBranches({ api, database, pollIntervalMs = 2000 }: Datab
     void load();
     api
       .getDatabase(id)
-      .then((d) => setSettings({ history_window: d.history_window, max_branches: d.max_branches }))
+      .then((d) =>
+        setSettings({
+          history_window: d.history_window,
+          max_branches: d.max_branches,
+          max_rows: d.max_rows,
+          statement_timeout_ms: d.statement_timeout_ms,
+          max_connections: d.max_connections,
+          default_schema: d.default_schema,
+        }),
+      )
       .catch((err) => setError(err instanceof Error ? err.message : String(err)));
   }, [api, id, load]);
 
@@ -80,7 +89,7 @@ export function DatabaseBranches({ api, database, pollIntervalMs = 2000 }: Datab
       )}
       {settings && (
         <DatabaseSettings
-          key={`${settings.history_window}-${settings.max_branches}`}
+          key={Object.values(settings).join("-")}
           api={api}
           databaseId={id}
           settings={settings}

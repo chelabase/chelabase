@@ -22,7 +22,10 @@ pub fn render_demo_env(e: &DemoEnv<'_>) -> String {
 CHELADB_ZITADEL_ORG_ID={}\nCHELADB_ZITADEL_PROJECT_ID={}\nCHELADB_ZITADEL_API_CLIENT_ID={}\n\
 CHELADB_DEMO_USER_ID={}\nCHELADB_DEMO_TENANT_ID={}\nCHELADB_INTERNAL_SIGNING_KEY={}\n\
 CHELADB_INTERNAL_VERIFY_KEY={}\nCHELADB_SECRETS_KEY={}\nCHELADB_AUTH_TOKEN_FILE={}\n\
-CHELADB_AUTH_COOKIE_KEY={}\nCHELADB_COMPUTE_JWT_DIR={}\n",
+CHELADB_AUTH_COOKIE_KEY={}\nCHELADB_COMPUTE_JWT_DIR={}\n\
+CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\nCHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n\
+CHELADB_REST_URL=http://127.0.0.1:8085\nCHELADB_REST_INTERNAL_URL=http://127.0.0.1:8086\n\
+CHELADB_INTERNAL_URL=http://127.0.0.1:8083\n",
         e.issuer,
         e.issuer,
         e.audiences,
@@ -78,6 +81,34 @@ mod tests {
         assert!(text.contains("CHELADB_AUTH_TOKEN_FILE=/z/login-client.pat\n"));
         assert!(text.contains("CHELADB_AUTH_COOKIE_KEY=/u/cookie.key\n"));
         assert!(text.contains("CHELADB_ZITADEL_JWKS_URL=http://localhost:8080/oauth/v2/keys\n"));
+    }
+
+    #[test]
+    fn demo_env_has_the_data_api_wiring() {
+        let text = render_demo_env(&DemoEnv {
+            issuer: "http://localhost:8080",
+            audiences: "p1,c1",
+            org_id: "o",
+            project_id: "p1",
+            api_client_id: "c1",
+            demo_user_id: "u",
+            demo_tenant: "t",
+            signing_key: "/s",
+            verify_key: "/v",
+            secrets_key: "/k",
+            auth_token_file: "/tok",
+            auth_cookie_key: "/cookie",
+            compute_jwt_dir: "/abs/neon",
+        });
+        for line in [
+            "CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\n",
+            "CHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n",
+            "CHELADB_REST_URL=http://127.0.0.1:8085\n",
+            "CHELADB_REST_INTERNAL_URL=http://127.0.0.1:8086\n",
+            "CHELADB_INTERNAL_URL=http://127.0.0.1:8083\n",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
     }
 
     #[test]

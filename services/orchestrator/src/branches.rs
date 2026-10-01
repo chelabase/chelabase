@@ -15,7 +15,7 @@ use axum::{
 };
 use cheladb_metadata::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome,
-    DatabaseRecord, NewBranch,
+    DatabaseRecord, NewBranch, SettingsPatch,
 };
 use cheladb_nats::{BranchJob, DatabaseSettingsJob, JobEnvelope, PointInTime};
 use cheladb_routes::orchestrator as routes;
@@ -119,7 +119,7 @@ impl BranchSummary {
 }
 
 /// Parses a JSON body; an empty, malformed or wrongly typed one is a 422 with the reason.
-fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {
+pub(crate) fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {
     serde_json::from_slice(body).map_err(|err| {
         Box::new(json_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -128,7 +128,7 @@ fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {
     })
 }
 
-fn unprocessable(message: &str) -> Box<Response> {
+pub(crate) fn unprocessable(message: &str) -> Box<Response> {
     Box::new(json_error(StatusCode::UNPROCESSABLE_ENTITY, message))
 }
 
@@ -183,7 +183,7 @@ fn valid_lsn(lsn: &str) -> bool {
 }
 
 /// The branch of the database, or the 404 to send.
-async fn load_branch<M, J>(
+pub(crate) async fn load_branch<M, J>(
     state: &AppState<M, J>,
     database: &DatabaseRecord,
     id: Uuid,
@@ -695,12 +695,52 @@ where
         .into_response()
 }
 
-/// Both optional; a missing one is left as it is. `history_window` is in seconds.
+/// All optional; a missing one is left as it is. `history_window` is in seconds.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateDatabaseRequest {
     history_window: Option<i64>,
     max_branches: Option<i64>,
+    max_rows: Option<i64>,
+    statement_timeout_ms: Option<i64>,
+    max_connections: Option<i64>,
+    default_schema: Option<String>,
+}
+
+/// Bounds of the data API settings.
+const MAX_ROWS: std::ops::RangeInclusive<i64> = 1..=100_000;
+const STATEMENT_TIMEOUT_MS: std::ops::RangeInclusive<i64> = 100..=120_000;
+const MAX_CONNECTIONS: std::ops::RangeInclusive<i64> = 1..=50;
+
+/// `^[a-z_][a-z0-9_]{0,62}$`.
+fn valid_schema_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    match bytes.split_first() {
+        Some((first, rest)) => {
+            rest.len() <= 62
+                && (first.is_ascii_lowercase() || *first == b'_')
+                && rest
+                    .iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+        }
+        None => false,
+    }
+}
+
+fn in_range(
+    name: &str,
+    value: Option<i64>,
+    range: &std::ops::RangeInclusive<i64>,
+) -> Result<Option<i32>, Box<Response>> {
+    match value {
+        Some(n) if !range.contains(&n) => Err(unprocessable(&format!(
+            "{name} must be between {} and {}",
+            range.start(),
+            range.end()
+        ))),
+        Some(n) => Ok(Some(n as i32)),
+        None => Ok(None),
+    }
 }
 
 pub(crate) async fn update_database<M, J>(
@@ -731,18 +771,44 @@ where
         Some(secs) => Some(Duration::from_secs(secs as u64)),
         None => None,
     };
-    let max = match request.max_branches {
-        Some(n) if !(0..=MAX_BRANCHES_LIMIT).contains(&n) => {
-            return *unprocessable(&format!(
-                "max_branches must be between 0 and {MAX_BRANCHES_LIMIT}"
-            ));
-        }
-        Some(n) => Some(n as i32),
-        None => None,
+    let max = match in_range("max_branches", request.max_branches, &(0..=MAX_BRANCHES_LIMIT)) {
+        Ok(max) => max,
+        Err(resp) => return *resp,
+    };
+    let max_rows = match in_range("max_rows", request.max_rows, &MAX_ROWS) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let statement_timeout_ms = match in_range(
+        "statement_timeout_ms",
+        request.statement_timeout_ms,
+        &STATEMENT_TIMEOUT_MS,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let max_connections = match in_range("max_connections", request.max_connections, &MAX_CONNECTIONS) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    if let Some(schema) = &request.default_schema
+        && !valid_schema_name(schema)
+    {
+        return *unprocessable(
+            "default_schema must be 1-63 characters from a-z, 0-9 and _, not starting with a digit",
+        );
+    }
+    let patch = SettingsPatch {
+        history_window: window,
+        max_branches: max,
+        max_rows,
+        statement_timeout_ms,
+        max_connections,
+        default_schema: request.default_schema.clone(),
     };
     match state
         .metadata
-        .update_database_settings(record.database_id, window, max)
+        .update_database_settings(record.database_id, &patch)
         .await
     {
         Ok(true) => {}
@@ -768,6 +834,10 @@ where
     Json(serde_json::json!({
         "history_window": window.unwrap_or(record.history_window).as_secs(),
         "max_branches": max.unwrap_or(record.max_branches),
+        "max_rows": max_rows.unwrap_or(record.max_rows),
+        "statement_timeout_ms": statement_timeout_ms.unwrap_or(record.statement_timeout_ms),
+        "max_connections": max_connections.unwrap_or(record.max_connections),
+        "default_schema": request.default_schema.unwrap_or(record.default_schema),
     }))
     .into_response()
 }

@@ -5,9 +5,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use cheladb_metadata::{
-    BranchDeleteOutcome, BranchRecord, BranchStatus, DatabaseRecord, DatabaseSettings,
-    DatabaseStatus, EndpointLock, EndpointState, LiveBranch, LiveDatabase, MetadataClient,
-    MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewEndpoint,
+    BranchConnectionRow, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
+    DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState, LiveBranch,
+    LiveDatabase, MetadataClient, MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewDataKey,
+    NewEndpoint,
 };
 use cheladb_neon::proxy_cache::ProxyCache;
 use cheladb_neon::spec::Placement;
@@ -212,6 +213,38 @@ pub trait WorkerMetadata: Send + Sync + 'static {
     fn list_live_branches_for_reconcile(
         &self,
     ) -> impl Future<Output = Result<Vec<LiveBranch>, MetadataError>> + Send;
+
+    // The data API (see `cheladb_metadata::data_api`).
+
+    /// A second live public key on the branch is [`MetadataError::Conflict`].
+    fn insert_data_key(
+        &self,
+        key: &NewDataKey,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// The branch's live keys, newest first.
+    fn list_data_keys(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<DataKeyRecord>, MetadataError>> + Send;
+    fn has_live_public_key(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Stores the password only when the branch has none. A no-op on a deleting, deleted
+    /// or unknown branch.
+    fn set_authenticator_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// Ready `normal` branches without a live public key or an authenticator password.
+    fn branches_missing_data_api(
+        &self,
+    ) -> impl Future<Output = Result<Vec<BranchId>, MetadataError>> + Send;
+    fn branch_connection(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchConnectionRow>, MetadataError>> + Send;
 }
 
 // Each method calls the inherent one by its full path: a bare `self.method()` would recurse
@@ -453,6 +486,37 @@ impl WorkerMetadata for MetadataClient {
 
     async fn list_live_branches_for_reconcile(&self) -> Result<Vec<LiveBranch>, MetadataError> {
         MetadataClient::list_live_branches_for_reconcile(self).await
+    }
+
+    async fn insert_data_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        MetadataClient::insert_data_key(self, key).await
+    }
+
+    async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
+        MetadataClient::list_data_keys(self, branch).await
+    }
+
+    async fn has_live_public_key(&self, branch: BranchId) -> Result<bool, MetadataError> {
+        MetadataClient::has_live_public_key(self, branch).await
+    }
+
+    async fn set_authenticator_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_authenticator_password(self, branch, sealed).await
+    }
+
+    async fn branches_missing_data_api(&self) -> Result<Vec<BranchId>, MetadataError> {
+        MetadataClient::branches_missing_data_api(self).await
+    }
+
+    async fn branch_connection(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchConnectionRow>, MetadataError> {
+        MetadataClient::branch_connection(self, branch).await
     }
 }
 

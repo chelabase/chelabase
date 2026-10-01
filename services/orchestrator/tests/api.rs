@@ -3,23 +3,26 @@ use cheladb_auth::internal::{
     generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier, IDENTITY_HEADER,
 };
 use cheladb_metadata::{
-    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseRecord, DatabaseStatus,
-    MetadataError, NewBranch, ProjectOverview, TenantOverview,
+    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DataKeyRecord, DatabaseRecord,
+    DatabaseStatus, MetadataError, NewBranch, NewDataKey, ProjectOverview, SettingsPatch, TenantOverview,
 };
 use cheladb_nats::{
-    BranchJob, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
+    BranchJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
     ProvisionDatabaseJob, ResetPasswordReply, RESET_NOT_APPLIED,
 };
 use cheladb_routes::{Service, ENDPOINTS};
 use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use cheladb_secrets::{seal_credential, Purpose, SecretKey};
-use orchestrator::{build_router, AppState, JobPort, MetadataPort, ResetError};
+use cheladb_secrets::{open_credential, seal_credential, Purpose, SecretKey};
+use cheladb_types::data_key::{self, DataKeyKind};
+use orchestrator::{build_router, AppState, JobPort, MetadataPort, ResetError, RestInternal};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+
+type KeyRow = (DataKeyRecord, [u8; 32]);
 
 #[derive(Clone, Default)]
 struct FakeMetadata {
@@ -30,6 +33,8 @@ struct FakeMetadata {
     overviews: Arc<Mutex<HashMap<TenantId, TenantOverview>>>,
     /// Calls to `main_branches_with_counts`: /v1/me makes exactly one per request.
     main_count_queries: Arc<AtomicUsize>,
+    /// Data API keys, live and revoked, with their hashes.
+    keys: Arc<Mutex<Vec<KeyRow>>>,
 }
 
 /// A database row and its main branch, which holds the endpoint and the sealed password.
@@ -83,6 +88,7 @@ fn main_for(record: &DatabaseRecord) -> BranchRecord {
         created_at: now,
         updated_at: now,
         history_start: None,
+        authenticator_password_enc: None,
     }
 }
 
@@ -136,6 +142,7 @@ impl FakeMetadata {
                 created_at: now,
                 updated_at: now,
                 history_start: None,
+                authenticator_password_enc: None,
             },
         );
         id
@@ -180,6 +187,10 @@ fn sample_database(tenant_id: TenantId) -> Db {
         neon_tenant_id: None,
         history_window: std::time::Duration::from_secs(7 * 24 * 3600),
         max_branches: 5,
+        max_rows: 1000,
+        statement_timeout_ms: 8000,
+        max_connections: 5,
+        default_schema: "public".into(),
     })
 }
 
@@ -324,6 +335,7 @@ impl MetadataPort for FakeMetadata {
                 created_at: now,
                 updated_at: now,
                 history_start: None,
+                authenticator_password_enc: None,
             },
         );
         Ok(CreateBranchOutcome::Created)
@@ -445,23 +457,114 @@ impl MetadataPort for FakeMetadata {
     async fn update_database_settings(
         &self,
         database_id: DatabaseId,
-        history_window: Option<std::time::Duration>,
-        max_branches: Option<i32>,
+        patch: &SettingsPatch,
     ) -> Result<bool, MetadataError> {
         let mut dbs = self.databases.lock().unwrap();
         match dbs.get_mut(&database_id) {
             Some(db) if !matches!(db.status, DatabaseStatus::Deleting | DatabaseStatus::Deleted) => {
-                if let Some(w) = history_window {
+                if let Some(w) = patch.history_window {
                     db.history_window = w;
                 }
-                if let Some(m) = max_branches {
+                if let Some(m) = patch.max_branches {
                     db.max_branches = m;
+                }
+                if let Some(v) = patch.max_rows {
+                    db.max_rows = v;
+                }
+                if let Some(v) = patch.statement_timeout_ms {
+                    db.statement_timeout_ms = v;
+                }
+                if let Some(v) = patch.max_connections {
+                    db.max_connections = v;
+                }
+                if let Some(v) = &patch.default_schema {
+                    db.default_schema = v.clone();
                 }
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
+
+    async fn insert_data_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        let mut keys = self.keys.lock().unwrap();
+        insert_key(&mut keys, key)
+    }
+
+    async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
+        let mut list: Vec<_> = self
+            .keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.branch_id == branch && k.revoked_at.is_none())
+            .map(|(k, _)| k.clone())
+            .collect();
+        list.reverse(); // newest first
+        Ok(list)
+    }
+
+    async fn revoke_data_key(&self, branch: BranchId, key_id: uuid::Uuid) -> Result<bool, MetadataError> {
+        let mut keys = self.keys.lock().unwrap();
+        match keys.iter_mut().find(|(k, _)| {
+            k.id == key_id && k.branch_id == branch && k.revoked_at.is_none() && k.kind == DataKeyKind::Secret
+        }) {
+            Some((k, _)) => {
+                k.revoked_at = Some(chrono::Utc::now());
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn rotate_data_key(
+        &self,
+        branch: BranchId,
+        old: uuid::Uuid,
+        new: &NewDataKey,
+    ) -> Result<bool, MetadataError> {
+        let mut keys = self.keys.lock().unwrap();
+        let Some(i) = keys
+            .iter()
+            .position(|(k, _)| k.id == old && k.branch_id == branch && k.revoked_at.is_none())
+        else {
+            return Ok(false);
+        };
+        keys[i].0.revoked_at = Some(chrono::Utc::now());
+        match insert_key(&mut keys, new) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                keys[i].0.revoked_at = None;
+                Err(e)
+            }
+        }
+    }
+}
+
+fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataError> {
+    if key.kind == DataKeyKind::Public
+        && keys
+            .iter()
+            .any(|(k, _)| k.branch_id == key.branch_id && k.kind == DataKeyKind::Public && k.revoked_at.is_none())
+    {
+        return Err(MetadataError::Conflict);
+    }
+    keys.push((
+        DataKeyRecord {
+            id: key.id,
+            branch_id: key.branch_id,
+            kind: key.kind,
+            role: key.role.clone(),
+            name: key.name.clone(),
+            prefix: key.prefix.clone(),
+            sealed: key.sealed.clone(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+        },
+        key.sha256,
+    ));
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -488,6 +591,9 @@ struct FakeJobs {
     settings_jobs: Arc<Mutex<Vec<DatabaseId>>>,
     /// Branch jobs can't be published.
     fail_branch_publish: Arc<Mutex<bool>>,
+    /// (branch, role) of each check-role request.
+    role_checks: Arc<Mutex<Vec<(BranchId, String)>>>,
+    role_check: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
 }
 
 impl FakeJobs {
@@ -532,6 +638,18 @@ impl JobPort for FakeJobs {
         Ok(())
     }
 
+    async fn check_data_role(
+        &self,
+        branch_id: BranchId,
+        role: &str,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        self.role_checks.lock().unwrap().push((branch_id, role.to_string()));
+        match self.role_check.lock().unwrap().clone() {
+            Some(answer) => answer,
+            None => Ok(CheckDataRoleReply::ok()),
+        }
+    }
+
     async fn reset_password(
         &self,
         database_id: DatabaseId,
@@ -573,12 +691,20 @@ fn identity(org_id: &str) -> Identity {
         org_id: org_id.into(),
         auth: AuthMethod::PlatformJwt,
         request_id: "test-rid".into(),
+        data: None,
     }
 }
 
 /// Boots the real orchestrator router (fake metadata/jobs, fresh internal
 /// keypair) on an ephemeral port.
 async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
+    // Nothing listens on the discard port: rest is "down".
+    spawn_app_with_rest(metadata, jobs, "http://127.0.0.1:9").await
+}
+
+const REST_TOKEN: &str = "rest-internal-token";
+
+async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str) -> TestApp {
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
     let state = Arc::new(AppState {
@@ -587,6 +713,11 @@ async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
         identity: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
         secrets: key.clone(),
         proxy_domain: "localtest.me".into(),
+        rest: RestInternal {
+            url: rest_url.into(),
+            token: REST_TOKEN.into(),
+            http: reqwest::Client::new(),
+        },
     });
     let app: Router = build_router(state);
 
@@ -2151,7 +2282,13 @@ async fn patch_updates_the_settings_and_returns_them() {
         .await;
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({ "history_window": 86400, "max_branches": 10 }));
+    assert_eq!(
+        body,
+        json!({
+            "history_window": 86400, "max_branches": 10,
+            "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 5, "default_schema": "public",
+        })
+    );
     let db = t.metadata.database(t.db);
     assert_eq!(db.history_window, std::time::Duration::from_secs(86400));
     assert_eq!(db.max_branches, 10);
@@ -2263,4 +2400,450 @@ async fn me_and_get_database_show_branch_count_with_one_lookup_for_me() {
     let get: Value = call(&app, Method::GET, &format!("/v1/databases/{}", id.as_uuid()), "org-1").await.json().await.unwrap();
     assert_eq!(get["branch_count"], 2);
     assert_eq!(get["host"], "ep-0123456789ab.localtest.me");
+}
+
+// ---- data API keys
+
+impl Branching {
+    fn keys(&self, branch: BranchId) -> String {
+        format!("{}/keys", self.branch(branch))
+    }
+
+    /// The branch's public key, sealed for display like the worker does.
+    fn seed_public_key(&self, branch: BranchId) -> (uuid::Uuid, String) {
+        let generated = data_key::generate(DataKeyKind::Public);
+        let id = uuid::Uuid::new_v4();
+        let new = NewDataKey {
+            id,
+            branch_id: branch,
+            kind: DataKeyKind::Public,
+            role: "anon".into(),
+            name: "public".into(),
+            prefix: generated.prefix.clone(),
+            sha256: generated.sha256,
+            sealed: Some(seal_credential(&self.app.key, &id.to_string(), Purpose::DataKey, &generated.key)),
+        };
+        insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
+        (id, generated.key)
+    }
+
+    fn seed_secret_key(&self, branch: BranchId, name: &str, role: &str) -> (uuid::Uuid, String) {
+        let generated = data_key::generate(DataKeyKind::Secret);
+        let id = uuid::Uuid::new_v4();
+        let new = NewDataKey {
+            id,
+            branch_id: branch,
+            kind: DataKeyKind::Secret,
+            role: role.into(),
+            name: name.into(),
+            prefix: generated.prefix.clone(),
+            sha256: generated.sha256,
+            sealed: None,
+        };
+        insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
+        (id, generated.key)
+    }
+
+    async fn list_keys(&self, branch: BranchId) -> Vec<Value> {
+        let resp = self.send(Method::GET, &self.keys(branch), None).await;
+        assert_eq!(resp.status(), 200);
+        resp.json().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn list_shows_the_public_key_in_full_and_never_secret_keys() {
+    let t = branching().await;
+    let (public_id, public) = t.seed_public_key(t.main());
+    let (secret_id, secret) = t.seed_secret_key(t.main(), "ci", "reporting");
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(list.len(), 2);
+    let by = |id: uuid::Uuid| list.iter().find(|k| k["id"] == json!(id)).unwrap();
+    let p = by(public_id);
+    assert_eq!(p["kind"], "public");
+    assert_eq!(p["role"], "anon");
+    assert_eq!(p["name"], "public");
+    assert_eq!(p["key"], public);
+    assert_eq!(p["prefix"], public[..12]);
+    assert!(p["created_at"].is_string());
+    assert!(p["last_used_at"].is_null());
+    let s = by(secret_id);
+    assert_eq!(s["kind"], "secret");
+    assert_eq!(s["role"], "reporting");
+    assert_eq!(s["name"], "ci");
+    assert_eq!(s["prefix"], secret[..12]);
+    assert!(s.get("key").is_none(), "{s}");
+    let text = serde_json::to_string(&list).unwrap();
+    for hidden in [secret.as_str(), "sealed", "sha256", "revoked"] {
+        assert!(!text.contains(hidden), "leaked {hidden}");
+    }
+    // Another branch's keys are its own.
+    let dev = t.ready("dev");
+    assert!(t.list_keys(dev).await.is_empty());
+}
+
+#[tokio::test]
+async fn create_secret_key_returns_it_once() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    let resp = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" })))
+        .await;
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    let key = created["key"].as_str().unwrap().to_string();
+    assert!(key.starts_with("chk_sec_") && key.len() == 51, "{key}");
+    assert_eq!(created["kind"], "secret");
+    assert_eq!(created["role"], "reporting");
+    assert_eq!(created["name"], "ci");
+    assert_eq!(created["prefix"], key[..12]);
+    let id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    // The worker was asked first, then only the hash was stored.
+    assert_eq!(*t.jobs.role_checks.lock().unwrap(), vec![(t.main(), "reporting".to_string())]);
+    {
+        let keys = t.metadata.keys.lock().unwrap();
+        let (stored, hash) = keys.iter().find(|(k, _)| k.id == id).unwrap();
+        assert_eq!(*hash, data_key::hash(&key));
+        assert_eq!(stored.sealed, None);
+        assert_eq!(stored.branch_id, t.main());
+    }
+    // A second list has no `key` for it.
+    let list = t.list_keys(t.main()).await;
+    let listed = list.iter().find(|k| k["id"] == json!(id)).expect("listed");
+    assert!(listed.get("key").is_none(), "{listed}");
+    assert!(!serde_json::to_string(&list).unwrap().contains(&key));
+
+    // The role defaults to `authenticated`.
+    let created: Value = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "web" })))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(created["role"], "authenticated");
+}
+
+#[tokio::test]
+async fn create_validates_the_body() {
+    let t = branching().await;
+    for body in [
+        json!({}),
+        json!({ "name": "" }),
+        json!({ "name": "x".repeat(64) }),
+        json!({ "name": "ok", "role": "" }),
+        json!({ "name": "ok", "surprise": 1 }),
+        json!({ "name": 5 }),
+    ] {
+        let resp = t.send(Method::POST, &t.keys(t.main()), Some(body.clone())).await;
+        assert_eq!(resp.status(), 422, "{body}");
+    }
+    assert_eq!(
+        t.send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "x".repeat(63) }))).await.status(),
+        201
+    );
+    // Nothing was asked of the worker for the refused ones.
+    assert_eq!(t.jobs.role_checks.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn create_maps_check_role_refusal_to_422() {
+    let t = branching().await;
+    let body = || Some(json!({ "name": "ci", "role": "boss" }));
+    let cases: [(Result<CheckDataRoleReply, ResetError>, u16, Option<&str>); 6] = [
+        (Ok(CheckDataRoleReply::refused("the role boss is a superuser")), 422, Some("the role boss is a superuser")),
+        (Ok(CheckDataRoleReply::not_ready()), 409, None),
+        (Ok(CheckDataRoleReply::failed("grant failed: secret detail")), 500, None),
+        (Err(ResetError::Timeout), 504, None),
+        (Err(ResetError::Transport("no worker listening".into())), 503, None),
+        // A reply that says no without saying why is our failure.
+        (Ok(CheckDataRoleReply { ok: false, error: None, kind: None }), 500, None),
+    ];
+    for (answer, status, message) in cases {
+        *t.jobs.role_check.lock().unwrap() = Some(answer);
+        let resp = t.send(Method::POST, &t.keys(t.main()), body()).await;
+        assert_eq!(resp.status(), status);
+        let err: Value = resp.json().await.unwrap();
+        let text = err["error"].as_str().unwrap();
+        if let Some(message) = message {
+            assert_eq!(text, message);
+        }
+        assert!(!text.contains("secret detail"), "{text}");
+    }
+    assert!(t.metadata.keys.lock().unwrap().is_empty(), "a refused role stores no key");
+
+    // A branch that isn't ready is a 409 without asking the worker.
+    *t.jobs.role_check.lock().unwrap() = None;
+    let before = t.jobs.role_checks.lock().unwrap().len();
+    let resetting = t.add("busy", t.main(), BranchKind::Normal, BranchStatus::Resetting);
+    let resp = t.send(Method::POST, &t.keys(resetting), body()).await;
+    assert_eq!(resp.status(), 409);
+    let backup = t.backup(t.main());
+    assert_eq!(t.send(Method::POST, &t.keys(backup), body()).await.status(), 409);
+    assert_eq!(t.jobs.role_checks.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn revoke_public_is_409() {
+    let t = branching().await;
+    let (public_id, _) = t.seed_public_key(t.main());
+    let path = format!("{}/{public_id}", t.keys(t.main()));
+    let resp = t.send(Method::DELETE, &path, None).await;
+    assert_eq!(resp.status(), 409);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({ "error": "rotate the public key instead" }));
+    assert_eq!(t.list_keys(t.main()).await.len(), 1);
+}
+
+#[tokio::test]
+async fn revoke_secret_is_204_then_404() {
+    let t = branching().await;
+    let (id, _) = t.seed_secret_key(t.main(), "ci", "reporting");
+    let (other, _) = t.seed_secret_key(t.main(), "keep", "reporting");
+    let path = format!("{}/{id}", t.keys(t.main()));
+    assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(list.iter().map(|k| k["id"].clone()).collect::<Vec<_>>(), vec![json!(other)]);
+    // Already revoked, unknown, not a uuid, and another branch's key.
+    assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 404);
+    let unknown = format!("{}/{}", t.keys(t.main()), uuid::Uuid::new_v4());
+    assert_eq!(t.send(Method::DELETE, &unknown, None).await.status(), 404);
+    let dev = t.ready("dev");
+    let wrong_branch = format!("{}/{other}", t.keys(dev));
+    assert_eq!(t.send(Method::DELETE, &wrong_branch, None).await.status(), 404);
+    assert_eq!(t.list_keys(t.main()).await.len(), 1);
+}
+
+#[tokio::test]
+async fn rotate_unknown_is_404() {
+    let t = branching().await;
+    let (id, _) = t.seed_secret_key(t.main(), "ci", "reporting");
+    let unknown = format!("{}/{}/rotate", t.keys(t.main()), uuid::Uuid::new_v4());
+    assert_eq!(t.send(Method::POST, &unknown, None).await.status(), 404);
+    // Revoked keys can't be rotated.
+    assert_eq!(t.send(Method::DELETE, &format!("{}/{id}", t.keys(t.main())), None).await.status(), 204);
+    let revoked = format!("{}/{id}/rotate", t.keys(t.main()));
+    assert_eq!(t.send(Method::POST, &revoked, None).await.status(), 404);
+    assert!(t.list_keys(t.main()).await.is_empty());
+}
+
+#[tokio::test]
+async fn rotate_public_gives_a_new_public_key_in_full() {
+    let t = branching().await;
+    let (old_id, old) = t.seed_public_key(t.main());
+    let resp = t.send(Method::POST, &format!("{}/{old_id}/rotate", t.keys(t.main())), None).await;
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    let key = created["key"].as_str().unwrap();
+    assert!(key.starts_with("chk_pub_") && key.len() == 51 && key != old, "{key}");
+    assert_eq!(created["kind"], "public");
+    assert_eq!(created["role"], "anon");
+    assert_eq!(created["name"], "public");
+    assert_ne!(created["id"], json!(old_id));
+    // Only the new one is live, and it is shown in full (sealed under its own id).
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], created["id"]);
+    assert_eq!(list[0]["key"], key);
+    let new_id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let sealed = t.metadata.keys.lock().unwrap().iter().find(|(k, _)| k.id == new_id).unwrap().0.sealed.clone().unwrap();
+    assert_eq!(open_credential(&t.app.key, &new_id.to_string(), Purpose::DataKey, &sealed).unwrap(), key);
+    // No role check for a public key.
+    assert!(t.jobs.role_checks.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rotate_secret_keeps_name_and_role() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    let (old_id, old) = t.seed_secret_key(t.main(), "ci", "reporting");
+    let created: Value = t
+        .send(Method::POST, &format!("{}/{old_id}/rotate", t.keys(t.main())), None)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let key = created["key"].as_str().unwrap();
+    assert!(key.starts_with("chk_sec_") && key != old);
+    assert_eq!((created["kind"].as_str(), created["role"].as_str(), created["name"].as_str()), (Some("secret"), Some("reporting"), Some("ci")));
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(list.len(), 2, "the public key and the new secret key");
+    assert!(list.iter().all(|k| k["id"] != json!(old_id)));
+    assert!(list.iter().find(|k| k["kind"] == "secret").unwrap().get("key").is_none());
+}
+
+#[tokio::test]
+async fn another_tenant_gets_403() {
+    let t = branching().await;
+    let mut other_db = None;
+    let other = lifecycle_app(FakeJobs::default(), |m, _t, k| {
+        let db = ready_database(TenantId::new(), k);
+        other_db = Some((db.database_id, BranchId::from(db.database_id)));
+        m.insert_database(db);
+    })
+    .await;
+    let (db, branch) = other_db.unwrap();
+    let base = format!("/v1/databases/{}/branches/{}", db.as_uuid(), branch.as_uuid());
+    let key = uuid::Uuid::new_v4();
+    for (method, path, body) in [
+        (Method::GET, format!("{base}/keys"), None),
+        (Method::POST, format!("{base}/keys"), Some(json!({ "name": "x" }))),
+        (Method::POST, format!("{base}/keys/{key}/rotate"), None),
+        (Method::DELETE, format!("{base}/keys/{key}"), None),
+        (Method::GET, format!("{base}/data-api/schema"), None),
+    ] {
+        let mut req = reqwest::Client::new()
+            .request(method.clone(), format!("{}{path}", other.base))
+            .header(IDENTITY_HEADER, other.token_for_org("org-1"));
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        assert_eq!(req.send().await.unwrap().status(), 403, "{method} {path}");
+    }
+    drop(t);
+}
+
+#[tokio::test]
+async fn keys_of_an_unknown_branch_are_404() {
+    let t = branching().await;
+    let unknown = format!("{}/keys", t.branch(BranchId::new()));
+    assert_eq!(t.send(Method::GET, &unknown, None).await.status(), 404);
+    assert_eq!(t.send(Method::POST, &unknown, Some(json!({ "name": "x" }))).await.status(), 404);
+}
+
+#[tokio::test]
+async fn settings_patch_bounds() {
+    let t = branching().await;
+    let path = database_path(&t);
+    for (field, ok, bad) in [
+        ("max_rows", [1, 100000], [0, 100001]),
+        ("statement_timeout_ms", [100, 120000], [99, 120001]),
+        ("max_connections", [1, 50], [0, 51]),
+    ] {
+        for value in ok {
+            let resp = t.send(Method::PATCH, &path, Some(json!({ field: value }))).await;
+            assert_eq!(resp.status(), 200, "{field}={value}");
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(body[field], value);
+        }
+        for value in bad {
+            assert_eq!(t.send(Method::PATCH, &path, Some(json!({ field: value }))).await.status(), 422, "{field}={value}");
+        }
+        assert_eq!(t.send(Method::PATCH, &path, Some(json!({ field: "many" }))).await.status(), 422);
+    }
+    for schema in ["app", "_x", "a1_b2", &"a".repeat(63)] {
+        let resp = t.send(Method::PATCH, &path, Some(json!({ "default_schema": schema }))).await;
+        assert_eq!(resp.status(), 200, "{schema}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["default_schema"], schema);
+    }
+    for schema in ["", "1abc", "Public", "a-b", "a b", &"a".repeat(64), "pub\"lic", "x;drop"] {
+        assert_eq!(
+            t.send(Method::PATCH, &path, Some(json!({ "default_schema": schema }))).await.status(),
+            422,
+            "{schema:?}"
+        );
+    }
+    // Refused values change nothing, and the stored values come back on the next PATCH.
+    let db = t.metadata.database(t.db);
+    assert_eq!((db.max_rows, db.statement_timeout_ms, db.max_connections), (100000, 120000, 50));
+    assert_eq!(db.default_schema, "a".repeat(63));
+    let body: Value = t.send(Method::PATCH, &path, Some(json!({}))).await.json().await.unwrap();
+    assert_eq!(body["max_rows"], 100000);
+    assert_eq!(body["default_schema"], "a".repeat(63));
+}
+
+// ---- the data API's schema, proxied from rest
+
+type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+async fn mock_rest(seen: Seen) -> String {
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::routing::get;
+    let app = Router::new().route(
+        "/internal/schema/{branch}",
+        get(move |Path(branch): Path<String>, headers: HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+                seen.lock().unwrap().push((branch, auth));
+                axum::Json(json!({ "version": "v1", "schemas": { "public": { "tables": {}, "functions": {}, "enums": {} } } }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn data_api_schema_is_proxied_from_rest() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let rest = mock_rest(seen.clone()).await;
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app_with_rest(metadata.clone(), jobs.clone(), &rest).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    let t = Branching { app, metadata, jobs, db: id };
+
+    let path = format!("{}/data-api/schema", t.branch(t.main()));
+    let resp = t.send(Method::GET, &path, None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], "v1");
+    assert!(body["schemas"]["public"].is_object());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(t.main().as_uuid().to_string(), Some(format!("Bearer {REST_TOKEN}")))]
+    );
+}
+
+#[tokio::test]
+async fn data_api_schema_is_503_when_rest_is_down() {
+    let t = branching().await; // rest points at a closed port
+    let path = format!("{}/data-api/schema", t.branch(t.main()));
+    let resp = t.send(Method::GET, &path, None).await;
+    assert_eq!(resp.status(), 503);
+    let text = resp.text().await.unwrap();
+    assert!(!text.contains("127.0.0.1"), "{text}");
+}
+
+/// Rest answering 503 (the branch's database is unreachable, the schema is being
+/// reinstalled) is passed on with its body and `Retry-After`, not turned into a 502.
+#[tokio::test]
+async fn data_api_schema_passes_rests_503_through() {
+    use axum::routing::get;
+    let app = Router::new().route(
+        "/internal/schema/{branch}",
+        get(|| async {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "2")],
+                axum::Json(json!({ "error": { "code": "unavailable", "message": "try again" } })),
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app_with_rest(metadata.clone(), jobs.clone(), &rest).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    let t = Branching { app, metadata, jobs, db: id };
+
+    let resp = t.send(Method::GET, &format!("{}/data-api/schema", t.branch(t.main())), None).await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.headers()["retry-after"], "2");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unavailable");
 }

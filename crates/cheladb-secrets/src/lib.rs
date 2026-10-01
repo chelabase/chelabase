@@ -93,12 +93,18 @@ pub fn verify_key_check(key: &SecretKey, stored: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Owner,
+    /// The `authenticator` role's password on a branch.
+    Authenticator,
+    /// A public data API key, sealed so it can be shown again.
+    DataKey,
 }
 
 impl Purpose {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Purpose::Owner => "owner",
+            Purpose::Authenticator => "authenticator",
+            Purpose::DataKey => "data_key",
         }
     }
 }
@@ -268,5 +274,27 @@ mod credential_tests {
         let key = SecretKey::generate();
         let unbound = seal(&key, "db-1", "pw");
         assert!(open_credential(&key, "db-1", Purpose::Owner, &unbound).is_err());
+    }
+
+    #[test]
+    fn authenticator_and_data_key_purposes_round_trip_and_differ_in_aad() {
+        let key = SecretKey::generate();
+        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey];
+        assert_eq!(Purpose::Owner.as_str(), "owner");
+        assert_eq!(Purpose::Authenticator.as_str(), "authenticator");
+        assert_eq!(Purpose::DataKey.as_str(), "data_key");
+        for sealed_for in all {
+            let sealed = seal_credential(&key, "id-1", sealed_for, "pw");
+            for open_as in all {
+                let opened = open_credential(&key, "id-1", open_as, &sealed);
+                if open_as == sealed_for {
+                    assert_eq!(opened.unwrap(), "pw");
+                } else {
+                    assert!(matches!(opened, Err(SecretsError::Decrypt)), "{sealed_for:?} as {open_as:?}");
+                }
+            }
+        }
+        let sealed = seal_credential(&key, "id-1", Purpose::DataKey, "pw");
+        assert_eq!(open(&key, "id-1:data_key", &sealed).unwrap(), "pw");
     }
 }

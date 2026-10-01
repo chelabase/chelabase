@@ -10,6 +10,8 @@ pub struct InternalConfig {
     pub addr: SocketAddr,
     pub proxy_token: String,
     pub storcon_token: String,
+    pub data_keys_token: String,
+    pub rest_token: String,
     pub storcon_url: String,
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
@@ -33,6 +35,8 @@ impl InternalConfig {
                 .context("CHELADB_INTERNAL_ADDR is not a socket address")?,
             proxy_token: or("CHELADB_PROXY_API_TOKEN", "cheladb-dev-proxy-api"),
             storcon_token: or("CHELADB_STORCON_HOOK_TOKEN", "cheladb-dev-storcon-hook"),
+            data_keys_token: or("CHELADB_DATA_KEYS_TOKEN", "cheladb-dev-data-keys"),
+            rest_token: or("CHELADB_REST_INTERNAL_TOKEN", "cheladb-dev-rest-internal"),
             storcon_url: or("CHELADB_STORCON_URL", "http://127.0.0.1:1234"),
             compute_jwt_dir: PathBuf::from(or("CHELADB_COMPUTE_JWT_DIR", ".cheladb/neon")),
             compute_network: or("CHELADB_COMPUTE_NETWORK", "cheladb_default"),
@@ -52,6 +56,8 @@ impl std::fmt::Debug for InternalConfig {
             .field("addr", &self.addr)
             .field("proxy_token", &"<redacted>")
             .field("storcon_token", &"<redacted>")
+            .field("data_keys_token", &"<redacted>")
+            .field("rest_token", &"<redacted>")
             .field("storcon_url", &self.storcon_url)
             .field("compute_jwt_dir", &self.compute_jwt_dir)
             .field("compute_network", &self.compute_network)
@@ -70,6 +76,8 @@ mod tests {
         assert_eq!(c.addr, "127.0.0.1:8083".parse().unwrap());
         assert_eq!(c.proxy_token, "cheladb-dev-proxy-api");
         assert_eq!(c.storcon_token, "cheladb-dev-storcon-hook");
+        assert_eq!(c.data_keys_token, "cheladb-dev-data-keys");
+        assert_eq!(c.rest_token, "cheladb-dev-rest-internal");
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
         assert_eq!(c.compute_jwt_dir, PathBuf::from(".cheladb/neon"));
         assert_eq!(c.compute_network, "cheladb_default");
@@ -103,6 +111,8 @@ mod tests {
         let shown = format!("{c:?}");
         assert!(!shown.contains("cheladb-dev-proxy-api"), "{shown}");
         assert!(!shown.contains("cheladb-dev-storcon-hook"), "{shown}");
+        assert!(!shown.contains("cheladb-dev-data-keys"), "{shown}");
+        assert!(!shown.contains("cheladb-dev-rest-internal"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
     }
 

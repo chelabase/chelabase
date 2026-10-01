@@ -1,0 +1,13 @@
+{
+  "call": "db.batch((tx) => [tx.from(\"orders\").insert([{ total: \"1.00\", region: \"eu\" }]).returning(\"id\"), tx.from(\"events\").update({ label: \"x\" }).where({ id: 1 }), tx.from(\"billing.invoices\").select(\"id\").limit(1), tx.call(\"add_points\", { user_id: \"u\" })])",
+  "tree": {
+    "v": 1,
+    "op": "batch",
+    "ops": [
+      { "op": "insert", "into": "orders", "values": [{ "total": "1.00", "region": "eu" }], "returning": ["id"] },
+      { "op": "update", "table": "events", "set": { "label": "x" }, "where": { "col": "id", "eq": 1 } },
+      { "op": "select", "from": "billing.invoices", "select": ["id"], "limit": 1 },
+      { "op": "call", "fn": "add_points", "args": { "user_id": "u" } }
+    ]
+  }
+}

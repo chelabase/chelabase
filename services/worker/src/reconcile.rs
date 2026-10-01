@@ -18,6 +18,8 @@ use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 
 pub const STALE_PROVISION_SECS: i64 = 600;
 pub const STALE_DELETE_SECS: i64 = 60;
+/// How many ready branches each pass checks for the `cheladb` schema (one `admin_sql` each).
+pub const SCHEMA_CHECKS_PER_PASS: usize = 20;
 
 /// One observation. Taken in the order computes, tenants, databases, endpoints: rows are
 /// written before their compute or tenant exists, so a fresh resource never looks orphaned.
@@ -37,6 +39,9 @@ pub struct Snapshot {
     /// The `pitr_interval` of each ready database's tenant. Absent when it was never set (or
     /// couldn't be read), which counts as drift.
     pub pitr: HashMap<String, Duration>,
+    /// Branches whose data API needs its bootstrap: no public key or authenticator password
+    /// (from the metadata), or no `cheladb.schema_version` (from this pass's checks).
+    pub needs_data_api: HashSet<BranchId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,10 +56,14 @@ pub enum Action {
     RetryBranchDelete(BranchId),
     /// A branch `resetting` for too long: finish the reset or restore.
     FinishSwitch(BranchId),
-    /// A ready `normal` branch's compute container is gone (main's included): start a new one.
-    RecreateBranchCompute(String),
+    /// `(branch, endpoint)`: a ready `normal` branch's compute container is gone (main's
+    /// included): start a new one.
+    RecreateBranchCompute(BranchId, String),
     /// A reset stored a new password but didn't apply it: reset steps 2–4.
     ApplyPending(String),
+    /// A ready `normal` branch with its compute lacks its public key, its authenticator
+    /// password or the `cheladb` schema: run the data API bootstrap.
+    BootstrapDataApi { branch_id: BranchId },
     /// A compute with no endpoint row.
     RemoveCompute(String),
     /// An endpoint row whose branch is failed or deleted: a teardown that failed.
@@ -83,15 +92,16 @@ impl Action {
             Action::RetryDelete(_) => 2,
             Action::RetryBranchDelete(_) => 3,
             Action::FinishSwitch(_) => 4,
-            Action::RecreateBranchCompute(_) => 5,
+            Action::RecreateBranchCompute(..) => 5,
             Action::ApplyPending(_) => 6,
-            Action::RemoveCompute(_) => 7,
-            Action::RetryTeardown(_) => 8,
-            Action::PatchHistoryWindow(_) => 9,
-            Action::ReportStuckRestore(_) => 10,
-            Action::ReportUnknownTenant(_) => 11,
-            Action::ReportUnknownTimeline(..) => 12,
-            Action::ReportEndpointWithoutDatabase(_) => 13,
+            Action::BootstrapDataApi { .. } => 7,
+            Action::RemoveCompute(_) => 8,
+            Action::RetryTeardown(_) => 9,
+            Action::PatchHistoryWindow(_) => 10,
+            Action::ReportStuckRestore(_) => 11,
+            Action::ReportUnknownTenant(_) => 12,
+            Action::ReportUnknownTimeline(..) => 13,
+            Action::ReportEndpointWithoutDatabase(_) => 14,
         }
     }
 
@@ -103,9 +113,10 @@ impl Action {
             Action::FailStaleBranch(id)
             | Action::RetryBranchDelete(id)
             | Action::FinishSwitch(id)
-            | Action::ReportStuckRestore(id) => id.to_string(),
+            | Action::ReportStuckRestore(id)
+            | Action::BootstrapDataApi { branch_id: id } => id.to_string(),
             Action::ReportUnknownTimeline(tenant, timeline) => format!("{tenant}/{timeline}"),
-            Action::RecreateBranchCompute(s)
+            Action::RecreateBranchCompute(_, s)
             | Action::ApplyPending(s)
             | Action::RemoveCompute(s)
             | Action::RetryTeardown(s)
@@ -169,14 +180,16 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
             BranchStatus::Failed if b.pending_timeline_id.is_some() => {
                 actions.push(Action::ReportStuckRestore(b.id));
             }
-            // Backups have no compute.
-            BranchStatus::Ready if b.kind == BranchKind::Normal => {
-                if let Some(ep) = &b.endpoint_id
-                    && !s.computes.contains(ep)
-                {
-                    actions.push(Action::RecreateBranchCompute(ep.clone()));
+            // Backups have no compute. Recreating a compute runs the data API bootstrap too.
+            BranchStatus::Ready if b.kind == BranchKind::Normal => match &b.endpoint_id {
+                Some(ep) if !s.computes.contains(ep) => {
+                    actions.push(Action::RecreateBranchCompute(b.id, ep.clone()));
                 }
-            }
+                Some(_) if s.needs_data_api.contains(&b.id) => {
+                    actions.push(Action::BootstrapDataApi { branch_id: b.id });
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -248,6 +261,24 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
     actions
 }
 
+/// The next `n` of `candidates` (sorted by id) after `after`, wrapping around: reconcile's
+/// `cheladb` schema check covers every ready branch in turn, a few per pass.
+pub fn schema_check_batch(
+    candidates: &[BranchId],
+    after: Option<BranchId>,
+    n: usize,
+) -> Vec<BranchId> {
+    let start = after.map_or(0, |a| {
+        candidates.partition_point(|c| c.as_uuid() <= a.as_uuid())
+    });
+    candidates[start..]
+        .iter()
+        .chain(&candidates[..start])
+        .take(n)
+        .copied()
+        .collect()
+}
+
 /// A running provision must stop (and clean up) once a delete has begun.
 pub fn should_abort_provision(status: DatabaseStatus) -> bool {
     matches!(status, DatabaseStatus::Deleting | DatabaseStatus::Deleted)
@@ -314,6 +345,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .list_endpoints_for_reconcile()
             .await
             .context("listing endpoints")?;
+        let computes: HashSet<String> = computes.into_iter().collect();
+        let mut needs_data_api: HashSet<BranchId> = self
+            .metadata
+            .branches_missing_data_api()
+            .await
+            .context("listing branches missing the data API")?
+            .into_iter()
+            .collect();
+        needs_data_api.extend(self.branches_without_cheladb(&branches, &computes).await);
         let tenants: HashSet<String> = tenants.iter().map(|t| t.as_str().to_string()).collect();
         // Only the tenants `plan` may patch: ready databases' tenants on the controller.
         let mut pitr = HashMap::new();
@@ -339,11 +379,57 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             databases,
             branches,
             endpoints,
-            computes: computes.into_iter().collect(),
+            computes,
             tenants,
             tenant_timelines,
             pitr,
+            needs_data_api,
         })
+    }
+
+    /// The next [`SCHEMA_CHECKS_PER_PASS`] ready `normal` branches with a compute (by id, after
+    /// the last pass's), checked for the data API's machinery ([`Worker::data_api_healthy`]);
+    /// those where it's broken. A failed check is logged and skipped.
+    async fn branches_without_cheladb(
+        &self,
+        branches: &[LiveBranch],
+        computes: &HashSet<String>,
+    ) -> Vec<BranchId> {
+        let mut ready: Vec<(BranchId, &str)> = branches
+            .iter()
+            .filter(|b| b.status == BranchStatus::Ready && b.kind == BranchKind::Normal)
+            .filter_map(|b| {
+                let ep = b.endpoint_id.as_deref()?;
+                computes.contains(ep).then_some((b.id, ep))
+            })
+            .collect();
+        ready.sort_by_key(|(id, _)| id.as_uuid());
+        let ids: Vec<BranchId> = ready.iter().map(|(id, _)| *id).collect();
+        let batch = {
+            let mut cursor = self
+                .schema_check_cursor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let batch = schema_check_batch(&ids, *cursor, SCHEMA_CHECKS_PER_PASS);
+            if let Some(last) = batch.last() {
+                *cursor = Some(*last);
+            }
+            batch
+        };
+        let mut missing = Vec::new();
+        for id in batch {
+            let Some((_, ep)) = ready.iter().find(|(b, _)| *b == id) else {
+                continue;
+            };
+            match self.data_api_healthy(ep).await {
+                Ok(true) => {}
+                Ok(false) => missing.push(id),
+                Err(err) => {
+                    warn!(branch_id = %id, endpoint_id = %ep, "checking the data API's machinery: {err:#}");
+                }
+            }
+        }
+        missing
     }
 
     async fn execute(&self, action: &Action) -> Result<(), String> {
@@ -373,7 +459,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             // Refused (the refusal recorded, the branch left as it is) while it has children.
             Action::RetryBranchDelete(id) => self.handle_branch_delete(*id).await,
             Action::FinishSwitch(id) => self.finish_switch(*id).await,
-            Action::RecreateBranchCompute(ep) => self.recreate_compute(ep).await,
+            Action::RecreateBranchCompute(id, ep) => self.recreate_compute(*id, ep).await,
+            Action::BootstrapDataApi { branch_id } => self.reconcile_data_api(*branch_id).await,
             // After a RecreateBranchCompute in the same pass, the push can reach the new container
             // before compute_ctl listens and fail. That heals itself: the flag stays set, the
             // next pass retries, and meanwhile the new compute boots with the current spec.
@@ -557,6 +644,7 @@ mod tests {
             tenants: [TENANT.to_string()].into(),
             tenant_timelines: [(TENANT.to_string(), [MAIN_TL.to_string()].into())].into(),
             pitr: [(TENANT.to_string(), WEEK)].into(),
+            ..Default::default()
         }
     }
 
@@ -634,7 +722,11 @@ mod tests {
     fn a_ready_database_without_its_compute_gets_a_new_one() {
         let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
         s.computes.clear();
-        assert_eq!(plan(&s), [Action::RecreateBranchCompute(EP.to_string())]);
+        let main = s.branches[0].id;
+        assert_eq!(
+            plan(&s),
+            [Action::RecreateBranchCompute(main, EP.to_string())]
+        );
     }
 
     #[test]
@@ -723,6 +815,7 @@ mod tests {
         let stale = db(DatabaseStatus::Provisioning, None, STALE_PROVISION_SECS + 1);
         let ready = db(DatabaseStatus::Ready, Some(EP), 3600);
         let stale_id = stale.id;
+        let ready_main = BranchId::from(ready.id);
         let s = Snapshot {
             endpoints: vec![endpoint(EP, Some(&ready), true)],
             branches: vec![main_of(&ready)],
@@ -735,7 +828,7 @@ mod tests {
             plan(&s),
             [
                 Action::FailStale(stale_id),
-                Action::RecreateBranchCompute(EP.to_string()),
+                Action::RecreateBranchCompute(ready_main, EP.to_string()),
                 Action::ApplyPending(EP.to_string()),
                 Action::RemoveCompute(EP2.to_string()),
                 Action::ReportUnknownTenant("fedcba9876543210fedcba9876543210".to_string()),
@@ -799,18 +892,79 @@ mod tests {
 
     #[test]
     fn a_ready_branch_without_its_compute_gets_a_new_one() {
-        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        let main = s.branches[0].id;
         s.computes.remove(EP3);
-        assert_eq!(plan(&s), [Action::RecreateBranchCompute(EP3.to_string())]);
+        assert_eq!(
+            plan(&s),
+            [Action::RecreateBranchCompute(dev, EP3.to_string())]
+        );
         // Main and a branch, both gone: one action each.
         s.computes.remove(EP);
         assert_eq!(
             plan(&s),
             [
-                Action::RecreateBranchCompute(EP3.to_string()),
-                Action::RecreateBranchCompute(EP.to_string()),
+                Action::RecreateBranchCompute(dev, EP3.to_string()),
+                Action::RecreateBranchCompute(main, EP.to_string()),
             ]
         );
+    }
+
+    // --- The data API (step 6) -----------------------------------------------------------
+
+    #[test]
+    fn a_branch_missing_its_data_api_is_bootstrapped() {
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        let main = s.branches[0].id;
+        s.needs_data_api.insert(dev);
+        assert_eq!(plan(&s), [Action::BootstrapDataApi { branch_id: dev }]);
+        s.needs_data_api.insert(main);
+        assert_eq!(plan(&s).len(), 2);
+        // Without its compute, recreating it runs the bootstrap too.
+        s.computes.remove(EP3);
+        assert_eq!(
+            plan(&s),
+            [
+                Action::RecreateBranchCompute(dev, EP3.to_string()),
+                Action::BootstrapDataApi { branch_id: main },
+            ]
+        );
+        // Only ready branches.
+        for status in [
+            BranchStatus::Provisioning,
+            BranchStatus::Resetting,
+            BranchStatus::Failed,
+        ] {
+            let (mut s, dev) = with_dev(status, 0);
+            s.needs_data_api.insert(dev);
+            let planned = plan(&s);
+            assert!(
+                !planned
+                    .iter()
+                    .any(|a| matches!(a, Action::BootstrapDataApi { .. })),
+                "{status:?}: {planned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_schema_check_takes_a_few_branches_round_robin() {
+        let mut ids: Vec<BranchId> = (0..25).map(|_| BranchId::new()).collect();
+        ids.sort_by_key(|b| b.as_uuid());
+        assert_eq!(schema_check_batch(&ids, None, 20), ids[..20]);
+        assert_eq!(
+            schema_check_batch(&ids, Some(ids[19]), 20),
+            [&ids[20..], &ids[..15]].concat()
+        );
+        // Fewer than `n`: each once, starting after the cursor.
+        assert_eq!(
+            schema_check_batch(&ids[..3], Some(ids[1]), 20),
+            [ids[2], ids[0], ids[1]]
+        );
+        // A cursor whose branch is gone: the next one after it.
+        let rest: Vec<BranchId> = ids.iter().copied().filter(|b| *b != ids[5]).collect();
+        assert_eq!(schema_check_batch(&rest, Some(ids[5]), 2), [ids[6], ids[7]]);
+        assert!(schema_check_batch(&[], Some(ids[0]), 20).is_empty());
     }
 
     #[test]
@@ -981,6 +1135,73 @@ mod tests {
         let token = w.computes.token_of(&ep).unwrap();
         assert_eq!(sha256_hex(&token), token_hash(&w, &ep));
         assert_ne!(token_hash(&w, &ep), old_hash);
+    }
+
+    #[tokio::test]
+    async fn reconcile_bootstraps_branches_missing_key_or_password() {
+        let (w, journal) = worker();
+        let (id, ep) = provision(&w, &journal).await;
+        let main = BranchId::from(id);
+        let data_api = format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp;");
+
+        // Nothing missing: no bootstrap.
+        w.reconcile_once().await.unwrap();
+        assert_eq!(
+            position(&journal, &data_api),
+            None,
+            "{:?}",
+            entries(&journal)
+        );
+
+        // No authenticator password.
+        w.metadata
+            .state()
+            .branches
+            .get_mut(&main)
+            .unwrap()
+            .authenticator_password_enc = None;
+        w.reconcile_once().await.unwrap();
+        assert!(w.metadata.main(id).authenticator_password_enc.is_some());
+        assert!(pos(&journal, "metadata.set_authenticator_password") < pos(&journal, &data_api));
+
+        // No public key.
+        journal.lock().unwrap().clear();
+        w.metadata.state().data_keys.clear();
+        w.reconcile_once().await.unwrap();
+        assert!(pos(&journal, &data_api) < pos(&journal, "metadata.insert_data_key"));
+        assert_eq!(w.metadata.state().data_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_bootstraps_when_cheladb_is_missing() {
+        let check = "to_regclass('cheladb.schema_version')";
+        // Present: checked, nothing else.
+        let (w, journal) = worker();
+        let (_id, ep) = provision(&w, &journal).await;
+        w.computes.answer(check, "t\n");
+        w.reconcile_once().await.unwrap();
+        assert!(
+            position(
+                &journal,
+                &format!("compute.sql {ep} app SELECT to_regclass")
+            )
+            .is_some()
+        );
+        assert_eq!(
+            position(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp;")),
+            None
+        );
+
+        // Missing: bootstrapped.
+        let (w, journal) = worker();
+        let (_id, ep) = provision(&w, &journal).await;
+        w.computes.answer(check, "f\n");
+        w.reconcile_once().await.unwrap();
+        let checked = pos(
+            &journal,
+            &format!("compute.sql {ep} app SELECT to_regclass"),
+        );
+        assert!(checked < pos(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp;")));
     }
 
     #[tokio::test]

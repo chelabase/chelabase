@@ -1,0 +1,13 @@
+{
+  "call": "db.from(\"orders\").insert([{ total: \"12.50\", region: \"eu\" }, { total: \"3.00\", region: \"us\" }]).returning(\"id\", \"total\")",
+  "tree": {
+    "v": 1,
+    "op": "insert",
+    "into": "orders",
+    "values": [
+      { "total": "12.50", "region": "eu" },
+      { "total": "3.00", "region": "us" }
+    ],
+    "returning": ["id", "total"]
+  }
+}

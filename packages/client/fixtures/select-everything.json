@@ -1,0 +1,4 @@
+{
+  "call": "db.from(\"orders\")",
+  "tree": { "v": 1, "op": "select", "from": "orders" }
+}

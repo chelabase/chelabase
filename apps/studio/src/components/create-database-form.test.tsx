@@ -19,6 +19,10 @@ function detail(status: DatabaseDetail["status"], error: string | null = null): 
     branch_count: 1,
     history_window: 604800,
     max_branches: 5,
+    max_rows: 1000,
+    statement_timeout_ms: 8000,
+    max_connections: 5,
+    default_schema: "public",
   };
 }
 

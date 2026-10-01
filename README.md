@@ -8,7 +8,7 @@ Apache-2.0. Tooling: [proto](https://moonrepo.dev/proto) + [moon](https://moonre
 
 ```
 apps/studio          the only user-facing app
-services/            gateway, orchestrator, worker, auth (was ui-auth); later rest
+services/            gateway, orchestrator, worker, rest, auth (was ui-auth)
 tools/cli            the `cheladb` binary (binary and package name unchanged)
 crates/, packages/   shared Rust and TypeScript libraries, unchanged
 infra/compose/       metadata Postgres, NATS JetStream, Zitadel
@@ -45,9 +45,10 @@ pnpm install
 | `just test` | Rust tests with nextest, then doctests |
 | `just sweep-builds` | Delete build artifacts older than 14 days (`days=N` to change) from both target dirs |
 | `just wt-add <branch> [base]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/` |
-| `just orchestrator` / `worker` / `gateway` / `auth` / `studio` | Foreground one process |
+| `just orchestrator` / `worker` / `gateway` / `rest` / `auth` / `studio` | Foreground one process |
 | `just cleanup` | Fresh start: stops dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps (keeps keys and the seeded tenant). Asks first |
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
+| `just data-e2e` | Live data API story: keys, queries, generated types, RLS, revoke (needs `just deps-up` and `just dev`) |
 
 ```bash
 just dev                 # deps + IAM bootstrap + background processes
@@ -126,7 +127,7 @@ How it's wired:
 
 Each database gets a Neon tenant and timeline on the storage controller, plus one compute container (`cheladb-compute-<ep>`). The `postgres` role is a member of `neon_superuser`, and a real superuser only when `CHELADB_DB_OWNER_SUPERUSER` is on and `CHELADB_MODE` is self-hosted. Clients connect through Neon's proxy: Postgres wire at `<ep>.localtest.me:4432`; SQL over HTTP and WebSocket at `https://<ep>.localtest.me:4444/sql`. Use `sslrootcert=.cheladb/neon/proxy-ca.crt`; if `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`.
 
-The data API roles `anon` (NOLOGIN), `authenticated` (NOLOGIN) and `authenticator` (NOLOGIN NOINHERIT, granted both) are created in every database. The `cheladb_platform` role is gone.
+The data API roles `anon` (NOLOGIN), `authenticated` (NOLOGIN) and `authenticator` (LOGIN NOINHERIT, with its own encrypted password per branch) are created in every database. The `cheladb_platform` role is gone.
 
 - **Connection details** (`GET /v1/databases/{id}/connection`, Studio → *Connection details*) can be revealed any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key at `CHELADB_SECRETS_KEY` (`.cheladb/secrets/secrets.key`, created by bootstrap). Keep that file: without it stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist (after `just sweep-dbs` a new key is simply adopted). Databases from before Neon provisioning became `deleted` tombstones when its migration ran; recreate them.
 - **Reset password** (`POST …/reset-password`) sets a new owner password. Existing sessions keep working until they reconnect. If the worker isn't running you get `503`. A `503` saying the password "was changed but not yet applied" means the new password is stored (reveal shows it; Studio shows it with the error) and the worker's reconcile applies it.
@@ -170,11 +171,227 @@ Every database can have branches: copies of another branch's data, each with its
 | Worker health | 8082 | `/health` |
 | Gateway | 8000 | HTTP front door (Pingora) |
 | auth | 8084 | Sign-in backend (via gateway at `/auth/v1`) |
+| rest | 8085 | Data API engine (via gateway at `/data/v1`) |
+| rest internal | 8086 | Orchestrator's schema calls to rest |
 | Neon storage controller | 1234 | Tenants and timelines |
 | Neon proxy | 4432, 4444 | Postgres wire; WebSocket and SQL over HTTP |
 | Valkey | 6379 | Proxy cache invalidation and query cancel |
 
 Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.cheladb/zitadel/demo.env` after bootstrap.
+
+## Data API
+
+Apps read and write a branch's tables over `POST /data/v1/query` with per-branch keys. The gateway checks the key; the `rest` service (`services/rest`, `just rest`) turns the request into SQL and runs it.
+
+### Request flow
+
+```
+POST /data/v1/query, Authorization: Bearer <key>  →  gateway
+  ↓ sha256(key) → cached internal listener
+  ↓ branch_id, role, key_id from the key
+  ↓ mint internal identity token (aud: "rest", branch_id, role, key_id)
+  ↓ rest service, verified identity
+  ↓ GET internal listener for branch connection (cached 60 s)
+  ↓ pool for the branch (sqlx, as `authenticator`)
+  ↓ BEGIN
+  ↓ one round trip: set_config for role, request.jwt.claims, statement_timeout and
+  ↓   transaction_timeout; read cheladb.schema_version
+  ↓ [introspect if the schema version is new]
+  ↓ parse query → shape cache → generate SQL → execute
+  ↓ COMMIT
+  ↓ JSON response
+```
+
+Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key (cached 30 s) and mints an internal token that `rest` verifies. Unknown keys are also cached 30 s, and cache misses (lookups reaching the internal listener) are limited to 20 per second per client IP; over the limit gets 429.
+
+`rest` listens on `127.0.0.1:8085` (internal listener on `:8086`). Its env:
+- `CHELADB_REST_ADDR` and `CHELADB_REST_INTERNAL_ADDR` (the defaults above);
+- `CHELADB_REST_MAX_CONNECTIONS` (default 200): permits shared by every branch's pool, on top of each branch's own `max_connections` setting;
+- `CHELADB_REST_MAX_RESPONSE_BYTES` (default 16 MiB): the largest response. Each operation's result is counted as it arrives; the first one past the cap rolls the request back and answers 413 `too_large`.
+
+The gateway answers its own 404 and 405 under `/data/` with the data API's error body (code `invalid_query`).
+
+### Keys
+
+Each branch has exactly one live **public key** (role `anon`, safe for browsers) and zero or more **secret keys** (chosen role, server only). Both start with a prefix (`chk_pub_` or `chk_sec_`) and are 51 characters total.
+
+- **What is stored:** the SHA-256 of every key and its first 12 characters (shown in lists). A secret key is returned once and the platform keeps no copy (Studio shows it in a copy-once box). The public key is also stored encrypted, so Studio can show it again.
+- **Public key:** created when the branch first becomes ready. It can't be revoked (409: rotate it instead). Rotating creates a new key with the same role and name and revokes the old one in one transaction; the old key keeps working until the gateway's 30-second cache expires.
+- **Secret key:** choose a role when creating one (`POST /v1/databases/{id}/branches/{bid}/keys`; the default is `authenticated`). The role is checked and granted to `authenticator` at creation; a refused role is a 422 saying why. A role is refused when it:
+  - isn't a valid role name (a letter or `_`, then letters, digits, `_` or `$`; at most 63 characters);
+  - is `authenticator` or `cheladb_admin`, or any `pg_*` role;
+  - doesn't exist in the branch's database;
+  - is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `cheladb_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`.
+- **Rotating a secret key** keeps its role and doesn't run the check or the grant again. A reset or restore rewinds the grant, so the worker's bootstrap grants each live secret key's role again (a role that's gone or now refused is skipped with a warning, and its key stops working).
+- **Revocation:** effective within 30 seconds (the gateway cache).
+- **Lifecycle:** keys belong to the branch, not its timeline, so reset and restore keep them. Deleting a branch deletes its keys.
+
+### Schema model
+
+The `cheladb` schema holds machinery only, reserved and never exposed. Other reserved schemas: `pg_catalog`, `information_schema`, `pg_toast`, `neon`, `neon_migration` and temp schemas. An object is reachable when the key's role has `USAGE` on its schema and any privilege on the object: any column-level `SELECT`, `INSERT` or `UPDATE`, or table-level `DELETE`, for tables, views, materialized views and foreign tables, and `EXECUTE` for functions. Anything else answers like a name that doesn't exist (`unknown_table`, `unknown_column`, `unknown_function`).
+
+**Default privileges.** The worker's bootstrap runs on every compute (re)creation and from reconcile, and is idempotent. It sets, for objects the owner role (`postgres`) creates:
+- `anon`: `SELECT` on tables and views in `public`, and `USAGE` on the `public` schema.
+- `authenticated`: `SELECT, INSERT, UPDATE, DELETE` on tables and views in `public`; `USAGE, SELECT` on sequences in `public`; `USAGE` on the `public` schema.
+- Functions: `EXECUTE` is revoked from `PUBLIC` for every function the owner creates (any schema) and granted to `authenticated` in `public`. `anon` gets no function by default.
+
+The first bootstrap of a database also grants the same on what already exists in `public` (tables, sequences, functions the owner made; extension functions are skipped). Later bootstraps don't repeat it.
+
+**Row-level security (RLS) is off by default.** Studio warns about every reachable object without it:
+- a table: `ALTER TABLE … ENABLE ROW LEVEL SECURITY; CREATE POLICY …`;
+- a view runs with its owner's rights, so RLS on the tables it reads doesn't apply: `ALTER VIEW … SET (security_invoker = true)`;
+- a materialized view or a foreign table can't have RLS: `REVOKE ALL … FROM anon, authenticated`.
+
+### Query language
+
+One request is one operation: a JSON tree. `"v": 1` is required at the top, and unknown fields are rejected anywhere. A table or function name is `"name"` (in the database's `default_schema`) or `"schema.name"`. These examples are the contract fixtures in `packages/client/fixtures`.
+
+- **`select`**: `from`, optional `select` (a list of column names or `{"col", "as"}`; omitted means every column), `where`, `orderBy`, `limit`, `offset`.
+  ```json
+  {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "select": ["id", "total", { "col": "customer_name", "as": "customer" }],
+    "where": { "and": [{ "col": "status", "eq": "paid" }, { "col": "total", "gte": "100" }] },
+    "orderBy": [{ "col": "created_at", "dir": "desc", "nulls": "last" }],
+    "limit": 50
+  }
+  ```
+  `dir` is `asc` or `desc`, `nulls` is `first` or `last`; both are optional.
+- **`insert`**: `into`, `values` (a non-empty array of objects with the same keys), optional `returning` (`"*"` or a list of columns).
+  ```json
+  { "v": 1, "op": "insert", "into": "orders", "values": [{ "total": "12.50", "region": "eu" }], "returning": ["id", "total"] }
+  ```
+- **`update`**: `table`, `set`, and `where` or `"all": true`; optional `returning`.
+  ```json
+  { "v": 1, "op": "update", "table": "orders", "set": { "status": "shipped" }, "where": { "col": "id", "eq": 7 }, "returning": "*" }
+  ```
+- **`delete`**: `from`, and `where` or `"all": true`; optional `returning`.
+  ```json
+  { "v": 1, "op": "delete", "from": "orders", "where": { "col": "status", "eq": "pending" } }
+  ```
+  An update or delete with neither `where` nor `"all": true` is refused (`invalid_query`). To touch every row, say so: `{ "v": 1, "op": "delete", "from": "billing.invoices", "all": true }`.
+- **`call`**: `fn` and named `args`, returning a scalar or rows.
+  ```json
+  { "v": 1, "op": "call", "fn": "add_points", "args": { "user_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "n": 5 } }
+  ```
+- **`batch`**: `ops`, up to 50 operations, all or nothing in one transaction. Batches don't nest; an operation inside may leave out `"v"`.
+  ```json
+  {
+    "v": 1,
+    "op": "batch",
+    "ops": [
+      { "op": "insert", "into": "orders", "values": [{ "total": "1.00", "region": "eu" }], "returning": ["id"] },
+      { "op": "update", "table": "events", "set": { "label": "x" }, "where": { "col": "id", "eq": 1 } },
+      { "op": "call", "fn": "add_points", "args": { "user_id": "u" } }
+    ]
+  }
+  ```
+
+**Filters.** A condition is `{ "col": "<column>", "<operator>": value }` with exactly one operator: `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `in` (an array), `is` (`null`, `true` or `false`), `like`, `ilike` (a string pattern). Combine with `{ "and": [...] }`, `{ "or": [...] }` and `{ "not": filter }`; a filter holds one of them and nothing beside it.
+```json
+{ "or": [{ "col": "region", "in": ["eu"] }, { "and": [{ "col": "vip", "eq": true }, { "col": "qty", "gt": 2 }] }] }
+```
+
+**Numbers keep every digit in a request.** A big JSON number in a body (say a 30-digit `numeric`) reaches Postgres exactly.
+
+### SDK and type generation
+
+`@cheladb/client` is a typed TypeScript SDK:
+
+```ts
+import { createClient } from "@cheladb/client";
+import { type Database, types } from "./db"; // from `cheladb gen types`
+
+const db = createClient<Database>({ url: "http://localhost:8000", key, types });
+await db.from("orders").select("id", "total").where({ status: "paid" }).limit(10);
+await db.from("orders").insert([{ total: "19.50" }]).returning("id");
+await db.from("orders").update({ status: "shipped" }).where({ id });
+await db.from("orders").delete().where({ id });
+await db.call("add_points", { user_id: 10, n: 5 });
+const [order, points] = await db.batch((tx) => [
+  tx.from("orders").insert({ total: "1.00", region: "eu" }).returning("id"),
+  tx.call("add_points", { user_id: 10, n: 5 }),
+]);
+```
+
+An `update` or `delete` needs `.where()` or `.all()` before it compiles.
+
+**A typed client requires `types`.** `createClient<Database>({ url, key })` without `types` is a compile error: without the map the client can't tell an `int8` or a `numeric` from any other number. The untyped `createClient({ url, key })` needs no `types`.
+
+**Type generation:** `cheladb gen types --url <gateway-url> --key <secret-key> --out db.ts` writes a typed `Database` type and a `types` constant. Pass the key through the environment variable `CHELADB_DATA_KEY` instead of a flag, so it stays out of the process list.
+
+**Big numbers:** `int8` and `numeric` columns are read exactly from JSON source text. The default type is `number` for `int8` (throws `UnsafeIntegerError` outside the safe range ±2^53) and `string` for `numeric`. Use `bigint: true` together with `types` to get `bigint` for all `int8` columns:
+
+```ts
+const db = createClient<Database>({ url, key, types, bigint: true });
+```
+
+See `packages/client/README.md` for details and runtime requirements.
+
+### Settings
+
+| Setting | Default | Min | Max |
+|---|---|---|---|
+| `max_rows` | 1000 | 1 | 100000 |
+| `statement_timeout_ms` | 8000 | 100 | 120000 |
+| `max_connections` | 5 | 1 | 50 |
+| `default_schema` | `public` | — | must match `^[a-z_][a-z0-9_]{0,62}$` |
+
+Changed with `PATCH /v1/databases/{id}` in Studio's database settings. Every setting takes up to 60 seconds to take effect (the connection-info cache). `max_connections` is per branch: the size of that branch's connection pool. `statement_timeout_ms` also sets Postgres's `transaction_timeout`, so it bounds the whole request: a batch of 50 operations shares one timeout, not 50.
+
+### Error responses
+
+The response is `{"error": {"code", "message", "detail"?, "hint"?, "sqlstate"?}}` with the status and code from this table.
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_query` | Syntax error, bad filter, wrong types, empty `select`/`returning`, an update or delete with neither `where` nor `all`. |
+| 400 | `unknown_column` | A column that doesn't exist or that the key's role can't reach. |
+| 400 | `invalid_value` | Not-null (23502) or check (23514) violation, or any type or value error (class 22). |
+| 400 | `raised` | `RAISE EXCEPTION` in SQL (P0001). |
+| 401 | `unauthorized` | Key unknown or revoked, or the branch is deleted. |
+| 403 | `permission_denied` | Postgres permission denied (42501). |
+| 404 | `unknown_table` | A table or view that doesn't exist or that the key's role can't reach. |
+| 404 | `unknown_function` | A function that doesn't exist, can't be called through the API, or that the key's role can't execute. |
+| 409 | `conflict` | Unique (23505), foreign key (23503) or exclusion (23P01) violation. |
+| 409 | `retry` | Serialization failure or deadlock (40001, 40P01). Safe to retry. |
+| 413 | `too_large` | Request body over 1 MiB, or a response over `CHELADB_REST_MAX_RESPONSE_BYTES`. |
+| 429 | `rate_limited` | Cache misses over 20 per second from this IP address. |
+| 500 | `internal` | Unexpected server error. The message includes a request id; check the logs. |
+| 503 | `unavailable` | See below. |
+| 504 | `timeout` | Query timeout (57014) or transaction timeout (25P04): the request ran past `statement_timeout_ms`. |
+
+A 503 comes with `Retry-After`: `1` when the gateway answers it, `2` when `rest` does. Causes:
+- the branch's database can't be reached, refuses the connection, or is out of connections or resources (Postgres classes 08, 28 and 53, and 57P01–57P03);
+- no connection to the branch in time, or too many connections in use;
+- `rest` can't look up the branch (the orchestrator is unreachable), or the branch isn't ready;
+- the key's role can't be used right now (dropped, or its grant is gone until the bootstrap runs again);
+- the data API's schema is missing; it will be reinstalled (by the worker's reconcile).
+
+The 503 message is fixed text; what happened goes to the log with the request id.
+
+A non-2xx response without this error body (a proxy error page) gets its code from status alone: 401 `unauthorized`, 413 `too_large`, 429 `rate_limited`, 502/503 `unavailable`, 504 `timeout`, else `internal`.
+
+### Testing
+
+`just data-e2e` (needs `just deps-up` and `just dev`) runs a live story through the gateway and the proxy:
+1. Provision a database, list its public key, create a secret key (role `authenticated`) and a table.
+2. Through the SDK: the secret key inserts, the public key reads, the public key's insert is refused (403), and a batch rolls back on error.
+3. Generate types with `cheladb gen types` and typecheck a sample: a valid call compiles, a wrong column doesn't.
+4. Add a row-level security policy: it hides a row from the public key (`anon`) but not from the secret key's role.
+5. Revoke the secret key and check it gets 401 within 35 seconds.
+
+`KEEP=1` leaves the database in place.
+
+### Known limits
+
+- **Default privileges:** cover only objects the owner role (`postgres`) creates. Objects created by any other role (a role you made, or a superuser) get no default grants; grant on them yourself.
+- **Settings and schema changes:** up to 60 seconds to take effect (connection-info cache lifetime).
+- **Revocation lag:** per gateway instance, up to 30 seconds.
+- **IPv6 rate limiting:** the limiter groups IPv6 clients by `/64` prefix; a load balancer in front collapses all clients into one address.
+- **Limiter size:** it remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds). Past that it evicts entries, and an evicted address starts again with a full allowance.
 
 ## Neon
 

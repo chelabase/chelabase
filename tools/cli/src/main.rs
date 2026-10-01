@@ -1,6 +1,7 @@
 //! Cheladb local CLI — local development setup / token mint (foundation for a fuller control-plane CLI).
 
 mod dev;
+mod generate;
 mod neon;
 mod paths;
 
@@ -24,6 +25,27 @@ enum Commands {
     Neon {
         #[command(subcommand)]
         command: NeonCommands,
+    },
+    /// Generate code from a database's data API schema
+    Gen {
+        #[command(subcommand)]
+        command: GenCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GenCommands {
+    /// Write the TypeScript `Database` and runtime `types` for `@cheladb/client`
+    Types {
+        /// The gateway's base URL (the data API is under `/data/v1`)
+        #[arg(long)]
+        url: String,
+        /// A secret data key (`chk_sec_…`)
+        #[arg(long, env = "CHELADB_DATA_KEY", hide_env_values = true)]
+        key: Option<String>,
+        /// Write to this file instead of stdout
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -70,6 +92,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Dev { command } => match command {
             DevCommands::Bootstrap => dev::bootstrap::run().await,
             DevCommands::Token => dev::token::run().await,
+        },
+        Commands::Gen { command } => match command {
+            GenCommands::Types { url, key, out } => {
+                generate::run(&url, key, out.as_deref()).await
+            }
         },
         Commands::Neon { command } => match command {
             NeonCommands::Verifier => neon::verifier(),

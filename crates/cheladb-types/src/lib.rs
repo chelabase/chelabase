@@ -1,5 +1,7 @@
 //! Shared domain identifiers for Cheladb control plane.
 
+pub mod data_key;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;

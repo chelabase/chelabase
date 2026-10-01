@@ -1,0 +1,9 @@
+{
+  "call": "db.call(\"add_points\", { user_id: \"7c9e6679-7425-40de-944b-e07fc1f90ae7\", n: 5 })",
+  "tree": {
+    "v": 1,
+    "op": "call",
+    "fn": "add_points",
+    "args": { "user_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "n": 5 }
+  }
+}

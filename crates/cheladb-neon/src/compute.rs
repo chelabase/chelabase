@@ -54,6 +54,12 @@ pub trait ComputeLocator: Send + Sync + 'static {
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = anyhow::Result<Option<SocketAddr>>> + Send;
+
+    /// `127.0.0.1:<published 5432>`: where host services (the data API) reach Postgres.
+    fn postgres_addr(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = anyhow::Result<Option<SocketAddr>>> + Send;
 }
 
 fn running(inspect: &ContainerInspectResponse) -> bool {
@@ -80,6 +86,17 @@ pub fn ip_on_network(inspect: &ContainerInspectResponse, network: &str) -> Optio
 /// The loopback address compute_ctl's port is published on (`-p 127.0.0.1::3080`), if the
 /// container is running. An all-interfaces binding is reachable on loopback too.
 pub fn published_control_addr(inspect: &ContainerInspectResponse) -> Option<SocketAddr> {
+    published_addr(inspect, COMPUTE_CTL_PORT)
+}
+
+/// The loopback address Postgres is published on (`-p 127.0.0.1::5432`), if the container is
+/// running.
+pub fn published_postgres_addr(inspect: &ContainerInspectResponse) -> Option<SocketAddr> {
+    published_addr(inspect, POSTGRES_PORT)
+}
+
+/// The loopback address the container's `port`/tcp is published on, if it's running.
+fn published_addr(inspect: &ContainerInspectResponse, port: u16) -> Option<SocketAddr> {
     if !running(inspect) {
         return None;
     }
@@ -88,7 +105,7 @@ pub fn published_control_addr(inspect: &ContainerInspectResponse) -> Option<Sock
         .as_ref()?
         .ports
         .as_ref()?
-        .get(&format!("{COMPUTE_CTL_PORT}/tcp"))?
+        .get(&format!("{port}/tcp"))?
         .as_ref()?;
     bindings.iter().find_map(|binding| {
         match binding.host_ip.as_deref() {
@@ -152,6 +169,13 @@ impl ComputeLocator for DockerLocator {
             .inspect(endpoint_id)
             .await?
             .and_then(|inspect| published_control_addr(&inspect)))
+    }
+
+    async fn postgres_addr(&self, endpoint_id: &str) -> anyhow::Result<Option<SocketAddr>> {
+        Ok(self
+            .inspect(endpoint_id)
+            .await?
+            .and_then(|inspect| published_postgres_addr(&inspect)))
     }
 }
 
@@ -260,6 +284,37 @@ mod tests {
             None,
             "an empty IP is no IP"
         );
+    }
+
+    #[test]
+    fn postgres_addr_reads_the_published_port() {
+        let mut running = inspect(ContainerStateStatusEnum::RUNNING, "n", "172.20.0.9");
+        assert_eq!(published_postgres_addr(&running), None, "not published");
+        let ports = running
+            .network_settings
+            .as_mut()
+            .unwrap()
+            .ports
+            .as_mut()
+            .unwrap();
+        ports.insert(
+            "5432/tcp".to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some("49200".to_string()),
+            }]),
+        );
+        assert_eq!(
+            published_postgres_addr(&running),
+            Some("127.0.0.1:49200".parse().unwrap())
+        );
+        assert_eq!(
+            published_control_addr(&running),
+            Some("127.0.0.1:49153".parse().unwrap()),
+            "each port reads its own binding"
+        );
+        running.state.as_mut().unwrap().status = Some(ContainerStateStatusEnum::EXITED);
+        assert_eq!(published_postgres_addr(&running), None);
     }
 
     #[test]

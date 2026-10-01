@@ -80,6 +80,7 @@ mod tests {
             org_id: "o".into(),
             auth: AuthMethod::PlatformJwt,
             request_id: "r".into(),
+            data: None,
         };
         let token = signer.sign("orchestrator", &identity).unwrap();
         assert_eq!(verifier.verify(&token, "orchestrator").unwrap().org_id, "o");

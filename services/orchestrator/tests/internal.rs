@@ -5,7 +5,13 @@
 use axum::Router;
 use axum::http::StatusCode as AxumStatus;
 use axum::routing::get;
-use cheladb_metadata::{MetadataError, NeonDatabase, NeonEndpoint, NeonRole};
+use cheladb_metadata::{
+    BranchConnectionRow, BranchStatus, DataApiSettings, DataKeyLookup, MetadataError,
+    NeonDatabase, NeonEndpoint, NeonRole,
+};
+use cheladb_secrets::{Purpose, SecretKey, seal_credential};
+use cheladb_types::BranchId;
+use cheladb_types::data_key::DataKeyKind;
 use cheladb_neon::jwt::generate_keypair;
 use cheladb_neon::{ComputeLocator, ComputeSigner, StorconClient};
 use orchestrator::internal::{InternalState, NeonMetadataPort, build_internal_router};
@@ -19,11 +25,15 @@ const PROXY_TOKEN: &str = "proxy-token";
 const STORCON_TOKEN: &str = "storcon-token";
 /// The compute token for every endpoint `FakeNeon::add` creates.
 const COMPUTE_TOKEN: &str = "compute-token";
+const DATA_KEYS_TOKEN: &str = "data-keys-token";
+const REST_TOKEN: &str = "rest-token";
 
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(s.as_bytes()))
 }
+
+type KeyEntry = ([u8; 32], DataKeyLookup);
 
 #[derive(Clone, Default)]
 struct FakeNeon {
@@ -33,6 +43,11 @@ struct FakeNeon {
     fail: Arc<Mutex<bool>>,
     /// Endpoints still listed for their tenant and timeline but gone when fetched.
     vanished: Arc<Mutex<Vec<String>>>,
+    /// (sha256, lookup)
+    data_keys: Arc<Mutex<Vec<KeyEntry>>>,
+    /// Key ids `touch_data_key` was called with.
+    touched: Arc<Mutex<Vec<uuid::Uuid>>>,
+    connections: Arc<Mutex<HashMap<BranchId, BranchConnectionRow>>>,
 }
 
 impl FakeNeon {
@@ -75,6 +90,30 @@ impl FakeNeon {
 }
 
 impl NeonMetadataPort for FakeNeon {
+    async fn lookup_data_key(&self, sha256: &[u8; 32]) -> Result<Option<DataKeyLookup>, MetadataError> {
+        self.check()?;
+        Ok(self
+            .data_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(h, _)| h == sha256)
+            .map(|(_, l)| l.clone()))
+    }
+
+    async fn touch_data_key(&self, key_id: uuid::Uuid) -> Result<(), MetadataError> {
+        self.touched.lock().unwrap().push(key_id);
+        Ok(())
+    }
+
+    async fn branch_connection(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchConnectionRow>, MetadataError> {
+        self.check()?;
+        Ok(self.connections.lock().unwrap().get(&branch).cloned())
+    }
+
     async fn neon_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
         self.check()?;
         if self.vanished.lock().unwrap().iter().any(|v| v == id) {
@@ -167,6 +206,7 @@ struct FakeLocator {
     ips: Arc<Mutex<HashMap<String, IpAddr>>>,
     controls: Arc<Mutex<HashMap<String, SocketAddr>>>,
     broken: Arc<Mutex<bool>>,
+    pg: Arc<Mutex<HashMap<String, SocketAddr>>>,
 }
 
 impl FakeLocator {
@@ -190,6 +230,10 @@ impl ComputeLocator for FakeLocator {
     async fn control_addr(&self, ep: &str) -> anyhow::Result<Option<SocketAddr>> {
         anyhow::ensure!(!*self.broken.lock().unwrap(), "docker is down");
         Ok(self.controls.lock().unwrap().get(ep).copied())
+    }
+
+    async fn postgres_addr(&self, ep: &str) -> anyhow::Result<Option<SocketAddr>> {
+        Ok(self.pg.lock().unwrap().get(ep).copied())
     }
 }
 
@@ -229,6 +273,8 @@ async fn storcon(healthy: bool) -> String {
 }
 
 struct Internal {
+    /// The secrets key the orchestrator opens credentials with.
+    key: SecretKey,
     base: String,
     signer: ComputeSigner,
     http: reqwest::Client,
@@ -271,6 +317,7 @@ impl Internal {
 
 async fn spawn_internal(neon: FakeNeon, locator: FakeLocator, storcon_base: &str) -> Internal {
     let (pem, x) = generate_keypair();
+    let key = SecretKey::generate();
     let state = Arc::new(InternalState {
         metadata: neon,
         locator,
@@ -279,9 +326,13 @@ async fn spawn_internal(neon: FakeNeon, locator: FakeLocator, storcon_base: &str
         http: reqwest::Client::new(),
         proxy_token: PROXY_TOKEN.into(),
         storcon_token: STORCON_TOKEN.into(),
+        data_keys_token: DATA_KEYS_TOKEN.into(),
+        rest_token: REST_TOKEN.into(),
+        secrets: key.clone(),
     });
     let addr = serve(build_internal_router(state)).await;
     Internal {
+        key,
         base: format!("http://{addr}"),
         signer: ComputeSigner::new(&pem, &x).unwrap(),
         http: reqwest::Client::new(),
@@ -819,4 +870,178 @@ async fn a_metadata_failure_is_retried() {
         app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await,
         503
     );
+}
+
+// --- Data API: key lookup and connection info ---------------------------------
+
+const KEY_ID: uuid::Uuid = uuid::Uuid::from_u128(0x1234);
+
+fn sha(key: &str) -> [u8; 32] {
+    cheladb_types::data_key::hash(key)
+}
+
+#[tokio::test]
+async fn key_lookup_requires_the_data_keys_bearer() {
+    let neon = FakeNeon::default();
+    let branch = BranchId::new();
+    neon.data_keys.lock().unwrap().push((
+        sha("chk_sec_x"),
+        DataKeyLookup { key_id: KEY_ID, branch_id: branch, kind: DataKeyKind::Secret, role: "reporting".into() },
+    ));
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let path = format!("/internal/data/keys/{}", hex::encode(sha("chk_sec_x")));
+    assert_eq!(app.get(&path, None).await.0, 401);
+    assert_eq!(app.get(&path, Some("wrong")).await.0, 401);
+    // Each caller has its own token: the proxy's and rest's open nothing here.
+    assert_eq!(app.get(&path, Some(PROXY_TOKEN)).await.0, 401);
+    assert_eq!(app.get(&path, Some(REST_TOKEN)).await.0, 401);
+    assert!(neon.touched.lock().unwrap().is_empty());
+
+    let (status, body) = app.get(&path, Some(DATA_KEYS_TOKEN)).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({ "key_id": KEY_ID, "branch_id": branch, "kind": "secret", "role": "reporting" })
+    );
+    // `last_used_at` is stamped off the response path.
+    for _ in 0..50 {
+        if !neon.touched.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(*neon.touched.lock().unwrap(), vec![KEY_ID]);
+}
+
+#[tokio::test]
+async fn key_lookup_404_for_unknown_or_bad_hex() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let unknown = hex::encode(sha("chk_sec_nobody"));
+    for hex in [
+        unknown.as_str(),
+        "zz",
+        "",
+        "abcd",
+        &"g".repeat(64),
+        &unknown.to_uppercase(),
+        &format!("{unknown}00"),
+    ] {
+        let (status, _) = app.get(&format!("/internal/data/keys/{hex}"), Some(DATA_KEYS_TOKEN)).await;
+        assert_eq!(status, 404, "{hex:?}");
+    }
+    assert!(neon.touched.lock().unwrap().is_empty());
+}
+
+fn connection_row(status: BranchStatus, endpoint: Option<&str>, password: Option<String>) -> BranchConnectionRow {
+    BranchConnectionRow {
+        branch_id: BranchId::new(),
+        status,
+        endpoint_id: endpoint.map(str::to_string),
+        database_name: Some("web1".into()),
+        authenticator_password_enc: password,
+        settings: DataApiSettings {
+            max_rows: 500,
+            statement_timeout_ms: 4000,
+            max_connections: 7,
+            default_schema: "app".into(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn connection_requires_the_rest_bearer() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+    let path = format!("/internal/data/branches/{}/connection", BranchId::new().as_uuid());
+    assert_eq!(app.get(&path, None).await.0, 401);
+    assert_eq!(app.get(&path, Some("wrong")).await.0, 401);
+    assert_eq!(app.get(&path, Some(DATA_KEYS_TOKEN)).await.0, 401);
+    assert_eq!(app.get(&path, Some(PROXY_TOKEN)).await.0, 401);
+    // With the right token an unknown branch is a plain 404.
+    assert_eq!(app.get(&path, Some(REST_TOKEN)).await.0, 404);
+}
+
+#[tokio::test]
+async fn connection_409_when_not_ready() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    let sealed = |id: BranchId| seal_credential(&app.key, &id.to_string(), Purpose::Authenticator, "pw");
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+
+    let mut cases = Vec::new();
+    for (name, status, endpoint, has_password, expect) in [
+        ("resetting", BranchStatus::Resetting, Some("ep-1"), true, 409),
+        ("pending", BranchStatus::Pending, None, true, 409),
+        ("failed", BranchStatus::Failed, Some("ep-1"), true, 409),
+        ("no endpoint", BranchStatus::Ready, None, true, 409),
+        ("no compute address", BranchStatus::Ready, Some("ep-gone"), true, 409),
+        ("no authenticator password", BranchStatus::Ready, Some("ep-1"), false, 409),
+        ("deleting", BranchStatus::Deleting, Some("ep-1"), true, 404),
+        ("deleted", BranchStatus::Deleted, Some("ep-1"), true, 404),
+    ] {
+        let mut row = connection_row(status, endpoint, None);
+        if has_password {
+            row.authenticator_password_enc = Some(sealed(row.branch_id));
+        }
+        neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+        cases.push((name, row, expect));
+    }
+    for (name, row, expect) in cases {
+        let (code, body) = app
+            .get(&format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()), Some(REST_TOKEN))
+            .await;
+        assert_eq!(code, expect, "{name}: {body}");
+        if expect == 409 {
+            assert_eq!(body, json!({ "status": row.status.as_str() }), "{name}");
+        }
+        let text = body.to_string();
+        assert!(!text.contains("pw") && !text.contains("password"), "{name}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn connection_opens_the_authenticator_password() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+    row.authenticator_password_enc =
+        Some(seal_credential(&app.key, &row.branch_id.to_string(), Purpose::Authenticator, "auth-pw"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+
+    let (code, body) = app
+        .get(&format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()), Some(REST_TOKEN))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "host": "127.0.0.1",
+            "port": 55432,
+            "database": "web1",
+            "user": "authenticator",
+            "password": "auth-pw",
+            "status": "ready",
+            "settings": {
+                "max_rows": 500,
+                "statement_timeout_ms": 4000,
+                "max_connections": 7,
+                "default_schema": "app",
+            },
+        })
+    );
+
+    // A password sealed for another branch doesn't open (AAD): 500, never the plaintext.
+    let mut other = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+    other.authenticator_password_enc =
+        Some(seal_credential(&app.key, &BranchId::new().to_string(), Purpose::Authenticator, "stolen"));
+    neon.connections.lock().unwrap().insert(other.branch_id, other.clone());
+    let (code, body) = app
+        .get(&format!("/internal/data/branches/{}/connection", other.branch_id.as_uuid()), Some(REST_TOKEN))
+        .await;
+    assert_eq!(code, 500);
+    assert!(!body.to_string().contains("stolen"));
 }

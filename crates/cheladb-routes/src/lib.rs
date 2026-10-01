@@ -42,6 +42,7 @@ impl Method {
 pub enum Service {
     Orchestrator,
     Auth,
+    Rest,
 }
 
 impl Service {
@@ -50,6 +51,7 @@ impl Service {
         match self {
             Service::Orchestrator => "orchestrator",
             Service::Auth => "auth",
+            Service::Rest => "rest",
         }
     }
 }
@@ -66,6 +68,10 @@ pub enum Auth {
     Public,
     /// Zitadel-issued platform JWT (developers / operators).
     Platform,
+    /// A data API key of either kind (`chk_pub_` or `chk_sec_`).
+    DataKey,
+    /// Only a secret data API key.
+    SecretDataKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +81,8 @@ pub enum Cors {
     Studio,
     /// Callable from the Studio origins with cookies (credentials); never for a "*" setting.
     StudioCredentials,
+    /// Any origin: `Access-Control-Allow-Origin: *`, never with credentials.
+    Any,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +291,82 @@ pub mod orchestrator {
             cors: Cors::Studio,
         },
     };
+
+    /// The branch's live data API keys (the public key in full).
+    pub const LIST_KEYS: Endpoint = key_endpoint(
+        "orchestrator.list_keys",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/keys",
+    );
+
+    /// A new secret key, shown once.
+    pub const CREATE_KEY: Endpoint = key_endpoint(
+        "orchestrator.create_key",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/keys",
+    );
+
+    pub const ROTATE_KEY: Endpoint = key_endpoint(
+        "orchestrator.rotate_key",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}/rotate",
+    );
+
+    pub const REVOKE_KEY: Endpoint = key_endpoint(
+        "orchestrator.revoke_key",
+        Method::Delete,
+        "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
+    );
+
+    /// The branch's schema as the data API sees it, with each table's role privileges.
+    pub const DATA_API_SCHEMA: Endpoint = key_endpoint(
+        "orchestrator.data_api_schema",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/data-api/schema",
+    );
+
+    const fn key_endpoint(name: &'static str, method: Method, path: &'static str) -> Endpoint {
+        Endpoint {
+            name,
+            method,
+            path,
+            scope: Scope::Platform,
+            service: Service::Orchestrator,
+            policy: Policy {
+                auth: Auth::Platform,
+                cors: Cors::Studio,
+            },
+        }
+    }
+}
+
+/// The data API, served by `rest`.
+pub mod rest {
+    use super::{Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+
+    pub const QUERY: Endpoint = Endpoint {
+        name: "rest.query",
+        method: Method::Post,
+        path: "/data/v1/query",
+        scope: Scope::Platform,
+        service: Service::Rest,
+        policy: Policy {
+            auth: Auth::DataKey,
+            cors: Cors::Any,
+        },
+    };
+
+    pub const SCHEMA: Endpoint = Endpoint {
+        name: "rest.schema",
+        method: Method::Get,
+        path: "/data/v1/schema",
+        scope: Scope::Platform,
+        service: Service::Rest,
+        policy: Policy {
+            auth: Auth::SecretDataKey,
+            cors: Cors::Any,
+        },
+    };
 }
 
 /// Studio's sign-in pages, served by `auth`.
@@ -333,6 +417,13 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::BRANCH_RESET_TO_PARENT,
     orchestrator::BRANCH_RESTORE,
     orchestrator::DELETE_BRANCH,
+    orchestrator::LIST_KEYS,
+    orchestrator::CREATE_KEY,
+    orchestrator::ROTATE_KEY,
+    orchestrator::REVOKE_KEY,
+    orchestrator::DATA_API_SCHEMA,
+    rest::QUERY,
+    rest::SCHEMA,
     auth::AUTH_REQUEST,
     auth::SIGN_IN,
     auth::SIGN_UP,
@@ -614,5 +705,56 @@ mod tests {
         assert_eq!(ENDPOINTS.iter().filter(|e| e.service == Service::Auth).count(), 8);
         assert!(matches!(match_endpoint(Scope::Platform, "POST", "/auth/v1/password-reset/confirm"),
             Match::Found(ep) if ep.name == "auth.password_reset_confirm"));
+    }
+
+    const KEYS: &str = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/keys";
+
+    #[test]
+    fn rest_endpoints_match_and_are_listed() {
+        assert_eq!(found("POST", "/data/v1/query"), "rest.query");
+        assert_eq!(found("GET", "/data/v1/schema"), "rest.schema");
+        assert_eq!(rest::QUERY.policy, Policy { auth: Auth::DataKey, cors: Cors::Any });
+        assert_eq!(rest::SCHEMA.policy, Policy { auth: Auth::SecretDataKey, cors: Cors::Any });
+        for ep in [rest::QUERY, rest::SCHEMA] {
+            assert_eq!(ep.service, Service::Rest);
+            assert_eq!(ep.scope, Scope::Platform);
+            assert!(ENDPOINTS.contains(&ep));
+        }
+        assert_eq!(found("GET", KEYS), "orchestrator.list_keys");
+        assert_eq!(found("POST", KEYS), "orchestrator.create_key");
+        assert_eq!(found("DELETE", &format!("{KEYS}/abc")), "orchestrator.revoke_key");
+        assert_eq!(found("POST", &format!("{KEYS}/abc/rotate")), "orchestrator.rotate_key");
+        assert_eq!(
+            found("GET", "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/schema"),
+            "orchestrator.data_api_schema"
+        );
+        for name in ["list_keys", "create_key", "rotate_key", "revoke_key", "data_api_schema"] {
+            let ep = ENDPOINTS
+                .iter()
+                .find(|e| e.name == format!("orchestrator.{name}"))
+                .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
+            assert_eq!(ep.policy, Policy { auth: Auth::Platform, cors: Cors::Studio }, "{name}");
+        }
+    }
+
+    #[test]
+    fn literal_keys_rotate_beats_param() {
+        let id = "6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11";
+        assert_eq!(found("POST", &format!("{KEYS}/{id}/rotate")), "orchestrator.rotate_key");
+        assert_eq!(found("DELETE", &format!("{KEYS}/{id}")), "orchestrator.revoke_key");
+        // `rotate` in the key-id position is a key id, not the rotate action.
+        assert_eq!(
+            match_endpoint(Scope::Platform, "POST", &format!("{KEYS}/rotate")),
+            Match::MethodNotAllowed(vec![Method::Delete])
+        );
+        assert_eq!(
+            match_endpoint(Scope::Platform, "GET", &format!("{KEYS}/{id}/rotate")),
+            Match::MethodNotAllowed(vec![Method::Post])
+        );
+    }
+
+    #[test]
+    fn service_rest_name_is_rest() {
+        assert_eq!(Service::Rest.name(), "rest");
     }
 }

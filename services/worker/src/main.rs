@@ -1,8 +1,8 @@
 use axum::{Json, Router, routing::get};
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{
-    NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply, ResetPasswordRequest,
-    SUBJECT_RESET_PASSWORD, connect, ensure_control_stream, run_branch_consumer,
+    CheckDataRoleReply, CheckDataRoleRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
+    ResetPasswordRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD, connect, ensure_control_stream, run_branch_consumer,
     run_delete_consumer, run_provision_consumer, run_settings_consumer,
 };
 use cheladb_secrets::{SecretKey, key_check_value, verify_key_check};
@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tokio::spawn(serve_reset_password(worker.clone(), nats.clone()));
+    tokio::spawn(serve_check_data_role(worker.clone(), nats.clone()));
     tokio::spawn(reconcile_loop(worker.clone()));
 
     let delete_worker = worker.clone();
@@ -234,5 +235,53 @@ async fn reconcile_loop(worker: Arc<RealWorker>) {
         if let Err(err) = worker.reconcile_once().await {
             warn!("reconcile: {err}");
         }
+    }
+}
+
+// --- Check a secret key's role (core NATS request/reply) ----------------------
+
+/// Hard cap on one check, below the orchestrator's request timeout (15 s).
+const CHECK_ROLE_DEADLINE: Duration = Duration::from_secs(10);
+
+async fn serve_check_data_role(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_CHECK_DATA_ROLE, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("check-data-role subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_CHECK_DATA_ROLE, "serving check-data-role requests");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply = match serde_json::from_slice::<CheckDataRoleRequest>(&message.payload) {
+                Ok(request) => {
+                    match tokio::time::timeout(
+                        CHECK_ROLE_DEADLINE,
+                        worker.check_data_role_reply(&request),
+                    )
+                    .await
+                    {
+                        Ok(reply) => reply,
+                        Err(_) => {
+                            warn!(branch_id = %request.branch_id, "check data role timed out");
+                            CheckDataRoleReply::not_ready()
+                        }
+                    }
+                }
+                Err(err) => CheckDataRoleReply::failed(format!("bad request: {err}")),
+            };
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("check-data-role reply failed: {err}");
+                }
+            }
+        });
     }
 }

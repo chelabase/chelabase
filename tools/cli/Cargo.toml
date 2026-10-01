@@ -16,6 +16,7 @@ chrono = { workspace = true }
 cheladb-auth = { workspace = true, features = ["keygen"] }
 cheladb-neon = { workspace = true }
 cheladb-secrets = { workspace = true }
+cheladb-types = { workspace = true }
 clap = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }

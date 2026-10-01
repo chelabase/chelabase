@@ -46,6 +46,7 @@ function AppPage() {
   return (
     <Dashboard
       api={api}
+      apiUrl={env.apiUrl}
       profile={{ name: auth.user?.profile.name, email: auth.user?.profile.email }}
       onSignOut={() => void signOut(createLoginApi(env.apiUrl), () => auth.signoutRedirect())}
     />

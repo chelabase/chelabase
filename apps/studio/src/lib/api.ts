@@ -2,8 +2,12 @@ import type {
   BranchSummary,
   ConnectionDetails,
   CreateBranchRequest,
+  CreateDataKeyRequest,
+  CreatedDataKey,
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
+  DataApiSchema,
+  DataKey,
   DatabaseDetail,
   DatabaseSettings,
   MeResponse,
@@ -60,6 +64,16 @@ export interface ApiClient {
   restoreBranch(databaseId: string, branchId: string, request: RestoreRequest): Promise<RestoreAccepted>;
   /** 202: the branch (and its backups) show `deleting` until gone. */
   deleteBranch(databaseId: string, branchId: string): Promise<void>;
+  /** The branch's live data API keys; the public key comes in full. */
+  listKeys(databaseId: string, branchId: string): Promise<DataKey[]>;
+  /** A secret key; `key` is returned this once. A 422 carries the worker's reason. */
+  createKey(databaseId: string, branchId: string, request: CreateDataKeyRequest): Promise<CreatedDataKey>;
+  /** The new key replaces the old one, which stops working within 30 seconds. */
+  rotateKey(databaseId: string, branchId: string, keyId: string): Promise<CreatedDataKey>;
+  /** Secret keys only; the public key can only be rotated (409). */
+  revokeKey(databaseId: string, branchId: string, keyId: string): Promise<void>;
+  /** Every table `anon` or `authenticated` can reach, with its RLS flag. */
+  getDataApiSchema(databaseId: string, branchId: string): Promise<DataApiSchema>;
 }
 
 export function createApiClient(options: ApiClientOptions): ApiClient {
@@ -117,6 +131,15 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
     deleteBranch: async (id, branchId) => {
       await request<unknown>("DELETE", branchPath(id, branchId));
     },
+    listKeys: (id, branchId) => request<DataKey[]>("GET", `${branchPath(id, branchId)}/keys`),
+    createKey: (id, branchId, req) => request<CreatedDataKey>("POST", `${branchPath(id, branchId)}/keys`, req),
+    rotateKey: (id, branchId, keyId) =>
+      request<CreatedDataKey>("POST", `${branchPath(id, branchId)}/keys/${encodeURIComponent(keyId)}/rotate`),
+    revokeKey: async (id, branchId, keyId) => {
+      await request<unknown>("DELETE", `${branchPath(id, branchId)}/keys/${encodeURIComponent(keyId)}`);
+    },
+    getDataApiSchema: (id, branchId) =>
+      request<DataApiSchema>("GET", `${branchPath(id, branchId)}/data-api/schema`),
   };
 }
 
@@ -125,6 +148,9 @@ async function errorMessage(response: Response): Promise<string> {
   try {
     const parsed = JSON.parse(text) as { error?: unknown };
     if (typeof parsed.error === "string") return parsed.error;
+    // The data API nests it: { error: { code, message } }.
+    const nested = (parsed.error as { message?: unknown } | null | undefined)?.message;
+    if (typeof nested === "string") return nested;
   } catch {
     // not JSON; fall through to the raw text
   }

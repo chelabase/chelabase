@@ -9,12 +9,13 @@ use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
 use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseRecord, DatabaseStatus,
-    MetadataClient, MetadataError, NewBranch, ProjectOverview, TenantOverview,
+    DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
+    SettingsPatch, TenantOverview,
 };
 use cheladb_nats::{
-    BranchJob, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
+    BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
     ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
-    SUBJECT_RESET_PASSWORD,
+    SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD,
 };
 use cheladb_secrets::{open_credential, Purpose, SecretKey};
 use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
@@ -27,6 +28,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 mod branches;
+mod data_keys;
 pub mod internal;
 
 /// Port the Neon proxy serves the Postgres protocol on.
@@ -139,8 +141,35 @@ pub trait MetadataPort: Send + Sync + 'static {
     fn update_database_settings(
         &self,
         database_id: DatabaseId,
-        history_window: Option<std::time::Duration>,
-        max_branches: Option<i32>,
+        patch: &SettingsPatch,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Stores a key; a second live public key on the branch is `MetadataError::Conflict`.
+    fn insert_data_key(
+        &self,
+        key: &NewDataKey,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
+    /// The branch's live keys, newest first.
+    fn list_data_keys(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<DataKeyRecord>, MetadataError>> + Send;
+
+    /// Revokes a live secret key; false for an unknown or revoked key, and for the public key.
+    fn revoke_data_key(
+        &self,
+        branch: BranchId,
+        key_id: Uuid,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Revokes `old` and stores `new` in one step; false when `old` isn't a live key of the
+    /// branch.
+    fn rotate_data_key(
+        &self,
+        branch: BranchId,
+        old: Uuid,
+        new: &NewDataKey,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 }
 
@@ -239,18 +268,37 @@ impl MetadataPort for MetadataClient {
     async fn update_database_settings(
         &self,
         database_id: DatabaseId,
-        history_window: Option<std::time::Duration>,
-        max_branches: Option<i32>,
+        patch: &SettingsPatch,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::update_database_settings(self, database_id, history_window, max_branches)
-            .await
+        MetadataClient::update_database_settings(self, database_id, patch).await
+    }
+
+    async fn insert_data_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        MetadataClient::insert_data_key(self, key).await
+    }
+
+    async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
+        MetadataClient::list_data_keys(self, branch).await
+    }
+
+    async fn revoke_data_key(&self, branch: BranchId, key_id: Uuid) -> Result<bool, MetadataError> {
+        MetadataClient::revoke_data_key(self, branch, key_id).await
+    }
+
+    async fn rotate_data_key(
+        &self,
+        branch: BranchId,
+        old: Uuid,
+        new: &NewDataKey,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::rotate_data_key(self, branch, old, new).await
     }
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Why a reset-password request got no answer from the worker.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ResetError {
     /// A worker is listening but didn't answer in time.
     Timeout,
@@ -280,6 +328,14 @@ pub trait JobPort: Send + Sync + 'static {
         &self,
         job: &JobEnvelope<DatabaseSettingsJob>,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    /// Asks the worker whether a secret key may use `role` on the branch (and grants it to
+    /// `authenticator`).
+    fn check_data_role(
+        &self,
+        branch_id: BranchId,
+        role: &str,
+    ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
 
     /// Resets the owner password of one branch (main's id is the database's).
     fn reset_password(
@@ -327,6 +383,32 @@ impl JobPort for NatsPorts {
             .map_err(|e| Box::new(e) as BoxError)
     }
 
+    async fn check_data_role(
+        &self,
+        branch_id: BranchId,
+        role: &str,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        use async_nats::RequestErrorKind;
+        let body = serde_json::to_vec(&CheckDataRoleRequest {
+            branch_id,
+            role: role.to_string(),
+        })
+        .map_err(|e| ResetError::Transport(e.to_string()))?;
+        let request = async_nats::Request::new()
+            .payload(body.into())
+            .timeout(Some(RESET_TIMEOUT));
+        let reply = self
+            .client
+            .send_request(SUBJECT_CHECK_DATA_ROLE, request)
+            .await
+            .map_err(|e| match e.kind() {
+                RequestErrorKind::TimedOut => ResetError::Timeout,
+                RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
+                _ => ResetError::Transport(e.to_string()),
+            })?;
+        serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+    }
+
     async fn reset_password(
         &self,
         database_id: DatabaseId,
@@ -362,6 +444,16 @@ pub struct AppState<M, J> {
     pub secrets: SecretKey,
     /// Domain the Neon proxy serves endpoints under: `<ep>.<proxy_domain>`.
     pub proxy_domain: String,
+    /// The REST service's internal listener (the data API's schema).
+    pub rest: RestInternal,
+}
+
+/// Where the REST service's internal listener is, and the token it takes.
+pub struct RestInternal {
+    /// `http://host:port`, no path.
+    pub url: String,
+    pub token: String,
+    pub http: reqwest::Client,
 }
 
 /// Caller verified from the gateway-minted internal identity token. Does not
@@ -507,6 +599,10 @@ struct DatabaseResponse {
     /// Seconds of history the database keeps.
     history_window: u64,
     max_branches: i32,
+    max_rows: i32,
+    statement_timeout_ms: i32,
+    max_connections: i32,
+    default_schema: String,
 }
 
 /// The proxy's host and Postgres port, once the database is ready: until then its endpoint
@@ -562,6 +658,10 @@ impl DatabaseResponse {
             branch_count,
             history_window: r.history_window.as_secs(),
             max_branches: r.max_branches,
+            max_rows: r.max_rows,
+            statement_timeout_ms: r.statement_timeout_ms,
+            max_connections: r.max_connections,
+            default_schema: r.default_schema,
         }
     }
 }
@@ -674,6 +774,7 @@ where
         .route(routes::RESET_PASSWORD.path, post(reset_password::<M, J>))
         .route(routes::ME.path, get(me::<M, J>))
         .merge(branches::routes::<M, J>())
+        .merge(data_keys::routes::<M, J>())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

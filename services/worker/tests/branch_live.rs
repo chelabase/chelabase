@@ -261,7 +261,13 @@ async fn story(
     // 5. A point outside the history window (1 h; 2 h back).
     assert!(
         metadata
-            .update_database_settings(id, Some(Duration::from_secs(3600)), None)
+            .update_database_settings(
+                id,
+                &cheladb_metadata::SettingsPatch {
+                    history_window: Some(Duration::from_secs(3600)),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap()
     );

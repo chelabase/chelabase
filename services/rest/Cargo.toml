@@ -1,0 +1,44 @@
+[package]
+name = "rest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cheladb data API engine: JSON query language to SQL over a branch's compute"
+
+[lib]
+name = "rest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+cheladb-auth = { workspace = true }
+cheladb-types = { workspace = true }
+dotenvy = { workspace = true }
+moka = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+# Keeps a bare JSON number's digits (a 30-digit numeric binds exactly). It changes
+# `serde_json::Number` for every crate built with rest; the workspace has no untagged or
+# flattened serde types it would break.
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sqlx = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+cheladb-auth = { workspace = true, features = ["keygen"] }
+cheladb-metadata = { workspace = true }
+cheladb-nats = { workspace = true }
+cheladb-neon = { workspace = true }
+cheladb-secrets = { workspace = true }
+chrono = { workspace = true }
+worker = { path = "../worker" }

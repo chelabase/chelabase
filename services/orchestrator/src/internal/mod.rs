@@ -3,6 +3,7 @@
 //! through the gateway. Each caller has its own bearer token and can open only its own routes.
 
 pub mod config;
+mod data;
 mod hooks;
 mod proxy;
 mod spec;
@@ -14,7 +15,13 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
-use cheladb_metadata::{MetadataClient, MetadataError, NeonDatabase, NeonEndpoint, NeonRole};
+use cheladb_metadata::{
+    BranchConnectionRow, DataKeyLookup, MetadataClient, MetadataError, NeonDatabase, NeonEndpoint,
+    NeonRole,
+};
+use cheladb_secrets::SecretKey;
+use cheladb_types::BranchId;
+use uuid::Uuid;
 use cheladb_neon::{ComputeLocator, ComputeSigner, StorconClient};
 use std::future::Future;
 use std::sync::Arc;
@@ -48,6 +55,24 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         timeline_id: &str,
     ) -> impl Future<Output = Result<Vec<String>, MetadataError>> + Send;
+
+    /// The live key with this hash, if its branch isn't deleting or deleted.
+    fn lookup_data_key(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<DataKeyLookup>, MetadataError>> + Send;
+
+    /// Stamps the key's `last_used_at` (at most once a minute).
+    fn touch_data_key(
+        &self,
+        key_id: Uuid,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
+    /// What the REST service needs to connect to a branch, whatever its status.
+    fn branch_connection(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchConnectionRow>, MetadataError>> + Send;
 }
 
 // As for `MetadataPort`: each method must call `MetadataClient`'s inherent method by its full
@@ -81,6 +106,21 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Vec<String>, MetadataError> {
         MetadataClient::neon_endpoints_for_timeline(self, timeline_id).await
     }
+    async fn lookup_data_key(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<DataKeyLookup>, MetadataError> {
+        MetadataClient::lookup_data_key(self, sha256).await
+    }
+    async fn touch_data_key(&self, key_id: Uuid) -> Result<(), MetadataError> {
+        MetadataClient::touch_data_key(self, key_id).await
+    }
+    async fn branch_connection(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchConnectionRow>, MetadataError> {
+        MetadataClient::branch_connection(self, branch).await
+    }
 }
 
 pub struct InternalState<M, L> {
@@ -93,6 +133,12 @@ pub struct InternalState<M, L> {
     pub http: reqwest::Client,
     pub proxy_token: String,
     pub storcon_token: String,
+    /// The gateway's token for key lookups.
+    pub data_keys_token: String,
+    /// The REST service's token for connection info.
+    pub rest_token: String,
+    /// Opens the `authenticator` passwords handed to the REST service.
+    pub secrets: SecretKey,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router
@@ -122,6 +168,20 @@ where
             storcon_token,
             require_bearer,
         ));
+    let data_keys_token: Arc<str> = state.data_keys_token.as_str().into();
+    let data_keys = Router::new()
+        .route("/internal/data/keys/{sha256}", get(data::key_lookup::<M, L>))
+        .route_layer(middleware::from_fn_with_state(
+            data_keys_token,
+            require_bearer,
+        ));
+    let rest_token: Arc<str> = state.rest_token.as_str().into();
+    let rest = Router::new()
+        .route(
+            "/internal/data/branches/{id}/connection",
+            get(data::branch_connection::<M, L>),
+        )
+        .route_layer(middleware::from_fn_with_state(rest_token, require_bearer));
     Router::new()
         .route("/health", get(health))
         .route(
@@ -130,6 +190,8 @@ where
         )
         .merge(proxy)
         .merge(storcon)
+        .merge(data_keys)
+        .merge(rest)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

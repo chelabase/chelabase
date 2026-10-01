@@ -7,10 +7,12 @@
 //! verify tokens but cannot mint them.
 
 use crate::AuthError;
+use cheladb_types::data_key::DataKeyKind;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub const INTERNAL_ISSUER: &str = "cheladb-gateway";
 /// Request header carrying the internal token from the gateway to a service.
@@ -23,15 +25,29 @@ const LEEWAY_SECS: u64 = 5;
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     PlatformJwt,
+    DataKey,
 }
 
-/// The caller, as established by the gateway.
+/// Who a data API key stands for: which branch, which key, and the Postgres role it runs as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataIdentity {
+    pub branch_id: Uuid,
+    pub key_id: Uuid,
+    pub kind: DataKeyKind,
+    pub role: String,
+    /// Extra JWT-style claims for the role's policies; `{}` until end-user auth exists.
+    pub claims: serde_json::Value,
+}
+
+/// The caller, as established by the gateway. For a data key, `sub` is the key id and
+/// `org_id` is empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub sub: String,
     pub org_id: String,
     pub auth: AuthMethod,
     pub request_id: String,
+    pub data: Option<DataIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +61,8 @@ pub struct InternalClaims {
     pub auth: AuthMethod,
     /// Gateway request id, for following one request across services.
     pub rid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<DataIdentity>,
 }
 
 pub struct InternalSigner {
@@ -88,6 +106,7 @@ impl InternalSigner {
             org_id: identity.org_id.clone(),
             auth: identity.auth,
             rid: identity.request_id.clone(),
+            data: identity.data.clone(),
         };
         encode(&Header::new(Algorithm::EdDSA), &claims, &self.key)
             .map_err(|e| AuthError::Config(format!("sign internal token: {e}")))

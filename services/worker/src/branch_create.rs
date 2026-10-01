@@ -1,5 +1,5 @@
 //! Creating a branch: an endpoint row, a timeline branched from the parent's, a compute, and
-//! the data API roles inside it.
+//! the data API roles and bootstrap inside it.
 
 use cheladb_metadata::{BranchKind, BranchRecord, BranchStatus, NewEndpoint};
 use cheladb_nats::PointInTime;
@@ -16,6 +16,7 @@ use crate::{OWNER_ROLE, credentials};
 
 /// Everything step 3 generated and recorded. Once it exists, a failure tears down.
 struct Recorded {
+    branch: BranchId,
     endpoint_id: String,
     tenant: NeonId,
     timeline: NeonId,
@@ -181,6 +182,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     ) -> Result<Recorded, String> {
         let database_name = self.main_database_name(branch.database_id).await?;
         let rec = Recorded {
+            branch: branch.id,
             endpoint_id: new_endpoint_id(),
             tenant,
             timeline: NeonId::new(),
@@ -282,6 +284,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
+        self.bootstrap_data_api_on(rec.branch, ep, &rec.database_name)
+            .await
+            .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
         Ok(Built::Compute)
     }
 

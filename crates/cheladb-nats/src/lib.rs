@@ -134,6 +134,44 @@ pub struct ResetPasswordReply {
     pub error: Option<String>,
 }
 
+/// Core request/reply (not JetStream): may a secret key use this role on this branch?
+pub const SUBJECT_CHECK_DATA_ROLE: &str = "cheladb.rpc.check_data_role";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckDataRoleRequest {
+    pub branch_id: BranchId,
+    pub role: String,
+}
+
+/// The worker's answer. `kind` says why when `ok` is false: `refused` (the caller's fault;
+/// `error` says why), `not_ready` (the branch isn't ready or its compute can't be reached) or
+/// `failed` (our side; `error` is for logs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckDataRoleReply {
+    pub ok: bool,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+impl CheckDataRoleReply {
+    pub fn ok() -> Self {
+        Self { ok: true, error: None, kind: None }
+    }
+
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self { ok: false, error: Some(message.into()), kind: Some("refused".into()) }
+    }
+
+    pub fn not_ready() -> Self {
+        Self { ok: false, error: Some("not ready".into()), kind: Some("not_ready".into()) }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self { ok: false, error: Some(message.into()), kind: Some("failed".into()) }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconcileDatabaseJob {
     pub database_id: DatabaseId,
@@ -492,6 +530,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_data_role_wire_shapes() {
+        let request = CheckDataRoleRequest {
+            branch_id: BranchId::new(),
+            role: "reporting".into(),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["role"], "reporting");
+        assert!(json["branch_id"].is_string());
+        assert_eq!(SUBJECT_CHECK_DATA_ROLE, "cheladb.rpc.check_data_role");
+
+        let ok = serde_json::to_value(CheckDataRoleReply::ok()).unwrap();
+        assert_eq!(ok, serde_json::json!({ "ok": true, "error": null, "kind": null }));
+        let refused = CheckDataRoleReply::refused("the role x does not exist");
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            serde_json::json!({ "ok": false, "error": "the role x does not exist", "kind": "refused" })
+        );
+        assert_eq!(CheckDataRoleReply::not_ready().kind.as_deref(), Some("not_ready"));
+        assert_eq!(CheckDataRoleReply::failed("boom").kind.as_deref(), Some("failed"));
+        // A reply without `kind` (the two-field shape) still parses.
+        let old: CheckDataRoleReply = serde_json::from_str(r#"{"ok":false,"error":"x"}"#).unwrap();
+        assert_eq!(old.kind, None);
+    }
 
     /// Opt-in, against the Compose NATS (`just deps-up`): a stream and consumer of their own,
     /// deleted afterwards.

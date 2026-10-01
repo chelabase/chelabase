@@ -18,6 +18,12 @@ export function fakeApi(overrides: Partial<ApiClient> = {}): ApiClient {
     resetBranchToParent: vi.fn(),
     restoreBranch: vi.fn(),
     deleteBranch: vi.fn(),
+    // The data API panel loads these as soon as a ready branch shows: empty by default.
+    listKeys: vi.fn().mockResolvedValue([]),
+    createKey: vi.fn(),
+    rotateKey: vi.fn(),
+    revokeKey: vi.fn(),
+    getDataApiSchema: vi.fn().mockResolvedValue({ version: "0", default_schema: "public", schemas: {} }),
     ...overrides,
   };
 }

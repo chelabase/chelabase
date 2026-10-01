@@ -19,7 +19,7 @@ use crate::Worker;
 use crate::branch_create::deleted;
 use crate::branch_job::{Attempt, StepFailure};
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
-use crate::provision::{new_compute_token, sha256_hex};
+use crate::provision::{bootstrap_sql, new_compute_token, sha256_hex};
 use crate::reconcile::STALE_PROVISION_SECS;
 
 /// The API's refusal, repeated by the worker.
@@ -279,10 +279,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.finish_restore(&target).await
     }
 
-    /// A new compute for `ep` on whatever timeline its row names: the new token's hash is
-    /// written first (the compute's first spec request must already pass), then the container
-    /// is created, then it's waited for.
-    pub(crate) async fn recreate_compute(&self, ep: &str) -> Result<(), String> {
+    /// A new compute for `branch`'s endpoint `ep` on whatever timeline its row names: the new
+    /// token's hash is written first (the compute's first spec request must already pass), then
+    /// the container is created and waited for, then the role and data API bootstraps run (a
+    /// restore can rewind both).
+    pub(crate) async fn recreate_compute(&self, branch: BranchId, ep: &str) -> Result<(), String> {
         let database_name = self
             .metadata
             .neon_databases(ep)
@@ -301,7 +302,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .create(ep, &token)
             .await
             .map_err(|e| format!("starting compute: {e:#}"))?;
-        self.wait_until_ready(ep, &database_name).await
+        self.wait_until_ready(ep, &database_name).await?;
+        self.computes
+            .admin_sql(ep, &database_name, &bootstrap_sql(self.owner_superuser))
+            .await
+            .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
+        self.bootstrap_data_api_on(branch, ep, &database_name)
+            .await
+            .map_err(|e| format!("bootstrapping the data API: {e:#}"))
     }
 
     /// Reconcile's end of a reset or restore left `resetting` (a crash, or a failure the run
@@ -357,7 +365,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // Even when the pending timeline stays: the branch keeps working on its current one.
         let restarted = match self.computes.status(&target.ep).await {
             Ok(Some(_)) => Ok(()),
-            Ok(None) => self.recreate_compute(&target.ep).await,
+            Ok(None) => self.recreate_compute(target.id, &target.ep).await,
             Err(e) => Err(format!("starting compute: {e:#}")),
         };
         if self.gone_meanwhile(&target).await? {
@@ -899,7 +907,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Steps 7-9 of reset: the compute on the new timeline, then the old timeline goes.
     async fn finish_reset(&self, target: &Target, superseded: &NeonId) -> Result<(), String> {
-        if let Err(err) = self.recreate_compute(&target.ep).await {
+        if let Err(err) = self.recreate_compute(target.id, &target.ep).await {
             return self.fail_after_switch(target, err).await;
         }
         if self.gone_meanwhile(target).await? {
@@ -922,7 +930,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Steps 6-7 of restore: the compute on the restored timeline.
     async fn finish_restore(&self, target: &Target) -> Result<(), String> {
-        if let Err(err) = self.recreate_compute(&target.ep).await {
+        if let Err(err) = self.recreate_compute(target.id, &target.ep).await {
             return self.fail_after_switch(target, err).await;
         }
         if self.gone_meanwhile(target).await? {
@@ -993,7 +1001,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             info!(branch_id = %target.id, "deleted meanwhile; not restarting the compute");
             return Ok(false);
         }
-        if let Err(err) = self.recreate_compute(&target.ep).await {
+        if let Err(err) = self.recreate_compute(target.id, &target.ep).await {
             warn!(endpoint_id = %target.ep, "restarting the compute failed; reconcile retries: {err}");
         }
         Ok(true)
@@ -2268,7 +2276,7 @@ mod tests {
         let old = token_hash(&w, &s.dev_ep);
         w.computes.remove(&s.dev_ep);
 
-        w.recreate_compute(&s.dev_ep).await.unwrap();
+        w.recreate_compute(s.dev, &s.dev_ep).await.unwrap();
 
         let order = [
             pos(&journal, "metadata.replace_compute_token"),
@@ -2281,7 +2289,7 @@ mod tests {
         assert_ne!(token_hash(&w, &s.dev_ep), old);
 
         *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
-        let err = w.recreate_compute(&s.dev_ep).await.unwrap_err();
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
         assert!(err.starts_with("waiting for the compute: "), "{err}");
     }
 

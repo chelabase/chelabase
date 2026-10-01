@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::compute::{
     COMPUTE_CTL_PORT, COMPUTE_TOKEN_ENV, ComputeLocator, DockerLocator, ENDPOINT_LABEL,
-    compute_ctl_args, container_name,
+    POSTGRES_PORT, compute_ctl_args, container_name,
 };
 
 const ADMIN_SQL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,19 +67,26 @@ pub trait ComputeBackend: ComputeLocator {
 }
 
 /// The container to create for an endpoint. The token goes in the environment, never argv.
+/// compute_ctl and Postgres are published on loopback only, each on a random host port.
 pub fn create_body(
     endpoint_id: &str,
     compute_token: &str,
     settings: &ComputeSettings,
 ) -> ContainerCreateBody {
-    let port = format!("{COMPUTE_CTL_PORT}/tcp");
+    let ports = [COMPUTE_CTL_PORT, POSTGRES_PORT].map(|p| format!("{p}/tcp"));
+    let loopback = || {
+        Some(vec![PortBinding {
+            host_ip: Some("127.0.0.1".to_string()),
+            host_port: Some("0".to_string()),
+        }])
+    };
     ContainerCreateBody {
         image: Some(settings.image.clone()),
         entrypoint: Some(vec!["/usr/local/bin/compute_ctl".to_string()]),
         cmd: Some(compute_ctl_args(endpoint_id, &settings.control_plane_uri)),
         env: Some(vec![format!("{COMPUTE_TOKEN_ENV}={compute_token}")]),
         labels: Some([(ENDPOINT_LABEL.to_string(), endpoint_id.to_string())].into()),
-        exposed_ports: Some(vec![port.clone()]),
+        exposed_ports: Some(ports.to_vec()),
         host_config: Some(HostConfig {
             network_mode: Some(settings.network.clone()),
             restart_policy: Some(RestartPolicy {
@@ -89,16 +96,7 @@ pub fn create_body(
             memory: Some(MEMORY_BYTES),
             nano_cpus: Some(NANO_CPUS),
             extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
-            port_bindings: Some(
-                [(
-                    port,
-                    Some(vec![PortBinding {
-                        host_ip: Some("127.0.0.1".to_string()),
-                        host_port: Some("0".to_string()),
-                    }]),
-                )]
-                .into(),
-            ),
+            port_bindings: Some(ports.into_iter().map(|p| (p, loopback())).collect()),
             ..Default::default()
         }),
         ..Default::default()
@@ -250,6 +248,10 @@ impl ComputeLocator for DockerBackend {
     async fn control_addr(&self, endpoint_id: &str) -> anyhow::Result<Option<SocketAddr>> {
         self.locator.control_addr(endpoint_id).await
     }
+
+    async fn postgres_addr(&self, endpoint_id: &str) -> anyhow::Result<Option<SocketAddr>> {
+        self.locator.postgres_addr(endpoint_id).await
+    }
 }
 
 impl ComputeBackend for DockerBackend {
@@ -361,6 +363,9 @@ pub mod fake {
         pub fail_delete: Mutex<Option<String>>,
         /// `control_addr` never answers, like a hung Docker daemon.
         pub hang_control_addr: Mutex<bool>,
+        /// `(needle, stdout)`: SQL containing the needle answers with stdout (the first match);
+        /// everything else answers "".
+        pub answers: Mutex<Vec<(String, String)>>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -373,6 +378,11 @@ pub mod fake {
                 journal,
                 ..Default::default()
             }
+        }
+
+        /// SQL containing `needle` answers `stdout` from now on.
+        pub fn answer(&self, needle: &str, stdout: &str) {
+            lock(&self.answers).push((needle.to_string(), stdout.to_string()));
         }
 
         fn record(&self, entry: String) {
@@ -428,6 +438,12 @@ pub mod fake {
             Ok(self
                 .is_running(endpoint_id)
                 .then(|| "127.0.0.1:3080".parse().unwrap()))
+        }
+
+        async fn postgres_addr(&self, endpoint_id: &str) -> anyhow::Result<Option<SocketAddr>> {
+            Ok(self
+                .is_running(endpoint_id)
+                .then(|| "127.0.0.1:55432".parse().unwrap()))
         }
     }
 
@@ -499,7 +515,11 @@ pub mod fake {
                 database.to_string(),
                 sql.to_string(),
             ));
-            Ok(String::new())
+            Ok(lock(&self.answers)
+                .iter()
+                .find(|(needle, _)| sql.contains(needle))
+                .map(|(_, stdout)| stdout.clone())
+                .unwrap_or_default())
         }
     }
 }
@@ -563,9 +583,27 @@ mod tests {
     #[test]
     fn compute_ctl_is_published_on_loopback_only() {
         let body = create_body("ep-abc123", "t", &settings());
-        assert_eq!(body.exposed_ports, Some(vec!["3080/tcp".to_string()]));
+        assert!(
+            body.exposed_ports
+                .unwrap()
+                .contains(&"3080/tcp".to_string())
+        );
         let bindings = body.host_config.unwrap().port_bindings.unwrap();
         let binding = &bindings["3080/tcp"].as_ref().unwrap()[0];
+        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(binding.host_port.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn create_body_publishes_postgres_on_loopback() {
+        let body = create_body("ep-abc123", "t", &settings());
+        assert_eq!(
+            body.exposed_ports,
+            Some(vec!["3080/tcp".to_string(), "5432/tcp".to_string()])
+        );
+        let bindings = body.host_config.unwrap().port_bindings.unwrap();
+        assert_eq!(bindings.len(), 2);
+        let binding = &bindings["5432/tcp"].as_ref().unwrap()[0];
         assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(binding.host_port.as_deref(), Some("0"));
     }
@@ -620,6 +658,10 @@ mod tests {
             fake.control_addr("ep-1").await.unwrap(),
             Some("127.0.0.1:3080".parse().unwrap())
         );
+        assert_eq!(
+            fake.postgres_addr("ep-1").await.unwrap(),
+            Some("127.0.0.1:55432".parse().unwrap())
+        );
         fake.admin_sql("ep-1", "postgres", "SELECT 1;\nSELECT 2;")
             .await
             .unwrap();
@@ -629,6 +671,7 @@ mod tests {
             Some(ComputeStatus::NotRunning("exited".to_string()))
         );
         assert_eq!(fake.address("ep-1").await.unwrap(), None);
+        assert_eq!(fake.postgres_addr("ep-1").await.unwrap(), None);
         fake.delete("ep-1").await.unwrap();
         assert_eq!(fake.status("ep-1").await.unwrap(), None);
         assert_eq!(
@@ -663,6 +706,15 @@ mod tests {
         assert!(fake.delete("ep-1").await.is_err());
         fake.insert("ep-3");
         fake.remove("ep-3");
+        // Canned output for SQL containing a needle; the rest answers "".
+        fake.answer("to_regclass", "f\n");
+        assert_eq!(
+            fake.admin_sql("ep-1", "app", "SELECT to_regclass('x')")
+                .await
+                .unwrap(),
+            "f\n"
+        );
+        assert_eq!(fake.admin_sql("ep-1", "app", "SELECT 1").await.unwrap(), "");
         assert_eq!(fake.status("ep-3").await.unwrap(), None);
     }
 }

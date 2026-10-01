@@ -1,0 +1,10 @@
+{
+  "call": "db.from(\"billing.invoices\").select(\"id\", \"amount\").where({ paid: false })",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "billing.invoices",
+    "select": ["id", "amount"],
+    "where": { "col": "paid", "eq": false }
+  }
+}

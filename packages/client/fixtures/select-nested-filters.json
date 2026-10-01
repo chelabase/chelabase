@@ -1,0 +1,20 @@
+{
+  "call": "db.from(\"orders\").where({ status: \"paid\", or: [{ region: { in: [\"eu\"] } }, { vip: true, qty: { gt: 2 } }], not: { customer_name: null } })",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "where": {
+      "and": [
+        { "col": "status", "eq": "paid" },
+        {
+          "or": [
+            { "col": "region", "in": ["eu"] },
+            { "and": [{ "col": "vip", "eq": true }, { "col": "qty", "gt": 2 }] }
+          ]
+        },
+        { "not": { "col": "customer_name", "is": null } }
+      ]
+    }
+  }
+}

@@ -38,3 +38,6 @@ infra/neon/.cache/
 
 # Playwright MCP snapshots and logs
 .playwright-mcp/
+
+# Claude
+.claude/settings.local.json

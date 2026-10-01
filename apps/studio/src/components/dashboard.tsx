@@ -5,6 +5,7 @@ import { ApiError, type ApiClient } from "@/lib/api";
 import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
+import { DatabaseDataApi } from "./database-data-api";
 
 type MeState =
   | { status: "loading" }
@@ -14,12 +15,14 @@ type MeState =
 
 export interface DashboardProps {
   api: ApiClient;
+  /** The gateway's base URL (shown as the data API endpoint). */
+  apiUrl: string;
   profile: { name?: string; email?: string };
   onSignOut: () => void;
   pollIntervalMs?: number;
 }
 
-export function Dashboard({ api, profile, onSignOut, pollIntervalMs }: DashboardProps) {
+export function Dashboard({ api, apiUrl, profile, onSignOut, pollIntervalMs }: DashboardProps) {
   const [state, setState] = useState<MeState>({ status: "loading" });
 
   const load = useCallback(async () => {
@@ -84,7 +87,7 @@ export function Dashboard({ api, profile, onSignOut, pollIntervalMs }: Dashboard
         {state.status === "ready" && state.refreshError && (
           <p className="text-sm text-muted-foreground">Couldn't refresh ({state.refreshError}); retrying…</p>
         )}
-        {state.status === "ready" && <Workspace me={state.me} api={api} reload={load} pollIntervalMs={pollIntervalMs} />}
+        {state.status === "ready" && <Workspace me={state.me} api={api} apiUrl={apiUrl} reload={load} pollIntervalMs={pollIntervalMs} />}
       </main>
     </div>
   );
@@ -93,11 +96,13 @@ export function Dashboard({ api, profile, onSignOut, pollIntervalMs }: Dashboard
 function Workspace({
   me,
   api,
+  apiUrl,
   reload,
   pollIntervalMs,
 }: {
   me: MeResponse;
   api: ApiClient;
+  apiUrl: string;
   reload: () => Promise<void>;
   pollIntervalMs?: number;
 }) {
@@ -154,6 +159,7 @@ function Workspace({
           <DatabasesTable
             databases={project.databases}
             api={api}
+            apiUrl={apiUrl}
             onChanged={() => void reload()}
             pollIntervalMs={pollIntervalMs}
           />
@@ -172,15 +178,19 @@ function hasTransitional(me: MeResponse): boolean {
 function DatabasesTable({
   databases,
   api,
+  apiUrl,
   onChanged,
   pollIntervalMs,
 }: {
   databases: DatabaseSummary[];
   api: ApiClient;
+  apiUrl: string;
   onChanged: () => void;
   pollIntervalMs?: number;
 }) {
-  const [expanded, setExpanded] = useState<string | null>(null);
+  const [open, setOpen] = useState<{ id: string; view: "branches" | "data-api" } | null>(null);
+  const toggle = (id: string, view: "branches" | "data-api") =>
+    setOpen(open?.id === id && open.view === view ? null : { id, view });
   if (databases.length === 0) {
     return <p className="text-sm text-muted-foreground">No databases yet.</p>;
   }
@@ -208,18 +218,31 @@ function DatabasesTable({
                     size="sm"
                     variant="outline"
                     disabled={db.status !== "ready"}
-                    aria-expanded={expanded === db.database_id}
-                    onClick={() => setExpanded(expanded === db.database_id ? null : db.database_id)}
+                    aria-expanded={open?.id === db.database_id && open.view === "branches"}
+                    onClick={() => toggle(db.database_id, "branches")}
                   >
                     Branches
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={db.status !== "ready"}
+                    aria-expanded={open?.id === db.database_id && open.view === "data-api"}
+                    onClick={() => toggle(db.database_id, "data-api")}
+                  >
+                    Data API
                   </Button>
                 </div>
               </td>
             </tr>
-            {expanded === db.database_id && db.status === "ready" && (
+            {open?.id === db.database_id && db.status === "ready" && (
               <tr className="border-b last:border-0">
                 <td colSpan={4}>
-                  <DatabaseBranches api={api} database={db} pollIntervalMs={pollIntervalMs} />
+                  {open.view === "branches" ? (
+                    <DatabaseBranches api={api} database={db} pollIntervalMs={pollIntervalMs} />
+                  ) : (
+                    <DatabaseDataApi api={api} apiUrl={apiUrl} database={db} />
+                  )}
                 </td>
               </tr>
             )}

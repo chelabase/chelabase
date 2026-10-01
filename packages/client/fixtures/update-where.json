@@ -1,0 +1,11 @@
+{
+  "call": "db.from(\"orders\").update({ status: \"shipped\" }).where({ id: 7 }).returning(\"*\")",
+  "tree": {
+    "v": 1,
+    "op": "update",
+    "table": "orders",
+    "set": { "status": "shipped" },
+    "where": { "col": "id", "eq": 7 },
+    "returning": "*"
+  }
+}

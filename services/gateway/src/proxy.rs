@@ -69,6 +69,11 @@ impl ProxyHttp for Gateway {
             .map(str::to_string)
             .or_else(|| req.uri.authority().map(|a| a.as_str().to_string()));
 
+        let client_ip = session
+            .client_addr()
+            .and_then(|addr| addr.as_inet())
+            .map(|inet| inet.ip());
+
         let handled = self
             .pipeline
             .handle(&RequestParts {
@@ -76,6 +81,7 @@ impl ProxyHttp for Gateway {
                 path: &path,
                 host: host.as_deref(),
                 headers: &headers,
+                client_ip,
             })
             .await;
 

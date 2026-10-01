@@ -9,10 +9,14 @@ use tracing::info;
 use uuid::Uuid;
 
 mod branches;
+mod data_api;
 mod neon;
 pub use branches::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome,
-    DatabaseSettings, LiveBranch, NewBranch,
+    DatabaseSettings, LiveBranch, NewBranch, SettingsPatch,
+};
+pub use data_api::{
+    BranchConnectionRow, DataApiSettings, DataKeyLookup, DataKeyRecord, NewDataKey,
 };
 pub use neon::{
     ENDPOINT_LOCK_TIMEOUT, EndpointLock, EndpointState, NeonDatabase, NeonEndpoint, NeonRole,
@@ -57,6 +61,14 @@ pub struct DatabaseRecord {
     pub history_window: std::time::Duration,
     /// Live `normal` branches allowed besides main.
     pub max_branches: i32,
+    /// Data API: rows a response may hold.
+    pub max_rows: i32,
+    /// Data API: per-statement timeout.
+    pub statement_timeout_ms: i32,
+    /// Data API: connections this database's pool may hold.
+    pub max_connections: i32,
+    /// Data API: the schema requests use when they name none.
+    pub default_schema: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +133,10 @@ pub enum MetadataError {
     /// A branch this write would insert has the name of a live one (`branches_live_name`).
     #[error("a live branch named {0:?} already exists")]
     BranchNameTaken(String),
+    /// A write would break a uniqueness rule the caller can resolve (a second live public
+    /// data key on a branch).
+    #[error("conflicting write")]
+    Conflict,
     #[error("invalid database name: {0}")]
     InvalidDatabaseName(String),
     /// [`MetadataClient::lock_endpoint`] waited [`ENDPOINT_LOCK_TIMEOUT`] in vain.
@@ -614,7 +630,8 @@ impl MetadataClient {
                 d.error,
                 d.neon_tenant_id,
                 EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
-                d.max_branches
+                d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections,
+                d.default_schema
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE d.id = $1
@@ -653,7 +670,8 @@ impl MetadataClient {
             SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.database_name,
                    d.owner_role, d.error, d.neon_tenant_id,
                    EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
-                   d.max_branches
+                   d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections,
+                   d.default_schema
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE p.tenant_id = $1 AND d.status <> 'deleted'
@@ -715,6 +733,10 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
             r.get::<i64, _>("history_window_secs").max(0) as u64,
         ),
         max_branches: r.get("max_branches"),
+        max_rows: r.get("max_rows"),
+        statement_timeout_ms: r.get("statement_timeout_ms"),
+        max_connections: r.get("max_connections"),
+        default_schema: r.get("default_schema"),
     }
 }
 
@@ -735,6 +757,10 @@ mod tests {
             neon_tenant_id: None,
             history_window: std::time::Duration::from_secs(7 * 24 * 3600),
             max_branches: 5,
+            max_rows: 1000,
+            statement_timeout_ms: 8000,
+            max_connections: 5,
+            default_schema: "public".into(),
         }
     }
 

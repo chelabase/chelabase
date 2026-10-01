@@ -4,7 +4,7 @@ use cheladb_nats::{connect, ensure_control_stream, NatsConfig};
 use cheladb_neon::{DockerLocator, StorconClient};
 use cheladb_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
-use orchestrator::{build_router, AppState, NatsPorts};
+use orchestrator::{build_router, AppState, NatsPorts, RestInternal};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +48,9 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         proxy_token: internal_config.proxy_token.clone(),
         storcon_token: internal_config.storcon_token.clone(),
+        data_keys_token: internal_config.data_keys_token.clone(),
+        rest_token: internal_config.rest_token.clone(),
+        secrets: secrets.clone(),
     });
 
     let state = AppState {
@@ -56,6 +59,11 @@ async fn main() -> anyhow::Result<()> {
         identity,
         secrets,
         proxy_domain: proxy_domain_from_env(),
+        rest: RestInternal {
+            url: env_or("CHELADB_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
+            token: internal_config.rest_token.clone(),
+            http: reqwest::Client::new(),
+        },
     };
 
     let app = build_router(Arc::new(state));
@@ -104,4 +112,13 @@ fn proxy_domain_from_env() -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "localtest.me".to_string())
+}
+
+/// The variable, or `default` when unset or blank.
+fn env_or(name: &str, default: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }

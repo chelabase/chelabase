@@ -1,8 +1,10 @@
 use cheladb_auth::internal::{
-    generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier,
+    generate_keypair_pem, AuthMethod, DataIdentity, Identity, InternalSigner, InternalVerifier,
     INTERNAL_ISSUER, INTERNAL_TOKEN_TTL_SECS,
 };
 use cheladb_auth::AuthError;
+use cheladb_types::data_key::DataKeyKind;
+use uuid::Uuid;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn keypair() -> (InternalSigner, InternalVerifier) {
@@ -19,6 +21,7 @@ fn identity() -> Identity {
         org_id: "org-1".into(),
         auth: AuthMethod::PlatformJwt,
         request_id: "rid-1".into(),
+        data: None,
     }
 }
 
@@ -132,4 +135,66 @@ fn token_with_another_issuer_is_rejected() {
     .unwrap();
     let err = verifier.verify(&token, "orchestrator").unwrap_err();
     assert!(matches!(err, AuthError::InvalidToken(_)), "{err:?}");
+}
+
+#[test]
+fn data_identity_round_trips_in_claims() {
+    let (signer, verifier) = keypair();
+    let data = DataIdentity {
+        branch_id: Uuid::new_v4(),
+        key_id: Uuid::new_v4(),
+        kind: DataKeyKind::Secret,
+        role: "service".into(),
+        claims: serde_json::json!({}),
+    };
+    let identity = Identity {
+        sub: data.key_id.to_string(),
+        org_id: String::new(),
+        auth: AuthMethod::DataKey,
+        request_id: "rid-2".into(),
+        data: Some(data.clone()),
+    };
+    let token = signer.sign("rest", &identity).unwrap();
+    let claims = verifier.verify(&token, "rest").unwrap();
+    assert_eq!(claims.auth, AuthMethod::DataKey);
+    assert_eq!(claims.sub, data.key_id.to_string());
+    assert_eq!(claims.org_id, "");
+    assert_eq!(claims.data, Some(data));
+}
+
+#[test]
+fn platform_claims_without_data_still_verify() {
+    let (private_pem, public_pem) = generate_keypair_pem();
+    let verifier = InternalVerifier::from_pem(public_pem.as_bytes()).unwrap();
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap();
+    // A token minted before `data` existed has no such field.
+    let claims = serde_json::json!({
+        "iss": INTERNAL_ISSUER,
+        "aud": "orchestrator",
+        "iat": now(),
+        "exp": now() + 60,
+        "sub": "user-1",
+        "org_id": "org-1",
+        "auth": "platform_jwt",
+        "rid": "rid-1",
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA),
+        &claims,
+        &key,
+    )
+    .unwrap();
+    let verified = verifier.verify(&token, "orchestrator").unwrap();
+    assert_eq!(verified.data, None);
+    assert_eq!(verified.auth, AuthMethod::PlatformJwt);
+
+    // And a platform identity signs without a `data` field at all.
+    let (signer, _) = keypair();
+    let token = signer.sign("orchestrator", &identity()).unwrap();
+    let payload = token.split('.').nth(1).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(
+        &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).unwrap(),
+    )
+    .unwrap();
+    assert!(json.get("data").is_none(), "{json}");
 }

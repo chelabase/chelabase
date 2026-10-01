@@ -131,21 +131,62 @@ export function windowParts(secs: number): { value: number; unit: WindowUnit } {
   return secs % 86400 === 0 ? { value: secs / 86400, unit: "days" } : { value: Math.round(secs / 3600), unit: "hours" };
 }
 
-export function parseSettings(input: {
+export const MAX_ROWS_RANGE = [1, 100_000] as const;
+export const STATEMENT_TIMEOUT_RANGE = [100, 120_000] as const;
+export const MAX_CONNECTIONS_RANGE = [1, 50] as const;
+const SCHEMA_RE = /^[a-z_][a-z0-9_]{0,62}$/;
+
+export interface SettingsInput {
   window: string;
   unit: WindowUnit;
   maxBranches: string;
-}): { ok: true; settings: DatabaseSettings } | { ok: false; window?: string; maxBranches?: string } {
-  const errors: { window?: string; maxBranches?: string } = {};
-  const w = /^\d+$/.test(input.window.trim()) ? Number(input.window.trim()) : NaN;
+  maxRows: string;
+  statementTimeoutMs: string;
+  maxConnections: string;
+  defaultSchema: string;
+}
+export type SettingsErrors = Partial<Record<Exclude<keyof SettingsInput, "unit">, string>>;
+
+const whole = (text: string) => (/^\d+$/.test(text.trim()) ? Number(text.trim()) : NaN);
+const inRange = (n: number, [min, max]: readonly [number, number]) => !Number.isNaN(n) && n >= min && n <= max;
+
+export function parseSettings(
+  input: SettingsInput,
+): { ok: true; settings: DatabaseSettings } | ({ ok: false } & SettingsErrors) {
+  const errors: SettingsErrors = {};
+  const w = whole(input.window);
   const secs = w * (input.unit === "days" ? 86400 : 3600);
   if (Number.isNaN(w) || secs < MIN_WINDOW_SECS || secs > MAX_WINDOW_SECS) {
     errors.window = "The history window must be a whole number between 1 hour and 30 days.";
   }
-  const m = /^\d+$/.test(input.maxBranches.trim()) ? Number(input.maxBranches.trim()) : NaN;
+  const m = whole(input.maxBranches);
   if (Number.isNaN(m) || m > MAX_BRANCH_LIMIT) {
     errors.maxBranches = "The branch limit must be a whole number between 0 and 20.";
   }
-  if (errors.window || errors.maxBranches) return { ok: false, ...errors };
-  return { ok: true, settings: { history_window: secs, max_branches: m } };
+  const rows = whole(input.maxRows);
+  if (!inRange(rows, MAX_ROWS_RANGE)) errors.maxRows = "Max rows must be a whole number between 1 and 100000.";
+  const timeout = whole(input.statementTimeoutMs);
+  if (!inRange(timeout, STATEMENT_TIMEOUT_RANGE)) {
+    errors.statementTimeoutMs = "Statement timeout must be a whole number between 100 and 120000 milliseconds.";
+  }
+  const connections = whole(input.maxConnections);
+  if (!inRange(connections, MAX_CONNECTIONS_RANGE)) {
+    errors.maxConnections = "Max connections must be a whole number between 1 and 50.";
+  }
+  if (!SCHEMA_RE.test(input.defaultSchema)) {
+    errors.defaultSchema =
+      "Default schema must be 1-63 characters from a-z, 0-9 and _, not starting with a digit.";
+  }
+  if (Object.keys(errors).length > 0) return { ok: false, ...errors };
+  return {
+    ok: true,
+    settings: {
+      history_window: secs,
+      max_branches: m,
+      max_rows: rows,
+      statement_timeout_ms: timeout,
+      max_connections: connections,
+      default_schema: input.defaultSchema,
+    },
+  };
 }

@@ -147,23 +147,63 @@ describe("restore bounds", () => {
 });
 
 describe("parseSettings", () => {
-  it("converts hours and days to seconds", () => {
-    expect(parseSettings({ window: "12", unit: "hours", maxBranches: "5" })).toEqual({
+  const base = {
+    window: "1",
+    unit: "days" as "days" | "hours",
+    maxBranches: "5",
+    maxRows: "1000",
+    statementTimeoutMs: "8000",
+    maxConnections: "5",
+    defaultSchema: "public",
+  };
+  const parse = (over: Partial<typeof base> = {}) => parseSettings({ ...base, ...over });
+
+  it("converts hours and days to seconds and carries the data API settings", () => {
+    expect(parse({ window: "12", unit: "hours" })).toEqual({
       ok: true,
-      settings: { history_window: 43200, max_branches: 5 },
+      settings: {
+        history_window: 43200,
+        max_branches: 5,
+        max_rows: 1000,
+        statement_timeout_ms: 8000,
+        max_connections: 5,
+        default_schema: "public",
+      },
     });
-    expect(parseSettings({ window: "30", unit: "days", maxBranches: "0" })).toEqual({
+    expect(parse({ window: "30", maxBranches: "0" })).toMatchObject({
       ok: true,
       settings: { history_window: 2592000, max_branches: 0 },
     });
   });
   it("enforces 1 hour to 30 days and 0 to 20 branches", () => {
-    expect(parseSettings({ window: "0", unit: "hours", maxBranches: "5" })).toMatchObject({ ok: false });
-    expect(parseSettings({ window: "31", unit: "days", maxBranches: "5" })).toMatchObject({ ok: false });
-    expect(parseSettings({ window: "721", unit: "hours", maxBranches: "5" })).toMatchObject({ ok: false });
-    expect(parseSettings({ window: "1.5", unit: "days", maxBranches: "5" })).toMatchObject({ ok: false });
-    expect(parseSettings({ window: "1", unit: "days", maxBranches: "21" })).toMatchObject({ ok: false });
-    expect(parseSettings({ window: "1", unit: "days", maxBranches: "-1" })).toMatchObject({ ok: false });
-    expect(parseSettings({ window: "1", unit: "days", maxBranches: "" })).toMatchObject({ ok: false });
+    expect(parse({ window: "0", unit: "hours" })).toMatchObject({ ok: false });
+    expect(parse({ window: "31" })).toMatchObject({ ok: false });
+    expect(parse({ window: "721", unit: "hours" })).toMatchObject({ ok: false });
+    expect(parse({ window: "1.5" })).toMatchObject({ ok: false });
+    expect(parse({ maxBranches: "21" })).toMatchObject({ ok: false });
+    expect(parse({ maxBranches: "-1" })).toMatchObject({ ok: false });
+    expect(parse({ maxBranches: "" })).toMatchObject({ ok: false });
+  });
+  it("enforces max_rows 1 to 100000", () => {
+    expect(parse({ maxRows: "1" })).toMatchObject({ ok: true });
+    expect(parse({ maxRows: "100000" })).toMatchObject({ ok: true });
+    for (const v of ["0", "100001", "", "1.5", "-1"]) expect(parse({ maxRows: v })).toMatchObject({ ok: false, maxRows: expect.any(String) });
+  });
+  it("enforces statement_timeout_ms 100 to 120000", () => {
+    expect(parse({ statementTimeoutMs: "100" })).toMatchObject({ ok: true });
+    expect(parse({ statementTimeoutMs: "120000" })).toMatchObject({ ok: true });
+    for (const v of ["99", "120001", "", "abc"]) expect(parse({ statementTimeoutMs: v })).toMatchObject({ ok: false, statementTimeoutMs: expect.any(String) });
+  });
+  it("enforces max_connections 1 to 50", () => {
+    expect(parse({ maxConnections: "1" })).toMatchObject({ ok: true });
+    expect(parse({ maxConnections: "50" })).toMatchObject({ ok: true });
+    for (const v of ["0", "51", "", "2.5"]) expect(parse({ maxConnections: v })).toMatchObject({ ok: false, maxConnections: expect.any(String) });
+  });
+  it("enforces default_schema ^[a-z_][a-z0-9_]{0,62}$", () => {
+    expect(parse({ defaultSchema: "_app1" })).toMatchObject({ ok: true });
+    expect(parse({ defaultSchema: "a".repeat(63) })).toMatchObject({ ok: true });
+    for (const v of ["", "1app", "App", "my-schema", "a".repeat(64), "pub lic"]) {
+      expect(parse({ defaultSchema: v })).toMatchObject({ ok: false, defaultSchema: expect.any(String) });
+    }
   });
 });

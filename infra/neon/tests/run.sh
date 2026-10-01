@@ -277,6 +277,10 @@ check "worker exports CHELADB_COMPUTE_IMAGE" \
   bash -c "just --justfile '$root/justfile' --show worker | grep -q 'export CHELADB_COMPUTE_IMAGE='"
 check "branch-e2e recipe exists" \
   bash -c "just --justfile '$root/justfile' --show branch-e2e | grep -q 'scripts/branch-e2e.sh'"
+check "data-e2e recipe exists" \
+  bash -c "just --justfile '$root/justfile' --show data-e2e | grep -q 'scripts/data-e2e.sh'"
+check "dev starts rest" \
+  bash -c "just --justfile '$root/justfile' --show dev | grep -q 'cargo run -p rest'"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

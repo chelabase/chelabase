@@ -2,10 +2,13 @@
 
 use cheladb_routes::Service;
 
+const DEFAULT_REST: &str = "127.0.0.1:8085";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstreams {
     orchestrator: String,
     auth: String,
+    rest: String,
 }
 
 impl Upstreams {
@@ -13,13 +16,21 @@ impl Upstreams {
         Ok(Self {
             orchestrator: authority_from_url(orchestrator_url)?,
             auth: authority_from_url(auth_url)?,
+            rest: DEFAULT_REST.to_string(),
         })
+    }
+
+    /// Where `rest` (the data API) lives.
+    pub fn with_rest(mut self, rest_url: &str) -> Result<Self, String> {
+        self.rest = authority_from_url(rest_url)?;
+        Ok(self)
     }
 
     pub fn addr(&self, service: Service) -> &str {
         match service {
             Service::Orchestrator => &self.orchestrator,
             Service::Auth => &self.auth,
+            Service::Rest => &self.rest,
         }
     }
 }

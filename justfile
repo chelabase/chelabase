@@ -105,6 +105,17 @@ gateway:
     fi
     cargo run -p gateway
 
+rest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -f .cheladb/zitadel/demo.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source .cheladb/zitadel/demo.env
+      set +a
+    fi
+    cargo run -p rest
+
 auth:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -160,7 +171,7 @@ dev: deps-up
     eval "$(scripts/neon-images.sh)"
     export CHELADB_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
 
-    cargo build -p orchestrator -p worker -p gateway -p auth -p cheladb
+    cargo build -p orchestrator -p worker -p gateway -p rest -p auth -p cheladb
 
     # Start orchestrator first so migrations add tenants.zitadel_org_id, then re-bind.
     nohup setsid cargo run -p orchestrator >"{{dev_dir}}/orchestrator.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
@@ -169,6 +180,7 @@ dev: deps-up
 
     nohup setsid cargo run -p worker >"{{dev_dir}}/worker.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid cargo run -p gateway >"{{dev_dir}}/gateway.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid cargo run -p rest >"{{dev_dir}}/rest.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid cargo run -p auth >"{{dev_dir}}/auth.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid pnpm --filter @cheladb/studio dev >"{{dev_dir}}/studio.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
 
@@ -181,6 +193,7 @@ dev: deps-up
     echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
     echo "Internal:        http://127.0.0.1:8083  (internal; proxy / compute_ctl / storage controller)"
     echo "Worker health:   http://127.0.0.1:8082/health"
+    echo "rest:            http://127.0.0.1:8085  (data API; via the gateway at /data/v1; internal on :8086)"
     echo "auth:            http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
     echo "Studio:          http://localhost:3000  (sign in / create account)"
     echo "Mailpit (email): http://localhost:8025  (signup verification codes)"
@@ -233,10 +246,10 @@ cleanup:
     just="{{just_executable()}}"
     "$just" dev-down
     # Anything still on the dev ports (e.g. an app started by hand) would keep old code running.
-    for port in 8000 8081 8082 8084 3000; do
+    for port in 8000 8081 8082 8084 8085 8086 3000; do
       for pid in $(ss -ltnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
         cmd="$(tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" || true)"
-        if [[ "$cmd" =~ (gateway|orchestrator|worker|auth|vite|node) ]]; then
+        if [[ "$cmd" =~ (gateway|orchestrator|worker|auth|rest|vite|node) ]]; then
           echo "stopping pid $pid on :$port ($cmd)"
           kill "$pid" 2>/dev/null || true
         fi
@@ -332,6 +345,8 @@ check:
     pnpm --filter @cheladb/types typecheck
     pnpm --filter @cheladb/studio typecheck
     pnpm --filter @cheladb/studio test
+    pnpm --filter @cheladb/client typecheck
+    pnpm --filter @cheladb/client test
 
 # Rust tests (nextest, one process per test) plus doctests, which nextest does not run.
 # The ignored live tests stay on `cargo test ... -- --ignored` (see neon-test-live).
@@ -417,6 +432,10 @@ neon-e2e:
 # with a backup, a point outside the history window, delete (needs just deps-up and just dev)
 branch-e2e:
     scripts/branch-e2e.sh
+
+# Live data API story: keys, queries through the gateway, RLS, generated types, revoke (needs just deps-up and just dev)
+data-e2e:
+    scripts/data-e2e.sh
 
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:

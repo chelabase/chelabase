@@ -1,0 +1,15 @@
+{
+  "call": "db.from(\"orders\").orderBy(\"created_at\", \"desc\", \"last\").orderBy(\"id\").orderBy(\"customer_name\", \"asc\", \"first\").limit(10).offset(20)",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "orderBy": [
+      { "col": "created_at", "dir": "desc", "nulls": "last" },
+      { "col": "id" },
+      { "col": "customer_name", "dir": "asc", "nulls": "first" }
+    ],
+    "limit": 10,
+    "offset": 20
+  }
+}

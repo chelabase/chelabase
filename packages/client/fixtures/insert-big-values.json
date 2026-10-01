@@ -1,0 +1,11 @@
+{
+  "call": "createClient<Database>({ url, key, bigint: true }).from(\"events\").insert({ amount: \"123456789012345678901234567890\", label: \"x\", seq: 9007199254740993n, ids: [1n, 9223372036854775807n] })",
+  "tree": {
+    "v": 1,
+    "op": "insert",
+    "into": "events",
+    "values": [
+      { "amount": "123456789012345678901234567890", "label": "x", "seq": 9007199254740993, "ids": [1, 9223372036854775807] }
+    ]
+  }
+}

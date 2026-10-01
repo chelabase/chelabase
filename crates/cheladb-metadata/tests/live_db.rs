@@ -8,8 +8,10 @@
 
 use cheladb_metadata::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseSettings, DatabaseStatus,
-    MetadataClient, MetadataConfig, NewBranch, NewEndpoint, DEMO_PROJECT_ID, DEMO_TENANT_ID,
+    MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey, NewEndpoint, SettingsPatch,
+    DEMO_PROJECT_ID, DEMO_TENANT_ID,
 };
+use cheladb_types::data_key::{self, DataKeyKind};
 use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
 
 async fn client() -> MetadataClient {
@@ -768,7 +770,7 @@ async fn create_branch_enforces_the_cap_under_a_race() {
     let client = client().await;
     for round in 0..5 {
         let (id, _ep) = ready_database(&client).await;
-        assert!(client.update_database_settings(id, None, Some(1)).await.unwrap());
+        assert!(client.update_database_settings(id, &SettingsPatch { max_branches: Some(1), ..Default::default() }).await.unwrap());
         let (a, b) = (new_branch(id, "a", main_of(id)), new_branch(id, "b", main_of(id)));
         let (ra, rb) = tokio::join!(client.create_branch(&a), client.create_branch(&b));
         let listed = client.list_branches(id).await.unwrap();
@@ -849,7 +851,7 @@ async fn create_branch_refuses_taken_names_and_unready_parents() {
 async fn backups_do_not_count_as_children_or_toward_the_cap() {
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
-    assert!(client.update_database_settings(id, None, Some(2)).await.unwrap());
+    assert!(client.update_database_settings(id, &SettingsPatch { max_branches: Some(2), ..Default::default() }).await.unwrap());
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
     let pending = start_reset(&client, dev).await;
     let backup = BranchId::new();
@@ -1204,15 +1206,15 @@ async fn database_settings_and_neon_tenant_round_trip() {
     let id = insert_pending(&client).await;
     let defaults = client.database_settings(id).await.unwrap();
     let hour = std::time::Duration::from_secs(3600);
-    assert!(client.update_database_settings(id, Some(hour), None).await.unwrap());
+    assert!(client.update_database_settings(id, &SettingsPatch { history_window: Some(hour), ..Default::default() }).await.unwrap());
     let window_only = client.database_settings(id).await.unwrap();
-    assert!(client.update_database_settings(id, None, Some(0)).await.unwrap());
+    assert!(client.update_database_settings(id, &SettingsPatch { max_branches: Some(0), ..Default::default() }).await.unwrap());
     let cap_only = client.database_settings(id).await.unwrap();
     let tenant = hex32();
     let tenant_set = client.set_neon_tenant(id, &tenant).await.unwrap();
     let row = client.get_database(id).await.unwrap().unwrap();
     assert!(client.begin_delete(id).await.unwrap());
-    let on_deleting = client.update_database_settings(id, None, Some(3)).await.unwrap();
+    let on_deleting = client.update_database_settings(id, &SettingsPatch { max_branches: Some(3), ..Default::default() }).await.unwrap();
     let tenant_on_deleting = client.set_neon_tenant(id, &hex32()).await.unwrap();
     let after_delete = client.database_settings(id).await.unwrap();
     let missing = client.database_settings(DatabaseId::new()).await.unwrap();
@@ -2087,7 +2089,7 @@ async fn list_live_for_reconcile_carries_the_tenant_and_history_window() {
     let tenant = hex32();
     assert!(client.set_neon_tenant(id, &tenant).await.unwrap());
     let hour = std::time::Duration::from_secs(3600);
-    assert!(client.update_database_settings(id, Some(hour), None).await.unwrap());
+    assert!(client.update_database_settings(id, &SettingsPatch { history_window: Some(hour), ..Default::default() }).await.unwrap());
     let fresh = insert_pending(&client).await;
 
     let rows = client.list_live_for_reconcile().await.unwrap();
@@ -2198,4 +2200,361 @@ async fn client_sweeps_databases_an_earlier_run_left_behind() {
     assert_eq!(kept, 2, "databases the tests didn't make are kept");
     assert_eq!(branches, 0);
     assert!(!main_left && !dev_left, "their endpoints go too");
+}
+
+// ---- data API: keys, authenticator password, settings ----
+
+fn new_key(branch: BranchId, kind: DataKeyKind, role: &str, name: &str) -> (NewDataKey, String) {
+    let generated = data_key::generate(kind);
+    let sealed = (kind == DataKeyKind::Public).then(|| "v1:sealed-public-key".to_string());
+    (
+        NewDataKey {
+            id: uuid::Uuid::new_v4(),
+            branch_id: branch,
+            kind,
+            role: role.into(),
+            name: name.into(),
+            prefix: generated.prefix,
+            sha256: generated.sha256,
+            sealed,
+        },
+        generated.key,
+    )
+}
+
+async fn last_used(client: &MetadataClient, key: uuid::Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT last_used_at FROM data_api_keys WHERE id = $1")
+        .bind(key)
+        .fetch_one(client.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore]
+async fn data_keys_insert_lookup_touch_revoke() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (public, _) = new_key(branch, DataKeyKind::Public, "anon", "default");
+    let (secret, _) = new_key(branch, DataKeyKind::Secret, "service_role", "backend");
+    client.insert_data_key(&public).await.unwrap();
+    client.insert_data_key(&secret).await.unwrap();
+
+    let listed = client.list_data_keys(branch).await.unwrap();
+    let found = client.lookup_data_key(&secret.sha256).await.unwrap();
+    let unknown = client.lookup_data_key(&[7u8; 32]).await.unwrap();
+    let has_public = client.has_live_public_key(branch).await.unwrap();
+
+    let before = last_used(&client, secret.id).await;
+    client.touch_data_key(secret.id).await.unwrap();
+    let first = last_used(&client, secret.id).await;
+    // A second touch within a minute leaves the stamp alone; an old one is refreshed.
+    client.touch_data_key(secret.id).await.unwrap();
+    let second = last_used(&client, secret.id).await;
+    sqlx::query("UPDATE data_api_keys SET last_used_at = now() - interval '2 minutes' WHERE id = $1")
+        .bind(secret.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let stale = last_used(&client, secret.id).await;
+    client.touch_data_key(secret.id).await.unwrap();
+    let refreshed = last_used(&client, secret.id).await;
+
+    let public_revoked = client.revoke_data_key(branch, public.id).await.unwrap();
+    let secret_revoked = client.revoke_data_key(branch, secret.id).await.unwrap();
+    let again = client.revoke_data_key(branch, secret.id).await.unwrap();
+    let unknown_revoked = client.revoke_data_key(branch, uuid::Uuid::new_v4()).await.unwrap();
+    let after = client.list_data_keys(branch).await.unwrap();
+    let gone = client.lookup_data_key(&secret.sha256).await.unwrap();
+    cleanup(&client, id).await;
+
+    assert_eq!(listed.iter().map(|k| k.id).collect::<Vec<_>>(), [secret.id, public.id]);
+    assert_eq!(listed[1].sealed.as_deref(), Some("v1:sealed-public-key"));
+    assert_eq!(listed[0].sealed, None);
+    assert_eq!((listed[0].kind, listed[0].role.as_str(), listed[0].name.as_str()), (DataKeyKind::Secret, "service_role", "backend"));
+    assert_eq!(listed[0].prefix, secret.prefix);
+    assert!(listed.iter().all(|k| k.revoked_at.is_none() && k.branch_id == branch));
+    let found = found.expect("secret key found");
+    assert_eq!((found.key_id, found.branch_id, found.kind, found.role.as_str()), (secret.id, branch, DataKeyKind::Secret, "service_role"));
+    assert!(unknown.is_none());
+    assert!(has_public);
+    assert!(before.is_none() && first.is_some());
+    assert_eq!(first, second, "touched twice within a minute");
+    assert!(refreshed > stale, "an old stamp is refreshed");
+    assert!(!public_revoked, "the live public key can only be rotated");
+    assert!(secret_revoked && !again && !unknown_revoked);
+    assert_eq!(after.iter().map(|k| k.id).collect::<Vec<_>>(), [public.id]);
+    assert!(gone.is_none());
+}
+
+#[tokio::test]
+#[ignore]
+async fn second_live_public_key_conflicts() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let (other, _) = ready_database(&client).await;
+    let (first, _) = new_key(main_of(id), DataKeyKind::Public, "anon", "one");
+    let (second, _) = new_key(main_of(id), DataKeyKind::Public, "anon", "two");
+    let (elsewhere, _) = new_key(main_of(other), DataKeyKind::Public, "anon", "other branch");
+    client.insert_data_key(&first).await.unwrap();
+    let conflict = client.insert_data_key(&second).await;
+    // Another branch is unaffected.
+    client.insert_data_key(&elsewhere).await.unwrap();
+    // A secret key with a non-anon role is fine; a public one with another role is not.
+    let (bad_role, _) = new_key(main_of(id), DataKeyKind::Secret, "anon", "ok");
+    let secret_anon = client.insert_data_key(&bad_role).await;
+    let (public_other_role, _) = new_key(main_of(other), DataKeyKind::Public, "service_role", "bad");
+    let check = client.insert_data_key(&public_other_role).await;
+    let count = client.list_data_keys(main_of(id)).await.unwrap().len();
+    cleanup(&client, id).await;
+    cleanup(&client, other).await;
+    assert!(matches!(conflict, Err(MetadataError::Conflict)), "{conflict:?}");
+    assert!(secret_anon.is_ok());
+    assert!(matches!(check, Err(MetadataError::Database(_))), "{check:?}");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+#[ignore]
+async fn rotate_is_atomic() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (public, _) = new_key(branch, DataKeyKind::Public, "anon", "default");
+    let (secret, _) = new_key(branch, DataKeyKind::Secret, "service_role", "backend");
+    client.insert_data_key(&public).await.unwrap();
+    client.insert_data_key(&secret).await.unwrap();
+
+    // The public key rotates: old revoked, new live, never two live.
+    let (public2, _) = new_key(branch, DataKeyKind::Public, "anon", "default");
+    let rotated_public = client.rotate_data_key(branch, public.id, &public2).await.unwrap();
+    let lookup_old = client.lookup_data_key(&public.sha256).await.unwrap();
+    let lookup_new = client.lookup_data_key(&public2.sha256).await.unwrap();
+
+    // A dead old key: false, and the new key is not inserted.
+    let (public3, _) = new_key(branch, DataKeyKind::Public, "anon", "default");
+    let stale = client.rotate_data_key(branch, public.id, &public3).await.unwrap();
+    let missing = client.rotate_data_key(branch, uuid::Uuid::new_v4(), &public3).await.unwrap();
+    let inserted = client.lookup_data_key(&public3.sha256).await.unwrap();
+
+    // Another branch's key can't be rotated through this one.
+    let (other_db, _) = ready_database(&client).await;
+    let (foreign, _) = new_key(main_of(other_db), DataKeyKind::Secret, "service_role", "foreign");
+    client.insert_data_key(&foreign).await.unwrap();
+    let (replacement, _) = new_key(branch, DataKeyKind::Secret, "service_role", "stolen");
+    let cross = client.rotate_data_key(branch, foreign.id, &replacement).await.unwrap();
+
+    // A failing insert rolls the revoke back: a secret rotated into a second live public key.
+    let (clash, _) = new_key(branch, DataKeyKind::Public, "anon", "clash");
+    let failed = client.rotate_data_key(branch, secret.id, &clash).await;
+    let secret_still_live = client.lookup_data_key(&secret.sha256).await.unwrap();
+
+    // A duplicate hash fails the same way.
+    let (dup, _) = new_key(branch, DataKeyKind::Secret, "service_role", "dup");
+    let dup = NewDataKey { sha256: secret.sha256, ..dup };
+    let failed_dup = client.rotate_data_key(branch, secret.id, &dup).await;
+    let still_live = client.lookup_data_key(&secret.sha256).await.unwrap();
+
+    let live = client.list_data_keys(branch).await.unwrap();
+    cleanup(&client, id).await;
+    cleanup(&client, other_db).await;
+    assert!(rotated_public);
+    assert!(lookup_old.is_none());
+    assert_eq!(lookup_new.unwrap().key_id, public2.id);
+    assert!(!stale && !missing);
+    assert!(inserted.is_none());
+    assert!(!cross);
+    assert!(matches!(failed, Err(MetadataError::Conflict)), "{failed:?}");
+    assert!(secret_still_live.is_some());
+    assert!(failed_dup.is_err());
+    assert!(still_live.is_some());
+    let mut ids: Vec<_> = live.iter().map(|k| k.id).collect();
+    ids.sort();
+    let mut want = vec![public2.id, secret.id];
+    want.sort();
+    assert_eq!(ids, want);
+}
+
+#[tokio::test]
+#[ignore]
+async fn lookup_ignores_revoked_keys_and_deleted_branches() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (secret, _) = new_key(branch, DataKeyKind::Secret, "service_role", "backend");
+    let (revoked, _) = new_key(branch, DataKeyKind::Secret, "service_role", "old");
+    client.insert_data_key(&secret).await.unwrap();
+    client.insert_data_key(&revoked).await.unwrap();
+    assert!(client.revoke_data_key(branch, revoked.id).await.unwrap());
+    let live = client.lookup_data_key(&secret.sha256).await.unwrap();
+    let revoked_lookup = client.lookup_data_key(&revoked.sha256).await.unwrap();
+    assert!(client.begin_delete(id).await.unwrap());
+    let deleting = client.lookup_data_key(&secret.sha256).await.unwrap();
+    client.mark_branch_deleted(branch).await.unwrap();
+    client.mark_deleted(id).await.unwrap();
+    let deleted = client.lookup_data_key(&secret.sha256).await.unwrap();
+    cleanup(&client, id).await;
+    assert!(live.is_some());
+    assert!(revoked_lookup.is_none());
+    assert!(deleting.is_none(), "a deleting branch's keys don't resolve");
+    assert!(deleted.is_none());
+}
+
+#[tokio::test]
+#[ignore]
+async fn deleting_a_branch_row_cascades_keys() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let (secret, _) = new_key(main_of(id), DataKeyKind::Secret, "service_role", "backend");
+    client.insert_data_key(&secret).await.unwrap();
+    cleanup(&client, id).await;
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM data_api_keys WHERE id = $1")
+        .bind(secret.id)
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn settings_patch_bounds_are_enforced_by_checks() {
+    let client = client().await;
+    let id = insert_pending(&client).await;
+    let defaults = client.get_database(id).await.unwrap().unwrap();
+    let bad = [
+        SettingsPatch { max_rows: Some(0), ..Default::default() },
+        SettingsPatch { max_rows: Some(100_001), ..Default::default() },
+        SettingsPatch { statement_timeout_ms: Some(99), ..Default::default() },
+        SettingsPatch { statement_timeout_ms: Some(120_001), ..Default::default() },
+        SettingsPatch { max_connections: Some(0), ..Default::default() },
+        SettingsPatch { max_connections: Some(51), ..Default::default() },
+        SettingsPatch { default_schema: Some("Public".into()), ..Default::default() },
+        SettingsPatch { default_schema: Some("1abc".into()), ..Default::default() },
+        SettingsPatch { default_schema: Some("a".repeat(64)), ..Default::default() },
+        SettingsPatch { default_schema: Some(String::new()), ..Default::default() },
+        // One bad field spoils the whole patch.
+        SettingsPatch { max_branches: Some(9), max_rows: Some(0), ..Default::default() },
+    ];
+    let mut rejected = 0;
+    for patch in &bad {
+        if matches!(client.update_database_settings(id, patch).await, Err(MetadataError::Database(_))) {
+            rejected += 1;
+        }
+    }
+    let unchanged = client.get_database(id).await.unwrap().unwrap();
+    let edges = SettingsPatch {
+        max_rows: Some(100_000),
+        statement_timeout_ms: Some(100),
+        max_connections: Some(50),
+        default_schema: Some("_app_1".into()),
+        max_branches: Some(7),
+        ..Default::default()
+    };
+    let applied = client.update_database_settings(id, &edges).await.unwrap();
+    let after = client.get_database(id).await.unwrap().unwrap();
+    // Unset fields keep their value.
+    client
+        .update_database_settings(id, &SettingsPatch { max_rows: Some(1), ..Default::default() })
+        .await
+        .unwrap();
+    let partial = client.get_database(id).await.unwrap().unwrap();
+    assert!(client.begin_delete(id).await.unwrap());
+    let on_deleting = client
+        .update_database_settings(id, &SettingsPatch { max_rows: Some(5), ..Default::default() })
+        .await
+        .unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(
+        (defaults.max_rows, defaults.statement_timeout_ms, defaults.max_connections, defaults.default_schema.as_str()),
+        (1000, 8000, 5, "public")
+    );
+    assert_eq!(rejected, bad.len());
+    assert_eq!(unchanged, defaults);
+    assert!(applied);
+    assert_eq!(
+        (after.max_rows, after.statement_timeout_ms, after.max_connections, after.default_schema.as_str(), after.max_branches),
+        (100_000, 100, 50, "_app_1", 7)
+    );
+    assert_eq!((partial.max_rows, partial.statement_timeout_ms, partial.max_connections), (1, 100, 50));
+    assert!(!on_deleting);
+}
+
+#[tokio::test]
+#[ignore]
+async fn branch_connection_returns_settings() {
+    let client = client().await;
+    let id = insert_pending(&client).await;
+    let pending = client.branch_connection(main_of(id)).await.unwrap();
+    let ep = link_endpoint(&client, id).await;
+    assert!(make_ready(&client, id, "v1:owner").await);
+    let ready = client.branch_connection(main_of(id)).await.unwrap().expect("row");
+    client
+        .update_database_settings(
+            id,
+            &SettingsPatch { max_rows: Some(50), default_schema: Some("app".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    client.set_authenticator_password(main_of(id), "v1:auth").await.unwrap();
+    // A second write never replaces it: a racing run reads the first one back.
+    client.set_authenticator_password(main_of(id), "v1:later").await.unwrap();
+    let with_password = client.branch_connection(main_of(id)).await.unwrap().expect("row");
+    let missing = client.branch_connection(BranchId::new()).await.unwrap();
+    let record = main_branch(&client, id).await;
+    cleanup(&client, id).await;
+    assert_eq!(pending.expect("pending branches have a row").status, BranchStatus::Pending);
+    assert_eq!(ready.branch_id, main_of(id));
+    assert_eq!(ready.status, BranchStatus::Ready);
+    assert_eq!(ready.endpoint_id.as_deref(), Some(ep.as_str()));
+    assert_eq!(ready.database_name.as_deref(), Some("db"));
+    assert_eq!(ready.authenticator_password_enc, None);
+    assert_eq!((ready.settings.max_rows, ready.settings.statement_timeout_ms), (1000, 8000));
+    assert_eq!((ready.settings.max_connections, ready.settings.default_schema.as_str()), (5, "public"));
+    assert_eq!(with_password.authenticator_password_enc.as_deref(), Some("v1:auth"));
+    assert_eq!(with_password.settings.max_rows, 50);
+    assert_eq!(with_password.settings.default_schema, "app");
+    assert!(missing.is_none());
+    assert_eq!(record.authenticator_password_enc.as_deref(), Some("v1:auth"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn branches_missing_data_api_lists_ready_branches_without_key_or_password() {
+    let client = client().await;
+    let (bare, _) = ready_database(&client).await;
+    let (keyed, _) = ready_database(&client).await;
+    let (passworded, _) = ready_database(&client).await;
+    let (complete, _) = ready_database(&client).await;
+    let not_ready = insert_pending(&client).await;
+    for (db, key, password) in [(keyed, true, false), (passworded, false, true), (complete, true, true)] {
+        if key {
+            let (k, _) = new_key(main_of(db), DataKeyKind::Public, "anon", "default");
+            client.insert_data_key(&k).await.unwrap();
+        }
+        if password {
+            client.set_authenticator_password(main_of(db), "v1:auth").await.unwrap();
+        }
+    }
+    let missing = client.branches_missing_data_api().await.unwrap();
+    // A revoked-and-rotated public key still counts; a secret key alone doesn't.
+    let (secret, _) = new_key(main_of(complete), DataKeyKind::Secret, "service_role", "s");
+    client.insert_data_key(&secret).await.unwrap();
+    let live_public = client.list_data_keys(main_of(complete)).await.unwrap();
+    let public = live_public.iter().find(|k| k.kind == DataKeyKind::Public).unwrap().id;
+    let (next, _) = new_key(main_of(complete), DataKeyKind::Public, "anon", "default");
+    client.rotate_data_key(main_of(complete), public, &next).await.unwrap();
+    let after_rotate = client.branches_missing_data_api().await.unwrap();
+    cleanup(&client, bare).await;
+    cleanup(&client, keyed).await;
+    cleanup(&client, passworded).await;
+    cleanup(&client, complete).await;
+    cleanup(&client, not_ready).await;
+    for db in [bare, keyed, passworded] {
+        assert!(missing.contains(&main_of(db)), "{db} should be listed");
+    }
+    assert!(!missing.contains(&main_of(complete)));
+    assert!(!missing.contains(&main_of(not_ready)), "a pending branch isn't listed");
+    assert!(!after_rotate.contains(&main_of(complete)));
 }

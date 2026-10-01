@@ -1,0 +1,14 @@
+{
+  "call": "createClient<Database>({ url, key, bigint: true }).from(\"events\").where({ id: { in: [9007199254740993n, 1n] }, amount: { gt: \"123456789012345678901234567890.12\" } })",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "events",
+    "where": {
+      "and": [
+        { "col": "id", "in": [9007199254740993, 1] },
+        { "col": "amount", "gt": "123456789012345678901234567890.12" }
+      ]
+    }
+  }
+}

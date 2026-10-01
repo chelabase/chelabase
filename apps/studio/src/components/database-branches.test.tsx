@@ -12,7 +12,18 @@ const summary: DatabaseSummary = {
   port: 4432,
   branch_count: 3,
 };
-const detail = { database_id: "db", name: "web1", status: "ready", history_window: 86400, max_branches: 5, branch_count: 3 } as unknown as DatabaseDetail;
+const detail = {
+  database_id: "db",
+  name: "web1",
+  status: "ready",
+  history_window: 86400,
+  max_branches: 5,
+  max_rows: 1000,
+  statement_timeout_ms: 8000,
+  max_connections: 5,
+  default_schema: "public",
+  branch_count: 3,
+} as unknown as DatabaseDetail;
 const b = (name: string, over: Partial<BranchSummary> = {}): BranchSummary => ({
   id: `id-${name}` as never,
   name,

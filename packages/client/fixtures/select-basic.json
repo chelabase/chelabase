@@ -1,0 +1,12 @@
+{
+  "call": "db.from(\"orders\").select(\"id\", \"total\", { col: \"customer_name\", as: \"customer\" }).where({ status: \"paid\", total: { gte: \"100\" } }).orderBy(\"created_at\", \"desc\").limit(50)",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "select": ["id", "total", { "col": "customer_name", "as": "customer" }],
+    "where": { "and": [{ "col": "status", "eq": "paid" }, { "col": "total", "gte": "100" }] },
+    "orderBy": [{ "col": "created_at", "dir": "desc" }],
+    "limit": 50
+  }
+}

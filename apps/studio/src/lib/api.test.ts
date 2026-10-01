@@ -69,6 +69,13 @@ describe("createApiClient", () => {
     ).rejects.toMatchObject({ status: 409, message: "database name already exists in project" });
   });
 
+  it("surfaces the data API's nested error message", async () => {
+    const { api } = client(jsonResponse(503, { error: { code: "unavailable", message: "the data API is starting" } }));
+    await expect(
+      api.createDatabase({ tenant_id: "t" as never, project_id: "p" as never, name: "x" }),
+    ).rejects.toMatchObject({ status: 503, message: "the data API is starting" });
+  });
+
   it("marks a 401 whose sign-in restart is under way", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(401, { error: "token expired" }));
     const api = createApiClient({ baseUrl: "http://gw", getToken: () => "t", onUnauthorized: () => true, fetchImpl });
@@ -155,5 +162,33 @@ describe("branch calls", () => {
       method: "PATCH",
       body: { history_window: 3600, max_branches: 3 },
     });
+  });
+
+  it("lists, creates, rotates and revokes a branch's data API keys", async () => {
+    const a = client(jsonResponse(200, [{ id: "k", kind: "public" }]));
+    await expect(a.api.listKeys("d1", "b1")).resolves.toEqual([{ id: "k", kind: "public" }]);
+    expect(call(a.fetchImpl)).toMatchObject({ url: "http://gw/v1/databases/d1/branches/b1/keys", method: "GET" });
+
+    const b = client(jsonResponse(201, { id: "k2", key: "chk_sec_x" }));
+    await expect(b.api.createKey("d1", "b1", { name: "ci", role: "authenticated" })).resolves.toMatchObject({ key: "chk_sec_x" });
+    expect(call(b.fetchImpl)).toEqual({
+      url: "http://gw/v1/databases/d1/branches/b1/keys",
+      method: "POST",
+      body: { name: "ci", role: "authenticated" },
+    });
+
+    const c = client(jsonResponse(201, { id: "k3", key: "chk_sec_y" }));
+    await expect(c.api.rotateKey("d1", "b1", "k2")).resolves.toMatchObject({ id: "k3" });
+    expect(call(c.fetchImpl)).toMatchObject({ url: "http://gw/v1/databases/d1/branches/b1/keys/k2/rotate", method: "POST" });
+
+    const d = client(new Response(null, { status: 204 }));
+    await expect(d.api.revokeKey("d1", "b1", "k2")).resolves.toBeUndefined();
+    expect(call(d.fetchImpl)).toMatchObject({ url: "http://gw/v1/databases/d1/branches/b1/keys/k2", method: "DELETE" });
+  });
+
+  it("reads the data API schema of a branch", async () => {
+    const { api, fetchImpl } = client(jsonResponse(200, { version: "1", default_schema: "public", schemas: {} }));
+    await expect(api.getDataApiSchema("d1", "b1")).resolves.toMatchObject({ default_schema: "public" });
+    expect(call(fetchImpl)).toMatchObject({ url: "http://gw/v1/databases/d1/branches/b1/data-api/schema", method: "GET" });
   });
 });

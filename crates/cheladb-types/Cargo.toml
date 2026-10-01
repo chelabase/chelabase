@@ -8,3 +8,5 @@ description = "Shared domain identifiers for Cheladb"
 [dependencies]
 serde = { workspace = true }
 uuid = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }

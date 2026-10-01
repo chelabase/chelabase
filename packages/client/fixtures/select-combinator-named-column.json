@@ -1,0 +1,9 @@
+{
+  "call": "db.from(\"orders\").where({ and: [{ col: \"and\", eq: \"x\" }, { status: \"paid\" }] })",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "where": { "and": [{ "col": "and", "eq": "x" }, { "col": "status", "eq": "paid" }] }
+  }
+}

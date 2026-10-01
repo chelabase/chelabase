@@ -438,3 +438,62 @@ async fn hostname_upstream_is_resolved() {
     assert_eq!(resp.status(), 200);
     assert!(seen.lock().unwrap().is_some());
 }
+
+/// Fake orchestrator internal listener: every key is a known public key.
+async fn spawn_internal_listener() -> String {
+    let app = Router::new().fallback(|req: Request| async move {
+        let ok = req.headers().get("authorization").and_then(|v| v.to_str().ok())
+            == Some("Bearer e2e-data-keys-token");
+        if !ok {
+            return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "key_id": "11111111-1111-4111-8111-111111111111",
+                "branch_id": "22222222-2222-4222-8222-222222222222",
+                "kind": "public",
+                "role": "anon",
+            })),
+        )
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_authorization_header_is_not_forwarded_to_rest() {
+    let jwks = MockJwks::start().await;
+    let (rest, seen) = spawn_upstream().await;
+    let internal = spawn_internal_listener().await;
+    let (base, verify, _gateway) = spawn_gateway_with(
+        &rest,
+        &jwks,
+        &[
+            ("CHELADB_REST_URL", &rest),
+            ("CHELADB_INTERNAL_URL", &internal),
+            ("CHELADB_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+        ],
+    )
+    .await;
+    let key = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Public).key;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/data/v1/query"))
+        .header("authorization", format!("Bearer {key}"))
+        .header("origin", "https://app.example")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+    assert!(resp.headers().get("access-control-allow-credentials").is_none());
+
+    let saw = seen.lock().unwrap().clone().expect("rest was called");
+    assert!(!saw.contains_key("authorization"), "the key must not reach rest");
+    let claims = verify.verify(&saw[IDENTITY_HEADER], "rest").unwrap();
+    assert_eq!(claims.data.unwrap().role, "anon");
+}

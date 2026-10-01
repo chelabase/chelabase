@@ -1,5 +1,5 @@
 //! Provisioning a database on Neon: an endpoint row, a tenant and timeline on the storage
-//! controller, a compute, and the data API roles inside it.
+//! controller, a compute, and the data API roles and bootstrap inside it.
 
 use cheladb_metadata::{DatabaseStatus, NewEndpoint};
 use cheladb_neon::{ComputeBackend, NeonId};
@@ -224,6 +224,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
+        self.bootstrap_data_api_on(BranchId::from(id), ep, &rec.database_name)
+            .await
+            .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
         Ok(Built::Compute)
     }
 

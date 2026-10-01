@@ -1,0 +1,14 @@
+{
+  "call": "db.from(\"orders\").delete().where({ status: \"pending\", created_at: { lt: \"2026-01-01T00:00:00Z\" } })",
+  "tree": {
+    "v": 1,
+    "op": "delete",
+    "from": "orders",
+    "where": {
+      "and": [
+        { "col": "status", "eq": "pending" },
+        { "col": "created_at", "lt": "2026-01-01T00:00:00Z" }
+      ]
+    }
+  }
+}

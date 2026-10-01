@@ -1,0 +1,9 @@
+{
+  "call": "db.from(\"orders\").select({ col: \"customer_name\", as: \"customer\" }, \"id\")",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "select": [{ "col": "customer_name", "as": "customer" }, "id"]
+  }
+}

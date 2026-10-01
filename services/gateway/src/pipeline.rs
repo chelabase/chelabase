@@ -4,12 +4,15 @@
 //! Pure over request parts; `proxy.rs` adapts it to Pingora. Nothing here is
 //! configurable per route except the typed `Policy` from `cheladb-routes`.
 
+use crate::data_keys::{DataKeyResolver, KeyError};
 use crate::registry::SharedRegistry;
-use cheladb_auth::internal::{AuthMethod, Identity, InternalSigner, IDENTITY_HEADER};
+use cheladb_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
 use cheladb_auth::{AuthError, JwtVerifier};
 use cheladb_routes::{match_endpoint, Auth, Cors, Endpoint, Match, Scope, Service};
+use cheladb_types::data_key::DataKeyKind;
 use http::HeaderMap;
 use serde_json::{json, Value};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
@@ -31,6 +34,8 @@ pub struct RequestParts<'a> {
     pub path: &'a str,
     pub host: Option<&'a str>,
     pub headers: &'a HeaderMap,
+    /// The downstream socket address (never `X-Forwarded-For`).
+    pub client_ip: Option<IpAddr>,
 }
 
 /// A response the gateway writes itself, without calling an upstream.
@@ -89,6 +94,7 @@ pub struct Pipeline {
     studio_origins: Vec<String>,
     verifier: JwtVerifier,
     signer: InternalSigner,
+    keys: Arc<DataKeyResolver>,
 }
 
 impl Pipeline {
@@ -97,12 +103,14 @@ impl Pipeline {
         studio_origins: Vec<String>,
         verifier: JwtVerifier,
         signer: InternalSigner,
+        keys: Arc<DataKeyResolver>,
     ) -> Self {
         Self {
             registry,
             studio_origins,
             verifier,
             signer,
+            keys,
         }
     }
 
@@ -128,8 +136,16 @@ impl Pipeline {
             return Outcome::Respond(preflight);
         }
 
+        let data_route = req.path == "/data" || req.path.starts_with("/data/");
         let endpoint = match match_endpoint(scope, req.method, req.path) {
             Match::Found(endpoint) => endpoint,
+            Match::NotFound if data_route => {
+                return Outcome::Respond(data_error(
+                    404,
+                    "invalid_query",
+                    "no such data API endpoint: use POST /data/v1/query or GET /data/v1/schema",
+                ));
+            }
             Match::NotFound => {
                 return respond(404, Vec::new(), json!({ "error": "no route" }));
             }
@@ -139,6 +155,15 @@ impl Pipeline {
                     .map(|m| m.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
+                if data_route {
+                    let mut resp = data_error(
+                        405,
+                        "invalid_query",
+                        &format!("this data API endpoint takes {allow}"),
+                    );
+                    resp.headers.push(("allow", allow));
+                    return Outcome::Respond(resp);
+                }
                 return respond(
                     405,
                     vec![("allow", allow)],
@@ -151,6 +176,19 @@ impl Pipeline {
 
         let identity = match endpoint.policy.auth {
             Auth::Public => None,
+            Auth::DataKey | Auth::SecretDataKey => {
+                let secret_only = endpoint.policy.auth == Auth::SecretDataKey;
+                match self
+                    .authenticate_key(endpoint.service, req, secret_only, request_id)
+                    .await
+                {
+                    Ok(token) => Some(token),
+                    Err(mut resp) => {
+                        resp.headers.extend(cors);
+                        return Outcome::Respond(resp);
+                    }
+                }
+            }
             Auth::Platform => {
                 match self
                     .authenticate(endpoint.service, req.headers, request_id)
@@ -182,6 +220,18 @@ impl Pipeline {
         let Match::Found(endpoint) = match_endpoint(scope, requested, req.path) else {
             return None;
         };
+        if endpoint.policy.cors == Cors::Any {
+            return Some(GatewayResponse {
+                status: 204,
+                headers: vec![
+                    ("access-control-allow-origin", "*".to_string()),
+                    ("access-control-allow-methods", "GET, POST".to_string()),
+                    ("access-control-allow-headers", "authorization, content-type".to_string()),
+                    ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
+                ],
+                body: None,
+            });
+        }
         if !matches!(endpoint.policy.cors, Cors::Studio | Cors::StudioCredentials) {
             return None;
         }
@@ -208,8 +258,11 @@ impl Pipeline {
     /// CORS response headers for a Studio endpoint. `Vary: Origin` is always
     /// present so caches never reuse a response across origins.
     fn cors_headers(&self, endpoint: &Endpoint, headers: &HeaderMap) -> Vec<(&'static str, String)> {
-        if endpoint.policy.cors == Cors::None {
-            return Vec::new();
+        match endpoint.policy.cors {
+            Cors::None => return Vec::new(),
+            // Any origin, never credentials; `*` needs no `Vary`.
+            Cors::Any => return vec![("access-control-allow-origin", "*".to_string())],
+            Cors::Studio | Cors::StudioCredentials => {}
         }
         let credentials = endpoint.policy.cors == Cors::StudioCredentials;
         let mut cors = vec![("vary", "Origin".to_string())];
@@ -235,6 +288,39 @@ impl Pipeline {
             .any(|allowed| allowed == "*" || allowed == origin)
     }
 
+    /// Resolve the data API key from `Authorization: Bearer` and mint an
+    /// internal identity for `service`. Errors use the data API error body.
+    async fn authenticate_key(
+        &self,
+        service: Service,
+        req: &RequestParts<'_>,
+        secret_only: bool,
+        request_id: &str,
+    ) -> Result<String, GatewayResponse> {
+        let key = bearer_token(req.headers).ok_or(KeyError::Missing).map_err(key_error)?;
+        let resolved = self.keys.resolve(key, req.client_ip).await.map_err(key_error)?;
+        if secret_only && resolved.kind != DataKeyKind::Secret {
+            return Err(key_error(KeyError::Invalid));
+        }
+        let identity = Identity {
+            sub: resolved.key_id.to_string(),
+            org_id: String::new(),
+            auth: AuthMethod::DataKey,
+            request_id: request_id.to_string(),
+            data: Some(DataIdentity {
+                branch_id: resolved.branch_id,
+                key_id: resolved.key_id,
+                kind: resolved.kind,
+                role: resolved.role,
+                claims: json!({}),
+            }),
+        };
+        self.signer.sign(service.name(), &identity).map_err(|err| {
+            error!("mint internal identity: {err}");
+            internal_key_error(request_id)
+        })
+    }
+
     /// Verify the platform JWT and mint an internal identity for `service`.
     async fn authenticate(
         &self,
@@ -255,6 +341,7 @@ impl Pipeline {
             org_id: claims.org_id,
             auth: AuthMethod::PlatformJwt,
             request_id: request_id.to_string(),
+            data: None,
         };
         self.signer.sign(service.name(), &identity).map_err(|err| {
             error!("mint internal identity: {err}");
@@ -290,6 +377,28 @@ fn json_response(status: u16, body: Value) -> GatewayResponse {
         status,
         headers: Vec::new(),
         body: Some(body),
+    }
+}
+
+/// The data API error body: `{"error":{"code","message"}}`.
+fn data_error(status: u16, code: &str, message: &str) -> GatewayResponse {
+    let mut resp = json_response(status, json!({ "error": { "code": code, "message": message } }));
+    if status == 503 {
+        resp.headers.push(("retry-after", "1".to_string()));
+    }
+    resp
+}
+
+fn internal_key_error(request_id: &str) -> GatewayResponse {
+    data_error(500, "internal", &format!("internal error (request id {request_id})"))
+}
+
+fn key_error(err: KeyError) -> GatewayResponse {
+    match err {
+        KeyError::Missing => data_error(401, "unauthorized", "missing API key: send Authorization: Bearer <key>"),
+        KeyError::Invalid => data_error(401, "unauthorized", "invalid, revoked or unauthorized API key"),
+        KeyError::RateLimited => data_error(429, "rate_limited", "too many unknown-key lookups; slow down"),
+        KeyError::Unavailable => data_error(503, "unavailable", "key lookup is unavailable; retry shortly"),
     }
 }
 
@@ -344,6 +453,7 @@ mod tests {
             vec![STUDIO.to_string()],
             verifier,
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
+            Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
         );
         (pipeline, InternalVerifier::from_pem(public_pem.as_bytes()).unwrap())
     }
@@ -367,6 +477,7 @@ mod tests {
                 path,
                 host,
                 headers: &headers,
+                client_ip: None,
             })
             .await
     }
@@ -440,6 +551,26 @@ mod tests {
         let resp = expect_response(run(&h.pipeline, "DELETE", "/v1/databases", None, &[]).await.outcome);
         assert_eq!(resp.status, 405);
         assert_eq!(header(&resp.headers, "allow"), Some("POST"));
+    }
+
+    /// Under /data/ the gateway's own 404 and 405 use the data API's error body.
+    #[tokio::test]
+    async fn data_routes_answer_404_and_405_with_the_data_api_body() {
+        let h = harness(&[]).await;
+        let resp = expect_response(run(&h.pipeline, "POST", "/data/v1/nope", None, &[]).await.outcome);
+        assert_eq!(resp.status, 404);
+        let body = resp.body.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_query");
+        assert!(body["error"]["message"].as_str().unwrap().contains("/data/v1/query"), "{body}");
+        let resp = expect_response(run(&h.pipeline, "GET", "/data/v1/query", None, &[]).await.outcome);
+        assert_eq!(resp.status, 405);
+        assert_eq!(header(&resp.headers, "allow"), Some("POST"));
+        let body = resp.body.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_query");
+        assert!(body["error"]["message"].as_str().unwrap().contains("POST"), "{body}");
+        // Elsewhere the platform's body stays.
+        let resp = expect_response(run(&h.pipeline, "GET", "/database/x", None, &[]).await.outcome);
+        assert_eq!(resp.body, Some(json!({ "error": "no route" })));
     }
 
     #[tokio::test]
@@ -725,9 +856,252 @@ mod tests {
             vec!["*".to_string()],
             JwtVerifier::new(jwks.config(vec![])),
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
+            Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
         );
         let plan = expect_plan(run(&pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", STUDIO)]).await.outcome);
         assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), None);
         assert_eq!(header(&plan.response_headers, "access-control-allow-credentials"), None);
+    }
+
+    // ---- data API keys (Task 4) ----
+
+    use crate::data_keys::test_support::{self as dk, Answer};
+    use cheladb_types::data_key::DataKeyKind;
+
+    struct DataHarness {
+        pipeline: Pipeline,
+        verify: InternalVerifier,
+        mock: dk::Mock,
+    }
+
+    async fn data_harness() -> DataHarness {
+        let (url, mock) = dk::start().await;
+        let jwks = MockJwks::start().await;
+        let (private_pem, public_pem) = generate_keypair_pem();
+        let pipeline = Pipeline::new(
+            Arc::new(SharedRegistry::new(Registry::new(Vec::<String>::new()))),
+            vec![STUDIO.to_string()],
+            JwtVerifier::new(jwks.config(vec![])),
+            InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
+            Arc::new(DataKeyResolver::new(&url, dk::BEARER)),
+        );
+        DataHarness {
+            pipeline,
+            verify: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
+            mock,
+        }
+    }
+
+    fn error_code(resp: &GatewayResponse) -> Option<&str> {
+        resp.body.as_ref()?["error"]["code"].as_str()
+    }
+
+    async fn data_call(h: &DataHarness, method: &str, path: &str, key: Option<&str>) -> Handled {
+        let bearer = key.map(|k| format!("Bearer {k}"));
+        let mut pairs = Vec::new();
+        if let Some(b) = &bearer {
+            pairs.push(("authorization", b.as_str()));
+        }
+        run(&h.pipeline, method, path, None, &pairs).await
+    }
+
+    #[tokio::test]
+    async fn known_key_mints_rest_identity_with_data() {
+        let h = data_harness().await;
+        let key = dk::new_key(DataKeyKind::Public);
+        let resolved = dk::resolved(DataKeyKind::Public);
+        h.mock.set(&key, Answer::Known(resolved.clone()));
+
+        let handled = data_call(&h, "POST", "/data/v1/query", Some(&key)).await;
+        let rid = handled.request_id.clone();
+        let plan = expect_plan(handled.outcome);
+        assert_eq!(plan.endpoint.service, Service::Rest);
+        let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap();
+        assert_eq!(claims.auth, AuthMethod::DataKey);
+        assert_eq!(claims.sub, resolved.key_id.to_string());
+        assert_eq!(claims.org_id, "");
+        assert_eq!(claims.rid, rid);
+        let data = claims.data.expect("data identity");
+        assert_eq!(data.key_id, resolved.key_id);
+        assert_eq!(data.branch_id, resolved.branch_id);
+        assert_eq!(data.kind, DataKeyKind::Public);
+        assert_eq!(data.role, "anon");
+        assert_eq!(data.claims, json!({}));
+    }
+
+    #[tokio::test]
+    async fn secret_key_is_accepted_on_the_schema_endpoint() {
+        let h = data_harness().await;
+        let key = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&key, Answer::Known(dk::resolved(DataKeyKind::Secret)));
+        let plan = expect_plan(data_call(&h, "GET", "/data/v1/schema", Some(&key)).await.outcome);
+        let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap();
+        assert_eq!(claims.data.unwrap().kind, DataKeyKind::Secret);
+    }
+
+    #[tokio::test]
+    async fn public_key_on_schema_endpoint_is_401() {
+        let h = data_harness().await;
+        let key = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&key, Answer::Known(dk::resolved(DataKeyKind::Public)));
+        let resp = expect_response(data_call(&h, "GET", "/data/v1/schema", Some(&key)).await.outcome);
+        assert_eq!(resp.status, 401);
+        assert_eq!(error_code(&resp), Some("unauthorized"));
+        assert!(resp.body.as_ref().unwrap()["error"]["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_key_is_401_unauthorized_without_lookup() {
+        let h = data_harness().await;
+        for key in [None, Some("not-a-key")] {
+            let resp = expect_response(data_call(&h, "POST", "/data/v1/query", key).await.outcome);
+            assert_eq!(resp.status, 401);
+            assert_eq!(error_code(&resp), Some("unauthorized"));
+        }
+        // A non-Bearer scheme is a missing key too.
+        let resp = expect_response(
+            run(&h.pipeline, "POST", "/data/v1/query", None, &[("authorization", "Basic abc")])
+                .await
+                .outcome,
+        );
+        assert_eq!(resp.status, 401);
+        assert_eq!(h.mock.lookups(), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_key_is_401_and_unavailable_is_503_with_retry_after() {
+        let h = data_harness().await;
+        let unknown = dk::new_key(DataKeyKind::Public);
+        let resp = expect_response(data_call(&h, "POST", "/data/v1/query", Some(&unknown)).await.outcome);
+        assert_eq!((resp.status, error_code(&resp)), (401, Some("unauthorized")));
+
+        let broken = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&broken, Answer::ServerError);
+        let resp = expect_response(data_call(&h, "POST", "/data/v1/query", Some(&broken)).await.outcome);
+        assert_eq!((resp.status, error_code(&resp)), (503, Some("unavailable")));
+        assert!(header(&resp.headers, "retry-after").is_some());
+    }
+
+    #[tokio::test]
+    async fn miss_flood_is_429_rate_limited() {
+        let h = data_harness().await;
+        let mut statuses = Vec::new();
+        for _ in 0..40 {
+            let key = dk::new_key(DataKeyKind::Public);
+            let headers = headers(&[("authorization", &format!("Bearer {key}"))]);
+            let handled = h
+                .pipeline
+                .handle(&RequestParts {
+                    method: "POST",
+                    path: "/data/v1/query",
+                    host: None,
+                    headers: &headers,
+                    client_ip: Some("203.0.113.9".parse().unwrap()),
+                })
+                .await;
+            let resp = expect_response(handled.outcome);
+            statuses.push((resp.status, error_code(&resp).map(str::to_string)));
+        }
+        assert!(statuses.contains(&(429, Some("rate_limited".to_string()))));
+        assert!(h.mock.lookups() <= 25, "{}", h.mock.lookups());
+    }
+
+    #[tokio::test]
+    async fn cors_any_preflight_and_response_headers() {
+        let h = data_harness().await;
+        for (path, method) in [("/data/v1/query", "POST"), ("/data/v1/schema", "GET")] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[("origin", "https://anything.example"), ("access-control-request-method", method)],
+                )
+                .await
+                .outcome,
+            );
+            assert_eq!(resp.status, 204, "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some("*"));
+            assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some("GET, POST"));
+            assert_eq!(
+                header(&resp.headers, "access-control-allow-headers"),
+                Some("authorization, content-type")
+            );
+            assert_eq!(header(&resp.headers, "access-control-max-age"), Some("600"));
+            assert_eq!(header(&resp.headers, "access-control-allow-credentials"), None);
+        }
+        assert_eq!(h.mock.lookups(), 0, "preflight does no auth");
+
+        // Proxied responses and gateway errors both carry the wildcard origin.
+        let key = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&key, Answer::Known(dk::resolved(DataKeyKind::Public)));
+        let bearer = format!("Bearer {key}");
+        let plan = expect_plan(
+            run(
+                &h.pipeline,
+                "POST",
+                "/data/v1/query",
+                None,
+                &[("authorization", &bearer), ("origin", "https://anything.example")],
+            )
+            .await
+            .outcome,
+        );
+        assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), Some("*"));
+        assert_eq!(header(&plan.response_headers, "access-control-allow-credentials"), None);
+
+        let denied = expect_response(
+            run(&h.pipeline, "POST", "/data/v1/query", None, &[("origin", "https://anything.example")])
+                .await
+                .outcome,
+        );
+        assert_eq!(denied.status, 401);
+        assert_eq!(header(&denied.headers, "access-control-allow-origin"), Some("*"));
+        assert_eq!(header(&denied.headers, "access-control-allow-credentials"), None);
+    }
+
+    #[tokio::test]
+    async fn client_authorization_header_is_not_forwarded() {
+        let h = data_harness().await;
+        let key = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&key, Answer::Known(dk::resolved(DataKeyKind::Public)));
+        let plan = expect_plan(data_call(&h, "POST", "/data/v1/query", Some(&key)).await.outcome);
+        let edits = plan.upstream_headers("rid");
+        assert!(edits.remove.contains(&"authorization"));
+        assert!(edits.set.iter().any(|(n, _)| *n == IDENTITY_HEADER));
+    }
+
+    #[test]
+    fn internal_error_body_carries_the_request_id() {
+        let resp = internal_key_error("rid-77");
+        assert_eq!((resp.status, error_code(&resp)), (500, Some("internal")));
+        let message = resp.body.as_ref().unwrap()["error"]["message"].as_str().unwrap();
+        assert!(message.contains("rid-77"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn client_identity_header_is_not_forwarded_on_data_routes() {
+        let h = data_harness().await;
+        let key = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&key, Answer::Known(dk::resolved(DataKeyKind::Public)));
+        let bearer = format!("Bearer {key}");
+        let plan = expect_plan(
+            run(
+                &h.pipeline,
+                "POST",
+                "/data/v1/query",
+                None,
+                &[("authorization", &bearer), (IDENTITY_HEADER, "forged-token")],
+            )
+            .await
+            .outcome,
+        );
+        let edits = plan.upstream_headers("rid");
+        assert!(edits.remove.contains(&IDENTITY_HEADER));
+        let sent: Vec<_> = edits.set.iter().filter(|(n, _)| *n == IDENTITY_HEADER).collect();
+        assert_eq!(sent.len(), 1);
+        assert_ne!(sent[0].1, "forged-token");
+        assert_eq!(Some(sent[0].1.as_str()), plan.identity.as_deref());
     }
 }

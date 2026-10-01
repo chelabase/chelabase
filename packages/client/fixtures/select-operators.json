@@ -1,0 +1,23 @@
+{
+  "call": "db.from(\"orders\").select(\"id\").where({ and: [{ status: { eq: \"paid\" } }, { region: { neq: \"eu\" } }, { qty: { lt: 10 } }, { qty: { lte: 9 } }, { total: { gt: \"1.00\" } }, { total: { gte: \"1.50\" } }, { region: { in: [\"eu\", \"us\"] } }, { vip: { is: true } }, { customer_name: { like: \"A%\" } }, { region: { ilike: \"e%\" } }] })",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "select": ["id"],
+    "where": {
+      "and": [
+        { "col": "status", "eq": "paid" },
+        { "col": "region", "neq": "eu" },
+        { "col": "qty", "lt": 10 },
+        { "col": "qty", "lte": 9 },
+        { "col": "total", "gt": "1.00" },
+        { "col": "total", "gte": "1.50" },
+        { "col": "region", "in": ["eu", "us"] },
+        { "col": "vip", "is": true },
+        { "col": "customer_name", "like": "A%" },
+        { "col": "region", "ilike": "e%" }
+      ]
+    }
+  }
+}

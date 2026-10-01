@@ -1,0 +1,10 @@
+{
+  "call": "db.from(\"orders\").update({ vip: false }).all()",
+  "tree": {
+    "v": 1,
+    "op": "update",
+    "table": "orders",
+    "set": { "vip": false },
+    "all": true
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "call": "db.from(\"orders\").select(\"id\").where({ qty: { gte: 1, lt: 10 } })",
+  "tree": {
+    "v": 1,
+    "op": "select",
+    "from": "orders",
+    "select": ["id"],
+    "where": { "and": [{ "col": "qty", "gte": 1 }, { "col": "qty", "lt": 10 }] }
+  }
+}

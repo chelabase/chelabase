@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use cheladb_metadata::{
-    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome,
-    DatabaseRecord, DatabaseSettings, DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState,
-    LiveBranch, LiveDatabase, MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewBranch,
-    NewEndpoint,
+    BranchConnectionRow, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus,
+    CreateBranchOutcome, DataApiSettings, DataKeyRecord, DatabaseRecord, DatabaseSettings,
+    DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState, LiveBranch, LiveDatabase, MetadataError,
+    NeonDatabase, NeonEndpoint, NeonRole, NewBranch, NewDataKey, NewEndpoint,
 };
 use cheladb_neon::backend::fake::FakeBackend;
 pub use cheladb_neon::backend::fake::Journal;
@@ -18,6 +18,7 @@ use cheladb_neon::spec::Placement;
 use cheladb_neon::storcon::{LsnAtTime, LsnKind};
 use cheladb_neon::{Lsn, NeonId, StorconError};
 use cheladb_secrets::SecretKey;
+use cheladb_types::data_key::DataKeyKind;
 use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
@@ -76,6 +77,13 @@ pub struct FakeState {
     /// Runs once, just before the next `claim_stale_reset`: a write landing between a run's
     /// first read and its claim.
     pub before_claim_stale_reset: Option<StateHook>,
+    /// Data API keys; live unless their id is in `revoked_keys`.
+    pub data_keys: Vec<NewDataKey>,
+    pub revoked_keys: HashSet<uuid::Uuid>,
+    /// Runs once, just before the next `insert_data_key`: a concurrent run's insert.
+    pub before_insert_data_key: Option<StateHook>,
+    /// Runs once, just before the next `set_authenticator_password`: a concurrent run's write.
+    pub before_set_authenticator_password: Option<StateHook>,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -169,6 +177,17 @@ impl FakeState {
         })
     }
 
+    fn has_live_public_key(&self, branch: BranchId) -> bool {
+        self.live_keys(branch)
+            .any(|k| k.kind == DataKeyKind::Public)
+    }
+
+    fn live_keys(&self, branch: BranchId) -> impl Iterator<Item = &NewDataKey> {
+        self.data_keys
+            .iter()
+            .filter(move |k| k.branch_id == branch && !self.revoked_keys.contains(&k.id))
+    }
+
     fn name_taken(&self, db: DatabaseId, name: &str) -> bool {
         self.branches
             .values()
@@ -239,6 +258,10 @@ impl FakeMetadata {
                 neon_tenant_id: None,
                 history_window: Duration::from_secs(7 * 24 * 3600),
                 max_branches: 5,
+                max_rows: 1000,
+                statement_timeout_ms: 8000,
+                max_connections: 5,
+                default_schema: "public".into(),
             },
         );
         state.branches.insert(
@@ -262,6 +285,7 @@ impl FakeMetadata {
                 created_at: now,
                 updated_at: now,
                 history_start: None,
+                authenticator_password_enc: None,
             },
         );
         id
@@ -333,6 +357,7 @@ impl FakeMetadata {
                 created_at: now,
                 updated_at: now,
                 history_start: None,
+                authenticator_password_enc: None,
             },
         );
         CreateBranchOutcome::Created
@@ -881,6 +906,7 @@ impl WorkerMetadata for FakeMetadata {
                 created_at: now,
                 updated_at: now,
                 history_start: b.history_start,
+                authenticator_password_enc: None,
             },
         );
         let branch = state.branches.get_mut(&id).expect("looked up above");
@@ -1009,6 +1035,96 @@ impl WorkerMetadata for FakeMetadata {
             .collect();
         rows.sort_by_key(|r| r.id.to_string());
         Ok(rows)
+    }
+
+    async fn insert_data_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        let mut state = self.write("insert_data_key")?;
+        if let Some(hook) = state.before_insert_data_key.take() {
+            hook(&mut state);
+        }
+        if key.kind == DataKeyKind::Public && state.has_live_public_key(key.branch_id) {
+            return Err(MetadataError::Conflict);
+        }
+        state.data_keys.push(key.clone());
+        Ok(())
+    }
+
+    async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
+        let state = self.read("list_data_keys")?;
+        Ok(state
+            .live_keys(branch)
+            .map(|k| DataKeyRecord {
+                id: k.id,
+                branch_id: k.branch_id,
+                kind: k.kind,
+                role: k.role.clone(),
+                name: k.name.clone(),
+                prefix: k.prefix.clone(),
+                sealed: k.sealed.clone(),
+                created_at: chrono::Utc::now(),
+                last_used_at: None,
+                revoked_at: None,
+            })
+            .collect())
+    }
+
+    async fn has_live_public_key(&self, branch: BranchId) -> Result<bool, MetadataError> {
+        Ok(self
+            .read("has_live_public_key")?
+            .has_live_public_key(branch))
+    }
+
+    async fn set_authenticator_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("set_authenticator_password")?;
+        if let Some(hook) = state.before_set_authenticator_password.take() {
+            hook(&mut state);
+        }
+        if let Some(b) = state.branches.get_mut(&branch)
+            && branch_live(b.status)
+            && b.authenticator_password_enc.is_none()
+        {
+            b.authenticator_password_enc = Some(sealed.to_string());
+        }
+        Ok(())
+    }
+
+    async fn branches_missing_data_api(&self) -> Result<Vec<BranchId>, MetadataError> {
+        let state = self.read("branches_missing_data_api")?;
+        Ok(sorted(state.branches.values().filter(|b| {
+            b.status == BranchStatus::Ready
+                && b.kind == BranchKind::Normal
+                && (b.authenticator_password_enc.is_none() || !state.has_live_public_key(b.id))
+        }))
+        .into_iter()
+        .map(|b| b.id)
+        .collect())
+    }
+
+    async fn branch_connection(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchConnectionRow>, MetadataError> {
+        let state = self.read("branch_connection")?;
+        Ok(state.branches.get(&branch).and_then(|b| {
+            let db = state.databases.get(&b.database_id)?;
+            Some(BranchConnectionRow {
+                branch_id: b.id,
+                status: b.status,
+                endpoint_id: b.endpoint_id.clone(),
+                database_name: db.database_name.clone(),
+                authenticator_password_enc: b.authenticator_password_enc.clone(),
+                settings: DataApiSettings {
+                    max_rows: db.max_rows,
+                    statement_timeout_ms: db.statement_timeout_ms,
+                    max_connections: db.max_connections,
+                    default_schema: db.default_schema.clone(),
+                },
+            })
+        }))
     }
 }
 
@@ -1474,6 +1590,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         ready_poll: Duration::from_millis(1),
         ready_timeout: Duration::from_millis(20),
         claim_refresh: Duration::from_millis(5),
+        schema_check_cursor: Mutex::default(),
     };
     (worker, journal)
 }

@@ -130,6 +130,9 @@ pub struct BranchRecord {
     /// Where the branch's history begins: the commit time at its timeline's branch point, or
     /// when the timeline was made. `None` when unknown.
     pub history_start: Option<DateTime<Utc>>,
+    /// The `authenticator` role's password on this branch, sealed with `cheladb-secrets`
+    /// (purpose `authenticator`); `None` until the data API is set up for it.
+    pub authenticator_password_enc: Option<String>,
 }
 
 /// A branch to create (always `normal`, status `pending`).
@@ -201,6 +204,18 @@ pub struct DatabaseSettings {
     pub max_branches: i32,
 }
 
+/// A change to a database's settings; `None` keeps a field. The tables' CHECK constraints
+/// bound the values (callers validate first for a friendly message).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsPatch {
+    pub history_window: Option<Duration>,
+    pub max_branches: Option<i32>,
+    pub max_rows: Option<i32>,
+    pub statement_timeout_ms: Option<i32>,
+    pub max_connections: Option<i32>,
+    pub default_schema: Option<String>,
+}
+
 /// A branch that isn't deleted, as seen by the reconcile loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveBranch {
@@ -219,7 +234,8 @@ pub struct LiveBranch {
 /// Every column of a `branches` row, as [`branch_from_row`] reads it.
 const BRANCH_COLUMNS: &str = "id, database_id, name, parent_branch_id, kind, status, timeline_id, \
      pending_timeline_id, pending_timeline_at, superseded_timeline_id, endpoint_id, owner_password_enc, \
-     branched_at_time, branched_at_lsn, error, created_at, updated_at, history_start";
+     branched_at_time, branched_at_lsn, error, created_at, updated_at, history_start, \
+     authenticator_password_enc";
 
 fn branch_from_row(r: &PgRow) -> Result<BranchRecord, MetadataError> {
     Ok(BranchRecord {
@@ -241,6 +257,7 @@ fn branch_from_row(r: &PgRow) -> Result<BranchRecord, MetadataError> {
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
         history_start: r.get("history_start"),
+        authenticator_password_enc: r.get("authenticator_password_enc"),
     })
 }
 
@@ -931,20 +948,27 @@ impl MetadataClient {
     pub async fn update_database_settings(
         &self,
         db: DatabaseId,
-        history_window: Option<Duration>,
-        max_branches: Option<i32>,
+        patch: &SettingsPatch,
     ) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             "UPDATE databases
              SET history_window = CASE WHEN $2::float8 IS NULL THEN history_window
                                        ELSE make_interval(secs => $2::float8) END,
                  max_branches = COALESCE($3, max_branches),
+                 max_rows = COALESCE($4, max_rows),
+                 statement_timeout_ms = COALESCE($5, statement_timeout_ms),
+                 max_connections = COALESCE($6, max_connections),
+                 default_schema = COALESCE($7, default_schema),
                  updated_at = now()
              WHERE id = $1 AND status NOT IN ('deleting', 'deleted')",
         )
         .bind(db.as_uuid())
-        .bind(history_window.map(|w| w.as_secs_f64()))
-        .bind(max_branches)
+        .bind(patch.history_window.map(|w| w.as_secs_f64()))
+        .bind(patch.max_branches)
+        .bind(patch.max_rows)
+        .bind(patch.statement_timeout_ms)
+        .bind(patch.max_connections)
+        .bind(patch.default_schema.as_deref())
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -1019,7 +1043,7 @@ async fn lock_database_of_main(
 
 /// Locks the database row of branch `id` (`FOR NO KEY UPDATE`), before any branch row: the
 /// lock order above.
-async fn lock_database_of_branch(
+pub(crate) async fn lock_database_of_branch(
     tx: &mut Transaction<'static, Postgres>,
     id: BranchId,
 ) -> Result<(), MetadataError> {

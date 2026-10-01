@@ -1,0 +1,10 @@
+{
+  "call": "db.from(\"billing.invoices\").delete().all().returning(\"id\")",
+  "tree": {
+    "v": 1,
+    "op": "delete",
+    "from": "billing.invoices",
+    "all": true,
+    "returning": ["id"]
+  }
+}

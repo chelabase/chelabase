@@ -4,9 +4,11 @@
 //! in-memory fakes; `main.rs` wires it to the real metadata database, storage controller,
 //! Docker, Valkey and compute_ctl.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use cheladb_secrets::SecretKey;
+use cheladb_types::BranchId;
 
 pub mod branch_create;
 pub mod branch_delete;
@@ -14,6 +16,7 @@ pub mod branch_job;
 pub mod branch_switch;
 pub mod config;
 pub mod credentials;
+pub mod data_api;
 pub mod delete;
 #[cfg(test)]
 mod fakes;
@@ -45,4 +48,7 @@ pub struct Worker<M, S, C, N, P> {
     /// How often a long reset or restore step refreshes the branch's claim (60 s in
     /// production), well inside reconcile's stale threshold.
     pub claim_refresh: Duration,
+    /// The last branch reconcile's `cheladb` schema check looked at: each pass checks the next
+    /// few ready branches after it, wrapping around.
+    pub schema_check_cursor: Mutex<Option<BranchId>>,
 }

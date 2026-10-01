@@ -1,0 +1,4 @@
+{
+  "call": "db.call(\"public.next_id\")",
+  "tree": { "v": 1, "op": "call", "fn": "public.next_id" }
+}

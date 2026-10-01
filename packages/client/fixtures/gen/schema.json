@@ -1,0 +1,129 @@
+{
+  "version": "v42",
+  "default_schema": "public",
+  "schemas": {
+    "public": {
+      "enums": { "status": ["pending", "paid", "ship\"ped"] },
+      "tables": {
+        "orders": {
+          "kind": "table",
+          "rls": true,
+          "security_invoker": false,
+          "privileges": null,
+          "columns": {
+            "id": { "type": "int8", "array": false, "nullable": false, "has_default": true, "generated": false },
+            "total": { "type": "numeric", "array": false, "nullable": false, "has_default": false, "generated": false },
+            "qty": { "type": "int4", "array": false, "nullable": false, "has_default": true, "generated": false },
+            "ratio": { "type": "float8", "array": false, "nullable": true, "has_default": false, "generated": false },
+            "status": { "type": "status", "array": false, "nullable": false, "has_default": true, "generated": false, "enum": "public.status" },
+            "tags": { "type": "text", "array": true, "nullable": true, "has_default": false, "generated": false },
+            "ids": { "type": "int8", "array": true, "nullable": false, "has_default": true, "generated": false },
+            "amounts": { "type": "numeric", "array": true, "nullable": true, "has_default": false, "generated": false },
+            "history": { "type": "status", "array": true, "nullable": false, "has_default": false, "generated": false, "enum": "public.status" },
+            "meta": { "type": "jsonb", "array": false, "nullable": false, "has_default": true, "generated": false },
+            "raw": { "type": "json", "array": false, "nullable": true, "has_default": false, "generated": false },
+            "seq": { "type": "int8", "array": false, "nullable": true, "has_default": false, "generated": false },
+            "created_at": { "type": "timestamptz", "array": false, "nullable": false, "has_default": true, "generated": false },
+            "vip": { "type": "bool", "array": false, "nullable": false, "has_default": false, "generated": false },
+            "slug": { "type": "text", "array": false, "nullable": true, "has_default": true, "generated": true },
+            "and": { "type": "text", "array": false, "nullable": true, "has_default": false, "generated": false },
+            "ship-to": { "type": "text", "array": false, "nullable": true, "has_default": false, "generated": false }
+          }
+        },
+        "order_stats": {
+          "kind": "materialized_view",
+          "rls": false,
+          "security_invoker": false,
+          "privileges": null,
+          "columns": {
+            "orders": { "type": "int8", "array": false, "nullable": true, "has_default": false, "generated": false }
+          }
+        },
+        "remote_orders": {
+          "kind": "foreign_table",
+          "rls": false,
+          "security_invoker": false,
+          "privileges": null,
+          "columns": {
+            "id": { "type": "int8", "array": false, "nullable": false, "has_default": false, "generated": false }
+          }
+        },
+        "my_orders": {
+          "kind": "view",
+          "rls": false,
+          "security_invoker": true,
+          "privileges": null,
+          "columns": {
+            "id": { "type": "int8", "array": false, "nullable": true, "has_default": false, "generated": false }
+          }
+        },
+        "order_totals": {
+          "kind": "view",
+          "rls": false,
+          "security_invoker": false,
+          "privileges": null,
+          "columns": {
+            "customer": { "type": "text", "array": false, "nullable": true, "has_default": false, "generated": false },
+            "total": { "type": "numeric", "array": false, "nullable": true, "has_default": false, "generated": false }
+          }
+        }
+      },
+      "functions": {
+        "next_id": [{ "args": [], "returns": { "type": "int8", "array": false, "set": false } }],
+        "add_points": [{
+          "args": [
+            { "name": "user_id", "type": "uuid", "array": false, "has_default": false },
+            { "name": "n", "type": "int4", "array": false, "has_default": true }
+          ],
+          "returns": { "type": "int4", "array": false, "set": false }
+        }],
+        "total_spent": [{
+          "args": [{ "name": "user_id", "type": "uuid", "array": false, "has_default": false }],
+          "returns": { "type": "numeric", "array": false, "set": false }
+        }],
+        "big_ids": [{
+          "args": [{ "name": "since", "type": "int8", "array": false, "has_default": true }],
+          "returns": { "type": "int8", "array": true, "set": false }
+        }],
+        "orders_by_status": [{
+          "args": [{ "name": "s", "type": "status", "array": false, "has_default": false }],
+          "returns": { "type": "orders", "array": false, "set": true }
+        }],
+        "latest_order": [{ "args": [], "returns": { "type": "orders", "array": false, "set": false } }],
+        "names": [{ "args": [], "returns": { "type": "text", "array": false, "set": true } }],
+        "pairs": [{ "args": [], "returns": { "type": "record", "array": false, "set": true } }],
+        "touch": [{ "args": [], "returns": { "type": "void", "array": false, "set": false } }],
+        "echo": [
+          { "args": [{ "name": "a", "type": "text", "array": false, "has_default": false }], "returns": { "type": "text", "array": false, "set": false } },
+          { "args": [{ "name": "b", "type": "int4", "array": false, "has_default": false }], "returns": { "type": "text", "array": false, "set": false } }
+        ],
+        "mixed": [
+          { "args": [{ "name": "a", "type": "text", "array": false, "has_default": false }], "returns": { "type": "text", "array": false, "set": false } },
+          { "args": [{ "name": "b", "type": "int4", "array": false, "has_default": false }], "returns": { "type": "int4", "array": false, "set": false } }
+        ]
+      }
+    },
+    "billing": {
+      "enums": {},
+      "tables": {
+        "invoices": {
+          "kind": "table",
+          "rls": false,
+          "security_invoker": false,
+          "privileges": null,
+          "columns": {
+            "id": { "type": "uuid", "array": false, "nullable": false, "has_default": true, "generated": false },
+            "amount": { "type": "numeric", "array": false, "nullable": false, "has_default": false, "generated": false },
+            "paid": { "type": "bool", "array": false, "nullable": false, "has_default": true, "generated": false }
+          }
+        }
+      },
+      "functions": {
+        "void_invoice": [{
+          "args": [{ "name": "id", "type": "uuid", "array": false, "has_default": false }],
+          "returns": { "type": "void", "array": false, "set": false }
+        }]
+      }
+    }
+  }
+}
