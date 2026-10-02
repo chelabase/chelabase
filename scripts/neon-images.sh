@@ -16,7 +16,7 @@ pinned() {
 }
 
 choose() { # choose <VAR> <image name>
-  local var="$1" local_ref="cheladb/$2:$neon_tag" ref
+  local var="$1" local_ref="cheladb/$2:$neon_dev_tag" ref
   if docker image inspect "$local_ref" >/dev/null 2>&1; then
     echo "[neon-images] using local build $local_ref" >&2
     echo "$var=$local_ref"
@@ -28,11 +28,11 @@ choose() { # choose <VAR> <image name>
     exit 1
   fi
   if ! docker image inspect "$ref" >/dev/null 2>&1 && ! docker pull -q "$ref" >/dev/null; then
-    echo "can't pull ${ref%%[:@]*} (docker's error is above). The packages are private: run docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk)." >&2
+    echo "can't pull ${ref%%[:@]*} (docker's error is above). The images are public on ghcr.io; build locally with just neon-build (~40 min, ~40 GB free disk)." >&2
     exit 1
   fi
   echo "$var=$ref"
 }
 
-choose NEON_IMAGE neon
-choose COMPUTE_NODE_IMAGE compute-node-v17
+choose NEON_IMAGE neon-storage
+choose COMPUTE_NODE_IMAGE neon-compute-v17

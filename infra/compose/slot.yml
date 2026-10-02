@@ -7,8 +7,9 @@
 name: cheladb-s${CHELADB_SLOT:-0}
 
 # Keep equal to shared.yml's pin (infra/compose/tests/slots.sh checks it); `just deps-up`
-# overrides it with a local `just neon-build` when present.
-x-neon-image: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon-storage:532981ad7de5-dev@sha256:08ab209a64face61321f140cd6a82941ff0297740d2882109bf1e462549b2935}
+# overrides it with a local `just neon-build` when present. The packages are public on
+# ghcr.io (infra/neon/README.md).
+x-neon-image: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon-storage:39b641053212-dev@sha256:8c6618db76f76a87b368123cbf13a22f3bd1f97c8e786ee3ebbf36902fc2e9ca}
 
 services:
   nats:

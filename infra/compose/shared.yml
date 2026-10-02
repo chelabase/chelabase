@@ -9,11 +9,11 @@ name: cheladb
 
 # --- Neon storage (part of the base stack: `just deps-up`) ---
 # Pinned by digest; `just deps-up` overrides these with a local `just neon-build` when present.
-# The packages are private: `docker login ghcr.io` first (infra/neon/README.md).
+# The packages are public on ghcr.io (infra/neon/README.md).
 x-neon-images:
-  neon: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon-storage:532981ad7de5-dev@sha256:08ab209a64face61321f140cd6a82941ff0297740d2882109bf1e462549b2935}
+  neon: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon-storage:39b641053212-dev@sha256:8c6618db76f76a87b368123cbf13a22f3bd1f97c8e786ee3ebbf36902fc2e9ca}
   # The image of the compute containers the worker starts (CHELADB_COMPUTE_IMAGE); pinned here.
-  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/cheladb/neon-compute-v17:532981ad7de5-dev@sha256:70fe8c53de2a5d7cfaee36d1553ae80041af2c6eb4498b2a58725f0402fd7f4c}
+  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/cheladb/neon-compute-v17:39b641053212-dev@sha256:d263f15661362838b3591f1325f08920addf87b8ef11914e931d72d503193a21}
 
 # S3 credentials for SeaweedFS. Local dev only.
 x-neon-s3-env: &neon-s3-env

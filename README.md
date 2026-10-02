@@ -268,7 +268,7 @@ Several worktrees can run their own development stacks side by side on the same 
 **Get started:**
 
 1. **Moving to slots:**
-   - **An old single stack is running** (for example on the second computer): `just dev-down`, `git pull`, `docker login ghcr.io`, then `just stack-migrate` (builds the hook relay, pulls the new image pins, removes the old NATS, Valkey and proxy containers and recreates the shared tier), then `just deps-up` and `just dev`.
+   - **An old single stack is running** (for example on the second computer): `just dev-down`, `git pull`, then `just stack-migrate` (builds the hook relay, pulls the new image pins, removes the old NATS, Valkey and proxy containers and recreates the shared tier), then `just deps-up` and `just dev`.
    - **A fresh machine:** `just dev`.
    - **A worktree made before slots:** merge `main` into its branch, run `just dev-down` if its apps run as slot 0, then `just stack-claim` (gives it a slot and writes its `.env.local`).
    - **After a hook relay code change:** `just hook-relay-build`, then `just stack-migrate` (which rebuilds the relay itself and recreates the shared tier; it refuses while other slots run).
@@ -280,7 +280,6 @@ Several worktrees can run their own development stacks side by side on the same 
 
 **Prerequisites on a second computer:**
 
-- `docker login ghcr.io` (for the Neon images)
 - `cargo` (to build the hook relay) and `jq` (to parse the metadata)
 - The host's glibc must be version ≤ 2.43, or the hook relay Dockerfile must be bumped (edit `FROM ubuntu:…` to a newer LTS base with a matching or newer glibc)
 - **Pre-slot branches** (created before this chore): their `just deps-up` does not error. It silently recreates the shared storage on older image pins (a pageserver downgrade), points the storage controller back at host port 8083 (bypassing the hook relay), and clashes with the `cheladb-s0` ports. Their `deps-down` stops the whole shared tier, their worker removes other slots' computes, and their orchestrator answers 200 for tenants it does not know. Rule: merge `main` and run `just stack-claim` before any `deps-up`, `dev`, `deps-down` or `sweep-dbs` on a pre-slot branch.
