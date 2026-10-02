@@ -1,6 +1,6 @@
 //! Settings for the internal listener, all with local-dev defaults.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use cheladb_neon::ComputeSigner;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,6 +15,11 @@ pub struct InternalConfig {
     pub storcon_url: String,
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
+    /// `CHELADB_CONTROL_PLANE_URI`: how computes reach this listener; the DDL receiver's URL
+    /// (`neon.console_url`) is built from it.
+    pub control_plane_uri: String,
+    /// `CHELADB_VALKEY_URL`: where the receiver tells the proxies a role's secret changed.
+    pub valkey_url: String,
 }
 
 impl InternalConfig {
@@ -40,6 +45,11 @@ impl InternalConfig {
             storcon_url: or("CHELADB_STORCON_URL", "http://127.0.0.1:1234"),
             compute_jwt_dir: PathBuf::from(or("CHELADB_COMPUTE_JWT_DIR", ".cheladb/neon")),
             compute_network: or("CHELADB_COMPUTE_NETWORK", "cheladb_default"),
+            control_plane_uri: check_control_plane_uri(or(
+                "CHELADB_CONTROL_PLANE_URI",
+                "http://host.docker.internal:8083",
+            ))?,
+            valkey_url: or("CHELADB_VALKEY_URL", "redis://127.0.0.1:6379"),
         })
     }
 
@@ -47,6 +57,27 @@ impl InternalConfig {
     pub fn load_signer(&self) -> Result<ComputeSigner> {
         cheladb_neon::jwt::load_signer(&self.compute_jwt_dir)
     }
+}
+
+/// Computes call this address from inside their containers, so it needs a scheme, a host and
+/// an explicit port (the worker's check).
+fn check_control_plane_uri(uri: String) -> Result<String> {
+    let bad = |why: &str| {
+        anyhow!(
+            "CHELADB_CONTROL_PLANE_URI={uri:?}: {why} (for example http://host.docker.internal:8083)"
+        )
+    };
+    let url = reqwest::Url::parse(&uri).map_err(|e| bad(&format!("not a URL ({e})")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(bad("the scheme must be http or https"));
+    }
+    if url.host_str().is_none() {
+        return Err(bad("it needs a host"));
+    }
+    if url.port().is_none() {
+        return Err(bad("it needs an explicit port"));
+    }
+    Ok(uri)
 }
 
 /// By hand, so the bearer tokens never reach a log.
@@ -61,6 +92,16 @@ impl std::fmt::Debug for InternalConfig {
             .field("storcon_url", &self.storcon_url)
             .field("compute_jwt_dir", &self.compute_jwt_dir)
             .field("compute_network", &self.compute_network)
+            .field("control_plane_uri", &self.control_plane_uri)
+            // A URL with credentials (`redis://:pw@host`) isn't shown.
+            .field(
+                "valkey_url",
+                &if self.valkey_url.contains('@') {
+                    "<redacted>"
+                } else {
+                    self.valkey_url.as_str()
+                },
+            )
             .finish()
     }
 }
@@ -103,6 +144,34 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("CHELADB_INTERNAL_ADDR"), "{err}");
+    }
+
+    #[test]
+    fn config_reads_control_plane_uri_and_valkey() {
+        let d = InternalConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(d.control_plane_uri, "http://host.docker.internal:8083");
+        assert_eq!(d.valkey_url, "redis://127.0.0.1:6379");
+        let c = InternalConfig::from_lookup(|name| match name {
+            "CHELADB_CONTROL_PLANE_URI" => Some("http://172.17.0.1:9083".into()),
+            "CHELADB_VALKEY_URL" => Some("redis://valkey:6379".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.control_plane_uri, "http://172.17.0.1:9083");
+        assert_eq!(c.valkey_url, "redis://valkey:6379");
+        let blank = InternalConfig::from_lookup(|name| {
+            (name == "CHELADB_VALKEY_URL").then(|| " ".to_string())
+        })
+        .unwrap();
+        assert_eq!(blank.valkey_url, "redis://127.0.0.1:6379");
+        for bad in ["host.docker.internal:8083", "http://h", "ftp://h:1"] {
+            let err = InternalConfig::from_lookup(|name| {
+                (name == "CHELADB_CONTROL_PLANE_URI").then(|| bad.to_string())
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("CHELADB_CONTROL_PLANE_URI"), "{bad}: {err}");
+        }
     }
 
     #[test]

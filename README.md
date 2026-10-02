@@ -49,6 +49,7 @@ pnpm install
 | `just cleanup` | Fresh start: stops dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps (keeps keys and the seeded tenant). Asks first |
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
 | `just data-e2e` | Live data API story: keys, queries, generated types, RLS, revoke (needs `just deps-up` and `just dev`) |
+| `just role-e2e` | Live login roles story: create, connect, back a secret key, refused delete, reset, delete (needs `just deps-up` and `just dev`) |
 
 ```bash
 just dev                 # deps + IAM bootstrap + background processes
@@ -160,6 +161,50 @@ Every database can have branches: copies of another branch's data, each with its
 - **Children rule:** Delete, reset-to-parent and restore are refused if the branch has live normal child branches. Each child's timeline branches from its parent's, and Neon refuses (412) to delete a timeline that others branch from; v1 doesn't re-parent children onto another timeline, so the children go first. Backup branches never count as children; a branch's backups are deleted when the branch itself is deleted.
 - **`just branch-e2e`** runs the story end to end through the gateway, checking the data with psql through the proxy: a database whose main gets rows A and then B; a branch at a time between the two (it has only A); C on main and a reset to parent (the branch has A, B and C); a refused restore of main while it has that child, then deleting the branch; a restore of main to the noted time (main has A; the backup has no compute, and a branch of it has A, B and C); a 1 hour window and a point 2 hours back, which fails with the oldest available point; and finally deleting the database, checking that every compute, the tenant, the endpoint rows and the branch rows are gone. It takes about 40 s.
 
+## Roles and migrations
+
+Projects run their own migrations and setup scripts through Cheladb's proxy. `CREATE ROLE … LOGIN PASSWORD`, `ALTER ROLE … PASSWORD`, `ALTER ROLE … RENAME`, `DROP ROLE`, `GRANT role TO role`, and `CREATE DATABASE` all work when run as the owner `postgres`.
+
+**What works in SQL:**
+- `CREATE ROLE <name> LOGIN PASSWORD <secret>`: the role can log in through the proxy. The password may be plain or a pre-hashed SCRAM verifier (see the password rules); an MD5 one is refused.
+- `ALTER ROLE <name> PASSWORD <secret>`: stored and synced to the proxy.
+- `ALTER ROLE <name> RENAME TO <new>`: the role's login works under its new name.
+- `DROP ROLE <name>`: removed from the proxy's cache. Deleting a role while a live secret data key uses it is refused.
+- `GRANT <role> TO <app>`: role inheritance is active; `SET ROLE app` and `INHERIT` work after creation.
+- `CREATE DATABASE <name>`: tracked and shown in Studio. The cap per branch is `CHELADB_BRANCH_DATABASE_CAP` (default 20, range 1–1000).
+- Roles made in SQL before this version can log in after the first resync once the database is running.
+- `ALTER TABLE … OWNER TO <role>` also needs `GRANT CREATE ON SCHEMA public TO <role>` (Postgres 15 and later); the owner can `SET ROLE` to the role right after `CREATE ROLE`.
+- Replaying a `pg_dumpall` globals file: its `ALTER ROLE … WITH NOSUPERUSER …` lines are refused for the owner, which isn't a superuser (`Only roles with the SUPERUSER attribute may change the SUPERUSER attribute`). Remove `NOSUPERUSER` from those lines; the SCRAM password literals are accepted as they are.
+
+**Password rules:**
+- `CHELADB_PASSWORD_STRENGTH` (self-hosted mode: `off` by default, opt-in `on`; platform mode: forced `on`): when on, at least 12 characters and an estimated 60 bits of entropy (character classes × length).
+- **MD5 passwords are refused** (`MD5 passwords can't be used through Cheladb; set a plain password`). A role that already has an MD5 password (from an older dump, say) is listed as unusable through the proxy until its password is reset.
+- A pre-hashed SCRAM password is **accepted in self-hosted mode** (strength rules don't apply to pre-hashed ones), and **refused in platform mode**.
+- `PASSWORD NULL` removes a role's login copy; a group role with no password has no proxy copy.
+- `PASSWORD ''` (which Postgres takes as no password) fails in the compute with `Failed to get encrypted password: User "<name>" has no password assigned.`, and nothing changes; use `PASSWORD NULL` instead.
+
+**The branch password rule:**
+- The owner `postgres` gets its own password on every branch.
+- Every other role keeps the parent branch's password unless the parent is **protected**.
+- From a protected branch, a child gives every role in its own database that has a password a fresh generated, revealable one: roles made in Studio, through the API or in SQL, MD5 ones and roles without `LOGIN` included, also a role the parent has dropped since the child's point in time.
+
+**Protected branches:**
+- Protect a branch in Studio's branch settings, or with `PATCH /v1/databases/{id}/branches/{branch_id}` and the body `{"protected": true}` (`false` unprotects it).
+- Delete and reset-to-parent are refused with 409 `branch_protected` while a branch is protected.
+- Deleting a database is refused while it has any protected branch.
+- Restore is allowed. The owner and the roles made in Studio or through the API keep their current passwords; roles made in SQL are as they were at the restore point, passwords included (a role made after it is gone).
+
+**Role caps and metadata:**
+- Login roles per branch: `CHELADB_BRANCH_ROLE_CAP` (default 50, range 0–500). Group roles without a password don't count.
+- The system `postgres` database is listed in Studio and the connection picker, and isn't counted in the database cap.
+- Dropping the branch's main database is refused (`the branch's main database "<name>" can't be dropped`, also with `IF EXISTS` or `WITH (FORCE)`); renaming it is refused.
+- The owner can `SET ROLE` to any role it creates (those with `createrole_self_grant = 'set, inherit'`).
+- An owner-level role made in Studio or through the API gets the owner's attributes (`CREATEROLE`, `CREATEDB`, `BYPASSRLS`, `REPLICATION`) and `neon_superuser`. If any of them is taken away in SQL, the next resync gives it back.
+
+**Control plane down:**
+- When Cheladb can't reach the control plane, the DDL fails after about 5 seconds with `role and database changes are unavailable right now; try again` (SQLSTATE 55000). The change doesn't take effect; retry the statement.
+- Cheladb's other refusals reach the client as their own one-line message (for example `the branch owner's password can't be removed; reset it instead`).
+
 ## Management API
 
 OpenAPI documents are generated from the Rust route handlers in `crates/cheladb-routes` using utoipa 6 and utoipa-axum. Two documents are maintained: `openapi/management.json` (the Management API, the orchestrator's `/v1`, meant to go public later) and `openapi/login.json` (the auth `/auth/v1` login API for Studio only). The route tests fail when the documents are stale or when a route isn't documented.
@@ -243,7 +288,8 @@ Each branch has exactly one live **public key** (role `anon`, safe for browsers)
   - isn't a valid role name (a letter or `_`, then letters, digits, `_` or `$`; at most 63 characters);
   - is `authenticator` or `cheladb_admin`, or any `pg_*` role;
   - doesn't exist in the branch's database;
-  - is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `cheladb_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`.
+  - is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `cheladb_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`;
+  - is owner-level: it has `CREATEROLE`, `CREATEDB`, `BYPASSRLS` or `REPLICATION` (`the role <name> is owner-level (owner-level roles can't back a secret key; use a plain role)`).
 - **Rotating a secret key** keeps its role and doesn't run the check or the grant again. A reset or restore rewinds the grant, so the worker's bootstrap grants each live secret key's role again (a role that's gone or now refused is skipped with a warning, and its key stops working).
 - **Revocation:** effective within 30 seconds (the gateway cache).
 - **Lifecycle:** keys belong to the branch, not its timeline, so reset and restore keep them. Deleting a branch deletes its keys.

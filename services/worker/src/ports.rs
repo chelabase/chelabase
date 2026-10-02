@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use cheladb_metadata::{
     BranchConnectionRow, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
-    DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState, LiveBranch,
-    LiveDatabase, MetadataClient, MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewDataKey,
-    NewEndpoint,
+    DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState,
+    InsertRoleOutcome, LiveBranch, LiveDatabase, MetadataClient, MetadataError, NeonDatabase,
+    NeonEndpoint, NeonRole, NewDataKey, NewEndpoint, ResyncApplied, ResyncWrite, RoleCopy,
 };
 use cheladb_neon::proxy_cache::ProxyCache;
 use cheladb_neon::spec::Placement;
@@ -60,10 +60,10 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = Result<Option<NeonEndpoint>, MetadataError>> + Send;
-    fn neon_roles(
+    fn neon_roles_versioned(
         &self,
         endpoint_id: &str,
-    ) -> impl Future<Output = Result<Vec<NeonRole>, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<(Vec<NeonRole>, i64), MetadataError>> + Send;
     fn neon_databases(
         &self,
         endpoint_id: &str,
@@ -103,9 +103,63 @@ pub trait WorkerMetadata: Send + Sync + 'static {
     fn clear_needs_reconfigure(
         &self,
         endpoint_id: &str,
-        role: &str,
-        applied_verifier: &str,
+        applied_version: i64,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    // Login roles (see `cheladb_metadata::neon`).
+
+    /// API create: `CapReached` at `cap` copies, `Exists` when the name is taken; the row is
+    /// `pending`. Bumps the version. An unknown endpoint is a database error.
+    fn insert_api_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        owner_level: bool,
+        verifier: &str,
+        password_enc: &str,
+        cap: u32,
+    ) -> impl Future<Output = Result<InsertRoleOutcome, MetadataError>> + Send;
+    /// Any non-owner row's verifier and sealed password, `pending`; false when there's no
+    /// such row. Bumps the version.
+    fn replace_role_secret(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        verifier: &str,
+        password_enc: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Clears one row's `pending` while `roles_version` is still `version`.
+    fn confirm_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        version: i64,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Deletes a non-owner row; false when there was none. Bumps the version.
+    fn delete_role_copy(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Every row of the endpoint (the owner's first), and `roles_version`.
+    fn role_copies(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<(Vec<RoleCopy>, i64), MetadataError>> + Send;
+    /// The resync's write, only while `roles_version` is still `read_version`.
+    fn apply_resync(
+        &self,
+        endpoint_id: &str,
+        branch: BranchId,
+        read_version: i64,
+        write: &ResyncWrite,
+    ) -> impl Future<Output = Result<ResyncApplied, MetadataError>> + Send;
+    /// Records the compute settings version the endpoint's compute was created with.
+    fn set_compute_settings_version(
+        &self,
+        endpoint_id: &str,
+        version: i32,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     fn replace_compute_token(
         &self,
         endpoint_id: &str,
@@ -296,8 +350,11 @@ impl WorkerMetadata for MetadataClient {
         MetadataClient::neon_endpoint(self, endpoint_id).await
     }
 
-    async fn neon_roles(&self, endpoint_id: &str) -> Result<Vec<NeonRole>, MetadataError> {
-        MetadataClient::neon_roles(self, endpoint_id).await
+    async fn neon_roles_versioned(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<(Vec<NeonRole>, i64), MetadataError> {
+        MetadataClient::neon_roles_versioned(self, endpoint_id).await
     }
 
     async fn neon_databases(&self, endpoint_id: &str) -> Result<Vec<NeonDatabase>, MetadataError> {
@@ -345,10 +402,75 @@ impl WorkerMetadata for MetadataClient {
     async fn clear_needs_reconfigure(
         &self,
         endpoint_id: &str,
-        role: &str,
-        applied_verifier: &str,
+        applied_version: i64,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::clear_needs_reconfigure(self, endpoint_id, role, applied_verifier).await
+        MetadataClient::clear_needs_reconfigure(self, endpoint_id, applied_version).await
+    }
+
+    async fn insert_api_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        owner_level: bool,
+        verifier: &str,
+        password_enc: &str,
+        cap: u32,
+    ) -> Result<InsertRoleOutcome, MetadataError> {
+        MetadataClient::insert_api_role(
+            self,
+            endpoint_id,
+            name,
+            owner_level,
+            verifier,
+            password_enc,
+            cap,
+        )
+        .await
+    }
+
+    async fn replace_role_secret(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        verifier: &str,
+        password_enc: &str,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::replace_role_secret(self, endpoint_id, name, verifier, password_enc).await
+    }
+
+    async fn confirm_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::confirm_role(self, endpoint_id, name, version).await
+    }
+
+    async fn delete_role_copy(&self, endpoint_id: &str, name: &str) -> Result<bool, MetadataError> {
+        MetadataClient::delete_role_copy(self, endpoint_id, name).await
+    }
+
+    async fn role_copies(&self, endpoint_id: &str) -> Result<(Vec<RoleCopy>, i64), MetadataError> {
+        MetadataClient::role_copies(self, endpoint_id).await
+    }
+
+    async fn apply_resync(
+        &self,
+        endpoint_id: &str,
+        branch: BranchId,
+        read_version: i64,
+        write: &ResyncWrite,
+    ) -> Result<ResyncApplied, MetadataError> {
+        MetadataClient::apply_resync(self, endpoint_id, branch, read_version, write).await
+    }
+
+    async fn set_compute_settings_version(
+        &self,
+        endpoint_id: &str,
+        version: i32,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_compute_settings_version(self, endpoint_id, version).await
     }
 
     async fn replace_compute_token(
@@ -720,11 +842,27 @@ pub trait CacheNotifier: Send + Sync + 'static {
         endpoint_id: &str,
         role: &str,
     ) -> impl Future<Output = anyhow::Result<u64>> + Send;
+    /// `password_updated` for each of `roles` again after `delay`, from a background task
+    /// (R22: a login between the first message and the commit may have cached the old
+    /// password). Failures are logged.
+    fn password_updated_later(&self, endpoint_id: &str, roles: Vec<String>, delay: Duration);
 }
 
 impl CacheNotifier for ProxyCache {
     async fn password_updated(&self, endpoint_id: &str, role: &str) -> anyhow::Result<u64> {
         ProxyCache::password_updated(self, endpoint_id, role).await
+    }
+
+    fn password_updated_later(&self, endpoint_id: &str, roles: Vec<String>, delay: Duration) {
+        let (cache, endpoint_id) = (self.clone(), endpoint_id.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            for role in roles {
+                if let Err(e) = cache.password_updated(&endpoint_id, &role).await {
+                    tracing::warn!(%endpoint_id, role, "publishing password_updated again: {e:#}");
+                }
+            }
+        });
     }
 }
 

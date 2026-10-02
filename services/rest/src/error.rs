@@ -56,6 +56,17 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 
+    /// 403: a secret key whose role can bypass row-level security.
+    pub fn role_not_allowed(role: &str) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "role_not_allowed",
+            format!(
+                "the role `{role}` of this key can bypass row-level security; make it plain or use another role"
+            ),
+        )
+    }
+
     pub fn too_large() -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -282,4 +293,15 @@ pub(crate) mod tests {
         let response = ApiError::invalid_query("bad").into_response();
         assert!(response.headers().get(header::RETRY_AFTER).is_none());
     }
+    #[test]
+    fn role_not_allowed_body() {
+        let e = ApiError::role_not_allowed("svc");
+        assert_eq!(e.status, StatusCode::FORBIDDEN);
+        assert_eq!(e.code, "role_not_allowed");
+        assert_eq!(
+            e.message,
+            "the role `svc` of this key can bypass row-level security; make it plain or use another role"
+        );
+    }
+
 }

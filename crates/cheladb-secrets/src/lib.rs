@@ -97,6 +97,8 @@ pub enum Purpose {
     Authenticator,
     /// A public data API key, sealed so it can be shown again.
     DataKey,
+    /// A login role's password (bound to its branch and name, see [`seal_role_password`]).
+    Role,
 }
 
 impl Purpose {
@@ -105,6 +107,7 @@ impl Purpose {
             Purpose::Owner => "owner",
             Purpose::Authenticator => "authenticator",
             Purpose::DataKey => "data_key",
+            Purpose::Role => "role",
         }
     }
 }
@@ -132,6 +135,25 @@ pub fn open_credential(
     sealed: &str,
 ) -> Result<String, SecretsError> {
     open(key, &credential_aad(database_id, purpose), sealed)
+}
+
+/// Seal a login role's password; the AAD is `{branch_id}:role:{role}`.
+pub fn seal_role_password(key: &SecretKey, branch_id: &str, role: &str, password: &str) -> String {
+    seal(key, &role_aad(branch_id, role), password)
+}
+
+/// Open a value from [`seal_role_password`] for the same branch and role.
+pub fn open_role_password(
+    key: &SecretKey,
+    branch_id: &str,
+    role: &str,
+    sealed: &str,
+) -> Result<String, SecretsError> {
+    open(key, &role_aad(branch_id, role), sealed)
+}
+
+fn role_aad(branch_id: &str, role: &str) -> String {
+    format!("{branch_id}:{}:{role}", Purpose::Role.as_str())
 }
 
 fn credential_aad(database_id: &str, purpose: Purpose) -> String {
@@ -296,5 +318,16 @@ mod credential_tests {
         }
         let sealed = seal_credential(&key, "id-1", Purpose::DataKey, "pw");
         assert_eq!(open(&key, "id-1:data_key", &sealed).unwrap(), "pw");
+    }
+
+    #[test]
+    fn role_password_round_trips_and_binds_branch_and_name() {
+        let key = SecretKey::generate();
+        assert_eq!(Purpose::Role.as_str(), "role");
+        let sealed = seal_role_password(&key, "b-1", "app", "pw");
+        assert_eq!(open_role_password(&key, "b-1", "app", &sealed).unwrap(), "pw");
+        assert!(matches!(open_role_password(&key, "b-2", "app", &sealed), Err(SecretsError::Decrypt)));
+        assert!(matches!(open_role_password(&key, "b-1", "other", &sealed), Err(SecretsError::Decrypt)));
+        assert_eq!(open(&key, "b-1:role:app", &sealed).unwrap(), "pw");
     }
 }

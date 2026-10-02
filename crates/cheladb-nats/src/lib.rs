@@ -128,6 +128,13 @@ impl From<ResetPasswordRequestWire> for ResetPasswordRequest {
 /// The worker's reply error when the new password is stored but the compute doesn't have it yet.
 pub const RESET_NOT_APPLIED: &str = "the password was changed but not yet applied; it will be retried";
 
+/// A role create's `not_applied`: the role is stored, but the compute doesn't have it yet.
+pub const ROLE_CREATE_NOT_APPLIED: &str = "the role was stored but not yet applied; it will be retried";
+
+/// A role delete's `not_applied`: the role is gone, but the compute's spec doesn't say so yet.
+pub const ROLE_DELETE_NOT_APPLIED: &str =
+    "the role was deleted but the change is not yet applied; it will be retried";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetPasswordReply {
     pub ok: bool,
@@ -141,6 +148,48 @@ pub const SUBJECT_CHECK_DATA_ROLE: &str = "cheladb.rpc.check_data_role";
 pub struct CheckDataRoleRequest {
     pub branch_id: BranchId,
     pub role: String,
+}
+
+/// Core request/reply (not JetStream): create a login role. The orchestrator waits up to
+/// `RESET_TIMEOUT` for the worker's [`RoleReply`].
+pub const SUBJECT_ROLE_CREATE: &str = "cheladb.rpc.roles.create";
+/// Core request/reply: reset a login role's password.
+pub const SUBJECT_ROLE_RESET: &str = "cheladb.rpc.roles.reset";
+/// Core request/reply: delete a login role.
+pub const SUBJECT_ROLE_DELETE: &str = "cheladb.rpc.roles.delete";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleCreateRequest {
+    pub branch_id: BranchId,
+    pub name: String,
+    pub owner_level: bool,
+}
+
+/// Reset and delete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleRequest {
+    pub branch_id: BranchId,
+    pub name: String,
+}
+
+/// A data API key that still uses a role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRef {
+    pub id: Uuid,
+    pub name: String,
+}
+
+/// The worker's answer. `code` says why when `ok` is false: `invalid_role_name`,
+/// `reserved_role_name`, `role_exists`, `role_cap_reached`, `branch_not_ready`, `not_found`,
+/// `role_in_use` (with `keys`), `role_privilege_mismatch`, `not_applied`, `failed`. `error` is
+/// a message (never a password).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleReply {
+    pub ok: bool,
+    pub code: Option<String>,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub keys: Vec<KeyRef>,
 }
 
 /// The worker's answer. `kind` says why when `ok` is false: `refused` (the caller's fault;
@@ -530,6 +579,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_create_request_uses_owner_level() {
+        let create = RoleCreateRequest { branch_id: BranchId::new(), name: "app".into(), owner_level: true };
+        let json = serde_json::to_value(&create).unwrap();
+        assert_eq!(json["owner_level"], true);
+        assert!(json.get("privileged").is_none());
+    }
+
+    #[test]
+    fn role_rpc_wire_shapes() {
+        assert_eq!(SUBJECT_ROLE_CREATE, "cheladb.rpc.roles.create");
+        assert_eq!(SUBJECT_ROLE_RESET, "cheladb.rpc.roles.reset");
+        assert_eq!(SUBJECT_ROLE_DELETE, "cheladb.rpc.roles.delete");
+        let create = RoleCreateRequest { branch_id: BranchId::new(), name: "app".into(), owner_level: true };
+        let json = serde_json::to_value(&create).unwrap();
+        assert_eq!(json["name"], "app");
+        assert_eq!(json["owner_level"], true);
+        let request = RoleRequest { branch_id: BranchId::new(), name: "app".into() };
+        assert!(serde_json::to_value(&request).unwrap()["branch_id"].is_string());
+        // A reply without `keys` parses, with none.
+        let reply: RoleReply = serde_json::from_str(r#"{"ok":false,"code":"not_found","error":"x"}"#).unwrap();
+        assert_eq!(reply.code.as_deref(), Some("not_found"));
+        assert!(reply.keys.is_empty());
+        let in_use = RoleReply {
+            ok: false,
+            code: Some("role_in_use".into()),
+            error: Some("in use".into()),
+            keys: vec![KeyRef { id: Uuid::nil(), name: "k".into() }],
+        };
+        let back: RoleReply = serde_json::from_slice(&serde_json::to_vec(&in_use).unwrap()).unwrap();
+        assert_eq!(back, in_use);
+    }
 
     #[test]
     fn check_data_role_wire_shapes() {

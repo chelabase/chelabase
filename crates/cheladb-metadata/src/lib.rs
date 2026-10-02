@@ -10,17 +10,21 @@ use uuid::Uuid;
 
 mod branches;
 mod data_api;
+mod ddl;
 mod neon;
 pub use branches::{
-    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome,
-    DatabaseSettings, LiveBranch, NewBranch, SettingsPatch,
+    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
+    CreateBranchOutcome, DatabaseSettings, LiveBranch, NewBranch, SettingsPatch,
 };
+pub use ddl::DdlTx;
 pub use data_api::{
     BranchConnectionRow, DataApiSettings, DataKeyLookup, DataKeyRecord, NewDataKey,
 };
 pub use neon::{
-    ENDPOINT_LOCK_TIMEOUT, EndpointLock, EndpointState, NeonDatabase, NeonEndpoint, NeonRole,
-    NewEndpoint,
+    BranchDatabase, CopyUpsert, DatabaseOrigin, ENDPOINT_LOCK_TIMEOUT, EndpointLock,
+    EndpointState, InsertRoleOutcome, NeonDatabase, NeonEndpoint, NeonRole, NewEndpoint,
+    NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied, ResyncWrite, RoleCopy,
+    RoleLevel, RoleOrigin, RoleRow, SealedChange,
 };
 
 /// Fixed seed tenant for local demos (`slug = demo`).
@@ -143,6 +147,17 @@ pub enum MetadataError {
     /// [`MetadataClient::lock_endpoint`] waited [`ENDPOINT_LOCK_TIMEOUT`] in vain.
     #[error("another password change for {0} is still being applied")]
     EndpointLockTimeout(String),
+}
+
+/// How [`MetadataClient::begin_delete`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginDelete {
+    /// The database and its live branches are now `deleting`.
+    Started,
+    /// Already deleting or deleted, or missing: nothing written.
+    NotReady,
+    /// A live branch is protected: nothing written.
+    Protected,
 }
 
 /// Postgres limits identifiers to 63 bytes.
@@ -400,9 +415,12 @@ impl MetadataClient {
         Ok(true)
     }
 
-    /// Move a database and every live branch of it to `deleting`, in one transaction. False
-    /// when it's already deleting, deleted, or missing.
-    pub async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+    /// Move a database and every live branch of it to `deleting`, in one transaction.
+    /// `NotReady` (nothing written) when it's already deleting, deleted, or missing;
+    /// `Protected` (nothing written) while any of its live branches is protected: the check
+    /// locks every live branch row (waiting for a protect in flight and reading its result), and
+    /// a protect that lands later waits for the new `deleting` status.
+    pub async fn begin_delete(&self, database_id: DatabaseId) -> Result<BeginDelete, MetadataError> {
         let mut tx = self.pool.begin().await?;
         let moved = sqlx::query(
             r#"
@@ -416,7 +434,18 @@ impl MetadataClient {
         .await?
         .rows_affected();
         if moved != 1 {
-            return Ok(false);
+            return Ok(BeginDelete::NotReady);
+        }
+        let flags: Vec<bool> = sqlx::query_scalar(
+            "SELECT protected FROM branches
+             WHERE database_id = $1 AND status NOT IN ('deleting', 'deleted')
+             FOR NO KEY UPDATE",
+        )
+        .bind(database_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+        if flags.contains(&true) {
+            return Ok(BeginDelete::Protected);
         }
         sqlx::query(
             "UPDATE branches SET status = 'deleting', updated_at = now()
@@ -426,7 +455,7 @@ impl MetadataClient {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(BeginDelete::Started)
     }
 
     /// Turn the database row into a tombstone. Its branches are marked deleted one by one

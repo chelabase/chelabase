@@ -43,7 +43,7 @@ describe("DataApiPanel", () => {
   it("loads the keys and schema for the branch", async () => {
     const { fetch } = setup();
     await screen.findByText(PUB);
-    await waitFor(() => expect(sent(fetch).sort()).toEqual([KEYS, SCHEMA].sort()));
+    await waitFor(() => expect(sent(fetch).filter((c) => !c.endsWith("/roles")).sort()).toEqual([KEYS, SCHEMA].sort()));
   });
 
   it("shows the endpoint and the public key, each with a copy button", async () => {

@@ -885,7 +885,14 @@
           "email_taken",
           "invalid_code",
           "weak_password",
-          "sign_in_expired"
+          "sign_in_expired",
+          "invalid_role_name",
+          "reserved_role_name",
+          "role_exists",
+          "role_cap_reached",
+          "role_in_use",
+          "role_privilege_mismatch",
+          "branch_protected"
         ]
       },
       "ErrorEnvelope": {

@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getGetMeQueryKey, type ConnectionDetails, type DatabaseSummary } from "@cheladb/management-client";
@@ -27,6 +27,7 @@ const details = (password: string): ConnectionDetails => ({
   password,
   uri: uriFor(password),
   http_url: HTTP_URL,
+  password_state: "generated",
 });
 
 const CONNECTION = "GET /v1/databases/d1/connection";
@@ -253,6 +254,7 @@ describe("DatabaseActions", () => {
     const branch = {
       id: "b2", name: "dev", parent_branch_id: "d1", kind: "normal", status: "ready", host: EP, port: 4432,
       branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
+      protected: false, main_database_missing: false,
     } as const;
     const { queryClient } = renderWithQuery(<DatabaseActions database={ready} branch={branch} />, { fetch: f });
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
@@ -262,6 +264,95 @@ describe("DatabaseActions", () => {
     expect(await screen.findByText(/password was reset/i)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Show password" }));
     expect(screen.getByText("br4nch")).toBeInTheDocument();
-    expect(queryClient.getQueryCache().findAll()).toHaveLength(0);
+    // The role list may be cached, the password never.
+    expect(JSON.stringify(queryClient.getQueryCache().findAll().map((q) => q.state))).not.toContain("br4nch");
+  });
+
+  it("connection_picker_switches_role", async () => {
+    const branch = {
+      id: "b2", name: "dev", parent_branch_id: "d1", kind: "normal", status: "ready", host: EP, port: 4432,
+      branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
+      protected: false, main_database_missing: false,
+    } as const;
+    const row = (name: string, kind: "owner" | "login") => ({
+      name, origin: kind === "owner" ? "owner" : "api", level: kind === "owner" ? "owner_level" : "plain",
+      login: true, password: "generated", blocked_keys: [], pending: false, created_at: "2026-10-01T09:00:00Z",
+    } as const);
+    const f = fakeFetch({
+      "GET /v1/databases/d1/branches/b2/roles": () => jsonResponse([row("cheladb_owner", "owner"), row("reporting", "login")]),
+      "GET /v1/databases/d1/branches/b2/connection": (req) => {
+        const r = new URL(req.url).searchParams.get("role");
+        return jsonResponse({ ...details(r ? "rolepw" : "ownerpw"), user: r ?? "cheladb_owner" });
+      },
+    });
+    renderWithQuery(<DatabaseActions database={ready} branch={branch} />, { fetch: f });
+    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
+    const picker = await screen.findByRole("combobox", { name: "Role" });
+    // Its label is exactly "Role", not "Role" plus its options (what Playwright's
+    // getByLabel('Role', { exact: true }) matches against).
+    expect(screen.getByLabelText("Role", { exact: true })).toBe(picker);
+    const labels = Array.from((picker as HTMLSelectElement).labels ?? []).map((l) => l.textContent);
+    expect(labels).toEqual(["Role"]);
+    expect(picker).toHaveValue("cheladb_owner");
+    expect(await screen.findByText("cheladb_owner", { selector: "dd" })).toBeInTheDocument();
+    await userEvent.selectOptions(picker, "reporting");
+    expect(await screen.findByText("reporting", { selector: "dd" })).toBeInTheDocument();
+    expect(f.calls.some((r) => r.url.includes("/connection?role=reporting"))).toBe(true);
+    expect(screen.getByRole("combobox", { name: "Role" })).toHaveValue("reporting");
+  });
+
+  const branchB2 = {
+    id: "b2", name: "dev", parent_branch_id: "d1", kind: "normal", status: "ready", host: EP, port: 4432,
+    branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
+    protected: false, main_database_missing: false,
+  } as const;
+  const ownerRow = {
+    name: "cheladb_owner", origin: "owner", level: "owner_level", login: true, password: "generated",
+    blocked_keys: [], pending: false, created_at: "2026-10-01T09:00:00Z",
+  } as const;
+
+  it("database_picker_refetches: main first, the system database labelled, each change re-fetches", async () => {
+    const f = fakeFetch({
+      "GET /v1/databases/d1/branches/b2/roles": () => jsonResponse([ownerRow]),
+      "GET /v1/databases/d1/branches/b2/databases": () =>
+        jsonResponse([
+          { name: "postgres", origin: "system", owner: "cloud_admin", main: false },
+          { name: "web1", origin: "main", owner: "cheladb_owner", main: true },
+          { name: "extra", origin: "sql", owner: "cheladb_owner", main: false },
+        ]),
+      "GET /v1/databases/d1/branches/b2/connection": (req) =>
+        jsonResponse({ ...details("pw"), database: new URL(req.url).searchParams.get("database") ?? "web1" }),
+    });
+    renderWithQuery(<DatabaseActions database={ready} branch={branchB2} />, { fetch: f });
+    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
+    const picker = await screen.findByRole("combobox", { name: "Database" });
+    await vi.waitFor(() => expect(within(picker).getAllByRole("option")).toHaveLength(3));
+    expect(within(picker).getAllByRole("option").map((o) => o.textContent)).toEqual(["web1", "extra", "postgres (System)"]);
+    expect(picker).toHaveValue("web1");
+    await userEvent.selectOptions(picker, "postgres");
+    await vi.waitFor(() => expect(f.calls.some((r) => r.url.includes("database=postgres"))).toBe(true));
+    await vi.waitFor(() => expect(screen.getByRole("combobox", { name: "Database" })).toHaveValue("postgres"));
+  });
+
+  it("connection shows the password state text when the password is null", async () => {
+    const f = fakeFetch({
+      "GET /v1/databases/d1/branches/b2/roles": () => jsonResponse([ownerRow]),
+      "GET /v1/databases/d1/branches/b2/connection": () =>
+        jsonResponse({ ...details("x"), password: null, password_state: "set_in_sql" }),
+    });
+    renderWithQuery(<DatabaseActions database={ready} branch={branchB2} />, { fetch: f });
+    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
+    expect(await screen.findByText("Password set in SQL — reset to get a revealable one")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show password" })).toBeNull();
+  });
+
+  it("database_delete_disabled_with_protected_branch", async () => {
+    const f = fakeFetch({
+      "GET /v1/databases/d1/branches": () => jsonResponse([{ ...branchB2, protected: true }]),
+    });
+    renderWithQuery(<DatabaseActions database={ready} />, { fetch: f });
+    const del = screen.getByRole("button", { name: "Delete" });
+    await vi.waitFor(() => expect(del).toBeDisabled());
+    expect(screen.getByText("A branch is protected")).toBeInTheDocument();
   });
 });

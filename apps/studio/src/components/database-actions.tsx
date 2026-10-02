@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ApiError,
@@ -6,6 +6,9 @@ import {
   getDatabaseConnection,
   getGetMeQueryKey,
   useDeleteDatabase,
+  useListBranchDatabases,
+  useListBranches,
+  useListRoles,
   useResetBranchPassword,
   useResetDatabasePassword,
   type Branch,
@@ -14,6 +17,7 @@ import {
 } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
+import { PASSWORD_STATE_TEXT } from "@/lib/password-state";
 
 type Panel = "none" | "connection" | "reset" | "delete";
 
@@ -37,6 +41,7 @@ export interface DatabaseActionsProps {
 /** The orchestrator's answer when a reset stored the new password but couldn't apply it yet. */
 const notApplied = (err: unknown) => err instanceof ApiError && err.code === "not_applied";
 /** What a not-applied reset tells the user, instead of both "reset" and the 503. */
+const PROTECTED_DB_REASON = "A branch is protected";
 const NOT_APPLIED_NOTICE = "The new password is stored but not yet applied; it will be retried.";
 
 export function DatabaseActions({
@@ -60,6 +65,12 @@ export function DatabaseActions({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [typedName, setTypedName] = useState("");
+  // The login role whose details are shown; null is the owner.
+  const [role, setRole] = useState<string | null>(null);
+  // The database whose details are shown; null is the branch's main database.
+  const [dbName, setDbName] = useState<string | null>(null);
+  const pickerId = useId();
+  const dbPickerId = useId();
   const ready = database.status === "ready";
   const id = database.database_id;
   const label = branch?.name ?? database.name;
@@ -67,7 +78,16 @@ export function DatabaseActions({
   const passwordReason = reasons?.resetPassword ?? null;
   const canConnect = branch ? connectReason === null : ready;
   const canReset = branch ? passwordReason === null : ready;
-
+  const roles = useListRoles(id, branch?.id ?? "", { query: { enabled: !!branch && panel === "connection" } });
+  const ownerRole = roles.data?.find((r) => r.origin === "owner");
+  const databases = useListBranchDatabases(id, branch?.id ?? "", { query: { enabled: !!branch && panel === "connection" } });
+  // Main first, the system database last (labelled).
+  const dbRank = (d: { origin: string }) => (d.origin === "main" ? 0 : d.origin === "system" ? 2 : 1);
+  const dbRows = [...(databases.data ?? [])].sort((a, b) => dbRank(a) - dbRank(b));
+  const mainDb = dbRows.find((d) => d.main)?.name ?? "";
+  // The database-level Delete waits until no branch is protected.
+  const branchList = useListBranches(id, { query: { enabled: !branch && ready } });
+  const hasProtected = !branch && (branchList.data?.some((b) => b.protected) ?? false);
   function open(next: Panel) {
     setError(null);
     setNotice(null);
@@ -76,19 +96,33 @@ export function DatabaseActions({
     if (target !== "connection") {
       setDetails(null);
       setShowPassword(false);
+      setRole(null);
+      setDbName(null);
     }
     setPanel(target);
   }
 
   /** `pending`: the reset stored the new password but couldn't apply it yet. */
-  async function reveal(afterReset = false, pending = false) {
+  async function reveal(
+    afterReset = false,
+    pending = false,
+    loginRole: string | null = null,
+    database: string | null = null,
+  ) {
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
       // Secrets stay out of the query cache: the plain functions, into component state.
-      setDetails(await (branch ? getBranchConnection(id, branch.id) : getDatabaseConnection(id)));
+      setDetails(await (branch
+          ? getBranchConnection(id, branch.id, {
+              ...(loginRole ? { role: loginRole } : {}),
+              ...(database ? { database } : {}),
+            })
+          : getDatabaseConnection(id)));
       setShowPassword(false);
+      setRole(loginRole);
+      setDbName(database);
       setNotice(
         pending
           ? NOT_APPLIED_NOTICE
@@ -175,7 +209,8 @@ export function DatabaseActions({
           <Button
             size="sm"
             variant="outline"
-            disabled={database.status === "deleting" || busy}
+            disabled={database.status === "deleting" || hasProtected || busy}
+            title={hasProtected ? PROTECTED_DB_REASON : undefined}
             onClick={() => {
               setTypedName("");
               open("delete");
@@ -187,9 +222,48 @@ export function DatabaseActions({
         {children}
       </div>
       {below}
+      {hasProtected && <p className="text-xs text-muted-foreground">{PROTECTED_DB_REASON}</p>}
 
       {panel === "connection" && details && (
         <div className="space-y-2 rounded-lg border p-3 text-sm">
+          {branch && dbRows.length > 0 && (
+            <div className="flex items-center gap-2">
+              <label htmlFor={dbPickerId}>Database</label>
+              <select
+                id={dbPickerId}
+                value={dbName ?? mainDb}
+                disabled={busy}
+                onChange={(e) => void reveal(false, false, role, e.target.value === mainDb ? null : e.target.value)}
+                className="h-8 rounded-lg border border-input bg-background px-2"
+              >
+                {dbRows.map((d) => (
+                  <option key={d.name} value={d.name}>
+                    {d.origin === "system" ? `${d.name} (System)` : d.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {branch && roles.data && roles.data.length > 1 && (
+            <div className="flex items-center gap-2">
+              <label htmlFor={pickerId}>Role</label>
+              <select
+                id={pickerId}
+                value={role ?? ownerRole?.name ?? ""}
+                disabled={busy}
+                onChange={(e) =>
+                  void reveal(false, false, e.target.value === ownerRole?.name ? null : e.target.value, dbName)
+                }
+                className="h-8 rounded-lg border border-input bg-background px-2"
+              >
+                {roles.data.map((r) => (
+                  <option key={r.name} value={r.name}>
+                    {r.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <dl className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1">
             {(
               [
@@ -201,22 +275,31 @@ export function DatabaseActions({
             ).map(([label, field, value]) => (
               <Field key={field} label={label} field={field} value={value} shown={value} onCopy={copy} />
             ))}
-            <Field
-              label="Password"
-              field="password"
-              value={details.password}
-              shown={showPassword ? details.password : "••••••••"}
-              onCopy={copy}
-            />
+            {details.password === null ? (
+              <>
+                <dt className="text-muted-foreground">Password</dt>
+                <dd className="col-span-2">{PASSWORD_STATE_TEXT[details.password_state]}</dd>
+              </>
+            ) : (
+              <Field
+                label="Password"
+                field="password"
+                value={details.password}
+                shown={showPassword ? details.password : "••••••••"}
+                onCopy={copy}
+              />
+            )}
             <Field label="HTTP URL" field="HTTP URL" value={details.http_url} shown={details.http_url} onCopy={copy} />
-            {showPassword && (
+            {(showPassword || details.password === null) && (
               <Field label="URI" field="URI" value={details.uri} shown={details.uri} onCopy={copy} />
             )}
           </dl>
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" variant="outline" onClick={() => setShowPassword((s) => !s)}>
-              {showPassword ? "Hide password" : "Show password"}
-            </Button>
+            {details.password !== null && (
+              <Button size="sm" variant="outline" onClick={() => setShowPassword((s) => !s)}>
+                {showPassword ? "Hide password" : "Show password"}
+              </Button>
+            )}
             <Button size="sm" variant="outline" onClick={() => void copy(details.uri)}>
               Copy URI
             </Button>

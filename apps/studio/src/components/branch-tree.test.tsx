@@ -15,6 +15,8 @@ const base = {
   branched_at_lsn: null,
   history_start: null,
   error: null,
+  protected: false,
+  main_database_missing: false,
 };
 const main: BranchSummary = {
   ...base,

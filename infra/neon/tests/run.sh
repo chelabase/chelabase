@@ -40,7 +40,7 @@ compose_file="$root/infra/compose/docker-compose.yml"
 check "NEON_IMAGE defaults to a digest-pinned GHCR image" \
   grep -Eq '\$\{NEON_IMAGE:-ghcr\.io/cheladb/neon:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
 check "COMPUTE_NODE_IMAGE defaults to a digest-pinned GHCR image" \
-  grep -Eq '\$\{COMPUTE_NODE_IMAGE:-ghcr\.io/cheladb/compute-node-v17:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
+  grep -Eq '\$\{COMPUTE_NODE_IMAGE:-ghcr\.io/cheladb/neon-compute-v17:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
 
 if command -v docker >/dev/null; then
   # env -u: the check must hold with nothing set, as for a plain `just deps-up`.
@@ -84,7 +84,7 @@ if command -v docker >/dev/null; then
   check "the proxy serves Postgres wire and serverless" \
     bash -c "grep -qx -- '--proxy=0.0.0.0:4432' <<<\"\$1\" && grep -qx -- '--wss=0.0.0.0:4444' <<<\"\$1\"" _ "$proxy_args"
   check "the proxy caches role secrets for at most a minute" \
-    grep -qx -- '--project-info-cache=size=10000,ttl=1m,max_roles=10,gc_interval=60m' <<<"$proxy_args"
+    grep -qx -- '--project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m' <<<"$proxy_args"
   check "the proxy uses Valkey (cache clearing, query cancel)" \
     bash -c "grep -qx -- '--redis-auth-type=plain' <<<\"\$1\" && grep -qx -- '--redis-plain=redis://valkey:6379' <<<\"\$1\"" _ "$proxy_args"
   valkey="$(jq -r '.services.valkey' <<<"$neon_json")"
@@ -127,7 +127,7 @@ images() { # images <local images> <ok|fail>: runs neon-images.sh against the st
 local_neon="cheladb/neon:$neon_tag"
 local_compute="cheladb/compute-node-v17:$neon_tag"
 pinned_neon='NEON_IMAGE=ghcr\.io/cheladb/neon:[^@]+@sha256:[0-9a-f]{64}'
-pinned_compute='COMPUTE_NODE_IMAGE=ghcr\.io/cheladb/compute-node-v17:[^@]+@sha256:[0-9a-f]{64}'
+pinned_compute='COMPUTE_NODE_IMAGE=ghcr\.io/cheladb/neon-compute-v17:[^@]+@sha256:[0-9a-f]{64}'
 
 out="$(images "$local_neon $local_compute" fail || true)"
 check "local builds are used for both images" \
@@ -279,6 +279,8 @@ check "branch-e2e recipe exists" \
   bash -c "just --justfile '$root/justfile' --show branch-e2e | grep -q 'scripts/branch-e2e.sh'"
 check "data-e2e recipe exists" \
   bash -c "just --justfile '$root/justfile' --show data-e2e | grep -q 'scripts/data-e2e.sh'"
+check "role-e2e recipe exists" \
+  bash -c "just --justfile '$root/justfile' --show role-e2e | grep -q 'scripts/role-e2e.sh'"
 check "dev starts rest" \
   bash -c "just --justfile '$root/justfile' --show dev | grep -q 'cargo run -p rest'"
 

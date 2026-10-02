@@ -20,6 +20,8 @@ const b = (name: string, over: Partial<Branch> = {}): Branch => ({
   created_at: "2026-09-30T10:00:00Z",
   history_start: null,
   error: null,
+  protected: false,
+  main_database_missing: false,
   ...over,
 });
 const keys = [

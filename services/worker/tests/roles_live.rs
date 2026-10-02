@@ -1,0 +1,1955 @@
+//! Login roles against real computes (roadmap step 6a, revision 2): roles and databases managed
+//! from SQL through Neon's DDL forwarding to the orchestrator's receiver, the worker's resync,
+//! API roles, the protected flag, and logins through Neon's proxy (Postgres wire on :4432 and
+//! SQL over HTTP on :4444).
+//!
+//! Same setup as `neon_live` (`just deps-up`, `just dev` from this checkout, so the orchestrator
+//! serves `neon.console_url` and the proxy runs with `max_roles=64`, `CHELADB_COMPUTE_IMAGE` set
+//! to the fork image), plus `psql` and `curl` on the host, the built `cheladb` CLI (for API
+//! tokens) and the proxy's CA in `.cheladb/neon/proxy-ca.crt`:
+//!
+//! ```text
+//! set -a; . .cheladb/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; set +a
+//! CHELADB_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
+//!   cargo test -p worker --test roles_live -- --ignored --test-threads=1 --nocapture
+//! ```
+//!
+//! Each test provisions its own database and deletes it afterwards, pass or fail. A few tests
+//! restart `just dev`'s orchestrator with extra settings (or stop it) and put it back as it was
+//! afterwards, pass or fail; they need `.cheladb/dev/pids` from `just dev`.
+
+use std::future::Future;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use cheladb_metadata::{
+    BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, DatabaseStatus,
+    MetadataClient, NewBranch, RoleLevel, RoleOrigin,
+};
+use cheladb_nats::{BranchJob, PointInTime};
+use cheladb_neon::ComputeBackend;
+use cheladb_secrets::{Purpose, open_credential, open_role_password};
+use cheladb_types::{BranchId, DatabaseId};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use worker::config::RealWorker;
+use worker::roles::RoleOutcome;
+
+mod common;
+use common::{cleanup, setup, workspace_root};
+
+/// One provisioned database: its main branch, endpoint and the owner's password.
+struct Fx {
+    worker: RealWorker,
+    metadata: MetadataClient,
+    id: DatabaseId,
+    main: BranchId,
+    ep: String,
+    database: String,
+    owner_password: String,
+}
+
+/// Provisions a database, runs `body` on it, then deletes it, pass or fail.
+async fn live<F, Fut>(body: F)
+where
+    F: FnOnce(Arc<Fx>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (worker, metadata, _config) = setup().await;
+    let id = DatabaseId::new();
+    let name = format!("live-{}", &id.to_string()[..8]);
+    metadata
+        .insert_database_pending(id, DEMO_TENANT_ID.into(), DEMO_PROJECT_ID.into(), &name)
+        .await
+        .expect("insert pending database");
+    let started = Instant::now();
+    let provisioned =
+        tokio::time::timeout(Duration::from_secs(90), worker.handle_provision(id, &name)).await;
+    println!("provision took {:?}", started.elapsed());
+    let ready = match provisioned {
+        Ok(Ok(())) => metadata.get_database(id).await.ok().flatten(),
+        _ => None,
+    };
+    let Some(record) = ready.filter(|r| r.status == DatabaseStatus::Ready) else {
+        cleanup(&worker, &metadata, id).await;
+        panic!("provision failed: {provisioned:?}");
+    };
+    let main = metadata
+        .get_branch(BranchId::from(id))
+        .await
+        .unwrap()
+        .expect("main branch");
+    let owner_password = open_credential(
+        &worker.key,
+        &main.id.to_string(),
+        Purpose::Owner,
+        main.owner_password_enc.as_deref().expect("owner password"),
+    )
+    .expect("open the owner password");
+    let fx = Arc::new(Fx {
+        ep: main.endpoint_id.clone().expect("endpoint"),
+        database: record.database_name.clone().expect("database name"),
+        main: main.id,
+        worker,
+        metadata,
+        id,
+        owner_password,
+    });
+
+    // A panic inside the task is caught here, so the cleanup below always runs.
+    let outcome = tokio::spawn(body(fx.clone())).await;
+    cleanup(&fx.worker, &fx.metadata, fx.id).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+impl Fx {
+    /// SQL as cloud_admin on `ep`'s compute, in `database` (forwarding off: `admin_sql`).
+    async fn sql_in(&self, ep: &str, database: &str, sql: &str) -> String {
+        self.worker
+            .computes
+            .admin_sql(ep, database, sql)
+            .await
+            .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
+    }
+
+    /// SQL as cloud_admin on main, in the main database.
+    async fn sql(&self, sql: &str) -> String {
+        self.sql_in(&self.ep, &self.database, sql).await
+    }
+
+    /// The first non-empty line of a one-value query.
+    async fn value(&self, ep: &str, sql: &str) -> String {
+        self.sql_in(ep, "postgres", sql)
+            .await
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// How many roles named `role` exist on `ep`.
+    async fn role_count(&self, ep: &str, role: &str) -> String {
+        self.value(
+            ep,
+            &format!(
+                "SELECT count(*) FROM pg_roles WHERE rolname = {};",
+                literal(role)
+            ),
+        )
+        .await
+    }
+
+    async fn create(&self, branch: BranchId, name: &str, owner_level: bool) {
+        let started = Instant::now();
+        let outcome = self.worker.create_role(branch, name, owner_level).await;
+        println!("create {name} took {:?}", started.elapsed());
+        assert_eq!(outcome, RoleOutcome::Ok, "create_role {name}");
+    }
+
+    /// A role's revealable password (sealed in metadata).
+    async fn password(&self, branch: BranchId, role: &str) -> String {
+        let ep = self.endpoint_of(branch).await;
+        let sealed = self
+            .metadata
+            .role_password(&ep, role)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no revealable password for {role} on {ep}"));
+        open_role_password(&self.worker.key, &branch.to_string(), role, &sealed)
+            .expect("open the role's password")
+    }
+
+    async fn endpoint_of(&self, branch: BranchId) -> String {
+        self.metadata
+            .get_branch(branch)
+            .await
+            .unwrap()
+            .expect("branch row")
+            .endpoint_id
+            .expect("branch endpoint")
+    }
+
+    /// The `(name, origin)` of each copy on `ep` but the owner's, sorted.
+    async fn copies(&self, ep: &str) -> Vec<(String, RoleOrigin)> {
+        let (copies, _) = self.metadata.role_copies(ep).await.unwrap();
+        let mut rows: Vec<(String, RoleOrigin)> = copies
+            .into_iter()
+            .filter(|c| c.origin != RoleOrigin::Owner)
+            .map(|c| (c.name, c.origin))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// `rolname|super|createrole|createdb|bypassrls|replication|login` of `role` on `ep`.
+    async fn attributes(&self, ep: &str, role: &str) -> String {
+        self.value(
+            ep,
+            &format!(
+                "SELECT rolname || '|' || rolsuper || '|' || rolcreaterole || '|' || \
+                 rolcreatedb || '|' || rolbypassrls || '|' || rolreplication || '|' || \
+                 rolcanlogin FROM pg_roles WHERE rolname = '{role}';"
+            ),
+        )
+        .await
+    }
+
+    /// `direct|any`: direct `pg_auth_members` rows with `neon_superuser`, and membership at
+    /// any depth.
+    async fn membership(&self, ep: &str, role: &str) -> String {
+        self.value(
+            ep,
+            &format!(
+                "SELECT (SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member \
+                 WHERE r.rolname = '{role}' AND m.roleid = 'neon_superuser'::regrole) || '|' || \
+                 pg_has_role('{role}', 'neon_superuser', 'MEMBER');"
+            ),
+        )
+        .await
+    }
+
+    /// Asserts `role` exists on `ep` with no attributes but LOGIN and no `neon_superuser`.
+    async fn assert_plain(&self, ep: &str, role: &str) {
+        assert_eq!(
+            self.attributes(ep, role).await,
+            format!("{role}|false|false|false|false|false|true"),
+            "{role}'s attributes"
+        );
+        assert_eq!(
+            self.membership(ep, role).await,
+            "0|false",
+            "{role}'s neon_superuser membership (direct|any)"
+        );
+    }
+
+    /// SQL as the branch owner through the proxy, in the main database.
+    async fn owner(&self, sql: &str) -> Result<String, String> {
+        psql(
+            &self.ep,
+            &self.database,
+            "postgres",
+            &self.owner_password,
+            sql,
+        )
+        .await
+    }
+
+    /// Like [`Self::owner`], but the call must succeed.
+    async fn owner_ok(&self, sql: &str) -> String {
+        self.owner(sql)
+            .await
+            .unwrap_or_else(|e| panic!("as postgres: {sql}: {e}"))
+    }
+
+    /// Like [`Self::owner`], but the call must fail; the error.
+    async fn owner_err(&self, sql: &str) -> String {
+        match self.owner(sql).await {
+            Ok(out) => panic!("as postgres, {sql} succeeded: {out}"),
+            Err(e) => e,
+        }
+    }
+
+    fn branch_path(&self, branch: BranchId) -> String {
+        format!("/v1/databases/{}/branches/{branch}", self.id)
+    }
+
+    /// Makes a child of main (the worker's create job) and waits for it; its endpoint.
+    async fn child(&self, name: &str) -> (BranchId, String) {
+        self.child_at(name, None).await
+    }
+
+    /// [`Self::child`] at `at` (`None`: now).
+    async fn child_at(
+        &self,
+        name: &str,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> (BranchId, String) {
+        let child = BranchId::new();
+        let outcome = self
+            .metadata
+            .create_branch(&NewBranch {
+                id: child,
+                database_id: self.id,
+                name,
+                parent_branch_id: self.main,
+                branched_at_time: at,
+                branched_at_lsn: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreateBranchOutcome::Created);
+        let started = Instant::now();
+        self.worker
+            .handle_branch_job(BranchJob::Create {
+                branch_id: child,
+                at: at.map(PointInTime::Timestamp),
+            })
+            .await
+            .expect("create job");
+        println!("create branch {name} took {:?}", started.elapsed());
+        let record = self.metadata.get_branch(child).await.unwrap().unwrap();
+        assert_eq!(record.status, BranchStatus::Ready, "{:?}", record.error);
+        (child, record.endpoint_id.expect("child endpoint"))
+    }
+
+    /// A secret data key on `role` through the API; `(id, key)`.
+    async fn secret_key(&self, name: &str, role: &str) -> (String, String) {
+        let (status, body) = api(
+            "POST",
+            &format!("{}/keys", self.branch_path(self.main)),
+            Some(json!({ "name": name, "role": role })),
+        )
+        .await;
+        assert_eq!(status, 201, "create key {name} on {role}: {body}");
+        (
+            body["id"].as_str().unwrap().to_string(),
+            body["key"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// `listRoles`' row for `role` on main.
+    async fn listed_role(&self, role: &str) -> Value {
+        let (status, body) = api(
+            "GET",
+            &format!("{}/roles", self.branch_path(self.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        body.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == role)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// `GET …/databases` of main: `(name, origin)` sorted.
+    async fn listed_databases(&self) -> Vec<(String, String)> {
+        let (status, body) = api(
+            "GET",
+            &format!("{}/databases", self.branch_path(self.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let mut rows: Vec<(String, String)> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["name"].as_str().unwrap().to_string(),
+                    d["origin"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+}
+
+/// `'…'` with `'` doubled.
+fn literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// `"…"` with `"` doubled.
+fn ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn proxy_host(ep: &str) -> String {
+    let domain = std::env::var("CHELADB_PROXY_DOMAIN")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| "localtest.me".into());
+    format!("{ep}.{domain}")
+}
+
+fn proxy_ca() -> String {
+    let ca = workspace_root().join(".cheladb/neon/proxy-ca.crt");
+    assert!(
+        ca.exists(),
+        "{} is missing (run just deps-up)",
+        ca.display()
+    );
+    ca.display().to_string()
+}
+
+/// psql through the proxy on :4432 as `user` (passed in `PGUSER`, so any name works).
+fn psql_base(ep: &str, database: &str, user: &str, password: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("psql");
+    cmd.arg(format!(
+        "host={} hostaddr=127.0.0.1 port=4432 dbname={database} sslmode=verify-full sslrootcert={}",
+        proxy_host(ep),
+        proxy_ca()
+    ))
+    .env("PGUSER", user)
+    .env("PGPASSWORD", password)
+    .env("PGCONNECT_TIMEOUT", "10")
+    .kill_on_drop(true);
+    cmd
+}
+
+fn psql_command(
+    ep: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+    sql: &str,
+) -> tokio::process::Command {
+    let mut cmd = psql_base(ep, database, user, password);
+    cmd.args(["-X", "-qtA", "-v", "ON_ERROR_STOP=1", "-c", sql])
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// `sql` (one `-c`, so one implicit transaction) through the proxy as `user`: the output, or
+/// psql's error.
+async fn psql(
+    ep: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+    sql: &str,
+) -> Result<String, String> {
+    let out = psql_command(ep, database, user, password, sql)
+        .output()
+        .await
+        .expect("run psql");
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// A script on psql's stdin (autocommit, statement by statement, stop at the first error):
+/// the output, or psql's error.
+async fn psql_script(
+    ep: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+    script: &str,
+) -> Result<String, String> {
+    let mut child = psql_base(ep, database, user, password)
+        .args(["-X", "-qtA", "-v", "ON_ERROR_STOP=1", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn psql");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(script.as_bytes()).await.unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().await.unwrap();
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// `sql` through the proxy's SQL over HTTP on :4444 as `user`: `(status, body)`.
+async fn http_sql(
+    ep: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+    sql: &str,
+) -> (u16, String) {
+    let host = proxy_host(ep);
+    let body = json!({ "query": sql, "params": [] }).to_string();
+    let out = tokio::process::Command::new("curl")
+        .args(["-sS", "--max-time", "30", "--cacert", &proxy_ca()])
+        .args(["--resolve", &format!("{host}:4444:127.0.0.1")])
+        .args([
+            "-w",
+            "\n%{http_code}",
+            "-X",
+            "POST",
+            &format!("https://{host}:4444/sql"),
+        ])
+        .arg("-H")
+        .arg(format!(
+            "Neon-Connection-String: postgresql://{user}:{password}@{host}/{database}"
+        ))
+        .args(["-H", "content-type: application/json", "-d", &body])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run curl");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, status) = text.rsplit_once('\n').unwrap_or(("", &text));
+    (status.trim().parse().unwrap_or(0), body.to_string())
+}
+
+/// Asserts the login works on :4432 (and on /sql for plain names).
+async fn assert_logs_in(ep: &str, database: &str, user: &str, password: &str) {
+    let out = psql(ep, database, user, password, "SELECT current_user")
+        .await
+        .unwrap_or_else(|e| panic!("{user} on :4432: {e}"));
+    assert_eq!(out, user);
+    if user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        let (status, body) =
+            http_sql(ep, database, user, password, "SELECT current_user AS u").await;
+        assert_eq!(status, 200, "{user} on /sql: {body}");
+        assert!(body.contains(&format!("\"u\":\"{user}\"")), "{body}");
+    }
+}
+
+/// Asserts the proxy refuses the password on :4432 (and on /sql for plain names).
+async fn assert_refused(ep: &str, database: &str, user: &str, password: &str) {
+    match psql(ep, database, user, password, "SELECT 1").await {
+        Ok(_) => panic!("{user} logged in on :4432 with a password that should be refused"),
+        Err(e) => assert!(
+            e.contains(&format!("password authentication failed for user '{user}'")),
+            "unexpected refusal of {user} on :4432: {e}"
+        ),
+    }
+    if user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        let (status, body) = http_sql(ep, database, user, password, "SELECT 1").await;
+        assert_eq!(status, 400, "{user} on /sql: {body}");
+        assert!(
+            body.contains("password authentication failed"),
+            "{user} on /sql: {body}"
+        );
+    }
+}
+
+fn gateway() -> String {
+    std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into())
+}
+
+/// The built `cheladb` CLI, next to this test's own binary's directory.
+fn cheladb_cli() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let cli = exe.parent().unwrap().parent().unwrap().join("cheladb");
+    assert!(
+        cli.exists(),
+        "{} is missing (just dev builds it)",
+        cli.display()
+    );
+    cli
+}
+
+/// A management API call through the gateway as the demo tenant's user: `(status, body)`.
+async fn api(method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    let token = tokio::process::Command::new(cheladb_cli())
+        .args(["dev", "token"])
+        .current_dir(workspace_root())
+        .output()
+        .await
+        .expect("cheladb dev token");
+    assert!(token.status.success(), "cheladb dev token failed");
+    let token = String::from_utf8_lossy(&token.stdout).trim().to_string();
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-sS",
+        "--max-time",
+        "60",
+        "-w",
+        "\n%{http_code}",
+        "-X",
+        method,
+    ])
+    .arg(format!("{}{path}", gateway()))
+    .arg("-H")
+    .arg(format!("Authorization: Bearer {token}"));
+    if let Some(body) = body {
+        cmd.args([
+            "-H",
+            "content-type: application/json",
+            "-d",
+            &body.to_string(),
+        ]);
+    }
+    let out = cmd.stdin(Stdio::null()).output().await.expect("run curl");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, status) = text.rsplit_once('\n').unwrap_or(("", &text));
+    (
+        status.trim().parse().unwrap_or(0),
+        serde_json::from_str(body).unwrap_or(Value::Null),
+    )
+}
+
+/// A data API select on `table` with `key`: `(status, body)`.
+async fn data_select(key: &str, table: &str) -> (u16, Value) {
+    let out = tokio::process::Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "30",
+            "-w",
+            "\n%{http_code}",
+            "-X",
+            "POST",
+        ])
+        .arg(format!("{}/data/v1/query", gateway()))
+        .args(["-H", "content-type: application/json", "-H"])
+        .arg(format!("Authorization: Bearer {key}"))
+        .arg("-d")
+        .arg(json!({ "v": 1, "op": "select", "from": table }).to_string())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run curl");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, status) = text.rsplit_once('\n').unwrap_or(("", &text));
+    (
+        status.trim().parse().unwrap_or(0),
+        serde_json::from_str(body).unwrap_or(Value::Null),
+    )
+}
+
+/// Polls the data API with `key` until it answers `status` (at most `within`).
+async fn wait_for_data_status(key: &str, table: &str, status: u16, within: Duration) -> Value {
+    let deadline = Instant::now() + within;
+    loop {
+        let (got, body) = data_select(key, table).await;
+        if got == status {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the data API still answers {got} {body} after {within:?} (wanted {status})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+// --- `just dev`'s orchestrator, restarted with other settings -------------------------------
+
+const PIDS: &str = ".cheladb/dev/pids";
+
+async fn port_open(port: u16) -> bool {
+    tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok()
+}
+
+/// Stops `just dev`'s orchestrator (its whole process group) and waits for its ports to close.
+async fn stop_orchestrator() {
+    let path = workspace_root().join(PIDS);
+    let pids =
+        std::fs::read_to_string(&path).expect("read .cheladb/dev/pids (is just dev running?)");
+    let mut found = false;
+    let mut kept = Vec::new();
+    for pid in pids.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+        if cmd.contains("orchestrator") {
+            found = true;
+            let _ = std::process::Command::new("kill")
+                .args(["--", &format!("-{pid}")])
+                .status();
+        } else {
+            kept.push(pid);
+        }
+    }
+    assert!(found, "no orchestrator in {PIDS}");
+    std::fs::write(&path, kept.join("\n") + "\n").unwrap();
+    for _ in 0..100 {
+        if !port_open(8083).await && !port_open(8081).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("the orchestrator still listens 20 s after the kill");
+}
+
+/// Starts the orchestrator as `just dev` does (same environment as this test, plus `env`),
+/// records it in `.cheladb/dev/pids` in place of the old one, and waits for it to answer.
+async fn start_orchestrator(env: &[(&str, &str)]) {
+    use std::os::unix::process::CommandExt;
+    let root = workspace_root();
+    let log = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(root.join(".cheladb/dev/orchestrator.log"))
+        .unwrap();
+    // Detached like `just dev`'s apps: it outlives this test, and `just dev-down` stops it.
+    #[allow(clippy::zombie_processes)]
+    let child = std::process::Command::new("cargo")
+        .args(["run", "-q", "-p", "orchestrator"])
+        .current_dir(&root)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .process_group(0)
+        .spawn()
+        .expect("start the orchestrator");
+    let pid = child.id().to_string();
+    // First, as `just dev` writes it; `just dev-down` stops the group.
+    let path = root.join(PIDS);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, format!("{pid}\n{old}")).unwrap();
+    for _ in 0..600 {
+        if port_open(8083).await && port_open(8081).await {
+            println!("orchestrator up with {env:?}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("the orchestrator didn't come up within 120 s");
+}
+
+/// Runs `body` with the orchestrator restarted with `env` (`None`: stopped), then restarts it
+/// plain, pass or fail.
+async fn with_orchestrator<F, Fut>(env: Option<&'static [(&'static str, &'static str)]>, body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    stop_orchestrator().await;
+    if let Some(env) = env {
+        start_orchestrator(env).await;
+    }
+    let outcome = tokio::spawn(body()).await;
+    if env.is_some() {
+        stop_orchestrator().await;
+    }
+    start_orchestrator(&[]).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+// --- SQL-managed roles ----------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn forwarding_is_off_in_admin_sql() {
+    live(|fx| async move {
+        assert_eq!(fx.value(&fx.ep, "SHOW neon.forward_ddl;").await, "off");
+        // And on for everyone else, pointed at the receiver.
+        assert_eq!(fx.owner_ok("SHOW neon.forward_ddl").await, "on");
+        let url = fx.owner_ok("SHOW neon.console_url").await;
+        assert!(
+            url.ends_with(&format!("/compute/api/v2/computes/{}/ddl", fx.ep)),
+            "{url}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn migration_script_runs_through_the_proxy() {
+    live(|fx| async move {
+        let (ep, db) = (fx.ep.clone(), fx.database.clone());
+        let started = Instant::now();
+        fx.owner_ok("CREATE ROLE app LOGIN PASSWORD 'app-pass-one-111'")
+            .await;
+        println!("CREATE ROLE took {:?}", started.elapsed());
+        assert_logs_in(&ep, &db, "app", "app-pass-one-111").await;
+        assert_eq!(fx.copies(&ep).await, [("app".to_string(), RoleOrigin::Sql)]);
+
+        let started = Instant::now();
+        fx.owner_ok("ALTER ROLE app PASSWORD 'app-pass-two-222'")
+            .await;
+        println!("ALTER ROLE … PASSWORD took {:?}", started.elapsed());
+        assert_refused(&ep, &db, "app", "app-pass-one-111").await;
+        assert_logs_in(&ep, &db, "app", "app-pass-two-222").await;
+
+        // A rename clears an MD5 hash only; a SCRAM verifier keeps working under the new name.
+        fx.owner_ok("ALTER ROLE app RENAME TO app2").await;
+        assert_logs_in(&ep, &db, "app2", "app-pass-two-222").await;
+        assert_eq!(
+            fx.copies(&ep).await,
+            [("app2".to_string(), RoleOrigin::Sql)]
+        );
+
+        fx.owner_ok("CREATE TABLE t (n int); INSERT INTO t VALUES (7); GRANT SELECT ON t TO app2")
+            .await;
+        assert_eq!(
+            psql(&ep, &db, "app2", "app-pass-two-222", "SELECT n FROM t").await,
+            Ok("7".into())
+        );
+        let started = Instant::now();
+        fx.owner_ok("CREATE DATABASE extra").await;
+        println!("CREATE DATABASE took {:?}", started.elapsed());
+        assert_eq!(
+            psql(
+                &ep,
+                "extra",
+                "app2",
+                "app-pass-two-222",
+                "SELECT current_database()"
+            )
+            .await,
+            Ok("extra".into())
+        );
+        assert!(
+            fx.listed_databases()
+                .await
+                .contains(&("extra".into(), "sql".into()))
+        );
+
+        fx.owner_ok("REVOKE ALL ON t FROM app2").await;
+        fx.owner_ok("DROP ROLE app2").await;
+        assert_refused(&ep, &db, "app2", "app-pass-two-222").await;
+        assert_eq!(fx.copies(&ep).await, []);
+        assert_eq!(fx.role_count(&ep, "app2").await, "0");
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn quoted_names_work() {
+    live(|fx| async move {
+        let name = "My \"Role\"";
+        fx.owner_ok(&format!(
+            "CREATE ROLE {} LOGIN PASSWORD 'quoted-pass-333'",
+            ident(name)
+        ))
+        .await;
+        assert_logs_in(&fx.ep, &fx.database, name, "quoted-pass-333").await;
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [(name.to_string(), RoleOrigin::Sql)]
+        );
+
+        // Reset through the worker: the old password is refused, the revealed one works.
+        assert_eq!(fx.worker.reset_role(fx.main, name).await, RoleOutcome::Ok);
+        let fresh = fx.password(fx.main, name).await;
+        assert_logs_in(&fx.ep, &fx.database, name, &fresh).await;
+        assert_refused(&fx.ep, &fx.database, name, "quoted-pass-333").await;
+
+        // And through the API: the path parameter percent-encoded.
+        let (status, body) = api(
+            "GET",
+            &format!(
+                "{}/connection?role=My%20%22Role%22",
+                fx.branch_path(fx.main)
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["user"], name);
+        assert!(
+            body["uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("postgresql://My%20%22Role%22:"),
+            "{}",
+            body["uri"]
+        );
+
+        assert_eq!(fx.worker.delete_role(fx.main, name).await, RoleOutcome::Ok);
+        assert_eq!(fx.role_count(&fx.ep, name).await, "0");
+        assert_eq!(fx.copies(&fx.ep).await, []);
+        assert_refused(&fx.ep, &fx.database, name, &fresh).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn savepoint_and_multi_statement_transactions() {
+    live(|fx| async move {
+        psql_script(
+            &fx.ep,
+            &fx.database,
+            "postgres",
+            &fx.owner_password,
+            "BEGIN;
+             SAVEPOINT s;
+             CREATE ROLE sp_role LOGIN PASSWORD 'savepoint-pass-1';
+             ROLLBACK TO SAVEPOINT s;
+             CREATE ROLE kept LOGIN PASSWORD 'kept-pass-12345';
+             COMMIT;
+             BEGIN;
+             CREATE ROLE t_a LOGIN PASSWORD 'multi-pass-12345';
+             ALTER ROLE t_a RENAME TO t_b;
+             DROP ROLE t_b;
+             COMMIT;
+             DROP ROLE IF EXISTS ghost;",
+        )
+        .await
+        .expect("the script");
+        for gone in ["sp_role", "t_a", "t_b"] {
+            assert_eq!(fx.role_count(&fx.ep, gone).await, "0", "{gone}");
+        }
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [("kept".to_string(), RoleOrigin::Sql)]
+        );
+        assert_logs_in(&fx.ep, &fx.database, "kept", "kept-pass-12345").await;
+        assert_refused(&fx.ep, &fx.database, "sp_role", "savepoint-pass-1").await;
+
+        // A transaction that rolls back as a whole leaves no copy either.
+        psql_script(
+            &fx.ep,
+            &fx.database,
+            "postgres",
+            &fx.owner_password,
+            "BEGIN; CREATE ROLE rolled LOGIN PASSWORD 'rolled-pass-123'; ROLLBACK;",
+        )
+        .await
+        .expect("the rollback script");
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [("kept".to_string(), RoleOrigin::Sql)]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn restore_before_the_migration_and_rerun() {
+    live(|fx| async move {
+        const MIGRATION: &str = "CREATE ROLE mig LOGIN PASSWORD 'migration-pass-1'";
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let noted = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        fx.owner_ok(MIGRATION).await;
+        assert_logs_in(&fx.ep, &fx.database, "mig", "migration-pass-1").await;
+        // Past the receiver's 10 s window (R7), in which the resync leaves a fresh copy alone.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        // An API role made after the restore point.
+        fx.create(fx.main, "apir", false).await;
+        let apir = fx.password(fx.main, "apir").await;
+
+        let moved = fx
+            .metadata
+            .set_branch_status(fx.main, &[BranchStatus::Ready], BranchStatus::Resetting)
+            .await
+            .unwrap();
+        assert!(moved, "main was not ready");
+        let started = Instant::now();
+        fx.worker
+            .handle_branch_job(BranchJob::Restore {
+                branch_id: fx.main,
+                backup_id: BranchId::new(),
+                backup_name: "main-before-restore-20261002T120000Z".into(),
+                at: PointInTime::Timestamp(noted),
+            })
+            .await
+            .expect("restore job");
+        println!("restore took {:?}", started.elapsed());
+        let main = fx.metadata.get_branch(fx.main).await.unwrap().unwrap();
+        assert_eq!(main.status, BranchStatus::Ready, "{:?}", main.error);
+
+        // The SQL role is gone, catalog and copy; the API role came back.
+        assert_eq!(fx.role_count(&fx.ep, "mig").await, "0");
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [("apir".to_string(), RoleOrigin::Api)]
+        );
+        assert_refused(&fx.ep, &fx.database, "mig", "migration-pass-1").await;
+        assert_logs_in(&fx.ep, &fx.database, "apir", &apir).await;
+
+        // The migration runs again (no "already exists").
+        fx.owner_ok(MIGRATION).await;
+        assert_logs_in(&fx.ep, &fx.database, "mig", "migration-pass-1").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn child_keeps_passwords_owner_differs() {
+    live(|fx| async move {
+        fx.owner_ok("CREATE ROLE app LOGIN PASSWORD 'app-pass-child-1'")
+            .await;
+        fx.create(fx.main, "apir", false).await;
+        let apir = fx.password(fx.main, "apir").await;
+        let (child, child_ep) = fx.child("dev").await;
+
+        assert_eq!(
+            fx.copies(&child_ep).await,
+            [
+                ("apir".to_string(), RoleOrigin::Api),
+                ("app".to_string(), RoleOrigin::Sql)
+            ]
+        );
+        assert_logs_in(&child_ep, &fx.database, "app", "app-pass-child-1").await;
+        assert_logs_in(&child_ep, &fx.database, "apir", &apir).await;
+        // The child's owner has its own password.
+        assert_refused(&child_ep, &fx.database, "postgres", &fx.owner_password).await;
+        let record = fx.metadata.get_branch(child).await.unwrap().unwrap();
+        let child_owner = open_credential(
+            &fx.worker.key,
+            &child.to_string(),
+            Purpose::Owner,
+            record
+                .owner_password_enc
+                .as_deref()
+                .expect("child owner password"),
+        )
+        .unwrap();
+        assert_ne!(child_owner, fx.owner_password);
+        assert_logs_in(&child_ep, &fx.database, "postgres", &child_owner).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn protected_child_gets_fresh_passwords() {
+    live(|fx| async move {
+        fx.owner_ok("CREATE ROLE app LOGIN PASSWORD 'app-pass-protected'")
+            .await;
+        fx.create(fx.main, "apir", false).await;
+        let apir = fx.password(fx.main, "apir").await;
+        let (status, body) = api(
+            "PATCH",
+            &fx.branch_path(fx.main),
+            Some(json!({ "protected": true })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let (child, child_ep) = fx.child("dev").await;
+
+        for (role, parent_pw) in [("app", "app-pass-protected"), ("apir", apir.as_str())] {
+            assert_refused(&child_ep, &fx.database, role, parent_pw).await;
+            let fresh = fx.password(child, role).await;
+            assert_ne!(fresh, parent_pw, "{role}");
+            assert_logs_in(&child_ep, &fx.database, role, &fresh).await;
+        }
+        // The parent keeps its own.
+        assert_logs_in(&fx.ep, &fx.database, "app", "app-pass-protected").await;
+        assert_logs_in(&fx.ep, &fx.database, "apir", &apir).await;
+
+        // A protected child can't be deleted until it's unprotected.
+        let path = format!("/v1/databases/{}/branches/{child}", fx.id);
+        let (status, _) = api("PATCH", &path, Some(json!({ "protected": true }))).await;
+        assert_eq!(status, 200);
+        let (status, body) = api("DELETE", &path, None).await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], "branch_protected", "{body}");
+        let (status, _) = api("PATCH", &path, Some(json!({ "protected": false }))).await;
+        assert_eq!(status, 200);
+    })
+    .await;
+}
+
+// I3: a child of a protected parent at a point before a role was dropped on the parent has
+// that role in its catalog, though the parent's copies don't: it gets a fresh password too, so
+// the old one is refused on the child. A role without LOGIN that has a password gets one too.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn protected_child_at_a_past_point_refuses_a_dropped_roles_password() {
+    live(|fx| async move {
+        fx.owner_ok("CREATE ROLE gone LOGIN PASSWORD 'gone-pass-12345'")
+            .await;
+        fx.owner_ok("CREATE ROLE grp PASSWORD 'grp-pass-12345'").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let noted = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        fx.owner_ok("DROP ROLE gone").await;
+        fx.owner_ok("DROP ROLE grp").await;
+        assert_eq!(fx.copies(&fx.ep).await, []);
+        let (status, body) = api(
+            "PATCH",
+            &fx.branch_path(fx.main),
+            Some(json!({ "protected": true })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        let (child, child_ep) = fx.child_at("past", Some(noted)).await;
+
+        assert_eq!(fx.role_count(&child_ep, "gone").await, "1");
+        assert_refused(&child_ep, &fx.database, "gone", "gone-pass-12345").await;
+        let fresh = fx.password(child, "gone").await;
+        assert_ne!(fresh, "gone-pass-12345");
+        assert_logs_in(&child_ep, &fx.database, "gone", &fresh).await;
+        assert_eq!(
+            fx.copies(&child_ep).await,
+            [
+                ("gone".to_string(), RoleOrigin::Sql),
+                ("grp".to_string(), RoleOrigin::Sql)
+            ]
+        );
+        let grp = fx.password(child, "grp").await;
+        assert_ne!(grp, "grp-pass-12345");
+        // Unprotected again, so the cleanup can delete it.
+        let (status, _) = api(
+            "PATCH",
+            &fx.branch_path(fx.main),
+            Some(json!({ "protected": false })),
+        )
+        .await;
+        assert_eq!(status, 200);
+    })
+    .await;
+}
+
+// M7: an empty password. Postgres takes `PASSWORD ''` as no password (with a notice), but
+// Neon forwards the typed password and then finds no stored hash for it, so the compute fails
+// the statement before anything reaches the receiver: no role is made, and an existing role
+// keeps its password and its copy.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn empty_password_fails_in_the_compute() {
+    live(|fx| async move {
+        const REFUSED: &str = "has no password assigned";
+        let err = fx.owner_err("CREATE ROLE blank LOGIN PASSWORD ''").await;
+        assert!(
+            err.contains(&format!("Failed to get encrypted password: User \"blank\" {REFUSED}")),
+            "{err}"
+        );
+        assert_eq!(fx.role_count(&fx.ep, "blank").await, "0");
+        assert_eq!(fx.copies(&fx.ep).await, []);
+
+        fx.owner_ok("CREATE ROLE later LOGIN PASSWORD 'later-pass-12345'")
+            .await;
+        let err = fx.owner_err("ALTER ROLE later PASSWORD ''").await;
+        assert!(err.contains(REFUSED), "{err}");
+        assert_eq!(fx.copies(&fx.ep).await, [("later".to_string(), RoleOrigin::Sql)]);
+        assert_logs_in(&fx.ep, &fx.database, "later", "later-pass-12345").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn md5_refused() {
+    live(|fx| async move {
+        // `md5` || md5(password || user), as old pg_dumpall output has it.
+        let out = std::process::Command::new("bash")
+            .args(["-c", "printf %s 'md5-pass-12345m5' | md5sum | cut -c1-32"])
+            .output()
+            .unwrap();
+        let hash = format!("md5{}", String::from_utf8_lossy(&out.stdout).trim());
+        let err = fx
+            .owner_err(&format!("CREATE ROLE m5 LOGIN PASSWORD '{hash}'"))
+            .await;
+        assert!(
+            err.contains("MD5 passwords can't be used through Cheladb; set a plain password"),
+            "{err}"
+        );
+        assert_eq!(fx.role_count(&fx.ep, "m5").await, "0");
+        assert_eq!(fx.copies(&fx.ep).await, []);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn pg_dumpall_style_scram_accepted() {
+    live(|fx| async move {
+        let verifier = cheladb_neon::scram::verifier("dumped-pass-12345");
+        // As pg_dumpall writes it: CREATE ROLE, then ALTER ROLE … PASSWORD '<SCRAM verifier>'.
+        // (Without its NOSUPERUSER: Postgres lets only a superuser name that attribute.)
+        psql_script(
+            &fx.ep,
+            &fx.database,
+            "postgres",
+            &fx.owner_password,
+            &format!(
+                "CREATE ROLE dumped;\n\
+                 ALTER ROLE dumped WITH INHERIT NOCREATEROLE NOCREATEDB LOGIN \
+                 NOREPLICATION NOBYPASSRLS PASSWORD '{verifier}';\n"
+            ),
+        )
+        .await
+        .expect("the pg_dumpall lines");
+        assert_logs_in(&fx.ep, &fx.database, "dumped", "dumped-pass-12345").await;
+        let row = fx.listed_role("dumped").await;
+        assert_eq!(row["origin"], "sql", "{row}");
+        assert_eq!(row["password"], "set_in_sql", "{row}");
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn weak_password_with_strength_on() {
+    live(|fx| async move {
+        with_orchestrator(
+            Some(&[("CHELADB_PASSWORD_STRENGTH", "on")]),
+            move || async move {
+                let err = fx
+                    .owner_err("CREATE ROLE weak LOGIN PASSWORD 'abcdefgh123'")
+                    .await;
+                assert!(
+                    err.contains(
+                        "password too weak: use at least 12 characters and mix letters, digits \
+                     and symbols (about 60 bits)"
+                    ),
+                    "{err}"
+                );
+                assert!(
+                    !err.contains("abcdefgh123"),
+                    "the refusal echoes the password: {err}"
+                );
+                assert_eq!(fx.role_count(&fx.ep, "weak").await, "0");
+                // A strong one, and a pre-hashed one (self-hosted, Q6), pass.
+                fx.owner_ok("CREATE ROLE strong LOGIN PASSWORD 'Tr0ub4dor&3-Horse'")
+                    .await;
+                assert_logs_in(&fx.ep, &fx.database, "strong", "Tr0ub4dor&3-Horse").await;
+                let verifier = cheladb_neon::scram::verifier("short");
+                fx.owner_ok(&format!("CREATE ROLE hashed LOGIN PASSWORD '{verifier}'"))
+                    .await;
+                assert_logs_in(&fx.ep, &fx.database, "hashed", "short").await;
+            },
+        )
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn key_role_drop_refused() {
+    live(|fx| async move {
+        fx.owner_ok("CREATE ROLE kr LOGIN PASSWORD 'key-role-pass-1'")
+            .await;
+        let (key_id, _) = fx.secret_key("k1", "kr").await;
+        let err = fx.owner_err("DROP ROLE kr").await;
+        assert!(
+            err.contains("role \"kr\" backs data API key(s) k1; revoke them first"),
+            "{err}"
+        );
+        assert_eq!(fx.role_count(&fx.ep, "kr").await, "1");
+        assert_logs_in(&fx.ep, &fx.database, "kr", "key-role-pass-1").await;
+        // Once the key is revoked, the drop goes through.
+        let (status, body) = api(
+            "DELETE",
+            &format!("{}/keys/{key_id}", fx.branch_path(fx.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 204, "{body}");
+        fx.owner_ok("DROP ROLE kr").await;
+        assert_eq!(fx.copies(&fx.ep).await, []);
+    })
+    .await;
+}
+
+// Re-review: Neon sends `DROP ROLE kr; ALTER ROLE other RENAME TO kr` as the rename alone; a
+// live key on `kr` still refuses it, with the DROP's text, and nothing changes.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn drop_then_rename_onto_a_key_role_refused() {
+    live(|fx| async move {
+        fx.owner_ok("CREATE ROLE kr LOGIN PASSWORD 'key-role-pass-1'")
+            .await;
+        fx.owner_ok("CREATE ROLE other LOGIN PASSWORD 'other-pass-1'")
+            .await;
+        fx.secret_key("k1", "kr").await;
+        let err = fx
+            .owner_err("BEGIN; DROP ROLE kr; ALTER ROLE other RENAME TO kr; COMMIT;")
+            .await;
+        assert!(
+            err.contains("role \"kr\" backs data API key(s) k1; revoke them first"),
+            "{err}"
+        );
+        assert_eq!(fx.role_count(&fx.ep, "kr").await, "1");
+        assert_eq!(fx.role_count(&fx.ep, "other").await, "1");
+        assert_logs_in(&fx.ep, &fx.database, "kr", "key-role-pass-1").await;
+        assert_logs_in(&fx.ep, &fx.database, "other", "other-pass-1").await;
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [
+                ("kr".to_string(), RoleOrigin::Sql),
+                ("other".to_string(), RoleOrigin::Sql)
+            ]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn control_plane_down_fails_the_ddl() {
+    live(|fx| async move {
+        // The owner's session is opened first: the proxy needs the control plane to log in.
+        let mut session = psql_base(&fx.ep, &fx.database, "postgres", &fx.owner_password)
+            .args(["-X", "-qtA", "-v", "ON_ERROR_STOP=0", "-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn psql");
+        let mut stdin = session.stdin.take().unwrap();
+        let mut stdout = BufReader::new(session.stdout.take().unwrap()).lines();
+        stdin
+            .write_all(b"\\set VERBOSITY verbose\nSELECT 'ready';\n")
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(20), stdout.next_line())
+            .await
+            .expect("psql answered")
+            .unwrap();
+        assert_eq!(first.as_deref(), Some("ready"));
+
+        let fx2 = fx.clone();
+        with_orchestrator(None, move || async move {
+            let started = Instant::now();
+            stdin
+                .write_all(
+                    b"CREATE ROLE down_role LOGIN PASSWORD 'down-pass-12345';\n\
+                      CREATE TABLE still_works (n int);\n\
+                      SELECT 'done';\n",
+                )
+                .await
+                .unwrap();
+            drop(stdin);
+            let out = tokio::time::timeout(Duration::from_secs(60), session.wait_with_output())
+                .await
+                .expect("psql finished")
+                .unwrap();
+            println!("the refused DDL took {:?}", started.elapsed());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // The fork's F2: a clean message and SQLSTATE 55000, no internal address.
+            assert!(
+                stderr.contains(
+                    "ERROR:  55000: role and database changes are unavailable right now; try again"
+                ),
+                "unexpected error: {stderr}"
+            );
+            for leak in ["curl", "host.docker.internal", "control plane", "HTTP"] {
+                assert!(!stderr.contains(leak), "the error shows {leak:?}: {stderr}");
+            }
+            assert_eq!(fx2.role_count(&fx2.ep, "down_role").await, "0");
+            // Non-role DDL is unaffected.
+            assert_eq!(
+                fx2.sql("SELECT count(*) FROM pg_tables WHERE tablename = 'still_works';")
+                    .await
+                    .trim(),
+                "1"
+            );
+        })
+        .await;
+        assert_eq!(fx.copies(&fx.ep).await, []);
+        // With the control plane back, the same DDL works.
+        fx.owner_ok("CREATE ROLE down_role LOGIN PASSWORD 'down-pass-12345'")
+            .await;
+        assert_logs_in(&fx.ep, &fx.database, "down_role", "down-pass-12345").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn forwarding_off_then_resync_picks_up() {
+    live(|fx| async move {
+        fx.sql("CREATE ROLE quiet LOGIN PASSWORD 'quiet-pass-12345';")
+            .await;
+        assert_eq!(fx.copies(&fx.ep).await, [], "admin_sql forwarded");
+        assert_refused(&fx.ep, &fx.database, "quiet", "quiet-pass-12345").await;
+        let started = Instant::now();
+        fx.worker.resync(fx.main).await.expect("resync");
+        println!("resync took {:?}", started.elapsed());
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [("quiet".to_string(), RoleOrigin::Sql)]
+        );
+        assert_logs_in(&fx.ep, &fx.database, "quiet", "quiet-pass-12345").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn owner_level_by_sql_blocks_the_key() {
+    live(|fx| async move {
+        fx.create(fx.main, "api_admin", true).await;
+        let roles = ["by_bypassrls", "by_createdb", "by_membership"];
+        let mut setup = String::from("CREATE TABLE notes (id int PRIMARY KEY, body text);\n");
+        setup.push_str("INSERT INTO notes VALUES (1, 'n');\n");
+        for r in roles {
+            setup.push_str(&format!(
+                "CREATE ROLE {r} LOGIN PASSWORD '{r}-pass-123';\nGRANT SELECT ON notes TO {r};\n"
+            ));
+        }
+        psql_script(&fx.ep, &fx.database, "postgres", &fx.owner_password, &setup)
+            .await
+            .expect("setup");
+        let mut keys = Vec::new();
+        for r in roles {
+            let (id, key) = fx.secret_key(&format!("key-{r}"), r).await;
+            // A first read: rest caches the role as plain.
+            let body = wait_for_data_status(&key, "notes", 200, Duration::from_secs(30)).await;
+            assert_eq!(body, json!([{ "id": 1, "body": "n" }]));
+            keys.push((r, id, key));
+        }
+        let changed = Instant::now();
+        psql_script(
+            &fx.ep,
+            &fx.database,
+            "postgres",
+            &fx.owner_password,
+            "ALTER ROLE by_bypassrls BYPASSRLS;\n\
+             ALTER ROLE by_createdb CREATEDB;\n\
+             GRANT api_admin TO by_membership;\n",
+        )
+        .await
+        .expect("make them owner-level");
+        for (r, _, key) in &keys {
+            let body = wait_for_data_status(key, "notes", 403, Duration::from_secs(35)).await;
+            assert_eq!(body["error"]["code"], "role_not_allowed", "{r}: {body}");
+            println!("{r}: 403 after {:?}", changed.elapsed());
+        }
+        // listRoles' level comes from the resync (these ALTERs forward nothing to record):
+        // reconcile's next pass, every 30 s.
+        for (r, id, _) in &keys {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let row = loop {
+                let row = fx.listed_role(r).await;
+                if row["level"] == "owner_level" || Instant::now() >= deadline {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+            println!("{r}: listed as owner-level after {:?}", changed.elapsed());
+            assert_eq!(row["level"], "owner_level", "{r}: {row}");
+            assert_eq!(
+                row["blocked_keys"],
+                json!([{ "id": id, "name": format!("key-{r}") }]),
+                "{r}: {row}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn database_cap_refusal_leaves_no_database() {
+    live(|fx| async move {
+        with_orchestrator(
+            Some(&[("CHELADB_BRANCH_DATABASE_CAP", "2")]),
+            move || async move {
+                // main + one: the system `postgres` database isn't counted.
+                fx.owner_ok("CREATE DATABASE second").await;
+                let err = fx.owner_err("CREATE DATABASE third").await;
+                assert!(
+                    err.contains(
+                        "this branch has reached its limit of 2 databases \
+                     (CHELADB_BRANCH_DATABASE_CAP)"
+                    ),
+                    "{err}"
+                );
+                assert_eq!(
+                    fx.value(
+                        &fx.ep,
+                        "SELECT count(*) FROM pg_database WHERE datname = 'third';"
+                    )
+                    .await,
+                    "0"
+                );
+                let names: Vec<String> = fx
+                    .listed_databases()
+                    .await
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect();
+                assert!(!names.contains(&"third".to_string()), "{names:?}");
+                assert!(names.contains(&"second".to_string()), "{names:?}");
+            },
+        )
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn owner_can_use_roles_it_creates() {
+    live(|fx| async move {
+        // Q9: `createrole_self_grant = 'set, inherit'`. (`ALTER … OWNER TO` also needs the new
+        // owner to have CREATE on the schema: Postgres 15+'s rule, nothing of ours.)
+        let out = psql_script(
+            &fx.ep,
+            &fx.database,
+            "postgres",
+            &fx.owner_password,
+            "CREATE TABLE t (n int);
+             CREATE ROLE app LOGIN PASSWORD 'app-pass-q9-1234';
+             GRANT CREATE ON SCHEMA public TO app;
+             ALTER TABLE t OWNER TO app;
+             SET ROLE app;
+             SELECT current_user;
+             RESET ROLE;
+             SELECT tableowner FROM pg_tables WHERE tablename = 't';",
+        )
+        .await
+        .expect("the owner uses its new role");
+        assert_eq!(out, "app\napp");
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn main_database_drop_is_refused() {
+    live(|fx| async move {
+        let main = fx.database.clone();
+        // A key to watch the data API with.
+        fx.owner_ok(
+            "CREATE TABLE notes (id int); CREATE ROLE reader LOGIN PASSWORD 'reader-pass-123'; \
+             GRANT SELECT ON notes TO reader",
+        )
+        .await;
+        let (_, key) = fx.secret_key("watch", "reader").await;
+        wait_for_data_status(&key, "notes", 200, Duration::from_secs(30)).await;
+
+        // The fork refuses each form before it runs (neon.protected_databases), even FORCE,
+        // which would otherwise end the data API's pooled session.
+        let refused =
+            format!("ERROR:  42501: the branch's main database \"{main}\" can't be dropped");
+        for drop in [
+            format!("DROP DATABASE {}", ident(&main)),
+            format!("DROP DATABASE IF EXISTS {}", ident(&main)),
+            format!("DROP DATABASE {} WITH (FORCE)", ident(&main)),
+        ] {
+            let started = Instant::now();
+            let err = psql_script(
+                &fx.ep,
+                "postgres",
+                "postgres",
+                &fx.owner_password,
+                &format!("\\set VERBOSITY verbose\n{drop};\n"),
+            )
+            .await
+            .expect_err(&format!("{drop} succeeded"));
+            println!("{drop} refused in {:?}", started.elapsed());
+            assert!(err.contains(&refused), "{drop}: {err}");
+        }
+        assert_eq!(
+            fx.value(
+                &fx.ep,
+                &format!(
+                    "SELECT count(*) FROM pg_database WHERE datname = {} AND datconnlimit <> -2;",
+                    literal(&main)
+                ),
+            )
+            .await,
+            "1",
+            "main is still a valid database"
+        );
+        assert!(
+            fx.listed_databases()
+                .await
+                .contains(&(main.clone(), "main".into()))
+        );
+        let (status, branches) =
+            api("GET", &format!("/v1/databases/{}/branches", fx.id), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(branches[0]["main_database_missing"], false, "{branches}");
+        assert_eq!(data_select(&key, "notes").await.0, 200);
+
+        // A rename stays refused by the receiver. Postgres refuses a rename of a database in
+        // use first, so the data API's pooled session is ended (as cloud_admin) just before.
+        fx.sql_in(
+            &fx.ep,
+            "postgres",
+            &format!(
+                "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+                 WHERE datname = {};",
+                literal(&main)
+            ),
+        )
+        .await;
+        let err = psql(
+            &fx.ep,
+            "postgres",
+            "postgres",
+            &fx.owner_password,
+            &format!("ALTER DATABASE {} RENAME TO renamed_main", ident(&main)),
+        )
+        .await
+        .expect_err("main was renamed");
+        assert!(
+            err.contains(&format!(
+                "ERROR:  the branch's main database \"{main}\" can't be renamed"
+            )),
+            "{err}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn system_database_listed_and_connectable() {
+    live(|fx| async move {
+        // Right after the provision: no resync has to happen first.
+        let listed = fx.listed_databases().await;
+        assert!(
+            listed.contains(&("postgres".into(), "system".into())),
+            "{listed:?}"
+        );
+        let (status, body) = api(
+            "GET",
+            &format!("{}/connection?database=postgres", fx.branch_path(fx.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["database"], "postgres");
+        let out = psql(
+            &fx.ep,
+            "postgres",
+            "postgres",
+            body["password"].as_str().unwrap(),
+            "SELECT current_database()",
+        )
+        .await;
+        assert_eq!(out, Ok("postgres".into()));
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn owner_password_set_in_sql() {
+    live(|fx| async move {
+        fx.owner_ok("ALTER ROLE postgres PASSWORD 'owner-set-in-sql-1'")
+            .await;
+        assert_logs_in(&fx.ep, &fx.database, "postgres", "owner-set-in-sql-1").await;
+        assert_refused(&fx.ep, &fx.database, "postgres", &fx.owner_password).await;
+        let (status, body) = api(
+            "GET",
+            &format!("{}/connection", fx.branch_path(fx.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["password_state"], "set_in_sql", "{body}");
+        assert_eq!(body["password"], Value::Null, "{body}");
+
+        // The receiver's refusal reaches the client as its body exactly (fork F2: no
+        // "Received HTTP code …" prefix).
+        let err = psql(
+            &fx.ep,
+            &fx.database,
+            "postgres",
+            "owner-set-in-sql-1",
+            "ALTER ROLE postgres PASSWORD NULL",
+        )
+        .await
+        .expect_err("the owner's password was removed");
+        assert!(
+            err.contains("ERROR:  the branch owner's password can't be removed; reset it instead"),
+            "{err}"
+        );
+        assert!(!err.contains("Received HTTP code"), "{err}");
+        assert_logs_in(&fx.ep, &fx.database, "postgres", "owner-set-in-sql-1").await;
+    })
+    .await;
+}
+
+// --- API roles ------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn plain_role_logs_in_and_is_plain() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        let pw = fx.password(fx.main, "app").await;
+        assert_logs_in(&fx.ep, &fx.database, "app", &pw).await;
+        fx.assert_plain(&fx.ep, "app").await;
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [("app".to_string(), RoleOrigin::Api)]
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn owner_level_role_is_a_neon_superuser_member() {
+    live(|fx| async move {
+        fx.create(fx.main, "admin", true).await;
+        let pw = fx.password(fx.main, "admin").await;
+        assert_logs_in(&fx.ep, &fx.database, "admin", &pw).await;
+        assert_eq!(fx.membership(&fx.ep, "admin").await, "1|true");
+        // The owner's attributes (N1, "match the owner").
+        assert_eq!(
+            fx.attributes(&fx.ep, "admin").await,
+            "admin|false|true|true|true|true|true"
+        );
+        let (copies, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+        let admin = copies.iter().find(|c| c.name == "admin").unwrap();
+        assert_eq!(admin.level, RoleLevel::OwnerLevel);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn reset_applies_at_once() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        let old = fx.password(fx.main, "app").await;
+        // Cached by the proxy: only the reset's /password_updated can make it refuse.
+        assert_logs_in(&fx.ep, &fx.database, "app", &old).await;
+        let started = Instant::now();
+        assert_eq!(fx.worker.reset_role(fx.main, "app").await, RoleOutcome::Ok);
+        println!("reset took {:?}", started.elapsed());
+        let new = fx.password(fx.main, "app").await;
+        assert_ne!(old, new);
+        assert_logs_in(&fx.ep, &fx.database, "app", &new).await;
+        assert_refused(&fx.ep, &fx.database, "app", &old).await;
+        fx.assert_plain(&fx.ep, "app").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn reset_of_an_sql_role_makes_it_revealable() {
+    live(|fx| async move {
+        fx.owner_ok("CREATE ROLE app LOGIN PASSWORD 'app-pass-sql-reset'")
+            .await;
+        assert_eq!(fx.listed_role("app").await["password"], "set_in_sql");
+        assert_eq!(fx.worker.reset_role(fx.main, "app").await, RoleOutcome::Ok);
+        let fresh = fx.password(fx.main, "app").await;
+        assert_logs_in(&fx.ep, &fx.database, "app", &fresh).await;
+        assert_refused(&fx.ep, &fx.database, "app", "app-pass-sql-reset").await;
+        let row = fx.listed_role("app").await;
+        assert_eq!(row["password"], "generated", "{row}");
+        assert_eq!(row["origin"], "sql", "{row}");
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn delete_refuses_login_and_hands_objects_to_the_owner() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        let pw = fx.password(fx.main, "app").await;
+
+        // A database made in SQL, and CREATE on public in both, so app makes its own tables.
+        fx.owner_ok("CREATE DATABASE extra_db").await;
+        for db in [fx.database.as_str(), "extra_db"] {
+            fx.sql_in(&fx.ep, db, "GRANT CREATE ON SCHEMA public TO app;")
+                .await;
+            psql(&fx.ep, db, "app", &pw, "CREATE TABLE app_t (n int);")
+                .await
+                .unwrap_or_else(|e| panic!("app creates a table in {db}: {e}"));
+        }
+
+        // An open session of app's.
+        let mut session = psql_command(&fx.ep, &fx.database, "app", &pw, "SELECT pg_sleep(300)")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn psql");
+        let mut seen = false;
+        for _ in 0..50 {
+            let n = fx
+                .value(
+                    &fx.ep,
+                    "SELECT count(*) FROM pg_stat_activity WHERE usename = 'app';",
+                )
+                .await;
+            if n != "0" {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(seen, "app's session never showed in pg_stat_activity");
+
+        let started = Instant::now();
+        assert_eq!(fx.worker.delete_role(fx.main, "app").await, RoleOutcome::Ok);
+        println!("delete took {:?}", started.elapsed());
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), session.wait())
+            .await
+            .expect("app's session still open 10 s after the delete")
+            .unwrap();
+        assert!(!ended.success(), "the session's query finished normally");
+        assert_refused(&fx.ep, &fx.database, "app", &pw).await;
+        assert_eq!(fx.role_count(&fx.ep, "app").await, "0");
+        for db in [fx.database.as_str(), "extra_db"] {
+            let owner = fx
+                .sql_in(
+                    &fx.ep,
+                    db,
+                    "SELECT tableowner FROM pg_tables WHERE tablename = 'app_t';",
+                )
+                .await;
+            assert_eq!(owner.trim(), "postgres", "app_t's owner in {db}");
+        }
+        assert_eq!(fx.copies(&fx.ep).await, []);
+        assert_logs_in(&fx.ep, &fx.database, "postgres", &fx.owner_password).await;
+    })
+    .await;
+}
+
+// I1: a database name that isn't a plain identifier (here one with a hyphen) doesn't block
+// the delete: psql reaches it, and the role's table in it moves to the owner.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn delete_reaches_a_hyphenated_database() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        fx.owner_ok("CREATE DATABASE \"my-app\"").await;
+        fx.sql_in(
+            &fx.ep,
+            "my-app",
+            "GRANT CREATE ON SCHEMA public TO app; SET ROLE app; CREATE TABLE app_t (n int);",
+        )
+        .await;
+
+        assert_eq!(fx.worker.delete_role(fx.main, "app").await, RoleOutcome::Ok);
+
+        let owner = fx
+            .sql_in(
+                &fx.ep,
+                "my-app",
+                "SELECT tableowner FROM pg_tables WHERE tablename = 'app_t';",
+            )
+            .await;
+        assert_eq!(owner.trim(), "postgres", "app_t's owner in my-app");
+        assert_eq!(fx.role_count(&fx.ep, "app").await, "0");
+    })
+    .await;
+}
+
+// M4: an owner-level role that granted a role to another login role (so Postgres 16+ records it
+// as that membership's grantor) still deletes. (The owner makes the group and gives `admin`
+// ADMIN on it: revision 2's owner-level role is a `neon_superuser` member without CREATEROLE.)
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn delete_owner_level_role_that_granted_memberships() {
+    live(|fx| async move {
+        fx.create(fx.main, "admin", true).await;
+        fx.create(fx.main, "app", false).await;
+        let admin_pw = fx.password(fx.main, "admin").await;
+        let app_pw = fx.password(fx.main, "app").await;
+        // An owner-level role has the owner's attributes (N1): it makes roles and databases
+        // and bypasses RLS.
+        psql_script(
+            &fx.ep,
+            &fx.database,
+            "admin",
+            &admin_pw,
+            "CREATE ROLE app_group NOLOGIN;\nGRANT app_group TO app;\n\
+             CREATE DATABASE admin_made;\n",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("admin makes a role, grants it and makes a database: {e}"));
+        assert!(
+            fx.listed_databases()
+                .await
+                .contains(&("admin_made".to_string(), "sql".into())),
+            "admin's database is listed"
+        );
+        fx.owner_ok(
+            "CREATE TABLE secrets (n int); INSERT INTO secrets VALUES (1), (2); \
+             ALTER TABLE secrets ENABLE ROW LEVEL SECURITY; GRANT SELECT ON secrets TO app",
+        )
+        .await;
+        let count = |user: &'static str, pw: String| {
+            let fx = fx.clone();
+            async move {
+                psql(
+                    &fx.ep,
+                    &fx.database,
+                    user,
+                    &pw,
+                    "SELECT count(*) FROM secrets",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{user} reads secrets: {e}"))
+            }
+        };
+        assert_eq!(
+            count("admin", admin_pw.clone()).await,
+            "2",
+            "admin bypasses RLS"
+        );
+        assert_eq!(count("app", app_pw.clone()).await, "0", "app doesn't");
+        let grantor = |member: &'static str| {
+            format!(
+                "SELECT coalesce(string_agg(g.rolname, ','), '') FROM pg_auth_members m \
+                 JOIN pg_roles r ON r.oid = m.member JOIN pg_roles g ON g.oid = m.grantor \
+                 WHERE r.rolname = '{member}' AND m.roleid = 'app_group'::regrole;"
+            )
+        };
+        assert_eq!(fx.value(&fx.ep, &grantor("app")).await, "admin");
+
+        let started = Instant::now();
+        let outcome = fx.worker.delete_role(fx.main, "admin").await;
+        println!("delete took {:?}", started.elapsed());
+        assert_eq!(outcome, RoleOutcome::Ok);
+
+        assert_eq!(fx.role_count(&fx.ep, "admin").await, "0");
+        // The group itself stays (roles have no owner to reassign); admin's database goes to
+        // the owner.
+        assert_eq!(fx.role_count(&fx.ep, "app_group").await, "1");
+        assert_eq!(
+            fx.value(
+                &fx.ep,
+                "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'admin_made';"
+            )
+            .await,
+            "postgres"
+        );
+        // The memberships the role granted went with it.
+        assert_eq!(
+            fx.value(&fx.ep, &grantor("app")).await,
+            "",
+            "app's membership"
+        );
+        assert_logs_in(&fx.ep, &fx.database, "app", &app_pw).await;
+        fx.assert_plain(&fx.ep, "app").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn restore_before_the_role_brings_it_back() {
+    live(|fx| async move {
+        fx.sql("CREATE TABLE t (v text); INSERT INTO t VALUES ('A');")
+            .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let noted = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        fx.create(fx.main, "app", false).await;
+        let pw = fx.password(fx.main, "app").await;
+        assert_logs_in(&fx.ep, &fx.database, "app", &pw).await;
+
+        let moved = fx
+            .metadata
+            .set_branch_status(fx.main, &[BranchStatus::Ready], BranchStatus::Resetting)
+            .await
+            .unwrap();
+        assert!(moved, "main was not ready");
+        let started = Instant::now();
+        fx.worker
+            .handle_branch_job(BranchJob::Restore {
+                branch_id: fx.main,
+                backup_id: BranchId::new(),
+                backup_name: "app-before-restore-20261001T120000Z".into(),
+                at: PointInTime::Timestamp(noted),
+            })
+            .await
+            .expect("restore job");
+        println!("restore took {:?}", started.elapsed());
+        let main = fx.metadata.get_branch(fx.main).await.unwrap().unwrap();
+        assert_eq!(main.status, BranchStatus::Ready, "{:?}", main.error);
+        // The restore really rewound: a row written after the noted time would be gone; the
+        // role was made after it and is back, plain, with the same password.
+        assert_eq!(
+            fx.sql("SELECT string_agg(v, ',') FROM t;").await.trim(),
+            "A"
+        );
+        fx.assert_plain(&fx.ep, "app").await;
+        assert_logs_in(&fx.ep, &fx.database, "app", &pw).await;
+    })
+    .await;
+}

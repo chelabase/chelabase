@@ -36,12 +36,12 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('cheladb.schema_version')
          AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3";
 
 /// `s` as an SQL string literal (`quote_literal`): single quotes doubled.
-fn quote_literal(s: &str) -> String {
+pub(crate) fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
 /// `s` as a quoted SQL identifier (`quote_ident`, always quoted): double quotes doubled.
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
@@ -245,14 +245,18 @@ const SYSTEM_ROLES: &str = "'cheladb_admin', 'pg_execute_server_program', \
      'pg_read_server_files', 'pg_write_server_files'";
 
 /// One row for an existing role: `superuser`, `neon_superuser` (a member, at any depth),
-/// `system` (a member of a superuser role or of [`SYSTEM_ROLES`]) or `ok`. No row when it
-/// doesn't exist. Membership goes by oid over `pg_roles`, so a system role missing from the
-/// image matches nothing instead of failing.
+/// `owner_level` (CREATEROLE, CREATEDB, BYPASSRLS or REPLICATION: with the two before, Q3's
+/// one wide owner-level definition, as rest's `OWNER_LEVEL_SQL`), `system` (a member of a
+/// superuser role or of [`SYSTEM_ROLES`]) or `ok`. No row when it doesn't exist. Membership
+/// goes by oid over `pg_roles`, so a system role missing from the image matches nothing
+/// instead of failing.
 fn role_check_sql(role: &str) -> String {
     format!(
         "SET search_path = pg_catalog, pg_temp; SELECT CASE WHEN r.rolsuper THEN 'superuser' \
          WHEN EXISTS (SELECT FROM pg_roles s WHERE s.rolname = 'neon_superuser' \
          AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'neon_superuser' \
+         WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolbypassrls OR r.rolreplication \
+         THEN 'owner_level' \
          WHEN EXISTS (SELECT FROM pg_roles s WHERE (s.rolsuper OR s.rolname IN ({SYSTEM_ROLES})) \
          AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'system' \
          ELSE 'ok' END FROM pg_roles r WHERE r.rolname = {};",
@@ -475,8 +479,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Whether `role` may back a secret key on `branch`: a valid name, not reserved or
-    /// built-in (`pg_*`), existing, not a superuser, and not a member (at any depth) of a
-    /// superuser role, `neon_superuser` or the other system roles. On success it's granted
+    /// built-in (`pg_*`), existing, not a superuser, without CREATEROLE, CREATEDB, BYPASSRLS
+    /// or REPLICATION, and not a member (at any depth) of a superuser role, `neon_superuser`
+    /// or the other system roles. On success it's granted
     /// to `authenticator` (`set_config('role', …)` needs the membership).
     pub async fn check_data_role(&self, branch: BranchId, role: &str) -> RoleCheck {
         if let Some(refusal) = refuse_by_name(role) {
@@ -536,7 +541,17 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             "ok" => {}
             "" => return refused("does not exist"),
             "superuser" => return refused("is a superuser"),
-            "neon_superuser" => return refused("is a member of neon_superuser"),
+            "neon_superuser" => {
+                return refused(
+                    "is a member of neon_superuser (owner-level roles can't back a secret \
+                     key; use a plain role)",
+                );
+            }
+            "owner_level" => {
+                return refused(
+                    "is owner-level (owner-level roles can't back a secret key; use a plain role)",
+                );
+            }
             "system" => return refused("has system privileges"),
             other => {
                 warn!(branch_id = %branch, "checking role {role}: unexpected answer {other:?}");
@@ -610,7 +625,10 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(e, _, s)| e == ep && s.starts_with(&format!("{DATA_API}\n")))
+            // The resync's catalog read starts the same way.
+            .filter(|(e, _, s)| {
+                e == ep && s.starts_with(&format!("{DATA_API}\n")) && !s.contains("SELECT 'r',")
+            })
             .map(|(_, _, s)| s.clone())
             .collect()
     }
@@ -1222,6 +1240,8 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     async fn bootstrap_regrants_the_roles_of_live_secret_keys() {
         let (w, journal) = worker();
         let id = ready_database(&w).await;
+        // The provision's own SQL (its resync reads the catalog in `postgres`) isn't checked.
+        w.computes.sql.lock().unwrap().clear();
         let main = w.metadata.main(id);
         let ep = main.endpoint_id.clone().unwrap();
         {
@@ -1297,17 +1317,26 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             (
                 "owner",
                 "neon_superuser\n",
-                "the role owner is a member of neon_superuser",
+                "the role owner is a member of neon_superuser (owner-level roles can't \
+                 back a secret key; use a plain role)",
             ),
             (
                 "shell",
                 "system\n",
                 "the role shell has system privileges",
             ),
+            (
+                "wide",
+                "owner_level\n",
+                "the role wide is owner-level (owner-level roles can't back a secret key; use \
+                 a plain role)",
+            ),
         ];
         for (role, stdout, message) in cases {
             let (w, _journal) = worker();
             let id = ready_database(&w).await;
+            // The provision's own SQL (its resync reads the catalog in `postgres`).
+            w.computes.sql.lock().unwrap().clear();
             answer_check(&w, stdout);
             let main = BranchId::from(id);
             assert_eq!(
@@ -1326,6 +1355,21 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             assert_eq!(check.1, "app");
             assert_eq!(check.2, role_check_sql(role));
         }
+    }
+
+    #[tokio::test]
+    async fn check_role_refusal_names_plain_roles() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        answer_check(&w, "neon_superuser\n");
+
+        assert_eq!(
+            w.check_data_role(BranchId::from(id), "admin").await,
+            refused(
+                "the role admin is a member of neon_superuser (owner-level roles can't back \
+                 a secret key; use a plain role)"
+            )
+        );
     }
 
     #[test]
@@ -1352,6 +1396,37 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             assert!(sql.contains(system), "{system} in {sql}");
         }
         assert!(sql.contains("WHEN r.rolsuper THEN 'superuser'"), "{sql}");
+    }
+
+    // Q3's one wide owner-level definition, as rest's: each attribute on the role itself
+    // makes it owner-level (attributes aren't inherited; neon_superuser counts at any depth).
+    #[test]
+    fn the_check_sql_refuses_each_owner_level_attribute() {
+        let sql = role_check_sql("app");
+        let (_, owner_level) = sql
+            .split_once("WHEN r.rolcreaterole")
+            .map(|(a, b)| (a, format!("r.rolcreaterole{b}")))
+            .expect("an owner-level branch");
+        let owner_level = owner_level
+            .split_once("THEN 'owner_level'")
+            .expect("answered owner_level")
+            .0;
+        for attribute in [
+            "r.rolcreaterole",
+            "r.rolcreatedb",
+            "r.rolbypassrls",
+            "r.rolreplication",
+        ] {
+            assert!(owner_level.contains(attribute), "{attribute} in {sql}");
+        }
+        // After superuser and neon_superuser, before the system roles.
+        let at = |needle: &str| {
+            sql.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {sql}"))
+        };
+        assert!(at("THEN 'superuser'") < at("THEN 'neon_superuser'"));
+        assert!(at("THEN 'neon_superuser'") < at("THEN 'owner_level'"));
+        assert!(at("THEN 'owner_level'") < at("THEN 'system'"));
     }
 
     #[tokio::test]

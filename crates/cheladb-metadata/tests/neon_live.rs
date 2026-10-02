@@ -36,17 +36,20 @@ async fn endpoint(client: &MetadataClient) -> NeonEndpoint {
     sqlx::query("INSERT INTO neon_endpoints (id, tenant_id, timeline_id, compute_token_sha256) VALUES ($1, $2, $3, $4)")
         .bind(&ep.id).bind(&ep.tenant_id).bind(&ep.timeline_id).bind(&ep.compute_token_sha256)
         .execute(pool).await.unwrap();
-    for (name, verifier) in [("app", "SCRAM-SHA-256$app"), ("ro", "SCRAM-SHA-256$ro")] {
-        sqlx::query(
-            "INSERT INTO neon_roles (endpoint_id, name, scram_verifier) VALUES ($1, $2, $3)",
-        )
+    // `app` is the owner; `ro` is a role made through the API (an endpoint has one owner).
+    sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, 'app', 'SCRAM-SHA-256$app', 'owner')")
         .bind(&ep.id)
-        .bind(name)
-        .bind(verifier)
         .execute(pool)
         .await
         .unwrap();
-    }
+    sqlx::query(
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin, password_enc)
+         VALUES ($1, 'ro', 'SCRAM-SHA-256$ro', 'api', 'v1:ro')",
+    )
+    .bind(&ep.id)
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO neon_databases (endpoint_id, name, owner) VALUES ($1, 'app', 'app')")
         .bind(&ep.id)
         .execute(pool)
@@ -89,16 +92,10 @@ async fn finds_an_endpoint_its_roles_and_databases() {
         assert_eq!(client.neon_endpoint("ep-missing").await.unwrap(), None);
         assert_eq!(
             client.neon_roles(&ep.id).await.unwrap(),
-            vec![
-                NeonRole {
-                    name: "app".into(),
-                    scram_verifier: "SCRAM-SHA-256$app".into()
-                },
-                NeonRole {
-                    name: "ro".into(),
-                    scram_verifier: "SCRAM-SHA-256$ro".into()
-                },
-            ]
+            vec![NeonRole {
+                name: "app".into(),
+                scram_verifier: "SCRAM-SHA-256$app".into(),
+            }]
         );
         assert_eq!(
             client.neon_databases(&ep.id).await.unwrap(),
@@ -181,25 +178,25 @@ async fn needs_reconfigure(client: &MetadataClient, ep: &str) -> bool {
 
 #[tokio::test]
 #[ignore = "needs the metadata Postgres (just deps-up)"]
-async fn clear_needs_reconfigure_only_for_the_applied_verifier() {
+async fn clear_needs_reconfigure_only_for_the_applied_version() {
     with_endpoint(|client, ep| async move {
         sqlx::query("UPDATE neon_endpoints SET needs_reconfigure = true WHERE id = $1")
             .bind(&ep.id)
             .execute(client.pool())
             .await
             .unwrap();
+        let (_, version) = client.neon_roles_versioned(&ep.id).await.unwrap();
 
-        // A stale verifier (a newer reset landed meanwhile), an unknown role and an unknown
-        // endpoint leave the flag alone.
-        assert!(!client.clear_needs_reconfigure(&ep.id, "app", "SCRAM-SHA-256$old").await.unwrap());
-        assert!(!client.clear_needs_reconfigure(&ep.id, "nobody", "SCRAM-SHA-256$app").await.unwrap());
-        assert!(!client.clear_needs_reconfigure("ep-missing", "app", "SCRAM-SHA-256$app").await.unwrap());
+        // A stale version (a newer write landed meanwhile) and an unknown endpoint leave the
+        // flag alone.
+        assert!(!client.clear_needs_reconfigure(&ep.id, version + 1).await.unwrap());
+        assert!(!client.clear_needs_reconfigure("ep-missing", version).await.unwrap());
         assert!(needs_reconfigure(&client, &ep.id).await);
 
-        assert!(client.clear_needs_reconfigure(&ep.id, "app", "SCRAM-SHA-256$app").await.unwrap());
+        assert!(client.clear_needs_reconfigure(&ep.id, version).await.unwrap());
         assert!(!needs_reconfigure(&client, &ep.id).await);
         // Already clear: nothing to do.
-        assert!(!client.clear_needs_reconfigure(&ep.id, "app", "SCRAM-SHA-256$app").await.unwrap());
+        assert!(!client.clear_needs_reconfigure(&ep.id, version).await.unwrap());
     })
     .await;
 }
@@ -215,26 +212,27 @@ async fn replace_compute_token_stores_the_new_hash() {
     .await;
 }
 
-// A newer reset commits while the clear waits on the endpoint row: the clear must recheck the
-// committed verifier, not its old snapshot, or the newer password is never pushed.
+// A newer write commits while the clear waits on the endpoint row: the clear must recheck the
+// committed version, not its old snapshot, or the newer write is never pushed.
 #[tokio::test]
 #[ignore = "needs the metadata Postgres (just deps-up)"]
-async fn clear_needs_reconfigure_rechecks_the_verifier_after_a_lock_wait() {
+async fn clear_needs_reconfigure_rechecks_the_version_after_a_lock_wait() {
     with_endpoint(|client, ep| async move {
         sqlx::query("UPDATE neon_endpoints SET needs_reconfigure = true WHERE id = $1")
             .bind(&ep.id)
             .execute(client.pool())
             .await
             .unwrap();
+        let (_, version) = client.neon_roles_versioned(&ep.id).await.unwrap();
 
-        // Reset B, not yet committed: new verifier, flag set (same lock order as replace_owner_secret).
+        // Write B, not yet committed: it holds the endpoint row (every writer locks it first).
         let mut tx = client.pool().begin().await.unwrap();
         sqlx::query("UPDATE neon_roles SET scram_verifier = 'SCRAM-SHA-256$v2' WHERE endpoint_id = $1 AND name = 'app'")
             .bind(&ep.id)
             .execute(&mut *tx)
             .await
             .unwrap();
-        sqlx::query("UPDATE neon_endpoints SET needs_reconfigure = true WHERE id = $1")
+        sqlx::query("UPDATE neon_endpoints SET needs_reconfigure = true, roles_version = roles_version + 1 WHERE id = $1")
             .bind(&ep.id)
             .execute(&mut *tx)
             .await
@@ -242,12 +240,12 @@ async fn clear_needs_reconfigure_rechecks_the_verifier_after_a_lock_wait() {
 
         let (c, id) = (client.clone(), ep.id.clone());
         let clear = tokio::spawn(async move {
-            c.clear_needs_reconfigure(&id, "app", "SCRAM-SHA-256$app").await.unwrap()
+            c.clear_needs_reconfigure(&id, version).await.unwrap()
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         tx.commit().await.unwrap();
 
-        assert!(!clear.await.unwrap(), "cleared a flag whose verifier had changed");
+        assert!(!clear.await.unwrap(), "cleared a flag whose version had changed");
         assert!(needs_reconfigure(&client, &ep.id).await);
     })
     .await;

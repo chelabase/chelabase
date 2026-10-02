@@ -9,7 +9,7 @@ name: cheladb
 x-neon-images:
   neon: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a}
   # The image of the compute containers the worker starts (CHELADB_COMPUTE_IMAGE); pinned here.
-  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/cheladb/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93}
+  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/cheladb/neon-compute-v17:b2402faa2394-dev@sha256:7816c6b0543d9ea83a9c925ba5da733d39a38e6845cae6888ecd297123859e43}
 
 # S3 credentials for SeaweedFS. Local dev only.
 x-neon-s3-env: &neon-s3-env
@@ -359,7 +359,7 @@ services:
       # The proxy takes the endpoint domain from the certificate's CN.
       - --tls-cert=/tls/tls.crt
       - --tls-key=/tls/tls.key
-      - --project-info-cache=size=10000,ttl=1m,max_roles=10,gc_interval=60m
+      - --project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m
       - --redis-auth-type=plain
       - --redis-plain=redis://valkey:6379
     environment:

@@ -4,6 +4,7 @@ import {
   createKey,
   getListKeysQueryKey,
   rotateKey,
+  useListRoles,
   useRevokeKey,
   type CreatedDataKey,
   type DataKey,
@@ -29,6 +30,9 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
     queryClient.invalidateQueries({ queryKey: getListKeysQueryKey(id, branch) });
   // Revoking returns no secret, so it can be an ordinary mutation.
   const revoke = useRevokeKey({ mutation: { onSuccess: (_, { id, branchId: branch }) => refreshKeys(id, branch) } });
+  // Keys the data API refuses: named by their role's `blocked_keys`.
+  const roles = useListRoles(databaseId, branchId);
+  const blockedRole = (keyId: string) => roles.data?.find((r) => r.blocked_keys.some((b) => b.id === keyId))?.name;
   const [name, setName] = useState("");
   const [role, setRole] = useState("authenticated");
   const [shown, setShown] = useState<CreatedDataKey | null>(null);
@@ -98,7 +102,19 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
           <tbody>
             {secrets.map((k) => (
               <tr key={k.id} className="border-b last:border-0">
-                <td className="py-1">{k.name}</td>
+                <td className="py-1">
+                  {k.name}
+                  {blockedRole(k.id) && (
+                    <span className="mt-0.5 flex flex-col gap-0.5">
+                      <span className="w-fit rounded-full border border-destructive px-2 py-0.5 text-xs text-destructive">
+                        Blocked
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        the role {blockedRole(k.id)} can bypass row-level security
+                      </span>
+                    </span>
+                  )}
+                </td>
                 <td className="py-1 font-mono">{k.prefix}…</td>
                 <td className="py-1">{k.role}</td>
                 <td className="py-1">{k.last_used_at ? utc(k.last_used_at) : "never"}</td>

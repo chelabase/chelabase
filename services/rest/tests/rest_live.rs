@@ -631,6 +631,59 @@ async fn secret_key_custom_role() {
     .await;
 }
 
+/// Step 6a (Q3): a secret key whose role is owner-level — BYPASSRLS, CREATEDB, CREATEROLE,
+/// REPLICATION or `neon_superuser` at any depth — is refused before rest switches to it. A plain
+/// role next to them still reads.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn secret_key_of_an_owner_level_role_is_refused() {
+    live("ownerlvl", |l| async move {
+        l.owner(
+            "CREATE TABLE r (v text);
+             INSERT INTO r VALUES ('seen');
+             CREATE ROLE plain_reader NOLOGIN;
+             CREATE ROLE by_bypassrls NOLOGIN BYPASSRLS;
+             CREATE ROLE by_createdb NOLOGIN CREATEDB;
+             CREATE ROLE by_createrole NOLOGIN CREATEROLE;
+             CREATE ROLE by_group NOLOGIN;
+             CREATE ROLE by_depth NOLOGIN;
+             GRANT by_group TO by_depth;
+             GRANT USAGE ON SCHEMA public TO plain_reader, by_bypassrls, by_depth;
+             GRANT SELECT ON r TO plain_reader, by_bypassrls, by_depth;",
+        )
+        .await;
+        // The owner can't grant neon_superuser; cloud_admin can.
+        l.sql_on(l.main_id(), "GRANT neon_superuser TO by_group;")
+            .await;
+        assert_eq!(
+            l.worker.check_data_role(l.main_id(), "plain_reader").await,
+            RoleCheck::Ok
+        );
+        let select = json!({"v":1,"op":"select","from":"r"});
+        assert_eq!(
+            l.query_on(l.main_id(), DataKeyKind::Secret, "plain_reader", select.clone())
+                .await
+                .ok(),
+            &json!([{"v":"seen"}])
+        );
+        for role in ["by_bypassrls", "by_createdb", "by_createrole", "by_depth"] {
+            let answer = l
+                .query_on(l.main_id(), DataKeyKind::Secret, role, select.clone())
+                .await;
+            let error = answer.error(403, "role_not_allowed");
+            assert_eq!(
+                error["message"],
+                format!(
+                    "the role `{role}` of this key can bypass row-level security; make it \
+                     plain or use another role"
+                ),
+                "{role}"
+            );
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
 async fn rls_policy_is_enforced() {

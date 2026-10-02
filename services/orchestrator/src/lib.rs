@@ -8,16 +8,17 @@ use axum::{
 use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
 use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{
-    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseRecord, DatabaseStatus,
+    BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus,
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
-    SettingsPatch, TenantOverview,
+    PasswordState, RoleRow, SettingsPatch, TenantOverview,
 };
 use cheladb_nats::{
     BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
     ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
-    SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD,
+    RoleCreateRequest, RoleReply, RoleRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD,
+    SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
 };
-use cheladb_secrets::{open_credential, Purpose, SecretKey};
+use cheladb_secrets::{open_credential, open_role_password, Purpose, SecretKey};
 use cheladb_types::api_error::{ApiError, ErrorCode};
 use cheladb_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
 use cheladb_types::api_error::ErrorEnvelope;
@@ -36,6 +37,7 @@ mod data_keys;
 mod docs;
 pub mod internal;
 mod openapi;
+mod roles;
 pub use openapi::openapi;
 
 /// Port the Neon proxy serves the Postgres protocol on.
@@ -86,11 +88,12 @@ pub trait MetadataPort: Send + Sync + 'static {
         branch_id: BranchId,
     ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
 
-    /// Move to `deleting`; false when already deleting, deleted, or missing.
+    /// Move to `deleting`; `NotReady` when already deleting, deleted, or missing, `Protected`
+    /// while a live branch is protected.
     fn begin_delete(
         &self,
         database_id: DatabaseId,
-    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<BeginDelete, MetadataError>> + Send;
 
     /// The database's branches that aren't deleted, oldest first (backups included).
     fn list_branches(
@@ -125,11 +128,21 @@ pub trait MetadataPort: Send + Sync + 'static {
         to: BranchStatus,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
-    /// ready → resetting, clearing the last error; true when it claimed the branch.
+    /// ready → resetting, clearing the last error. With `allow_protected = false` a protected
+    /// branch isn't claimed (`Protected`).
     fn claim_branch_for_switch(
         &self,
         branch_id: BranchId,
-    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+        allow_protected: bool,
+    ) -> impl Future<Output = Result<ClaimOutcome, MetadataError>> + Send;
+
+    /// Sets a `normal` branch's protected flag; `None` for an unknown, backup or deleting
+    /// branch.
+    fn set_branch_protected(
+        &self,
+        branch_id: BranchId,
+        protected: bool,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
 
     fn set_branch_failed(
         &self,
@@ -178,6 +191,25 @@ pub trait MetadataPort: Send + Sync + 'static {
         old: Uuid,
         new: &NewDataKey,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// The endpoint's roles, the owner first.
+    fn list_roles(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<Vec<RoleRow>, MetadataError>> + Send;
+
+    /// A non-owner role's sealed password; `None` when there's no such row or nothing sealed.
+    fn role_password(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<String>, MetadataError>> + Send;
+
+    /// The branch's Postgres databases: the main one first, then by name.
+    fn branch_databases(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<BranchDatabase>, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -225,7 +257,7 @@ impl MetadataPort for MetadataClient {
         MetadataClient::get_branch(self, branch_id).await
     }
 
-    async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+    async fn begin_delete(&self, database_id: DatabaseId) -> Result<BeginDelete, MetadataError> {
         MetadataClient::begin_delete(self, database_id).await
     }
 
@@ -257,8 +289,20 @@ impl MetadataPort for MetadataClient {
         MetadataClient::set_branch_status(self, branch_id, from, to).await
     }
 
-    async fn claim_branch_for_switch(&self, branch_id: BranchId) -> Result<bool, MetadataError> {
-        MetadataClient::claim_branch_for_switch(self, branch_id).await
+    async fn claim_branch_for_switch(
+        &self,
+        branch_id: BranchId,
+        allow_protected: bool,
+    ) -> Result<ClaimOutcome, MetadataError> {
+        MetadataClient::claim_branch_for_switch(self, branch_id, allow_protected).await
+    }
+
+    async fn set_branch_protected(
+        &self,
+        branch_id: BranchId,
+        protected: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::set_branch_protected(self, branch_id, protected).await
     }
 
     async fn set_branch_failed(&self, branch_id: BranchId, error: &str) -> Result<(), MetadataError> {
@@ -299,6 +343,25 @@ impl MetadataPort for MetadataClient {
         new: &NewDataKey,
     ) -> Result<bool, MetadataError> {
         MetadataClient::rotate_data_key(self, branch, old, new).await
+    }
+
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
+        MetadataClient::list_roles(self, endpoint_id).await
+    }
+
+    async fn role_password(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, MetadataError> {
+        MetadataClient::role_password(self, endpoint_id, name).await
+    }
+
+    async fn branch_databases(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<BranchDatabase>, MetadataError> {
+        MetadataClient::branch_databases(self, branch).await
     }
 }
 
@@ -350,10 +413,50 @@ pub trait JobPort: Send + Sync + 'static {
         database_id: DatabaseId,
         branch_id: BranchId,
     ) -> impl Future<Output = Result<ResetPasswordReply, ResetError>> + Send;
+
+    /// Creates a login role on a branch.
+    fn create_role(
+        &self,
+        request: RoleCreateRequest,
+    ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
+
+    /// Resets a login role's password.
+    fn reset_role(
+        &self,
+        request: RoleRequest,
+    ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
+
+    /// Deletes a login role.
+    fn delete_role(
+        &self,
+        request: RoleRequest,
+    ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
 }
 
 /// How long the orchestrator waits for the worker to reset a password.
 const RESET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One request/reply to the worker on `subject`, waiting up to [`RESET_TIMEOUT`].
+async fn role_rpc<T: Serialize>(
+    client: &async_nats::Client,
+    subject: &'static str,
+    request: &T,
+) -> Result<RoleReply, ResetError> {
+    use async_nats::RequestErrorKind;
+    let body = serde_json::to_vec(request).map_err(|e| ResetError::Transport(e.to_string()))?;
+    let request = async_nats::Request::new()
+        .payload(body.into())
+        .timeout(Some(RESET_TIMEOUT));
+    let reply = client
+        .send_request(subject, request)
+        .await
+        .map_err(|e| match e.kind() {
+            RequestErrorKind::TimedOut => ResetError::Timeout,
+            RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
+            _ => ResetError::Transport(e.to_string()),
+        })?;
+    serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+}
 
 /// NATS-backed [`JobPort`]: JetStream for jobs, core request/reply for resets.
 #[derive(Clone)]
@@ -439,6 +542,18 @@ impl JobPort for NatsPorts {
             _ => ResetError::Transport(e.to_string()),
         })?;
         serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+    }
+
+    async fn create_role(&self, request: RoleCreateRequest) -> Result<RoleReply, ResetError> {
+        role_rpc(&self.client, SUBJECT_ROLE_CREATE, &request).await
+    }
+
+    async fn reset_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+        role_rpc(&self.client, SUBJECT_ROLE_RESET, &request).await
+    }
+
+    async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+        role_rpc(&self.client, SUBJECT_ROLE_DELETE, &request).await
     }
 }
 
@@ -789,6 +904,7 @@ where
         .routes(routes!(me))
         .merge(branches::routes())
         .merge(data_keys::routes())
+        .merge(roles::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
@@ -1065,16 +1181,37 @@ pub(crate) struct OperationAccepted {
     pub(crate) status: &'static str,
 }
 
-/// The owner credentials of a branch.
+/// How to connect to a branch as one of its roles.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ConnectionDetails {
     host: String,
     port: u16,
     database: String,
     user: String,
-    password: String,
+    /// Null when it can't be shown; `password_state` says why.
+    #[schema(required = true)]
+    password: Option<String>,
+    /// `generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is
+    /// stored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy
+    /// can't use; set a new password.
+    password_state: PasswordState,
+    /// Without a password when `password` is null. The user and database are
+    /// percent-encoded.
     uri: String,
     http_url: String,
+}
+
+/// Percent-encodes everything but RFC 3986's unreserved characters.
+fn uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// What a backup answers to reveal, reset-password, reset-to-parent and restore.
@@ -1129,15 +1266,18 @@ where
         Ok(main) => main,
         Err(resp) => return resp.into_response(),
     };
-    reveal(&state, &principal, &record, main).await
+    reveal(&state, &principal, &record, main, None, None).await
 }
 
-/// The owner credentials of `branch`, a branch of `record`'s database.
+/// The connection details of `branch`, a branch of `record`'s database, as `role` (the owner
+/// by default) for `database` (the recorded main database by default).
 async fn reveal<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
     record: &DatabaseRecord,
     branch: Option<BranchRecord>,
+    role: Option<&str>,
+    database: Option<&str>,
 ) -> Response
 where
     M: MetadataPort,
@@ -1165,9 +1305,17 @@ where
         )
         .into_response();
     }
+    let owner = roles::owner_name(record).to_string();
+    // The owner by default or by name; any other name is a role of the branch.
+    let other_role = role.filter(|name| *name != owner);
+    if let Some(name) = other_role
+        && let Err(err) = roles::check_any_name(name)
+    {
+        return err.into_response();
+    }
     let sealed = branch.owner_password_enc.filter(|s| !s.is_empty());
-    let (Some(endpoint_id), Some(database), Some(sealed)) =
-        (branch.endpoint_id, record.database_name.clone(), sealed)
+    // The recorded main database is the default, even while it's missing (R24).
+    let (Some(endpoint_id), Some(main_database)) = (branch.endpoint_id, record.database_name.clone())
     else {
         return ApiError::new(
             409,
@@ -1176,36 +1324,94 @@ where
         )
         .into_response();
     };
-    let password = match open_credential(
-        &state.secrets,
-        &branch.id.to_string(),
-        Purpose::Owner,
-        &sealed,
-    ) {
-        Ok(password) => password,
-        Err(err) => {
-            error!(database_id = %record.database_id, branch_id = %branch.id, "decrypt owner password: {err}");
-            return ApiError::new(
-                500,
-                ErrorCode::CredentialsUnavailable,
-                "stored credentials can't be decrypted with the current secrets key; \
-                 restore the original CHELADB_SECRETS_KEY file",
-            )
-            .into_response();
+    let credentials_unreadable = || {
+        ApiError::new(
+            500,
+            ErrorCode::CredentialsUnavailable,
+            "stored credentials can't be decrypted with the current secrets key; \
+             restore the original CHELADB_SECRETS_KEY file",
+        )
+        .into_response()
+    };
+    let (user, password, password_state) = match other_role {
+        None => match sealed {
+            // No sealed password: the owner's was set in SQL.
+            None => (owner, None, PasswordState::SetInSql),
+            Some(sealed) => {
+                match open_credential(&state.secrets, &branch.id.to_string(), Purpose::Owner, &sealed) {
+                    Ok(password) => (owner, Some(password), PasswordState::Generated),
+                    Err(err) => {
+                        error!(database_id = %record.database_id, branch_id = %branch.id, "decrypt owner password: {err}");
+                        return credentials_unreadable();
+                    }
+                }
+            }
+        },
+        Some(name) => {
+            let rows = match state.metadata.list_roles(&endpoint_id).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    error!(branch_id = %branch.id, "list roles: {err}");
+                    return ApiError::internal().into_response();
+                }
+            };
+            let Some(row) = rows.into_iter().find(|r| r.name == name) else {
+                return ApiError::not_found("role not found").into_response();
+            };
+            let password = if row.password == PasswordState::Generated {
+                let sealed = match state.metadata.role_password(&endpoint_id, name).await {
+                    Ok(sealed) => sealed,
+                    Err(err) => {
+                        error!(branch_id = %branch.id, "load role password: {err}");
+                        return ApiError::internal().into_response();
+                    }
+                };
+                match sealed {
+                    Some(sealed) => {
+                        match open_role_password(&state.secrets, &branch.id.to_string(), name, &sealed) {
+                            Ok(password) => Some(password),
+                            Err(err) => {
+                                error!(branch_id = %branch.id, role = %name, "decrypt role password: {err}");
+                                return credentials_unreadable();
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            (name.to_string(), password, row.password)
         }
     };
-    let user = record.owner_role.clone().unwrap_or_else(|| "postgres".to_string());
+    let database = match database {
+        None => main_database,
+        Some(name) => match state.metadata.branch_databases(branch.id).await {
+            Ok(rows) if rows.iter().any(|d| d.name == name) => name.to_string(),
+            Ok(_) => return ApiError::not_found("database not found").into_response(),
+            Err(err) => {
+                error!(branch_id = %branch.id, "list branch databases: {err}");
+                return ApiError::internal().into_response();
+            }
+        },
+    };
     info!(
         request_id = %principal.request_id,
         sub = %principal.sub,
         database_id = %record.database_id,
         branch_id = %branch.id,
+        role = %user,
         "revealed connection details"
     );
     let host = proxy_host(&endpoint_id, &state.proxy_domain);
     let port = PROXY_PG_PORT;
+    let userinfo = match &password {
+        Some(password) => format!("{}:{}", uri_component(&user), uri_component(password)),
+        None => uri_component(&user),
+    };
     let uri = format!(
-        "postgresql://{user}:{password}@{host}:{port}/{database}?sslmode=verify-full"
+        "postgresql://{userinfo}@{host}:{port}/{}?sslmode=verify-full",
+        uri_component(&database)
     );
     let http_url = format!("https://{host}:{PROXY_HTTP_PORT}/sql");
     (
@@ -1216,6 +1422,7 @@ where
             database,
             user,
             password,
+            password_state,
             uri,
             http_url,
         }),
@@ -1349,7 +1556,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
-        (status = 409, description = "`already_deleting`: the database is already being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`already_deleting`: the database is already being deleted; `branch_protected`: a branch of the database is protected, unprotect it first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -1367,8 +1574,16 @@ where
         Err(resp) => return resp.into_response(),
     };
     match state.metadata.begin_delete(record.database_id).await {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(BeginDelete::Started) => {}
+        Ok(BeginDelete::Protected) => {
+            return ApiError::new(
+                409,
+                ErrorCode::BranchProtected,
+                "a branch of this database is protected; unprotect it first",
+            )
+            .into_response()
+        }
+        Ok(BeginDelete::NotReady) => {
             return ApiError::new(409, ErrorCode::AlreadyDeleting, "database is already being deleted")
                 .into_response()
         }

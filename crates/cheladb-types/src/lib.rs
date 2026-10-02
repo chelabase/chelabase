@@ -2,6 +2,9 @@
 
 pub mod data_api_schema;
 pub mod data_key;
+pub mod role_name;
+pub mod role_password;
+pub mod role_settings;
 pub mod api_error;
 #[cfg(feature = "axum")]
 pub mod api_extract;

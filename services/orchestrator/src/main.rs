@@ -1,7 +1,10 @@
 use cheladb_auth::internal::InternalVerifier;
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{connect, ensure_control_stream, NatsConfig};
+use cheladb_neon::proxy_cache::ProxyCache;
 use cheladb_neon::{DockerLocator, StorconClient};
+use cheladb_types::mode::Mode;
+use cheladb_types::role_settings::RoleSettings;
 use cheladb_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
 use orchestrator::{build_router, AppState, NatsPorts, RestInternal};
@@ -27,6 +30,11 @@ async fn main() -> anyhow::Result<()> {
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
     let internal_config = InternalConfig::from_env()?;
     let signer = internal_config.load_signer()?;
+    let roles = RoleSettings::from_lookup(
+        Mode::from_env().map_err(anyhow::Error::msg)?,
+        |name| std::env::var(name).ok(),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let metadata = MetadataClient::connect(&metadata_config).await?;
     metadata.migrate().await?;
@@ -51,6 +59,9 @@ async fn main() -> anyhow::Result<()> {
         data_keys_token: internal_config.data_keys_token.clone(),
         rest_token: internal_config.rest_token.clone(),
         secrets: secrets.clone(),
+        roles,
+        cache: Arc::new(ProxyCache::new(&internal_config.valkey_url)?),
+        control_plane_uri: internal_config.control_plane_uri.clone(),
     });
 
     let state = AppState {

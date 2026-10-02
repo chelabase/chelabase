@@ -165,6 +165,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             owner_role: OWNER_ROLE,
             owner_verifier: &verifier,
             database_name: &rec.database_name,
+            role_copies: &[],
         };
         match self
             .metadata
@@ -227,6 +228,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.bootstrap_data_api_on(BranchId::from(id), ep, &rec.database_name)
             .await
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
+        self.record_compute_settings(ep).await;
+        // Lists the branch's databases (the system `postgres` one included) from the start. A
+        // failure only logs: reconcile's resync catches up.
+        if let Err(err) = self.resync(BranchId::from(id)).await {
+            warn!(database_id = %id, endpoint_id = %ep, "{err}; reconcile retries");
+        }
         Ok(Built::Compute)
     }
 
@@ -436,6 +443,10 @@ GRANT anon, authenticated TO authenticator;
         assert_eq!(stored.databases.len(), 1);
         assert_eq!(stored.databases[0].name, "web_1_prod");
         assert_eq!(stored.databases[0].owner, "postgres");
+        assert_eq!(
+            stored.compute_settings_version,
+            crate::COMPUTE_SETTINGS_VERSION
+        );
         assert!(w.storage.has_tenant(&stored.endpoint.tenant_id));
         assert_eq!(db.neon_tenant_id.as_ref(), Some(&stored.endpoint.tenant_id));
         assert_eq!(main.timeline_id.as_ref(), Some(&stored.endpoint.timeline_id));
@@ -468,9 +479,59 @@ GRANT anon, authenticated TO authenticator;
             pos(&journal, "compute.create"),
             pos(&journal, &format!("compute.sql {ep} web_1_prod SELECT 1")),
             pos(&journal, &format!("compute.sql {ep} web_1_prod DO $$")),
+            pos(&journal, "metadata.set_compute_settings_version"),
             pos(&journal, "metadata.set_branch_ready"),
         ];
         assert!(order.is_sorted(), "{:?}", entries(&journal));
+    }
+
+    /// Q8: the system `postgres` database is listed from the start, so the provision ends with
+    /// a resync (before the branch is ready) rather than leaving it to reconcile's round robin.
+    #[tokio::test]
+    async fn provision_resyncs_so_the_system_database_is_listed() {
+        let (w, journal) = worker();
+        let line = |name: &str, owner: &str, system: bool| {
+            format!(
+                "d|{}||{}|{}||\n",
+                hex::encode(name),
+                hex::encode(owner),
+                if system { "t" } else { "f" }
+            )
+        };
+        w.computes.answer(
+            "FROM pg_authid",
+            &format!(
+                "{}{}",
+                line("app", "postgres", false),
+                line("postgres", "cloud_admin", true)
+            ),
+        );
+        let id = provision(&w, "app").await;
+        assert_eq!(w.metadata.database(id).status, DatabaseStatus::Ready);
+        let ep = w.metadata.main(id).endpoint_id.unwrap();
+        let state = w.metadata.state();
+        let listed: Vec<(&str, bool)> = state.endpoints[&ep]
+            .branch_databases
+            .iter()
+            .map(|d| (d.name.as_str(), d.system))
+            .collect();
+        assert_eq!(listed, [("app", false), ("postgres", true)]);
+        drop(state);
+        let order = [
+            pos(&journal, "metadata.set_compute_settings_version"),
+            pos(&journal, "metadata.apply_resync"),
+            pos(&journal, "metadata.set_branch_ready"),
+        ];
+        assert!(order.is_sorted(), "{:?}", entries(&journal));
+    }
+
+    /// A failed resync doesn't fail the provision: reconcile's resync catches up.
+    #[tokio::test]
+    async fn a_failed_resync_still_provisions() {
+        let (w, _journal) = worker();
+        w.computes.answer("FROM pg_authid", "garbage\n");
+        let id = provision(&w, "app").await;
+        assert_eq!(w.metadata.database(id).status, DatabaseStatus::Ready);
     }
 
     #[tokio::test]

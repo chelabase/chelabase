@@ -25,21 +25,26 @@ import type {
 
 import type {
   Branch,
+  BranchDatabaseView,
+  BranchRole,
   ConnectionDetails,
   CreateBranchRequest,
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
   CreateKeyRequest,
+  CreateRoleRequest,
   CreatedDataKey,
   DataApiSchema,
   DataKey,
   Database,
   DatabaseSettings,
   ErrorEnvelope,
+  GetBranchConnectionParams,
   Me,
   OperationAccepted,
   RestoreAccepted,
   RestoreRequest,
+  UpdateBranchRequest,
   UpdateDatabaseRequest
 } from './model';
 
@@ -160,7 +165,7 @@ export const getGetDatabaseUrl = (id: string,) => {
 
 
 
-  return `/v1/databases/${id}`
+  return `/v1/databases/${encodeURIComponent(String(id))}`
 }
 
 /**
@@ -261,7 +266,7 @@ export const getDeleteDatabaseUrl = (id: string,) => {
 
 
 
-  return `/v1/databases/${id}`
+  return `/v1/databases/${encodeURIComponent(String(id))}`
 }
 
 /**
@@ -335,7 +340,7 @@ export const getUpdateDatabaseUrl = (id: string,) => {
 
 
 
-  return `/v1/databases/${id}`
+  return `/v1/databases/${encodeURIComponent(String(id))}`
 }
 
 /**
@@ -425,7 +430,7 @@ export const getListBranchesUrl = (id: string,) => {
 
 
 
-  return `/v1/databases/${id}/branches`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches`
 }
 
 /**
@@ -527,7 +532,7 @@ export const getCreateBranchUrl = (id: string,) => {
 
 
 
-  return `/v1/databases/${id}/branches`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches`
 }
 
 /**
@@ -618,7 +623,7 @@ export const getDeleteBranchUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}`
 }
 
 /**
@@ -688,23 +693,124 @@ export const useDeleteBranch = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getDeleteBranchMutationOptions(options), queryClient);
     }
 
-export const getGetBranchConnectionUrl = (id: string,
+export const getUpdateBranchUrl = (id: string,
     branchId: string,) => {
 
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/connection`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}`
 }
 
 /**
- * The owner credentials of the branch. Never cached (`Cache-Control: no-store`) and never logged.
+ * Sets the branch's `protected` flag. A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included.
+ * @summary Protect or unprotect a branch
+ */
+export const updateBranch = async (id: string,
+    branchId: string,
+    updateBranchRequest: UpdateBranchRequest, options?: Parameters<typeof customFetch>[1]): Promise<Branch> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Branch>(getUpdateBranchUrl(id,branchId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateBranchRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateBranchMutationKey = () => ['updateBranch'] as const;
+
+export const getUpdateBranchMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateBranch>>, TError,UpdateBranchMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateBranch>>, TError,UpdateBranchMutationVariables, TContext> => {
+
+const mutationKey = getUpdateBranchMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateBranch>>, UpdateBranchMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  updateBranch(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateBranchMutationResult = NonNullable<Awaited<ReturnType<typeof updateBranch>>>
+    export type UpdateBranchMutationBody = UpdateBranchRequest
+    export type UpdateBranchMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateBranchMutationVariables = {id: string;branchId: string;data: UpdateBranchRequest}
+
+    /**
+ * @summary Protect or unprotect a branch
+ */
+export const useUpdateBranch = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateBranch>>, TError,UpdateBranchMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateBranch>>,
+        TError,
+        UpdateBranchMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateBranchMutationOptions(options), queryClient);
+    }
+
+export const getGetBranchConnectionUrl = (id: string,
+    branchId: string,
+    params?: GetBranchConnectionParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/connection?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/connection`
+}
+
+/**
+ * The connection details of the branch's owner, or of the role named by `role`, for its main database or the one named by `database`. `password` is null, with the reason in `password_state`, when it can't be shown: a role whose password was set in SQL (only its hash is stored) or has an MD5 hash the proxy can't use; the `uri` then has no password. Never cached (`Cache-Control: no-store`) and never logged.
  * @summary Reveal a branch's connection details
  */
 export const getBranchConnection = async (id: string,
-    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<ConnectionDetails> => {
+    branchId: string,
+    params?: GetBranchConnectionParams, options?: Parameters<typeof customFetch>[1]): Promise<ConnectionDetails> => {
 
-  return customFetch<ConnectionDetails>(getGetBranchConnectionUrl(id,branchId),
+  return customFetch<ConnectionDetails>(getGetBranchConnectionUrl(id,branchId,params),
   {
     ...options,
     method: 'GET'
@@ -718,24 +824,26 @@ export const getBranchConnection = async (id: string,
 
 
 export const getGetBranchConnectionQueryKey = (id: string,
-    branchId: string,) => {
+    branchId: string,
+    params?: GetBranchConnectionParams,) => {
     return [
-    `/v1/databases/${id}/branches/${branchId}/connection`
+    `/v1/databases/${id}/branches/${branchId}/connection`, ...(params ? [params] : [])
     ] as const;
     }
 
 
 export const getGetBranchConnectionQueryOptions = <TData = Awaited<ReturnType<typeof getBranchConnection>>, TError = ErrorType<ErrorEnvelope>>(id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+    branchId: string,
+    params?: GetBranchConnectionParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
 ) => {
 
 const {query: queryOptions, request: requestOptions} = options ?? {};
 
-  const queryKey =  queryOptions?.queryKey ?? getGetBranchConnectionQueryKey(id,branchId);
+  const queryKey =  queryOptions?.queryKey ?? getGetBranchConnectionQueryKey(id,branchId,params);
 
 
 
-    const queryFn: QueryFunction<Awaited<ReturnType<typeof getBranchConnection>>> = ({ signal }) => getBranchConnection(id,branchId, { signal, ...requestOptions });
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getBranchConnection>>> = ({ signal }) => getBranchConnection(id,branchId,params, { signal, ...requestOptions });
 
 
 
@@ -750,7 +858,8 @@ export type GetBranchConnectionQueryError = ErrorType<ErrorEnvelope>
 
 export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBranchConnection>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>> & Pick<
+    branchId: string,
+    params: undefined |  GetBranchConnectionParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>> & Pick<
         DefinedInitialDataOptions<
           Awaited<ReturnType<typeof getBranchConnection>>,
           TError,
@@ -761,7 +870,8 @@ export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBran
   ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBranchConnection>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>> & Pick<
+    branchId: string,
+    params?: GetBranchConnectionParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>> & Pick<
         UndefinedInitialDataOptions<
           Awaited<ReturnType<typeof getBranchConnection>>,
           TError,
@@ -772,7 +882,8 @@ export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBran
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBranchConnection>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+    branchId: string,
+    params?: GetBranchConnectionParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 /**
@@ -781,11 +892,12 @@ export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBran
 
 export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBranchConnection>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+    branchId: string,
+    params?: GetBranchConnectionParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchConnection>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
 
-  const queryOptions = getGetBranchConnectionQueryOptions(id,branchId,options)
+  const queryOptions = getGetBranchConnectionQueryOptions(id,branchId,params,options)
 
   const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
 
@@ -804,7 +916,7 @@ export const getGetDataApiSchemaUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/data-api/schema`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/data-api/schema`
 }
 
 /**
@@ -907,13 +1019,123 @@ export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApi
 
 
 
+export const getListBranchDatabasesUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/databases`
+}
+
+/**
+ * The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details.
+ * @summary List a branch's Postgres databases
+ */
+export const listBranchDatabases = async (id: string,
+    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<BranchDatabaseView[]> => {
+
+  return customFetch<BranchDatabaseView[]>(getListBranchDatabasesUrl(id,branchId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListBranchDatabasesQueryKey = (id: string,
+    branchId: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/databases`
+    ] as const;
+    }
+
+
+export const getListBranchDatabasesQueryOptions = <TData = Awaited<ReturnType<typeof listBranchDatabases>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listBranchDatabases>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListBranchDatabasesQueryKey(id,branchId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listBranchDatabases>>> = ({ signal }) => listBranchDatabases(id,branchId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listBranchDatabases>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListBranchDatabasesQueryResult = NonNullable<Awaited<ReturnType<typeof listBranchDatabases>>>
+export type ListBranchDatabasesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListBranchDatabases<TData = Awaited<ReturnType<typeof listBranchDatabases>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listBranchDatabases>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listBranchDatabases>>,
+          TError,
+          Awaited<ReturnType<typeof listBranchDatabases>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListBranchDatabases<TData = Awaited<ReturnType<typeof listBranchDatabases>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listBranchDatabases>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listBranchDatabases>>,
+          TError,
+          Awaited<ReturnType<typeof listBranchDatabases>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListBranchDatabases<TData = Awaited<ReturnType<typeof listBranchDatabases>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listBranchDatabases>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a branch's Postgres databases
+ */
+
+export function useListBranchDatabases<TData = Awaited<ReturnType<typeof listBranchDatabases>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listBranchDatabases>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListBranchDatabasesQueryOptions(id,branchId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
 export const getListKeysUrl = (id: string,
     branchId: string,) => {
 
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/keys`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/keys`
 }
 
 /**
@@ -1022,7 +1244,7 @@ export const getCreateKeyUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/keys`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/keys`
 }
 
 /**
@@ -1114,7 +1336,7 @@ export const getRevokeKeyUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/keys/${keyId}`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/keys/${encodeURIComponent(String(keyId))}`
 }
 
 /**
@@ -1192,7 +1414,7 @@ export const getRotateKeyUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/keys/${keyId}/rotate`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/keys/${encodeURIComponent(String(keyId))}/rotate`
 }
 
 /**
@@ -1269,7 +1491,7 @@ export const getResetBranchPasswordUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/reset-password`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/reset-password`
 }
 
 /**
@@ -1345,7 +1567,7 @@ export const getResetBranchToParentUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/reset-to-parent`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/reset-to-parent`
 }
 
 /**
@@ -1421,7 +1643,7 @@ export const getRestoreBranchUrl = (id: string,
 
 
 
-  return `/v1/databases/${id}/branches/${branchId}/restore`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/restore`
 }
 
 /**
@@ -1506,12 +1728,372 @@ export const useRestoreBranch = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getRestoreBranchMutationOptions(options), queryClient);
     }
 
+export const getListRolesUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles`
+}
+
+/**
+ * The branch's owner role first, then the others by name: roles made through the API and roles made in SQL, with their level, password state and the data API secret keys an owner-level role blocks. No passwords: read one with the connection details and `role`.
+ * @summary List a branch's roles
+ */
+export const listRoles = async (id: string,
+    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<BranchRole[]> => {
+
+  return customFetch<BranchRole[]>(getListRolesUrl(id,branchId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListRolesQueryKey = (id: string,
+    branchId: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/roles`
+    ] as const;
+    }
+
+
+export const getListRolesQueryOptions = <TData = Awaited<ReturnType<typeof listRoles>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoles>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListRolesQueryKey(id,branchId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listRoles>>> = ({ signal }) => listRoles(id,branchId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listRoles>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListRolesQueryResult = NonNullable<Awaited<ReturnType<typeof listRoles>>>
+export type ListRolesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListRoles<TData = Awaited<ReturnType<typeof listRoles>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoles>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listRoles>>,
+          TError,
+          Awaited<ReturnType<typeof listRoles>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListRoles<TData = Awaited<ReturnType<typeof listRoles>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoles>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listRoles>>,
+          TError,
+          Awaited<ReturnType<typeof listRoles>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListRoles<TData = Awaited<ReturnType<typeof listRoles>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoles>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a branch's roles
+ */
+
+export function useListRoles<TData = Awaited<ReturnType<typeof listRoles>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoles>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListRolesQueryOptions(id,branchId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateRoleUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles`
+}
+
+/**
+ * Creates a login role with a generated password and answers with the role. `owner_level` gives it the owner's attributes (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION) and makes it a member of `neon_superuser`. The password isn't in the answer: read it with the connection details and `role`. A role the compute couldn't take yet is `pending` and applied later.
+ * @summary Create a login role
+ */
+export const createRole = async (id: string,
+    branchId: string,
+    createRoleRequest: CreateRoleRequest, options?: Parameters<typeof customFetch>[1]): Promise<BranchRole> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<BranchRole>(getCreateRoleUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createRoleRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateRoleMutationKey = () => ['createRole'] as const;
+
+export const getCreateRoleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createRole>>, TError,CreateRoleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createRole>>, TError,CreateRoleMutationVariables, TContext> => {
+
+const mutationKey = getCreateRoleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createRole>>, CreateRoleMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  createRole(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateRoleMutationResult = NonNullable<Awaited<ReturnType<typeof createRole>>>
+    export type CreateRoleMutationBody = CreateRoleRequest
+    export type CreateRoleMutationError = ErrorType<ErrorEnvelope>
+    export type CreateRoleMutationVariables = {id: string;branchId: string;data: CreateRoleRequest}
+
+    /**
+ * @summary Create a login role
+ */
+export const useCreateRole = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createRole>>, TError,CreateRoleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createRole>>,
+        TError,
+        CreateRoleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateRoleMutationOptions(options), queryClient);
+    }
+
+export const getDeleteRoleUrl = (id: string,
+    branchId: string,
+    role: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}`
+}
+
+/**
+ * Deletes a login role. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted.
+ * @summary Delete a login role
+ */
+export const deleteRole = async (id: string,
+    branchId: string,
+    role: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteRoleUrl(id,branchId,role),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteRoleMutationKey = () => ['deleteRole'] as const;
+
+export const getDeleteRoleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteRole>>, TError,DeleteRoleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteRole>>, TError,DeleteRoleMutationVariables, TContext> => {
+
+const mutationKey = getDeleteRoleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteRole>>, DeleteRoleMutationVariables> = (props) => {
+          const {id,branchId,role} = props ?? {};
+
+          return  deleteRole(id,branchId,role,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteRoleMutationResult = NonNullable<Awaited<ReturnType<typeof deleteRole>>>
+
+    export type DeleteRoleMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteRoleMutationVariables = {id: string;branchId: string;role: string}
+
+    /**
+ * @summary Delete a login role
+ */
+export const useDeleteRole = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteRole>>, TError,DeleteRoleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteRole>>,
+        TError,
+        DeleteRoleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteRoleMutationOptions(options), queryClient);
+    }
+
+export const getResetRolePasswordUrl = (id: string,
+    branchId: string,
+    role: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}/reset-password`
+}
+
+/**
+ * Generates a new password for the role. The owner's name resets the owner password, like the branch's reset-password. Read the new password with the connection details and `role`.
+ * @summary Reset a role's password
+ */
+export const resetRolePassword = async (id: string,
+    branchId: string,
+    role: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getResetRolePasswordUrl(id,branchId,role),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getResetRolePasswordMutationKey = () => ['resetRolePassword'] as const;
+
+export const getResetRolePasswordMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resetRolePassword>>, TError,ResetRolePasswordMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof resetRolePassword>>, TError,ResetRolePasswordMutationVariables, TContext> => {
+
+const mutationKey = getResetRolePasswordMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof resetRolePassword>>, ResetRolePasswordMutationVariables> = (props) => {
+          const {id,branchId,role} = props ?? {};
+
+          return  resetRolePassword(id,branchId,role,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ResetRolePasswordMutationResult = NonNullable<Awaited<ReturnType<typeof resetRolePassword>>>
+
+    export type ResetRolePasswordMutationError = ErrorType<ErrorEnvelope>
+    export type ResetRolePasswordMutationVariables = {id: string;branchId: string;role: string}
+
+    /**
+ * @summary Reset a role's password
+ */
+export const useResetRolePassword = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resetRolePassword>>, TError,ResetRolePasswordMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof resetRolePassword>>,
+        TError,
+        ResetRolePasswordMutationVariables,
+        TContext
+      > => {
+      return useMutation(getResetRolePasswordMutationOptions(options), queryClient);
+    }
+
 export const getGetDatabaseConnectionUrl = (id: string,) => {
 
 
 
 
-  return `/v1/databases/${id}/connection`
+  return `/v1/databases/${encodeURIComponent(String(id))}/connection`
 }
 
 /**
@@ -1613,7 +2195,7 @@ export const getResetDatabasePasswordUrl = (id: string,) => {
 
 
 
-  return `/v1/databases/${id}/reset-password`
+  return `/v1/databases/${encodeURIComponent(String(id))}/reset-password`
 }
 
 /**

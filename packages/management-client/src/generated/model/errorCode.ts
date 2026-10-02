@@ -42,4 +42,11 @@ export const ErrorCode = {
   invalid_code: 'invalid_code',
   weak_password: 'weak_password',
   sign_in_expired: 'sign_in_expired',
+  invalid_role_name: 'invalid_role_name',
+  reserved_role_name: 'reserved_role_name',
+  role_exists: 'role_exists',
+  role_cap_reached: 'role_cap_reached',
+  role_in_use: 'role_in_use',
+  role_privilege_mismatch: 'role_privilege_mismatch',
+  branch_protected: 'branch_protected',
 } as const;

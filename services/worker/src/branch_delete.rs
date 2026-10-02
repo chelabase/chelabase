@@ -373,6 +373,34 @@ mod tests {
         }
     }
 
+    // T6: the delete's own update refuses a protected branch (protected after the API's
+    // check): nothing is torn down, and the branch says why.
+    #[tokio::test]
+    async fn a_protected_branch_is_left_as_it_was() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        w.metadata
+            .state()
+            .branches
+            .get_mut(&s.dev)
+            .unwrap()
+            .protected = true;
+        let timelines = w.storage.timeline_ids();
+
+        w.handle_branch_delete(s.dev).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready);
+        assert_eq!(
+            dev.error.as_deref(),
+            Some("cannot delete dev: it is protected; unprotect it first")
+        );
+        assert_eq!(w.storage.timeline_ids(), timelines);
+        for entry in ["storage.", "compute.", "metadata.mark_branch_deleted"] {
+            assert!(!has(&journal, entry), "{entry}: {:?}", entries(&journal));
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_teardown_keeps_deleting() {
         type Arrange = fn(&FakeWorker);

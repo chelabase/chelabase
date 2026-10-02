@@ -290,6 +290,26 @@ pub mod orchestrator {
         },
     };
 
+    /// Marks a branch protected or not.
+    pub const UPDATE_BRANCH: Endpoint = Endpoint {
+        name: "orchestrator.update_branch",
+        method: Method::Patch,
+        path: "/v1/databases/{id}/branches/{branch_id}",
+        scope: Scope::Api,
+        service: Service::Orchestrator,
+        policy: Policy {
+            auth: Auth::Management,
+            cors: Cors::Studio,
+        },
+    };
+
+    /// The branch's Postgres databases: the main one first.
+    pub const LIST_BRANCH_DATABASES: Endpoint = key_endpoint(
+        "orchestrator.list_branch_databases",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/databases",
+    );
+
     /// Database settings: the history window and the branch cap.
     pub const UPDATE_DATABASE: Endpoint = Endpoint {
         name: "orchestrator.update_database",
@@ -347,6 +367,31 @@ pub mod orchestrator {
         "orchestrator.data_api_schema",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/data-api/schema",
+    );
+
+    /// The branch's roles: the owner first, then the login roles.
+    pub const LIST_ROLES: Endpoint = key_endpoint(
+        "orchestrator.list_roles",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/roles",
+    );
+
+    pub const CREATE_ROLE: Endpoint = key_endpoint(
+        "orchestrator.create_role",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/roles",
+    );
+
+    pub const RESET_ROLE: Endpoint = key_endpoint(
+        "orchestrator.reset_role_password",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/roles/{role}/reset-password",
+    );
+
+    pub const DELETE_ROLE: Endpoint = key_endpoint(
+        "orchestrator.delete_role",
+        Method::Delete,
+        "/v1/databases/{id}/branches/{branch_id}/roles/{role}",
     );
 
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str) -> Endpoint {
@@ -444,11 +489,17 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::BRANCH_RESET_TO_PARENT,
     orchestrator::BRANCH_RESTORE,
     orchestrator::DELETE_BRANCH,
+    orchestrator::UPDATE_BRANCH,
+    orchestrator::LIST_BRANCH_DATABASES,
     orchestrator::LIST_KEYS,
     orchestrator::CREATE_KEY,
     orchestrator::ROTATE_KEY,
     orchestrator::REVOKE_KEY,
     orchestrator::DATA_API_SCHEMA,
+    orchestrator::LIST_ROLES,
+    orchestrator::CREATE_ROLE,
+    orchestrator::RESET_ROLE,
+    orchestrator::DELETE_ROLE,
     rest::QUERY,
     rest::SCHEMA,
     auth::AUTH_REQUEST,
@@ -680,6 +731,11 @@ mod tests {
         assert_eq!(found("GET", BRANCHES), "orchestrator.list_branches");
         assert_eq!(found("POST", BRANCHES), "orchestrator.create_branch");
         assert_eq!(found("DELETE", BRANCH), "orchestrator.delete_branch");
+        assert_eq!(found("PATCH", BRANCH), "orchestrator.update_branch");
+        assert_eq!(
+            found("GET", &format!("{BRANCH}/databases")),
+            "orchestrator.list_branch_databases"
+        );
         for (method, suffix, name) in [
             ("GET", "connection", "orchestrator.branch_connection"),
             ("POST", "reset-password", "orchestrator.branch_reset_password"),
@@ -687,6 +743,26 @@ mod tests {
             ("POST", "restore", "orchestrator.branch_restore"),
         ] {
             assert_eq!(found(method, &format!("{BRANCH}/{suffix}")), name);
+        }
+    }
+
+    #[test]
+    fn role_endpoints_route_and_are_management_auth_with_studio_cors() {
+        let roles = format!("{BRANCH}/roles");
+        assert_eq!(found("GET", &roles), "orchestrator.list_roles");
+        assert_eq!(found("POST", &roles), "orchestrator.create_role");
+        assert_eq!(found("DELETE", &format!("{roles}/app")), "orchestrator.delete_role");
+        assert_eq!(
+            found("POST", &format!("{roles}/app/reset-password")),
+            "orchestrator.reset_role_password"
+        );
+        for name in ["list_roles", "create_role", "reset_role_password", "delete_role"] {
+            let ep = ENDPOINTS
+                .iter()
+                .find(|e| e.name == format!("orchestrator.{name}"))
+                .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
+            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!(ep.service, Service::Orchestrator, "{name}");
         }
     }
 
@@ -706,7 +782,7 @@ mod tests {
     fn branch_paths_reject_wrong_methods_and_extra_segments() {
         assert_eq!(
             match_endpoint(Scope::Api, "PUT", BRANCH),
-            Match::MethodNotAllowed(vec![Method::Delete])
+            Match::MethodNotAllowed(vec![Method::Delete, Method::Patch])
         );
         assert_eq!(
             match_endpoint(Scope::Api, "GET", &format!("{BRANCH}/restore")),
@@ -728,6 +804,8 @@ mod tests {
             "branch_reset_to_parent",
             "branch_restore",
             "delete_branch",
+            "update_branch",
+            "list_branch_databases",
             "update_database",
         ] {
             let ep = ENDPOINTS

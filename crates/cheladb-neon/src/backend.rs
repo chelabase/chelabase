@@ -103,16 +103,26 @@ pub fn create_body(
     }
 }
 
-/// psql as cloud_admin against `database` on the compute's own Postgres. `database` must be a
-/// plain identifier: psql reads `-d a=b` as a conninfo string.
+/// psql as cloud_admin against `database` on the compute's own Postgres, with terse errors
+/// (no statement excerpt, so a verifier in the script never reaches the error). A plain identifier
+/// goes in as is; any other name as a quoted conninfo (`dbname='…'`), so psql never reads it
+/// as options or connection parameters. Refused: an empty name, one over 63 bytes (Postgres'
+/// limit) or one with a NUL (it can't be an argument).
 pub fn admin_psql_command(database: &str) -> anyhow::Result<Vec<String>> {
-    let ok = (1..=63).contains(&database.len())
-        && database
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    if !ok {
-        bail!("database name {database:?} isn't 1-63 letters, digits or underscores");
+    if database.is_empty() || database.len() > 63 || database.contains('\0') {
+        bail!("database name {database:?} can't be passed to psql");
     }
+    let plain = database
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    let target = if plain {
+        database.to_string()
+    } else {
+        format!(
+            "dbname='{}'",
+            database.replace('\\', "\\\\").replace('\'', "\\'")
+        )
+    };
     let mut cmd: Vec<String> = [
         "psql",
         "-X",
@@ -121,6 +131,9 @@ pub fn admin_psql_command(database: &str) -> anyhow::Result<Vec<String>> {
         "-t",
         "-v",
         "ON_ERROR_STOP=1",
+        // No `LINE n:` excerpt in errors: scripts can carry SCRAM verifiers.
+        "-v",
+        "VERBOSITY=terse",
         "-h",
         "localhost",
         "-U",
@@ -129,12 +142,20 @@ pub fn admin_psql_command(database: &str) -> anyhow::Result<Vec<String>> {
     ]
     .map(String::from)
     .into();
-    cmd.push(database.to_string());
+    cmd.push(target);
     Ok(cmd)
 }
 
 fn is_status(err: &DockerError, code: u16) -> bool {
     matches!(err, DockerError::DockerResponseServerError { status_code, .. } if *status_code == code)
+}
+
+/// Environment variables for admin_sql execution.
+fn admin_exec_env() -> Vec<String> {
+    vec![
+        "PGCONNECT_TIMEOUT=5".to_string(),
+        "PGOPTIONS=-c neon.forward_ddl=off".to_string(),
+    ]
 }
 
 /// [`ComputeBackend`] over the Docker Engine API.
@@ -184,7 +205,7 @@ impl DockerBackend {
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     user: Some("postgres".to_string()),
-                    env: Some(vec!["PGCONNECT_TIMEOUT=5".to_string()]),
+                    env: Some(admin_exec_env()),
                     cmd: Some(cmd),
                     ..Default::default()
                 },
@@ -620,6 +641,8 @@ mod tests {
                 "-t",
                 "-v",
                 "ON_ERROR_STOP=1",
+                "-v",
+                "VERBOSITY=terse",
                 "-h",
                 "localhost",
                 "-U",
@@ -630,13 +653,39 @@ mod tests {
         );
     }
 
+    // Terse errors carry no `LINE n:` excerpt of the statement, so a SCRAM verifier in a
+    // script never reaches the error text (logs, role replies, branch errors).
     #[test]
-    fn psql_command_refuses_non_identifiers() {
-        for bad in ["", "a=b", "x -h evil", "-c", &"a".repeat(64)] {
+    fn psql_command_prints_terse_errors() {
+        let cmd = admin_psql_command("web_1").unwrap();
+        assert!(
+            cmd.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "VERBOSITY=terse"),
+            "{cmd:?}"
+        );
+    }
+
+    #[test]
+    fn psql_command_refuses_names_it_cant_pass() {
+        for bad in ["", "a\0b", &"a".repeat(64), &"é".repeat(32)] {
             assert!(admin_psql_command(bad).is_err(), "{bad:?}");
         }
         assert!(admin_psql_command("1abc").is_ok());
         assert!(admin_psql_command(&"a".repeat(63)).is_ok());
+    }
+
+    // Any other name goes in as a quoted conninfo, so psql never reads it as options or
+    // connection parameters.
+    #[test]
+    fn psql_command_quotes_other_names_as_a_conninfo() {
+        let db = |name: &str| admin_psql_command(name).unwrap().last().unwrap().clone();
+        assert_eq!(db("my-app"), "dbname='my-app'");
+        assert_eq!(db("a=b host=evil"), "dbname='a=b host=evil'");
+        assert_eq!(db("-c"), "dbname='-c'");
+        assert_eq!(db("it's"), r"dbname='it\'s'");
+        assert_eq!(db(r"back\slash"), r"dbname='back\\slash'");
+        assert_eq!(db("new\nline"), "dbname='new\nline'");
+        assert_eq!(db("postgres://evil"), "dbname='postgres://evil'");
     }
 
     #[tokio::test]
@@ -716,5 +765,13 @@ mod tests {
         );
         assert_eq!(fake.admin_sql("ep-1", "app", "SELECT 1").await.unwrap(), "");
         assert_eq!(fake.status("ep-3").await.unwrap(), None);
+    }
+
+    #[test]
+    fn admin_exec_turns_forwarding_off() {
+        let env = admin_exec_env();
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0], "PGCONNECT_TIMEOUT=5");
+        assert_eq!(env[1], "PGOPTIONS=-c neon.forward_ddl=off");
     }
 }

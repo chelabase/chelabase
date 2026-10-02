@@ -4,16 +4,17 @@
 
 pub mod config;
 mod data;
+mod ddl;
 mod hooks;
 mod proxy;
 mod spec;
 
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, patch, put};
 use axum::{Json, Router};
 use cheladb_metadata::{
     BranchConnectionRow, DataKeyLookup, MetadataClient, MetadataError, NeonDatabase, NeonEndpoint,
@@ -23,13 +24,27 @@ use cheladb_secrets::SecretKey;
 use cheladb_types::BranchId;
 use uuid::Uuid;
 use cheladb_neon::{ComputeLocator, ComputeSigner, StorconClient};
+pub use ddl::{BoxFuture, CachePort, DdlPort};
+use cheladb_types::role_settings::RoleSettings;
 use std::future::Future;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
+/// The DDL receiver's body limit (T5): a forwarded delta is a few hundred bytes.
+const DDL_BODY_LIMIT: usize = 64 * 1024;
+
 /// The metadata the internal routes read. Abstracted so tests can use an in-memory fake.
 pub trait NeonMetadataPort: Send + Sync + 'static {
+    /// The DDL receiver's transaction.
+    type Ddl: DdlPort;
+
+    /// Opens the DDL receiver's transaction under the endpoint's row lock (`None` for an
+    /// unknown endpoint; a lock timeout is `MetadataError::EndpointLockTimeout`).
+    fn begin_ddl(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<Option<Self::Ddl>, MetadataError>> + Send;
     fn neon_endpoint(
         &self,
         id: &str,
@@ -78,6 +93,14 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
 // As for `MetadataPort`: each method must call `MetadataClient`'s inherent method by its full
 // path, or a rename would make it call itself.
 impl NeonMetadataPort for MetadataClient {
+    type Ddl = cheladb_metadata::DdlTx;
+
+    async fn begin_ddl(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<cheladb_metadata::DdlTx>, MetadataError> {
+        MetadataClient::begin_ddl(self, endpoint_id).await
+    }
     async fn neon_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
         MetadataClient::neon_endpoint(self, id).await
     }
@@ -137,8 +160,15 @@ pub struct InternalState<M, L> {
     pub data_keys_token: String,
     /// The REST service's token for connection info.
     pub rest_token: String,
-    /// Opens the `authenticator` passwords handed to the REST service.
+    /// Opens the `authenticator` passwords handed to the REST service, and re-seals an API
+    /// role's password when SQL renames it.
     pub secrets: SecretKey,
+    /// Caps and password rules the DDL receiver applies.
+    pub roles: RoleSettings,
+    /// Tells the proxies a role's secret changed.
+    pub cache: Arc<dyn CachePort>,
+    /// `CHELADB_CONTROL_PLANE_URI`: the base of `neon.console_url` in the specs served.
+    pub control_plane_uri: String,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router
@@ -187,6 +217,11 @@ where
         .route(
             "/compute/api/v2/computes/{id}/spec",
             get(spec::compute_spec::<M, L>),
+        )
+        .route(
+            "/compute/api/v2/computes/{id}/ddl",
+            // Reachable from every compute's network; a delta is a few hundred bytes.
+            patch(ddl::receive::<M, L>).layer(DefaultBodyLimit::max(DDL_BODY_LIMIT)),
         )
         .merge(proxy)
         .merge(storcon)

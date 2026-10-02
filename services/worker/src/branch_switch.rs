@@ -15,12 +15,13 @@ use cheladb_neon::{ComputeBackend, NeonId, StorconError};
 use cheladb_types::BranchId;
 use tracing::{info, warn};
 
-use crate::Worker;
 use crate::branch_create::deleted;
 use crate::branch_job::{Attempt, StepFailure};
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::provision::{bootstrap_sql, new_compute_token, sha256_hex};
 use crate::reconcile::STALE_PROVISION_SECS;
+use crate::resync::SYSTEM_DATABASE;
+use crate::{COMPUTE_SETTINGS_VERSION, Worker};
 
 /// The API's refusal, repeated by the worker.
 pub const MAIN_RESET_REFUSAL: &str = "main has no parent to reset to; use restore to rewind it";
@@ -282,7 +283,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// A new compute for `branch`'s endpoint `ep` on whatever timeline its row names: the new
     /// token's hash is written first (the compute's first spec request must already pass), then
     /// the container is created and waited for, then the role and data API bootstraps run (a
-    /// restore can rewind both).
+    /// restore can rewind both); then the endpoint records [`COMPUTE_SETTINGS_VERSION`], and
+    /// last the login-role resync runs.
     pub(crate) async fn recreate_compute(&self, branch: BranchId, ep: &str) -> Result<(), String> {
         let database_name = self
             .metadata
@@ -309,7 +311,35 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
         self.bootstrap_data_api_on(branch, ep, &database_name)
             .await
-            .map_err(|e| format!("bootstrapping the data API: {e:#}"))
+            .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
+        // Recorded before the resync: the compute now runs these settings whatever the
+        // resync does, and a resync that keeps failing gets a plain `Resync` from reconcile,
+        // not a re-creation every pass.
+        self.record_compute_settings(ep).await;
+        self.resync_endpoint(branch, ep).await
+    }
+
+    /// Records that `ep`'s compute runs [`COMPUTE_SETTINGS_VERSION`]'s settings. A failure
+    /// only logs: reconcile's `UpgradeCompute` then re-creates the compute once more.
+    pub(crate) async fn record_compute_settings(&self, ep: &str) {
+        if let Err(e) = self
+            .metadata
+            .set_compute_settings_version(ep, COMPUTE_SETTINGS_VERSION)
+            .await
+        {
+            warn!(endpoint_id = %ep, "recording the compute settings version: {e}");
+        }
+    }
+
+    /// The resync under `ep`'s lock, through the system database (the main one may be
+    /// dropped).
+    pub(crate) async fn resync_endpoint(&self, branch: BranchId, ep: &str) -> Result<(), String> {
+        let _lock = self
+            .metadata
+            .lock_endpoint(ep)
+            .await
+            .map_err(|e| format!("syncing login roles: locking the endpoint: {e}"))?;
+        self.resync_locked(branch, ep, SYSTEM_DATABASE).await
     }
 
     /// Reconcile's end of a reset or restore left `resetting` (a crash, or a failure the run
@@ -2291,6 +2321,69 @@ mod tests {
         *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
         let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
         assert!(err.starts_with("waiting for the compute: "), "{err}");
+    }
+
+    #[tokio::test]
+    async fn recreate_compute_resyncs_and_records_the_settings_version() {
+        const CATALOG_READ: &str = "SELECT 'r',";
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&s.dev_ep)
+            .unwrap()
+            .compute_settings_version = 0;
+        w.computes.remove(&s.dev_ep);
+        journal.lock().unwrap().clear();
+
+        w.recreate_compute(s.dev, &s.dev_ep).await.unwrap();
+
+        // After the data API bootstrap, under the lock, through the system database.
+        let order = [
+            pos(&journal, &format!("compute.create {}", s.dev_ep)),
+            pos(
+                &journal,
+                &format!(
+                    "compute.sql {} app SET search_path = pg_catalog, pg_temp;",
+                    s.dev_ep
+                ),
+            ),
+            // Recorded before the resync: a resync that keeps failing must not make every
+            // pass re-create the compute.
+            pos(&journal, "metadata.set_compute_settings_version"),
+            pos(&journal, "metadata.lock_endpoint"),
+            pos(
+                &journal,
+                &format!(
+                    "compute.sql {} postgres SET search_path = pg_catalog, pg_temp;",
+                    s.dev_ep
+                ),
+            ),
+            pos(&journal, "metadata.apply_resync"),
+        ];
+        assert!(order.is_sorted(), "{order:?} {:?}", entries(&journal));
+        assert_eq!(
+            w.metadata.state().endpoints[&s.dev_ep].compute_settings_version,
+            crate::COMPUTE_SETTINGS_VERSION
+        );
+
+        // A resync that fails fails the step; the version is recorded all the same.
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&s.dev_ep)
+            .unwrap()
+            .compute_settings_version = 0;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some((CATALOG_READ.into(), "connection reset".into()));
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+        assert!(err.starts_with("syncing login roles: "), "{err}");
+        assert_eq!(
+            w.metadata.state().endpoints[&s.dev_ep].compute_settings_version,
+            crate::COMPUTE_SETTINGS_VERSION
+        );
     }
 
     // --- Skips and retries -------------------------------------------------------------

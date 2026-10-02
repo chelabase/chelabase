@@ -45,10 +45,12 @@ function setup(routes: Record<string, FakeHandler> = {}, keys: DataKey[] = [publ
   result.queryClient.setQueryData(getListKeysQueryKey("db", "other"), keys);
   return { ...result, fetch: f };
 }
-const sent = (f: FakeFetch) => f.calls.map((r) => `${r.method} ${new URL(r.url).pathname}`);
+/** The key calls only: the keys' roles are read in the background. */
+const sent = (f: FakeFetch) =>
+  f.calls.map((r) => `${r.method} ${new URL(r.url).pathname}`).filter((c) => !c.endsWith("/roles"));
 async function bodyOf(f: FakeFetch, route: string): Promise<unknown> {
   await vi.waitFor(() => expect(sent(f)).toContain(route));
-  return f.calls[sent(f).indexOf(route)].clone().json();
+  return f.calls.find((r) => `${r.method} ${new URL(r.url).pathname}` === route)!.clone().json();
 }
 async function expectKeysInvalidated(queryClient: ReturnType<typeof setup>["queryClient"]) {
   await vi.waitFor(() => expect(queryClient.getQueryState(getListKeysQueryKey("db", "br"))?.isInvalidated).toBe(true));
@@ -145,7 +147,7 @@ describe("DataApiKeys", () => {
   it("revokes only after a confirm", async () => {
     const { fetch, queryClient } = setup({ [revokeRoute("k1")]: revoked });
     await userEvent.click(screen.getByRole("button", { name: "Revoke reporting" }));
-    expect(fetch.calls).toHaveLength(0);
+    expect(sent(fetch)).toHaveLength(0);
     expect(screen.getByText(/Revoke reporting\? Anything using it stops working within 30 seconds\./)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Confirm revoke" }));
     await vi.waitFor(() => expect(sent(fetch)).toEqual([revokeRoute("k1")]));
@@ -158,14 +160,14 @@ describe("DataApiKeys", () => {
     const { fetch } = setup({ [revokeRoute("k1")]: revoked });
     await userEvent.click(screen.getByRole("button", { name: "Revoke reporting" }));
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(fetch.calls).toHaveLength(0);
+    expect(sent(fetch)).toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Confirm revoke" })).not.toBeInTheDocument();
   });
 
   it("rotates after a confirm and shows the new key once", async () => {
     const { fetch, queryClient } = setup({ [rotateRoute("k1")]: () => jsonResponse(created({ id: "k9", name: "reporting" })) });
     await userEvent.click(screen.getByRole("button", { name: "Rotate reporting" }));
-    expect(fetch.calls).toHaveLength(0);
+    expect(sent(fetch)).toHaveLength(0);
     await userEvent.click(screen.getByRole("button", { name: "Confirm rotate" }));
     expect(await screen.findByRole("region", { name: "New key" })).toHaveTextContent(FULL);
     expect(sent(fetch)).toEqual([rotateRoute("k1")]);
@@ -203,5 +205,19 @@ describe("DataApiKeys", () => {
     // Nor after the screen goes away (a mutation's data would outlive it for gcTime).
     unmount();
     for (const secret of [FULL, ROTATED]) expect(cachedState(queryClient)).not.toContain(secret);
+  });
+
+  it("blocked_key_badge", async () => {
+    const roleRow = (name: string, blocked: { id: string; name: string }[]) => ({
+      name, origin: "sql", level: blocked.length ? "owner_level" : "plain", login: true, password: "generated",
+      blocked_keys: blocked, pending: false, created_at: "2026-10-01T09:00:00Z",
+    });
+    setup(
+      { "GET /v1/databases/db/branches/br/roles": () => jsonResponse([roleRow("service", [{ id: "k2", name: "worker" }]), roleRow("authenticated", [])]) },
+    );
+    const row = within(await screen.findByRole("row", { name: /worker/ }));
+    expect(await row.findByText("Blocked")).toBeInTheDocument();
+    expect(row.getByText("the role service can bypass row-level security")).toBeInTheDocument();
+    expect(within(screen.getByRole("row", { name: /reporting/ })).queryByText("Blocked")).toBeNull();
   });
 });

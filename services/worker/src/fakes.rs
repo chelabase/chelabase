@@ -9,8 +9,10 @@ use std::time::Duration;
 use cheladb_metadata::{
     BranchConnectionRow, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus,
     CreateBranchOutcome, DataApiSettings, DataKeyRecord, DatabaseRecord, DatabaseSettings,
-    DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState, LiveBranch, LiveDatabase, MetadataError,
-    NeonDatabase, NeonEndpoint, NeonRole, NewBranch, NewDataKey, NewEndpoint,
+    DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState, InsertRoleOutcome, LiveBranch,
+    LiveDatabase, MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewBranch, NewDataKey,
+    NewEndpoint, ObservedDatabase, ResyncApplied, ResyncWrite, RoleCopy, RoleLevel, RoleOrigin,
+    SealedChange,
 };
 use cheladb_neon::backend::fake::FakeBackend;
 pub use cheladb_neon::backend::fake::Journal;
@@ -48,6 +50,55 @@ pub struct FakeEndpoint {
     pub roles: Vec<NeonRole>,
     pub databases: Vec<NeonDatabase>,
     pub needs_reconfigure: bool,
+    pub roles_version: i64,
+    /// What `neon_roles` holds beyond [`NeonRole`] for each non-owner row. A row with a
+    /// verifier is in `roles` too; an MD5 row (no verifier) isn't.
+    pub logins: HashMap<String, FakeLogin>,
+    /// `branch_databases` as the last resync set it.
+    pub branch_databases: Vec<ObservedDatabase>,
+    /// 0 for a new row, as the column's default.
+    pub compute_settings_version: i32,
+}
+
+/// A non-owner `neon_roles` row beyond its verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeLogin {
+    pub origin: RoleOrigin,
+    pub password_enc: Option<String>,
+    pub pending: bool,
+    pub login: bool,
+    pub level: RoleLevel,
+    pub api_owner_level: bool,
+}
+
+impl FakeEndpoint {
+    /// A non-owner row's verifier (`None` for MD5 or no row).
+    pub fn verifier(&self, name: &str) -> Option<String> {
+        self.roles
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.scram_verifier.clone())
+    }
+
+    /// Sets (or, with `None`, removes) a role's entry in `roles`.
+    pub fn set_verifier(&mut self, name: &str, verifier: Option<&str>) {
+        match (self.roles.iter_mut().find(|r| r.name == name), verifier) {
+            (Some(r), Some(v)) => r.scram_verifier = v.to_string(),
+            (None, Some(v)) => self.roles.push(NeonRole {
+                name: name.to_string(),
+                scram_verifier: v.to_string(),
+            }),
+            (_, None) => self.roles.retain(|r| r.name != name),
+        }
+    }
+
+    /// Copies counted toward the cap: rows with a verifier.
+    fn copy_count(&self) -> usize {
+        self.logins
+            .keys()
+            .filter(|n| self.roles.iter().any(|r| &r.name == *n))
+            .count()
+    }
 }
 
 /// A one-off change to the fake's state, run from inside a write.
@@ -84,6 +135,12 @@ pub struct FakeState {
     pub before_insert_data_key: Option<StateHook>,
     /// Runs once, just before the next `set_authenticator_password`: a concurrent run's write.
     pub before_set_authenticator_password: Option<StateHook>,
+    /// The next N `apply_resync` calls answer `VersionMoved` (and bump the version, as a
+    /// concurrent write would).
+    pub resync_version_moves: u32,
+    /// `delete_role_copy` finds the row already gone (removed meanwhile, say by a forwarded
+    /// `DROP ROLE`).
+    pub role_row_vanishes: bool,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -286,6 +343,7 @@ impl FakeMetadata {
                 updated_at: now,
                 history_start: None,
                 authenticator_password_enc: None,
+                protected: false,
             },
         );
         id
@@ -358,6 +416,7 @@ impl FakeMetadata {
                 updated_at: now,
                 history_start: None,
                 authenticator_password_enc: None,
+                protected: false,
             },
         );
         CreateBranchOutcome::Created
@@ -487,15 +546,40 @@ impl WorkerMetadata for FakeMetadata {
                     timeline_id: ep.timeline_id.to_string(),
                     compute_token_sha256: ep.compute_token_sha256.to_string(),
                 },
-                roles: vec![NeonRole {
+                roles: std::iter::once(NeonRole {
                     name: ep.owner_role.to_string(),
                     scram_verifier: ep.owner_verifier.to_string(),
-                }],
+                })
+                .chain(ep.role_copies.iter().filter_map(|l| {
+                    Some(NeonRole {
+                        name: l.name.to_string(),
+                        scram_verifier: l.verifier?.to_string(),
+                    })
+                }))
+                .collect(),
                 databases: vec![NeonDatabase {
                     name: ep.database_name.to_string(),
                     owner: ep.owner_role.to_string(),
                 }],
                 needs_reconfigure: false,
+                roles_version: 0,
+                logins: ep
+                    .role_copies
+                    .iter()
+                    .map(|l| {
+                        let login = FakeLogin {
+                            origin: l.origin,
+                            password_enc: l.password_enc.map(str::to_string),
+                            pending: l.pending,
+                            login: l.login,
+                            level: l.level,
+                            api_owner_level: l.api_owner_level,
+                        };
+                        (l.name.to_string(), login)
+                    })
+                    .collect(),
+                branch_databases: Vec::new(),
+                compute_settings_version: 0,
             },
         );
         Ok(true)
@@ -520,12 +604,19 @@ impl WorkerMetadata for FakeMetadata {
         Ok(state.endpoints.get(endpoint_id).map(|e| e.endpoint.clone()))
     }
 
-    async fn neon_roles(&self, endpoint_id: &str) -> Result<Vec<NeonRole>, MetadataError> {
-        let state = self.read("neon_roles")?;
+    async fn neon_roles_versioned(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<(Vec<NeonRole>, i64), MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.neon_roles_versioned {endpoint_id}"),
+        );
+        let state = self.read("neon_roles_versioned")?;
         Ok(state
             .endpoints
             .get(endpoint_id)
-            .map(|e| e.roles.clone())
+            .map(|e| (e.roles.clone(), e.roles_version))
             .unwrap_or_default())
     }
 
@@ -645,28 +736,212 @@ impl WorkerMetadata for FakeMetadata {
         branch.owner_password_enc = Some(sealed.to_string());
         r.scram_verifier = verifier.to_string();
         ep.needs_reconfigure = true;
+        ep.roles_version += 1;
         Ok(true)
     }
 
     async fn clear_needs_reconfigure(
         &self,
         endpoint_id: &str,
-        role: &str,
-        applied_verifier: &str,
+        applied_version: i64,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("clear_needs_reconfigure")?;
         let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
             return Ok(false);
         };
-        let applied = ep
-            .roles
-            .iter()
-            .any(|r| r.name == role && r.scram_verifier == applied_verifier);
-        if !(ep.needs_reconfigure && applied) {
+        if !(ep.needs_reconfigure && ep.roles_version == applied_version) {
             return Ok(false);
         }
+        // The owner's row only; the others' go through `confirm_role`.
         ep.needs_reconfigure = false;
         Ok(true)
+    }
+
+    async fn insert_api_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        owner_level: bool,
+        verifier: &str,
+        password_enc: &str,
+        cap: u32,
+    ) -> Result<InsertRoleOutcome, MetadataError> {
+        let mut state = self.write("insert_api_role")?;
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            // `SELECT … FOR UPDATE` with `fetch_one`.
+            return Err(MetadataError::Database(sqlx::Error::RowNotFound));
+        };
+        if ep.copy_count() >= usize::try_from(cap).unwrap_or(usize::MAX) {
+            return Ok(InsertRoleOutcome::CapReached);
+        }
+        if ep.roles.iter().any(|r| r.name == name) || ep.logins.contains_key(name) {
+            return Ok(InsertRoleOutcome::Exists);
+        }
+        ep.set_verifier(name, Some(verifier));
+        ep.logins.insert(
+            name.to_string(),
+            FakeLogin {
+                origin: RoleOrigin::Api,
+                password_enc: Some(password_enc.to_string()),
+                pending: true,
+                login: true,
+                level: if owner_level {
+                    RoleLevel::OwnerLevel
+                } else {
+                    RoleLevel::Plain
+                },
+                api_owner_level: owner_level,
+            },
+        );
+        ep.roles_version += 1;
+        Ok(InsertRoleOutcome::Inserted)
+    }
+
+    async fn replace_role_secret(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        verifier: &str,
+        password_enc: &str,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("replace_role_secret")?;
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Ok(false);
+        };
+        let Some(login) = ep.logins.get_mut(name) else {
+            return Ok(false);
+        };
+        login.password_enc = Some(password_enc.to_string());
+        login.pending = true;
+        ep.set_verifier(name, Some(verifier));
+        ep.roles_version += 1;
+        Ok(true)
+    }
+
+    async fn confirm_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("confirm_role")?;
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Ok(false);
+        };
+        if ep.roles_version != version {
+            return Ok(false);
+        }
+        match ep.logins.get_mut(name) {
+            Some(login) if login.pending => {
+                login.pending = false;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn delete_role_copy(&self, endpoint_id: &str, name: &str) -> Result<bool, MetadataError> {
+        let mut state = self.write("delete_role_copy")?;
+        let vanishes = state.role_row_vanishes;
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Ok(false);
+        };
+        if vanishes {
+            ep.logins.remove(name);
+            ep.set_verifier(name, None);
+            return Ok(false);
+        }
+        if ep.logins.remove(name).is_none() {
+            return Ok(false);
+        }
+        ep.set_verifier(name, None);
+        ep.roles_version += 1;
+        Ok(true)
+    }
+
+    async fn role_copies(&self, endpoint_id: &str) -> Result<(Vec<RoleCopy>, i64), MetadataError> {
+        record(&self.journal, format!("metadata.role_copies {endpoint_id}"));
+        let state = self.read("role_copies")?;
+        let Some(ep) = state.endpoints.get(endpoint_id) else {
+            return Ok((Vec::new(), 0));
+        };
+        Ok((fake_copies(ep), ep.roles_version))
+    }
+
+    async fn apply_resync(
+        &self,
+        endpoint_id: &str,
+        _branch: BranchId,
+        read_version: i64,
+        write: &ResyncWrite,
+    ) -> Result<ResyncApplied, MetadataError> {
+        let mut state = self.write("apply_resync")?;
+        let state = &mut *state;
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Err(MetadataError::Database(sqlx::Error::RowNotFound));
+        };
+        if state.resync_version_moves > 0 {
+            state.resync_version_moves -= 1;
+            ep.roles_version += 1;
+            return Ok(ResyncApplied::VersionMoved);
+        }
+        if ep.roles_version != read_version {
+            return Ok(ResyncApplied::VersionMoved);
+        }
+        let owner = ep.roles.first().map(|r| r.name.clone());
+        let mut changed = Vec::new();
+        for up in &write.upserts {
+            if owner.as_deref() == Some(up.name.as_str()) {
+                continue;
+            }
+            let before = ep.logins.get(&up.name).cloned();
+            let before_verifier = ep.verifier(&up.name);
+            let mut row = before.clone().unwrap_or(FakeLogin {
+                origin: up.origin,
+                password_enc: None,
+                pending: up.pending,
+                login: up.login,
+                level: up.level,
+                api_owner_level: false,
+            });
+            row.password_enc = match &up.password_enc {
+                SealedChange::Keep => row.password_enc,
+                SealedChange::Clear => None,
+                SealedChange::Set(s) => Some(s.clone()),
+            };
+            row.login = up.login;
+            row.level = up.level;
+            row.pending = up.pending;
+            if before.as_ref() != Some(&row) || before_verifier != up.verifier {
+                ep.logins.insert(up.name.clone(), row);
+                ep.set_verifier(&up.name, up.verifier.as_deref());
+                changed.push(up.name.clone());
+            }
+        }
+        for name in &write.removals {
+            if owner.as_deref() != Some(name.as_str()) && ep.logins.remove(name).is_some() {
+                ep.set_verifier(name, None);
+                changed.push(name.clone());
+            }
+        }
+        let databases_changed = ep.branch_databases != write.databases;
+        ep.branch_databases = write.databases.clone();
+        if !changed.is_empty() || databases_changed {
+            ep.roles_version += 1;
+        }
+        Ok(ResyncApplied::Applied { changed })
+    }
+
+    async fn set_compute_settings_version(
+        &self,
+        endpoint_id: &str,
+        version: i32,
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("set_compute_settings_version")?;
+        if let Some(ep) = state.endpoints.get_mut(endpoint_id) {
+            ep.compute_settings_version = version;
+        }
+        Ok(())
     }
 
     async fn replace_compute_token(
@@ -743,6 +1018,7 @@ impl WorkerMetadata for FakeMetadata {
                     branch_id: branch.map(|b| b.id),
                     branch_status: branch.map(|b| b.status),
                     needs_reconfigure: ep.needs_reconfigure,
+                    compute_settings_version: ep.compute_settings_version,
                 }
             })
             .collect();
@@ -798,6 +1074,14 @@ impl WorkerMetadata for FakeMetadata {
         let mut state = self.write("begin_branch_delete")?;
         if let Some(refused) = state.children_blocking_delete(id) {
             return Ok(refused);
+        }
+        // Like the real update's `AND NOT protected`.
+        if state
+            .branches
+            .get(&id)
+            .is_some_and(|b| b.protected && branch_live(b.status))
+        {
+            return Ok(BranchDeleteOutcome::Protected);
         }
         Ok(if state.begin_branch_delete(id) {
             BranchDeleteOutcome::Started
@@ -907,6 +1191,7 @@ impl WorkerMetadata for FakeMetadata {
                 updated_at: now,
                 history_start: b.history_start,
                 authenticator_password_enc: None,
+                protected: false,
             },
         );
         let branch = state.branches.get_mut(&id).expect("looked up above");
@@ -1129,6 +1414,39 @@ impl WorkerMetadata for FakeMetadata {
 }
 
 /// Oldest first, like the real queries.
+/// The endpoint's rows as `role_copies` reads them: the owner's first, then by name.
+fn fake_copies(ep: &FakeEndpoint) -> Vec<RoleCopy> {
+    let at = DateTime::<Utc>::UNIX_EPOCH;
+    let owner = ep.roles.first().map(|o| RoleCopy {
+        name: o.name.clone(),
+        origin: RoleOrigin::Owner,
+        scram_verifier: Some(o.scram_verifier.clone()),
+        password_enc: None,
+        login: true,
+        level: RoleLevel::OwnerLevel,
+        api_owner_level: false,
+        pending: false,
+        created_at: at,
+    });
+    let mut rest: Vec<RoleCopy> = ep
+        .logins
+        .iter()
+        .map(|(name, l)| RoleCopy {
+            name: name.clone(),
+            origin: l.origin,
+            scram_verifier: ep.verifier(name),
+            password_enc: l.password_enc.clone(),
+            login: l.login,
+            level: l.level,
+            api_owner_level: l.api_owner_level,
+            pending: l.pending,
+            created_at: at,
+        })
+        .collect();
+    rest.sort_by(|a, b| a.name.cmp(&b.name));
+    owner.into_iter().chain(rest).collect()
+}
+
 fn sorted<'a>(branches: impl Iterator<Item = &'a BranchRecord>) -> Vec<BranchRecord> {
     let mut branches: Vec<BranchRecord> = branches.cloned().collect();
     branches.sort_by_key(|b| (b.created_at, b.id.to_string()));
@@ -1499,15 +1817,38 @@ pub struct FakeCache {
 }
 
 impl CacheNotifier for FakeCache {
-    async fn password_updated(&self, endpoint_id: &str, _role: &str) -> anyhow::Result<u64> {
+    async fn password_updated(&self, endpoint_id: &str, role: &str) -> anyhow::Result<u64> {
         record(
             &self.journal,
-            format!("cache.password_updated {endpoint_id}"),
+            format!("cache.password_updated {endpoint_id} {role}"),
         );
         if let Some(message) = lock(&self.fail).clone() {
             anyhow::bail!(message);
         }
         Ok(*lock(&self.receivers))
+    }
+
+    /// Journals `cache.password_updated_later` at once, then each `password_updated` after
+    /// `delay` from a spawned task (tests advance a paused clock).
+    fn password_updated_later(&self, endpoint_id: &str, roles: Vec<String>, delay: Duration) {
+        let journal = self.journal.clone();
+        let endpoint_id = endpoint_id.to_string();
+        record(
+            &journal,
+            format!(
+                "cache.password_updated_later {endpoint_id} {}",
+                roles.join(",")
+            ),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            for role in roles {
+                record(
+                    &journal,
+                    format!("cache.password_updated {endpoint_id} {role}"),
+                );
+            }
+        });
     }
 }
 
@@ -1587,6 +1928,13 @@ pub fn worker() -> (FakeWorker, Journal) {
         },
         key: SecretKey::generate(),
         owner_superuser: false,
+        roles: cheladb_types::role_settings::RoleSettings {
+            role_cap: 10,
+            database_cap: 20,
+            strength: false,
+            prehashed_allowed: true,
+        },
+        control_plane_uri: "http://host.docker.internal:8083".to_string(),
         ready_poll: Duration::from_millis(1),
         ready_timeout: Duration::from_millis(20),
         claim_refresh: Duration::from_millis(5),

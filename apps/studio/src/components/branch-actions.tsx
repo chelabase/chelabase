@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useDeleteBranch, useResetBranchToParent, useRestoreBranch, type Branch } from "@cheladb/management-client";
+import { useDeleteBranch, useResetBranchToParent, useRestoreBranch, useUpdateBranch, type Branch } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
 import {
   actionReasons,
@@ -12,9 +12,10 @@ import {
   type ActionKey,
 } from "@/lib/branches";
 import { errorText } from "@/lib/errors";
+import { BranchRoles } from "./branch-roles";
 import { DatabaseActions } from "./database-actions";
 
-type Panel = "none" | "reset-to-parent" | "restore" | "delete";
+type Panel = "none" | "protect" | "reset-to-parent" | "restore" | "delete" | "roles";
 
 export interface BranchActionsProps {
   databaseId: string;
@@ -33,6 +34,7 @@ export function BranchActions({ databaseId, databaseName, branch, branches, hist
   const resetBranch = useResetBranchToParent(invalidate);
   const deleteBranch = useDeleteBranch(invalidate);
   const restoreBranch = useRestoreBranch(invalidate);
+  const updateBranch = useUpdateBranch(invalidate);
   const [panel, setPanel] = useState<Panel>("none");
   const [point, setPoint] = useState("");
   const [busy, setBusy] = useState(false);
@@ -78,6 +80,11 @@ export function BranchActions({ databaseId, databaseName, branch, branches, hist
     }
   }
 
+  const setProtected = (value: boolean) =>
+    run(async () => {
+      await updateBranch.mutateAsync({ id: databaseId, branchId: branch.id, data: { protected: value } });
+      return null;
+    });
   const resetToParent = () =>
     run(async () => {
       await resetBranch.mutateAsync({ id: databaseId, branchId: branch.id });
@@ -136,6 +143,16 @@ export function BranchActions({ databaseId, databaseName, branch, branches, hist
           )
         }
       >
+        {branch.kind === "normal" &&
+          (branch.protected ? (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => void setProtected(false)}>
+              Unprotect
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => open("protect")}>
+              Protect
+            </Button>
+          ))}
         <Button size="sm" variant="outline" {...gated("resetToParent")} onClick={() => open("reset-to-parent")}>
           Reset to parent
         </Button>
@@ -145,7 +162,42 @@ export function BranchActions({ databaseId, databaseName, branch, branches, hist
         <Button size="sm" variant="outline" {...gated("delete")} onClick={() => open("delete")}>
           Delete branch
         </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={reasons.connect !== null || busy}
+          title={reasons.connect ?? undefined}
+          aria-describedby={reasonId("connect")}
+          onClick={() => open("roles")}
+        >
+          Roles
+        </Button>
       </DatabaseActions>
+
+      {panel === "roles" && reasons.connect === null && <BranchRoles databaseId={databaseId} branchId={branch.id} />}
+
+      {branch.main_database_missing && (
+        <p role="status" className="text-sm text-destructive">
+          Main database missing: create a database named <code>{databaseName}</code> to bring it back
+        </p>
+      )}
+
+      {panel === "protect" && (
+        <div className="space-y-2 rounded-lg border p-3 text-sm">
+          <p>
+            Children of a protected branch get new passwords for every role. It can&apos;t be deleted or reset to its
+            parent until you unprotect it. Restore stays allowed.
+          </p>
+          <div className="flex gap-2">
+            <Button size="sm" disabled={busy} onClick={() => void setProtected(true)}>
+              Confirm protect
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => open("none")}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
 
       {panel === "reset-to-parent" && (
         <div className="space-y-2 rounded-lg border p-3 text-sm">

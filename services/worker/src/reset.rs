@@ -71,6 +71,17 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .lock_endpoint(endpoint_id)
             .await
             .context("locking the endpoint")?;
+        self.apply_pending_locked(endpoint_id, &[]).await
+    }
+
+    /// [`Self::apply_pending`] for a caller that already holds `endpoint_id`'s lock. Publishes
+    /// `/password_updated` for every role row on the endpoint plus `also_publish` (a deleted
+    /// role's name), since a retry doesn't know which role changed.
+    pub(crate) async fn apply_pending_locked(
+        &self,
+        endpoint_id: &str,
+        also_publish: &[&str],
+    ) -> anyhow::Result<()> {
         let Some(endpoint) = self
             .metadata
             .neon_endpoint(endpoint_id)
@@ -80,17 +91,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             // Deleted meanwhile: nothing left to apply.
             return Ok(());
         };
-        let roles = self
+        let (roles, applied_version) = self
             .metadata
-            .neon_roles(endpoint_id)
+            .neon_roles_versioned(endpoint_id)
             .await
             .context("loading the roles")?;
-        // The flag is cleared only if this is still the stored verifier once applied.
-        let applied = roles
-            .iter()
-            .find(|r| r.name == OWNER_ROLE)
-            .map(|r| r.scram_verifier.clone())
-            .ok_or_else(|| anyhow!("the endpoint has no {OWNER_ROLE} role"))?;
+        // The flag is cleared only if the roles are still at this version once applied.
+        if !roles.iter().any(|r| r.name == OWNER_ROLE) {
+            bail!("the endpoint has no {OWNER_ROLE} role");
+        }
+        let role_names: Vec<String> = roles.iter().map(|r| r.name.clone()).collect();
 
         // Step 2: a compute that isn't running pulls the current spec when it boots.
         // Bounded: a hung Docker daemon would otherwise keep the endpoint's lock forever.
@@ -117,6 +127,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 roles,
                 databases,
                 self.pusher.jwks(),
+                Some(cheladb_neon::spec::ddl_url(
+                    &self.control_plane_uri,
+                    endpoint_id,
+                )),
             )
             .await
             .context("building the spec")?;
@@ -127,26 +141,32 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
 
         // Step 3.
-        let receivers = self
-            .cache
-            .password_updated(endpoint_id, OWNER_ROLE)
-            .await
-            .context("publishing password_updated")?;
-        if receivers == 0 {
-            bail!(
-                "no proxy received /password_updated; the old password stays cached until its \
-                 TTL runs out"
-            );
+        for role in role_names
+            .iter()
+            .map(String::as_str)
+            .chain(also_publish.iter().copied())
+        {
+            let receivers = self
+                .cache
+                .password_updated(endpoint_id, role)
+                .await
+                .with_context(|| format!("publishing password_updated for {role}"))?;
+            if receivers == 0 {
+                bail!(
+                    "no proxy received /password_updated for {role}; the old password stays \
+                     cached until its TTL runs out"
+                );
+            }
         }
 
         // Step 4. `false` means a newer reset landed meanwhile; its flag stays for it.
         let cleared = self
             .metadata
-            .clear_needs_reconfigure(endpoint_id, OWNER_ROLE, &applied)
+            .clear_needs_reconfigure(endpoint_id, applied_version)
             .await
             .context("clearing needs_reconfigure")?;
         if !cleared {
-            info!(%endpoint_id, "a newer reset is pending; leaving its flag set");
+            info!(%endpoint_id, "a newer role write is pending; leaving its flag set");
         }
         Ok(())
     }
@@ -227,6 +247,7 @@ mod tests {
         let order = [
             pos(&journal, "metadata.replace_owner_secret"),
             pos(&journal, "metadata.lock_endpoint"),
+            pos(&journal, &format!("metadata.neon_roles_versioned {ep}")),
             pos(&journal, &format!("pusher.push {ep}")),
             pos(&journal, &format!("cache.password_updated {ep}")),
             pos(&journal, "metadata.clear_needs_reconfigure"),
@@ -360,6 +381,7 @@ mod tests {
             .unwrap();
         role.scram_verifier = verifier.to_string();
         endpoint.needs_reconfigure = true;
+        endpoint.roles_version += 1;
     }
 
     // Review I1: a stale push (reconcile holding verifier A) must not land after a newer
@@ -434,6 +456,30 @@ mod tests {
         *w.computes.hang_control_addr.lock().unwrap() = false;
         w.apply_pending(&ep).await.unwrap();
         assert!(!secret(&w, id, &ep).2);
+    }
+
+    // R3: every role row on the endpoint, plus the extra names (a deleted role's).
+    #[tokio::test]
+    async fn apply_pending_locked_publishes_for_every_role_and_the_extras() {
+        let (w, journal) = worker();
+        let (_id, ep) = ready(&w, &journal).await;
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&ep)
+            .unwrap()
+            .roles
+            .push(cheladb_metadata::NeonRole {
+                name: "app".into(),
+                scram_verifier: cheladb_neon::scram::verifier("x"),
+            });
+
+        let _lock = w.metadata.lock_endpoint(&ep).await.unwrap();
+        w.apply_pending_locked(&ep, &["gone"]).await.unwrap();
+
+        for role in [OWNER_ROLE, "app", "gone"] {
+            pos(&journal, &format!("cache.password_updated {ep} {role}"));
+        }
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ use cheladb_neon::proxy_cache::ProxyCache;
 use cheladb_neon::{ComputeSettings, DockerBackend, StorconClient};
 use cheladb_secrets::SecretKey;
 use cheladb_types::mode::Mode;
+use cheladb_types::role_settings::RoleSettings;
 
 use crate::Worker;
 use crate::ports::HttpPusher;
@@ -29,6 +30,9 @@ pub struct WorkerConfig {
     pub compute_image: String,
     pub mode: cheladb_types::mode::Mode,
     pub owner_superuser_requested: bool,
+    /// `CHELADB_BRANCH_ROLE_CAP`, `CHELADB_BRANCH_DATABASE_CAP` and
+    /// `CHELADB_PASSWORD_STRENGTH` (platform mode forces strength on).
+    pub roles: RoleSettings,
 }
 
 /// The value of `name`, or `None` when it's unset or blank.
@@ -60,6 +64,7 @@ impl WorkerConfig {
                 .as_deref(),
             Some("true" | "1" | "yes")
         );
+        let roles = RoleSettings::from_lookup(mode, &get).map_err(|e| anyhow!(e))?;
         let config = Self {
             storcon_url: or_default("CHELADB_STORCON_URL", "http://127.0.0.1:1234"),
             compute_jwt_dir: PathBuf::from(or_default("CHELADB_COMPUTE_JWT_DIR", ".cheladb/neon")),
@@ -72,6 +77,7 @@ impl WorkerConfig {
             compute_image,
             mode,
             owner_superuser_requested,
+            roles,
         };
         check_control_plane_uri(&config.control_plane_uri)?;
         Ok(config)
@@ -129,6 +135,8 @@ pub fn build(
         pusher: HttpPusher { http, signer },
         key,
         owner_superuser: config.owner_superuser(),
+        roles: config.roles,
+        control_plane_uri: config.control_plane_uri.clone(),
         ready_poll: Duration::from_millis(500),
         ready_timeout: Duration::from_secs(60),
         claim_refresh: Duration::from_secs(60),
@@ -141,6 +149,7 @@ mod tests {
     use super::*;
     use cheladb_metadata::MetadataConfig;
     use cheladb_types::mode::Mode;
+    use cheladb_types::role_settings::RoleSettings;
     use std::collections::HashMap;
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -222,6 +231,48 @@ mod tests {
             .unwrap();
         assert!(!c.owner_superuser());
         assert!(WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELADB_MODE", "cloud")])).is_err());
+    }
+
+    #[test]
+    fn config_reads_role_settings() {
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert_eq!(
+            c.roles,
+            RoleSettings {
+                role_cap: 50,
+                database_cap: 20,
+                strength: false,
+                prehashed_allowed: true
+            }
+        );
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELADB_BRANCH_ROLE_CAP", "7"),
+            ("CHELADB_BRANCH_DATABASE_CAP", "3"),
+            ("CHELADB_PASSWORD_STRENGTH", "on"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.roles,
+            RoleSettings {
+                role_cap: 7,
+                database_cap: 3,
+                strength: true,
+                prehashed_allowed: true
+            }
+        );
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELADB_MODE", "platform")])).unwrap();
+        assert!(c.roles.strength && !c.roles.prehashed_allowed);
+        for (name, bad) in [
+            ("CHELADB_BRANCH_ROLE_CAP", "501"),
+            ("CHELADB_BRANCH_DATABASE_CAP", "0"),
+            ("CHELADB_PASSWORD_STRENGTH", "maybe"),
+        ] {
+            let err = WorkerConfig::from_lookup(lookup(&[IMAGE, (name, bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(name), "{name}={bad}: {err}");
+        }
     }
 
     #[test]

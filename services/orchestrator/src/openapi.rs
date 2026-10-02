@@ -91,7 +91,7 @@ impl MetadataPort for Doc {
     async fn get_branch(&self, branch_id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
         match *self {}
     }
-    async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+    async fn begin_delete(&self, database_id: DatabaseId) -> Result<BeginDelete, MetadataError> {
         match *self {}
     }
     async fn list_branches(
@@ -123,7 +123,18 @@ impl MetadataPort for Doc {
     ) -> Result<bool, MetadataError> {
         match *self {}
     }
-    async fn claim_branch_for_switch(&self, branch_id: BranchId) -> Result<bool, MetadataError> {
+    async fn claim_branch_for_switch(
+        &self,
+        branch_id: BranchId,
+        allow_protected: bool,
+    ) -> Result<ClaimOutcome, MetadataError> {
+        match *self {}
+    }
+    async fn set_branch_protected(
+        &self,
+        branch_id: BranchId,
+        protected: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
         match *self {}
     }
     async fn set_branch_failed(
@@ -163,6 +174,22 @@ impl MetadataPort for Doc {
     ) -> Result<bool, MetadataError> {
         match *self {}
     }
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
+        match *self {}
+    }
+    async fn role_password(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, MetadataError> {
+        match *self {}
+    }
+    async fn branch_databases(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<BranchDatabase>, MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -197,6 +224,15 @@ impl JobPort for Doc {
         database_id: DatabaseId,
         branch_id: BranchId,
     ) -> Result<ResetPasswordReply, ResetError> {
+        match *self {}
+    }
+    async fn create_role(&self, request: RoleCreateRequest) -> Result<RoleReply, ResetError> {
+        match *self {}
+    }
+    async fn reset_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+        match *self {}
+    }
+    async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
         match *self {}
     }
 }
@@ -290,6 +326,10 @@ mod tests {
                 "DELETE /v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
                 "revokeKey",
             ),
+            (
+                "DELETE /v1/databases/{id}/branches/{branch_id}/roles/{role}",
+                "deleteRole",
+            ),
             ("GET /v1/databases/{id}", "getDatabase"),
             ("GET /v1/databases/{id}/branches", "listBranches"),
             (
@@ -301,12 +341,24 @@ mod tests {
                 "getDataApiSchema",
             ),
             (
+                "GET /v1/databases/{id}/branches/{branch_id}/databases",
+                "listBranchDatabases",
+            ),
+            (
                 "GET /v1/databases/{id}/branches/{branch_id}/keys",
                 "listKeys",
+            ),
+            (
+                "GET /v1/databases/{id}/branches/{branch_id}/roles",
+                "listRoles",
             ),
             ("GET /v1/databases/{id}/connection", "getDatabaseConnection"),
             ("GET /v1/me", "getMe"),
             ("PATCH /v1/databases/{id}", "updateDatabase"),
+            (
+                "PATCH /v1/databases/{id}/branches/{branch_id}",
+                "updateBranch",
+            ),
             ("POST /v1/databases", "createDatabase"),
             ("POST /v1/databases/{id}/branches", "createBranch"),
             (
@@ -328,6 +380,14 @@ mod tests {
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/restore",
                 "restoreBranch",
+            ),
+            (
+                "POST /v1/databases/{id}/branches/{branch_id}/roles",
+                "createRole",
+            ),
+            (
+                "POST /v1/databases/{id}/branches/{branch_id}/roles/{role}/reset-password",
+                "resetRolePassword",
             ),
             (
                 "POST /v1/databases/{id}/reset-password",
@@ -361,7 +421,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "me"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -406,8 +466,10 @@ mod tests {
         let expected = [
             "ArgDesc",
             "Branch",
+            "BranchDatabaseView",
             "BranchId",
             "BranchKind",
+            "BranchRole",
             "BranchStatus",
             "ColumnDesc",
             "ConnectionDetails",
@@ -415,12 +477,14 @@ mod tests {
             "CreateDatabaseAccepted",
             "CreateDatabaseRequest",
             "CreateKeyRequest",
+            "CreateRoleRequest",
             "CreatedDataKey",
             "DataApiSchema",
             "DataKey",
             "DataKeyKind",
             "Database",
             "DatabaseId",
+            "DatabaseOrigin",
             "DatabaseSettings",
             "DatabaseStatus",
             "DatabaseSummary",
@@ -431,6 +495,7 @@ mod tests {
             "Me",
             "MeUser",
             "OperationAccepted",
+            "PasswordState",
             "PointInTime",
             "Privilege",
             "Project",
@@ -438,11 +503,15 @@ mod tests {
             "RestoreAccepted",
             "RestoreRequest",
             "ReturnDesc",
+            "RoleInUseKey",
+            "RoleLevel",
+            "RoleOrigin",
             "SchemaEntry",
             "TableDesc",
             "TableKind",
             "Tenant",
             "TenantId",
+            "UpdateBranchRequest",
             "UpdateDatabaseRequest",
         ];
         // The names are map keys, so a clash between two types would drop one from this list.

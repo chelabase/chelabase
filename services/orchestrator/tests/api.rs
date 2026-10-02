@@ -3,12 +3,13 @@ use cheladb_auth::internal::{
     generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier, IDENTITY_HEADER,
 };
 use cheladb_metadata::{
-    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DataKeyRecord, DatabaseRecord,
-    DatabaseStatus, MetadataError, NewBranch, NewDataKey, ProjectOverview, SettingsPatch, TenantOverview,
+    BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseOrigin, DataKeyRecord, DatabaseRecord,
+    DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
+    TenantOverview,
 };
 use cheladb_nats::{
     BranchJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
-    ProvisionDatabaseJob, ResetPasswordReply, RESET_NOT_APPLIED,
+    ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RESET_NOT_APPLIED,
 };
 use cheladb_routes::{Service, ENDPOINTS};
 use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
@@ -40,6 +41,13 @@ struct FakeMetadata {
     main_count_queries: Arc<AtomicUsize>,
     /// Data API keys, live and revoked, with their hashes.
     keys: Arc<Mutex<Vec<KeyRow>>>,
+    /// Roles by endpoint id, and login roles' sealed passwords by (endpoint id, name).
+    roles: Arc<Mutex<HashMap<String, Vec<RoleRow>>>>,
+    role_passwords: Arc<Mutex<HashMap<(String, String), String>>>,
+    /// The branch's Postgres databases.
+    branch_dbs: Arc<Mutex<HashMap<BranchId, Vec<BranchDatabase>>>>,
+    /// `begin_branch_delete` protects this branch first: a flag set after the API's check.
+    protect_on_delete: Arc<Mutex<Option<BranchId>>>,
 }
 
 /// A database row and its main branch, which holds the endpoint and the sealed password.
@@ -94,6 +102,7 @@ fn main_for(record: &DatabaseRecord) -> BranchRecord {
         updated_at: now,
         history_start: None,
         authenticator_password_enc: None,
+            protected: false,
     }
 }
 
@@ -148,6 +157,7 @@ impl FakeMetadata {
                 updated_at: now,
                 history_start: None,
                 authenticator_password_enc: None,
+            protected: false,
             },
         );
         id
@@ -159,6 +169,33 @@ impl FakeMetadata {
 
     fn database(&self, id: DatabaseId) -> DatabaseRecord {
         self.databases.lock().unwrap().get(&id).cloned().expect("database row")
+    }
+
+    /// Adds a role row to an endpoint, as the worker would have written it.
+    fn add_role(&self, endpoint: &str, name: &str, origin: RoleOrigin, privileged: bool, pending: bool) {
+        self.roles.lock().unwrap().entry(endpoint.to_string()).or_default().push(RoleRow {
+            name: name.into(),
+            origin,
+            level: if privileged { RoleLevel::OwnerLevel } else { RoleLevel::Plain },
+            login: true,
+            password: PasswordState::Generated,
+            created_at: chrono::Utc::now(),
+            pending,
+        });
+    }
+
+    /// Adds a role row built by the caller.
+    fn add_role_row(&self, endpoint: &str, row: RoleRow) {
+        self.roles.lock().unwrap().entry(endpoint.to_string()).or_default().push(row);
+    }
+
+    /// Records a Postgres database of a branch.
+    fn add_branch_db(&self, branch: BranchId, name: &str, owner: &str, origin: DatabaseOrigin) {
+        self.branch_dbs.lock().unwrap().entry(branch).or_default().push(BranchDatabase {
+            name: name.into(),
+            owner: owner.into(),
+            origin,
+        });
     }
 
     fn fail_next_insert(&self) {
@@ -251,14 +288,22 @@ impl MetadataPort for FakeMetadata {
         Ok(self.branches.lock().unwrap().get(&branch_id).cloned())
     }
 
-    async fn begin_delete(&self, database_id: DatabaseId) -> Result<bool, MetadataError> {
+    async fn begin_delete(&self, database_id: DatabaseId) -> Result<BeginDelete, MetadataError> {
         let mut dbs = self.databases.lock().unwrap();
         match dbs.get_mut(&database_id) {
             Some(db) if !matches!(db.status, DatabaseStatus::Deleting | DatabaseStatus::Deleted) => {
+                let protected = self.branches.lock().unwrap().values().any(|b| {
+                    b.database_id == database_id
+                        && b.protected
+                        && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted)
+                });
+                if protected {
+                    return Ok(BeginDelete::Protected);
+                }
                 db.status = DatabaseStatus::Deleting;
-                Ok(true)
+                Ok(BeginDelete::Started)
             }
-            _ => Ok(false),
+            _ => Ok(BeginDelete::NotReady),
         }
     }
 
@@ -350,6 +395,7 @@ impl MetadataPort for FakeMetadata {
                 updated_at: now,
                 history_start: None,
                 authenticator_password_enc: None,
+            protected: false,
             },
         );
         Ok(CreateBranchOutcome::Created)
@@ -391,14 +437,38 @@ impl MetadataPort for FakeMetadata {
         }
     }
 
-    async fn claim_branch_for_switch(&self, branch_id: BranchId) -> Result<bool, MetadataError> {
+    async fn claim_branch_for_switch(
+        &self,
+        branch_id: BranchId,
+        allow_protected: bool,
+    ) -> Result<ClaimOutcome, MetadataError> {
         match self.branches.lock().unwrap().get_mut(&branch_id) {
+            Some(b) if b.status == BranchStatus::Ready && b.protected && !allow_protected => {
+                Ok(ClaimOutcome::Protected)
+            }
             Some(b) if b.status == BranchStatus::Ready => {
                 b.status = BranchStatus::Resetting;
                 b.error = None;
-                Ok(true)
+                Ok(ClaimOutcome::Claimed)
             }
-            _ => Ok(false),
+            _ => Ok(ClaimOutcome::NotReady),
+        }
+    }
+
+    async fn set_branch_protected(
+        &self,
+        branch_id: BranchId,
+        protected: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        match self.branches.lock().unwrap().get_mut(&branch_id) {
+            Some(b)
+                if b.kind == BranchKind::Normal
+                    && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) =>
+            {
+                b.protected = protected;
+                Ok(Some(b.clone()))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -412,6 +482,9 @@ impl MetadataPort for FakeMetadata {
 
     async fn begin_branch_delete(&self, branch_id: BranchId) -> Result<BranchDeleteOutcome, MetadataError> {
         let mut branches = self.branches.lock().unwrap();
+        if *self.protect_on_delete.lock().unwrap() == Some(branch_id) {
+            branches.get_mut(&branch_id).unwrap().protected = true;
+        }
         // Like the real guard: refused while the branch or a live backup of it has live
         // normal children (the branch's own first, then each backup's, oldest first).
         let live = |b: &BranchRecord| !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted);
@@ -450,6 +523,9 @@ impl MetadataPort for FakeMetadata {
             }
         }
         let moved = match branches.get_mut(&branch_id) {
+            Some(b) if !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) && b.protected => {
+                return Ok(BranchDeleteOutcome::Protected);
+            }
             Some(b) if !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) => {
                 b.status = BranchStatus::Deleting;
                 b.error = None;
@@ -553,6 +629,29 @@ impl MetadataPort for FakeMetadata {
             }
         }
     }
+
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
+        Ok(self.roles.lock().unwrap().get(endpoint_id).cloned().unwrap_or_default())
+    }
+
+    async fn role_password(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, MetadataError> {
+        Ok(self
+            .role_passwords
+            .lock()
+            .unwrap()
+            .get(&(endpoint_id.to_string(), name.to_string()))
+            .cloned())
+    }
+
+    async fn branch_databases(&self, branch: BranchId) -> Result<Vec<BranchDatabase>, MetadataError> {
+        let mut rows = self.branch_dbs.lock().unwrap().get(&branch).cloned().unwrap_or_default();
+        rows.sort_by_key(|d| (d.origin != DatabaseOrigin::Main, d.name.clone()));
+        Ok(rows)
+    }
 }
 
 fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataError> {
@@ -610,6 +709,10 @@ struct FakeJobs {
     /// (branch, role) of each check-role request.
     role_checks: Arc<Mutex<Vec<(BranchId, String)>>>,
     role_check: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
+    /// Each login-role RPC as `create:<name>:<privileged>`, `reset:<name>` or `delete:<name>`.
+    role_calls: Arc<Mutex<Vec<String>>>,
+    /// What the worker answers to the role RPCs; `ok` when unset.
+    role_reply: Arc<Mutex<Option<Result<RoleReply, ResetError>>>>,
 }
 
 impl FakeJobs {
@@ -683,6 +786,33 @@ impl JobPort for FakeJobs {
             FakeReset::Timeout => Err(ResetError::Timeout),
             FakeReset::WorkerTimedOut => Ok(ResetPasswordReply { ok: false, error: Some("timed out".into()) }),
             FakeReset::Unavailable => Err(ResetError::Transport("no worker listening".into())),
+        }
+    }
+
+    async fn create_role(&self, request: RoleCreateRequest) -> Result<RoleReply, ResetError> {
+        self.role_calls
+            .lock()
+            .unwrap()
+            .push(format!("create:{}:{}", request.name, request.owner_level));
+        self.role_answer()
+    }
+
+    async fn reset_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+        self.role_calls.lock().unwrap().push(format!("reset:{}", request.name));
+        self.role_answer()
+    }
+
+    async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+        self.role_calls.lock().unwrap().push(format!("delete:{}", request.name));
+        self.role_answer()
+    }
+}
+
+impl FakeJobs {
+    fn role_answer(&self) -> Result<RoleReply, ResetError> {
+        match self.role_reply.lock().unwrap().clone() {
+            Some(answer) => answer,
+            None => Ok(RoleReply { ok: true, code: None, error: None, keys: vec![] }),
         }
     }
 }
@@ -1469,7 +1599,7 @@ async fn reveal_not_ready_is_409() {
 
 // Review Focus 2.
 #[tokio::test]
-async fn reveal_without_stored_credentials_is_409_with_recreate_hint() {
+async fn reveal_without_a_sealed_owner_password_says_set_in_sql() {
     let mut id = None;
     let app = lifecycle_app(FakeJobs::default(), |m, t, k| {
         let mut db = ready_database(t, k);
@@ -1479,9 +1609,11 @@ async fn reveal_without_stored_credentials_is_409_with_recreate_hint() {
     })
     .await;
     let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.unwrap().as_uuid()), "org-1").await;
-    assert_eq!(resp.status(), 409);
+    assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(code_of(&body), "credentials_unavailable");
+    assert!(body["password"].is_null(), "{body}");
+    assert_eq!(body["password_state"], "set_in_sql");
+    assert_eq!(body["uri"], "postgresql://postgres@ep-0123456789ab.localtest.me:4432/web1?sslmode=verify-full");
 }
 
 #[tokio::test]
@@ -3154,4 +3286,639 @@ async fn schema_404_is_not_found_and_unexpected_answers_are_unavailable() {
     let resp = t.send(Method::GET, &format!("{}/data-api/schema", t.branch(t.main())), None).await;
     let err = error_of(resp, 502).await;
     assert_eq!(code_of(&err), "unavailable");
+}
+
+// ---- login roles
+
+impl Branching {
+    fn roles(&self, branch: BranchId) -> String {
+        format!("{}/roles", self.branch(branch))
+    }
+
+    /// The branch's endpoint, with its owner row so a list has something to start from.
+    fn with_owner_row(&self, branch: BranchId) -> String {
+        let ep = self.metadata.branch(branch).endpoint_id.unwrap();
+        self.metadata.add_role(&ep, "postgres", RoleOrigin::Owner, true, false);
+        ep
+    }
+}
+
+fn role_row(name: &str, origin: RoleOrigin, level: RoleLevel, password: PasswordState) -> RoleRow {
+    RoleRow {
+        name: name.into(),
+        origin,
+        level,
+        login: true,
+        password,
+        created_at: chrono::Utc::now(),
+        pending: false,
+    }
+}
+
+fn role_reply(code: &str) -> RoleReply {
+    RoleReply { ok: false, code: Some(code.into()), error: Some("worker said so".into()), keys: vec![] }
+}
+
+#[tokio::test]
+async fn list_roles_shapes_and_blocked_keys() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, true);
+    t.metadata.add_role_row(&ep, role_row("etl", RoleOrigin::Sql, RoleLevel::OwnerLevel, PasswordState::SetInSql));
+    t.metadata.add_role_row(&ep, role_row("old", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Md5Unusable));
+    // Live secret keys naming `etl` (owner-level) and `app` (plain): only the first is blocked.
+    {
+    let mut keys = t.metadata.keys.lock().unwrap();
+    for (role, name) in [("etl", "ci"), ("app", "web")] {
+        let id = uuid::Uuid::new_v4();
+        insert_key(
+            &mut keys,
+            &NewDataKey {
+                id,
+                branch_id: dev,
+                kind: DataKeyKind::Secret,
+                role: role.into(),
+                name: name.into(),
+                prefix: "ck_x".into(),
+                sealed: None,
+                sha256: [id.as_bytes()[0]; 32],
+            },
+        )
+        .unwrap();
+    }
+    }
+    let resp = t.send(Method::GET, &t.roles(dev), None).await;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("cache-control").is_none());
+    let body: Value = resp.json().await.unwrap();
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["name"], "postgres");
+    assert_eq!(rows[0]["origin"], "owner");
+    assert_eq!(rows[0]["level"], "owner_level");
+    assert_eq!(rows[0]["blocked_keys"], json!([]));
+    assert_eq!(rows[1]["name"], "app");
+    assert_eq!(rows[1]["origin"], "api");
+    assert_eq!(rows[1]["level"], "plain");
+    assert_eq!(rows[1]["login"], true);
+    assert_eq!(rows[1]["password"], "generated");
+    assert_eq!(rows[1]["pending"], true);
+    assert_eq!(rows[1]["blocked_keys"], json!([]));
+    assert_eq!(rows[2]["origin"], "sql");
+    assert_eq!(rows[2]["level"], "owner_level");
+    assert_eq!(rows[2]["password"], "set_in_sql");
+    assert_eq!(rows[2]["blocked_keys"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[2]["blocked_keys"][0]["name"], "ci");
+    assert!(rows[2]["blocked_keys"][0]["id"].is_string());
+    assert_eq!(rows[3]["password"], "md5_unusable");
+    assert!(rows[1]["created_at"].is_string());
+    for row in rows {
+        assert!(row.get("kind").is_none() && row.get("privileged").is_none(), "{row}");
+    }
+}
+
+#[tokio::test]
+async fn create_role_takes_owner_level_and_refuses_privileged() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    // The worker writes the row; the fake answers ok.
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, true, true);
+    let resp = t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app", "owner_level": true }))).await;
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    // Exactly the role's fields: `password` is the state (`generated`), never a secret.
+    let mut fields: Vec<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        ["blocked_keys", "created_at", "level", "login", "name", "origin", "password", "pending"],
+        "{body}"
+    );
+    assert_eq!(body["password"], "generated");
+    assert_eq!(body["name"], "app");
+    assert_eq!(body["origin"], "api");
+    assert_eq!(body["level"], "owner_level");
+    assert_eq!(body["pending"], true);
+    assert!(body["created_at"].is_string());
+    assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["create:app:true".to_string()]);
+    // `privileged` was revision 1's field: now unknown.
+    let err = error_of(t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "x", "privileged": true }))).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    assert_eq!(t.jobs.role_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn create_role_defaults_to_not_privileged() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    let resp = t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app" }))).await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["create:app:false".to_string()]);
+}
+
+#[tokio::test]
+async fn create_role_bad_name_is_422_without_rpc() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    for (name, code) in [
+        ("Bad-Name", "invalid_role_name"),
+        ("", "invalid_role_name"),
+        ("postgres", "reserved_role_name"),
+        ("pg_x", "reserved_role_name"),
+    ] {
+        let err = error_of(t.send(Method::POST, &t.roles(dev), Some(json!({ "name": name }))).await, 422).await;
+        assert_eq!(code_of(&err), code, "{name}");
+    }
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn create_role_unknown_field_is_422() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let err = error_of(t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app", "password": "x" }))).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    let resp = reqwest::Client::new()
+        .post(format!("{}{}", t.app.base, t.roles(dev)))
+        .header(IDENTITY_HEADER, t.app.token_for_org("org-1"))
+        .header("content-type", "application/json")
+        .body("{nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(code_of(&error_of(resp, 400).await), "invalid_request");
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn role_routes_refuse_backups_unready_and_unknown_branches() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let backup = t.backup(dev);
+    let pending = t.add("p", t.main(), BranchKind::Normal, BranchStatus::Pending);
+    for (method, suffix, body) in [
+        (Method::GET, "", None),
+        (Method::POST, "", Some(json!({ "name": "app" }))),
+        (Method::POST, "/app/reset-password", None),
+        (Method::DELETE, "/app", None),
+    ] {
+        let path = |id| format!("{}{suffix}", t.roles(id));
+        let err = error_of(t.send(method.clone(), &path(backup), body.clone()).await, 409).await;
+        assert_eq!(code_of(&err), "backup_branch", "{suffix}");
+        let err = error_of(t.send(method.clone(), &path(pending), body.clone()).await, 409).await;
+        assert_eq!(code_of(&err), "branch_not_ready", "{suffix}");
+        assert_eq!(t.send(method.clone(), &path(BranchId::new()), body.clone()).await.status(), 404, "{suffix}");
+    }
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+    assert!(t.jobs.resets.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn role_reply_codes_map_to_statuses() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    let key = uuid::Uuid::new_v4();
+    let in_use = RoleReply {
+        keys: vec![cheladb_nats::KeyRef { id: key, name: "ci".into() }],
+        ..role_reply("role_in_use")
+    };
+    let table: Vec<(RoleReply, u16, &str)> = vec![
+        (role_reply("invalid_role_name"), 422, "invalid_role_name"),
+        (role_reply("reserved_role_name"), 422, "reserved_role_name"),
+        (role_reply("role_exists"), 409, "role_exists"),
+        (role_reply("role_cap_reached"), 409, "role_cap_reached"),
+        (role_reply("branch_not_ready"), 409, "branch_not_ready"),
+        (in_use, 409, "role_in_use"),
+        (role_reply("not_found"), 404, "not_found"),
+        (role_reply("role_privilege_mismatch"), 500, "role_privilege_mismatch"),
+        (role_reply("failed"), 500, "internal"),
+        (role_reply("something_new"), 500, "internal"),
+        (role_reply("not_applied"), 503, "not_applied"),
+    ];
+    let requests = [
+        (Method::POST, t.roles(dev), Some(json!({ "name": "app" }))),
+        (Method::POST, format!("{}/app/reset-password", t.roles(dev)), None),
+        (Method::DELETE, format!("{}/app", t.roles(dev)), None),
+    ];
+    for (reply, status, code) in table {
+        *t.jobs.role_reply.lock().unwrap() = Some(Ok(reply.clone()));
+        for (method, path, body) in &requests {
+            let err = error_of(t.send(method.clone(), path, body.clone()).await, status).await;
+            assert_eq!(code_of(&err), code, "{method} {path} {reply:?}");
+            let text = err.to_string();
+            assert!(!text.contains("worker said so"), "the worker's message leaked: {text}");
+            if reply.code.as_deref() == Some("role_in_use") {
+                assert_eq!(err["error"]["keys"], json!([{ "id": key, "name": "ci" }]));
+            } else {
+                assert!(err["error"].get("keys").is_none());
+            }
+            if code == "not_applied" {
+                let expected = match *method {
+                    Method::POST if path.ends_with("/reset-password") => RESET_NOT_APPLIED,
+                    Method::POST => "the role was stored but not yet applied; it will be retried",
+                    _ => "the role was deleted but the change is not yet applied; it will be retried",
+                };
+                assert_eq!(message_of(&err), expected, "{method} {path}");
+            }
+        }
+    }
+    *t.jobs.role_reply.lock().unwrap() = Some(Err(ResetError::Timeout));
+    let err = error_of(t.send(Method::DELETE, &format!("{}/app", t.roles(dev)), None).await, 504).await;
+    assert_eq!(code_of(&err), "timeout");
+    *t.jobs.role_reply.lock().unwrap() = Some(Err(ResetError::Transport("no worker listening".into())));
+    let err = error_of(t.send(Method::DELETE, &format!("{}/app", t.roles(dev)), None).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+}
+
+#[tokio::test]
+async fn reset_owner_alias_uses_owner_reset_and_is_204() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let resp = t.send(Method::POST, &format!("{}/postgres/reset-password", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(*t.jobs.resets.lock().unwrap(), vec![(t.db, dev)]);
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reset_login_role_is_204() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let resp = t.send(Method::POST, &format!("{}/app/reset-password", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    assert!(resp.text().await.unwrap().is_empty());
+    assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["reset:app".to_string()]);
+    assert!(t.jobs.resets.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reset_and_delete_accept_sql_names() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    // SQL can make `"My Role"`: the percent-encoded name reaches the worker decoded.
+    let resp = t.send(Method::POST, &format!("{}/My%20Role/reset-password", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    let resp = t.send(Method::DELETE, &format!("{}/Bad-Name", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        *t.jobs.role_calls.lock().unwrap(),
+        vec!["reset:My Role".to_string(), "delete:Bad-Name".to_string()]
+    );
+    // A NUL byte, and a name over 63 bytes, never reach the worker.
+    for path in [format!("{}/a%00b/reset-password", t.roles(dev)), format!("{}/{}/reset-password", t.roles(dev), "x".repeat(64))] {
+        let err = error_of(t.send(Method::POST, &path, None).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_role_name", "{path}");
+    }
+    let err = error_of(t.send(Method::DELETE, &format!("{}/a%00b", t.roles(dev)), None).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_role_name");
+    assert_eq!(t.jobs.role_calls.lock().unwrap().len(), 2);
+}
+
+// What Studio sends for a role named `a/b%61?#`: one segment, decoded once (`%2561` stays
+// `%61`, not `a`).
+#[tokio::test]
+async fn role_path_is_decoded_once() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let segment = "a%2Fb%2561%3F%23";
+    let resp = t.send(Method::POST, &format!("{}/{segment}/reset-password", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    let resp = t.send(Method::DELETE, &format!("{}/{segment}", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        *t.jobs.role_calls.lock().unwrap(),
+        vec!["reset:a/b%61?#".to_string(), "delete:a/b%61?#".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn delete_role_204() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let resp = t.send(Method::DELETE, &format!("{}/app", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["delete:app".to_string()]);
+}
+
+#[tokio::test]
+async fn delete_owner_is_422() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let err = error_of(t.send(Method::DELETE, &format!("{}/postgres", t.roles(dev)), None).await, 422).await;
+    assert_eq!(code_of(&err), "reserved_role_name");
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn connection_by_role_and_database() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let sealed = seal_credential(&t.app.key, &dev.to_string(), Purpose::Owner, "dev-pw");
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().owner_password_enc = Some(sealed);
+    let ep = t.metadata.branch(dev).endpoint_id.unwrap();
+    t.metadata.role_passwords.lock().unwrap().insert(
+        (ep.clone(), "app".into()),
+        cheladb_secrets::seal_role_password(&t.app.key, &dev.to_string(), "app", "app-pw"),
+    );
+    t.metadata.add_role(&ep, "postgres", RoleOrigin::Owner, true, false);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    t.metadata.add_role_row(&ep, role_row("etl", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::SetInSql));
+    t.metadata.add_role_row(&ep, role_row("old", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Md5Unusable));
+    t.metadata.add_role_row(&ep, role_row("My Role@x", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::SetInSql));
+    t.metadata.add_branch_db(dev, "web1", "postgres", DatabaseOrigin::Main);
+    t.metadata.add_branch_db(dev, "analytics", "etl", DatabaseOrigin::Sql);
+    t.metadata.add_branch_db(dev, "postgres", "cloud_admin", DatabaseOrigin::System);
+    let conn = format!("{}/connection", t.branch(dev));
+
+    // Absent, or the owner by name: the owner's credentials.
+    for path in [conn.clone(), format!("{conn}?role=postgres"), format!("{conn}?other=1")] {
+        let resp = t.send(Method::GET, &path, None).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!((body["user"].as_str(), body["password"].as_str()), (Some("postgres"), Some("dev-pw")), "{path}");
+        assert_eq!(body["password_state"], "generated");
+    }
+
+    // A role made through the API: its own user and password.
+    let resp = t.send(Method::GET, &format!("{conn}?role=app"), None).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["user"], "app");
+    assert_eq!(body["password"], "app-pw");
+    assert_eq!(body["password_state"], "generated");
+    assert_eq!(body["database"], "web1");
+    assert_eq!(body["host"], format!("{ep}.localtest.me"));
+    assert_eq!(body["uri"], format!("postgresql://app:app-pw@{ep}.localtest.me:4432/web1?sslmode=verify-full"));
+
+    // A role set in SQL: no password, a uri without one.
+    let resp = t.send(Method::GET, &format!("{conn}?role=etl&database=analytics"), None).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["password"].is_null(), "{body}");
+    assert_eq!(body["password_state"], "set_in_sql");
+    assert_eq!(body["database"], "analytics");
+    assert_eq!(body["uri"], format!("postgresql://etl@{ep}.localtest.me:4432/analytics?sslmode=verify-full"));
+
+    // An MD5 role.
+    let body: Value = t.send(Method::GET, &format!("{conn}?role=old"), None).await.json().await.unwrap();
+    assert!(body["password"].is_null());
+    assert_eq!(body["password_state"], "md5_unusable");
+
+    // The system database is pickable; the user and database are percent-encoded in the uri.
+    let body: Value = t.send(Method::GET, &format!("{conn}?role=My%20Role%40x&database=postgres"), None).await.json().await.unwrap();
+    assert_eq!(body["user"], "My Role@x");
+    assert_eq!(body["database"], "postgres");
+    assert_eq!(body["uri"], format!("postgresql://My%20Role%40x@{ep}.localtest.me:4432/postgres?sslmode=verify-full"));
+
+    // Unknown database, unknown role, NUL: 404, 404, 422.
+    let err = error_of(t.send(Method::GET, &format!("{conn}?database=ghost"), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let err = error_of(t.send(Method::GET, &format!("{conn}?role=ghost"), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let err = error_of(t.send(Method::GET, &format!("{conn}?role=a%00b"), None).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_role_name");
+    // Any Postgres name is a lookup now, so a platform role is just not there.
+    let err = error_of(t.send(Method::GET, &format!("{conn}?role=anon"), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+
+    // A backup is refused whatever the role.
+    let backup = t.backup(dev);
+    let err = error_of(t.send(Method::GET, &format!("{}/connection?role=app", t.branch(backup)), None).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
+}
+
+#[tokio::test]
+async fn owner_set_in_sql_reveals_no_password() {
+    let t = branching().await;
+    let dev = t.ready("dev"); // no sealed owner password
+    t.metadata.add_branch_db(dev, "web1", "postgres", DatabaseOrigin::Main);
+    let ep = t.metadata.branch(dev).endpoint_id.unwrap();
+    let resp = t.send(Method::GET, &format!("{}/connection", t.branch(dev)), None).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["user"], "postgres");
+    assert!(body["password"].is_null(), "{body}");
+    assert_eq!(body["password_state"], "set_in_sql");
+    assert_eq!(body["uri"], format!("postgresql://postgres@{ep}.localtest.me:4432/web1?sslmode=verify-full"));
+}
+
+#[tokio::test]
+async fn list_branch_databases() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    t.metadata.add_branch_db(dev, "postgres", "cloud_admin", DatabaseOrigin::System);
+    t.metadata.add_branch_db(dev, "zeta", "etl", DatabaseOrigin::Sql);
+    t.metadata.add_branch_db(dev, "web1", "postgres", DatabaseOrigin::Main);
+    t.metadata.add_branch_db(dev, "alpha", "etl", DatabaseOrigin::Sql);
+    let resp = t.send(Method::GET, &format!("{}/databases", t.branch(dev)), None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!([
+            { "name": "web1", "owner": "postgres", "origin": "main", "main": true },
+            { "name": "alpha", "owner": "etl", "origin": "sql", "main": false },
+            { "name": "postgres", "owner": "cloud_admin", "origin": "system", "main": false },
+            { "name": "zeta", "owner": "etl", "origin": "sql", "main": false },
+        ])
+    );
+    let backup = t.backup(dev);
+    let err = error_of(t.send(Method::GET, &format!("{}/databases", t.branch(backup)), None).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
+    assert_eq!(t.send(Method::GET, &format!("{}/databases", t.branch(BranchId::new())), None).await.status(), 404);
+}
+
+#[tokio::test]
+async fn main_database_missing_is_reported() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    // `dev` has a database row but no `main` one: the branch says so; the reveal still names
+    // the recorded main database (R24).
+    t.metadata.add_branch_db(dev, "other", "etl", DatabaseOrigin::Sql);
+    let list: Vec<Value> = t.send(Method::GET, &t.branches(), None).await.json().await.unwrap();
+    let by = |id: BranchId| list.iter().find(|b| b["id"] == id.as_uuid().to_string()).unwrap().clone();
+    assert_eq!(by(dev)["main_database_missing"], true);
+    let body: Value = t.send(Method::GET, &format!("{}/connection", t.branch(dev)), None).await.json().await.unwrap();
+    assert_eq!(body["database"], "web1");
+    // With the main row present, it isn't missing.
+    t.metadata.add_branch_db(dev, "web1", "postgres", DatabaseOrigin::Main);
+    let list: Vec<Value> = t.send(Method::GET, &t.branches(), None).await.json().await.unwrap();
+    let dev_row = list.iter().find(|b| b["id"] == dev.as_uuid().to_string()).unwrap();
+    assert_eq!(dev_row["main_database_missing"], false);
+}
+
+#[tokio::test]
+async fn update_branch_protected() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let resp = t.send(Method::PATCH, &t.branch(dev), Some(json!({ "protected": true }))).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], dev.as_uuid().to_string());
+    assert_eq!(body["protected"], true);
+    assert!(t.metadata.branch(dev).protected);
+    let body: Value = t.send(Method::PATCH, &t.branch(dev), Some(json!({ "protected": false }))).await.json().await.unwrap();
+    assert_eq!(body["protected"], false);
+    // Main can be protected too.
+    assert_eq!(t.send(Method::PATCH, &t.branch(t.main()), Some(json!({ "protected": true }))).await.status(), 200);
+    // A backup: 409; unknown: 404; a deleting branch: 409 branch_not_ready.
+    let backup = t.backup(dev);
+    let err = error_of(t.send(Method::PATCH, &t.branch(backup), Some(json!({ "protected": true }))).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
+    assert_eq!(t.send(Method::PATCH, &t.branch(BranchId::new()), Some(json!({ "protected": true }))).await.status(), 404);
+    let deleting = t.add("gone", t.main(), BranchKind::Normal, BranchStatus::Deleting);
+    let err = error_of(t.send(Method::PATCH, &t.branch(deleting), Some(json!({ "protected": true }))).await, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    // Unknown or missing field: 422; a bad body: 400.
+    for body in [json!({ "protected": true, "name": "x" }), json!({}), json!({ "protected": "yes" })] {
+        let err = error_of(t.send(Method::PATCH, &t.branch(dev), Some(body.clone())).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{body}");
+    }
+    // Malformed JSON: 400.
+    let resp = reqwest::Client::new()
+        .patch(format!("{}{}", t.app.base, t.branch(dev)))
+        .header(IDENTITY_HEADER, t.app.token_for_org("org-1"))
+        .header("content-type", "application/json")
+        .body("{\"protected\": tru")
+        .send()
+        .await
+        .unwrap();
+    let err = error_of(resp, 400).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    assert!(!t.metadata.branch(dev).protected);
+    // Needs the management credential.
+    let resp = reqwest::Client::new()
+        .patch(format!("{}{}", t.app.base, t.branch(dev)))
+        .json(&json!({ "protected": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn protected_branch_refuses_delete_and_reset_but_not_restore() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().protected = true;
+    let expect = |err: &Value| {
+        assert_eq!(code_of(err), "branch_protected");
+        assert_eq!(message_of(err), "this branch is protected; unprotect it first");
+    };
+    expect(&error_of(t.send(Method::DELETE, &t.branch(dev), None).await, 409).await);
+    expect(&error_of(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await, 409).await);
+    assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
+    assert!(t.published().is_empty());
+    // A non-ready (failed) protected branch refuses a delete as well.
+    let failed = t.add("bad", t.main(), BranchKind::Normal, BranchStatus::Failed);
+    t.metadata.branches.lock().unwrap().get_mut(&failed).unwrap().protected = true;
+    expect(&error_of(t.send(Method::DELETE, &t.branch(failed), None).await, 409).await);
+    assert_eq!(t.metadata.branch(failed).status, BranchStatus::Failed);
+    // Restore rewinds a protected branch (its previous state is kept as a backup).
+    let resp = t
+        .send(Method::POST, &format!("{}/restore", t.branch(dev)), Some(json!({ "at": { "timestamp": "2026-01-01T00:00:00Z" } })))
+        .await;
+    assert_eq!(resp.status(), 202);
+    // Unprotected, the delete goes through.
+    let other = t.ready("other");
+    assert_eq!(t.send(Method::DELETE, &t.branch(other), None).await.status(), 202);
+}
+
+// T6: a protect that lands after the API's check is still refused by the delete itself; a
+// claimed (ready) branch is released.
+#[tokio::test]
+async fn delete_refused_when_protected_after_the_check() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let failed = t.add("bad", t.main(), BranchKind::Normal, BranchStatus::Failed);
+    for (branch, status) in [(dev, BranchStatus::Ready), (failed, BranchStatus::Failed)] {
+        *t.metadata.protect_on_delete.lock().unwrap() = Some(branch);
+        let err = error_of(t.send(Method::DELETE, &t.branch(branch), None).await, 409).await;
+        assert_eq!(code_of(&err), "branch_protected", "{status:?}");
+        assert_eq!(t.metadata.branch(branch).status, status);
+    }
+    assert!(t.published().is_empty());
+}
+
+#[tokio::test]
+async fn database_delete_refused_with_a_protected_branch() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().protected = true;
+    let path = format!("/v1/databases/{}", t.db.as_uuid());
+    let err = error_of(t.send(Method::DELETE, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "branch_protected");
+    assert_eq!(message_of(&err), "a branch of this database is protected; unprotect it first");
+    assert!(t.jobs.deleted.lock().unwrap().is_empty());
+    assert_eq!(t.metadata.database(t.db).status, DatabaseStatus::Ready);
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().protected = false;
+    assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 202);
+}
+
+#[tokio::test]
+async fn branch_responses_carry_protected() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().protected = true;
+    let list: Vec<Value> = t.send(Method::GET, &t.branches(), None).await.json().await.unwrap();
+    let flag = |id: BranchId| list.iter().find(|b| b["id"] == id.as_uuid().to_string()).unwrap()["protected"].clone();
+    assert_eq!(flag(dev), true);
+    assert_eq!(flag(t.main()), false);
+    let resp = t.send(Method::POST, &t.branches(), Some(json!({ "name": "feat" }))).await;
+    assert_eq!(resp.status(), 202);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["protected"], false);
+    // A branch that isn't ready yet has no databases to miss.
+    assert_eq!(body["main_database_missing"], false);
+}
+
+#[tokio::test]
+async fn connection_role_sealed_for_another_branch_is_500_credentials_unavailable() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.metadata.branch(dev).endpoint_id.unwrap();
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    t.metadata.role_passwords.lock().unwrap().insert(
+        (ep, "app".into()),
+        cheladb_secrets::seal_role_password(&t.app.key, &BranchId::new().to_string(), "app", "x"),
+    );
+    let err = error_of(t.send(Method::GET, &format!("{}/connection?role=app", t.branch(dev)), None).await, 500).await;
+    assert_eq!(code_of(&err), "credentials_unavailable");
+}
+
+#[tokio::test]
+async fn role_routes_need_management_auth() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    for (method, suffix) in [
+        (Method::GET, ""),
+        (Method::POST, ""),
+        (Method::POST, "/app/reset-password"),
+        (Method::DELETE, "/app"),
+    ] {
+        let resp = reqwest::Client::new()
+            .request(method.clone(), format!("{}{}{suffix}", t.app.base, t.roles(dev)))
+            .json(&json!({ "name": "app" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{method} {suffix}");
+    }
+    let resp = reqwest::Client::new()
+        .get(format!("{}{}/connection?role=app", t.app.base, t.branch(dev)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
 }

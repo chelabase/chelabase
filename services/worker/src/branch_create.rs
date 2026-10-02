@@ -1,10 +1,12 @@
 //! Creating a branch: an endpoint row, a timeline branched from the parent's, a compute, and
 //! the data API roles and bootstrap inside it.
 
-use cheladb_metadata::{BranchKind, BranchRecord, BranchStatus, NewEndpoint};
+use cheladb_metadata::{
+    BranchKind, BranchRecord, BranchStatus, NewEndpoint, NewRoleCopy, RoleLevel, RoleOrigin,
+};
 use cheladb_nats::PointInTime;
 use cheladb_neon::{ComputeBackend, Lsn, NeonId};
-use cheladb_secrets::{Purpose, seal_credential};
+use cheladb_secrets::{Purpose, open_role_password, seal_credential, seal_role_password};
 use cheladb_types::{BranchId, DatabaseId};
 use tracing::{info, warn};
 
@@ -12,6 +14,7 @@ use crate::Worker;
 use crate::branch_job::{Attempt, StepFailure};
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::provision::{bootstrap_sql, new_compute_token, new_endpoint_id, sha256_hex};
+use crate::resync::{FreshPasswords, SYSTEM_DATABASE};
 use crate::{OWNER_ROLE, credentials};
 
 /// Everything step 3 generated and recorded. Once it exists, a failure tears down.
@@ -24,6 +27,24 @@ struct Recorded {
     compute_token: String,
     database_name: String,
     password: String,
+    /// The parent was protected when its copies were read: every role of the child's
+    /// catalog with a password gets a fresh one (I3).
+    protected: bool,
+    /// `(name, verifier)` of each copy recorded with a fresh password (a protected parent's).
+    fresh: Vec<(String, String)>,
+}
+
+/// One parent row as copied for the child.
+struct ChildCopy {
+    name: String,
+    origin: RoleOrigin,
+    verifier: Option<String>,
+    sealed: Option<String>,
+    login: bool,
+    level: RoleLevel,
+    api_owner_level: bool,
+    /// A fresh password not yet set in the child's catalog.
+    fresh: bool,
 }
 
 /// How [`Worker::build_branch`] ended when nothing failed.
@@ -181,6 +202,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         tenant: NeonId,
     ) -> Result<Recorded, String> {
         let database_name = self.main_database_name(branch.database_id).await?;
+        // The parent's role copies (the owner's excluded: it gets its own password).
+        let (copies, protected) = self.child_role_copies(branch).await?;
         let rec = Recorded {
             branch: branch.id,
             endpoint_id: new_endpoint_id(),
@@ -189,9 +212,28 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             compute_token: new_compute_token(),
             database_name,
             password: credentials::generate_password(),
+            protected,
+            fresh: copies
+                .iter()
+                .filter(|c| c.fresh)
+                .filter_map(|c| Some((c.name.clone(), c.verifier.clone()?)))
+                .collect(),
         };
         let verifier = cheladb_neon::scram::verifier(&rec.password);
         let token_hash = sha256_hex(&rec.compute_token);
+        let role_copies: Vec<NewRoleCopy<'_>> = copies
+            .iter()
+            .map(|c| NewRoleCopy {
+                name: &c.name,
+                origin: c.origin,
+                verifier: c.verifier.as_deref(),
+                password_enc: c.sealed.as_deref(),
+                login: c.login,
+                level: c.level,
+                api_owner_level: c.api_owner_level,
+                pending: c.fresh,
+            })
+            .collect();
         let endpoint = NewEndpoint {
             id: &rec.endpoint_id,
             tenant_id: rec.tenant.as_str(),
@@ -200,6 +242,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             owner_role: OWNER_ROLE,
             owner_verifier: &verifier,
             database_name: &rec.database_name,
+            role_copies: &role_copies,
         };
         match self
             .metadata
@@ -216,6 +259,71 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             ),
             Err(err) => Err(format!("recording the endpoint: {err}")),
         }
+    }
+
+    /// Each non-owner row of `branch`'s parent, copied for `branch` (none when the parent has
+    /// no endpoint). The owner rule: a copy keeps the parent's verifier, its sealed password
+    /// sealed again for `branch`; a protected parent's copies get a fresh password each
+    /// (`fresh`). MD5 rows are copied as they are. Also whether the parent is protected.
+    async fn child_role_copies(
+        &self,
+        branch: &BranchRecord,
+    ) -> Result<(Vec<ChildCopy>, bool), String> {
+        let Some(parent_id) = branch.parent_branch_id else {
+            return Ok((Vec::new(), false));
+        };
+        // Read now (R17): a flag set after this point protects only later children.
+        let parent = self
+            .metadata
+            .get_branch(parent_id)
+            .await
+            .map_err(|e| format!("recording the endpoint: reading the parent: {e}"))?;
+        let protected = parent.as_ref().is_some_and(|p| p.protected);
+        let Some(parent_ep) = parent.and_then(|p| p.endpoint_id) else {
+            return Ok((Vec::new(), protected));
+        };
+        let (rows, _) = self
+            .metadata
+            .role_copies(&parent_ep)
+            .await
+            .map_err(|e| format!("recording the endpoint: reading the parent's roles: {e}"))?;
+        let (parent_aad, child_aad) = (parent_id.to_string(), branch.id.to_string());
+        let seal =
+            |name: &str, password: &str| seal_role_password(&self.key, &child_aad, name, password);
+        let copies = rows
+            .into_iter()
+            .filter(|r| r.origin != RoleOrigin::Owner && r.name != OWNER_ROLE)
+            .map(|r| {
+                let mut copy = ChildCopy {
+                    name: r.name,
+                    origin: r.origin,
+                    verifier: r.scram_verifier,
+                    sealed: None,
+                    login: r.login,
+                    level: r.level,
+                    api_owner_level: r.api_owner_level,
+                    fresh: false,
+                };
+                if protected && copy.verifier.is_some() {
+                    let password = credentials::generate_password();
+                    copy.verifier = Some(cheladb_neon::scram::verifier(&password));
+                    copy.sealed = Some(seal(&copy.name, &password));
+                    copy.fresh = true;
+                } else if let Some(sealed) = r.password_enc {
+                    match open_role_password(&self.key, &parent_aad, &copy.name, &sealed) {
+                        Ok(password) => copy.sealed = Some(seal(&copy.name, &password)),
+                        // The copy still works; only its reveal is lost.
+                        Err(e) => warn!(
+                            branch_id = %branch.id,
+                            role = %copy.name,
+                            "the parent's sealed password doesn't open ({e}); copied without it"
+                        ),
+                    }
+                }
+                copy
+            })
+            .collect();
+        Ok((copies, protected))
     }
 
     /// The database name every branch shares: main's, from its endpoint (the database row's
@@ -287,7 +395,31 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.bootstrap_data_api_on(rec.branch, ep, &rec.database_name)
             .await
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
+        // Before the resync, as in `recreate_compute`.
+        self.record_compute_settings(ep).await;
+        self.sync_child_roles(rec).await?;
         Ok(Built::Compute)
+    }
+
+    /// Under the endpoint's lock, the resync, which takes the catalog's SQL roles as they were
+    /// at the branch point and re-creates API roles. A protected parent's child first gives
+    /// every role of its own catalog with a password a fresh one (I3): the copies recorded
+    /// with one keep theirs, any other role (one the parent dropped since a past branch point,
+    /// one made after the copies were read, an MD5 role) gets a new one, stored sealed.
+    async fn sync_child_roles(&self, rec: &Recorded) -> Result<(), String> {
+        let ep = rec.endpoint_id.as_str();
+        let _lock = self
+            .metadata
+            .lock_endpoint(ep)
+            .await
+            .map_err(|e| format!("syncing login roles: locking the endpoint: {e}"))?;
+        if rec.protected {
+            let mut fresh = FreshPasswords::new(rec.fresh.iter().cloned());
+            self.resync_locked_with(rec.branch, ep, SYSTEM_DATABASE, Some(&mut fresh))
+                .await
+        } else {
+            self.resync_locked(rec.branch, ep, SYSTEM_DATABASE).await
+        }
     }
 
     /// The branch's teardown: its compute, its timeline, its endpoint row; never the tenant.
@@ -402,6 +534,7 @@ mod tests {
         ready_database, worker,
     };
     use crate::provision::sha256_hex;
+    use crate::roles::RoleOutcome;
 
     fn pos(journal: &Journal, prefix: &str) -> usize {
         position(journal, prefix)
@@ -1115,5 +1248,395 @@ mod tests {
         assert!(w.handle_branch_create(s.dev, None).await.is_err());
         w.metadata.state().fail = Some("set_branch_status");
         assert!(w.handle_branch_create(s.dev, None).await.is_err());
+    }
+
+    // --- Login roles -------------------------------------------------------------------
+
+    /// One `neon_roles` row (owner excluded) as the fake holds it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Row {
+        origin: RoleOrigin,
+        level: RoleLevel,
+        api_owner_level: bool,
+        login: bool,
+        verifier: Option<String>,
+        sealed: Option<String>,
+        pending: bool,
+    }
+
+    fn row(w: &FakeWorker, ep: &str, name: &str) -> Option<Row> {
+        let state = w.metadata.state();
+        let endpoint = &state.endpoints[ep];
+        let login = endpoint.logins.get(name)?;
+        Some(Row {
+            origin: login.origin,
+            level: login.level,
+            api_owner_level: login.api_owner_level,
+            login: login.login,
+            verifier: endpoint.verifier(name),
+            sealed: login.password_enc.clone(),
+            pending: login.pending,
+        })
+    }
+
+    /// Adds an `sql` row to `ep` (sealed for `branch` when `password` is given; `None`
+    /// verifier for an MD5 role).
+    fn sql_row(
+        w: &FakeWorker,
+        branch: BranchId,
+        ep: &str,
+        name: &str,
+        verifier: Option<&str>,
+        password: Option<&str>,
+    ) {
+        let sealed = password.map(|p| seal_role_password(&w.key, &branch.to_string(), name, p));
+        let mut state = w.metadata.state();
+        let endpoint = state.endpoints.get_mut(ep).unwrap();
+        endpoint.logins.insert(
+            name.to_string(),
+            crate::fakes::FakeLogin {
+                origin: RoleOrigin::Sql,
+                password_enc: sealed,
+                pending: false,
+                login: true,
+                level: RoleLevel::Plain,
+                api_owner_level: false,
+            },
+        );
+        endpoint.set_verifier(name, verifier);
+    }
+
+    /// One `r` line of the resync's catalog read, as psql prints it.
+    fn r_line(name: &str, password: &str, owner_level: bool) -> String {
+        let tf = if owner_level { "t" } else { "f" };
+        format!(
+            "r|{}|t|{}|{tf}|t|{tf}\n",
+            hex::encode(name),
+            hex::encode(password),
+        )
+    }
+
+    const MD5: &str = "md5ffffffffffffffffffffffffffffffff";
+    /// Needle: the resync's catalog read.
+    const CATALOG_READ: &str = "SELECT 'r',";
+
+    /// Main with an API `app` (plain) and `admin` (owner-level), an SQL `sqlrole` (revealable:
+    /// it was reset through the API) and an MD5 `md5role`, and a pending `dev` of main. The
+    /// child's catalog read answers the parent's roles and hashes.
+    async fn with_login_roles(w: &FakeWorker, journal: &Journal) -> Setup {
+        let s = setup(w, journal).await;
+        let main = BranchId::from(s.db);
+        assert_eq!(w.create_role(main, "app", false).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(main, "admin", true).await, RoleOutcome::Ok);
+        let sql_verifier = cheladb_neon::scram::verifier("sql-password");
+        sql_row(
+            w,
+            main,
+            &s.main_ep,
+            "sqlrole",
+            Some(&sql_verifier),
+            Some("sql-password"),
+        );
+        sql_row(w, main, &s.main_ep, "md5role", None, None);
+        let verifier = |name: &str| row(w, &s.main_ep, name).unwrap().verifier.unwrap();
+        let catalog = [
+            r_line("admin", &verifier("admin"), true),
+            r_line("app", &verifier("app"), false),
+            r_line("md5role", MD5, false),
+            r_line("sqlrole", &sql_verifier, false),
+        ]
+        .concat();
+        w.computes.answer(CATALOG_READ, &catalog);
+        journal.lock().unwrap().clear();
+        s
+    }
+
+    fn open(w: &FakeWorker, branch: BranchId, name: &str, sealed: &str) -> Option<String> {
+        cheladb_secrets::open_role_password(&w.key, &branch.to_string(), name, sealed).ok()
+    }
+
+    #[tokio::test]
+    async fn child_copies_keep_parent_passwords() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+        let main = BranchId::from(s.db);
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        let dev_ep = dev.endpoint_id.unwrap();
+        for name in ["app", "admin", "sqlrole"] {
+            let parent = row(&w, &s.main_ep, name).unwrap();
+            let child = row(&w, &dev_ep, name).unwrap();
+            let shape = |r: &Row| (r.origin, r.level, r.api_owner_level, r.login);
+            assert_eq!(shape(&child), shape(&parent), "{name}");
+            assert_eq!(child.verifier, parent.verifier, "{name}");
+            assert!(!child.pending, "{name}");
+            let (p_sealed, c_sealed) = (parent.sealed.unwrap(), child.sealed.unwrap());
+            assert_ne!(c_sealed, p_sealed, "{name}");
+            // Sealed again for the child: only the child's AAD opens it, to the same password.
+            let password = open(&w, s.dev, name, &c_sealed).expect(name);
+            assert_eq!(Some(password), open(&w, main, name, &p_sealed), "{name}");
+            assert!(open(&w, main, name, &c_sealed).is_none(), "{name}");
+        }
+        // The MD5 role is copied as it is.
+        let md5 = row(&w, &dev_ep, "md5role").unwrap();
+        assert_eq!(
+            (md5.origin, md5.verifier, md5.sealed),
+            (RoleOrigin::Sql, None, None)
+        );
+        // Nothing was set in SQL: the child's catalog already has the parent's hashes.
+        let sql = w.computes.sql.lock().unwrap().clone();
+        assert!(
+            !sql.iter()
+                .any(|(ep, _, s)| *ep == dev_ep && s.contains("PASSWORD 'SCRAM")),
+            "{sql:?}"
+        );
+    }
+
+    fn protect(w: &FakeWorker, branch: BranchId) {
+        w.metadata
+            .state()
+            .branches
+            .get_mut(&branch)
+            .unwrap()
+            .protected = true;
+    }
+
+    /// The script that set the protected child's fresh passwords, on `dev_ep`.
+    fn fresh_script(w: &FakeWorker, dev_ep: &str) -> String {
+        let sql = w.computes.sql.lock().unwrap().clone();
+        let scripts: Vec<&String> = sql
+            .iter()
+            .filter(|(ep, _, s)| {
+                ep == dev_ep
+                    && s.starts_with("SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"")
+            })
+            .map(|(_, _, s)| s)
+            .collect();
+        assert_eq!(scripts.len(), 1, "one script: {sql:?}");
+        scripts[0].clone()
+    }
+
+    /// The child's row for `name`: its verifier is new, its sealed password (the child's AAD)
+    /// opens to a password that matches it, it's confirmed, and `script` set it.
+    fn assert_fresh(
+        w: &FakeWorker,
+        dev: BranchId,
+        dev_ep: &str,
+        name: &str,
+        old: &str,
+        script: &str,
+    ) -> Row {
+        let child = row(w, dev_ep, name).unwrap_or_else(|| panic!("{name} has a row"));
+        let verifier = child
+            .verifier
+            .clone()
+            .unwrap_or_else(|| panic!("{name}: a verifier"));
+        assert_ne!(verifier, old, "{name}");
+        let sealed = child
+            .sealed
+            .clone()
+            .unwrap_or_else(|| panic!("{name}: revealable"));
+        let password = open(w, dev, name, &sealed).expect(name);
+        assert!(verifier_matches(&verifier, &password), "{name}");
+        assert!(!child.pending, "{name}: the resync confirms it");
+        assert!(
+            script.contains(&format!("ALTER ROLE \"{name}\" PASSWORD '{verifier}';")),
+            "{name}: {script}"
+        );
+        child
+    }
+
+    // I3: every role with a password in the CHILD's catalog gets a fresh one, not only the
+    // parent's copies read before the branch point: a role the copies don't have (dropped on
+    // the parent since a past point, or made after the read), an MD5 role and a NOLOGIN role
+    // with a password too. A role without a password is left alone; a missing API role is
+    // re-created by the resync with its fresh password.
+    #[tokio::test]
+    async fn protected_parent_gives_fresh_passwords_and_alters_them() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+        let main = BranchId::from(s.db);
+        protect(&w, main);
+        let parent: Vec<(&str, String)> = ["app", "admin", "sqlrole"]
+            .iter()
+            .map(|n| (*n, row(&w, &s.main_ep, n).unwrap().verifier.unwrap()))
+            .collect();
+        let old = |name: &str| parent.iter().find(|(n, _)| *n == name).unwrap().1.clone();
+        let late = cheladb_neon::scram::verifier("late-password");
+        let group = cheladb_neon::scram::verifier("group-password");
+        // The child's catalog at the branch point: `admin` is missing; `late` and `grp` aren't
+        // among the parent's copies.
+        w.computes.answers.lock().unwrap().clear();
+        let catalog = [
+            r_line("app", &old("app"), false),
+            r_line("late", &late, false),
+            r_line("md5role", MD5, false),
+            r_line("sqlrole", &old("sqlrole"), false),
+            format!("r|{}|f|{}|f|t|f\n", hex::encode("grp"), hex::encode(&group)),
+            format!("r|{}|t||f|t|f\n", hex::encode("nopass")),
+        ]
+        .concat();
+        w.computes.answer(CATALOG_READ, &catalog);
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        let dev_ep = dev.endpoint_id.unwrap();
+        let script = fresh_script(&w, &dev_ep);
+        assert!(
+            script.starts_with("SET search_path = pg_catalog, pg_temp;\n"),
+            "{script}"
+        );
+        for (name, old, origin) in [
+            ("app", old("app"), RoleOrigin::Api),
+            ("sqlrole", old("sqlrole"), RoleOrigin::Sql),
+            ("md5role", MD5.to_string(), RoleOrigin::Sql),
+            ("late", late.clone(), RoleOrigin::Sql),
+            ("grp", group.clone(), RoleOrigin::Sql),
+        ] {
+            let child = assert_fresh(&w, s.dev, &dev_ep, name, &old, &script);
+            assert_eq!(child.origin, origin, "{name}");
+        }
+        assert!(!row(&w, &dev_ep, "grp").unwrap().login);
+        assert!(!script.contains("\"admin\""), "{script}");
+        assert!(!script.contains("nopass"), "{script}");
+        assert!(row(&w, &dev_ep, "nopass").is_none());
+        // The missing API role is re-created with its fresh password.
+        let admin = row(&w, &dev_ep, "admin").unwrap();
+        let admin_verifier = admin.verifier.unwrap();
+        assert_ne!(admin_verifier, old("admin"));
+        let password = open(&w, s.dev, "admin", &admin.sealed.unwrap()).unwrap();
+        assert!(verifier_matches(&admin_verifier, &password));
+        let sql = w.computes.sql.lock().unwrap().clone();
+        assert!(
+            sql.iter().any(|(ep, _, s)| *ep == dev_ep
+                && s.contains(&format!("CREATE ROLE \"admin\" LOGIN CREATEROLE CREATEDB BYPASSRLS REPLICATION PASSWORD '{admin_verifier}'"))),
+            "{sql:?}"
+        );
+        // The catalog read, then the fresh passwords, all in `postgres`, before the write.
+        let on_dev = |needle: &str| {
+            sql.iter()
+                .position(|(ep, _, s)| *ep == dev_ep && s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} not in {sql:?}"))
+        };
+        assert!(on_dev(CATALOG_READ) < on_dev("ALTER ROLE \"app\" PASSWORD"));
+        assert_eq!(sql[on_dev("ALTER ROLE \"app\" PASSWORD")].1, "postgres");
+        // In the journal: the catalog read and the script (both start with the search path),
+        // then the write.
+        let all = entries(&journal);
+        let on_postgres = format!("compute.sql {dev_ep} postgres SET search_path");
+        let reads: Vec<usize> = (0..all.len())
+            .filter(|&i| all[i].starts_with(&on_postgres))
+            .collect();
+        assert!(reads.len() >= 2, "{all:?}");
+        assert!(reads[1] < pos(&journal, "metadata.apply_resync"), "{all:?}");
+        // The parent keeps its passwords.
+        for (name, verifier) in &parent {
+            assert_eq!(
+                row(&w, &s.main_ep, name).unwrap().verifier.as_ref(),
+                Some(verifier)
+            );
+        }
+    }
+
+    // A protected parent whose copies were empty when they were read still protects: the
+    // child's catalog is what counts.
+    #[tokio::test]
+    async fn protected_parent_without_copies_still_gives_fresh_passwords() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        protect(&w, BranchId::from(s.db));
+        let late = cheladb_neon::scram::verifier("late-password");
+        w.computes
+            .answer(CATALOG_READ, &r_line("late", &late, false));
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        let dev_ep = dev.endpoint_id.unwrap();
+        let script = fresh_script(&w, &dev_ep);
+        let child = assert_fresh(&w, s.dev, &dev_ep, "late", &late, &script);
+        assert_eq!(child.origin, RoleOrigin::Sql);
+    }
+
+    #[tokio::test]
+    async fn protected_copy_names_with_quotes_are_quoted() {
+        const NAME: &str = "it's \"q\"";
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        let main = BranchId::from(s.db);
+        protect(&w, main);
+        let verifier = cheladb_neon::scram::verifier("sql-password");
+        sql_row(&w, main, &s.main_ep, NAME, Some(&verifier), None);
+        w.computes
+            .answer(CATALOG_READ, &r_line(NAME, &verifier, false));
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        let dev_ep = dev.endpoint_id.unwrap();
+        let script = fresh_script(&w, &dev_ep);
+        assert!(
+            script.contains("\nALTER ROLE \"it's \"\"q\"\"\" PASSWORD 'SCRAM-SHA-256$"),
+            "{script}"
+        );
+        assert!(!script.contains(&verifier), "a fresh verifier: {script}");
+    }
+
+    #[tokio::test]
+    async fn child_create_runs_the_resync_before_ready() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        let dev_ep = dev.endpoint_id.unwrap();
+        let order = [
+            pos(&journal, "metadata.insert_data_key"),
+            pos(&journal, "metadata.set_compute_settings_version"),
+            pos(&journal, "metadata.lock_endpoint"),
+            pos(
+                &journal,
+                &format!("compute.sql {dev_ep} postgres SET search_path = pg_catalog, pg_temp;"),
+            ),
+            pos(&journal, "metadata.apply_resync"),
+            pos(&journal, "metadata.set_branch_ready"),
+        ];
+        assert!(order.is_sorted(), "{order:?} {:?}", entries(&journal));
+        let state = w.metadata.state();
+        let endpoint = &state.endpoints[&dev_ep];
+        assert_eq!(
+            endpoint.compute_settings_version,
+            crate::COMPUTE_SETTINGS_VERSION
+        );
+        // The child's catalog wins for its SQL roles: the MD5 role stays a row without a
+        // verifier, and the databases come from the read.
+        assert!(endpoint.logins.contains_key("md5role"));
+    }
+
+    #[tokio::test]
+    async fn child_create_fails_with_syncing_prefix() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some((CATALOG_READ.into(), "connection reset".into()));
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Failed);
+        let error = dev.error.unwrap();
+        assert!(error.starts_with("syncing login roles: "), "{error}");
+        assert!(!has(&journal, "metadata.set_branch_ready"));
+        assert_eq!(w.metadata.endpoint_ids(), std::slice::from_ref(&s.main_ep));
+        assert_main_untouched(&w, &journal, &s).await;
     }
 }

@@ -2,8 +2,9 @@ use axum::{Json, Router, routing::get};
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{
     CheckDataRoleReply, CheckDataRoleRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
-    ResetPasswordRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD, connect, ensure_control_stream, run_branch_consumer,
-    run_delete_consumer, run_provision_consumer, run_settings_consumer,
+    ResetPasswordRequest, RoleReply, SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD,
+    SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, connect, ensure_control_stream,
+    run_branch_consumer, run_delete_consumer, run_provision_consumer, run_settings_consumer,
 };
 use cheladb_secrets::{SecretKey, key_check_value, verify_key_check};
 use cheladb_types::mode::Mode;
@@ -70,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(serve_reset_password(worker.clone(), nats.clone()));
     tokio::spawn(serve_check_data_role(worker.clone(), nats.clone()));
+    for subject in [SUBJECT_ROLE_CREATE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_DELETE] {
+        tokio::spawn(serve_role_rpc(worker.clone(), nats.clone(), subject));
+    }
     tokio::spawn(reconcile_loop(worker.clone()));
 
     let delete_worker = worker.clone();
@@ -280,6 +284,46 @@ async fn serve_check_data_role(worker: Arc<RealWorker>, client: async_nats::Clie
                 let body = serde_json::to_vec(&reply).unwrap_or_default();
                 if let Err(err) = client.publish(reply_to, body.into()).await {
                     warn!("check-data-role reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+// --- Login roles (core NATS request/reply) -------------------------------------
+
+/// Hard cap on one role request, below the orchestrator's request timeout (15 s).
+const ROLE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Serves one of the role subjects (create, reset, delete) in the reset queue group; a request
+/// that doesn't decode answers `failed`.
+async fn serve_role_rpc(
+    worker: Arc<RealWorker>,
+    client: async_nats::Client,
+    subject: &'static str,
+) {
+    let mut requests = match client
+        .queue_subscribe(subject, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!(subject, "role subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject, "serving role requests");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply: RoleReply = worker
+                .role_rpc_reply(subject, &message.payload, ROLE_DEADLINE)
+                .await;
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!(subject, "role reply failed: {err}");
                 }
             }
         });

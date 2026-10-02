@@ -8,7 +8,9 @@
 
 use cheladb_metadata::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseSettings, DatabaseStatus,
-    MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey, NewEndpoint, SettingsPatch,
+    BeginDelete, ClaimOutcome, CopyUpsert, DatabaseOrigin, InsertRoleOutcome, MetadataClient, MetadataConfig,
+    MetadataError, NewBranch, NewDataKey, NewEndpoint, NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied,
+    ResyncWrite, RoleLevel, RoleOrigin, SealedChange, SettingsPatch,
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
 };
 use cheladb_types::data_key::{self, DataKeyKind};
@@ -127,6 +129,7 @@ fn new_endpoint<'a>(id: &'a str, tenant: &'a str, timeline: &'a str) -> NewEndpo
         owner_role: "postgres",
         owner_verifier: "SCRAM-SHA-256$v1",
         database_name: "db",
+        role_copies: &[],
     }
 }
 
@@ -168,6 +171,11 @@ async fn ready_database(client: &MetadataClient) -> (DatabaseId, String) {
     (id, ep)
 }
 
+/// True when the delete began.
+async fn begin_delete(client: &MetadataClient, id: DatabaseId) -> bool {
+    client.begin_delete(id).await.unwrap() == BeginDelete::Started
+}
+
 async fn branch(client: &MetadataClient, id: BranchId) -> BranchRecord {
     client.get_branch(id).await.unwrap().expect("branch row")
 }
@@ -182,7 +190,7 @@ async fn main_branch(client: &MetadataClient, id: DatabaseId) -> BranchRecord {
 async fn provisioning_writes_never_resurrect_a_tombstone() {
     let client = client().await;
     let id = insert_pending(&client).await;
-    assert!(client.begin_delete(id).await.unwrap());
+    assert!(begin_delete(&client, id).await);
     client.mark_branch_deleted(main_of(id)).await.unwrap();
     client.mark_deleted(id).await.unwrap();
 
@@ -414,7 +422,7 @@ async fn replace_owner_secret_is_atomic_and_needs_ready() {
 
     // Deleted: refused because the status is no longer ready.
     let (gone, ep_gone) = ready_database(&client).await;
-    assert!(client.begin_delete(gone).await.unwrap());
+    assert!(begin_delete(&client, gone).await);
     client.mark_branch_deleted(main_of(gone)).await.unwrap();
     client.mark_deleted(gone).await.unwrap();
     let on_tombstone = client
@@ -591,9 +599,9 @@ async fn create_endpoint_links_and_refuses_a_deleting_database() {
 
     // Deleting, deleted and missing branches are refused without writing anything.
     let deleting = insert_pending(&client).await;
-    assert!(client.begin_delete(deleting).await.unwrap());
+    assert!(begin_delete(&client, deleting).await);
     let deleted = insert_pending(&client).await;
-    assert!(client.begin_delete(deleted).await.unwrap());
+    assert!(begin_delete(&client, deleted).await);
     client.mark_branch_deleted(main_of(deleted)).await.unwrap();
     client.mark_deleted(deleted).await.unwrap();
     let mut refused = Vec::new();
@@ -661,7 +669,7 @@ async fn list_endpoints_for_reconcile_joins_status() {
         .unwrap();
     let deleting = insert_pending(&client).await;
     let ep_deleting = link_endpoint(&client, deleting).await;
-    assert!(client.begin_delete(deleting).await.unwrap());
+    assert!(begin_delete(&client, deleting).await);
     client
         .replace_owner_secret(main_of(linked), &ep_linked, "postgres", "SCRAM-SHA-256$v2", "v1:n")
         .await
@@ -695,7 +703,7 @@ async fn tenant_overview_hides_deleted_databases() {
     let client = client().await;
     let live = insert_pending(&client).await;
     let deleted = insert_pending(&client).await;
-    assert!(client.begin_delete(deleted).await.unwrap());
+    assert!(begin_delete(&client, deleted).await);
     client.mark_deleted(deleted).await.unwrap();
 
     let overview = client.tenant_overview(TenantId(DEMO_TENANT_ID)).await.unwrap().unwrap();
@@ -812,7 +820,7 @@ async fn create_branch_refuses_taken_names_and_unready_parents() {
     let reused = client.create_branch(&new_branch(id, "dev", main_of(id))).await.unwrap();
     let listed = client.list_branches(id).await.unwrap();
     // A database being deleted, and one that doesn't exist.
-    assert!(client.begin_delete(other).await.unwrap());
+    assert!(begin_delete(&client, other).await);
     let not_live = client
         .create_branch(&new_branch(other, "x", main_of(other)))
         .await
@@ -906,7 +914,7 @@ async fn switch_to_pending_timeline_moves_endpoint_and_records_superseded() {
     // Deleting: refused even with a pending timeline.
     let (gone, _ep) = ready_database(&client).await;
     let gone_pending = start_reset(&client, main_of(gone)).await;
-    assert!(client.begin_delete(gone).await.unwrap());
+    assert!(begin_delete(&client, gone).await);
     let while_deleting = client
         .switch_to_pending_timeline(main_of(gone), &gone_pending, None)
         .await
@@ -1019,6 +1027,24 @@ async fn a_switch_expecting_another_pending_timeline_changes_nothing() {
     assert_eq!(endpoint_after.timeline_id, endpoint_before.timeline_id);
     assert_eq!(no_backup, None);
     assert!(owner);
+}
+
+// T6: the delete's own UPDATE refuses a protected branch (a flag set after the API's check).
+#[tokio::test]
+#[ignore]
+async fn begin_branch_delete_refuses_a_protected_branch() {
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let dev = ready_branch(&client, id, "dev", main_of(id)).await;
+    assert!(client.set_branch_protected(dev, true).await.unwrap().is_some());
+    let refused = client.begin_branch_delete(dev).await.unwrap();
+    let row = branch(&client, dev).await;
+    assert!(client.set_branch_protected(dev, false).await.unwrap().is_some());
+    let moved = client.begin_branch_delete(dev).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(refused, BranchDeleteOutcome::Protected);
+    assert_eq!(row.status, BranchStatus::Ready, "nothing written");
+    assert_eq!(moved, BranchDeleteOutcome::Started);
 }
 
 #[tokio::test]
@@ -1187,7 +1213,7 @@ async fn begin_delete_takes_every_branch_along() {
     assert_eq!(client.begin_branch_delete(gone).await.unwrap(), BranchDeleteOutcome::Started);
     client.mark_branch_deleted(gone).await.unwrap();
 
-    assert!(client.begin_delete(id).await.unwrap());
+    assert!(begin_delete(&client, id).await);
     let statuses = [
         main_branch(&client, id).await.status,
         branch(&client, dev).await.status,
@@ -1213,7 +1239,7 @@ async fn database_settings_and_neon_tenant_round_trip() {
     let tenant = hex32();
     let tenant_set = client.set_neon_tenant(id, &tenant).await.unwrap();
     let row = client.get_database(id).await.unwrap().unwrap();
-    assert!(client.begin_delete(id).await.unwrap());
+    assert!(begin_delete(&client, id).await);
     let on_deleting = client.update_database_settings(id, &SettingsPatch { max_branches: Some(3), ..Default::default() }).await.unwrap();
     let tenant_on_deleting = client.set_neon_tenant(id, &hex32()).await.unwrap();
     let after_delete = client.database_settings(id).await.unwrap();
@@ -1339,7 +1365,7 @@ async fn begin_delete_racing_main_set_ready_never_deadlocks() {
         link_endpoint(&client, id).await;
         client.set_status(id, DatabaseStatus::Provisioning).await.unwrap();
         let (a, b) = (client.clone(), client.clone());
-        let delete = tokio::spawn(async move { a.begin_delete(id).await });
+        let delete = tokio::spawn(async move { a.begin_delete(id).await.map(|o| o == BeginDelete::Started) });
         let ready = tokio::spawn(async move { b.set_branch_ready(main_of(id), "v1:owner", None, None).await });
         let (delete, ready) = (delete.await.unwrap(), ready.await.unwrap());
         let (row, main) = (client.get_database(id).await.unwrap().unwrap(), main_branch(&client, id).await);
@@ -1791,7 +1817,7 @@ async fn begin_branch_delete_racing_begin_delete_never_deadlocks() {
     for round in 0..20 {
         let (id, dev, backup) = branch_with_backup(&client).await;
         let (a, b) = (client.clone(), client.clone());
-        let delete = tokio::spawn(async move { a.begin_delete(id).await });
+        let delete = tokio::spawn(async move { a.begin_delete(id).await.map(|o| o == BeginDelete::Started) });
         let branch_delete = tokio::spawn(async move { b.begin_branch_delete(dev).await });
         let (delete, branch_delete) = (delete.await.unwrap(), branch_delete.await.unwrap());
         let (dev_row, backup_row) = (branch(&client, dev).await, branch(&client, backup).await);
@@ -2116,10 +2142,10 @@ async fn claim_branch_for_switch_starts_each_attempt_without_the_old_error() {
     client.set_branch_error(dev, Some("an old failure")).await.unwrap();
     client.set_branch_error(main_of(id), Some("an old failure")).await.unwrap();
 
-    let claimed = client.claim_branch_for_switch(dev).await.unwrap();
+    let claimed = client.claim_branch_for_switch(dev, false).await.unwrap() == ClaimOutcome::Claimed;
     let dev_row = branch(&client, dev).await;
-    let again = client.claim_branch_for_switch(dev).await.unwrap();
-    let main_claimed = client.claim_branch_for_switch(main_of(id)).await.unwrap();
+    let again = client.claim_branch_for_switch(dev, false).await.unwrap() == ClaimOutcome::Claimed;
+    let main_claimed = client.claim_branch_for_switch(main_of(id), false).await.unwrap() == ClaimOutcome::Claimed;
     let main_row = main_branch(&client, id).await;
     cleanup(&client, id).await;
 
@@ -2389,7 +2415,7 @@ async fn lookup_ignores_revoked_keys_and_deleted_branches() {
     assert!(client.revoke_data_key(branch, revoked.id).await.unwrap());
     let live = client.lookup_data_key(&secret.sha256).await.unwrap();
     let revoked_lookup = client.lookup_data_key(&revoked.sha256).await.unwrap();
-    assert!(client.begin_delete(id).await.unwrap());
+    assert!(begin_delete(&client, id).await);
     let deleting = client.lookup_data_key(&secret.sha256).await.unwrap();
     client.mark_branch_deleted(branch).await.unwrap();
     client.mark_deleted(id).await.unwrap();
@@ -2460,7 +2486,7 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         .await
         .unwrap();
     let partial = client.get_database(id).await.unwrap().unwrap();
-    assert!(client.begin_delete(id).await.unwrap());
+    assert!(begin_delete(&client, id).await);
     let on_deleting = client
         .update_database_settings(id, &SettingsPatch { max_rows: Some(5), ..Default::default() })
         .await
@@ -2557,4 +2583,1003 @@ async fn branches_missing_data_api_lists_ready_branches_without_key_or_password(
     assert!(!missing.contains(&main_of(complete)));
     assert!(!missing.contains(&main_of(not_ready)), "a pending branch isn't listed");
     assert!(!after_rotate.contains(&main_of(complete)));
+}
+
+// ---- Step 6a revision 2: login roles and databases managed from SQL ----
+
+const SQL_VERIFIER: &str = "SCRAM-SHA-256$sql";
+
+async fn flag_and_version(client: &MetadataClient, ep: &str) -> (bool, i64) {
+    sqlx::query_as("SELECT needs_reconfigure, roles_version FROM neon_endpoints WHERE id = $1")
+        .bind(ep)
+        .fetch_one(client.pool())
+        .await
+        .unwrap()
+}
+
+async fn version(client: &MetadataClient, ep: &str) -> i64 {
+    flag_and_version(client, ep).await.1
+}
+
+/// The constraint a failed statement violated.
+async fn violated(client: &MetadataClient, sql: &'static str, ep: &str, name: &str) -> String {
+    let err = sqlx::query(sql).bind(ep).bind(name).execute(client.pool()).await.unwrap_err();
+    match err {
+        sqlx::Error::Database(e) => e.constraint().unwrap_or("<none>").to_string(),
+        other => panic!("not a database error: {other}"),
+    }
+}
+
+/// A row as the receiver or a resync would have left it.
+async fn seed_copy(client: &MetadataClient, ep: &str, name: &str, origin: &str, verifier: Option<&str>, sealed: Option<&str>) {
+    sqlx::query(
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin, password_enc)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(ep)
+    .bind(name)
+    .bind(verifier)
+    .bind(origin)
+    .bind(sealed)
+    .execute(client.pool())
+    .await
+    .unwrap();
+}
+
+async fn set_forwarded(client: &MetadataClient, ep: &str, name: &str, secs_ago: i32) {
+    sqlx::query(
+        "UPDATE neon_roles SET forwarded_at = now() - make_interval(secs => $3)
+         WHERE endpoint_id = $1 AND name = $2",
+    )
+    .bind(ep)
+    .bind(name)
+    .bind(f64::from(secs_ago))
+    .execute(client.pool())
+    .await
+    .unwrap();
+}
+
+async fn names_of(client: &MetadataClient, ep: &str) -> Vec<String> {
+    client.list_roles(ep).await.unwrap().into_iter().map(|r| r.name).collect()
+}
+
+fn upsert(name: &str, origin: RoleOrigin, verifier: &str) -> CopyUpsert {
+    CopyUpsert {
+        name: name.into(),
+        origin,
+        verifier: Some(verifier.into()),
+        password_enc: SealedChange::Keep,
+        login: true,
+        level: RoleLevel::Plain,
+        pending: false,
+    }
+}
+
+fn observed(name: &str, owner: &str, system: bool) -> ObservedDatabase {
+    ObservedDatabase { name: name.into(), owner: owner.into(), system }
+}
+
+async fn databases_of(client: &MetadataClient, branch: BranchId) -> Vec<(String, String, DatabaseOrigin)> {
+    client
+        .branch_databases(branch)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| (d.name, d.owner, d.origin))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore]
+async fn migration_maps_revision_one_rows() {
+    let pool = raw_pool().await;
+    let schema = format!("step6a_migration_{}", hex32());
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}; SET search_path TO {schema};")))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    // The tables as revision 1 left them (the real migrations), and a stub of `branches`.
+    sqlx::raw_sql(include_str!("../migrations/20260928000003_neon_endpoints.sql")).execute(&mut *conn).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/20261003000001_login_roles.sql")).execute(&mut *conn).await.unwrap();
+    sqlx::raw_sql("CREATE TABLE branches (id uuid PRIMARY KEY, endpoint_id text, status text NOT NULL)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let ep = ep_id();
+    let (live, gone) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    for sql in [
+        "INSERT INTO neon_endpoints (id, tenant_id, timeline_id, compute_token_sha256) VALUES ($1, 't', 'l', 'cd')",
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier) VALUES ($1, 'postgres', 'SCRAM-SHA-256$o')",
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, kind, privileged, password_enc)
+         VALUES ($1, 'reader', 'SCRAM-SHA-256$r', 'login', false, 'v1:r')",
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, kind, privileged, password_enc)
+         VALUES ($1, 'writer', 'SCRAM-SHA-256$w', 'login', true, 'v1:w')",
+        "INSERT INTO neon_databases (endpoint_id, name, owner) VALUES ($1, 'db', 'postgres')",
+    ] {
+        sqlx::query(sql).bind(&ep).execute(&mut *conn).await.unwrap();
+    }
+    sqlx::query("INSERT INTO branches (id, endpoint_id, status) VALUES ($1, $2, 'ready'), ($3, NULL, 'deleted')")
+        .bind(live)
+        .bind(&ep)
+        .bind(gone)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(include_str!("../migrations/20261004000001_sql_roles.sql")).execute(&mut *conn).await.unwrap();
+
+    let rows: Vec<(String, String, String, bool, bool, Option<String>)> = sqlx::query_as(
+        "SELECT name, origin, level, api_owner_level, login, password_enc FROM neon_roles ORDER BY name",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    let dbs: Vec<(uuid::Uuid, String, String, String)> =
+        sqlx::query_as("SELECT branch_id, name, owner, origin FROM branch_databases")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+    let settings: i32 = sqlx::query_scalar("SELECT compute_settings_version FROM neon_endpoints")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let protected: bool = sqlx::query_scalar("SELECT protected FROM branches WHERE id = $1")
+        .bind(live)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET search_path TO public; DROP SCHEMA {schema} CASCADE;")))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let s = |v: &str| v.to_string();
+    assert_eq!(
+        rows,
+        vec![
+            (s("postgres"), s("owner"), s("owner_level"), false, true, None),
+            (s("reader"), s("api"), s("plain"), false, true, Some(s("v1:r"))),
+            (s("writer"), s("api"), s("owner_level"), true, true, Some(s("v1:w"))),
+        ]
+    );
+    assert_eq!(dbs, vec![(live, s("db"), s("postgres"), s("main"))]);
+    assert_eq!(settings, 0);
+    assert!(!protected);
+}
+
+#[tokio::test]
+#[ignore]
+async fn owner_constraints() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let null_verifier = violated(
+        &client,
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, $2, NULL, 'owner')",
+        &ep,
+        "o1",
+    )
+    .await;
+    let sealed = violated(
+        &client,
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin, password_enc)
+         VALUES ($1, $2, 'x', 'owner', 'v1:x')",
+        &ep,
+        "o2",
+    )
+    .await;
+    let second_owner = violated(
+        &client,
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, $2, 'x', 'owner')",
+        &ep,
+        "o3",
+    )
+    .await;
+    let sql_owner_level = violated(
+        &client,
+        "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin, api_owner_level)
+         VALUES ($1, $2, 'x', 'sql', true)",
+        &ep,
+        "o4",
+    )
+    .await;
+    cleanup(&client, id).await;
+    assert_eq!(null_verifier, "neon_roles_owner_verifier");
+    assert_eq!(sealed, "neon_roles_owner_unsealed");
+    assert_eq!(second_owner, "neon_roles_one_owner");
+    assert_eq!(sql_owner_level, "neon_roles_api_owner_level");
+}
+
+#[tokio::test]
+#[ignore]
+async fn sql_names_may_be_anything_postgres_allows() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let insert = "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, $2, 'x', 'sql')";
+    let ok_names = ["My Role", "a\"b", "É", &"x".repeat(63)];
+    for name in ok_names {
+        sqlx::query(insert).bind(&ep).bind(name).execute(client.pool()).await.unwrap();
+    }
+    let too_long = violated(&client, insert, &ep, &"x".repeat(64)).await;
+    let too_long_multibyte = violated(&client, insert, &ep, &"é".repeat(32)).await;
+    let empty = violated(&client, insert, &ep, "").await;
+    let stored = names_of(&client, &ep).await;
+    cleanup(&client, id).await;
+    for name in ok_names {
+        assert!(stored.iter().any(|n| n == name), "{name} stored");
+    }
+    assert_eq!(too_long, "neon_roles_name_length");
+    assert_eq!(too_long_multibyte, "neon_roles_name_length");
+    assert_eq!(empty, "neon_roles_name_length");
+}
+
+#[tokio::test]
+#[ignore]
+async fn neon_roles_lists_only_the_owner() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "from_sql", "sql", Some(SQL_VERIFIER), None).await;
+    seed_copy(&client, &ep, "from_api", "api", Some(SQL_VERIFIER), Some("v1:x")).await;
+    seed_copy(&client, &ep, "from_md5", "sql", None, None).await;
+    let roles = client.neon_roles(&ep).await.unwrap();
+    let (versioned, v) = client.neon_roles_versioned(&ep).await.unwrap();
+    let unknown = client.neon_roles_versioned("ep-nothing").await.unwrap();
+    cleanup(&client, id).await;
+    let owner = cheladb_metadata::NeonRole { name: "postgres".into(), scram_verifier: "SCRAM-SHA-256$v1".into() };
+    assert_eq!(roles, vec![owner.clone()]);
+    assert_eq!(versioned, vec![owner]);
+    assert_eq!(v, 0);
+    assert_eq!(unknown, (vec![], 0));
+}
+
+#[tokio::test]
+#[ignore]
+async fn role_secret_of_an_md5_row_is_none() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "legacy", "sql", None, None).await;
+    seed_copy(&client, &ep, "modern", "sql", Some(SQL_VERIFIER), None).await;
+    let md5 = client.neon_role_secret(&ep, "legacy").await.unwrap();
+    let scram = client.neon_role_secret(&ep, "modern").await.unwrap();
+    let missing = client.neon_role_secret(&ep, "nobody").await.unwrap();
+    let unknown = client.neon_role_secret("ep-nothing", "legacy").await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(md5, Some(None));
+    assert_eq!(scram, Some(Some(SQL_VERIFIER.to_string())));
+    assert_eq!(missing, Some(None));
+    assert_eq!(unknown, None);
+}
+
+#[tokio::test]
+#[ignore]
+async fn list_roles_password_states() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    assert_eq!(client.insert_api_role(&ep, "a_gen", false, "SCRAM-SHA-256$g", "v1:g", 10).await.unwrap(), InsertRoleOutcome::Inserted);
+    seed_copy(&client, &ep, "b_sql", "sql", Some(SQL_VERIFIER), None).await;
+    seed_copy(&client, &ep, "c_md5", "sql", None, None).await;
+    let generated_owner = client.list_roles(&ep).await.unwrap();
+    sqlx::query("UPDATE branches SET owner_password_enc = NULL WHERE id = $1")
+        .bind(main_of(id).as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let set_owner = client.list_roles(&ep).await.unwrap();
+    let states = |rows: &[cheladb_metadata::RoleRow]| {
+        rows.iter().map(|r| (r.name.clone(), r.origin, r.password)).collect::<Vec<_>>()
+    };
+    cleanup(&client, id).await;
+    let tail = vec![
+        ("a_gen".to_string(), RoleOrigin::Api, PasswordState::Generated),
+        ("b_sql".to_string(), RoleOrigin::Sql, PasswordState::SetInSql),
+        ("c_md5".to_string(), RoleOrigin::Sql, PasswordState::Md5Unusable),
+    ];
+    let with_owner = |state| [vec![("postgres".to_string(), RoleOrigin::Owner, state)], tail.clone()].concat();
+    assert_eq!(states(&generated_owner), with_owner(PasswordState::Generated));
+    assert_eq!(states(&set_owner), with_owner(PasswordState::SetInSql));
+}
+
+#[tokio::test]
+#[ignore]
+async fn list_roles_owner_first_then_c_collation() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    for name in ["zeta", "alpha", "_first", "Beta"] {
+        seed_copy(&client, &ep, name, "sql", Some(SQL_VERIFIER), None).await;
+    }
+    let names = names_of(&client, &ep).await;
+    cleanup(&client, id).await;
+    assert_eq!(names, ["postgres", "Beta", "_first", "alpha", "zeta"]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn api_insert_respects_the_cap_under_concurrency() {
+    let client = client().await;
+    // MD5 rows don't count.
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "legacy", "sql", None, None).await;
+    let mut tasks = Vec::new();
+    for name in ["r1", "r2", "r3", "r4", "r5"] {
+        let (c, ep) = (client.clone(), ep.clone());
+        tasks.push(tokio::spawn(async move {
+            c.insert_api_role(&ep, name, false, "SCRAM-SHA-256$r", "v1:r", 2).await.unwrap()
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for t in tasks {
+        outcomes.push(t.await.unwrap());
+    }
+    let count = |rows: &[cheladb_metadata::RoleRow], o| rows.iter().filter(|r| r.origin == o).count();
+    let rows = client.list_roles(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(outcomes.iter().filter(|o| **o == InsertRoleOutcome::Inserted).count(), 2);
+    assert_eq!(outcomes.iter().filter(|o| **o == InsertRoleOutcome::CapReached).count(), 3);
+    assert_eq!(count(&rows, RoleOrigin::Api), 2);
+
+    // SQL rows with a verifier do.
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "from_sql", "sql", Some(SQL_VERIFIER), None).await;
+    let first = client.insert_api_role(&ep, "a1", false, "SCRAM-SHA-256$a", "v1:a", 2).await.unwrap();
+    let second = client.insert_api_role(&ep, "a2", false, "SCRAM-SHA-256$a", "v1:a", 2).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!((first, second), (InsertRoleOutcome::Inserted, InsertRoleOutcome::CapReached));
+}
+
+#[tokio::test]
+#[ignore]
+async fn api_insert_sets_level_pending_and_versions() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let plain = client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$p", "v1:p", 10).await.unwrap();
+    let admin = client.insert_api_role(&ep, "admin", true, "SCRAM-SHA-256$a", "v1:a", 10).await.unwrap();
+    let again = client.insert_api_role(&ep, "app", true, "SCRAM-SHA-256$x", "v1:x", 10).await.unwrap();
+    let owner = client.insert_api_role(&ep, "postgres", false, "SCRAM-SHA-256$x", "v1:x", 10).await.unwrap();
+    let flag = flag_and_version(&client, &ep).await;
+    let (copies, v) = client.role_copies(&ep).await.unwrap();
+    let password = client.role_password(&ep, "app").await.unwrap();
+    let owner_password = client.role_password(&ep, "postgres").await.unwrap();
+    let nobody = client.role_password(&ep, "nobody").await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!((plain, admin), (InsertRoleOutcome::Inserted, InsertRoleOutcome::Inserted));
+    assert_eq!((again, owner), (InsertRoleOutcome::Exists, InsertRoleOutcome::Exists));
+    // The spec lists only the owner: an API role needs no compute reconfigure (M5).
+    assert_eq!(flag, (false, 2));
+    assert_eq!(v, 2);
+    let by_name = |n: &str| copies.iter().find(|c| c.name == n).unwrap();
+    assert_eq!(by_name("app").origin, RoleOrigin::Api);
+    assert_eq!((by_name("app").level, by_name("app").api_owner_level), (RoleLevel::Plain, false));
+    assert_eq!((by_name("admin").level, by_name("admin").api_owner_level), (RoleLevel::OwnerLevel, true));
+    assert!(by_name("app").pending && by_name("app").login);
+    assert_eq!(by_name("app").scram_verifier.as_deref(), Some("SCRAM-SHA-256$p"));
+    assert_eq!(by_name("postgres").origin, RoleOrigin::Owner);
+    assert_eq!(password.as_deref(), Some("v1:p"));
+    assert_eq!(owner_password, None);
+    assert_eq!(nobody, None);
+}
+
+#[tokio::test]
+#[ignore]
+async fn confirm_and_replace_secret_and_delete_copy() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$old", "v1:old", 10).await.unwrap();
+    seed_copy(&client, &ep, "legacy", "sql", None, None).await;
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+
+    // A stale version confirms nothing; the current one clears just that row.
+    let stale = client.confirm_role(&ep, "app", v - 1).await.unwrap();
+    let pending_after_stale = client.list_roles(&ep).await.unwrap().iter().filter(|r| r.pending).count();
+    let confirmed = client.confirm_role(&ep, "app", v).await.unwrap();
+    let pending_after = client.list_roles(&ep).await.unwrap().iter().filter(|r| r.pending).count();
+
+    // Reset of an MD5 row gives it a verifier and a sealed password; the owner's row is left alone.
+    let replaced = client.replace_role_secret(&ep, "legacy", "SCRAM-SHA-256$new", "v1:new").await.unwrap();
+    let owner_replaced = client.replace_role_secret(&ep, "postgres", "SCRAM-SHA-256$x", "v1:x").await.unwrap();
+    let missing = client.replace_role_secret(&ep, "nobody", "SCRAM-SHA-256$x", "v1:x").await.unwrap();
+    let legacy = client.role_copies(&ep).await.unwrap().0.into_iter().find(|c| c.name == "legacy").unwrap();
+    let after_replace = flag_and_version(&client, &ep).await;
+
+    let owner_deleted = client.delete_role_copy(&ep, "postgres").await.unwrap();
+    let deleted = client.delete_role_copy(&ep, "app").await.unwrap();
+    let again = client.delete_role_copy(&ep, "app").await.unwrap();
+    let after_delete = flag_and_version(&client, &ep).await;
+    let names = names_of(&client, &ep).await;
+    cleanup(&client, id).await;
+
+    assert!(!stale);
+    assert_eq!(pending_after_stale, 1);
+    assert!(confirmed);
+    assert_eq!(pending_after, 0);
+    assert!(replaced && !owner_replaced && !missing);
+    assert_eq!(legacy.scram_verifier.as_deref(), Some("SCRAM-SHA-256$new"));
+    assert_eq!(legacy.password_enc.as_deref(), Some("v1:new"));
+    assert!(legacy.pending);
+    // Versions only: the spec lists only the owner (M5).
+    assert_eq!(after_replace, (false, v + 1));
+    assert!(!owner_deleted && deleted && !again);
+    assert_eq!(after_delete, (false, v + 2));
+    assert_eq!(names, ["postgres", "legacy"]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn clear_needs_reconfigure_clears_only_the_owner_pending() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$a", "v1:a", 10).await.unwrap();
+    assert!(client.replace_owner_secret(main_of(id), &ep, "postgres", "SCRAM-SHA-256$v2", "v1:new").await.unwrap());
+    let v = version(&client, &ep).await;
+    let cleared = client.clear_needs_reconfigure(&ep, v).await.unwrap();
+    let rows = client.list_roles(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    assert!(cleared);
+    let pending: Vec<(&str, bool)> = rows.iter().map(|r| (r.name.as_str(), r.pending)).collect();
+    assert_eq!(pending, [("postgres", false), ("app", true)]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_skips_recently_forwarded_rows() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    for name in ["gone_recent", "gone_old", "up_recent", "up_old"] {
+        seed_copy(&client, &ep, name, "sql", Some("SCRAM-SHA-256$before"), None).await;
+    }
+    set_forwarded(&client, &ep, "gone_recent", 1).await;
+    set_forwarded(&client, &ep, "gone_old", 11).await;
+    set_forwarded(&client, &ep, "up_recent", 1).await;
+    set_forwarded(&client, &ep, "up_old", 11).await;
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![
+            upsert("up_recent", RoleOrigin::Sql, "SCRAM-SHA-256$after"),
+            upsert("up_old", RoleOrigin::Sql, "SCRAM-SHA-256$after"),
+            upsert("fresh", RoleOrigin::Sql, "SCRAM-SHA-256$after"),
+        ],
+        removals: vec!["gone_recent".into(), "gone_old".into()],
+        databases: vec![observed("db", "postgres", false)],
+    };
+    let applied = client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let after = version(&client, &ep).await;
+    let (copies, _) = client.role_copies(&ep).await.unwrap();
+    // The same write again changes nothing, so the version holds.
+    let (_, v2) = client.role_copies(&ep).await.unwrap();
+    let again = client.apply_resync(&ep, branch, v2, &ResyncWrite {
+        upserts: vec![upsert("fresh", RoleOrigin::Sql, "SCRAM-SHA-256$after")],
+        removals: vec!["gone_old".into()],
+        databases: vec![observed("db", "postgres", false)],
+    }).await.unwrap();
+    let after_again = version(&client, &ep).await;
+    cleanup(&client, id).await;
+
+    let ResyncApplied::Applied { mut changed } = applied else { panic!("{applied:?}") };
+    changed.sort();
+    assert_eq!(changed, ["fresh", "gone_old", "up_old"]);
+    assert_eq!(after, v + 1);
+    let verifier = |n: &str| copies.iter().find(|c| c.name == n).map(|c| c.scram_verifier.clone());
+    assert_eq!(verifier("up_recent"), Some(Some("SCRAM-SHA-256$before".to_string())));
+    assert_eq!(verifier("up_old"), Some(Some("SCRAM-SHA-256$after".to_string())));
+    assert!(verifier("gone_recent").is_some());
+    assert_eq!(verifier("gone_old"), None);
+    assert_eq!(again, ResyncApplied::Applied { changed: vec![] });
+    assert_eq!(after_again, after);
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_upsert_keeps_the_origin_and_applies_the_sealed_change() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "app", true, "SCRAM-SHA-256$old", "v1:old", 10).await.unwrap();
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let mut changed_row = upsert("app", RoleOrigin::Sql, "SCRAM-SHA-256$new");
+    changed_row.password_enc = SealedChange::Clear;
+    changed_row.login = false;
+    changed_row.pending = false;
+    let mut md5 = upsert("legacy", RoleOrigin::Sql, "x");
+    md5.verifier = None;
+    md5.password_enc = SealedChange::Set("v1:set".into());
+    let write = ResyncWrite {
+        upserts: vec![changed_row, md5, upsert("postgres", RoleOrigin::Sql, "SCRAM-SHA-256$hijack")],
+        removals: vec![],
+        databases: vec![observed("db", "postgres", false)],
+    };
+    client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let (copies, _) = client.role_copies(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    let by_name = |n: &str| copies.iter().find(|c| c.name == n).unwrap();
+    let app = by_name("app");
+    assert_eq!(app.origin, RoleOrigin::Api, "an existing row keeps its origin");
+    assert_eq!(app.scram_verifier.as_deref(), Some("SCRAM-SHA-256$new"));
+    assert_eq!(app.password_enc, None);
+    assert!(!app.login && !app.pending);
+    assert_eq!(app.level, RoleLevel::Plain);
+    assert!(app.api_owner_level, "api_owner_level is not the resync's to change");
+    let legacy = by_name("legacy");
+    assert_eq!((legacy.origin, legacy.scram_verifier.clone()), (RoleOrigin::Sql, None));
+    assert_eq!(legacy.password_enc.as_deref(), Some("v1:set"));
+    let owner = by_name("postgres");
+    assert_eq!((owner.origin, owner.scram_verifier.as_deref()), (RoleOrigin::Owner, Some("SCRAM-SHA-256$v1")));
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_version_guard() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (_, read) = client.role_copies(&ep).await.unwrap();
+    // The receiver commits between the read and the write.
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.upsert_sql_copy("from_ddl", SQL_VERIFIER).await.unwrap();
+    tx.commit().await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![upsert("from_resync", RoleOrigin::Sql, "SCRAM-SHA-256$r")],
+        removals: vec!["from_ddl".into()],
+        databases: vec![observed("elsewhere", "postgres", false)],
+    };
+    let outcome = client.apply_resync(&ep, branch, read, &write).await.unwrap();
+    let names = names_of(&client, &ep).await;
+    let dbs = databases_of(&client, branch).await;
+    cleanup(&client, id).await;
+    assert_eq!(outcome, ResyncApplied::VersionMoved);
+    assert_eq!(names, ["postgres", "from_ddl"]);
+    assert_eq!(dbs, vec![("db".to_string(), "postgres".to_string(), DatabaseOrigin::Main)]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_sets_databases_with_origins() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let initial = databases_of(&client, branch).await;
+    let sync = |dbs: Vec<ObservedDatabase>| {
+        let client = client.clone();
+        let ep = ep.clone();
+        async move {
+            let (_, v) = client.role_copies(&ep).await.unwrap();
+            client
+                .apply_resync(&ep, branch, v, &ResyncWrite { upserts: vec![], removals: vec![], databases: dbs })
+                .await
+                .unwrap();
+            databases_of(&client, branch).await
+        }
+    };
+    let s = |n: &str, o: &str, origin| (n.to_string(), o.to_string(), origin);
+    let full = sync(vec![
+        observed("postgres", "cloud_admin", true),
+        observed("db", "postgres", false),
+        observed("extra", "app", false),
+    ])
+    .await;
+    // Q1: the main database was dropped; its row goes.
+    let dropped = sync(vec![observed("postgres", "cloud_admin", true), observed("extra", "app", false)]).await;
+    let (_, ver_dropped) = client.role_copies(&ep).await.unwrap();
+    // It comes back as `main`.
+    let back = sync(vec![observed("postgres", "cloud_admin", true), observed("db", "postgres", false)]).await;
+    let (_, ver_back) = client.role_copies(&ep).await.unwrap();
+    cleanup(&client, id).await;
+
+    assert_eq!(initial, vec![s("db", "postgres", DatabaseOrigin::Main)]);
+    assert_eq!(
+        full,
+        vec![
+            s("db", "postgres", DatabaseOrigin::Main),
+            s("extra", "app", DatabaseOrigin::Sql),
+            s("postgres", "cloud_admin", DatabaseOrigin::System),
+        ]
+    );
+    assert_eq!(
+        dropped,
+        vec![s("extra", "app", DatabaseOrigin::Sql), s("postgres", "cloud_admin", DatabaseOrigin::System)]
+    );
+    assert_eq!(
+        back,
+        vec![s("db", "postgres", DatabaseOrigin::Main), s("postgres", "cloud_admin", DatabaseOrigin::System)]
+    );
+    assert!(ver_back > ver_dropped);
+}
+
+#[tokio::test]
+#[ignore]
+async fn database_count_ignores_system() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![],
+        removals: vec![],
+        databases: vec![
+            observed("postgres", "cloud_admin", true),
+            observed("db", "postgres", false),
+            observed("extra", "app", false),
+        ],
+    };
+    client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let count = tx.database_count().await.unwrap();
+    drop(tx);
+    cleanup(&client, id).await;
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_begin_reads_the_endpoint_branch_and_owner() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let seen = (tx.branch_id(), tx.owner().to_string(), tx.main_database().map(str::to_string));
+    drop(tx);
+    let unknown = client.begin_ddl("ep-nothing").await.unwrap().is_none();
+    cleanup(&client, id).await;
+    assert_eq!(seen, (Some(main_of(id)), "postgres".to_string(), Some("db".to_string())));
+    assert!(unknown);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_copy_count_and_upsert_follow_r5() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "legacy", "sql", None, None).await;
+    client.insert_api_role(&ep, "api1", false, "SCRAM-SHA-256$a", "v1:a", 10).await.unwrap();
+    seed_copy(&client, &ep, "from_sql", "sql", Some("SCRAM-SHA-256$old"), None).await;
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let count = tx.copy_count().await.unwrap();
+    tx.upsert_sql_copy("fresh", "SCRAM-SHA-256$f").await.unwrap();
+    tx.upsert_sql_copy("api1", "SCRAM-SHA-256$typed").await.unwrap();
+    tx.upsert_sql_copy("from_sql", "SCRAM-SHA-256$new").await.unwrap();
+    let count_after = tx.copy_count().await.unwrap();
+    let seen = tx.role("api1").await.unwrap().expect("row");
+    let owner_row = tx.role("postgres").await.unwrap().expect("owner");
+    let none = tx.role("nobody").await.unwrap();
+    tx.commit().await.unwrap();
+
+    let (copies, v_after) = client.role_copies(&ep).await.unwrap();
+    // A transaction that wrote nothing leaves the version alone.
+    let quiet = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    quiet.commit().await.unwrap();
+    let v_quiet = version(&client, &ep).await;
+    let forwarded: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT forwarded_at FROM neon_roles WHERE endpoint_id = $1 AND name = 'fresh'")
+            .bind(&ep)
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+    cleanup(&client, id).await;
+
+    assert_eq!(count, 2, "api1 and from_sql count; the MD5 row doesn't");
+    assert_eq!(count_after, 3);
+    assert_eq!(seen.origin, RoleOrigin::Api);
+    assert_eq!(owner_row.origin, RoleOrigin::Owner);
+    assert!(none.is_none());
+    let by_name = |n: &str| copies.iter().find(|c| c.name == n).unwrap();
+    let fresh = by_name("fresh");
+    assert_eq!((fresh.origin, fresh.login, fresh.level, fresh.password_enc.clone()), (RoleOrigin::Sql, true, RoleLevel::Plain, None));
+    assert_eq!(by_name("api1").password_enc, None, "a password set in SQL unseals the copy");
+    assert_eq!(by_name("api1").origin, RoleOrigin::Api);
+    assert_eq!(by_name("from_sql").scram_verifier.as_deref(), Some("SCRAM-SHA-256$new"));
+    assert_eq!(v_after, v + 1);
+    assert_eq!(v_quiet, v_after);
+    assert!(forwarded.is_some());
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_main_database_drop_and_recreate() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let removed = tx.remove_database("db").await.unwrap();
+    let removed_again = tx.remove_database("db").await.unwrap();
+    tx.commit().await.unwrap();
+    let after_drop = databases_of(&client, branch).await;
+
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.upsert_database("db", "postgres").await.unwrap();
+    tx.upsert_database("other", "app").await.unwrap();
+    tx.commit().await.unwrap();
+    let after_create = databases_of(&client, branch).await;
+    cleanup(&client, id).await;
+    assert!(removed && !removed_again);
+    assert!(after_drop.is_empty());
+    assert_eq!(
+        after_create,
+        vec![
+            ("db".to_string(), "postgres".to_string(), DatabaseOrigin::Main),
+            ("other".to_string(), "app".to_string(), DatabaseOrigin::Sql),
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_rename_database_moves_the_row() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.upsert_database("one", "app").await.unwrap();
+    let renamed = tx.rename_database("one", "two").await.unwrap();
+    let missing = tx.rename_database("nobody", "three").await.unwrap();
+    tx.commit().await.unwrap();
+    let dbs = databases_of(&client, branch).await;
+    cleanup(&client, id).await;
+    assert!(renamed && !missing);
+    assert_eq!(dbs[1], ("two".to_string(), "app".to_string(), DatabaseOrigin::Sql));
+    assert_eq!(dbs.len(), 2);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_has_database_sees_the_open_transaction() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let main = tx.main_database().map(str::to_string).expect("main database");
+    let has_main = tx.has_database(&main).await.unwrap();
+    let before = tx.has_database("extra").await.unwrap();
+    tx.upsert_database("extra", "app").await.unwrap();
+    let after = tx.has_database("extra").await.unwrap();
+    drop(tx);
+    cleanup(&client, id).await;
+    assert!(has_main && !before && after);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_rename_moves_copy_and_keys() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "old", true, "SCRAM-SHA-256$o", "v1:old", 10).await.unwrap();
+    let (live, _) = new_key(branch, DataKeyKind::Secret, "old", "live");
+    let (revoked, _) = new_key(branch, DataKeyKind::Secret, "old", "revoked");
+    let (other, _) = new_key(branch, DataKeyKind::Secret, "service_role", "other");
+    for key in [&live, &revoked, &other] {
+        client.insert_data_key(key).await.unwrap();
+    }
+    sqlx::query("UPDATE data_api_keys SET revoked_at = now() WHERE id = $1")
+        .bind(revoked.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let v = version(&client, &ep).await;
+
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let live_before = tx.live_secret_keys("old").await.unwrap();
+    let renamed = tx.rename_copy("old", "new", Some("v1:resealed")).await.unwrap();
+    let missing = tx.rename_copy("nobody", "x", None).await.unwrap();
+    let live_after = tx.live_secret_keys("new").await.unwrap();
+    let live_old = tx.live_secret_keys("old").await.unwrap();
+    tx.commit().await.unwrap();
+
+    let (copies, v_after) = client.role_copies(&ep).await.unwrap();
+    let roles: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, role FROM data_api_keys WHERE branch_id = $1 ORDER BY name")
+            .bind(branch.as_uuid())
+            .fetch_all(client.pool())
+            .await
+            .unwrap();
+    // A rename with nothing to reseal leaves the copy unsealed.
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.rename_copy("new", "newer", None).await.unwrap();
+    tx.commit().await.unwrap();
+    let (copies_unsealed, _) = client.role_copies(&ep).await.unwrap();
+    cleanup(&client, id).await;
+
+    assert!(renamed && !missing);
+    assert_eq!(live_before, vec![(live.id, "live".to_string())]);
+    assert_eq!(live_after, live_before);
+    assert!(live_old.is_empty());
+    assert_eq!(v_after, v + 1);
+    assert!(copies.iter().all(|c| c.name != "old"));
+    let new = copies.iter().find(|c| c.name == "new").expect("renamed");
+    assert_eq!((new.origin, new.level, new.api_owner_level), (RoleOrigin::Api, RoleLevel::OwnerLevel, true));
+    assert_eq!(new.password_enc.as_deref(), Some("v1:resealed"));
+    assert_eq!(
+        roles,
+        vec![
+            ("live".to_string(), "new".to_string()),
+            ("other".to_string(), "service_role".to_string()),
+            ("revoked".to_string(), "new".to_string()),
+        ]
+    );
+    assert_eq!(copies_unsealed.iter().find(|c| c.name == "newer").unwrap().password_enc, None);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_remove_copy_and_commit_versions() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "tmp", "sql", Some(SQL_VERIFIER), None).await;
+    let v = version(&client, &ep).await;
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let owner = tx.remove_copy("postgres").await.unwrap();
+    let removed = tx.remove_copy("tmp").await.unwrap();
+    let again = tx.remove_copy("tmp").await.unwrap();
+    tx.commit().await.unwrap();
+    let (flag, after) = flag_and_version(&client, &ep).await;
+    let names = names_of(&client, &ep).await;
+    cleanup(&client, id).await;
+    assert!(!owner && removed && !again);
+    assert_eq!(after, v + 1);
+    assert!(!flag, "the compute already has what the DDL did");
+    assert_eq!(names, ["postgres"]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_dropped_transaction_writes_nothing() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let v = version(&client, &ep).await;
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.upsert_sql_copy("ghost", SQL_VERIFIER).await.unwrap();
+    drop(tx);
+    let names = names_of(&client, &ep).await;
+    let after = version(&client, &ep).await;
+    cleanup(&client, id).await;
+    assert_eq!(names, ["postgres"]);
+    assert_eq!(after, v);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_owner_verifier_clears_the_sealed_owner_password() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let sealed_before = main_branch(&client, id).await.owner_password_enc;
+    let v = version(&client, &ep).await;
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.set_owner_verifier("SCRAM-SHA-256$typed").await.unwrap();
+    tx.commit().await.unwrap();
+    let sealed_after = main_branch(&client, id).await.owner_password_enc;
+    let owner = client.neon_roles(&ep).await.unwrap();
+    let forwarded: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT forwarded_at FROM neon_roles WHERE endpoint_id = $1 AND origin = 'owner'")
+            .bind(&ep)
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+    let state = client.list_roles(&ep).await.unwrap()[0].password;
+    let after = version(&client, &ep).await;
+    cleanup(&client, id).await;
+    assert_eq!(sealed_before.as_deref(), Some("v1:owner"));
+    assert_eq!(sealed_after, None);
+    assert_eq!(owner[0].scram_verifier, "SCRAM-SHA-256$typed");
+    assert!(forwarded.is_some());
+    assert_eq!(state, PasswordState::SetInSql);
+    assert_eq!(after, v + 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_lock_times_out() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let mut holder = client.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM neon_endpoints WHERE id = $1 FOR UPDATE")
+        .bind(&ep)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        holder.commit().await.unwrap();
+    });
+    let started = std::time::Instant::now();
+    let outcome = client.begin_ddl(&ep).await;
+    let waited = started.elapsed();
+    let timed_out = matches!(&outcome, Err(MetadataError::EndpointLockTimeout(e)) if *e == ep);
+    drop(outcome);
+    release.await.unwrap();
+    // Once released, it works.
+    let free = client.begin_ddl(&ep).await.unwrap().is_some();
+    cleanup(&client, id).await;
+    assert!(timed_out);
+    assert!(waited >= std::time::Duration::from_millis(1800) && waited < std::time::Duration::from_millis(2800), "{waited:?}");
+    assert!(free);
+}
+
+#[tokio::test]
+#[ignore]
+async fn branch_copy_writes_role_copies_and_main_database() {
+    let client = client().await;
+    let id = insert_pending(&client).await;
+    let ep = ep_id();
+    let (tenant, timeline) = (hex32(), hex32());
+    let copies = [
+        NewRoleCopy { name: "reader", origin: RoleOrigin::Api, verifier: Some("SCRAM-SHA-256$r"), password_enc: Some("v1:reader"), login: true, level: RoleLevel::Plain, api_owner_level: false, pending: true },
+        NewRoleCopy { name: "writer", origin: RoleOrigin::Api, verifier: Some("SCRAM-SHA-256$w"), password_enc: Some("v1:writer"), login: true, level: RoleLevel::OwnerLevel, api_owner_level: true, pending: true },
+        NewRoleCopy { name: "My Role", origin: RoleOrigin::Sql, verifier: Some("SCRAM-SHA-256$s"), password_enc: None, login: false, level: RoleLevel::OwnerLevel, api_owner_level: false, pending: false },
+        NewRoleCopy { name: "legacy", origin: RoleOrigin::Sql, verifier: None, password_enc: None, login: true, level: RoleLevel::Plain, api_owner_level: false, pending: false },
+    ];
+    let mut new = new_endpoint(&ep, &tenant, &timeline);
+    new.role_copies = &copies;
+    assert!(client.create_endpoint_for_branch(main_of(id), &timeline, &new).await.unwrap());
+    let rows = client.list_roles(&ep).await.unwrap();
+    let (all, _) = client.role_copies(&ep).await.unwrap();
+    let dbs = databases_of(&client, main_of(id)).await;
+    let reader = client.role_password(&ep, "reader").await.unwrap();
+    let owner_pw = client.role_password(&ep, "postgres").await.unwrap();
+    let spec_roles = client.neon_roles(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(
+        rows.iter().map(|r| (r.name.as_str(), r.origin, r.level, r.login, r.pending)).collect::<Vec<_>>(),
+        vec![
+            ("postgres", RoleOrigin::Owner, RoleLevel::OwnerLevel, true, false),
+            ("My Role", RoleOrigin::Sql, RoleLevel::OwnerLevel, false, false),
+            ("legacy", RoleOrigin::Sql, RoleLevel::Plain, true, false),
+            ("reader", RoleOrigin::Api, RoleLevel::Plain, true, true),
+            ("writer", RoleOrigin::Api, RoleLevel::OwnerLevel, true, true),
+        ]
+    );
+    assert!(all.iter().find(|c| c.name == "writer").unwrap().api_owner_level);
+    assert_eq!(all.iter().find(|c| c.name == "legacy").unwrap().scram_verifier, None);
+    assert_eq!(dbs, vec![("db".to_string(), "postgres".to_string(), DatabaseOrigin::Main)]);
+    assert_eq!(reader.as_deref(), Some("v1:reader"));
+    assert_eq!(owner_pw, None);
+    assert_eq!(spec_roles.len(), 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn claim_refuses_a_protected_branch_unless_allowed() {
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let dev = ready_branch(&client, id, "dev", main_of(id)).await;
+    let marked = client.set_branch_protected(dev, true).await.unwrap().expect("a normal branch");
+    let refused = client.claim_branch_for_switch(dev, false).await.unwrap();
+    let still_ready = branch(&client, dev).await.status;
+    let allowed = client.claim_branch_for_switch(dev, true).await.unwrap();
+    let again = client.claim_branch_for_switch(dev, true).await.unwrap();
+    let unmarked = client.set_branch_protected(dev, false).await.unwrap().expect("a normal branch");
+    let unknown = client.set_branch_protected(BranchId::new(), true).await.unwrap();
+    // Not once a delete has begun.
+    let mut other = ready_branch(&client, id, "gone", main_of(id)).await;
+    client.begin_branch_delete(other).await.unwrap();
+    let deleting = client.set_branch_protected(other, true).await.unwrap();
+    other = main_of(id);
+    let main_marked = client.set_branch_protected(other, true).await.unwrap().map(|b| b.protected);
+    cleanup(&client, id).await;
+    assert!(marked.protected);
+    assert_eq!(refused, ClaimOutcome::Protected);
+    assert_eq!(still_ready, BranchStatus::Ready);
+    assert_eq!(allowed, ClaimOutcome::Claimed);
+    assert_eq!(again, ClaimOutcome::NotReady, "protected or not, only a ready branch is claimed");
+    assert!(!unmarked.protected);
+    assert!(unknown.is_none() && deleting.is_none());
+    assert_eq!(main_marked, Some(true));
+}
+
+#[tokio::test]
+#[ignore]
+async fn begin_delete_refuses_with_a_protected_branch() {
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let dev = ready_branch(&client, id, "dev", main_of(id)).await;
+    client.set_branch_protected(dev, true).await.unwrap().unwrap();
+    let refused = client.begin_delete(id).await.unwrap();
+    let db_status = client.get_database(id).await.unwrap().unwrap().status;
+    let branch_status = branch(&client, dev).await.status;
+    client.set_branch_protected(dev, false).await.unwrap().unwrap();
+    let started = client.begin_delete(id).await.unwrap();
+    let again = client.begin_delete(id).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(refused, BeginDelete::Protected);
+    assert_eq!(db_status, DatabaseStatus::Ready);
+    assert_eq!(branch_status, BranchStatus::Ready);
+    assert_eq!(started, BeginDelete::Started);
+    assert_eq!(again, BeginDelete::NotReady);
 }

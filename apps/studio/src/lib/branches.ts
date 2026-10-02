@@ -61,6 +61,8 @@ export function liveNormalChildren(branch: Branch, all: Branch[]): Branch[] {
   );
 }
 
+export const PROTECTED_REASON = "Unprotect the branch first";
+
 export type ActionKey = "connect" | "resetPassword" | "resetToParent" | "restore" | "delete";
 
 /** Why each action is unavailable (null when it is available). */
@@ -70,19 +72,20 @@ export function actionReasons(branch: Branch, all: Branch[]): Record<ActionKey, 
   const childReason = kids.length > 0 ? `has child branches: ${kids.map((k) => k.name).join(", ")}` : null;
   const notReady = branch.status !== "ready" ? `branch is not ready (it is ${branch.status})` : null;
   const backup = branch.kind === "backup";
+  const unprotect = branch.protected ? PROTECTED_REASON : null;
 
   const connect = backup ? BACKUP_CONNECT_REASON : notReady;
   const rewrite = backup ? "a restore backup can't be rewritten; create a branch from it" : (notReady ?? childReason);
   return {
     connect,
     resetPassword: connect,
-    resetToParent: isMain ? "main can't be reset to a parent" : rewrite,
+    resetToParent: isMain ? "main can't be reset to a parent" : (unprotect ?? rewrite),
     restore: rewrite,
     delete: isMain
       ? "main can't be deleted; delete the database instead"
       : branch.status === "deleting"
         ? "branch is already being deleted"
-        : childReason,
+        : (unprotect ?? childReason),
   };
 }
 

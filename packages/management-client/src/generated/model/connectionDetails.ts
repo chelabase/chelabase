@@ -4,17 +4,32 @@
  * Cheladb Management API
  * OpenAPI spec version: 1
  */
+import type { PasswordState } from './passwordState.ts';
 
 /**
- * The owner credentials of a branch.
+ * How to connect to a branch as one of its roles.
  */
 export interface ConnectionDetails {
   database: string;
   host: string;
   http_url: string;
-  password: string;
+  /**
+     * Null when it can't be shown; `password_state` says why.
+     * @nullable
+     */
+  password: string | null;
+  /**
+     * `generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is
+     * stored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy
+     * can't use; set a new password.
+     */
+  password_state: PasswordState;
   /** @minimum 0 */
   port: number;
+  /**
+     * Without a password when `password` is null. The user and database are
+     * percent-encoded.
+     */
   uri: string;
   user: string;
 }

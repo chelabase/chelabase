@@ -94,7 +94,8 @@ async fn lifecycle(
         "postgres,true,true",
         "anon,false,false",
         "authenticated,false,false",
-        "authenticator,false,false",
+        // The data API bootstrap makes authenticator LOGIN (rest connects as it).
+        "authenticator,true,false",
     ] {
         assert!(roles.contains(expected), "missing {expected} in:\n{roles}");
     }

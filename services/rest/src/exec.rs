@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use cheladb_auth::internal::DataIdentity;
+use cheladb_types::data_key::DataKeyKind;
 use serde_json::Value;
 use sqlx::{Acquire, PgConnection};
 use uuid::Uuid;
@@ -79,6 +80,51 @@ pub const PREAMBLE_SQL: &str = "SELECT set_config('role', $1, true), \
      set_config('request.jwt.claims', $2, true), set_config('statement_timeout', $3, true), \
      set_config('transaction_timeout', $3, true), \
      (SELECT version::text FROM cheladb.schema_version)";
+
+/// Whether role `$1` is owner-level: any attribute that bypasses or administers, or
+/// membership in `neon_superuser`. The one wide definition.
+pub const OWNER_LEVEL_SQL: &str = "SELECT rolsuper OR rolbypassrls OR rolcreaterole OR rolcreatedb OR rolreplication \
+    OR pg_has_role(oid, 'neon_superuser', 'MEMBER') FROM pg_catalog.pg_roles WHERE rolname = $1";
+
+/// How long an owner-level answer is kept.
+const OWNER_LEVEL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn owner_level_cache() -> moka::future::Cache<(Uuid, String), bool> {
+    moka::future::Cache::builder()
+        .max_capacity(SCHEMA_CACHE * 10)
+        .time_to_live(OWNER_LEVEL_TTL)
+        .build()
+}
+
+/// For a secret key only: refuses a role that is owner-level (cached per branch and role).
+/// `fetch` asks Postgres on a miss.
+async fn ensure_not_owner_level<F, Fut>(
+    cache: &moka::future::Cache<(Uuid, String), bool>,
+    data: &DataIdentity,
+    fetch: F,
+) -> Result<(), ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, ApiError>>,
+{
+    if data.kind != DataKeyKind::Secret {
+        return Ok(());
+    }
+    let key = (data.branch_id, data.role.clone());
+    let owner = match cache.get(&key).await {
+        Some(v) => v,
+        None => {
+            let v = fetch().await?;
+            cache.insert(key, v).await;
+            v
+        }
+    };
+    if owner {
+        Err(ApiError::role_not_allowed(&data.role))
+    } else {
+        Ok(())
+    }
+}
 
 /// Why a request failed before or while it ran.
 #[derive(Debug)]
@@ -160,6 +206,7 @@ pub struct Engine<S> {
     max_response_bytes: usize,
     schemas: moka::future::Cache<(Uuid, String), Arc<Schema>>,
     shapes: ShapeCache,
+    owner_level: moka::future::Cache<(Uuid, String), bool>,
 }
 
 fn introspect_error(e: IntrospectError, request_id: &str) -> ApiError {
@@ -178,6 +225,7 @@ impl<S: ConnSource> Engine<S> {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             schemas: moka::future::Cache::new(SCHEMA_CACHE),
             shapes: ShapeCache::default(),
+            owner_level: owner_level_cache(),
         }
     }
 
@@ -216,6 +264,25 @@ impl<S: ConnSource> Engine<S> {
             Err(sqlx::Error::Database(db)) => Err(preamble_failure(db.as_ref(), role, request_id)),
             Err(e) => Err(ApiError::from_sqlx(e, request_id)),
         }
+    }
+
+    /// The owner-level check, in the request's transaction; a missing role counts as plain
+    /// (the preamble reports it).
+    async fn check_owner_level(
+        &self,
+        conn: &mut PgConnection,
+        data: &DataIdentity,
+        request_id: &str,
+    ) -> Result<(), ApiError> {
+        ensure_not_owner_level(&self.owner_level, data, || async {
+            let row: Option<(Option<bool>,)> = sqlx::query_as(OWNER_LEVEL_SQL)
+                .bind(&data.role)
+                .fetch_optional(conn)
+                .await
+                .map_err(|e| ApiError::from_sqlx(e, request_id))?;
+            Ok(row.and_then(|r| r.0).unwrap_or(false))
+        })
+        .await
     }
 
     async fn schema(
@@ -264,6 +331,7 @@ impl<S: ConnSource> Engine<S> {
             .await
             .map_err(|e| ApiError::from_sqlx(e, request_id))?;
         let claims = data.claims.to_string();
+        self.check_owner_level(&mut tx, data, request_id).await?;
         let version = Self::preamble(&mut tx, &info, &data.role, &claims, request_id).await?;
         let schema = self
             .schema(&mut tx, branch, version.clone(), request_id)
@@ -304,7 +372,13 @@ impl<S: ConnSource> Engine<S> {
         request_id: &str,
     ) -> Result<Value, Failure> {
         let (schema, views, info_default) = self
-            .schemas_for(data.branch_id, &data.role, &[&data.role], request_id)
+            .schemas_for(
+                data.branch_id,
+                &data.role,
+                &[&data.role],
+                Some(data),
+                request_id,
+            )
             .await?;
         let roles: Vec<(&str, &schema::Visibility)> =
             vec![(data.role.as_str(), &views[0].visibility)];
@@ -315,7 +389,13 @@ impl<S: ConnSource> Engine<S> {
     /// can reach, with what each holds.
     pub async fn branch_schema(&self, branch: Uuid, request_id: &str) -> Result<Value, Failure> {
         let (schema, views, info_default) = self
-            .schemas_for(branch, "none", &["anon", "authenticated"], request_id)
+            .schemas_for(
+                branch,
+                "none",
+                &["anon", "authenticated"],
+                None,
+                request_id,
+            )
             .await?;
         let roles: Vec<(&str, &schema::Visibility)> = vec![
             ("anon", &views[0].visibility),
@@ -329,6 +409,7 @@ impl<S: ConnSource> Engine<S> {
         branch: Uuid,
         role: &str,
         roles: &[&str],
+        guard: Option<&DataIdentity>,
         request_id: &str,
     ) -> Result<(Arc<Schema>, Vec<Arc<RoleView>>, String), Failure> {
         let mut conn = self.acquire(branch, request_id).await?;
@@ -338,6 +419,9 @@ impl<S: ConnSource> Engine<S> {
             .begin()
             .await
             .map_err(|e| ApiError::from_sqlx(e, request_id))?;
+        if let Some(data) = guard {
+            self.check_owner_level(&mut tx, data, request_id).await?;
+        }
         let version = Self::preamble(&mut tx, &info, role, "{}", request_id).await?;
         let schema = self.schema(&mut tx, branch, version, request_id).await?;
         let mut views = Vec::new();
@@ -523,4 +607,77 @@ mod tests {
                 .is_ok()
         );
     }
+    #[test]
+    fn owner_level_sql_is_pinned() {
+        for needle in [
+            "rolsuper",
+            "rolbypassrls",
+            "rolcreaterole",
+            "rolcreatedb",
+            "rolreplication",
+            "pg_has_role(oid, 'neon_superuser', 'MEMBER')",
+            "FROM pg_catalog.pg_roles WHERE rolname = $1",
+        ] {
+            assert!(OWNER_LEVEL_SQL.contains(needle), "{needle}: {OWNER_LEVEL_SQL}");
+        }
+    }
+
+    fn identity(kind: DataKeyKind, branch: Uuid, role: &str) -> DataIdentity {
+        DataIdentity {
+            branch_id: branch,
+            key_id: Uuid::nil(),
+            kind,
+            role: role.into(),
+            claims: serde_json::json!({}),
+        }
+    }
+
+    fn owner_cache() -> moka::future::Cache<(Uuid, String), bool> {
+        owner_level_cache()
+    }
+
+    #[tokio::test]
+    async fn owner_level_check_is_cached_per_branch_and_role() {
+        let cache = owner_cache();
+        let branch = Uuid::new_v4();
+        let queries = std::cell::Cell::new(0);
+        let check = |branch: Uuid, role: &'static str, answer: bool| {
+            let data = identity(DataKeyKind::Secret, branch, role);
+            let cache = &cache;
+            let queries = &queries;
+            async move {
+                ensure_not_owner_level(cache, &data, || async {
+                    queries.set(queries.get() + 1);
+                    Ok(answer)
+                })
+                .await
+            }
+        };
+        assert!(check(branch, "svc", false).await.is_ok());
+        assert!(check(branch, "svc", false).await.is_ok());
+        assert_eq!(queries.get(), 1);
+        // Another role asks again; an owner-level answer is cached and refused.
+        let e = check(branch, "boss", true).await.unwrap_err();
+        assert_eq!((e.status, e.code), (axum::http::StatusCode::FORBIDDEN, "role_not_allowed"));
+        assert_eq!(queries.get(), 2);
+        assert!(check(branch, "boss", true).await.is_err());
+        assert_eq!(queries.get(), 2);
+        // Another branch asks again.
+        assert!(check(Uuid::new_v4(), "svc", false).await.is_ok());
+        assert_eq!(queries.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn publishable_keys_skip_the_check() {
+        let cache = owner_cache();
+        let data = identity(DataKeyKind::Public, Uuid::new_v4(), "anon");
+        let r = ensure_not_owner_level(&cache, &data, || async {
+            panic!("a publishable key must not be checked");
+            #[allow(unreachable_code)]
+            Ok(true)
+        })
+        .await;
+        assert!(r.is_ok());
+    }
+
 }

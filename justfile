@@ -454,6 +454,11 @@ branch-e2e:
 data-e2e:
     scripts/data-e2e.sh
 
+# Live login roles story: create a plain role, connect, back a secret key, refused delete, reset,
+# revoke, delete (needs just deps-up and just dev)
+role-e2e:
+    scripts/role-e2e.sh
+
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:
     infra/neon/tests/run.sh

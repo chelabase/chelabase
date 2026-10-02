@@ -302,7 +302,7 @@
             }
           },
           "409": {
-            "description": "`already_deleting`: the database is already being deleted",
+            "description": "`already_deleting`: the database is already being deleted; `branch_protected`: a branch of the database is protected, unprotect it first",
             "content": {
               "application/json": {
                 "schema": {
@@ -766,7 +766,7 @@
             }
           },
           "409": {
-            "description": "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches",
+            "description": "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches; `branch_protected`: the branch is protected, unprotect it first",
             "content": {
               "application/json": {
                 "schema": {
@@ -791,16 +791,14 @@
             "bearer": []
           }
         ]
-      }
-    },
-    "/v1/databases/{id}/branches/{branch_id}/connection": {
-      "get": {
+      },
+      "patch": {
         "tags": [
           "branches"
         ],
-        "summary": "Reveal a branch's connection details",
-        "description": "The owner credentials of the branch. Never cached (`Cache-Control: no-store`) and never logged.",
-        "operationId": "getBranchConnection",
+        "summary": "Protect or unprotect a branch",
+        "description": "Sets the branch's `protected` flag. A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included.",
+        "operationId": "updateBranch",
         "parameters": [
           {
             "name": "id",
@@ -823,19 +821,29 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBranchRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
-            "description": "The owner credentials; never cached",
+            "description": "The branch with its new flag",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ConnectionDetails"
+                  "$ref": "#/components/schemas/Branch"
                 }
               }
             }
           },
           "400": {
-            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
             "content": {
               "application/json": {
                 "schema": {
@@ -875,7 +883,164 @@
             }
           },
           "409": {
-            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the owner credentials are missing",
+            "description": "`backup_branch`: a restore backup can't be protected; `branch_not_ready`: the branch is being deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown or missing field, or `protected` isn't a boolean",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/connection": {
+      "get": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "Reveal a branch's connection details",
+        "description": "The connection details of the branch's owner, or of the role named by `role`, for its main database or the one named by `database`. `password` is null, with the reason in `password_state`, when it can't be shown: a role whose password was set in SQL (only its hash is stored) or has an MD5 hash the proxy can't use; the `uri` then has no password. Never cached (`Cache-Control: no-store`) and never logged.",
+        "operationId": "getBranchConnection",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "The role to connect as: any role of the branch. Absent, or the owner's name, gives the owner",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database to connect to, one of the branch's databases (the system `postgres` one included). Absent gives the main database",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The role's credentials; never cached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionDetails"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the requested role or the requested database doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_role_name`: `role` is empty, over 63 bytes or has a NUL",
             "content": {
               "application/json": {
                 "schema": {
@@ -1024,6 +1189,118 @@
                 "description": "Seconds to wait before retrying"
               }
             },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/databases": {
+      "get": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "List a branch's Postgres databases",
+        "description": "The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details.",
+        "operationId": "listBranchDatabases",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The databases, main first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BranchDatabaseView"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
             "content": {
               "application/json": {
                 "schema": {
@@ -1728,7 +2005,7 @@
             }
           },
           "409": {
-            "description": "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches",
+            "description": "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_protected`: the branch is protected, unprotect it first",
             "content": {
               "application/json": {
                 "schema": {
@@ -1897,6 +2174,547 @@
           },
           "503": {
             "description": "`worker_unavailable`: the worker or job queue can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/roles": {
+      "get": {
+        "tags": [
+          "roles"
+        ],
+        "summary": "List a branch's roles",
+        "description": "The branch's owner role first, then the others by name: roles made through the API and roles made in SQL, with their level, password state and the data API secret keys an owner-level role blocks. No passwords: read one with the connection details and `role`.",
+        "operationId": "listRoles",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The roles, owner first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BranchRole"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "roles"
+        ],
+        "summary": "Create a login role",
+        "description": "Creates a login role with a generated password and answers with the role. `owner_level` gives it the owner's attributes (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION) and makes it a member of `neon_superuser`. The password isn't in the answer: read it with the connection details and `role`. A role the compute couldn't take yet is `pending` and applied later.",
+        "operationId": "createRole",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRoleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The role was created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchRole"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't valid JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`role_exists`: the name is taken; `role_cap_reached`: the branch has its maximum of login roles; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_role_name`: the name doesn't fit the rules; `reserved_role_name`: the name is reserved; `invalid_request`: an unknown field (`privileged` is gone, use `owner_level`) or a missing one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: the worker failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`not_applied`: the role is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker or database didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/roles/{role}": {
+      "delete": {
+        "tags": [
+          "roles"
+        ],
+        "summary": "Delete a login role",
+        "description": "Deletes a login role. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted.",
+        "operationId": "deleteRole",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "Role name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The role was deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the role doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`role_in_use`: data API keys still use the role, listed in `keys` as `{id, name}`; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: the worker failed to delete the role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`not_applied`: the change is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker or database didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/roles/{role}/reset-password": {
+      "post": {
+        "tags": [
+          "roles"
+        ],
+        "summary": "Reset a role's password",
+        "description": "Generates a new password for the role. The owner's name resets the owner password, like the branch's reset-password. Read the new password with the connection details and `role`.",
+        "operationId": "resetRolePassword",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "Role name; the owner's name resets the owner password",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The password was reset"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the role doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: the worker failed to reset the password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`not_applied`: the new password is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker or database didn't answer in time",
             "content": {
               "application/json": {
                 "schema": {
@@ -2210,7 +3028,9 @@
           "branched_at_lsn",
           "created_at",
           "history_start",
-          "error"
+          "error",
+          "protected",
+          "main_database_missing"
         ],
         "properties": {
           "branched_at_lsn": {
@@ -2256,6 +3076,10 @@
           "kind": {
             "$ref": "#/components/schemas/BranchKind"
           },
+          "main_database_missing": {
+            "type": "boolean",
+            "description": "A ready branch with no recorded main database: it was dropped in SQL. The data API is\nunavailable on the branch until a database of the main name exists again."
+          },
           "name": {
             "type": "string"
           },
@@ -2277,8 +3101,38 @@
             "format": "int32",
             "minimum": 0
           },
+          "protected": {
+            "type": "boolean",
+            "description": "A protected branch can't be deleted or reset to its parent (restore still works), and\nits database can't be deleted. Set with `updateBranch`."
+          },
           "status": {
             "$ref": "#/components/schemas/BranchStatus"
+          }
+        }
+      },
+      "BranchDatabaseView": {
+        "type": "object",
+        "description": "A Postgres database of a branch.",
+        "required": [
+          "name",
+          "owner",
+          "origin",
+          "main"
+        ],
+        "properties": {
+          "main": {
+            "type": "boolean",
+            "description": "The branch's main database: the one the data API serves."
+          },
+          "name": {
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/DatabaseOrigin"
+          },
+          "owner": {
+            "type": "string",
+            "description": "The Postgres role that owns it."
           }
         }
       },
@@ -2293,6 +3147,56 @@
           "normal",
           "backup"
         ]
+      },
+      "BranchRole": {
+        "type": "object",
+        "description": "A role of a branch, without secrets. The owner comes first.",
+        "required": [
+          "name",
+          "origin",
+          "level",
+          "login",
+          "password",
+          "blocked_keys",
+          "created_at",
+          "pending"
+        ],
+        "properties": {
+          "blocked_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RoleInUseKey"
+            },
+            "description": "Live data API secret keys that name this role while it is owner-level: the keys the\ndata API refuses (empty for a plain role)."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "level": {
+            "$ref": "#/components/schemas/RoleLevel",
+            "description": "`owner_level`: superuser, CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, or a member of\n`neon_superuser` at any depth. Such a role can't back a data API secret key."
+          },
+          "login": {
+            "type": "boolean",
+            "description": "Whether the role has the LOGIN attribute."
+          },
+          "name": {
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/RoleOrigin",
+            "description": "The branch's owner, a role made in SQL, or one made through the API."
+          },
+          "password": {
+            "$ref": "#/components/schemas/PasswordState",
+            "description": "Whether the password can be shown (`generated`), was set in SQL, or is an unusable MD5\nhash."
+          },
+          "pending": {
+            "type": "boolean",
+            "description": "Written but not yet applied to the compute; applied when the compute next runs."
+          }
+        }
       },
       "BranchStatus": {
         "type": "string",
@@ -2342,13 +3246,14 @@
       },
       "ConnectionDetails": {
         "type": "object",
-        "description": "The owner credentials of a branch.",
+        "description": "How to connect to a branch as one of its roles.",
         "required": [
           "host",
           "port",
           "database",
           "user",
           "password",
+          "password_state",
           "uri",
           "http_url"
         ],
@@ -2363,7 +3268,15 @@
             "type": "string"
           },
           "password": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null when it can't be shown; `password_state` says why."
+          },
+          "password_state": {
+            "$ref": "#/components/schemas/PasswordState",
+            "description": "`generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is\nstored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy\ncan't use; set a new password."
           },
           "port": {
             "type": "integer",
@@ -2371,7 +3284,8 @@
             "minimum": 0
           },
           "uri": {
-            "type": "string"
+            "type": "string",
+            "description": "Without a password when `password` is null. The user and database are\npercent-encoded."
           },
           "user": {
             "type": "string"
@@ -2465,6 +3379,23 @@
               "string",
               "null"
             ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateRoleRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "`^[a-z_][a-z0-9_]{0,62}$`, and not a reserved name (`postgres`, `anon`, `pg_…`, …)."
+          },
+          "owner_level": {
+            "type": "boolean",
+            "description": "Makes the role owner-level, like the branch owner: CREATEROLE, CREATEDB, BYPASSRLS\nand REPLICATION, and a member of `neon_superuser`. Default `false`."
           }
         },
         "additionalProperties": false
@@ -2675,6 +3606,15 @@
         "format": "uuid",
         "description": "Stable identifier for a provisioned database instance."
       },
+      "DatabaseOrigin": {
+        "type": "string",
+        "description": "Where a `branch_databases` row came from.",
+        "enum": [
+          "main",
+          "sql",
+          "system"
+        ]
+      },
       "DatabaseSettings": {
         "type": "object",
         "description": "A database's settings after a change.",
@@ -2816,7 +3756,14 @@
           "email_taken",
           "invalid_code",
           "weak_password",
-          "sign_in_expired"
+          "sign_in_expired",
+          "invalid_role_name",
+          "reserved_role_name",
+          "role_exists",
+          "role_cap_reached",
+          "role_in_use",
+          "role_privilege_mismatch",
+          "branch_protected"
         ]
       },
       "ErrorEnvelope": {
@@ -2898,6 +3845,15 @@
             "type": "string"
           }
         }
+      },
+      "PasswordState": {
+        "type": "string",
+        "description": "Where a role's password stands, as Studio shows it.",
+        "enum": [
+          "generated",
+          "set_in_sql",
+          "md5_unusable"
+        ]
       },
       "PointInTime": {
         "oneOf": [
@@ -3017,6 +3973,40 @@
             "type": "string"
           }
         }
+      },
+      "RoleInUseKey": {
+        "type": "object",
+        "description": "A data API key that names an owner-level role; also the `keys` extra of `role_in_use`.",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "RoleLevel": {
+        "type": "string",
+        "description": "What a role may do: `OwnerLevel` is the wide definition (superuser, CREATEROLE, CREATEDB,\nBYPASSRLS, REPLICATION, or `neon_superuser` at any depth).",
+        "enum": [
+          "plain",
+          "owner_level"
+        ]
+      },
+      "RoleOrigin": {
+        "type": "string",
+        "description": "Where a `neon_roles` row came from: the branch's owner, a role made in SQL, or one made\nthrough the API.",
+        "enum": [
+          "owner",
+          "sql",
+          "api"
+        ]
       },
       "SchemaEntry": {
         "type": "object",
@@ -3142,6 +4132,19 @@
         "type": "string",
         "format": "uuid",
         "description": "Stable identifier for a tenant (organization)."
+      },
+      "UpdateBranchRequest": {
+        "type": "object",
+        "required": [
+          "protected"
+        ],
+        "properties": {
+          "protected": {
+            "type": "boolean",
+            "description": "`true` refuses deleting the branch, resetting it to its parent and deleting its\ndatabase; restore still works."
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateDatabaseRequest": {
         "type": "object",

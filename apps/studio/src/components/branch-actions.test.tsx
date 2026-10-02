@@ -17,6 +17,8 @@ const mk = (over: Partial<BranchSummary> & { name: string; id: string }): Branch
   created_at: "2026-09-30T10:00:00Z",
   history_start: null,
   error: null,
+  protected: false,
+  main_database_missing: false,
   ...over,
 });
 const main = mk({ id: "m", name: "main" });
@@ -159,6 +161,7 @@ describe("BranchActions", () => {
           database: "web1",
           user: "postgres",
           password: "pw",
+          password_state: "generated",
           uri: "postgresql://postgres:pw@ep-aaaaaaaaaaaa.localtest.me:4432/web1",
           http_url: "https://ep-aaaaaaaaaaaa.localtest.me:4444/sql",
         }),
@@ -169,7 +172,12 @@ describe("BranchActions", () => {
     );
     await userEvent.click(btn("Connection details"));
     expect(await screen.findByText("postgres")).toBeInTheDocument();
-    expect(f.calls.map((r) => new URL(r.url).pathname)).toEqual(["/v1/databases/db/branches/d/connection"]);
+    // The connection panel also lists the branch's roles for its picker.
+    expect(f.calls.map((r) => new URL(r.url).pathname).sort()).toEqual([
+      "/v1/databases/db/branches/d/connection",
+      "/v1/databases/db/branches/d/databases",
+      "/v1/databases/db/branches/d/roles",
+    ]);
   });
 
   it("resets the branch's password", async () => {
@@ -344,5 +352,78 @@ describe("BranchActions", () => {
       expect(await screen.findByRole("alert")).toHaveTextContent(/history window/i);
       expect(fetch.calls).toHaveLength(0);
     });
+  });
+});
+
+describe("BranchActions roles", () => {
+  it("toggles the Roles panel on a ready branch", async () => {
+    setup(main, [main], { "GET /v1/databases/db/branches/m/roles": () => jsonResponse([]) });
+    await userEvent.click(btn("Roles"));
+    expect(await screen.findByRole("heading", { name: "Roles" })).toBeInTheDocument();
+    await userEvent.click(btn("Roles"));
+    expect(screen.queryByRole("heading", { name: "Roles" })).toBeNull();
+  });
+
+  it("disables Roles when the branch isn't ready", () => {
+    setup({ ...main, status: "provisioning" }, [main]);
+    expect(btn("Roles")).toBeDisabled();
+  });
+});
+
+describe("BranchActions protection", () => {
+  const PATCH = "PATCH /v1/databases/db/branches/d";
+
+  it("main_database_missing_notice", () => {
+    setup({ ...main, main_database_missing: true }, [main]);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Main database missing: create a database named web1 to bring it back",
+    );
+  });
+
+  it("no notice when the main database is there", () => {
+    setup(main, [main]);
+    expect(screen.queryByText(/Main database missing/)).toBeNull();
+  });
+
+  it("protect_toggle_confirms_and_patches", async () => {
+    const patch = vi.fn(() => jsonResponse({ ...dev, protected: true }));
+    const { fetch } = setup(dev, [main, dev], { [PATCH]: patch });
+    await userEvent.click(btn("Protect"));
+    expect(
+      screen.getByText(
+        "Children of a protected branch get new passwords for every role. It can't be deleted or reset to its parent until you unprotect it. Restore stays allowed.",
+      ),
+    ).toBeInTheDocument();
+    expect(patch).not.toHaveBeenCalled();
+    await userEvent.click(btn("Confirm protect"));
+    await vi.waitFor(() => expect(patch).toHaveBeenCalled());
+    const call = fetch.calls.find((r) => r.method === "PATCH")!;
+    expect(await call.clone().json()).toEqual({ protected: true });
+  });
+
+  it("unprotect patches without a confirm", async () => {
+    const patch = vi.fn(() => jsonResponse({ ...dev, protected: false }));
+    const { fetch } = setup({ ...dev, protected: true }, [main, { ...dev, protected: true }], { [PATCH]: patch });
+    await userEvent.click(btn("Unprotect"));
+    await vi.waitFor(() => expect(patch).toHaveBeenCalled());
+    const call = fetch.calls.find((r) => r.method === "PATCH")!;
+    expect(await call.clone().json()).toEqual({ protected: false });
+  });
+
+  it("protected_branch_disables_delete_and_reset", () => {
+    const p = { ...dev, protected: true };
+    setup(p, [main, p]);
+    for (const name of ["Reset to parent", "Delete branch"]) {
+      expect(btn(name)).toBeDisabled();
+      expect(btn(name)).toHaveAttribute("title", "Unprotect the branch first");
+    }
+    expect(screen.getAllByText("Unprotect the branch first").length).toBeGreaterThan(0);
+    expect(btn("Restore")).toBeEnabled();
+  });
+
+  it("a backup has no Protect toggle", () => {
+    const backup = mk({ id: "b", name: "main-before-restore-x", kind: "backup", parent_branch_id: main.id, host: null });
+    setup(backup, [main, backup]);
+    expect(screen.queryByRole("button", { name: "Protect" })).toBeNull();
   });
 });

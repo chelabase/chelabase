@@ -135,6 +135,8 @@ pub struct BranchRecord {
     /// The `authenticator` role's password on this branch, sealed with `cheladb-secrets`
     /// (purpose `authenticator`); `None` until the data API is set up for it.
     pub authenticator_password_enc: Option<String>,
+    /// Refused by delete and reset-to-parent (restore still works).
+    pub protected: bool,
 }
 
 /// A branch to create (always `normal`, status `pending`).
@@ -164,6 +166,17 @@ pub enum CreateBranchOutcome {
     DatabaseNotLive,
 }
 
+/// Outcome of [`MetadataClient::claim_branch_for_switch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// ready → resetting.
+    Claimed,
+    /// The branch isn't ready (or is missing).
+    NotReady,
+    /// The branch is ready but protected, and the caller doesn't allow that.
+    Protected,
+}
+
 /// Outcome of [`MetadataClient::begin_branch_delete`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchDeleteOutcome {
@@ -179,11 +192,19 @@ pub enum BranchDeleteOutcome {
         backup: Option<String>,
         children: Vec<String>,
     },
+    /// Refused, nothing written: the branch is protected (a flag set after the caller's own
+    /// check).
+    Protected,
 }
 
 impl BranchDeleteOutcome {
     /// The refusal message for deleting `branch_name`, when this is a refusal.
     pub fn refusal(&self, branch_name: &str) -> Option<String> {
+        if *self == Self::Protected {
+            return Some(format!(
+                "cannot delete {branch_name}: it is protected; unprotect it first"
+            ));
+        }
         let Self::HasChildren { backup, children } = self else {
             return None;
         };
@@ -237,7 +258,7 @@ pub struct LiveBranch {
 const BRANCH_COLUMNS: &str = "id, database_id, name, parent_branch_id, kind, status, timeline_id, \
      pending_timeline_id, pending_timeline_at, superseded_timeline_id, endpoint_id, owner_password_enc, \
      branched_at_time, branched_at_lsn, error, created_at, updated_at, history_start, \
-     authenticator_password_enc";
+     authenticator_password_enc, protected";
 
 fn branch_from_row(r: &PgRow) -> Result<BranchRecord, MetadataError> {
     Ok(BranchRecord {
@@ -260,6 +281,7 @@ fn branch_from_row(r: &PgRow) -> Result<BranchRecord, MetadataError> {
         updated_at: r.get("updated_at"),
         history_start: r.get("history_start"),
         authenticator_password_enc: r.get("authenticator_password_enc"),
+        protected: r.get("protected"),
     })
 }
 
@@ -449,17 +471,61 @@ impl MetadataClient {
     }
 
     /// ready → resetting, clearing the last error: the API's claim before a reset or restore,
-    /// so each attempt starts clean. True when it claimed the branch.
-    pub async fn claim_branch_for_switch(&self, id: BranchId) -> Result<bool, MetadataError> {
+    /// so each attempt starts clean. With `allow_protected = false` (delete, reset-to-parent) a
+    /// protected branch isn't claimed: the claim's `UPDATE` carries `AND NOT protected`, and a
+    /// zero-row result is re-read to tell `Protected` (a ready, protected branch) from
+    /// `NotReady`. Restore passes `true`.
+    pub async fn claim_branch_for_switch(
+        &self,
+        id: BranchId,
+        allow_protected: bool,
+    ) -> Result<ClaimOutcome, MetadataError> {
         let updated = sqlx::query(
             "UPDATE branches SET status = 'resetting', error = NULL, updated_at = now()
-             WHERE id = $1 AND status = 'ready'",
+             WHERE id = $1 AND status = 'ready' AND ($2 OR NOT protected)",
         )
         .bind(id.as_uuid())
+        .bind(allow_protected)
         .execute(&self.pool)
         .await?
         .rows_affected();
-        Ok(updated == 1)
+        if updated == 1 {
+            return Ok(ClaimOutcome::Claimed);
+        }
+        let protected_and_ready: bool = sqlx::query_scalar(
+            "SELECT coalesce((SELECT protected AND status = 'ready' FROM branches WHERE id = $1), false)",
+        )
+        .bind(id.as_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(if protected_and_ready && !allow_protected {
+            ClaimOutcome::Protected
+        } else {
+            ClaimOutcome::NotReady
+        })
+    }
+
+    /// Sets the protected flag of a `normal` branch (main included) in any status but
+    /// `deleting`/`deleted`. `None` when there's no such branch (or it's a backup, or being
+    /// deleted); `Some(record)` after the update.
+    pub async fn set_branch_protected(
+        &self,
+        id: BranchId,
+        protected: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        let sql = format!(
+            "UPDATE branches SET protected = $2, updated_at = now()
+             WHERE id = $1 AND kind = 'normal' AND status NOT IN ('deleting', 'deleted')
+             RETURNING {BRANCH_COLUMNS}"
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(id.as_uuid())
+            .bind(protected)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(branch_from_row)
+            .transpose()
     }
 
     /// Not once a delete has begun.
@@ -545,15 +611,28 @@ impl MetadataClient {
                 });
             }
         }
-        // A new attempt: an error left by an earlier one no longer applies.
+        // A new attempt: an error left by an earlier one no longer applies. Never a protected
+        // branch (a flag set after the caller's check): a zero-row result is re-read.
         let moved = sqlx::query(
             "UPDATE branches SET status = 'deleting', error = NULL, updated_at = now()
-             WHERE id = $1 AND status NOT IN ('deleting', 'deleted')",
+             WHERE id = $1 AND status NOT IN ('deleting', 'deleted') AND NOT protected",
         )
         .bind(id.as_uuid())
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        if moved == 0 {
+            let protected: bool = sqlx::query_scalar(
+                "SELECT coalesce((SELECT protected AND status NOT IN ('deleting', 'deleted')
+                                  FROM branches WHERE id = $1), false)",
+            )
+            .bind(id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            if protected {
+                return Ok(BranchDeleteOutcome::Protected);
+            }
+        }
         // Also when an earlier call moved the branch: a backup made since goes too.
         sqlx::query(
             "UPDATE branches SET status = 'deleting', updated_at = now()
@@ -619,19 +698,48 @@ impl MetadataClient {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO neon_roles (endpoint_id, name, scram_verifier) VALUES ($1, $2, $3)",
+            "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin, level)
+             VALUES ($1, $2, $3, 'owner', 'owner_level')",
         )
         .bind(ep.id)
         .bind(ep.owner_role)
         .bind(ep.owner_verifier)
         .execute(&mut *tx)
         .await?;
+        for copy in ep.role_copies {
+            sqlx::query(
+                "INSERT INTO neon_roles
+                     (endpoint_id, name, scram_verifier, origin, password_enc, login, level,
+                      api_owner_level, pending)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(ep.id)
+            .bind(copy.name)
+            .bind(copy.verifier)
+            .bind(copy.origin.as_str())
+            .bind(copy.password_enc)
+            .bind(copy.login)
+            .bind(copy.level.as_str())
+            .bind(copy.api_owner_level)
+            .bind(copy.pending)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query("INSERT INTO neon_databases (endpoint_id, name, owner) VALUES ($1, $2, $3)")
             .bind(ep.id)
             .bind(ep.database_name)
             .bind(ep.owner_role)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "INSERT INTO branch_databases (branch_id, name, owner, origin)
+             VALUES ($1, $2, $3, 'main')",
+        )
+        .bind(id.as_uuid())
+        .bind(ep.database_name)
+        .bind(ep.owner_role)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE branches SET endpoint_id = $2, timeline_id = $3, updated_at = now()
              WHERE id = $1",

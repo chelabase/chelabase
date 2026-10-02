@@ -8,17 +8,17 @@ use std::time::Duration;
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
+    extract::{Query, State, rejection::QueryRejection},
     http::{StatusCode, header::CACHE_CONTROL},
     response::{IntoResponse, Response},
 };
 use cheladb_metadata::{
-    BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome,
-    DatabaseRecord, NewBranch, SettingsPatch,
+    BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
+    CreateBranchOutcome, DatabaseOrigin, DatabaseRecord, NewBranch, SettingsPatch,
 };
 use cheladb_nats::{BranchJob, DatabaseSettingsJob, JobEnvelope, PointInTime};
 use cheladb_types::api_error::{ApiError, ErrorCode};
-use cheladb_types::{ApiPath, BranchId};
+use cheladb_types::{ApiJson, ApiPath, BranchId};
 use chrono::{DateTime, Utc};
 use cheladb_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -47,7 +47,8 @@ where
 {
     OpenApiRouter::new()
         .routes(routes!(list_branches, create_branch))
-        .routes(routes!(delete_branch))
+        .routes(routes!(delete_branch, update_branch))
+        .routes(routes!(list_branch_databases))
         .routes(routes!(branch_connection))
         .routes(routes!(branch_reset_password))
         .routes(routes!(reset_to_parent))
@@ -78,10 +79,16 @@ struct Branch {
     history_start: Option<DateTime<Utc>>,
     #[schema(required = true)]
     error: Option<String>,
+    /// A protected branch can't be deleted or reset to its parent (restore still works), and
+    /// its database can't be deleted. Set with `updateBranch`.
+    protected: bool,
+    /// A ready branch with no recorded main database: it was dropped in SQL. The data API is
+    /// unavailable on the branch until a database of the main name exists again.
+    main_database_missing: bool,
 }
 
 impl Branch {
-    fn new(b: BranchRecord, proxy_domain: &str) -> Self {
+    fn new(b: BranchRecord, proxy_domain: &str, main_database_missing: bool) -> Self {
         let endpoint = (b.kind == BranchKind::Normal)
             .then_some(b.endpoint_id.as_deref())
             .flatten();
@@ -108,8 +115,39 @@ impl Branch {
             created_at: b.created_at,
             history_start: b.history_start,
             error: b.error,
+            protected: b.protected,
+            main_database_missing,
         }
     }
+}
+
+/// Whether a ready `normal` branch has no `main` row in `branch_databases`. A branch that
+/// isn't ready has nothing recorded yet, and a failed lookup is logged and reads as present.
+async fn main_database_missing<M, J>(state: &AppState<M, J>, b: &BranchRecord) -> bool
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    if b.kind != BranchKind::Normal || b.status != BranchStatus::Ready || b.endpoint_id.is_none() {
+        return false;
+    }
+    match state.metadata.branch_databases(b.id).await {
+        Ok(rows) => !rows.iter().any(|d| d.origin == DatabaseOrigin::Main),
+        Err(err) => {
+            warn!(branch_id = %b.id, "load branch databases: {err}");
+            false
+        }
+    }
+}
+
+/// A branch as the API shows it.
+async fn branch_view<M, J>(state: &AppState<M, J>, b: BranchRecord) -> Branch
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let missing = main_database_missing(state, &b).await;
+    Branch::new(b, &state.proxy_domain, missing)
 }
 
 /// Parses a JSON body with the reason on failure: text that isn't JSON (syntax error, empty or
@@ -260,13 +298,13 @@ where
         Err(resp) => return resp.into_response(),
     };
     match state.metadata.list_branches(record.database_id).await {
-        Ok(branches) => Json(
-            branches
-                .into_iter()
-                .map(|b| Branch::new(b, &state.proxy_domain))
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(branches) => {
+            let mut views = Vec::with_capacity(branches.len());
+            for b in branches {
+                views.push(branch_view(&state, b).await);
+            }
+            Json(views).into_response()
+        }
         Err(err) => {
             error!("list branches: {err}");
             ApiError::internal().into_response()
@@ -406,7 +444,7 @@ where
     match state.metadata.get_branch(branch_id).await {
         Ok(Some(branch)) => (
             StatusCode::ACCEPTED,
-            Json(Branch::new(branch, &state.proxy_domain)),
+            Json(branch_view(&state, branch).await),
         )
             .into_response(),
         Ok(None) => ApiError::internal().into_response(),
@@ -417,21 +455,34 @@ where
     }
 }
 
+/// The query of the connection reveal; other parameters are ignored.
+#[derive(Debug, Deserialize)]
+struct ConnectionQuery {
+    role: Option<String>,
+    database: Option<String>,
+}
+
 #[utoipa::path(
     get,
     path = "/v1/databases/{id}/branches/{branch_id}/connection",
     operation_id = "getBranchConnection",
     tag = "branches",
     summary = "Reveal a branch's connection details",
-    description = "The owner credentials of the branch. Never cached (`Cache-Control: no-store`) and never logged.",
-    params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id")),
+    description = "The connection details of the branch's owner, or of the role named by `role`, for its main database or the one named by `database`. `password` is null, with the reason in `password_state`, when it can't be shown: a role whose password was set in SQL (only its hash is stored) or has an MD5 hash the proxy can't use; the `uri` then has no password. Never cached (`Cache-Control: no-store`) and never logged.",
+    params(
+        ("id" = Uuid, Path, description = "Database id"),
+        ("branch_id" = Uuid, Path, description = "Branch id"),
+        ("role" = Option<String>, Query, description = "The role to connect as: any role of the branch. Absent, or the owner's name, gives the owner"),
+        ("database" = Option<String>, Query, description = "The Postgres database to connect to, one of the branch's databases (the system `postgres` one included). Absent gives the main database"),
+    ),
     responses(
-        (status = 200, description = "The owner credentials; never cached", body = ConnectionDetails),
+        (status = 200, description = "The role's credentials; never cached", body = ConnectionDetails),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
-        (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the owner credentials are missing", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's), the branch, the requested role or the requested database doesn't exist", body = ErrorEnvelope),
+        (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_role_name`: `role` is empty, over 63 bytes or has a NUL", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored credentials can't be opened with the current secrets key; `internal`: unexpected", body = ErrorEnvelope),
     ),
 )]
@@ -439,6 +490,7 @@ async fn branch_connection<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
     ApiPath((id, branch_id)): ApiPath<(Uuid, Uuid)>,
+    query: Result<Query<ConnectionQuery>, QueryRejection>,
 ) -> Response
 where
     M: MetadataPort,
@@ -452,7 +504,22 @@ where
         Ok(branch) => branch,
         Err(resp) => return resp.into_response(),
     };
-    let mut response = reveal(&state, &principal, &record, Some(branch)).await;
+    let Query(ConnectionQuery { role, database }) = match query {
+        Ok(query) => query,
+        Err(rej) => {
+            return ApiError::invalid_request(400, format!("invalid query: {}", rej.body_text()))
+                .into_response();
+        }
+    };
+    let mut response = reveal(
+        &state,
+        &principal,
+        &record,
+        Some(branch),
+        role.as_deref(),
+        database.as_deref(),
+    )
+    .await;
     if response.status().is_success() {
         response
             .headers_mut()
@@ -516,6 +583,7 @@ async fn claim<M, J>(
     state: &AppState<M, J>,
     branch: &BranchRecord,
     action: &str,
+    allow_protected: bool,
 ) -> Result<(), ApiError>
 where
     M: MetadataPort,
@@ -523,17 +591,21 @@ where
 {
     let moved = state
         .metadata
-        .claim_branch_for_switch(branch.id)
+        .claim_branch_for_switch(branch.id, allow_protected)
         .await
         .map_err(|err| {
             error!("claim branch: {err}");
             ApiError::internal()
         })?;
-    if !moved {
-        return Err(conflict(
-            ErrorCode::BranchNotReady,
-            "branch is not ready; try again in a moment",
-        ));
+    match moved {
+        ClaimOutcome::Claimed => {}
+        ClaimOutcome::Protected => return Err(protected_refusal()),
+        ClaimOutcome::NotReady => {
+            return Err(conflict(
+                ErrorCode::BranchNotReady,
+                "branch is not ready; try again in a moment",
+            ));
+        }
     }
     match state.metadata.live_children(branch.id).await {
         Ok(children) if children.is_empty() => Ok(()),
@@ -554,6 +626,11 @@ where
             Err(ApiError::internal())
         }
     }
+}
+
+/// The 409 for a delete or reset of a protected branch.
+fn protected_refusal() -> ApiError {
+    conflict(ErrorCode::BranchProtected, "this branch is protected; unprotect it first")
 }
 
 /// Puts a claimed branch back to ready.
@@ -598,7 +675,7 @@ fn check_rewritable(branch: &BranchRecord) -> Result<(), ApiError> {
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches", body = ErrorEnvelope),
+        (status = 409, description = "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_protected`: the branch is protected, unprotect it first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
     ),
@@ -630,7 +707,7 @@ where
     if let Err(resp) = check_rewritable(&branch) {
         return resp.into_response();
     }
-    if let Err(resp) = claim(&state, &branch, "reset").await {
+    if let Err(resp) = claim(&state, &branch, "reset", false).await {
         return resp.into_response();
     }
     let job = JobEnvelope {
@@ -728,7 +805,7 @@ where
         Ok(at) => at,
         Err(message) => return unprocessable(&message).into_response(),
     };
-    if let Err(resp) = claim(&state, &branch, "restore").await {
+    if let Err(resp) = claim(&state, &branch, "restore", true).await {
         return resp.into_response();
     }
     let backup_id = BranchId::new();
@@ -772,7 +849,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches", body = ErrorEnvelope),
+        (status = 409, description = "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches; `branch_protected`: the branch is protected, unprotect it first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -807,11 +884,15 @@ where
     let claimed = branch.status == BranchStatus::Ready;
     if claimed {
         // A ready branch can still gain children: hold it while checking.
-        if let Err(resp) = claim(&state, &branch, "delete").await {
+        if let Err(resp) = claim(&state, &branch, "delete", false).await {
             return resp.into_response();
         }
     } else {
         // Not ready, so no create can pick it as a parent; existing children still block.
+        // The claim above checks the flag for a ready branch; here it's read from the row.
+        if branch.protected {
+            return protected_refusal().into_response();
+        }
         match state.metadata.live_children(branch.id).await {
             Ok(children) if children.is_empty() => {}
             Ok(children) => {
@@ -839,6 +920,13 @@ where
         }
         // The branch's own children were checked above; this is a child of one of its backups
         // (or a child created in between), found under the database row's lock.
+        // Protected after the check above: the delete's own update refused it.
+        Ok(BranchDeleteOutcome::Protected) => {
+            if claimed {
+                release(&state, branch.id).await;
+            }
+            return protected_refusal().into_response();
+        }
         Ok(refused @ BranchDeleteOutcome::HasChildren { .. }) => {
             if claimed {
                 release(&state, branch.id).await;
@@ -870,6 +958,144 @@ where
         Json(OperationAccepted { status: "deleting" }),
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct UpdateBranchRequest {
+    /// `true` refuses deleting the branch, resetting it to its parent and deleting its
+    /// database; restore still works.
+    protected: bool,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/databases/{id}/branches/{branch_id}",
+    operation_id = "updateBranch",
+    tag = "branches",
+    summary = "Protect or unprotect a branch",
+    description = "Sets the branch's `protected` flag. A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included.",
+    params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id")),
+    request_body = UpdateBranchRequest,
+    responses(
+        (status = 200, description = "The branch with its new flag", body = Branch),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
+        (status = 409, description = "`backup_branch`: a restore backup can't be protected; `branch_not_ready`: the branch is being deleted", body = ErrorEnvelope),
+        (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: an unknown or missing field, or `protected` isn't a boolean", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+    ),
+)]
+async fn update_branch<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath((id, branch_id)): ApiPath<(Uuid, Uuid)>,
+    ApiJson(request): ApiJson<UpdateBranchRequest>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let record = match load_owned(&state, &principal, id).await {
+        Ok(record) => record,
+        Err(resp) => return resp.into_response(),
+    };
+    let branch = match load_branch(&state, &record, branch_id).await {
+        Ok(branch) => branch,
+        Err(resp) => return resp.into_response(),
+    };
+    if branch.kind == BranchKind::Backup {
+        return conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
+    }
+    if branch.status == BranchStatus::Deleting {
+        return conflict(ErrorCode::BranchNotReady, "branch is being deleted").into_response();
+    }
+    match state.metadata.set_branch_protected(branch.id, request.protected).await {
+        Ok(Some(updated)) => {
+            info!(
+                request_id = %principal.request_id,
+                branch_id = %branch.id,
+                protected = request.protected,
+                "branch protection changed"
+            );
+            Json(branch_view(&state, updated).await).into_response()
+        }
+        // The branch started deleting between the load and the update.
+        Ok(None) => conflict(ErrorCode::BranchNotReady, "branch is being deleted").into_response(),
+        Err(err) => {
+            error!("set branch protected: {err}");
+            ApiError::internal().into_response()
+        }
+    }
+}
+
+/// A Postgres database of a branch.
+#[derive(Debug, Serialize, ToSchema)]
+struct BranchDatabaseView {
+    name: String,
+    /// The Postgres role that owns it.
+    owner: String,
+    origin: DatabaseOrigin,
+    /// The branch's main database: the one the data API serves.
+    main: bool,
+}
+
+impl From<BranchDatabase> for BranchDatabaseView {
+    fn from(d: BranchDatabase) -> Self {
+        Self { main: d.origin == DatabaseOrigin::Main, name: d.name, owner: d.owner, origin: d.origin }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/databases/{id}/branches/{branch_id}/databases",
+    operation_id = "listBranchDatabases",
+    tag = "branches",
+    summary = "List a branch's Postgres databases",
+    description = "The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details.",
+    params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id")),
+    responses(
+        (status = 200, description = "The databases, main first", body = Vec<BranchDatabaseView>),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
+        (status = 409, description = "`backup_branch`: a restore backup has no compute", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+    ),
+)]
+async fn list_branch_databases<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath((id, branch_id)): ApiPath<(Uuid, Uuid)>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let record = match load_owned(&state, &principal, id).await {
+        Ok(record) => record,
+        Err(resp) => return resp.into_response(),
+    };
+    let branch = match load_branch(&state, &record, branch_id).await {
+        Ok(branch) => branch,
+        Err(resp) => return resp.into_response(),
+    };
+    if branch.kind == BranchKind::Backup {
+        return conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
+    }
+    match state.metadata.branch_databases(branch.id).await {
+        Ok(rows) => {
+            Json(rows.into_iter().map(BranchDatabaseView::from).collect::<Vec<_>>()).into_response()
+        }
+        Err(err) => {
+            error!("list branch databases: {err}");
+            ApiError::internal().into_response()
+        }
+    }
 }
 
 /// All optional; a missing one is left as it is. `history_window` is in seconds.

@@ -6,15 +6,20 @@ controller) and, from roadmap step 4, its compute image. Both come from
 
 ## Pull (default)
 
-`just deps-up` pulls `ghcr.io/cheladb/neon` and `ghcr.io/cheladb/compute-node-v17`, pinned
-by digest in `infra/compose/docker-compose.yml`. **The packages are private:** run
+`just deps-up` pulls `ghcr.io/cheladb/neon` and `ghcr.io/cheladb/neon-compute-v17` (the
+fork's dev compute image, `b2402faa2394-dev`), pinned by digest in
+`infra/compose/docker-compose.yml`. **The packages are private:** run
 `docker login ghcr.io` first (a token with `read:packages`).
+
+The compute runs Postgres 17.5. The worker's login-role check revokes `neon_superuser` once
+per grantor (`REVOKE … GRANTED BY <grantor>`), which needs Postgres 16 or later.
 
 ## Build from source
 
 `just neon-build` shallow-clones Neon at `NEON_REF` into `infra/neon/.cache/` and builds
 `cheladb/neon:<tag>` and `cheladb/compute-node-v17:<tag>` (`<tag>` = first 12 chars of
-`NEON_REF`). The first build needs about 40 GB of free disk and about 40 minutes. When
+`NEON_REF`). The dev tag format (e.g., `b2402faa2394-dev`) indicates a development-mode
+image published from the Neon fork. The first build needs about 40 GB of free disk and about 40 minutes. When
 those local images exist, `just deps-up` uses them instead of pulling.
 
 Reclaim the build cache afterwards with `docker builder prune -f --keep-storage 5GB`.

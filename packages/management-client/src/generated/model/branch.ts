@@ -29,6 +29,11 @@ export interface Branch {
   host: string | null;
   id: BranchId;
   kind: BranchKind;
+  /**
+     * A ready branch with no recorded main database: it was dropped in SQL. The data API is
+     * unavailable on the branch until a database of the main name exists again.
+     */
+  main_database_missing: boolean;
   name: string;
   parent_branch_id: BranchId | null;
   /**
@@ -36,5 +41,10 @@ export interface Branch {
      * @nullable
      */
   port: number | null;
+  /**
+     * A protected branch can't be deleted or reset to its parent (restore still works), and
+     * its database can't be deleted. Set with `updateBranch`.
+     */
+  protected: boolean;
   status: BranchStatus;
 }

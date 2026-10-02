@@ -150,7 +150,7 @@ pass "query cancel works through the proxy"
 # above: only the worker's /password_updated publish can make it refuse the old password.
 sql "$old" -c 'select 1' >/dev/null 2>"$tmp/err" || die "the old password stopped working before the reset: $(cat "$tmp/err")"
 status="$(api POST "/v1/databases/$db_id/reset-password")"
-[[ "$status" == 200 ]] || die "POST /reset-password: $status $(cat "$tmp/body")"
+[[ "$status" == 204 ]] || die "POST /reset-password: $status $(cat "$tmp/body")"
 status="$(api GET "/v1/databases/$db_id/connection")"
 [[ "$status" == 200 ]] || die "GET /connection after the reset: $status $(cat "$tmp/body")"
 new="$(jq -r '.password' "$tmp/body")"

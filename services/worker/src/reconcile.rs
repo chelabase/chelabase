@@ -13,12 +13,13 @@ use cheladb_types::{BranchId, DatabaseId};
 use reqwest::StatusCode;
 use tracing::{info, warn};
 
-use crate::Worker;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
+use crate::{COMPUTE_SETTINGS_VERSION, Worker};
 
 pub const STALE_PROVISION_SECS: i64 = 600;
 pub const STALE_DELETE_SECS: i64 = 60;
-/// How many ready branches each pass checks for the `cheladb` schema (one `admin_sql` each).
+/// How many ready branches each pass checks for the `cheladb` schema (one `admin_sql` each)
+/// and resyncs the login roles of.
 pub const SCHEMA_CHECKS_PER_PASS: usize = 20;
 
 /// One observation. Taken in the order computes, tenants, databases, endpoints: rows are
@@ -42,6 +43,9 @@ pub struct Snapshot {
     /// Branches whose data API needs its bootstrap: no public key or authenticator password
     /// (from the metadata), or no `cheladb.schema_version` (from this pass's checks).
     pub needs_data_api: HashSet<BranchId>,
+    /// Branches in this pass's health-check batch (ready, `normal`, with a compute): their
+    /// login roles are resynced.
+    pub resync: HashSet<BranchId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,11 +63,17 @@ pub enum Action {
     /// `(branch, endpoint)`: a ready `normal` branch's compute container is gone (main's
     /// included): start a new one.
     RecreateBranchCompute(BranchId, String),
+    /// `(branch, endpoint)`: a ready `normal` branch's compute was created with settings older
+    /// than [`COMPUTE_SETTINGS_VERSION`] (R11): remove it and create a new one.
+    UpgradeCompute(BranchId, String),
     /// A reset stored a new password but didn't apply it: reset steps 2–4.
     ApplyPending(String),
     /// A ready `normal` branch with its compute lacks its public key, its authenticator
     /// password or the `cheladb` schema: run the data API bootstrap.
     BootstrapDataApi { branch_id: BranchId },
+    /// `(branch, endpoint)` in this pass's health-check batch: resync its login roles (it
+    /// catches a DDL forward that was lost). A failure is logged, and retried at its next turn.
+    Resync(BranchId, String),
     /// A compute with no endpoint row.
     RemoveCompute(String),
     /// An endpoint row whose branch is failed or deleted: a teardown that failed.
@@ -93,15 +103,17 @@ impl Action {
             Action::RetryBranchDelete(_) => 3,
             Action::FinishSwitch(_) => 4,
             Action::RecreateBranchCompute(..) => 5,
-            Action::ApplyPending(_) => 6,
-            Action::BootstrapDataApi { .. } => 7,
-            Action::RemoveCompute(_) => 8,
-            Action::RetryTeardown(_) => 9,
-            Action::PatchHistoryWindow(_) => 10,
-            Action::ReportStuckRestore(_) => 11,
-            Action::ReportUnknownTenant(_) => 12,
-            Action::ReportUnknownTimeline(..) => 13,
-            Action::ReportEndpointWithoutDatabase(_) => 14,
+            Action::UpgradeCompute(..) => 6,
+            Action::ApplyPending(_) => 7,
+            Action::BootstrapDataApi { .. } => 8,
+            Action::Resync(..) => 9,
+            Action::RemoveCompute(_) => 10,
+            Action::RetryTeardown(_) => 11,
+            Action::PatchHistoryWindow(_) => 12,
+            Action::ReportStuckRestore(_) => 13,
+            Action::ReportUnknownTenant(_) => 14,
+            Action::ReportUnknownTimeline(..) => 15,
+            Action::ReportEndpointWithoutDatabase(_) => 16,
         }
     }
 
@@ -117,6 +129,8 @@ impl Action {
             | Action::BootstrapDataApi { branch_id: id } => id.to_string(),
             Action::ReportUnknownTimeline(tenant, timeline) => format!("{tenant}/{timeline}"),
             Action::RecreateBranchCompute(_, s)
+            | Action::UpgradeCompute(_, s)
+            | Action::Resync(_, s)
             | Action::ApplyPending(s)
             | Action::RemoveCompute(s)
             | Action::RetryTeardown(s)
@@ -152,6 +166,12 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
             _ => {}
         }
     }
+    // An endpoint missing from the list counts as current: only a known old one is upgraded.
+    let settings: HashMap<&str, i32> = s
+        .endpoints
+        .iter()
+        .map(|e| (e.id.as_str(), e.compute_settings_version))
+        .collect();
     let deleting: HashSet<DatabaseId> = s
         .databases
         .iter()
@@ -180,15 +200,28 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
             BranchStatus::Failed if b.pending_timeline_id.is_some() => {
                 actions.push(Action::ReportStuckRestore(b.id));
             }
-            // Backups have no compute. Recreating a compute runs the data API bootstrap too.
+            // Backups have no compute. Recreating a compute runs the data API bootstrap and
+            // the resync too.
             BranchStatus::Ready if b.kind == BranchKind::Normal => match &b.endpoint_id {
                 Some(ep) if !s.computes.contains(ep) => {
                     actions.push(Action::RecreateBranchCompute(b.id, ep.clone()));
                 }
-                Some(_) if s.needs_data_api.contains(&b.id) => {
-                    actions.push(Action::BootstrapDataApi { branch_id: b.id });
+                Some(ep)
+                    if settings
+                        .get(ep.as_str())
+                        .is_some_and(|v| *v < COMPUTE_SETTINGS_VERSION) =>
+                {
+                    actions.push(Action::UpgradeCompute(b.id, ep.clone()));
                 }
-                _ => {}
+                Some(ep) => {
+                    if s.needs_data_api.contains(&b.id) {
+                        actions.push(Action::BootstrapDataApi { branch_id: b.id });
+                    }
+                    if s.resync.contains(&b.id) {
+                        actions.push(Action::Resync(b.id, ep.clone()));
+                    }
+                }
+                None => {}
             },
             _ => {}
         }
@@ -279,6 +312,15 @@ pub fn schema_check_batch(
         .collect()
 }
 
+/// What one pass's round-robin batch found.
+#[derive(Debug, Default)]
+struct RoundRobin {
+    /// Branches whose data API machinery is broken.
+    missing_data_api: Vec<BranchId>,
+    /// Every branch of the batch: its login roles are resynced.
+    resync: HashSet<BranchId>,
+}
+
 /// A running provision must stop (and clean up) once a delete has begun.
 pub fn should_abort_provision(status: DatabaseStatus) -> bool {
     matches!(status, DatabaseStatus::Deleting | DatabaseStatus::Deleted)
@@ -353,7 +395,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .context("listing branches missing the data API")?
             .into_iter()
             .collect();
-        needs_data_api.extend(self.branches_without_cheladb(&branches, &computes).await);
+        let checked = self.round_robin_checks(&branches, &computes).await;
+        needs_data_api.extend(checked.missing_data_api);
         let tenants: HashSet<String> = tenants.iter().map(|t| t.as_str().to_string()).collect();
         // Only the tenants `plan` may patch: ready databases' tenants on the controller.
         let mut pitr = HashMap::new();
@@ -384,17 +427,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             tenant_timelines,
             pitr,
             needs_data_api,
+            resync: checked.resync,
         })
     }
 
     /// The next [`SCHEMA_CHECKS_PER_PASS`] ready `normal` branches with a compute (by id, after
     /// the last pass's), checked for the data API's machinery ([`Worker::data_api_healthy`]);
-    /// those where it's broken. A failed check is logged and skipped.
-    async fn branches_without_cheladb(
+    /// each is also planned a login-role resync. A failed check is logged and skipped.
+    async fn round_robin_checks(
         &self,
         branches: &[LiveBranch],
         computes: &HashSet<String>,
-    ) -> Vec<BranchId> {
+    ) -> RoundRobin {
         let mut ready: Vec<(BranchId, &str)> = branches
             .iter()
             .filter(|b| b.status == BranchStatus::Ready && b.kind == BranchKind::Normal)
@@ -416,20 +460,21 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
             batch
         };
-        let mut missing = Vec::new();
+        let mut checked = RoundRobin::default();
         for id in batch {
             let Some((_, ep)) = ready.iter().find(|(b, _)| *b == id) else {
                 continue;
             };
             match self.data_api_healthy(ep).await {
                 Ok(true) => {}
-                Ok(false) => missing.push(id),
+                Ok(false) => checked.missing_data_api.push(id),
                 Err(err) => {
                     warn!(branch_id = %id, endpoint_id = %ep, "checking the data API's machinery: {err:#}");
                 }
             }
+            checked.resync.insert(id);
         }
-        missing
+        checked
     }
 
     async fn execute(&self, action: &Action) -> Result<(), String> {
@@ -460,7 +505,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Action::RetryBranchDelete(id) => self.handle_branch_delete(*id).await,
             Action::FinishSwitch(id) => self.finish_switch(*id).await,
             Action::RecreateBranchCompute(id, ep) => self.recreate_compute(*id, ep).await,
+            // Serial like the re-creation above. A failure after the removal leaves no
+            // container: the next pass plans `RecreateBranchCompute`.
+            Action::UpgradeCompute(id, ep) => {
+                info!(branch_id = %id, endpoint_id = %ep, "re-creating a compute with old settings");
+                self.computes
+                    .delete(ep)
+                    .await
+                    .map_err(|e| format!("removing compute: {e:#}"))?;
+                self.recreate_compute(*id, ep).await
+            }
             Action::BootstrapDataApi { branch_id } => self.reconcile_data_api(*branch_id).await,
+            Action::Resync(id, _) => self.resync(*id).await,
             // After a RecreateBranchCompute in the same pass, the push can reach the new container
             // before compute_ctl listens and fail. That heals itself: the flag stays set, the
             // next pass retries, and meanwhile the new compute boots with the current spec.
@@ -614,6 +670,7 @@ mod tests {
             branch_id: db.map(|d| BranchId::from(d.id)),
             branch_status: db.map(|d| BranchStatus::from(d.status)),
             needs_reconfigure,
+            compute_settings_version: crate::COMPUTE_SETTINGS_VERSION,
         }
     }
 
@@ -669,6 +726,7 @@ mod tests {
             branch_id: Some(dev.id),
             branch_status: Some(status),
             needs_reconfigure: false,
+            compute_settings_version: crate::COMPUTE_SETTINGS_VERSION,
         });
         s.computes.insert(EP3.to_string());
         timelines(&mut s).insert(DEV_TL.to_string());
@@ -948,6 +1006,105 @@ mod tests {
     }
 
     #[test]
+    fn resync_follows_the_data_api_bootstrap() {
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        let main = s.branches[0].id;
+        s.resync.insert(dev);
+        assert_eq!(plan(&s), [Action::Resync(dev, EP3.to_string())]);
+        s.needs_data_api.insert(dev);
+        s.needs_data_api.insert(main);
+        s.computes.insert("ep-orphan".to_string());
+        let planned = plan(&s);
+        let resync = planned
+            .iter()
+            .position(|a| *a == Action::Resync(dev, EP3.to_string()))
+            .unwrap();
+        assert_eq!(resync, 2, "{planned:?}");
+        assert!(
+            matches!(planned[3], Action::RemoveCompute(_)),
+            "{planned:?}"
+        );
+        // Recreating the compute runs the resync itself.
+        s.computes.remove(EP3);
+        assert!(!plan(&s).iter().any(|a| matches!(a, Action::Resync(..))));
+        // Only ready branches.
+        for status in [BranchStatus::Resetting, BranchStatus::Failed] {
+            let (mut s, dev) = with_dev(status, 0);
+            s.resync.insert(dev);
+            assert!(
+                !plan(&s).iter().any(|a| matches!(a, Action::Resync(..))),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn computes_with_old_settings_are_upgraded() {
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        s.endpoints[1].compute_settings_version = crate::COMPUTE_SETTINGS_VERSION - 1;
+        assert_eq!(plan(&s), [Action::UpgradeCompute(dev, EP3.to_string())]);
+        // The re-creation covers the bootstrap and the resync; it runs after a missing
+        // compute's, before the rest.
+        s.needs_data_api.insert(dev);
+        s.resync.insert(dev);
+        let main = s.branches[0].id;
+        s.branches[0].endpoint_id = Some(EP2.to_string());
+        s.endpoints.push(EndpointState {
+            id: EP2.to_string(),
+            tenant_id: TENANT.to_string(),
+            branch_id: Some(main),
+            branch_status: Some(BranchStatus::Ready),
+            needs_reconfigure: true,
+            compute_settings_version: crate::COMPUTE_SETTINGS_VERSION,
+        });
+        s.computes.remove(EP);
+        let planned = plan(&s);
+        assert_eq!(
+            planned[..3],
+            [
+                Action::RecreateBranchCompute(main, EP2.to_string()),
+                Action::UpgradeCompute(dev, EP3.to_string()),
+                Action::ApplyPending(EP2.to_string()),
+            ],
+            "{planned:?}"
+        );
+        assert!(
+            !planned
+                .iter()
+                .any(|a| matches!(a, Action::Resync(..) | Action::BootstrapDataApi { .. })),
+            "{planned:?}"
+        );
+        // A missing compute is re-created instead.
+        s.computes.remove(EP3);
+        let planned = plan(&s);
+        assert!(planned.contains(&Action::RecreateBranchCompute(dev, EP3.to_string())));
+        assert!(
+            !planned
+                .iter()
+                .any(|a| matches!(a, Action::UpgradeCompute(..)))
+        );
+        // Only ready normal branches.
+        for status in [BranchStatus::Resetting, BranchStatus::Failed] {
+            let (mut s, _) = with_dev(status, 0);
+            s.endpoints[1].compute_settings_version = 0;
+            assert!(
+                !plan(&s)
+                    .iter()
+                    .any(|a| matches!(a, Action::UpgradeCompute(..))),
+                "{status:?}"
+            );
+        }
+        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        s.endpoints[1].compute_settings_version = 0;
+        s.branches[1].kind = BranchKind::Backup;
+        assert!(
+            !plan(&s)
+                .iter()
+                .any(|a| matches!(a, Action::UpgradeCompute(..)))
+        );
+    }
+
+    #[test]
     fn the_schema_check_takes_a_few_branches_round_robin() {
         let mut ids: Vec<BranchId> = (0..25).map(|_| BranchId::new()).collect();
         ids.sort_by_key(|b| b.as_uuid());
@@ -1202,6 +1359,140 @@ mod tests {
             &format!("compute.sql {ep} app SELECT to_regclass"),
         );
         assert!(checked < pos(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp;")));
+    }
+
+    #[tokio::test]
+    async fn reconcile_plans_resync_in_the_health_batch() {
+        const CATALOG_READ: &str = "SET search_path = pg_catalog, pg_temp;";
+        let (w, journal) = worker();
+        let (a_db, a_ep) = provision(&w, &journal).await;
+        let (_b_db, b_ep) = provision(&w, &journal).await;
+        assert_eq!(
+            w.create_role(BranchId::from(a_db), "app", false).await,
+            crate::roles::RoleOutcome::Ok
+        );
+        w.computes
+            .answer("to_regclass('cheladb.schema_version')", "t\n");
+        journal.lock().unwrap().clear();
+        w.computes.sql.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        // Every branch of the batch with a compute, under its lock, through the system
+        // database; the API role missing from the (empty) catalog is re-created.
+        for ep in [&a_ep, &b_ep] {
+            let read = pos(
+                &journal,
+                &format!("compute.sql {ep} postgres {CATALOG_READ}"),
+            );
+            assert!(pos(&journal, "metadata.lock_endpoint") < read);
+        }
+        assert!(
+            w.computes
+                .sql
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(ep, _, s)| *ep == a_ep && s.contains("CREATE ROLE \"app\"")),
+        );
+
+        // A failure is logged; the pass goes on, and the next pass tries again.
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("SELECT 'r',".into(), "connection reset".into()));
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        for ep in [&a_ep, &b_ep] {
+            assert!(
+                position(
+                    &journal,
+                    &format!("compute.sql {ep} postgres {CATALOG_READ}")
+                )
+                .is_some()
+            );
+        }
+        *w.computes.fail_sql_containing.lock().unwrap() = None;
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        assert!(position(&journal, "metadata.apply_resync").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_resync_after_an_upgrade_is_retried_without_another_upgrade() {
+        let (w, journal) = worker();
+        let (_id, ep) = provision(&w, &journal).await;
+        w.computes
+            .answer("to_regclass('cheladb.schema_version')", "t\n");
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&ep)
+            .unwrap()
+            .compute_settings_version = 0;
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("SELECT 'r',".into(), "connection reset".into()));
+
+        w.reconcile_once().await.unwrap();
+
+        // Re-created once; the resync failed, but the version is recorded.
+        assert!(position(&journal, &format!("compute.create {ep}")).is_some());
+        assert_eq!(
+            w.metadata.state().endpoints[&ep].compute_settings_version,
+            crate::COMPUTE_SETTINGS_VERSION
+        );
+
+        // The next pass plans a plain resync, never another delete.
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        assert!(
+            position(&journal, "compute.delete").is_none(),
+            "{:?}",
+            entries(&journal)
+        );
+        assert!(position(&journal, "compute.create").is_none());
+        let read = pos(
+            &journal,
+            &format!("compute.sql {ep} postgres SET search_path = pg_catalog, pg_temp;"),
+        );
+        assert!(pos(&journal, "metadata.lock_endpoint") < read);
+    }
+
+    #[tokio::test]
+    async fn reconcile_upgrades_old_computes_once() {
+        let (w, journal) = worker();
+        let (_id, ep) = provision(&w, &journal).await;
+        w.computes
+            .answer("to_regclass('cheladb.schema_version')", "t\n");
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&ep)
+            .unwrap()
+            .compute_settings_version = 0;
+
+        w.reconcile_once().await.unwrap();
+
+        let order = [
+            pos(&journal, &format!("compute.delete {ep}")),
+            pos(&journal, "metadata.replace_compute_token"),
+            pos(&journal, &format!("compute.create {ep}")),
+            pos(&journal, "metadata.set_compute_settings_version"),
+            pos(&journal, "metadata.apply_resync"),
+        ];
+        assert!(order.is_sorted(), "{:?}", entries(&journal));
+        assert!(w.computes.list().await.unwrap().contains(&ep));
+        assert_eq!(
+            w.metadata.state().endpoints[&ep].compute_settings_version,
+            crate::COMPUTE_SETTINGS_VERSION
+        );
+
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        assert!(
+            position(&journal, "compute.delete").is_none(),
+            "{:?}",
+            entries(&journal)
+        );
+        assert!(position(&journal, "compute.create").is_none());
     }
 
     #[tokio::test]

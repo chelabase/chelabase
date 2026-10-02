@@ -39,6 +39,13 @@ pub enum ErrorCode {
     InvalidCode,
     WeakPassword,
     SignInExpired,
+    InvalidRoleName,
+    ReservedRoleName,
+    RoleExists,
+    RoleCapReached,
+    RoleInUse,
+    RolePrivilegeMismatch,
+    BranchProtected,
 }
 
 impl ErrorCode {
@@ -74,6 +81,13 @@ impl ErrorCode {
             Self::InvalidCode => "invalid_code",
             Self::WeakPassword => "weak_password",
             Self::SignInExpired => "sign_in_expired",
+            Self::InvalidRoleName => "invalid_role_name",
+            Self::ReservedRoleName => "reserved_role_name",
+            Self::RoleExists => "role_exists",
+            Self::RoleCapReached => "role_cap_reached",
+            Self::RoleInUse => "role_in_use",
+            Self::RolePrivilegeMismatch => "role_privilege_mismatch",
+            Self::BranchProtected => "branch_protected",
         }
     }
 }
@@ -176,7 +190,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 30] = [
+    const ALL: [(ErrorCode, &str); 37] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -207,6 +221,13 @@ mod tests {
         (ErrorCode::InvalidCode, "invalid_code"),
         (ErrorCode::WeakPassword, "weak_password"),
         (ErrorCode::SignInExpired, "sign_in_expired"),
+        (ErrorCode::InvalidRoleName, "invalid_role_name"),
+        (ErrorCode::ReservedRoleName, "reserved_role_name"),
+        (ErrorCode::RoleExists, "role_exists"),
+        (ErrorCode::RoleCapReached, "role_cap_reached"),
+        (ErrorCode::RoleInUse, "role_in_use"),
+        (ErrorCode::RolePrivilegeMismatch, "role_privilege_mismatch"),
+        (ErrorCode::BranchProtected, "branch_protected"),
     ];
 
     #[test]
@@ -217,6 +238,12 @@ mod tests {
             let back: ErrorCode = serde_json::from_value(serde_json::json!(name)).unwrap();
             assert_eq!(back, code);
         }
+    }
+
+    #[test]
+    fn branch_protected_is_a_409() {
+        let e = ApiError::new(409, ErrorCode::BranchProtected, "protected");
+        assert_eq!((e.status, e.code.as_str()), (409, "branch_protected"));
     }
 
     #[test]
