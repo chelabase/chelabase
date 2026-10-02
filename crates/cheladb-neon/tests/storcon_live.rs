@@ -10,7 +10,8 @@
 use cheladb_neon::{NeonId, StorconClient};
 
 fn client() -> StorconClient {
-    let url = std::env::var("CHELADB_STORCON_URL")
+    let url = std::env::var("STORCON_URL")
+        .or_else(|_| std::env::var("CHELADB_STORCON_URL"))
         .unwrap_or_else(|_| "http://127.0.0.1:1234".to_string());
     StorconClient::new(&url, 0)
 }
@@ -40,11 +41,9 @@ async fn round_trip(client: StorconClient, tenant: NeonId) {
     client.create_tenant(&tenant).await.unwrap();
     let described = client.describe_tenant(&tenant).await.unwrap();
     assert!(!described.shards.is_empty());
+    // No worktree slot knows a throwaway tenant, so its compute notification stays pending (the
+    // hook answers 404, which the storage controller expects during a create).
     for shard in &described.shards {
-        assert!(
-            !shard.is_pending_compute_notification,
-            "compute notification pending (is storcon-hook answering?): {shard:?}"
-        );
         assert_eq!(shard.last_error, "", "{shard:?}");
     }
 

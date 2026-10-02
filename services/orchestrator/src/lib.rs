@@ -41,10 +41,55 @@ mod openapi;
 mod roles;
 pub use openapi::openapi;
 
-/// Port the Neon proxy serves the Postgres protocol on.
+/// Port the Neon proxy serves the Postgres protocol on (slot 0's; `CHELADB_PROXY_PG_PORT`).
 pub const PROXY_PG_PORT: u16 = 4432;
-/// Port the Neon proxy serves SQL-over-HTTP on.
+/// Port the Neon proxy serves SQL-over-HTTP on (slot 0's; `CHELADB_PROXY_HTTP_PORT`).
 pub const PROXY_HTTP_PORT: u16 = 4444;
+
+/// Where clients reach the Neon proxy: `<ep>.<domain>` on these ports. In local dev each
+/// worktree slot's proxy publishes its own ports (4432/4444 + 100 × slot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyAddress {
+    pub domain: String,
+    pub pg_port: u16,
+    pub http_port: u16,
+}
+
+impl ProxyAddress {
+    /// `domain` on the default ports.
+    pub fn local(domain: &str) -> Self {
+        Self {
+            domain: domain.to_string(),
+            pg_port: PROXY_PG_PORT,
+            http_port: PROXY_HTTP_PORT,
+        }
+    }
+
+    /// `CHELADB_PROXY_DOMAIN` (default `localtest.me`), `CHELADB_PROXY_PG_PORT` and
+    /// `CHELADB_PROXY_HTTP_PORT` (defaults 4432 and 4444). Blank values count as unset.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let value = |name: &str| {
+            get(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let port = |name: &str, default: u16| -> anyhow::Result<u16> {
+            match value(name) {
+                None => Ok(default),
+                Some(v) => v
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| anyhow::anyhow!("{name}={v:?} is not a port (1-65535)")),
+            }
+        };
+        Ok(Self {
+            domain: value("CHELADB_PROXY_DOMAIN").unwrap_or_else(|| "localtest.me".to_string()),
+            pg_port: port("CHELADB_PROXY_PG_PORT", PROXY_PG_PORT)?,
+            http_port: port("CHELADB_PROXY_HTTP_PORT", PROXY_HTTP_PORT)?,
+        })
+    }
+}
 
 /// The proxy's host name for an endpoint.
 fn proxy_host(endpoint_id: &str, domain: &str) -> String {
@@ -578,8 +623,8 @@ pub struct AppState<M, J> {
     pub identity: InternalVerifier,
     /// Decrypts stored database credentials for reveal.
     pub secrets: SecretKey,
-    /// Domain the Neon proxy serves endpoints under: `<ep>.<proxy_domain>`.
-    pub proxy_domain: String,
+    /// Where clients reach the Neon proxy: `<ep>.<domain>` on its ports.
+    pub proxy: ProxyAddress,
     /// The REST service's internal listener (the data API's schema).
     pub rest: RestInternal,
     /// Self-hosted mode reveals the dev CA's path next to the connection details.
@@ -758,11 +803,11 @@ struct Database {
 fn proxy_address(
     status: DatabaseStatus,
     endpoint_id: Option<&str>,
-    proxy_domain: &str,
+    proxy: &ProxyAddress,
 ) -> Option<(String, u16)> {
     match endpoint_id {
         Some(ep) if status == DatabaseStatus::Ready => {
-            Some((proxy_host(ep, proxy_domain), PROXY_PG_PORT))
+            Some((proxy_host(ep, &proxy.domain), proxy.pg_port))
         }
         _ => None,
     }
@@ -791,9 +836,9 @@ impl Database {
         r: DatabaseRecord,
         main: Option<&BranchRecord>,
         branch_count: i64,
-        proxy_domain: &str,
+        proxy: &ProxyAddress,
     ) -> Self {
-        let (host, port) = proxy_address(r.status, main_endpoint(main), proxy_domain).unzip();
+        let (host, port) = proxy_address(r.status, main_endpoint(main), proxy).unzip();
         Self {
             database_id: r.database_id,
             project_id: r.project_id,
@@ -860,7 +905,7 @@ impl Tenant {
     fn new(
         t: TenantOverview,
         mains: &HashMap<DatabaseId, (BranchRecord, i64)>,
-        proxy_domain: &str,
+        proxy: &ProxyAddress,
     ) -> Self {
         Self {
             id: t.id,
@@ -868,7 +913,7 @@ impl Tenant {
             projects: t
                 .projects
                 .into_iter()
-                .map(|p| Project::new(p, mains, proxy_domain))
+                .map(|p| Project::new(p, mains, proxy))
                 .collect(),
         }
     }
@@ -878,7 +923,7 @@ impl Project {
     fn new(
         p: ProjectOverview,
         mains: &HashMap<DatabaseId, (BranchRecord, i64)>,
-        proxy_domain: &str,
+        proxy: &ProxyAddress,
     ) -> Self {
         Self {
             id: p.id,
@@ -889,8 +934,7 @@ impl Project {
                 .map(|d| {
                     let main = mains.get(&d.database_id);
                     let (host, port) =
-                        proxy_address(d.status, main_endpoint(main.map(|m| &m.0)), proxy_domain)
-                            .unzip();
+                        proxy_address(d.status, main_endpoint(main.map(|m| &m.0)), proxy).unzip();
                     DatabaseSummary {
                         database_id: d.database_id,
                         name: d.name,
@@ -966,7 +1010,7 @@ where
         Ok(Some(tenant_id)) => match state.metadata.tenant_overview(tenant_id).await {
             Ok(None) => None,
             Ok(Some(overview)) => match main_branches(&state.metadata, overview.id).await {
-                Ok(mains) => Some(Tenant::new(overview, &mains, &state.proxy_domain)),
+                Ok(mains) => Some(Tenant::new(overview, &mains, &state.proxy)),
                 Err(err) => {
                     error!("main branches: {err}");
                     return ApiError::internal().into_response();
@@ -1136,7 +1180,7 @@ where
             let main = branches.iter().find(|b| b.id == BranchId::from(database_id));
             (
                 StatusCode::OK,
-                Json(Database::new(record, main, count, &state.proxy_domain)),
+                Json(Database::new(record, main, count, &state.proxy)),
             )
                 .into_response()
         }
@@ -1426,8 +1470,8 @@ where
         role = %user,
         "revealed connection details"
     );
-    let host = proxy_host(&endpoint_id, &state.proxy_domain);
-    let port = PROXY_PG_PORT;
+    let host = proxy_host(&endpoint_id, &state.proxy.domain);
+    let port = state.proxy.pg_port;
     let userinfo = match &password {
         Some(password) => format!("{}:{}", uri_component(&user), uri_component(password)),
         None => uri_component(&user),
@@ -1436,7 +1480,7 @@ where
         "postgresql://{userinfo}@{host}:{port}/{}?sslmode=verify-full",
         uri_component(&database)
     );
-    let http_url = format!("https://{host}:{PROXY_HTTP_PORT}/sql");
+    let http_url = format!("https://{host}:{}/sql", state.proxy.http_port);
     (
         [(CACHE_CONTROL, "no-store")],
         Json(ConnectionDetails {
@@ -1653,5 +1697,56 @@ fn map_metadata_error(err: MetadataError) -> Response {
             error!("metadata error: {other}");
             ApiError::internal().into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_address_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn the_proxy_defaults_to_slot_0s_ports() {
+        let p = ProxyAddress::from_lookup(lookup(&[])).unwrap();
+        assert_eq!(p, ProxyAddress::local("localtest.me"));
+        assert_eq!((p.pg_port, p.http_port), (4432, 4444));
+        assert_eq!(p.domain, "localtest.me");
+    }
+
+    // A worktree slot's proxy publishes 4432 + 100N and 4444 + 100N (`just` sets both).
+    #[test]
+    fn the_proxy_ports_follow_the_slot() {
+        let p = ProxyAddress::from_lookup(lookup(&[
+            ("CHELADB_PROXY_PG_PORT", "4532"),
+            ("CHELADB_PROXY_HTTP_PORT", "4544"),
+            ("CHELADB_PROXY_DOMAIN", "example.test"),
+        ]))
+        .unwrap();
+        assert_eq!((p.pg_port, p.http_port), (4532, 4544));
+        assert_eq!(p.domain, "example.test");
+        assert_eq!(
+            proxy_address(DatabaseStatus::Ready, Some("ep-1"), &p),
+            Some(("ep-1.example.test".to_string(), 4532))
+        );
+    }
+
+    #[test]
+    fn a_proxy_port_that_isnt_a_port_is_refused() {
+        for bad in ["x", "0", "70000"] {
+            let err = ProxyAddress::from_lookup(lookup(&[("CHELADB_PROXY_PG_PORT", bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("CHELADB_PROXY_PG_PORT"), "{bad}: {err}");
+        }
+        let blank = ProxyAddress::from_lookup(lookup(&[("CHELADB_PROXY_HTTP_PORT", " ")]));
+        assert_eq!(blank.unwrap().http_port, 4444);
     }
 }

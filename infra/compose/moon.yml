@@ -1,35 +1,23 @@
 language: "bash"
 
+# The lifecycle lives in the justfile: it loads the worktree's slot first (ports, project, and
+# CHELADB_SHARED_DIR so the shared tier's mounts name the same paths from every worktree).
 tasks:
   up:
-    command: "docker"
-    args:
-      - "compose"
-      - "-f"
-      - "docker-compose.yml"
-      - "--env-file"
-      - ".env.example"
-      - "up"
-      - "-d"
+    command: "just"
+    args: ["deps-up"]
     options:
       cache: false
+      runFromWorkspaceRoot: true
   down:
-    command: "docker"
-    args:
-      - "compose"
-      - "-f"
-      - "docker-compose.yml"
-      - "--profile"
-      - "neon"
-      - "down"
+    command: "just"
+    args: ["deps-down"]
     options:
       cache: false
+      runFromWorkspaceRoot: true
   ps:
-    command: "docker"
-    args:
-      - "compose"
-      - "-f"
-      - "docker-compose.yml"
-      - "ps"
+    command: "just"
+    args: ["deps-ps"]
     options:
       cache: false
+      runFromWorkspaceRoot: true

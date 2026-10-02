@@ -4,7 +4,9 @@
 //! cargo test -p cheladb-metadata --test live_db -- --ignored --test-threads=1
 //! ```
 //!
-//! They use the seeded demo tenant/project and delete the rows they create.
+//! They use the seeded demo tenant/project and delete the rows they create. Every run names its
+//! databases `live-test-<run id>-<id>` and sweeps only those, so runs can overlap. Rows a crashed
+//! run leaves survive for up to an hour (`STALE_AFTER`); `just sweep-dbs` is the manual remedy.
 
 use cheladb_metadata::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseSettings, DatabaseStatus,
@@ -28,21 +30,39 @@ async fn client() -> MetadataClient {
     client
 }
 
-/// Deletes the databases these tests made (with their branches and endpoints): a test that
+/// This process's run id: every database a test makes is named `live-test-<run>-<id>`, so
+/// concurrent runs (two terminals, two worktrees) never see or delete each other's rows.
+fn run_id() -> &'static str {
+    static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| hex32()[..8].to_string())
+}
+
+/// Rows older than this are swept whoever made them (a run that died). It must exceed the longest
+/// live run, or a long run's databases could be swept from under it.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Deletes the databases this run made (with their branches and endpoints): a test that
 /// panics skips its cleanup, and the fake sealed values it leaves make the key check refuse the
-/// dev stack's key. Only the harness's own: in the demo project, named `live-test-<its own id>`
-/// as [`insert_pending`] names them, so a database made by hand survives. Safe because the
-/// tests run one at a time (`--test-threads=1`). One transaction, in the lock order: the
+/// dev stack's key. Only this run's own (in the demo project, named `live-test-<run>-<its own
+/// id>` as [`insert_pending`] names them) plus the harness's own rows older than [`STALE_AFTER`]
+/// (`live-test-<8 hex>-<id>`, or the older `live-test-<id>`; left by runs that died); a database made by hand
+/// survives, and so does every other live run's. One transaction, in the lock order: the
 /// database rows, then their branch rows, then endpoints.
 async fn sweep_leftovers(client: &MetadataClient) {
     let mut tx = client.pool().begin().await.unwrap();
     // FOR UPDATE, not the usual FOR NO KEY UPDATE: the rows are deleted below anyway.
     let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
         "SELECT id FROM databases
-         WHERE project_id = $1 AND name = 'live-test-' || id::text
+         WHERE project_id = $1
+           AND (name = 'live-test-' || $2 || '-' || id::text
+                OR (created_at < now() - make_interval(secs => $3)
+                    AND (name = 'live-test-' || id::text
+                         OR name ~ ('^live-test-[0-9a-f]{8}-' || id::text || '$'))))
          ORDER BY id FOR UPDATE",
     )
     .bind(DEMO_PROJECT_ID)
+    .bind(run_id())
+    .bind(STALE_AFTER.as_secs_f64())
     .fetch_all(&mut *tx)
     .await
     .unwrap();
@@ -80,7 +100,7 @@ async fn insert_pending(client: &MetadataClient) -> DatabaseId {
             id,
             TenantId(DEMO_TENANT_ID),
             ProjectId(DEMO_PROJECT_ID),
-            &format!("live-test-{id}"),
+            &format!("live-test-{}-{id}", run_id()),
         )
         .await
         .unwrap();
@@ -188,6 +208,7 @@ async fn main_branch(client: &MetadataClient, id: DatabaseId) -> BranchRecord {
 #[tokio::test]
 #[ignore]
 async fn provisioning_writes_never_resurrect_a_tombstone() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let id = insert_pending(&client).await;
     assert!(begin_delete(&client, id).await);
@@ -213,6 +234,7 @@ async fn provisioning_writes_never_resurrect_a_tombstone() {
 #[tokio::test]
 #[ignore]
 async fn provisioning_writes_still_apply_while_deleting_has_not_started() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let id = insert_pending(&client).await;
 
@@ -289,6 +311,32 @@ async fn fail_if_stale_only_fails_rows_that_are_still_stale() {
     assert_eq!(mains[0].error.as_deref(), Some("provisioning timed out"));
 }
 
+/// Advisory lock id shared by the key-check tests (exclusive) and every test that stores a
+/// sealed owner password (shared): the key check counts all sealed branches, so the two kinds
+/// must not overlap, in this run or another.
+const KEY_CHECK_LOCK: i64 = 7_310_001;
+
+/// Opens a connection that holds the advisory lock for as long as it lives (closed on drop).
+async fn advisory_lock(statement: &'static str) -> sqlx::PgConnection {
+    use sqlx::Connection;
+    let database_url = std::env::var("CHELADB_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".to_string()
+    });
+    let mut conn = sqlx::PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query(statement).bind(KEY_CHECK_LOCK).execute(&mut conn).await.unwrap();
+    conn
+}
+
+/// Exclusive: the key-check tests rewrite one global row and count every sealed branch.
+async fn key_check_lock() -> sqlx::PgConnection {
+    advisory_lock("SELECT pg_advisory_lock($1)").await
+}
+
+/// Shared: tests that store sealed credentials may overlap each other, not a key-check test.
+async fn sealed_lock() -> sqlx::PgConnection {
+    advisory_lock("SELECT pg_advisory_lock_shared($1)").await
+}
+
 /// The environment's real key-check value, restored after a key-check test so
 /// running these tests never locks the local services out.
 async fn saved_key_check(client: &MetadataClient) -> Option<String> {
@@ -318,6 +366,7 @@ async fn restore_key_check(client: &MetadataClient, saved: Option<String>) {
 async fn key_check_records_matches_and_refuses_a_different_key_while_credentials_exist() {
     use cheladb_metadata::KeyCheck;
     let client = client().await;
+    let _lock = key_check_lock().await;
     let saved = saved_key_check(&client).await;
     sqlx::query("DELETE FROM control_settings WHERE key = 'secrets_key_check'")
         .execute(client.pool())
@@ -348,6 +397,7 @@ async fn key_check_records_matches_and_refuses_a_different_key_while_credentials
 async fn key_check_adopts_a_new_key_when_nothing_is_encrypted_yet() {
     use cheladb_metadata::KeyCheck;
     let client = client().await;
+    let _lock = key_check_lock().await;
     let sealed: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM branches WHERE owner_password_enc IS NOT NULL",
     )
@@ -372,6 +422,7 @@ async fn key_check_adopts_a_new_key_when_nothing_is_encrypted_yet() {
 #[tokio::test]
 #[ignore]
 async fn replace_owner_secret_is_atomic_and_needs_ready() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let verifier = |ep: &str| {
         let ep = ep.to_string();
@@ -452,6 +503,7 @@ async fn replace_owner_secret_is_atomic_and_needs_ready() {
 #[tokio::test]
 #[ignore]
 async fn replace_owner_secret_refuses_a_backup() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let backup = BranchId::new();
@@ -634,6 +686,7 @@ async fn create_endpoint_links_and_refuses_a_deleting_database() {
 #[tokio::test]
 #[ignore]
 async fn delete_endpoint_cascades_and_unlinks() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
 
@@ -656,6 +709,7 @@ async fn delete_endpoint_cascades_and_unlinks() {
 #[tokio::test]
 #[ignore]
 async fn list_endpoints_for_reconcile_joins_status() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (linked, ep_linked) = ready_database(&client).await;
     let orphan = ep_id();
@@ -775,6 +829,7 @@ fn names(branches: &[BranchRecord]) -> Vec<&str> {
 #[tokio::test]
 #[ignore]
 async fn create_branch_enforces_the_cap_under_a_race() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     for round in 0..5 {
         let (id, _ep) = ready_database(&client).await;
@@ -797,6 +852,7 @@ async fn create_branch_enforces_the_cap_under_a_race() {
 #[tokio::test]
 #[ignore]
 async fn create_branch_refuses_taken_names_and_unready_parents() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let (other, _ep) = ready_database(&client).await;
@@ -857,6 +913,7 @@ async fn create_branch_refuses_taken_names_and_unready_parents() {
 #[tokio::test]
 #[ignore]
 async fn backups_do_not_count_as_children_or_toward_the_cap() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     assert!(client.update_database_settings(id, &SettingsPatch { max_branches: Some(2), ..Default::default() }).await.unwrap());
@@ -888,6 +945,7 @@ async fn backups_do_not_count_as_children_or_toward_the_cap() {
 #[tokio::test]
 #[ignore]
 async fn switch_to_pending_timeline_moves_endpoint_and_records_superseded() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let main = main_of(id);
@@ -940,6 +998,7 @@ async fn switch_to_pending_timeline_moves_endpoint_and_records_superseded() {
 #[tokio::test]
 #[ignore]
 async fn switch_to_restored_timeline_inserts_the_backup_atomically() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let main = main_of(id);
@@ -999,6 +1058,7 @@ async fn switch_to_restored_timeline_inserts_the_backup_atomically() {
 #[tokio::test]
 #[ignore]
 async fn a_switch_expecting_another_pending_timeline_changes_nothing() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let main = main_of(id);
@@ -1033,6 +1093,7 @@ async fn a_switch_expecting_another_pending_timeline_changes_nothing() {
 #[tokio::test]
 #[ignore]
 async fn begin_branch_delete_refuses_a_protected_branch() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -1050,6 +1111,7 @@ async fn begin_branch_delete_refuses_a_protected_branch() {
 #[tokio::test]
 #[ignore]
 async fn begin_branch_delete_takes_backups_along() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -1097,6 +1159,7 @@ async fn begin_branch_delete_takes_backups_along() {
 #[tokio::test]
 #[ignore]
 async fn set_branch_status_never_leaves_deleting() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = new_branch(id, "dev", main_of(id));
@@ -1159,6 +1222,7 @@ async fn set_branch_status_never_leaves_deleting() {
 #[tokio::test]
 #[ignore]
 async fn main_set_ready_sets_the_database_ready_too() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let id = insert_pending(&client).await;
     let pending_main = main_branch(&client, id).await;
@@ -1206,6 +1270,7 @@ async fn main_set_ready_sets_the_database_ready_too() {
 #[tokio::test]
 #[ignore]
 async fn begin_delete_takes_every_branch_along() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -1262,6 +1327,7 @@ async fn database_settings_and_neon_tenant_round_trip() {
 #[tokio::test]
 #[ignore]
 async fn list_live_branches_for_reconcile_skips_deleted_branches() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -1344,6 +1410,7 @@ where
 #[tokio::test]
 #[ignore]
 async fn begin_delete_racing_main_set_ready_never_deadlocks() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     // Deterministic: the delete holds the database row while set_branch_ready starts.
     let id = insert_pending(&client).await;
@@ -1413,6 +1480,7 @@ async fn begin_delete_racing_main_endpoint_never_deadlocks() {
 #[tokio::test]
 #[ignore]
 async fn create_branch_racing_a_restore_of_its_parent_never_deadlocks() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let backup = BranchId::new();
@@ -1450,6 +1518,7 @@ async fn create_branch_racing_a_restore_of_its_parent_never_deadlocks() {
 #[tokio::test]
 #[ignore]
 async fn database_writes_mirror_only_onto_a_provisioning_main() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     assert!(client
@@ -1711,6 +1780,7 @@ async fn migration_backfills_main_for_live_databases_only() {
 #[tokio::test]
 #[ignore]
 async fn main_branches_with_counts_covers_a_tenants_databases() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -1772,6 +1842,7 @@ async fn branch_with_backup(client: &MetadataClient) -> (DatabaseId, BranchId, B
 #[tokio::test]
 #[ignore]
 async fn begin_branch_delete_racing_begin_delete_never_deadlocks() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     // Deterministic: begin_delete's statements by hand. Its UPDATE of the branches has locked
     // the backup (reached first in its scan) when begin_branch_delete starts, then goes on to
@@ -1841,6 +1912,7 @@ async fn begin_branch_delete_racing_begin_delete_never_deadlocks() {
 #[tokio::test]
 #[ignore]
 async fn begin_branch_delete_refuses_while_the_branch_or_a_backup_has_children() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     // A child of dev's backup.
     let (id, dev, backup) = branch_with_backup(&client).await;
@@ -1887,6 +1959,7 @@ async fn begin_branch_delete_refuses_while_the_branch_or_a_backup_has_children()
 #[tokio::test]
 #[ignore]
 async fn swap_pending_timeline_is_a_compare_and_swap() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -1924,6 +1997,7 @@ async fn swap_pending_timeline_is_a_compare_and_swap() {
 #[tokio::test]
 #[ignore]
 async fn claim_stale_reset_claims_only_a_stale_resetting_branch_once() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let stale = ready_branch(&client, id, "stale", main_of(id)).await;
@@ -1970,6 +2044,7 @@ async fn claim_stale_reset_claims_only_a_stale_resetting_branch_once() {
 #[tokio::test]
 #[ignore]
 async fn history_start_is_set_when_ready_and_follows_the_timeline() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let main = main_branch(&client, id).await;
@@ -2015,6 +2090,7 @@ async fn history_start_is_set_when_ready_and_follows_the_timeline() {
 #[tokio::test]
 #[ignore]
 async fn fail_stuck_restore_fails_only_a_resetting_branch_whose_pending_timeline_is_old() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let stuck = ready_branch(&client, id, "stuck", main_of(id)).await;
@@ -2059,6 +2135,7 @@ async fn fail_stuck_restore_fails_only_a_resetting_branch_whose_pending_timeline
 #[tokio::test]
 #[ignore]
 async fn fail_branch_if_stale_only_fails_stale_branches_and_never_main() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let stale = new_branch(id, "stale", main_of(id));
@@ -2110,6 +2187,7 @@ async fn fail_branch_if_stale_only_fails_stale_branches_and_never_main() {
 #[tokio::test]
 #[ignore]
 async fn list_live_for_reconcile_carries_the_tenant_and_history_window() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let tenant = hex32();
@@ -2136,6 +2214,7 @@ async fn list_live_for_reconcile_carries_the_tenant_and_history_window() {
 #[tokio::test]
 #[ignore]
 async fn claim_branch_for_switch_starts_each_attempt_without_the_old_error() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -2161,6 +2240,7 @@ async fn claim_branch_for_switch_starts_each_attempt_without_the_old_error() {
 #[tokio::test]
 #[ignore]
 async fn begin_branch_delete_clears_the_old_error() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -2178,6 +2258,7 @@ async fn begin_branch_delete_clears_the_old_error() {
 #[tokio::test]
 #[ignore]
 async fn client_sweeps_databases_an_earlier_run_left_behind() {
+    let _sealed = sealed_lock().await;
     // What a test that panicked before its cleanup leaves: a database, main with its endpoint
     // and a branch with its own.
     let first = client().await;
@@ -2187,7 +2268,7 @@ async fn client_sweeps_databases_an_earlier_run_left_behind() {
     // Databases a developer made by hand, with names like the tests': never swept.
     let by_hand = DatabaseId::new();
     first
-        .insert_database_pending(by_hand, TenantId(DEMO_TENANT_ID), ProjectId(DEMO_PROJECT_ID), "live-test-by-hand")
+        .insert_database_pending(by_hand, TenantId(DEMO_TENANT_ID), ProjectId(DEMO_PROJECT_ID), &format!("live-test-by-hand-{}", run_id()))
         .await
         .unwrap();
     let lookalike = DatabaseId::new();
@@ -2196,7 +2277,7 @@ async fn client_sweeps_databases_an_earlier_run_left_behind() {
             lookalike,
             TenantId(DEMO_TENANT_ID),
             ProjectId(DEMO_PROJECT_ID),
-            &format!("live-test-{}", DatabaseId::new()),
+            &format!("live-test-{}-{}", run_id(), DatabaseId::new()),
         )
         .await
         .unwrap();
@@ -2259,6 +2340,7 @@ async fn last_used(client: &MetadataClient, key: uuid::Uuid) -> Option<chrono::D
 #[tokio::test]
 #[ignore]
 async fn data_keys_insert_lookup_touch_revoke() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _) = ready_database(&client).await;
     let branch = main_of(id);
@@ -2317,6 +2399,7 @@ async fn data_keys_insert_lookup_touch_revoke() {
 #[tokio::test]
 #[ignore]
 async fn second_live_public_key_conflicts() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _) = ready_database(&client).await;
     let (other, _) = ready_database(&client).await;
@@ -2344,6 +2427,7 @@ async fn second_live_public_key_conflicts() {
 #[tokio::test]
 #[ignore]
 async fn rotate_is_atomic() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _) = ready_database(&client).await;
     let branch = main_of(id);
@@ -2405,6 +2489,7 @@ async fn rotate_is_atomic() {
 #[tokio::test]
 #[ignore]
 async fn lookup_ignores_revoked_keys_and_deleted_branches() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _) = ready_database(&client).await;
     let branch = main_of(id);
@@ -2430,6 +2515,7 @@ async fn lookup_ignores_revoked_keys_and_deleted_branches() {
 #[tokio::test]
 #[ignore]
 async fn deleting_a_branch_row_cascades_keys() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _) = ready_database(&client).await;
     let (secret, _) = new_key(main_of(id), DataKeyKind::Secret, "service_role", "backend");
@@ -2510,6 +2596,7 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
 #[tokio::test]
 #[ignore]
 async fn branch_connection_returns_settings() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let id = insert_pending(&client).await;
     let pending = client.branch_connection(main_of(id)).await.unwrap();
@@ -2548,6 +2635,7 @@ async fn branch_connection_returns_settings() {
 #[tokio::test]
 #[ignore]
 async fn branches_missing_data_api_lists_ready_branches_without_key_or_password() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (bare, _) = ready_database(&client).await;
     let (keyed, _) = ready_database(&client).await;
@@ -2751,6 +2839,7 @@ async fn migration_maps_revision_one_rows() {
 #[tokio::test]
 #[ignore]
 async fn owner_constraints() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let null_verifier = violated(
@@ -2793,6 +2882,7 @@ async fn owner_constraints() {
 #[tokio::test]
 #[ignore]
 async fn sql_names_may_be_anything_postgres_allows() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let insert = "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, $2, 'x', 'sql')";
@@ -2816,6 +2906,7 @@ async fn sql_names_may_be_anything_postgres_allows() {
 #[tokio::test]
 #[ignore]
 async fn neon_roles_lists_only_the_owner() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "from_sql", "sql", Some(SQL_VERIFIER), None).await;
@@ -2835,6 +2926,7 @@ async fn neon_roles_lists_only_the_owner() {
 #[tokio::test]
 #[ignore]
 async fn role_secret_of_an_md5_row_is_none() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "legacy", "sql", None, None).await;
@@ -2853,6 +2945,7 @@ async fn role_secret_of_an_md5_row_is_none() {
 #[tokio::test]
 #[ignore]
 async fn list_roles_password_states() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     assert_eq!(client.insert_api_role(&ep, "a_gen", false, "SCRAM-SHA-256$g", "v1:g", 10).await.unwrap(), InsertRoleOutcome::Inserted);
@@ -2882,6 +2975,7 @@ async fn list_roles_password_states() {
 #[tokio::test]
 #[ignore]
 async fn list_roles_owner_first_then_c_collation() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     for name in ["zeta", "alpha", "_first", "Beta"] {
@@ -2895,6 +2989,7 @@ async fn list_roles_owner_first_then_c_collation() {
 #[tokio::test]
 #[ignore]
 async fn api_insert_respects_the_cap_under_concurrency() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     // MD5 rows don't count.
     let (id, ep) = ready_database(&client).await;
@@ -2929,6 +3024,7 @@ async fn api_insert_respects_the_cap_under_concurrency() {
 #[tokio::test]
 #[ignore]
 async fn api_insert_sets_level_pending_and_versions() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let plain = client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$p", "v1:p", 10).await.unwrap();
@@ -2961,6 +3057,7 @@ async fn api_insert_sets_level_pending_and_versions() {
 #[tokio::test]
 #[ignore]
 async fn confirm_and_replace_secret_and_delete_copy() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$old", "v1:old", 10).await.unwrap();
@@ -3005,6 +3102,7 @@ async fn confirm_and_replace_secret_and_delete_copy() {
 #[tokio::test]
 #[ignore]
 async fn clear_needs_reconfigure_clears_only_the_owner_pending() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$a", "v1:a", 10).await.unwrap();
@@ -3021,6 +3119,7 @@ async fn clear_needs_reconfigure_clears_only_the_owner_pending() {
 #[tokio::test]
 #[ignore]
 async fn resync_skips_recently_forwarded_rows() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3070,6 +3169,7 @@ async fn resync_skips_recently_forwarded_rows() {
 #[tokio::test]
 #[ignore]
 async fn resync_upsert_keeps_the_origin_and_applies_the_sealed_change() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3108,6 +3208,7 @@ async fn resync_upsert_keeps_the_origin_and_applies_the_sealed_change() {
 #[tokio::test]
 #[ignore]
 async fn resync_version_guard() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3133,6 +3234,7 @@ async fn resync_version_guard() {
 #[tokio::test]
 #[ignore]
 async fn resync_sets_databases_with_origins() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3187,6 +3289,7 @@ async fn resync_sets_databases_with_origins() {
 #[tokio::test]
 #[ignore]
 async fn database_count_ignores_system() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3211,6 +3314,7 @@ async fn database_count_ignores_system() {
 #[tokio::test]
 #[ignore]
 async fn ddl_begin_reads_the_endpoint_branch_and_owner() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
@@ -3225,6 +3329,7 @@ async fn ddl_begin_reads_the_endpoint_branch_and_owner() {
 #[tokio::test]
 #[ignore]
 async fn ddl_copy_count_and_upsert_follow_r5() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "legacy", "sql", None, None).await;
@@ -3275,6 +3380,7 @@ async fn ddl_copy_count_and_upsert_follow_r5() {
 #[tokio::test]
 #[ignore]
 async fn ddl_main_database_drop_and_recreate() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3304,6 +3410,7 @@ async fn ddl_main_database_drop_and_recreate() {
 #[tokio::test]
 #[ignore]
 async fn ddl_rename_database_moves_the_row() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3322,6 +3429,7 @@ async fn ddl_rename_database_moves_the_row() {
 #[tokio::test]
 #[ignore]
 async fn ddl_has_database_sees_the_open_transaction() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
@@ -3338,6 +3446,7 @@ async fn ddl_has_database_sees_the_open_transaction() {
 #[tokio::test]
 #[ignore]
 async fn ddl_rename_moves_copy_and_keys() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3400,6 +3509,7 @@ async fn ddl_rename_moves_copy_and_keys() {
 #[tokio::test]
 #[ignore]
 async fn ddl_remove_copy_and_commit_versions() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "tmp", "sql", Some(SQL_VERIFIER), None).await;
@@ -3421,6 +3531,7 @@ async fn ddl_remove_copy_and_commit_versions() {
 #[tokio::test]
 #[ignore]
 async fn ddl_dropped_transaction_writes_nothing() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let v = version(&client, &ep).await;
@@ -3437,6 +3548,7 @@ async fn ddl_dropped_transaction_writes_nothing() {
 #[tokio::test]
 #[ignore]
 async fn ddl_owner_verifier_clears_the_sealed_owner_password() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let sealed_before = main_branch(&client, id).await.owner_password_enc;
@@ -3466,6 +3578,7 @@ async fn ddl_owner_verifier_clears_the_sealed_owner_password() {
 #[tokio::test]
 #[ignore]
 async fn ddl_lock_times_out() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let mut holder = client.pool().begin().await.unwrap();
@@ -3536,6 +3649,7 @@ async fn branch_copy_writes_role_copies_and_main_database() {
 #[tokio::test]
 #[ignore]
 async fn claim_refuses_a_protected_branch_unless_allowed() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -3566,6 +3680,7 @@ async fn claim_refuses_a_protected_branch_unless_allowed() {
 #[tokio::test]
 #[ignore]
 async fn begin_delete_refuses_with_a_protected_branch() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let dev = ready_branch(&client, id, "dev", main_of(id)).await;
@@ -3611,6 +3726,7 @@ async fn set_dbs_stamp(client: &MetadataClient, ep: &str, secs_ago: Option<i32>)
 #[tokio::test]
 #[ignore]
 async fn database_ddl_stamps_the_endpoint() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let fresh = dbs_stamp_age_secs(&client, &ep).await;
@@ -3636,6 +3752,7 @@ async fn database_ddl_stamps_the_endpoint() {
 #[tokio::test]
 #[ignore]
 async fn resync_skips_databases_after_a_recent_ddl() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     let branch = main_of(id);
@@ -3660,6 +3777,7 @@ async fn resync_skips_databases_after_a_recent_ddl() {
 #[tokio::test]
 #[ignore]
 async fn clear_forwarded_lifts_both_guards() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), None).await;
@@ -3681,6 +3799,7 @@ async fn clear_forwarded_lifts_both_guards() {
 #[tokio::test]
 #[ignore]
 async fn unreadable_password_state() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), Some("v1:a")).await;
@@ -3713,6 +3832,7 @@ async fn password_of(client: &MetadataClient, ep: &str, name: &str) -> PasswordS
 #[tokio::test]
 #[ignore]
 async fn endpoint_insert_refuses_a_changed_parent_protection() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let parent = main_of(id);
@@ -3736,6 +3856,7 @@ async fn endpoint_insert_refuses_a_changed_parent_protection() {
 #[tokio::test]
 #[ignore]
 async fn branches_with_main_database_in_one_query() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let with = ready_branch(&client, id, "with", main_of(id)).await;
@@ -3758,6 +3879,7 @@ async fn branches_with_main_database_in_one_query() {
 #[tokio::test]
 #[ignore]
 async fn resync_password_change_clears_the_unreadable_mark() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), Some("v1:a")).await;
@@ -3787,6 +3909,7 @@ async fn resync_password_change_clears_the_unreadable_mark() {
 #[tokio::test]
 #[ignore]
 async fn rename_copy_keeps_the_unreadable_mark_when_nothing_was_resealed() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, ep) = ready_database(&client).await;
     seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), Some("v1:a")).await;
@@ -3812,6 +3935,7 @@ async fn rename_copy_keeps_the_unreadable_mark_when_nothing_was_resealed() {
 #[tokio::test]
 #[ignore]
 async fn child_endpoint_insert_waits_on_the_database_row_before_branch_rows() {
+    let _sealed = sealed_lock().await;
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let parent = main_of(id);

@@ -84,10 +84,43 @@ pub fn gateway_dir() -> PathBuf {
     repo_root().join(".cheladb/gateway")
 }
 
+/// The shared Compose tier (metadata Postgres, Zitadel, Neon storage).
 pub fn compose_file() -> PathBuf {
     env::var("COMPOSE_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root().join("infra/compose/docker-compose.yml"))
+        .unwrap_or_else(|_| repo_root().join("infra/compose/shared.yml"))
+}
+
+/// The worktree slot (`CHELADB_SLOT`, set by `just`; 0 = the main checkout).
+pub fn slot() -> anyhow::Result<u16> {
+    slot_from(env::var("CHELADB_SLOT").ok())
+}
+
+fn slot_from(value: Option<String>) -> anyhow::Result<u16> {
+    match value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        None => Ok(0),
+        Some(v) => v
+            .parse::<u16>()
+            .ok()
+            .filter(|n| *n <= 9)
+            .ok_or_else(|| anyhow::anyhow!("CHELADB_SLOT={v:?} is not a slot (0-9)")),
+    }
+}
+
+/// This worktree slot's metadata database on the shared server (`CHELADB_METADATA_DB`, set by
+/// `just`); slot 0's is `cheladb_metadata`.
+pub fn metadata_db() -> String {
+    metadata_db_from(env::var("CHELADB_METADATA_DB").ok())
+}
+
+fn metadata_db_from(value: Option<String>) -> String {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "cheladb_metadata".into())
 }
 
 pub fn compose_env() -> PathBuf {
@@ -126,6 +159,36 @@ pub fn load_dotenv_file(path: &std::path::Path) -> std::collections::HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `just` sets CHELADB_METADATA_DB per worktree slot; slot 0 (and no slot) keeps today's.
+    #[test]
+    fn the_metadata_database_follows_the_slot() {
+        assert_eq!(metadata_db_from(None), "cheladb_metadata");
+        assert_eq!(metadata_db_from(Some("  ".into())), "cheladb_metadata");
+        assert_eq!(
+            metadata_db_from(Some("cheladb_metadata_s3".into())),
+            "cheladb_metadata_s3"
+        );
+    }
+
+    #[test]
+    fn the_slot_comes_from_cheladb_slot() {
+        assert_eq!(slot_from(None).unwrap(), 0);
+        assert_eq!(slot_from(Some(" ".into())).unwrap(), 0);
+        assert_eq!(slot_from(Some("7".into())).unwrap(), 7);
+        for bad in ["x", "10", "-1"] {
+            let err = slot_from(Some(bad.into())).unwrap_err().to_string();
+            assert!(err.contains("CHELADB_SLOT"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_compose_file_is_the_shared_tier() {
+        assert!(
+            compose_file().ends_with("infra/compose/shared.yml")
+                || env::var("COMPOSE_FILE").is_ok()
+        );
+    }
 
     // Review Focus 1.
     #[test]

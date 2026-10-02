@@ -329,6 +329,14 @@ pub fn should_abort_provision(status: DatabaseStatus) -> bool {
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
 {
+    /// Whether `tenant` is reported for the first time in this process (and remembers it).
+    pub(crate) fn first_report_of_unknown_tenant(&self, tenant: &str) -> bool {
+        self.reported_unknown_tenants
+            .lock()
+            .unwrap()
+            .insert(tenant.to_string())
+    }
+
     /// One reconcile pass. `Err` only when observing fails; each action's error is logged
     /// and the next action still runs.
     ///
@@ -549,9 +557,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 Ok(())
             }
             Action::ReportUnknownTenant(tenant) => {
+                if !self.first_report_of_unknown_tenant(tenant) {
+                    return Ok(());
+                }
                 warn!(
                     tenant_id = %tenant,
-                    "storage-controller tenant has no endpoint row; keeping it. Restore the \
+                    "storage-controller tenant has no endpoint row; keeping it (logged once). \
+                     In local dev it may be another worktree slot's. Otherwise restore the \
                      metadata, or delete the tenant by hand if it's disposable (`just \
                      sweep-dbs` only removes tenants that have an endpoint row)"
                 );
@@ -1608,6 +1620,20 @@ mod tests {
         );
         assert_eq!(w.computes.list().await.unwrap(), Vec::<String>::new());
         assert_eq!(w.storage.tenants.lock().unwrap().len(), 2);
+    }
+
+    // Every worktree slot shares the storage controller, so each worker sees the other slots'
+    // tenants on every pass: each is logged once per process, not every 30 s.
+    #[tokio::test]
+    async fn an_unknown_tenant_is_reported_once() {
+        let (w, _journal) = worker();
+        assert!(w.first_report_of_unknown_tenant("t1"));
+        assert!(!w.first_report_of_unknown_tenant("t1"));
+        assert!(w.first_report_of_unknown_tenant("t2"));
+        w.storage.tenants.lock().unwrap().insert(NeonId::new());
+        w.reconcile_once().await.unwrap();
+        w.reconcile_once().await.unwrap();
+        assert_eq!(w.reported_unknown_tenants.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

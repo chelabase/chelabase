@@ -1,7 +1,7 @@
 //! Login roles against real computes (roadmap step 6a, revision 2): roles and databases managed
 //! from SQL through Neon's DDL forwarding to the orchestrator's receiver, the worker's resync,
-//! API roles, the protected flag, and logins through Neon's proxy (Postgres wire on :4432 and
-//! SQL over HTTP on :4444).
+//! API roles, the protected flag, and logins through Neon's proxy (Postgres wire on
+//! `CHELADB_PROXY_PG_PORT`, default 4432, and SQL over HTTP on `CHELADB_PROXY_HTTP_PORT`, default 4444).
 //!
 //! Same setup as `neon_live` (`just deps-up`, `just dev` from this checkout, so the orchestrator
 //! serves `neon.console_url` and the proxy runs with `max_roles=64`, `CHELADB_COMPUTE_IMAGE` set
@@ -16,7 +16,7 @@
 //!
 //! Each test provisions its own database and deletes it afterwards, pass or fail. A few tests
 //! restart `just dev`'s orchestrator with extra settings (or stop it) and put it back as it was
-//! afterwards, pass or fail; they need `.cheladb/dev/pids` from `just dev`.
+//! afterwards, pass or fail; they need the `pids` file from `just dev` in `CHELADB_DEV_DIR` (default `.cheladb/dev`).
 
 use std::future::Future;
 use std::process::Stdio;
@@ -381,12 +381,13 @@ fn proxy_ca() -> String {
     ca.display().to_string()
 }
 
-/// psql through the proxy on :4432 as `user` (passed in `PGUSER`, so any name works).
+/// psql through the proxy (Postgres port) as `user` (passed in `PGUSER`, so any name works).
 fn psql_base(ep: &str, database: &str, user: &str, password: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("psql");
     cmd.arg(format!(
-        "host={} hostaddr=127.0.0.1 port=4432 dbname={database} sslmode=verify-full sslrootcert={}",
+        "host={} hostaddr=127.0.0.1 port={} dbname={database} sslmode=verify-full sslrootcert={}",
         proxy_host(ep),
+        proxy_pg_port(),
         proxy_ca()
     ))
     .env("PGUSER", user)
@@ -456,7 +457,7 @@ async fn psql_script(
     }
 }
 
-/// `sql` through the proxy's SQL over HTTP on :4444 as `user`: `(status, body)`.
+/// `sql` through the proxy's SQL over HTTP as `user`: `(status, body)`.
 async fn http_sql(
     ep: &str,
     database: &str,
@@ -465,16 +466,17 @@ async fn http_sql(
     sql: &str,
 ) -> (u16, String) {
     let host = proxy_host(ep);
+    let http_port = proxy_http_port();
     let body = json!({ "query": sql, "params": [] }).to_string();
     let out = tokio::process::Command::new("curl")
         .args(["-sS", "--max-time", "30", "--cacert", &proxy_ca()])
-        .args(["--resolve", &format!("{host}:4444:127.0.0.1")])
+        .args(["--resolve", &format!("{host}:{http_port}:127.0.0.1")])
         .args([
             "-w",
             "\n%{http_code}",
             "-X",
             "POST",
-            &format!("https://{host}:4444/sql"),
+            &format!("https://{host}:{http_port}/sql"),
         ])
         .arg("-H")
         .arg(format!(
@@ -490,11 +492,11 @@ async fn http_sql(
     (status.trim().parse().unwrap_or(0), body.to_string())
 }
 
-/// Asserts the login works on :4432 (and on /sql for plain names).
+/// Asserts the login works on the Postgres port (and on /sql for plain names).
 async fn assert_logs_in(ep: &str, database: &str, user: &str, password: &str) {
     let out = psql(ep, database, user, password, "SELECT current_user")
         .await
-        .unwrap_or_else(|e| panic!("{user} on :4432: {e}"));
+        .unwrap_or_else(|e| panic!("{user} on the proxy: {e}"));
     assert_eq!(out, user);
     if user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         let (status, body) =
@@ -504,13 +506,13 @@ async fn assert_logs_in(ep: &str, database: &str, user: &str, password: &str) {
     }
 }
 
-/// Asserts the proxy refuses the password on :4432 (and on /sql for plain names).
+/// Asserts the proxy refuses the password on the Postgres port (and on /sql for plain names).
 async fn assert_refused(ep: &str, database: &str, user: &str, password: &str) {
     match psql(ep, database, user, password, "SELECT 1").await {
-        Ok(_) => panic!("{user} logged in on :4432 with a password that should be refused"),
+        Ok(_) => panic!("{user} logged in on the proxy with a password that should be refused"),
         Err(e) => assert!(
             e.contains(&format!("password authentication failed for user '{user}'")),
-            "unexpected refusal of {user} on :4432: {e}"
+            "unexpected refusal of {user} on the proxy: {e}"
         ),
     }
     if user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -525,6 +527,41 @@ async fn assert_refused(ep: &str, database: &str, user: &str, password: &str) {
 
 fn gateway() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into())
+}
+
+fn env_port(var: &str, default: u16) -> u16 {
+    std::env::var(var)
+        .ok()
+        .map(|v| v.parse().unwrap_or_else(|_| panic!("{var} is not a port: {v}")))
+        .unwrap_or(default)
+}
+
+/// The port of a `host:port` listen address in `var`, or `default`.
+fn addr_port(var: &str, default: u16) -> u16 {
+    match std::env::var(var) {
+        Ok(addr) => addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("{var} is not host:port: {addr}")),
+        Err(_) => default,
+    }
+}
+
+fn proxy_pg_port() -> u16 {
+    env_port("CHELADB_PROXY_PG_PORT", 4432)
+}
+
+fn proxy_http_port() -> u16 {
+    env_port("CHELADB_PROXY_HTTP_PORT", 4444)
+}
+
+fn internal_port() -> u16 {
+    addr_port("CHELADB_INTERNAL_ADDR", 8083)
+}
+
+fn orchestrator_port() -> u16 {
+    addr_port("CHELADB_ORCHESTRATOR_ADDR", 8081)
 }
 
 /// The built `cheladb` CLI, next to this test's own binary's directory.
@@ -626,7 +663,35 @@ async fn wait_for_data_status(key: &str, table: &str, status: u16, within: Durat
 
 // --- `just dev`'s orchestrator, restarted with other settings -------------------------------
 
-const PIDS: &str = ".cheladb/dev/pids";
+/// The dev directory `just dev` writes its pids and logs to: `CHELADB_DEV_DIR` (relative paths
+/// from the workspace root), `.cheladb/dev` by default.
+fn dev_dir() -> std::path::PathBuf {
+    resolve_dev_dir(
+        &workspace_root(),
+        std::env::var("CHELADB_DEV_DIR").ok().as_deref(),
+    )
+}
+
+fn resolve_dev_dir(root: &std::path::Path, env: Option<&str>) -> std::path::PathBuf {
+    match env.filter(|v| !v.is_empty()) {
+        Some(dir) => root.join(dir), // an absolute `dir` replaces the root
+        None => root.join(".cheladb/dev"),
+    }
+}
+
+fn pids_file() -> std::path::PathBuf {
+    dev_dir().join("pids")
+}
+
+#[test]
+fn dev_dir_resolves_against_the_root_with_the_old_default() {
+    use std::path::Path;
+    let root = Path::new("/w");
+    assert_eq!(resolve_dev_dir(root, None), Path::new("/w/.cheladb/dev"));
+    assert_eq!(resolve_dev_dir(root, Some("")), Path::new("/w/.cheladb/dev"));
+    assert_eq!(resolve_dev_dir(root, Some(".cheladb/dev-1")), Path::new("/w/.cheladb/dev-1"));
+    assert_eq!(resolve_dev_dir(root, Some("/abs/dev")), Path::new("/abs/dev"));
+}
 
 async fn port_open(port: u16) -> bool {
     tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -636,9 +701,9 @@ async fn port_open(port: u16) -> bool {
 
 /// Stops `just dev`'s orchestrator (its whole process group) and waits for its ports to close.
 async fn stop_orchestrator() {
-    let path = workspace_root().join(PIDS);
+    let path = pids_file();
     let pids =
-        std::fs::read_to_string(&path).expect("read .cheladb/dev/pids (is just dev running?)");
+        std::fs::read_to_string(&path).expect("read the dev pids file (is just dev running?)");
     let mut found = false;
     let mut kept = Vec::new();
     for pid in pids.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -653,10 +718,10 @@ async fn stop_orchestrator() {
             kept.push(pid);
         }
     }
-    assert!(found, "no orchestrator in {PIDS}");
+    assert!(found, "no orchestrator in {}", path.display());
     std::fs::write(&path, kept.join("\n") + "\n").unwrap();
     for _ in 0..100 {
-        if !port_open(8083).await && !port_open(8081).await {
+        if !port_open(internal_port()).await && !port_open(orchestrator_port()).await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -665,14 +730,14 @@ async fn stop_orchestrator() {
 }
 
 /// Starts the orchestrator as `just dev` does (same environment as this test, plus `env`),
-/// records it in `.cheladb/dev/pids` in place of the old one, and waits for it to answer.
+/// records it in the dev directory's `pids` in place of the old one, and waits for it to answer.
 async fn start_orchestrator(env: &[(&str, &str)]) {
     use std::os::unix::process::CommandExt;
     let root = workspace_root();
     let log = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(root.join(".cheladb/dev/orchestrator.log"))
+        .open(dev_dir().join("orchestrator.log"))
         .unwrap();
     // Detached like `just dev`'s apps: it outlives this test, and `just dev-down` stops it.
     #[allow(clippy::zombie_processes)]
@@ -688,11 +753,11 @@ async fn start_orchestrator(env: &[(&str, &str)]) {
         .expect("start the orchestrator");
     let pid = child.id().to_string();
     // First, as `just dev` writes it; `just dev-down` stops the group.
-    let path = root.join(PIDS);
+    let path = pids_file();
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     std::fs::write(&path, format!("{pid}\n{old}")).unwrap();
     for _ in 0..600 {
-        if port_open(8083).await && port_open(8081).await {
+        if port_open(internal_port()).await && port_open(orchestrator_port()).await {
             println!("orchestrator up with {env:?}");
             return;
         }

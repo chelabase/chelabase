@@ -88,7 +88,7 @@ struct Branch {
 }
 
 impl Branch {
-    fn new(b: BranchRecord, proxy_domain: &str, main_database_missing: bool) -> Self {
+    fn new(b: BranchRecord, proxy: &crate::ProxyAddress, main_database_missing: bool) -> Self {
         let endpoint = (b.kind == BranchKind::Normal)
             .then_some(b.endpoint_id.as_deref())
             .flatten();
@@ -99,7 +99,7 @@ impl Branch {
                 cheladb_metadata::DatabaseStatus::Pending
             },
             endpoint,
-            proxy_domain,
+            proxy,
         )
         .unzip();
         Self {
@@ -179,7 +179,7 @@ where
     J: JobPort,
 {
     let missing = main_database_missing(state, &b).await;
-    Branch::new(b, &state.proxy_domain, missing)
+    Branch::new(b, &state.proxy, missing)
 }
 
 /// Parses a JSON body with the reason on failure: text that isn't JSON (syntax error, empty or
@@ -337,7 +337,7 @@ where
                 .map(|b| {
                     let missing = main_database_expected(&b)
                         && with_main.as_ref().is_some_and(|set| !set.contains(&b.id));
-                    Branch::new(b, &state.proxy_domain, missing)
+                    Branch::new(b, &state.proxy, missing)
                 })
                 .collect();
             Json(views).into_response()

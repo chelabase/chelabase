@@ -7,7 +7,7 @@ use cheladb_types::mode::Mode;
 use cheladb_types::role_settings::RoleSettings;
 use cheladb_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
-use orchestrator::{build_router, AppState, NatsPorts, RestInternal};
+use orchestrator::{build_router, AppState, NatsPorts, ProxyAddress, RestInternal};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         js: NatsPorts { js, client: nats },
         identity,
         secrets,
-        proxy_domain: proxy_domain_from_env(),
+        proxy: ProxyAddress::from_lookup(|name| std::env::var(name).ok())?,
         rest: RestInternal {
             url: env_or("CHELADB_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
             token: internal_config.rest_token.clone(),
@@ -117,15 +117,6 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
              remove every database with `just sweep-dbs`."
         ),
     }
-}
-
-/// `CHELADB_PROXY_DOMAIN`, or `localtest.me` when unset or blank.
-fn proxy_domain_from_env() -> String {
-    std::env::var("CHELADB_PROXY_DOMAIN")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "localtest.me".to_string())
 }
 
 /// The variable, or `default` when unset or blank.

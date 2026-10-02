@@ -16,7 +16,9 @@ use cheladb_types::mode::Mode;
 use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use cheladb_secrets::{open_credential, seal_credential, Purpose, SecretKey};
 use cheladb_types::data_key::{self, DataKeyKind};
-use orchestrator::{build_router, AppState, JobPort, MetadataPort, ResetError, RestInternal};
+use orchestrator::{
+    build_router, AppState, JobPort, MetadataPort, ProxyAddress, ResetError, RestInternal,
+};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -885,7 +887,7 @@ async fn spawn_app_in_mode(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &st
         js: jobs,
         identity: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
         secrets: key.clone(),
-        proxy_domain: "localtest.me".into(),
+        proxy: ProxyAddress::local("localtest.me"),
         rest: RestInternal {
             url: rest_url.into(),
             token: REST_TOKEN.into(),

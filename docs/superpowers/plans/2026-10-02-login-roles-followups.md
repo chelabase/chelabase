@@ -8,7 +8,7 @@
 
 ## Status
 
-- **Current (2026-10-02): plan approved by the user; T1–T5 and T7 merged; T6 done; full verification passed; the end-of-step review (opus) and its fix batch are done; AT THE USER'S MERGE PAUSE.** The fork session recorded F3 as its Task 11e (tag to follow) and released the Compose stack to us until it asks for a 45–60 min slot. Branch `login-roles-followups` (`.worktrees/login-roles-followups`), from `main` `8d67f8c`.
+- **Current (2026-10-02): plan approved by the user; T1–T5 and T7 merged; T6 done; full verification passed; the end-of-step review (opus) and its fix batch are done; MERGED into `main` (`d6bf097`) at the user's word on 2026-10-02; after the merge, `main` has 963/963 tests passing and clippy clean.** `just dev` runs from `.worktrees/login-roles-followups` (pre-fix binaries; restart to pick up the review fixes). The fork session recorded F3 as its Task 11e (tag to follow) and released the Compose stack to us until it asks for a 45–60 min slot. Branch `login-roles-followups` (`.worktrees/login-roles-followups`), from `main` `8d67f8c`.
 - **User's decisions (2026-10-02):**
   - **D1. Scope:** all ten open follow-ups: the clear fixes, the small design calls, the provisioning slowdown and rename + `PASSWORD NULL`.
   - **D2. An unopenable sealed password gets its own `password_state`: `unreadable`** (password null, URI without a password). Studio: "Stored password can't be read; reset it."

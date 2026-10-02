@@ -3,7 +3,7 @@
 # - creates a database and waits until it is ready;
 # - psql, SQL over HTTP and the serverless driver answer through Neon's proxy;
 # - a wrong password is refused, and query cancel works;
-# - a password reset takes effect at once (the old password is refused, on 4432 and /sql);
+# - a password reset takes effect at once (the old password is refused, on the Postgres port and /sql);
 # - deleting the database removes the compute and the storage-controller tenant.
 # KEEP=1 leaves the database in place on failure.
 set -euo pipefail
@@ -16,6 +16,8 @@ LOG_PREFIX=neon-e2e
 [[ -z "${CHELADB_INTERNAL_ADDR:-}" ]] || check_internal_addr "$CHELADB_INTERNAL_ADDR"
 STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
+PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
+PROXY_HTTP_PORT="${CHELADB_PROXY_HTTP_PORT:-4444}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -73,6 +75,18 @@ for i in $(seq 120); do
 done
 pass "database $name ($db_id) is ready"
 
+# The storage controller's attach hook reached this slot: it goes through the hook relay, and
+# only the slot whose metadata names the tenant answers it (the others say 404).
+hook_tenant="$(metadata_sql -v id="$db_id" <<<"SELECT neon_tenant_id FROM databases WHERE id = :'id';")"
+[[ "$hook_tenant" =~ ^[0-9a-f]{32}$ ]] || die "no tenant for database $db_id in metadata (got '$hook_tenant')"
+for i in $(seq 20); do
+  shards="$(call GET "$STORCON/control/v1/tenant/$hook_tenant" | jq -c '.shards')"
+  jq -e 'length > 0 and all(.[]; .is_pending_compute_notification == false)' <<<"$shards" >/dev/null && break
+  [[ $i -lt 20 ]] || die "tenant $hook_tenant's compute notification is still pending after 10 s (hook relay, or this slot's internal listener): $shards"
+  sleep 0.5
+done
+pass "the storage controller's hook reached this slot (tenant $hook_tenant)"
+
 # 2. The owner credentials.
 status="$(api GET "/v1/databases/$db_id/connection")"
 [[ "$status" == 200 ]] || die "GET /connection: $status $(cat "$tmp/body")"
@@ -83,7 +97,7 @@ http_url="$(jq -r '.http_url' "$tmp/body")"
 uri="$(jq -r '.uri' "$tmp/body")"
 ep="${host%%.*}"
 [[ "$ep" =~ ^ep-[0-9a-f]{12}$ ]] || die "unexpected host '$host' in /connection"
-[[ "$uri" == "postgresql://postgres:$old@$host:4432/$dbname?sslmode=verify-full" ]] ||
+[[ "$uri" == "postgresql://postgres:$old@$host:${PROXY_PG_PORT}/$dbname?sslmode=verify-full" ]] ||
   die "unexpected uri in /connection (host $host, database $dbname)"
 pass "/connection reveals $host, database $dbname"
 
@@ -92,7 +106,7 @@ sql() {
   local pw="$1"
   shift
   PGPASSWORD="$pw" PGCONNECT_TIMEOUT=10 psql \
-    "host=$host hostaddr=127.0.0.1 port=4432 user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+    "host=$host hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
     -v ON_ERROR_STOP=1 -qtA "$@"
 }
 # http_sql <password> <query>: prints the HTTP status; the body goes to $tmp/body.
@@ -115,7 +129,7 @@ for i in $(seq 90); do
   [[ $i -lt 90 ]] || die "the compute never answered through the proxy: $(cat "$tmp/err")"
   sleep 2
 done
-pass "the compute answers through the proxy on 4432"
+pass "the compute answers through the proxy on $PROXY_PG_PORT"
 
 # 4. Postgres wire.
 sql "$old" -c 'CREATE TABLE e2e (n int); INSERT INTO e2e VALUES (1), (2), (3);'
@@ -125,22 +139,23 @@ pass "psql created a table and inserted 3 rows"
 status="$(http_sql "$old" 'SELECT count(*)::int AS n FROM e2e')"
 [[ "$status" == 200 && "$(jq -r '.rows[0].n' "$tmp/body")" == 3 ]] ||
   die "SQL over HTTP: $status $(cat "$tmp/body")"
-pass "SQL over HTTP on 4444 read the rows back"
+pass "SQL over HTTP on $PROXY_HTTP_PORT read the rows back"
 
 # The serverless driver, over WebSocket and HTTP.
 DATABASE_URL="postgresql://postgres:$old@$host/$dbname" NODE_EXTRA_CA_CERTS="$ca" EXPECT=3 \
+  CHELADB_PROXY_HTTP_PORT="$PROXY_HTTP_PORT" \
   pnpm --filter @cheladb/neon-e2e --silent check || die "@neondatabase/serverless"
 
 # A wrong password is refused, over Postgres wire and over HTTP.
 if sql wrong-password -c 'select 1' >/dev/null 2>"$tmp/err"; then die "a wrong password connected"; fi
-refused "$tmp/err" || die "unexpected refusal on 4432: $(cat "$tmp/err")"
+refused "$tmp/err" || die "unexpected refusal on $PROXY_PG_PORT: $(cat "$tmp/err")"
 http_refused wrong-password || die "unexpected answer to a wrong password on /sql: $(cat "$tmp/body")"
-pass "a wrong password is refused (4432 and /sql)"
+pass "a wrong password is refused ($PROXY_PG_PORT and /sql)"
 
 # Query cancel goes through the proxy (it keeps cancel keys in Valkey).
 started=$SECONDS
 PGPASSWORD="$old" timeout -s INT 2 psql \
-  "host=$host hostaddr=127.0.0.1 port=4432 user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+  "host=$host hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
   -c 'SELECT pg_sleep(30)' >/dev/null 2>"$tmp/err" || true
 [[ $((SECONDS - started)) -lt 10 ]] || die "cancel took $((SECONDS - started)) s"
 grep -q 'canceling statement due to user request' "$tmp/err" || die "query cancel: $(cat "$tmp/err")"
@@ -156,11 +171,11 @@ status="$(api GET "/v1/databases/$db_id/connection")"
 new="$(jq -r '.password' "$tmp/body")"
 [[ -n "$new" && "$new" != null && "$new" != "$old" ]] || die "the reset did not change the password"
 sql "$new" -c 'select 1' >/dev/null 2>"$tmp/err" || die "the new password was refused right after the reset: $(cat "$tmp/err")"
-if sql "$old" -c 'select 1' >/dev/null 2>"$tmp/err"; then die "the old password still connects on 4432"; fi
-refused "$tmp/err" || die "unexpected refusal of the old password on 4432: $(cat "$tmp/err")"
+if sql "$old" -c 'select 1' >/dev/null 2>"$tmp/err"; then die "the old password still connects on $PROXY_PG_PORT"; fi
+refused "$tmp/err" || die "unexpected refusal of the old password on $PROXY_PG_PORT: $(cat "$tmp/err")"
 [[ "$(http_sql "$new" 'select 1')" == 200 ]] || die "the new password over HTTP: $(cat "$tmp/body")"
 http_refused "$old" || die "the old password over HTTP wasn't refused: $(cat "$tmp/body")"
-pass "a reset password works at once; the old one is refused (4432 and /sql)"
+pass "a reset password works at once; the old one is refused ($PROXY_PG_PORT and /sql)"
 
 # 6. Delete: the compute and the tenant are gone.
 tenant="$(metadata_sql -v ep="$ep" <<<"SELECT tenant_id FROM neon_endpoints WHERE id = :'ep';")"

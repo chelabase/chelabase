@@ -36,19 +36,27 @@ check "build.sh with an unknown target exits 2" refuses 2 "$here/build.sh" bogus
 check "build.sh no longer builds vm-compute" refuses 2 "$here/build.sh" vm-compute
 
 # --- Compose ------------------------------------------------------------------------------
-compose_file="$root/infra/compose/docker-compose.yml"
+# The shared tier (shared.yml) and a worktree slot's app tier (slot.yml, here slot 0); the
+# slot arithmetic is checked by infra/compose/tests/slots.sh.
+compose_file="$root/infra/compose/shared.yml"
+slot_file="$root/infra/compose/slot.yml"
 check "NEON_IMAGE defaults to a digest-pinned GHCR image" \
-  grep -Eq '\$\{NEON_IMAGE:-ghcr\.io/cheladb/neon:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
+  grep -Eq '\$\{NEON_IMAGE:-ghcr\.io/cheladb/neon-storage:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
 check "COMPUTE_NODE_IMAGE defaults to a digest-pinned GHCR image" \
   grep -Eq '\$\{COMPUTE_NODE_IMAGE:-ghcr\.io/cheladb/neon-compute-v17:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
 
 if command -v docker >/dev/null; then
   # env -u: the check must hold with nothing set, as for a plain `just deps-up`.
   compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -f "$compose_file")
+  slot_compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE -u CHELADB_SLOT docker compose -f "$slot_file")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
-  check "the base config has every service" \
-    test "$(services)" = "create-bucket mailpit metadata-db nats pageserver proxy proxy-tls register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db valkey zitadel zitadel-db "
-  neon_json="$("${compose[@]}" config --format json)"
+  check "the shared tier has every service" \
+    test "$(services)" = "create-bucket hook-relay mailpit metadata-db pageserver proxy-tls register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db zitadel zitadel-db "
+  check "a slot's app tier has NATS, Valkey and the proxy" \
+    test "$("${slot_compose[@]}" config --services | sort | tr '\n' ' ')" = "nats proxy valkey "
+  # One document: the shared tier's services plus slot 0's.
+  neon_json="$(jq -s '{services: (.[0].services + .[1].services)}' \
+    <("${compose[@]}" config --format json) <("${slot_compose[@]}" config --format json))"
   published="$(jq <<<"$neon_json" -r '
     [.services | to_entries[]
       | select(.key | IN("seaweedfs","storage-broker","safekeeper1","storcon-db","storage-controller","pageserver","proxy"))
@@ -73,10 +81,10 @@ if command -v docker >/dev/null; then
   check "the hook token comes from CHELADB_STORCON_HOOK_TOKEN" \
     test "$token" = "--control-plane-jwt-token=from-env"
   storcon="$(jq -r '.services["storage-controller"]' <<<"$neon_json")"
-  check "the storage controller calls the orchestrator's internal listener" \
-    grep -qx -- '--control-plane-url=http://host.docker.internal:8083/storcon' <(jq -r '.command[]' <<<"$storcon")
-  check "the storage controller can resolve host.docker.internal" \
-    grep -q 'host-gateway' <<<"$(jq -c '.extra_hosts' <<<"$storcon")"
+  check "the storage controller calls the hook relay (it forwards to the slots' internal listeners)" \
+    grep -qx -- '--control-plane-url=http://hook-relay:8099/storcon' <(jq -r '.command[]' <<<"$storcon")
+  check "the hook relay can resolve host.docker.internal" \
+    grep -q 'host-gateway' <<<"$(jq -c '.services["hook-relay"].extra_hosts' <<<"$neon_json")"
   proxy="$(jq -r '.services.proxy' <<<"$neon_json")"
   proxy_args="$(jq -r '.command[]' <<<"$proxy")"
   check "the proxy asks the orchestrator's internal listener" \
@@ -98,7 +106,7 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.depends_on.valkey.condition' <<<"$proxy")" = "service_healthy"
   check "valkey's healthcheck has an explicit timeout" \
     test "$(jq -r '.healthcheck.timeout // empty' <<<"$valkey")" != ""
-  ptoken="$(CHELADB_PROXY_API_TOKEN=from-env "${compose[@]}" config --format json |
+  ptoken="$(CHELADB_PROXY_API_TOKEN=from-env "${slot_compose[@]}" config --format json |
     jq -r '.services.proxy.environment.NEON_PROXY_TO_CONTROLPLANE_TOKEN')"
   check "the proxy's token comes from CHELADB_PROXY_API_TOKEN" test "$ptoken" = "from-env"
 else
@@ -126,7 +134,7 @@ images() { # images <local images> <ok|fail>: runs neon-images.sh against the st
 }
 local_neon="cheladb/neon:$neon_tag"
 local_compute="cheladb/compute-node-v17:$neon_tag"
-pinned_neon='NEON_IMAGE=ghcr\.io/cheladb/neon:[^@]+@sha256:[0-9a-f]{64}'
+pinned_neon='NEON_IMAGE=ghcr\.io/cheladb/neon-storage:[^@]+@sha256:[0-9a-f]{64}'
 pinned_compute='COMPUTE_NODE_IMAGE=ghcr\.io/cheladb/neon-compute-v17:[^@]+@sha256:[0-9a-f]{64}'
 
 out="$(images "$local_neon $local_compute" fail || true)"
@@ -146,7 +154,7 @@ status=0
 images "" fail >/dev/null || status=$?
 check "a failed pull exits 1" test "$status" -eq 1
 check "a failed pull says to log in or build" \
-  grep -qF "can't pull ghcr.io/cheladb/neon (docker's error is above). The packages are private: run docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk)." "$stub/err"
+  grep -qF "can't pull ghcr.io/cheladb/neon-storage (docker's error is above). The packages are private: run docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk)." "$stub/err"
 
 # --- scripts/neon-smoke.sh (offline: nothing listens on port 1) ----------------------------
 status=0
@@ -268,7 +276,7 @@ check "CHELADB_INTERNAL_ADDR accepts a host name" addr_ok host.docker.internal:8
 
 # --- justfile -----------------------------------------------------------------------------
 check "neon-ps shows exited one-shots too" bash -c "just --justfile '$root/justfile' --show neon-ps | grep -q ' ps -a '"
-check "deps-down also removes demo computes" bash -c "just --justfile '$root/justfile' --show deps-down | grep -q 'cheladb-compute-'"
+check "deps-down also removes the slot's computes" bash -c "just --justfile '$root/justfile' --show deps-down | grep -q 'slot_compute_ids'"
 check "deps-up copies the proxy CA" \
   bash -c "just --justfile '$root/justfile' --show deps-up | grep -q 'cp proxy:/tls/ca.crt'"
 check "dev exports CHELADB_COMPUTE_IMAGE" \

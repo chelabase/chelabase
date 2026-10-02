@@ -1992,6 +1992,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         ready_timeout: Duration::from_millis(20),
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
+        reported_unknown_tenants: Mutex::default(),
     };
     (worker, journal)
 }

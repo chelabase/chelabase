@@ -6,9 +6,9 @@ controller) and, from roadmap step 4, its compute image. Both come from
 
 ## Pull (default)
 
-`just deps-up` pulls `ghcr.io/cheladb/neon` and `ghcr.io/cheladb/neon-compute-v17` (the
-fork's dev compute image, `b2402faa2394-dev`), pinned by digest in
-`infra/compose/docker-compose.yml`. **The packages are private:** run
+`just deps-up` pulls `ghcr.io/cheladb/neon-storage` and `ghcr.io/cheladb/neon-compute-v17` (the
+fork's dev images, `532981ad7de5-dev`), pinned by digest in `infra/compose/shared.yml` (the
+storage pin is repeated in `slot.yml`, for the proxy). **The packages are private:** run
 `docker login ghcr.io` first (a token with `read:packages`).
 
 The compute runs Postgres 17.5. The worker's login-role check revokes `neon_superuser` once

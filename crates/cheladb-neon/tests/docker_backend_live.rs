@@ -25,11 +25,20 @@ fn compute_image() -> String {
         .expect("COMPUTE_NODE_IMAGE in the script's output")
 }
 
+/// The port of `CHELADB_INTERNAL_ADDR` (`host:port`), 8083 by default.
+fn internal_port() -> u16 {
+    std::env::var("CHELADB_INTERNAL_ADDR")
+        .ok()
+        .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse().ok()))
+        .unwrap_or(8083)
+}
+
 fn backend(network: &str, control_plane_uri: &str) -> DockerBackend {
     DockerBackend::connect(ComputeSettings {
         image: compute_image(),
         network: network.to_string(),
         control_plane_uri: control_plane_uri.to_string(),
+        slot: 0,
     })
     .unwrap()
 }
@@ -64,7 +73,10 @@ async fn lifecycle() {
 #[ignore = "needs CHELADB_LIVE_ENDPOINT: the endpoint id of a database created through the API or Studio with `just dev`"]
 async fn admin_sql_on_a_running_compute() {
     let ep = std::env::var("CHELADB_LIVE_ENDPOINT").expect("CHELADB_LIVE_ENDPOINT");
-    let backend = backend("cheladb_default", "http://host.docker.internal:8083");
+    let backend = backend(
+        "cheladb_default",
+        &format!("http://host.docker.internal:{}", internal_port()),
+    );
 
     let out = backend
         .admin_sql(&ep, "postgres", "SELECT current_user")

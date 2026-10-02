@@ -6,6 +6,7 @@ members = [
     "services/gateway",
     "services/auth",
     "services/rest",
+    "services/hook-relay",
     "tools/cli",
     "crates/cheladb-types",
     "crates/cheladb-metadata",

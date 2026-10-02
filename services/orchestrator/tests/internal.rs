@@ -1037,18 +1037,45 @@ async fn an_unparseable_hook_body_is_retried_never_a_4xx() {
     }
 }
 
+// The storage controller is shared by every worktree slot; the hook relay offers each hook to
+// the slots in order and keeps the first answer that isn't 404. A slot that doesn't know the
+// tenant must say so, or every hook would stop at slot 0.
 #[tokio::test]
-async fn a_tenant_without_endpoints_is_answered_at_once() {
-    let app = spawn_internal(
-        FakeNeon::default(),
-        FakeLocator::default(),
-        &storcon(true).await,
-    )
-    .await;
+async fn hook_for_an_unknown_tenant_is_404() {
+    let neon = FakeNeon::default();
+    neon.add(
+        "ep-other",
+        "0000000000000000000000000000ffff",
+        "0000000000000000000000000000eeee",
+    );
+    let app = spawn_internal(neon, FakeLocator::default(), &storcon(true).await).await;
+    assert_eq!(
+        app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await,
+        404
+    );
+    let body = json!({ "tenant_id": TENANT, "timeline_id": TIMELINE, "generation": 3,
+                       "safekeepers": [{ "id": 1, "hostname": "sk1" }] })
+    .to_string();
+    assert_eq!(app.put(SAFEKEEPERS, Some(STORCON_TOKEN), &body).await, 404);
+}
+
+#[tokio::test]
+async fn hook_for_a_known_tenant_still_reconfigures() {
+    let neon = FakeNeon::default();
+    neon.add("ep-a", TENANT, TIMELINE);
+    let (addr, seen) = compute(200).await;
+    let locator = FakeLocator::default();
+    locator.running("ep-a", "172.20.0.9", Some(addr));
+    let app = spawn_internal(neon, locator, &storcon(true).await).await;
     assert_eq!(
         app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await,
         200
     );
+    let body = json!({ "tenant_id": TENANT, "timeline_id": TIMELINE, "generation": 3,
+                       "safekeepers": [{ "id": 1, "hostname": "sk1" }] })
+    .to_string();
+    assert_eq!(app.put(SAFEKEEPERS, Some(STORCON_TOKEN), &body).await, 200);
+    assert_eq!(seen.0.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 //!
 //! Needs `just deps-up` (storage controller, proxy, Valkey, metadata database, Docker)
 //! and `just dev` running (computes pull their spec from the orchestrator's internal
-//! listener on :8083), plus `CHELADB_COMPUTE_IMAGE` exported from `scripts/neon-images.sh`:
+//! listener on `CHELADB_INTERNAL_ADDR`, default :8083), plus `CHELADB_COMPUTE_IMAGE` exported from `scripts/neon-images.sh`:
 //!
 //! ```text
 //! set -a; . .cheladb/zitadel/demo.env; eval "$(scripts/neon-images.sh)"

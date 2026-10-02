@@ -4,6 +4,11 @@
 //! gets a fresh spec. The storage controller retries 503 and treats 400/401/403 as fatal, so
 //! our own failures are always 503, an unparseable body included (the `Json` extractor would
 //! answer 400/415/422).
+//!
+//! A tenant no endpoint row names gets 404: in local dev the storage controller is shared by
+//! every worktree slot, and the hook relay offers each hook to the slots in turn, keeping the
+//! first answer that isn't 404. The row is written before the tenant is created (provision
+//! step 2), so a slot always knows its tenants by the time their first hook arrives.
 
 use super::spec::endpoint_config;
 use super::{InternalState, NeonMetadataPort};
@@ -15,7 +20,7 @@ use cheladb_neon::ComputeLocator;
 use cheladb_neon::reconfigure;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Other fields (`shards`, `preferred_az`, `stripe_size`) aren't needed.
 #[derive(Debug, Deserialize)]
@@ -45,12 +50,13 @@ pub async fn notify_attach<M: NeonMetadataPort, L: ComputeLocator>(
         Ok(r) => r,
         Err(code) => return code,
     };
+    let endpoints = match known_tenant(&state, &req.tenant_id).await {
+        Ok(Some(endpoints)) => endpoints,
+        Ok(None) => return StatusCode::NOT_FOUND,
+        Err(code) => return code,
+    };
     info!(tenant = %req.tenant_id, "notify-attach");
-    let endpoints = state
-        .metadata
-        .neon_endpoints_for_tenant(&req.tenant_id)
-        .await;
-    reconfigure_all(&state, endpoints).await
+    reconfigure_all(&state, Ok(endpoints)).await
 }
 
 pub async fn notify_safekeepers<M: NeonMetadataPort, L: ComputeLocator>(
@@ -61,12 +67,36 @@ pub async fn notify_safekeepers<M: NeonMetadataPort, L: ComputeLocator>(
         Ok(r) => r,
         Err(code) => return code,
     };
+    match known_tenant(&state, &req.tenant_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND,
+        Err(code) => return code,
+    }
     info!(tenant = %req.tenant_id, timeline = %req.timeline_id, "notify-safekeepers");
     let endpoints = state
         .metadata
         .neon_endpoints_for_timeline(&req.timeline_id)
         .await;
     reconfigure_all(&state, endpoints).await
+}
+
+/// The tenant's endpoints, or `None` when no endpoint row names it (another slot's tenant, or
+/// one already torn down). A lookup failure is 503, so the storage controller retries.
+async fn known_tenant<M: NeonMetadataPort, L: ComputeLocator>(
+    state: &InternalState<M, L>,
+    tenant_id: &str,
+) -> Result<Option<Vec<String>>, StatusCode> {
+    match state.metadata.neon_endpoints_for_tenant(tenant_id).await {
+        Ok(ids) if ids.is_empty() => {
+            debug!(tenant = %tenant_id, "hook for a tenant this slot doesn't know: 404");
+            Ok(None)
+        }
+        Ok(ids) => Ok(Some(ids)),
+        Err(e) => {
+            error!("looking up endpoints: {e}");
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
 }
 
 /// Every endpoint is tried, even after one fails.

@@ -44,7 +44,9 @@ pnpm install
 | `just check` | Rust + TS typechecks |
 | `just test` | Rust tests with nextest, then doctests |
 | `just sweep-builds` | Delete build artifacts older than 14 days (`days=N` to change) from both target dirs |
-| `just wt-add <branch> [base]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/` |
+| `just wt-add <branch> [base] [auto\|none]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/`, with its own slot (`none`: without one) |
+| `just stack` / `stack-claim` / `stack-free <N>` / `stack-migrate` | List the slots and the shared tier; give this worktree a slot; wipe a stale slot; apply the shared tier's configuration (see "Running several worktrees") |
+| `just hook-relay-build` / `stack-test` | Build the hook relay image; offline checks for slots and Compose |
 | `just orchestrator` / `worker` / `gateway` / `rest` / `auth` / `studio` | Foreground one process |
 | `just cleanup` | Fresh start: stops dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps (keeps keys and the seeded tenant). Asks first |
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
@@ -248,6 +250,47 @@ Generated files are never edited by hand. Errors from these clients are thrown a
 | Valkey | 6379 | Proxy cache invalidation and query cancel |
 
 Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.cheladb/zitadel/demo.env` after bootstrap.
+
+## Running several worktrees
+
+Several worktrees can run their own development stacks side by side on the same machine, each with their own app tier. The heavy tier (Postgres server, Neon storage, Zitadel, hook relay) is shared. A quick reference:
+
+| What | Main checkout (slot 0) | Slot N worktree |
+|---|---|---|
+| Metadata database | `cheladb_metadata` | `cheladb_metadata_s<N>` |
+| Dev directory | `.cheladb/dev` | `.cheladb/dev/s<N>` |
+| Compose project | `cheladb-s0` | `cheladb-s<N>` |
+| NATS, Valkey, proxy ports | 4222, 6379, 4432/4444 | 4222+100N, 6379+100N, 4432+100N / 4444+100N |
+| Gateway, internal, auth, rest ports | 8000, 8083, 8084, 8085 | 8000+100N, 8083+100N, 8084+100N, 8085+100N |
+| Studio port | 3000 | 3000+100N |
+
+**Get started:**
+
+1. **Moving to slots:**
+   - **An old single stack is running** (for example on the second computer): `just dev-down`, `git pull`, `docker login ghcr.io`, then `just stack-migrate` (builds the hook relay, pulls the new image pins, removes the old NATS, Valkey and proxy containers and recreates the shared tier), then `just deps-up` and `just dev`.
+   - **A fresh machine:** `just dev`.
+   - **A worktree made before slots:** merge `main` into its branch, run `just dev-down` if its apps run as slot 0, then `just stack-claim` (gives it a slot and writes its `.env.local`).
+   - **After a hook relay code change:** `just hook-relay-build`, then `just stack-migrate` (which rebuilds the relay itself and recreates the shared tier; it refuses while other slots run).
+2. `just wt-add my-feature` creates a worktree in `.worktrees/my-feature` with its own slot (lowest free from 1–9), metadata database, and `.env.local`. It writes an entry to `.cheladb/slots/N.env`. `just wt-add my-feature main none` creates the worktree without a slot (no registry entry, no `.env.local`; for worktrees that run no stack, such as implementer worktrees); `just stack-claim` gives it one later. When all nine slots are taken, `wt-add` fails and suggests the `none` form or `just stack-free`.
+3. `just dev` (in the new worktree) starts that slot's dev apps and its metadata database. Run `just neon-e2e` to test it.
+4. Multiple slots can run live tests and e2e scripts at the same time. Studio sign-in for each slot is separate; open `http://localhost:3N00` (e.g., `3100` for slot 1). Each slot has its own Zitadel app (`cheladb-studio` for slot 0, `cheladb-studio-s<N>` for slot N) whose login URL is that slot's Studio. To make that work, `just zitadel-bootstrap` (run by `just dev`) switches off the Zitadel instance's "login v2 required" in self-hosted mode, since that setting sends every app to slot 0's login. It also checks that every Studio app names its own login URL, because an app without one would fall back to Zitadel's old v1 login. Platform mode leaves the instance setting alone.
+5. `just wt-remove my-feature` stops that slot's apps, removes its Compose project, drops its metadata database, frees the registry entry, and removes the worktree.
+6. `just stack` lists all running slot projects and the shared tier. `just stack-free <N>` wipes a stale slot N and frees it if nothing is using it. `just stack-claim` gives the current worktree a slot. `just stack-migrate` applies the shared tier's current configuration (see step 1). `just hook-relay-build` builds the hook relay image. `just stack-test` runs the offline slot checks.
+
+**Prerequisites on a second computer:**
+
+- `docker login ghcr.io` (for the Neon images)
+- `cargo` (to build the hook relay) and `jq` (to parse the metadata)
+- The host's glibc must be version ≤ 2.43, or the hook relay Dockerfile must be bumped (edit `FROM ubuntu:…` to a newer LTS base with a matching or newer glibc)
+- **Pre-slot branches** (created before this chore): their `just deps-up` does not error. It silently recreates the shared storage on older image pins (a pageserver downgrade), points the storage controller back at host port 8083 (bypassing the hook relay), and clashes with the `cheladb-s0` ports. Their `deps-down` stops the whole shared tier, their worker removes other slots' computes, and their orchestrator answers 200 for tenants it does not know. Rule: merge `main` and run `just stack-claim` before any `deps-up`, `dev`, `deps-down` or `sweep-dbs` on a pre-slot branch.
+
+**Important during development:**
+
+- Don't run `just deps-down` or `just cleanup` while other slot projects are running; they stop the shared tier that those slots depend on.
+- Each slot's dev services (gateway, orchestrator, worker, auth, rest) run independently; a slot 1 worker doesn't affect slot 0.
+- The hook relay routes storage-controller hooks (paths under `/storcon/`; anything else is 404) to the slot that owns each tenant.
+- Slots on `localhost` share their session cookies (cookies ignore ports), so signing in on one slot's Studio replaces the other's session: keep one signed-in Studio at a time.
+- Two worktrees building at once can overwrite each other's binaries in the shared target dir; set `CARGO_TARGET_DIR` per worktree for concurrent live runs of different branches.
 
 ## Data API
 

@@ -16,6 +16,7 @@ LOG_PREFIX=data-e2e
 . scripts/lib/neon-common.sh
 STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
+PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -81,7 +82,7 @@ psql_on() {
   reveal
   for _ in $(seq 60); do
     if out="$(PGPASSWORD="$bpw" PGCONNECT_TIMEOUT=10 psql \
-      "host=$bhost hostaddr=127.0.0.1 port=4432 user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
+      "host=$bhost hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
       -v ON_ERROR_STOP=1 -qtA "$@" 2>"$tmp/err")"; then
       printf '%s' "$out"
       return

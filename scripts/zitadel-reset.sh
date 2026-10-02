@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Wipe only the Zitadel Postgres volume so FirstInstance can rewrite admin.pat.
-# Does not touch metadata or NATS volumes.
+# Does not touch metadata or NATS volumes. Zitadel is in the shared tier: every worktree
+# slot signs in against it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/infra/compose/docker-compose.yml}"
+# CHELADB_SHARED_DIR: the shared tier's bind mounts name the main checkout's .cheladb from
+# every worktree, so a later `just deps-up` doesn't recreate Zitadel.
+# shellcheck source=lib/slots.sh
+. "$ROOT/scripts/lib/slots.sh"
+slot_load "$ROOT"
+COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/infra/compose/shared.yml}"
 COMPOSE_ENV="${COMPOSE_ENV:-$ROOT/infra/compose/.env.example}"
 ZDIR="${CHELADB_ZITADEL_DIR:-$ROOT/.cheladb/zitadel}"
 
@@ -21,7 +27,7 @@ else
   echo "[zitadel-reset] no zitadel_pg_data volume found"
 fi
 
-rm -f "${ZDIR}/admin.pat" "${ZDIR}/login-client.pat" "${ZDIR}/demo.env" "${ZDIR}/demo-sa.json"
+rm -f "${ZDIR}/admin.pat" "${ZDIR}/login-client.pat" "${ZDIR}/demo.env" "${ZDIR}/demo-sa.json" "${ZDIR}"/studio-s*.env
 mkdir -p "$ZDIR"
 chmod 777 "$ZDIR" 2>/dev/null || true
 

@@ -23,9 +23,7 @@ CHELADB_ZITADEL_ORG_ID={}\nCHELADB_ZITADEL_PROJECT_ID={}\nCHELADB_ZITADEL_API_CL
 CHELADB_DEMO_USER_ID={}\nCHELADB_DEMO_TENANT_ID={}\nCHELADB_INTERNAL_SIGNING_KEY={}\n\
 CHELADB_INTERNAL_VERIFY_KEY={}\nCHELADB_SECRETS_KEY={}\nCHELADB_AUTH_TOKEN_FILE={}\n\
 CHELADB_AUTH_COOKIE_KEY={}\nCHELADB_COMPUTE_JWT_DIR={}\n\
-CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\nCHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n\
-CHELADB_REST_URL=http://127.0.0.1:8085\nCHELADB_REST_INTERNAL_URL=http://127.0.0.1:8086\n\
-CHELADB_INTERNAL_URL=http://127.0.0.1:8083\n",
+CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\nCHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n",
         e.issuer,
         e.issuer,
         e.audiences,
@@ -103,11 +101,17 @@ mod tests {
         for line in [
             "CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\n",
             "CHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n",
-            "CHELADB_REST_URL=http://127.0.0.1:8085\n",
-            "CHELADB_REST_INTERNAL_URL=http://127.0.0.1:8086\n",
-            "CHELADB_INTERNAL_URL=http://127.0.0.1:8083\n",
         ] {
             assert!(text.contains(line), "{line} in {text}");
+        }
+        // demo.env is shared by every worktree slot: no ports in it. The apps default to slot
+        // 0's, and `just` sets each slot's (scripts/lib/slots.sh).
+        for key in [
+            "CHELADB_REST_URL=",
+            "CHELADB_REST_INTERNAL_URL=",
+            "CHELADB_INTERNAL_URL=",
+        ] {
+            assert!(!text.contains(key), "{key} in {text}");
         }
     }
 

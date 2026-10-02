@@ -19,6 +19,7 @@ LOG_PREFIX=role-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
+PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 MIGRATION="$root/scripts/fixtures/role-migration.sql"
@@ -69,12 +70,12 @@ reveal() {
   dbname="$(jq -r '.database' "$tmp/body")"
 }
 
-# sql_as <user> <password> <psql args…>: through the proxy on 4432.
+# sql_as <user> <password> <psql args…>: through the proxy.
 sql_as() {
   local user="$1" password="$2"
   shift 2
   PGUSER="$user" PGPASSWORD="$password" PGCONNECT_TIMEOUT=10 psql \
-    "host=$host hostaddr=127.0.0.1 port=4432 dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+    "host=$host hostaddr=127.0.0.1 port=${PROXY_PG_PORT} dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
     -X -v ON_ERROR_STOP=1 -qtA "$@"
 }
 
