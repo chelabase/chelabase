@@ -1,8 +1,10 @@
 use axum::{Json, Router, routing::get};
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{
-    CheckDataRoleReply, CheckDataRoleRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
-    ResetPasswordRequest, RoleReply, SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD,
+    CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, NatsConfig,
+    RESET_NOT_APPLIED, ResetPasswordReply, ResetPasswordRequest, RoleReply,
+    SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_ENABLE,
+    SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_RESET_PASSWORD,
     SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, connect, ensure_control_stream,
     run_branch_consumer, run_delete_consumer, run_provision_consumer, run_settings_consumer,
 };
@@ -71,6 +73,10 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(serve_reset_password(worker.clone(), nats.clone()));
     tokio::spawn(serve_check_data_role(worker.clone(), nats.clone()));
+    tokio::spawn(serve_enable_data_api(worker.clone(), nats.clone()));
+    for subject in [SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_REBOOTSTRAP] {
+        tokio::spawn(serve_data_api_rpc(worker.clone(), nats.clone(), subject));
+    }
     for subject in [SUBJECT_ROLE_CREATE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_DELETE] {
         tokio::spawn(serve_role_rpc(worker.clone(), nats.clone(), subject));
     }
@@ -284,6 +290,92 @@ async fn serve_check_data_role(worker: Arc<RealWorker>, client: async_nats::Clie
                 let body = serde_json::to_vec(&reply).unwrap_or_default();
                 if let Err(err) = client.publish(reply_to, body.into()).await {
                     warn!("check-data-role reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+// --- The data API per database (core NATS) ---------------------------------------
+
+/// Serves the enable publish (no reply): the orchestrator already set the row `enabling`.
+async fn serve_enable_data_api(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_DATA_API_ENABLE, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("enable-data-api subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_DATA_API_ENABLE, "serving enable-data-api requests");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            match serde_json::from_slice::<DataApiDatabaseRequest>(&message.payload) {
+                Ok(request) => {
+                    if tokio::time::timeout(worker::data_api::ENABLE_DEADLINE, worker.enable_data_api(&request))
+                        .await
+                        .is_err()
+                    {
+                        warn!(branch_id = %request.branch_id, database = %request.name, "enable data API timed out; reconcile retries");
+                    }
+                }
+                Err(err) => warn!("bad enable-data-api request: {err}"),
+            }
+        });
+    }
+}
+
+/// Hard cap on one disable or rebootstrap, below the orchestrator's request timeout (15 s).
+const DATA_API_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Serves the disable and rebootstrap requests (request/reply with a [`CheckDataRoleReply`]).
+async fn serve_data_api_rpc(
+    worker: Arc<RealWorker>,
+    client: async_nats::Client,
+    subject: &'static str,
+) {
+    let mut requests = match client
+        .queue_subscribe(subject, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!(subject, "data API subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject, "serving data API requests");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply = match serde_json::from_slice::<DataApiDatabaseRequest>(&message.payload) {
+                Ok(request) => {
+                    let work = async {
+                        if subject == SUBJECT_DATA_API_DISABLE {
+                            worker.disable_data_api(&request).await
+                        } else {
+                            worker.rebootstrap_data_api(&request).await
+                        }
+                    };
+                    match tokio::time::timeout(DATA_API_DEADLINE, work).await {
+                        Ok(reply) => reply,
+                        Err(_) => {
+                            warn!(subject, branch_id = %request.branch_id, "data API request timed out");
+                            CheckDataRoleReply::failed("timed out")
+                        }
+                    }
+                }
+                Err(err) => CheckDataRoleReply::failed(format!("bad request: {err}")),
+            };
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!(subject, "data API reply failed: {err}");
                 }
             }
         });

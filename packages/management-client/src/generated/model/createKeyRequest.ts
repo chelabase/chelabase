@@ -6,6 +6,12 @@
  */
 
 export interface CreateKeyRequest {
+  /**
+     * The Postgres databases the key may reach: 1 to 20 databases of the branch, disabled ones
+     * included. Absent or null is every served database.
+     * @nullable
+     */
+  databases?: string[] | null;
   name: string;
   /** @nullable */
   role?: string | null;

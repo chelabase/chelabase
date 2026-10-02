@@ -27,7 +27,6 @@ export function DatabaseBranches({ database }: DatabaseBranchesProps) {
         max_rows: d.max_rows,
         statement_timeout_ms: d.statement_timeout_ms,
         max_connections: d.max_connections,
-        default_schema: d.default_schema,
       }
     : null;
   const failed = list.error ?? detail.error;

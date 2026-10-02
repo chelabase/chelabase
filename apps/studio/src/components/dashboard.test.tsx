@@ -221,4 +221,16 @@ describe("Dashboard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Branches" }));
     expect(screen.queryByText("0 of 5 branches")).not.toBeInTheDocument();
   });
+
+  it("opens the Tables console of a database", async () => {
+    setup(ok(bound), {}, undefined, {
+      ...databaseRoutes,
+      "GET /v1/databases/d1/branches/b-main/databases": () =>
+        jsonResponse([{ name: "app", main: true, data_api: "on", data_api_error: null, default_schema: "public", origin: "owner", owner: "o" }]),
+      "GET /v1/databases/d1/branches/b-main/roles": () => jsonResponse([]),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Tables" }));
+    expect(await screen.findByLabelText("View as")).toBeInTheDocument();
+    expect(screen.getByText(/Viewing as owner/)).toBeInTheDocument();
+  });
 });

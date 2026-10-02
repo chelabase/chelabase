@@ -1,4 +1,4 @@
-use rest::query::{Name, Op, parse};
+use cheladb_query::query::{Name, Op, parse};
 
 fn rejected(json: &str) -> String {
     match parse(json.as_bytes()) {
@@ -11,7 +11,9 @@ fn rejected(json: &str) -> String {
 }
 
 fn accepted(json: &str) -> Op {
-    parse(json.as_bytes()).unwrap_or_else(|e| panic!("{json} should parse: {e}"))
+    parse(json.as_bytes())
+        .unwrap_or_else(|e| panic!("{json} should parse: {e}"))
+        .op
 }
 
 #[test]
@@ -215,5 +217,56 @@ fn names_have_at_most_one_dot_and_nonempty_parts() {
             }
         ),
         other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn parse_reads_a_top_level_database() {
+    let p = parse(br#"{"v":1,"database":"shop","op":"select","from":"t"}"#).unwrap();
+    assert_eq!(p.database.as_deref(), Some("shop"));
+    assert!(matches!(p.op, Op::Select(_)), "{:?}", p.op);
+    let p = parse(br#"{"v":1,"op":"select","from":"t"}"#).unwrap();
+    assert_eq!(p.database, None);
+    // A batch names it once, at the top, for every operation in it.
+    let p = parse(
+        br#"{"v":1,"database":"shop","op":"batch","ops":[{"op":"select","from":"t"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(p.database.as_deref(), Some("shop"));
+    assert!(matches!(&p.op, Op::Batch(ops) if ops.len() == 1), "{:?}", p.op);
+    // A name is a string of 1 to 63 bytes.
+    let long = format!("\"{}\"", "a".repeat(63));
+    let p = parse(format!(r#"{{"v":1,"database":{long},"op":"select","from":"t"}}"#).as_bytes())
+        .unwrap();
+    assert_eq!(p.database.map(|d| d.len()), Some(63));
+    for bad in [
+        r#""""#.to_owned(),
+        "5".to_owned(),
+        "null".to_owned(),
+        r#"["shop"]"#.to_owned(),
+        format!("\"{}\"", "a".repeat(64)),
+    ] {
+        let e = rejected(&format!(
+            r#"{{"v":1,"database":{bad},"op":"select","from":"t"}}"#
+        ));
+        assert!(e.contains("\"database\""), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn a_database_inside_a_batch_op_is_refused() {
+    for top in ["", r#""database":"shop","#] {
+        for inner in [
+            r#"{"database":"shop","op":"select","from":"t"}"#,
+            r#"{"v":1,"database":"other","op":"delete","from":"t","all":true}"#,
+        ] {
+            let e = rejected(&format!(
+                r#"{{"v":1,{top}"op":"batch","ops":[{{"op":"select","from":"t"}},{inner}]}}"#
+            ));
+            assert!(
+                e.contains("ops[1]") && e.contains("only the top level may name a database"),
+                "{e}"
+            );
+        }
     }
 }

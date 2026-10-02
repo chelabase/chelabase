@@ -17,6 +17,7 @@ path = "src/main.rs"
 cheladb-auth = { workspace = true }
 cheladb-metadata = { workspace = true, features = ["openapi"] }
 cheladb-nats = { workspace = true }
+cheladb-query = { workspace = true }
 cheladb-routes = { workspace = true }
 cheladb-secrets = { workspace = true }
 async-nats = { workspace = true }
@@ -34,8 +35,11 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 cheladb-neon = { workspace = true, features = ["metadata"] }
 hex = { workspace = true }
+moka = { workspace = true }
 reqwest = { workspace = true }
+urlencoding = { workspace = true }
 sha2 = { workspace = true }
+sqlx = { workspace = true }
 subtle = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }

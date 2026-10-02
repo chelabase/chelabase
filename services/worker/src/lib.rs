@@ -64,6 +64,9 @@ pub struct Worker<M, S, C, N, P> {
     /// The last branch reconcile's `cheladb` schema check looked at: each pass checks the next
     /// few ready branches after it, wrapping around.
     pub schema_check_cursor: Mutex<Option<BranchId>>,
+    /// When reconcile first saw each `enabling` database row: one still there after
+    /// [`reconcile::ENABLING_RETRY_SECS`] has its enable bootstrap run again.
+    pub enabling_seen: Mutex<std::collections::HashMap<(BranchId, String), std::time::Instant>>,
     /// Storage-controller tenants already reported as having no endpoint row. Every worktree
     /// slot shares the storage controller, so each worker sees the others' tenants: each is
     /// logged once per process.

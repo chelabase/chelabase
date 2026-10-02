@@ -369,6 +369,48 @@ pub mod orchestrator {
         "/v1/databases/{id}/branches/{branch_id}/data-api/schema",
     );
 
+    /// Starts serving one of the branch's Postgres databases through the data API.
+    pub const ENABLE_DATA_API: Endpoint = key_endpoint(
+        "orchestrator.enable_data_api",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api",
+    );
+
+    /// Stops serving a Postgres database (`?remove=true` also drops the machinery).
+    pub const DISABLE_DATA_API: Endpoint = key_endpoint(
+        "orchestrator.disable_data_api",
+        Method::Delete,
+        "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api",
+    );
+
+    /// Changes a Postgres database's data API settings (its default schema).
+    pub const UPDATE_PG_DATABASE: Endpoint = key_endpoint(
+        "orchestrator.update_pg_database",
+        Method::Patch,
+        "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
+    );
+
+    /// Studio's console: one data API request on the branch, as the owner or a named role.
+    pub const CONSOLE_QUERY: Endpoint = key_endpoint(
+        "orchestrator.console_query",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/console/query",
+    );
+
+    /// Studio's console: the schema it may show, as the owner or a named role.
+    pub const CONSOLE_SCHEMA: Endpoint = key_endpoint(
+        "orchestrator.console_schema",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/console/schema",
+    );
+
+    /// Changes which databases a key may reach.
+    pub const UPDATE_KEY: Endpoint = key_endpoint(
+        "orchestrator.update_key",
+        Method::Patch,
+        "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
+    );
+
     /// The branch's roles: the owner first, then the login roles.
     pub const LIST_ROLES: Endpoint = key_endpoint(
         "orchestrator.list_roles",
@@ -496,6 +538,12 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::ROTATE_KEY,
     orchestrator::REVOKE_KEY,
     orchestrator::DATA_API_SCHEMA,
+    orchestrator::ENABLE_DATA_API,
+    orchestrator::DISABLE_DATA_API,
+    orchestrator::UPDATE_PG_DATABASE,
+    orchestrator::UPDATE_KEY,
+    orchestrator::CONSOLE_QUERY,
+    orchestrator::CONSOLE_SCHEMA,
     orchestrator::LIST_ROLES,
     orchestrator::CREATE_ROLE,
     orchestrator::RESET_ROLE,
@@ -861,6 +909,51 @@ mod tests {
     }
 
     #[test]
+    fn per_database_data_api_routes_are_registered() {
+        let branch = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e";
+        assert_eq!(found("POST", &format!("{branch}/pg-databases/analytics/data-api")), "orchestrator.enable_data_api");
+        assert_eq!(found("DELETE", &format!("{branch}/pg-databases/analytics/data-api")), "orchestrator.disable_data_api");
+        assert_eq!(found("PATCH", &format!("{branch}/pg-databases/analytics")), "orchestrator.update_pg_database");
+        assert_eq!(found("PATCH", &format!("{KEYS}/abc")), "orchestrator.update_key");
+        for name in ["enable_data_api", "disable_data_api", "update_pg_database", "update_key"] {
+            let ep = ENDPOINTS
+                .iter()
+                .find(|e| e.name == format!("orchestrator.{name}"))
+                .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
+            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!(ep.service, Service::Orchestrator, "{name}");
+        }
+    }
+
+    #[test]
+    fn console_schema_route_is_management_auth_with_studio_cors() {
+        let branch = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e";
+        assert_eq!(found("GET", &format!("{branch}/console/schema")), "orchestrator.console_schema");
+        let ep = ENDPOINTS
+            .iter()
+            .find(|e| e.name == "orchestrator.console_schema")
+            .expect("console_schema is in ENDPOINTS");
+        assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio });
+        assert_eq!(ep.service, Service::Orchestrator);
+    }
+
+    #[test]
+    fn console_query_route_is_management_auth_with_studio_cors() {
+        let branch = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e";
+        assert_eq!(found("POST", &format!("{branch}/console/query")), "orchestrator.console_query");
+        assert_eq!(
+            match_endpoint(Scope::Api, "GET", &format!("{branch}/console/query")),
+            Match::MethodNotAllowed(vec![Method::Post])
+        );
+        let ep = ENDPOINTS
+            .iter()
+            .find(|e| e.name == "orchestrator.console_query")
+            .expect("console_query is in ENDPOINTS");
+        assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio });
+        assert_eq!(ep.service, Service::Orchestrator);
+    }
+
+    #[test]
     fn literal_keys_rotate_beats_param() {
         let id = "6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11";
         assert_eq!(found("POST", &format!("{KEYS}/{id}/rotate")), "orchestrator.rotate_key");
@@ -868,7 +961,7 @@ mod tests {
         // `rotate` in the key-id position is a key id, not the rotate action.
         assert_eq!(
             match_endpoint(Scope::Api, "POST", &format!("{KEYS}/rotate")),
-            Match::MethodNotAllowed(vec![Method::Delete])
+            Match::MethodNotAllowed(vec![Method::Delete, Method::Patch])
         );
         assert_eq!(
             match_endpoint(Scope::Api, "GET", &format!("{KEYS}/{id}/rotate")),

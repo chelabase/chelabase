@@ -17,7 +17,7 @@ fn every_client_fixture_tree_parses() {
             serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert!(fixture["call"].is_string(), "{}: no `call`", path.display());
         let tree = serde_json::to_vec(&fixture["tree"]).unwrap();
-        if let Err(e) = rest::query::parse(&tree) {
+        if let Err(e) = cheladb_query::query::parse(&tree) {
             panic!("{}: {e}", path.display());
         }
         count += 1;

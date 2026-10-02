@@ -13,7 +13,6 @@ export interface Database {
   /** Live `normal` branches, main included (backups and deleted branches don't count). */
   branch_count: number;
   database_id: DatabaseId;
-  default_schema: string;
   /** @nullable */
   error: string | null;
   /**

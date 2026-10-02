@@ -5,25 +5,29 @@ import {
   getListKeysQueryKey,
   rotateKey,
   useRevokeKey,
+  type BranchDatabaseView,
   type CreatedDataKey,
   type DataKey,
 } from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { CopyButton } from "./copy-button";
+import { DatabaseSelector, KeyDatabases, selectionReason } from "./data-api-databases";
 
 export interface DataApiKeysProps {
   databaseId: string;
   branchId: string;
   /** Every live key of the branch; the public key is left to the panel. */
   keys: DataKey[];
+  /** The branch's databases, for the allow-lists. */
+  databases: BranchDatabaseView[];
 }
 
 type Pending = { kind: "revoke" | "rotate"; key: DataKey } | null;
 
 const utc = (iso: string) => `${new Date(iso).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 
-export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
+export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKeysProps) {
   const queryClient = useQueryClient();
   const refreshKeys = (id: string, branch: string) =>
     queryClient.invalidateQueries({ queryKey: getListKeysQueryKey(id, branch) });
@@ -31,6 +35,8 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
   const revoke = useRevokeKey({ mutation: { onSuccess: (_, { id, branchId: branch }) => refreshKeys(id, branch) } });
   const [name, setName] = useState("");
   const [role, setRole] = useState("authenticated");
+  // `null` is every served database.
+  const [allowed, setAllowed] = useState<string[] | null>(null);
   const [shown, setShown] = useState<CreatedDataKey | null>(null);
   const [pending, setPending] = useState<Pending>(null);
   const [busy, setBusy] = useState(false);
@@ -38,7 +44,7 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
   const reasonId = useId();
   const secrets = keys.filter((k) => k.kind === "secret");
   const busyId = useId();
-  const nameReason = name.trim() === "" ? "Enter a name for the key." : null;
+  const nameReason = name.trim() === "" ? "Enter a name for the key." : selectionReason(allowed);
 
   async function create(event: FormEvent) {
     event.preventDefault();
@@ -48,8 +54,13 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
     try {
       // A new key is a secret: the plain function keeps it out of the mutation cache; it
       // lives only in this component's state.
-      setShown(await createKey(databaseId, branchId, { name: name.trim(), role: role.trim() }));
+      setShown(await createKey(databaseId, branchId, {
+          name: name.trim(),
+          role: role.trim(),
+          ...(allowed ? { databases: allowed } : {}),
+        }));
       setName("");
+      setAllowed(null);
       await refreshKeys(databaseId, branchId);
     } catch (err) {
       setError(errorText(err));
@@ -91,6 +102,7 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
               <th className="py-1 font-medium">Name</th>
               <th className="py-1 font-medium">Key</th>
               <th className="py-1 font-medium">Role</th>
+              <th className="py-1 font-medium">Databases</th>
               <th className="py-1 font-medium">Last used</th>
               <th className="py-1 font-medium">Actions</th>
             </tr>
@@ -113,6 +125,9 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
                 </td>
                 <td className="py-1 font-mono">{k.prefix}…</td>
                 <td className="py-1">{k.role}</td>
+                <td className="py-1">
+                  <KeyDatabases databaseId={databaseId} branchId={branchId} keyId={k.id} value={k.databases} databases={databases} />
+                </td>
                 <td className="py-1">{k.last_used_at ? utc(k.last_used_at) : "never"}</td>
                 <td className="py-1">
                   <div className="flex gap-2">
@@ -189,6 +204,7 @@ export function DataApiKeys({ databaseId, branchId, keys }: DataApiKeysProps) {
           <span>Role</span>
           <input value={role} onChange={(e) => setRole(e.target.value)} className={`${field} w-40`} />
         </label>
+        <DatabaseSelector databases={databases} value={allowed} onChange={setAllowed} />
         <Button
           type="submit"
           size="sm"

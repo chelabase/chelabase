@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::{BranchStatus, MetadataClient, MetadataError};
+use crate::{BranchStatus, MetadataClient, MetadataError, ServedDatabase};
 use chrono::{DateTime, Utc};
 use cheladb_types::BranchId;
 use serde::Serialize;
@@ -224,12 +224,70 @@ impl DatabaseOrigin {
     }
 }
 
+/// Whether the data API serves a database of a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum DataApiState {
+    Off,
+    /// A worker job is setting the database up.
+    Enabling,
+    On,
+    /// The last enable failed; `data_api_error` says why.
+    Error,
+}
+
+impl DataApiState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Enabling => "enabling",
+            Self::On => "on",
+            Self::Error => "error",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, MetadataError> {
+        match s {
+            "off" => Ok(Self::Off),
+            "enabling" => Ok(Self::Enabling),
+            "on" => Ok(Self::On),
+            "error" => Ok(Self::Error),
+            other => Err(MetadataError::InvalidStatus(format!("data api state {other}"))),
+        }
+    }
+}
+
+/// What [`MetadataClient::begin_enable_data_api`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnableStart {
+    /// The row is now `enabling` (also for a retry of one already `enabling` or in `error`).
+    Started,
+    AlreadyOn,
+    /// The branch has no such database.
+    Unknown,
+    /// The cluster's own `postgres` database is never served.
+    System,
+    /// The branch already serves this many databases (the cap).
+    OverCap(u32),
+}
+
+/// A `branch_databases` row as read: name, owner, origin, data API state and error, default
+/// schema, bootstrapped.
+type BranchDatabaseRow = (String, String, String, String, Option<String>, String, bool);
+
 /// A Postgres database of a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchDatabase {
     pub name: String,
     pub owner: String,
     pub origin: DatabaseOrigin,
+    pub data_api: DataApiState,
+    pub data_api_error: Option<String>,
+    pub default_schema: String,
+    /// An enable began on this database at least once (main: always), so the bootstrap may
+    /// have installed the machinery; never cleared.
+    pub data_api_bootstrapped: bool,
 }
 
 /// What a resync observed on the compute, to write in one transaction.
@@ -605,22 +663,203 @@ impl MetadataClient {
         &self,
         branch: BranchId,
     ) -> Result<Vec<BranchDatabase>, MetadataError> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT name, owner, origin FROM branch_databases WHERE branch_id = $1
+        let rows: Vec<BranchDatabaseRow> =
+            sqlx::query_as(
+                "SELECT name, owner, origin, data_api, data_api_error, default_schema,
+                        data_api_bootstrapped
+                 FROM branch_databases WHERE branch_id = $1
+                 ORDER BY (origin <> 'main'), name COLLATE \"C\"",
+            )
+            .bind(branch.as_uuid())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|(name, owner, origin, state, data_api_error, default_schema, bootstrapped)| {
+                Ok(BranchDatabase {
+                    name,
+                    owner,
+                    origin: DatabaseOrigin::parse(&origin)?,
+                    data_api: DataApiState::parse(&state)?,
+                    data_api_error,
+                    default_schema,
+                    data_api_bootstrapped: bootstrapped,
+                })
+            })
+            .collect()
+    }
+
+    /// Claims the right to set the data API up on a database: the row becomes `enabling` (its
+    /// error cleared). Locks the branch row, so two enables can't both pass the cap; the cap
+    /// counts the other databases that are `on` or `enabling` (main included). A row already
+    /// `enabling` or in `error` starts again.
+    pub async fn begin_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        cap: u32,
+    ) -> Result<EnableStart, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM branches WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(branch.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT origin, data_api FROM branch_databases WHERE branch_id = $1 AND name = $2",
+        )
+        .bind(branch.as_uuid())
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((origin, state)) = row else {
+            return Ok(EnableStart::Unknown);
+        };
+        if origin == "system" {
+            return Ok(EnableStart::System);
+        }
+        if state == "on" {
+            return Ok(EnableStart::AlreadyOn);
+        }
+        let others: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM branch_databases
+             WHERE branch_id = $1 AND name <> $2 AND data_api IN ('on', 'enabling')",
+        )
+        .bind(branch.as_uuid())
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if others >= i64::from(cap) {
+            return Ok(EnableStart::OverCap(cap));
+        }
+        sqlx::query(
+            "UPDATE branch_databases
+             SET data_api = 'enabling', data_api_error = NULL, data_api_bootstrapped = true
+             WHERE branch_id = $1 AND name = $2",
+        )
+        .bind(branch.as_uuid())
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(EnableStart::Started)
+    }
+
+    /// Ends an enable: `Ok` makes the row `on`, `Err(text)` makes it `error` with the text.
+    /// Only a row still `enabling` moves (one switched off meanwhile stays off); false otherwise.
+    pub async fn finish_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        outcome: Result<(), String>,
+    ) -> Result<bool, MetadataError> {
+        let (state, error) = match &outcome {
+            Ok(()) => ("on", None),
+            Err(text) => ("error", Some(text.as_str())),
+        };
+        let updated = sqlx::query(
+            "UPDATE branch_databases SET data_api = $3, data_api_error = $4
+             WHERE branch_id = $1 AND name = $2 AND data_api = 'enabling'",
+        )
+        .bind(branch.as_uuid())
+        .bind(name)
+        .bind(state)
+        .bind(error)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// Switches a database's data API off, clearing any error. False for the main database
+    /// (always served) and for an unknown name.
+    pub async fn set_data_api_off(
+        &self,
+        branch: BranchId,
+        name: &str,
+    ) -> Result<bool, MetadataError> {
+        let updated = sqlx::query(
+            "UPDATE branch_databases SET data_api = 'off', data_api_error = NULL
+             WHERE branch_id = $1 AND name = $2 AND origin <> 'main'",
+        )
+        .bind(branch.as_uuid())
+        .bind(name)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// Sets the schema requests to a database use when they name none. False for an unknown
+    /// name. The column's CHECK bounds the value (`^[a-z_][a-z0-9_]{0,62}$`); callers
+    /// validate first for a friendly message.
+    pub async fn set_database_default_schema(
+        &self,
+        branch: BranchId,
+        name: &str,
+        schema: &str,
+    ) -> Result<bool, MetadataError> {
+        let updated = sqlx::query(
+            "UPDATE branch_databases SET default_schema = $3 WHERE branch_id = $1 AND name = $2",
+        )
+        .bind(branch.as_uuid())
+        .bind(name)
+        .bind(schema)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// The databases the data API serves (state `on`): the main one first, then by name
+    /// (`COLLATE "C"`).
+    pub async fn served_databases(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<ServedDatabase>, MetadataError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, default_schema FROM branch_databases
+             WHERE branch_id = $1 AND data_api = 'on'
              ORDER BY (origin <> 'main'), name COLLATE \"C\"",
         )
         .bind(branch.as_uuid())
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|(name, owner, origin)| {
-                Ok(BranchDatabase {
-                    name,
-                    owner,
-                    origin: DatabaseOrigin::parse(&origin)?,
-                })
-            })
-            .collect()
+        Ok(rows
+            .into_iter()
+            .map(|(name, default_schema)| ServedDatabase { name, default_schema })
+            .collect())
+    }
+
+    /// Every `(branch, database)` row in state `enabling`, for reconcile to retry the ones whose
+    /// enable job was lost.
+    pub async fn enabling_databases(&self) -> Result<Vec<(BranchId, String)>, MetadataError> {
+        let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT branch_id, name FROM branch_databases WHERE data_api = 'enabling'
+             ORDER BY branch_id, name COLLATE \"C\"",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(b, n)| (BranchId(b), n)).collect())
+    }
+
+    /// Gives a child branch its parent's data API flags, per database name: `on` stays `on`,
+    /// `enabling` and `error` become `off`, and the schema is copied. Call it after the child's
+    /// first resync wrote its rows. A branch without a parent, and names the parent lacks, are
+    /// left alone.
+    pub async fn copy_parent_database_flags(&self, child: BranchId) -> Result<(), MetadataError> {
+        sqlx::query(
+            "UPDATE branch_databases c
+             SET data_api = CASE p.data_api WHEN 'on' THEN 'on' ELSE 'off' END,
+                 data_api_error = NULL,
+                 default_schema = p.default_schema,
+                 data_api_bootstrapped = c.data_api_bootstrapped OR p.data_api_bootstrapped
+             FROM branches b
+             JOIN branch_databases p ON p.branch_id = b.parent_branch_id
+             WHERE b.id = $1 AND c.branch_id = $1 AND p.name = c.name AND c.origin <> 'system'",
+        )
+        .bind(child.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Records the compute settings version the endpoint's compute was last created with.
@@ -1216,15 +1455,17 @@ async fn set_databases(
     desired.sort_by_key(|(_, _, origin)| *origin == DatabaseOrigin::Main);
     let mut changed = false;
     let keep: Vec<&str> = desired.iter().map(|(name, _, _)| *name).collect();
-    let removed = sqlx::query(
-        "DELETE FROM branch_databases WHERE branch_id = $1 AND NOT (name = ANY($2))",
+    let removed: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM branch_databases WHERE branch_id = $1 AND NOT (name = ANY($2)) RETURNING name",
     )
     .bind(branch.as_uuid())
     .bind(&keep)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-    changed |= removed > 0;
+    .fetch_all(&mut **tx)
+    .await?;
+    changed |= !removed.is_empty();
+    for name in &removed {
+        crate::ddl::drop_name_from_key_lists(tx, branch, name).await?;
+    }
     for (name, owner, origin) in desired {
         let same = existing
             .iter()
@@ -1233,9 +1474,17 @@ async fn set_databases(
             continue;
         }
         sqlx::query(
-            "INSERT INTO branch_databases (branch_id, name, owner, origin) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (branch_id, name) DO UPDATE SET owner = EXCLUDED.owner,
-                                                         origin = EXCLUDED.origin",
+            "INSERT INTO branch_databases (branch_id, name, owner, origin, data_api, data_api_bootstrapped)
+             VALUES ($1, $2, $3, $4, CASE WHEN $4::text = 'main' THEN 'on' ELSE 'off' END,
+                     $4::text = 'main')
+             ON CONFLICT (branch_id, name) DO UPDATE
+             SET owner = EXCLUDED.owner,
+                 origin = EXCLUDED.origin,
+                 data_api_bootstrapped = branch_databases.data_api_bootstrapped
+                                         OR EXCLUDED.origin = 'main',
+                 data_api = CASE EXCLUDED.origin WHEN 'system' THEN 'off'
+                                                 WHEN 'main' THEN 'on'
+                                                 ELSE branch_databases.data_api END",
         )
         .bind(branch.as_uuid())
         .bind(name)

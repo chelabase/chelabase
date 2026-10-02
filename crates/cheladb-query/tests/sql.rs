@@ -1,8 +1,8 @@
 mod common;
 
 use common::{FakeCatalog, MAX_ROWS, one, op, plans};
-use rest::query::{Path, Slot, resolve};
-use rest::sql::{Bind, BindValue, PlanError, plan, resolve_bind};
+use cheladb_query::query::{Path, Slot, resolve};
+use cheladb_query::sql::{Bind, BindValue, PlanError, plan, resolve_bind};
 use serde_json::json;
 
 fn at(slot: Slot) -> Path {
@@ -622,11 +622,11 @@ fn plan_errors_map_to_codes() {
 fn big_numbers_reach_the_binds_with_their_digits() {
     const BIG: &str = "123456789012345678901234567890";
     const FRACTION: &str = "1234567890.12345678901234567890";
-    let text = |tree: &rest::query::Op, bind: Bind| match resolve_bind(tree, &bind, MAX_ROWS) {
+    let text = |tree: &cheladb_query::query::Op, bind: Bind| match resolve_bind(tree, &bind, MAX_ROWS) {
         Some(BindValue::Text(Some(v))) => v.into_owned(),
         other => panic!("{other:?}"),
     };
-    let json = |tree: &rest::query::Op, bind: Bind| match resolve_bind(tree, &bind, MAX_ROWS) {
+    let json = |tree: &cheladb_query::query::Op, bind: Bind| match resolve_bind(tree, &bind, MAX_ROWS) {
         Some(BindValue::Json(v)) => serde_json::to_string(v).unwrap(),
         other => panic!("{other:?}"),
     };

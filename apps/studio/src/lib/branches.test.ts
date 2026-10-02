@@ -156,7 +156,6 @@ describe("parseSettings", () => {
     maxRows: "1000",
     statementTimeoutMs: "8000",
     maxConnections: "5",
-    defaultSchema: "public",
   };
   const parse = (over: Partial<typeof base> = {}) => parseSettings({ ...base, ...over });
 
@@ -169,7 +168,6 @@ describe("parseSettings", () => {
         max_rows: 1000,
         statement_timeout_ms: 8000,
         max_connections: 5,
-        default_schema: "public",
       },
     });
     expect(parse({ window: "30", maxBranches: "0" })).toMatchObject({
@@ -200,12 +198,5 @@ describe("parseSettings", () => {
     expect(parse({ maxConnections: "1" })).toMatchObject({ ok: true });
     expect(parse({ maxConnections: "50" })).toMatchObject({ ok: true });
     for (const v of ["0", "51", "", "2.5"]) expect(parse({ maxConnections: v })).toMatchObject({ ok: false, maxConnections: expect.any(String) });
-  });
-  it("enforces default_schema ^[a-z_][a-z0-9_]{0,62}$", () => {
-    expect(parse({ defaultSchema: "_app1" })).toMatchObject({ ok: true });
-    expect(parse({ defaultSchema: "a".repeat(63) })).toMatchObject({ ok: true });
-    for (const v of ["", "1app", "App", "my-schema", "a".repeat(64), "pub lic"]) {
-      expect(parse({ defaultSchema: v })).toMatchObject({ ok: false, defaultSchema: expect.any(String) });
-    }
   });
 });

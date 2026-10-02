@@ -13,6 +13,7 @@ use cheladb_metadata::{
     BeginDelete, ClaimOutcome, CopyUpsert, DatabaseOrigin, InsertRoleOutcome, MetadataClient, MetadataConfig,
     MetadataError, NewBranch, NewDataKey, NewEndpoint, NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied,
     ResyncWrite, RoleLevel, RoleOrigin, SealedChange, SettingsPatch,
+    DataApiState, EnableStart, ServedDatabase,
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
 };
 use cheladb_types::data_key::{self, DataKeyKind};
@@ -2324,6 +2325,7 @@ fn new_key(branch: BranchId, kind: DataKeyKind, role: &str, name: &str) -> (NewD
             prefix: generated.prefix,
             sha256: generated.sha256,
             sealed,
+            databases: None,
         },
         generated.key,
     )
@@ -2542,10 +2544,6 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         SettingsPatch { statement_timeout_ms: Some(120_001), ..Default::default() },
         SettingsPatch { max_connections: Some(0), ..Default::default() },
         SettingsPatch { max_connections: Some(51), ..Default::default() },
-        SettingsPatch { default_schema: Some("Public".into()), ..Default::default() },
-        SettingsPatch { default_schema: Some("1abc".into()), ..Default::default() },
-        SettingsPatch { default_schema: Some("a".repeat(64)), ..Default::default() },
-        SettingsPatch { default_schema: Some(String::new()), ..Default::default() },
         // One bad field spoils the whole patch.
         SettingsPatch { max_branches: Some(9), max_rows: Some(0), ..Default::default() },
     ];
@@ -2560,7 +2558,6 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         max_rows: Some(100_000),
         statement_timeout_ms: Some(100),
         max_connections: Some(50),
-        default_schema: Some("_app_1".into()),
         max_branches: Some(7),
         ..Default::default()
     };
@@ -2579,15 +2576,15 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         .unwrap();
     cleanup(&client, id).await;
     assert_eq!(
-        (defaults.max_rows, defaults.statement_timeout_ms, defaults.max_connections, defaults.default_schema.as_str()),
-        (1000, 8000, 5, "public")
+        (defaults.max_rows, defaults.statement_timeout_ms, defaults.max_connections),
+        (1000, 8000, 5)
     );
     assert_eq!(rejected, bad.len());
     assert_eq!(unchanged, defaults);
     assert!(applied);
     assert_eq!(
-        (after.max_rows, after.statement_timeout_ms, after.max_connections, after.default_schema.as_str(), after.max_branches),
-        (100_000, 100, 50, "_app_1", 7)
+        (after.max_rows, after.statement_timeout_ms, after.max_connections, after.max_branches),
+        (100_000, 100, 50, 7)
     );
     assert_eq!((partial.max_rows, partial.statement_timeout_ms, partial.max_connections), (1, 100, 50));
     assert!(!on_deleting);
@@ -2606,7 +2603,7 @@ async fn branch_connection_returns_settings() {
     client
         .update_database_settings(
             id,
-            &SettingsPatch { max_rows: Some(50), default_schema: Some("app".into()), ..Default::default() },
+            &SettingsPatch { max_rows: Some(50), ..Default::default() },
         )
         .await
         .unwrap();
@@ -2624,10 +2621,9 @@ async fn branch_connection_returns_settings() {
     assert_eq!(ready.database_name.as_deref(), Some("db"));
     assert_eq!(ready.authenticator_password_enc, None);
     assert_eq!((ready.settings.max_rows, ready.settings.statement_timeout_ms), (1000, 8000));
-    assert_eq!((ready.settings.max_connections, ready.settings.default_schema.as_str()), (5, "public"));
+    assert_eq!(ready.settings.max_connections, 5);
     assert_eq!(with_password.authenticator_password_enc.as_deref(), Some("v1:auth"));
     assert_eq!(with_password.settings.max_rows, 50);
-    assert_eq!(with_password.settings.default_schema, "app");
     assert!(missing.is_none());
     assert_eq!(record.authenticator_password_enc.as_deref(), Some("v1:auth"));
 }
@@ -3975,4 +3971,470 @@ async fn child_endpoint_insert_waits_on_the_database_row_before_branch_rows() {
     assert!(still_waiting, "the insert should wait on the database row");
     assert!(rows_free.is_ok(), "branch rows were locked before the database row: {rows_free:?}");
     assert!(matches!(linked, Ok(true)), "{linked:?}");
+}
+
+// ---- step 6c: data API across databases ----
+
+async fn state_of(client: &MetadataClient, branch: BranchId, name: &str) -> (DataApiState, Option<String>, String) {
+    client
+        .branch_databases(branch)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == name)
+        .map(|d| (d.data_api, d.data_api_error, d.default_schema))
+        .expect("database row")
+}
+
+/// Adds `names` (owner `app`, origin sql) to the branch's endpoint through a DDL transaction.
+async fn add_databases(client: &MetadataClient, ep: &str, names: &[&str]) {
+    let mut tx = client.begin_ddl(ep).await.unwrap().expect("endpoint");
+    for name in names {
+        tx.upsert_database(name, "app").await.unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
+fn key_with(branch: BranchId, role: &str, name: &str, databases: Option<&[&str]>) -> NewDataKey {
+    let (mut key, _) = new_key(branch, DataKeyKind::Secret, role, name);
+    key.databases = databases.map(|d| d.iter().map(|s| s.to_string()).collect());
+    key
+}
+
+async fn key_databases(client: &MetadataClient, branch: BranchId, id: uuid::Uuid) -> Option<Vec<String>> {
+    client.list_data_keys(branch).await.unwrap().into_iter().find(|k| k.id == id).map(|k| k.databases.unwrap_or_default())
+}
+
+#[tokio::test]
+#[ignore]
+async fn migration_backfills_main_as_on() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let main = state_of(&client, main_of(id), "db").await;
+    let cheladb_main_rows_off: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM branch_databases WHERE origin = 'main' AND data_api <> 'on'
+           AND branch_id IN (SELECT id FROM branches WHERE database_id = $1)",
+    )
+    .bind(id.as_uuid())
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    let column_gone: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM information_schema.columns
+                            WHERE table_schema = current_schema() AND table_name = 'databases' AND column_name = 'default_schema')",
+    )
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(main, (DataApiState::On, None, "public".to_string()));
+    assert_eq!(cheladb_main_rows_off, 0);
+    assert!(column_gone, "databases.default_schema moved to branch_databases");
+}
+
+#[tokio::test]
+#[ignore]
+async fn enable_respects_the_cap_and_refuses_system() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["one", "two"]).await;
+    // A system row, as the resync writes it.
+    sqlx::query("INSERT INTO branch_databases (branch_id, name, owner, origin) VALUES ($1, 'postgres', 'cloud_admin', 'system')")
+        .bind(branch.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    // main is on, so a cap of 2 leaves room for one more.
+    let first = client.begin_enable_data_api(branch, "one", 2).await.unwrap();
+    let over = client.begin_enable_data_api(branch, "two", 2).await.unwrap();
+    let again = client.begin_enable_data_api(branch, "one", 2).await.unwrap();
+    let unknown = client.begin_enable_data_api(branch, "nope", 2).await.unwrap();
+    let system = client.begin_enable_data_api(branch, "postgres", 2).await.unwrap();
+    let main_again = client.begin_enable_data_api(branch, "db", 1).await.unwrap();
+    let one_state = state_of(&client, branch, "one").await.0;
+    let two_state = state_of(&client, branch, "two").await.0;
+    let check_blocks_system = sqlx::query("UPDATE branch_databases SET data_api = 'on' WHERE branch_id = $1 AND name = 'postgres'")
+        .bind(branch.as_uuid())
+        .execute(client.pool())
+        .await
+        .is_err();
+    cleanup(&client, id).await;
+    assert_eq!(first, EnableStart::Started);
+    assert_eq!(over, EnableStart::OverCap(2));
+    assert_eq!(again, EnableStart::Started, "a retry while enabling starts again");
+    assert_eq!(unknown, EnableStart::Unknown);
+    assert_eq!(system, EnableStart::System);
+    assert_eq!(main_again, EnableStart::AlreadyOn);
+    assert_eq!((one_state, two_state), (DataApiState::Enabling, DataApiState::Off));
+    assert!(check_blocks_system);
+}
+
+#[tokio::test]
+#[ignore]
+async fn enable_finish_records_errors() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["one"]).await;
+    assert_eq!(client.begin_enable_data_api(branch, "one", 10).await.unwrap(), EnableStart::Started);
+    let failed = client.finish_enable_data_api(branch, "one", Err("boom".into())).await.unwrap();
+    let after_fail = state_of(&client, branch, "one").await;
+    assert_eq!(client.begin_enable_data_api(branch, "one", 10).await.unwrap(), EnableStart::Started);
+    let cleared = state_of(&client, branch, "one").await;
+    let ok = client.finish_enable_data_api(branch, "one", Ok(())).await.unwrap();
+    let after_ok = state_of(&client, branch, "one").await;
+    // Off again, and a finish that lands afterwards doesn't bring it back.
+    let off = client.set_data_api_off(branch, "one").await.unwrap();
+    let late = client.finish_enable_data_api(branch, "one", Ok(())).await.unwrap();
+    let after_off = state_of(&client, branch, "one").await;
+    let main_off = client.set_data_api_off(branch, "db").await.unwrap();
+    let unknown_off = client.set_data_api_off(branch, "nope").await.unwrap();
+    cleanup(&client, id).await;
+    assert!(failed);
+    assert_eq!(after_fail.0, DataApiState::Error);
+    assert_eq!(after_fail.1.as_deref(), Some("boom"));
+    assert_eq!((cleared.0, cleared.1), (DataApiState::Enabling, None));
+    assert!(ok);
+    assert_eq!((after_ok.0, after_ok.1), (DataApiState::On, None));
+    assert!(off && !late);
+    assert_eq!(after_off.0, DataApiState::Off);
+    assert!(!main_off && !unknown_off, "main stays on; unknown is false");
+}
+
+/// A row remembers that an enable ever began on it (the bootstrap may have run), so a
+/// `remove` can be refused on a database the data API never touched. Main is bootstrapped
+/// with the branch; switching off keeps the mark.
+#[tokio::test]
+#[ignore]
+async fn rows_remember_an_enable_began() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["one", "two"]).await;
+    let marks = |client: &MetadataClient| {
+        let client = client.clone();
+        async move {
+            client
+                .branch_databases(branch)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|d| (d.name, d.data_api_bootstrapped))
+                .collect::<Vec<_>>()
+        }
+    };
+    let before = marks(&client).await;
+    client.begin_enable_data_api(branch, "one", 10).await.unwrap();
+    client.finish_enable_data_api(branch, "one", Err("boom".into())).await.unwrap();
+    client.set_data_api_off(branch, "one").await.unwrap();
+    let after = marks(&client).await;
+    cleanup(&client, id).await;
+    let m = |n: &str, b: bool| (n.to_string(), b);
+    assert_eq!(before, vec![m("db", true), m("one", false), m("two", false)]);
+    assert_eq!(after, vec![m("db", true), m("one", true), m("two", false)]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn served_databases_lists_on_only_main_first() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["b_on", "a_on", "c_off", "d_enabling"]).await;
+    for name in ["b_on", "a_on"] {
+        client.begin_enable_data_api(branch, name, 10).await.unwrap();
+        client.finish_enable_data_api(branch, name, Ok(())).await.unwrap();
+    }
+    client.begin_enable_data_api(branch, "d_enabling", 10).await.unwrap();
+    assert!(client.set_database_default_schema(branch, "a_on", "app").await.unwrap());
+    let served = client.served_databases(branch).await.unwrap();
+    let none = client.served_databases(BranchId::new()).await.unwrap();
+    cleanup(&client, id).await;
+    let s = |n: &str, d: &str| ServedDatabase { name: n.into(), default_schema: d.into() };
+    assert_eq!(served, vec![s("db", "public"), s("a_on", "app"), s("b_on", "public")]);
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn default_schema_check() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let mut rejected = 0;
+    for bad in ["Public", "1abc", "", &"a".repeat(64), "a-b"] {
+        if matches!(client.set_database_default_schema(branch, "db", bad).await, Err(MetadataError::Database(_))) {
+            rejected += 1;
+        }
+    }
+    let edge = client.set_database_default_schema(branch, "db", &format!("_{}", "a".repeat(62))).await.unwrap();
+    let ok = client.set_database_default_schema(branch, "db", "_app_1").await.unwrap();
+    let unknown = client.set_database_default_schema(branch, "nope", "app").await.unwrap();
+    let after = state_of(&client, branch, "db").await.2;
+    cleanup(&client, id).await;
+    assert_eq!(rejected, 5);
+    assert!(edge && ok && !unknown);
+    assert_eq!(after, "_app_1");
+}
+
+#[tokio::test]
+#[ignore]
+async fn child_copies_parent_flags() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let parent = main_of(id);
+    add_databases(&client, &ep, &["served", "pending", "plain"]).await;
+    client.begin_enable_data_api(parent, "served", 10).await.unwrap();
+    client.finish_enable_data_api(parent, "served", Ok(())).await.unwrap();
+    client.set_database_default_schema(parent, "served", "app").await.unwrap();
+    client.set_database_default_schema(parent, "db", "main_schema").await.unwrap();
+    client.begin_enable_data_api(parent, "pending", 10).await.unwrap();
+
+    let b = new_branch(id, "child", parent);
+    assert_eq!(client.create_branch(&b).await.unwrap(), CreateBranchOutcome::Created);
+    let child_ep = link_branch(&client, b.id).await;
+    // The child's main row is served at once, with the parent's schema.
+    let main_at_creation = state_of(&client, b.id, "db").await;
+    // The first resync brings the other rows in, all off.
+    add_databases(&client, &child_ep, &["served", "pending", "plain", "extra"]).await;
+    let before = (state_of(&client, b.id, "served").await.0, state_of(&client, b.id, "pending").await.0);
+    client.copy_parent_database_flags(b.id).await.unwrap();
+    let served = state_of(&client, b.id, "served").await;
+    let pending = state_of(&client, b.id, "pending").await;
+    let plain = state_of(&client, b.id, "plain").await;
+    let extra = state_of(&client, b.id, "extra").await;
+    let main = state_of(&client, b.id, "db").await;
+    let parent_pending = state_of(&client, parent, "pending").await.0;
+    // A branch with no parent is a no-op.
+    client.copy_parent_database_flags(parent).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(main_at_creation, (DataApiState::On, None, "main_schema".to_string()));
+    assert_eq!(before, (DataApiState::Off, DataApiState::Off));
+    assert_eq!(served, (DataApiState::On, None, "app".to_string()));
+    assert_eq!(pending.0, DataApiState::Off);
+    assert_eq!(plain.0, DataApiState::Off);
+    assert_eq!(extra, (DataApiState::Off, None, "public".to_string()));
+    assert_eq!(main, (DataApiState::On, None, "main_schema".to_string()));
+    assert_eq!(parent_pending, DataApiState::Enabling, "the parent keeps its own state");
+}
+
+#[tokio::test]
+#[ignore]
+async fn key_lists_follow_renames() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["a", "b"]).await;
+    let other = ready_branch(&client, id, "other", branch).await;
+    let listed = key_with(branch, "service_role", "listed", Some(&["a", "b"]));
+    let every = key_with(branch, "service_role", "every", None);
+    let elsewhere = key_with(other, "service_role", "elsewhere", Some(&["a"]));
+    for k in [&listed, &every, &elsewhere] {
+        client.insert_data_key(k).await.unwrap();
+    }
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(tx.rename_database("a", "c").await.unwrap());
+    tx.commit().await.unwrap();
+    let after = key_databases(&client, branch, listed.id).await;
+    let every_after = client.list_data_keys(branch).await.unwrap().into_iter().find(|k| k.id == every.id).unwrap();
+    let other_after = key_databases(&client, other, elsewhere.id).await;
+    cleanup(&client, id).await;
+    assert_eq!(after, Some(vec!["c".to_string(), "b".to_string()]));
+    assert_eq!(every_after.databases, None, "an unlisted key stays unlisted");
+    assert_eq!(other_after, Some(vec!["a".to_string()]), "another branch's keys are untouched");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dropping_the_last_allowed_database_revokes_the_key() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["a", "b"]).await;
+    let only_a = key_with(branch, "service_role", "only-a", Some(&["a"]));
+    let both = key_with(branch, "service_role", "both", Some(&["a", "b"]));
+    let every = key_with(branch, "service_role", "every", None);
+    for k in [&only_a, &both, &every] {
+        client.insert_data_key(k).await.unwrap();
+    }
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(tx.remove_database("a").await.unwrap());
+    tx.commit().await.unwrap();
+    let live = client.list_data_keys(branch).await.unwrap();
+    let revoked_lookup = client.lookup_data_key(&only_a.sha256).await.unwrap();
+    let both_after = live.iter().find(|k| k.id == both.id).and_then(|k| k.databases.clone());
+    let every_live = live.iter().any(|k| k.id == every.id);
+    let only_a_live = live.iter().any(|k| k.id == only_a.id);
+    cleanup(&client, id).await;
+    assert!(!only_a_live && revoked_lookup.is_none());
+    assert_eq!(both_after, Some(vec!["b".to_string()]));
+    assert!(every_live);
+}
+
+#[tokio::test]
+#[ignore]
+async fn rotation_keeps_the_list() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let old = key_with(branch, "service_role", "old", Some(&["db", "x"]));
+    client.insert_data_key(&old).await.unwrap();
+    let (mut new, _) = new_key(branch, DataKeyKind::Secret, "service_role", "old");
+    new.databases = Some(vec!["ignored".into()]);
+    assert!(client.rotate_data_key(branch, old.id, &new).await.unwrap());
+    let after = key_databases(&client, branch, new.id).await;
+    cleanup(&client, id).await;
+    assert_eq!(after, Some(vec!["db".to_string(), "x".to_string()]));
+}
+
+#[tokio::test]
+#[ignore]
+async fn lookup_returns_the_list() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let listed = key_with(branch, "service_role", "listed", Some(&["db"]));
+    let every = key_with(branch, "service_role", "every", None);
+    client.insert_data_key(&listed).await.unwrap();
+    client.insert_data_key(&every).await.unwrap();
+    let l = client.lookup_data_key(&listed.sha256).await.unwrap().expect("listed");
+    let e = client.lookup_data_key(&every.sha256).await.unwrap().expect("every");
+    // set_key_databases: replace, clear, refuse a revoked or unknown key, and the CHECK bounds.
+    let set = client.set_key_databases(branch, listed.id, Some(vec!["x".into(), "y".into()])).await.unwrap();
+    let after_set = client.lookup_data_key(&listed.sha256).await.unwrap().unwrap().databases;
+    let cleared = client.set_key_databases(branch, listed.id, None).await.unwrap();
+    let after_clear = client.lookup_data_key(&listed.sha256).await.unwrap().unwrap().databases;
+    let unknown = client.set_key_databases(branch, uuid::Uuid::new_v4(), None).await.unwrap();
+    let other_branch = client.set_key_databases(BranchId::new(), listed.id, None).await.unwrap();
+    let empty = client.set_key_databases(branch, listed.id, Some(vec![])).await;
+    let too_many = client
+        .set_key_databases(branch, listed.id, Some((0..21).map(|i| format!("d{i}")).collect()))
+        .await;
+    cleanup(&client, id).await;
+    assert_eq!(l.databases, Some(vec!["db".to_string()]));
+    assert_eq!(e.databases, None);
+    assert!(set && cleared && !unknown && !other_branch);
+    assert_eq!(after_set, Some(vec!["x".to_string(), "y".to_string()]));
+    assert_eq!(after_clear, None);
+    assert!(matches!(empty, Err(MetadataError::Database(_))));
+    assert!(matches!(too_many, Err(MetadataError::Database(_))));
+}
+
+#[tokio::test]
+#[ignore]
+async fn branch_connection_lists_served_databases() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["two", "three"]).await;
+    client.begin_enable_data_api(branch, "two", 10).await.unwrap();
+    client.finish_enable_data_api(branch, "two", Ok(())).await.unwrap();
+    client.set_database_default_schema(branch, "two", "app").await.unwrap();
+    let row = client.branch_connection(branch).await.unwrap().expect("row");
+    cleanup(&client, id).await;
+    let s = |n: &str, d: &str| ServedDatabase { name: n.into(), default_schema: d.into() };
+    assert_eq!(row.databases, vec![s("db", "public"), s("two", "app")]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_drop_removes_the_name_from_key_lists() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let resync = |dbs: Vec<ObservedDatabase>| {
+        let client = client.clone();
+        let ep = ep.clone();
+        async move {
+            let (_, v) = client.role_copies(&ep).await.unwrap();
+            client
+                .apply_resync(&ep, branch, v, &ResyncWrite { upserts: vec![], removals: vec![], databases: dbs })
+                .await
+                .unwrap();
+        }
+    };
+    resync(vec![
+        observed("postgres", "cloud_admin", true),
+        observed("db", "postgres", false),
+        observed("a", "app", false),
+        observed("b", "app", false),
+    ])
+    .await;
+    let only_a = key_with(branch, "service_role", "only-a", Some(&["a"]));
+    let both = key_with(branch, "service_role", "both", Some(&["a", "b"]));
+    let every = key_with(branch, "service_role", "every", None);
+    for k in [&only_a, &both, &every] {
+        client.insert_data_key(k).await.unwrap();
+    }
+    resync(vec![
+        observed("postgres", "cloud_admin", true),
+        observed("db", "postgres", false),
+        observed("b", "app", false),
+    ])
+    .await;
+    let live = client.list_data_keys(branch).await.unwrap();
+    let revoked_lookup = client.lookup_data_key(&only_a.sha256).await.unwrap();
+    let both_after = live.iter().find(|k| k.id == both.id).and_then(|k| k.databases.clone());
+    let every_live = live.iter().any(|k| k.id == every.id);
+    let only_a_live = live.iter().any(|k| k.id == only_a.id);
+    cleanup(&client, id).await;
+    assert!(!only_a_live && revoked_lookup.is_none(), "a list emptied by the drop revokes the key");
+    assert_eq!(both_after, Some(vec!["b".to_string()]));
+    assert!(every_live);
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_main_origin_is_served() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    // A row that was `sql` and `off` becomes the main database (the endpoint's first one).
+    sqlx::query("UPDATE branch_databases SET origin = 'sql', data_api = 'off' WHERE branch_id = $1 AND name = 'db'")
+        .bind(branch.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![],
+        removals: vec![],
+        databases: vec![observed("postgres", "cloud_admin", true), observed("db", "postgres", false)],
+    };
+    client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let served = client.served_databases(branch).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(served.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["db"]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn enabling_databases_lists_only_enabling_rows() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    add_databases(&client, &ep, &["pending", "done", "idle"]).await;
+    client.begin_enable_data_api(branch, "pending", 10).await.unwrap();
+    client.begin_enable_data_api(branch, "done", 10).await.unwrap();
+    client.finish_enable_data_api(branch, "done", Ok(())).await.unwrap();
+    let listed = client.enabling_databases().await.unwrap();
+    cleanup(&client, id).await;
+    let mine: Vec<_> = listed.into_iter().filter(|(b, _)| *b == branch).collect();
+    assert_eq!(mine, vec![(branch, "pending".to_string())]);
 }

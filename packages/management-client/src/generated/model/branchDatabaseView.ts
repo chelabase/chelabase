@@ -4,13 +4,26 @@
  * Cheladb Management API
  * OpenAPI spec version: 1
  */
+import type { DataApiState } from './dataApiState.ts';
 import type { DatabaseOrigin } from './databaseOrigin.ts';
 
 /**
  * A Postgres database of a branch.
  */
 export interface BranchDatabaseView {
-  /** The branch's main database: the one the data API serves. */
+  /**
+     * Whether the data API serves it: `off`, `enabling` (the bootstrap is running or will be
+     * retried), `on` or `error` (see `data_api_error`).
+     */
+  data_api: DataApiState;
+  /**
+     * Why the last enable failed; null otherwise.
+     * @nullable
+     */
+  data_api_error: string | null;
+  /** The schema a request to this database uses when it names none. */
+  default_schema: string;
+  /** The branch's main database: always served by the data API. */
   main: boolean;
   name: string;
   origin: DatabaseOrigin;

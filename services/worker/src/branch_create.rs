@@ -453,7 +453,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
-        self.bootstrap_data_api_on(rec.branch, ep, &rec.database_name)
+        let bootstrapped = self
+            .bootstrap_served_on(rec.branch, ep, &rec.database_name, &[])
             .await
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
         phase_done(ep, "bootstrap", phase);
@@ -462,6 +463,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let phase = Instant::now();
         self.sync_child_roles(rec).await?;
         phase_done(ep, "resync", phase);
+        // The resync wrote the child's `branch_databases` rows (all `off`): they take the
+        // parent's flags and schemas now (P3), and the databases it serves are bootstrapped
+        // (main again only when its schema changed).
+        let phase = Instant::now();
+        self.metadata
+            .copy_parent_database_flags(rec.branch)
+            .await
+            .map_err(|e| format!("copying the parent's data API flags: {e}"))?;
+        self.bootstrap_served_on(rec.branch, ep, &rec.database_name, &bootstrapped)
+            .await
+            .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
+        phase_done(ep, "bootstrap_databases", phase);
         Ok(Built::Compute)
     }
 

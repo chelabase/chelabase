@@ -1067,6 +1067,330 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/console/query": {
+      "post": {
+        "tags": [
+          "data-api"
+        ],
+        "summary": "Run a data API request from the console",
+        "description": "Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and can't bypass row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.",
+        "operationId": "consoleQuery",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsoleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The data API's answer: the rows, the written rows or count, a call's result, or a batch's results in order",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON; the data API's `invalid_query` or `invalid_value`: the tree is malformed, the request and its tree name different databases, or Postgres refused a value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `permission_denied` or `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; the data API's `unknown_table` or `unknown_function`, or `unknown_role` when the role was dropped after the check (a passed check is remembered five minutes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`data_api_disabled`: the Postgres database isn't served by the data API (enable it first); `owner_password_unknown`: the owner's password was set in SQL (reset it to view as owner); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; the data API's `conflict` or `retry`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit, or the answer is over the data API's response cap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`invalid_request`: the request isn't `Content-Type: application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body is valid JSON but not the console's shape, `role` is empty, or `role` names the owner (use `role: null`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute or the data API can't be reached right now (`Retry-After`); `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the statement or transaction timeout passed, or the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/console/schema": {
+      "get": {
+        "tags": [
+          "data-api"
+        ],
+        "summary": "The schema the console can show, as the owner or a role",
+        "description": "What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and can't bypass row-level security).",
+        "operationId": "getConsoleSchema",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database; the branch's main database when absent. It must be served by the\ndata API.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "The role whose view to describe; absent: the database's owner.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The schemas, tables, functions and enums the owner (or the role) reaches; each table's `privileges` has one entry, for that role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataApiSchema"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; the data API's `unknown_role` when the role was dropped after the check (a passed check is remembered five minutes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`data_api_disabled`: the Postgres database isn't served by the data API; `owner_password_unknown`: the owner's password was set in SQL (reset it to view as owner); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the query string is malformed, `role` is empty, or `role` names the owner (omit it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute or the data API can't be reached right now, or the database's data API schema is being reinstalled (`Retry-After`); `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/data-api/schema": {
       "get": {
         "tags": [
@@ -1093,6 +1417,15 @@
             "schema": {
               "type": "string",
               "format": "uuid"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database to describe; main when absent. It must be served by the data API.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1138,7 +1471,7 @@
             }
           },
           "404": {
-            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist",
+            "description": "`not_found`: the database (or another tenant's), the branch or the named Postgres database doesn't exist",
             "content": {
               "application/json": {
                 "schema": {
@@ -1148,7 +1481,7 @@
             }
           },
           "409": {
-            "description": "`branch_not_ready`: the branch isn't ready",
+            "description": "`branch_not_ready`: the branch isn't ready; `data_api_disabled`: the named Postgres database isn't served by the data API",
             "content": {
               "application/json": {
                 "schema": {
@@ -1211,7 +1544,7 @@
           "branches"
         ],
         "summary": "List a branch's Postgres databases",
-        "description": "The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details.",
+        "description": "The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details. Each carries its data API state and default schema.",
         "operationId": "listBranchDatabases",
         "parameters": [
           {
@@ -1527,7 +1860,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the name or role is invalid; `role_refused`: the worker refused the role (the message says why)",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (the message says why)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1683,6 +2016,143 @@
             "bearer": []
           }
         ]
+      },
+      "patch": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "Change which databases a key may reach",
+        "description": "Replaces the key's database list on a secret or the public key. `databases` is required: a list of 1 to 20 databases of the branch (a disabled one is allowed; it is just not served), or null for every served database. Rest forgets the branch's cached state when the list changes. The gateway caches a key for up to 30 seconds, so a narrowed list applies to new requests within 30 seconds of the answer, not at once.",
+        "operationId": "updateKey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "key_id",
+            "in": "path",
+            "description": "Key id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The key after the change; only the public key carries its full value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataKey"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the key doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: `databases` is missing or isn't null or a list of 1 to 20 distinct names of the branch's databases",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}/rotate": {
@@ -1787,6 +2257,480 @@
           },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}": {
+      "patch": {
+        "tags": [
+          "data-api"
+        ],
+        "summary": "Change a Postgres database's default schema",
+        "description": "Stores the schema a data API request to this database uses when it names none. On a served database the bootstrap re-runs for the new schema (so default privileges cover it) before the answer, and the data API picks the change up at once. Objects already in the new schema get the data API grants only with `grant_existing: true`; that flag with an unchanged schema grants on its existing objects now.",
+        "operationId": "updatePgDatabase",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The Postgres database's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePgDatabaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The database after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchDatabaseView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `conflict`: the worker refused the bootstrap; `data_api_disabled`: `grant_existing` with an unchanged schema on a database the data API does not serve",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body is the wrong shape, `default_schema` isn't `^[a-z_][a-z0-9_]{0,62}$`, or the database is the cluster's own `postgres` (never served)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`unavailable`: the worker failed to bootstrap the new schema; the old one stays",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api": {
+      "post": {
+        "tags": [
+          "data-api"
+        ],
+        "summary": "Serve a Postgres database through the data API",
+        "description": "Marks the database `enabling` and asks the worker to bootstrap it; the answer is 202 at once. Poll the branch's databases for `data_api`: `on`, or `error` with the reason. Pressing it again retries a failed or stuck enable. A database already `on` answers 200 and nothing runs. The branch serves at most `CHELADB_BRANCH_DATA_API_DATABASE_CAP` databases (default 10, main included).",
+        "operationId": "enableDataApi",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The Postgres database's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The database is already served",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchDatabaseView"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The database is `enabling`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchDatabaseView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `conflict`: the branch already serves as many databases as the cap allows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the cluster's own `postgres` database is never served",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "data-api"
+        ],
+        "summary": "Stop serving a Postgres database",
+        "description": "Stops serving the database at once. The `cheladb` schema and the grants stay, so enabling again is instant; `remove=true` also drops the `cheladb` schema and its event trigger (grants to `anon` and `authenticated` stay). Answers 204 after the worker has done it. The branch's main database can't be disabled.",
+        "operationId": "disableDataApi",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The Postgres database's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "remove",
+            "in": "query",
+            "description": "Also drop the `cheladb` machinery in the database",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The database is no longer served"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the query is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the main database is always served, `remove=true` on a database the data API was never enabled on, or the worker refused (the message says why); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the cluster's own `postgres` database is never served",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`unavailable`: the worker failed to do it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
             "content": {
               "application/json": {
                 "schema": {
@@ -3117,12 +4061,30 @@
           "name",
           "owner",
           "origin",
-          "main"
+          "main",
+          "data_api",
+          "data_api_error",
+          "default_schema"
         ],
         "properties": {
+          "data_api": {
+            "$ref": "#/components/schemas/DataApiState",
+            "description": "Whether the data API serves it: `off`, `enabling` (the bootstrap is running or will be\nretried), `on` or `error` (see `data_api_error`)."
+          },
+          "data_api_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last enable failed; null otherwise."
+          },
+          "default_schema": {
+            "type": "string",
+            "description": "The schema a request to this database uses when it names none."
+          },
           "main": {
             "type": "boolean",
-            "description": "The branch's main database: the one the data API serves."
+            "description": "The branch's main database: always served by the data API."
           },
           "name": {
             "type": "string"
@@ -3300,6 +4262,34 @@
           }
         }
       },
+      "ConsoleRequest": {
+        "type": "object",
+        "description": "`POST …/console/query`'s body.",
+        "required": [
+          "tree"
+        ],
+        "properties": {
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Postgres database; null is the branch's main database. The tree may name it\ninstead (both must then agree)."
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The role to run as; null runs as the database's owner."
+          },
+          "tree": {
+            "type": "object",
+            "description": "A data API request: the same JSON `POST /data/v1/query` takes."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateBranchRequest": {
         "type": "object",
         "required": [
@@ -3379,6 +4369,16 @@
           "name"
         ],
         "properties": {
+          "databases": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The Postgres databases the key may reach: 1 to 20 databases of the branch, disabled ones\nincluded. Absent or null is every served database."
+          },
           "name": {
             "type": "string"
           },
@@ -3417,9 +4417,20 @@
           "role",
           "name",
           "prefix",
-          "key"
+          "key",
+          "databases"
         ],
         "properties": {
+          "databases": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The Postgres databases the key may reach; null is every served database."
+          },
           "id": {
             "type": "string",
             "format": "uuid"
@@ -3467,6 +4478,16 @@
           }
         }
       },
+      "DataApiState": {
+        "type": "string",
+        "description": "Whether the data API serves a database of a branch.",
+        "enum": [
+          "off",
+          "enabling",
+          "on",
+          "error"
+        ]
+      },
       "DataKey": {
         "type": "object",
         "description": "A key as listed: `key` only for the public key.",
@@ -3478,12 +4499,23 @@
           "prefix",
           "created_at",
           "last_used_at",
-          "role_blocked"
+          "role_blocked",
+          "databases"
         ],
         "properties": {
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "databases": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The Postgres databases the key may reach; null is every served database."
           },
           "id": {
             "type": "string",
@@ -3543,8 +4575,7 @@
           "max_branches",
           "max_rows",
           "statement_timeout_ms",
-          "max_connections",
-          "default_schema"
+          "max_connections"
         ],
         "properties": {
           "branch_count": {
@@ -3554,9 +4585,6 @@
           },
           "database_id": {
             "$ref": "#/components/schemas/DatabaseId"
-          },
-          "default_schema": {
-            "type": "string"
           },
           "error": {
             "type": [
@@ -3636,13 +4664,9 @@
           "max_branches",
           "max_rows",
           "statement_timeout_ms",
-          "max_connections",
-          "default_schema"
+          "max_connections"
         ],
         "properties": {
-          "default_schema": {
-            "type": "string"
-          },
           "history_window": {
             "type": "integer",
             "format": "int64",
@@ -3776,7 +4800,10 @@
           "role_cap_reached",
           "role_in_use",
           "role_privilege_mismatch",
-          "branch_protected"
+          "branch_protected",
+          "conflict",
+          "data_api_disabled",
+          "owner_password_unknown"
         ]
       },
       "ErrorEnvelope": {
@@ -4088,6 +5115,13 @@
           "kind": {
             "$ref": "#/components/schemas/TableKind"
           },
+          "primary_key": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The primary key's columns, in the key's order; left out when there is none (a view,\nor a table without a key)."
+          },
           "privileges": {
             "type": [
               "object",
@@ -4164,12 +5198,6 @@
         "type": "object",
         "description": "All optional; a missing one is left as it is. `history_window` is in seconds.",
         "properties": {
-          "default_schema": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "history_window": {
             "type": [
               "integer",
@@ -4204,6 +5232,44 @@
               "null"
             ],
             "format": "int64"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateKeyRequest": {
+        "type": "object",
+        "description": "Which databases a key may reach. `databases` has no default, so an empty body can't widen a\nkey to every database by accident.",
+        "required": [
+          "databases"
+        ],
+        "properties": {
+          "databases": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The Postgres databases the key may reach (1 to 20 databases of the branch, disabled ones\nincluded), or null for every served database. Required."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdatePgDatabaseRequest": {
+        "type": "object",
+        "description": "A database's data API settings.",
+        "required": [
+          "default_schema"
+        ],
+        "properties": {
+          "default_schema": {
+            "type": "string",
+            "description": "The schema a request to this database uses when it names none: `^[a-z_][a-z0-9_]{0,62}$`."
+          },
+          "grant_existing": {
+            "type": "boolean",
+            "description": "Also grant the data API roles on the objects already in the schema (default false).\nWithout it, only objects created from now on get grants (through default privileges),\nplus, once per database, the first schema's existing objects (a database whose first\nenable ran while its schema was missing gets that full first grant once the schema\nexists, flag or not). Grants only: it never revokes anything. Sent with an unchanged\n`default_schema` it grants on that schema's existing objects now, and answers 409\n`data_api_disabled` when the database isn't served."
           }
         },
         "additionalProperties": false

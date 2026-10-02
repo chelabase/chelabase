@@ -52,6 +52,7 @@ pnpm install
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
 | `just data-e2e` | Live data API story: keys, queries, generated types, RLS, revoke (needs `just deps-up` and `just dev`) |
 | `just role-e2e` | Live login roles story: create, connect, back a secret key, refused delete, reset, delete (needs `just deps-up` and `just dev`) |
+| `just console-e2e` | Live data API across databases and Studio's console: a second database, a key allowed only on it, console CRUD as owner, `anon` under RLS and other roles, disable (needs `just deps-up` and `just dev`) |
 
 ```bash
 just dev                 # deps + IAM bootstrap + background processes
@@ -304,8 +305,9 @@ POST /data/v1/query, Authorization: Bearer <key>  →  gateway
   ↓ branch_id, role, key_id from the key
   ↓ mint internal identity token (aud: "rest", branch_id, role, key_id)
   ↓ rest service, verified identity
-  ↓ GET internal listener for branch connection (cached 60 s)
-  ↓ pool for the branch (sqlx, as `authenticator`)
+  ↓ GET internal listener for branch connection (cached 60 s): its served databases
+  ↓ the body's top-level "database" (main when omitted): served, and on the key's allow-list
+  ↓ pool for the branch and that database (sqlx, as `authenticator`)
   ↓ BEGIN
   ↓ one round trip: set_config for role, request.jwt.claims, statement_timeout and
   ↓   transaction_timeout; read cheladb.schema_version
@@ -315,11 +317,11 @@ POST /data/v1/query, Authorization: Bearer <key>  →  gateway
   ↓ JSON response
 ```
 
-Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key (cached 30 s) and mints an internal token that `rest` verifies. Unknown keys are also cached 30 s, and cache misses (lookups reaching the internal listener) are limited to 20 per second per client IP; over the limit gets 429.
+Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key (cached 30 s) and mints an internal token that `rest` verifies; the token carries the key's database allow-list, and `rest` enforces it (the gateway never reads bodies). Unknown keys are also cached 30 s, and cache misses (lookups reaching the internal listener) are limited to 20 per second per client IP; over the limit gets 429.
 
 `rest` listens on `127.0.0.1:8085` (internal listener on `:8086`). Its env:
 - `CHELADB_REST_ADDR` and `CHELADB_REST_INTERNAL_ADDR` (the defaults above);
-- `CHELADB_REST_MAX_CONNECTIONS` (default 200): permits shared by every branch's pool, on top of each branch's own `max_connections` setting;
+- `CHELADB_REST_MAX_CONNECTIONS` (default 200): permits shared by every pool, on top of each branch's own `max_connections` setting (one budget for all of the branch's database pools);
 - `CHELADB_REST_MAX_RESPONSE_BYTES` (default 16 MiB): the largest response. Each operation's result is counted as it arrives; the first one past the cap rolls the request back and answers 413 `too_large`.
 
 The gateway answers its own 404 and 405 under `/data/` with the data API's error body (code `invalid_query`).
@@ -338,7 +340,38 @@ Each branch has exactly one live **public key** (role `anon`, safe for browsers)
   - is owner-level: it has `CREATEROLE`, `CREATEDB`, `BYPASSRLS` or `REPLICATION` (`the role <name> is owner-level (owner-level roles can't back a secret key; use a plain role)`).
 - **Rotating a secret key** keeps its role and doesn't run the check or the grant again. A reset or restore rewinds the grant, so the worker's bootstrap grants each live secret key's role again (a role that's gone or now refused is skipped with a warning, and its key stops working).
 - **Revocation:** effective within 30 seconds (the gateway cache).
+- **Database allow-list:** a key may carry a list of the Postgres databases it reaches (both kinds; see "Allow-lists" below). Without one it reaches every served database of the branch.
 - **Lifecycle:** keys belong to the branch, not its timeline, so reset and restore keep them. Deleting a branch deletes its keys.
+
+### Serving more databases
+
+A branch's data API serves its main database, and any other Postgres database of the branch you enable. A database made in SQL (`CREATE DATABASE analytics`) is listed with the branch's databases, not served.
+
+- **Enable:** `POST /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api` answers 202; the worker runs the data API bootstrap in that database (the `cheladb` schema, its event triggers, the default privileges and, the first time, the grants on existing objects, all in that database's `default_schema`). The database's `data_api` reads `enabling`, then `on`, or `error` with `data_api_error` (`GET …/branches/{branch_id}/databases` lists each database's state). Studio's Data API view has the same controls, per database.
+- **Disable:** `DELETE …/pg-databases/{name}/data-api` stops serving at once (the orchestrator tells `rest` to drop the branch's pools and caches; if that call fails, the 60-second connection-info cache bounds the delay). The machinery stays, so enabling again is quick. `?remove=true` also drops the `cheladb` schema and its event triggers; grants already made to `anon` and `authenticated` stay. The main database can't be switched off (409).
+- **The system `postgres` database** can't be enabled (422): `cloud_admin` owns it, so the owner couldn't manage its grants.
+- **Default schema, per database:** `PATCH …/pg-databases/{name}` with `{ "default_schema": "app" }` (the name check is `^[a-z_][a-z0-9_]{0,62}$`). For a served database the bootstrap runs again, so the default privileges cover the new schema; objects already in it are granted only with `"grant_existing": true` (grants only, never revokes). Studio shows the same opt-in as the checkbox "Also grant existing objects in <schema>" next to Save default schema; it clears after a save.
+- **Cap:** at most `CHELADB_BRANCH_DATA_API_DATABASE_CAP` served databases per branch (orchestrator env; default 10, 1–100, main included; each costs `rest` a pool). Over it, enable answers 409 "this branch already serves <n> databases (the cap is <n>)".
+- **Changes made in SQL:** a rename keeps the database's state and default schema, and every key list naming it follows. A drop removes it from every key list; a key whose list would be left empty is revoked (an empty list can't mean "every database"). The resync paths can revoke keys too: a rename seen only by the resync (not by a tracked `ALTER DATABASE … RENAME`) looks like a drop plus a create, and a reset or restore that rewinds a database's creation re-inserts its row. In both cases a key that listed only that database is revoked, and the database comes back with the data API off.
+- **Branches, reset and restore:** a child branch serves what its parent serves (states and default schemas are copied after its first sync), and the bootstrap runs in every served database wherever it runs for main: after each compute (re)creation and from the worker's reconcile.
+
+A request names its database with the top-level `"database"` field (see "Query language"); `GET /data/v1/schema?database=<name>` reads that database's schema, and the response's `databases` lists the served databases the key reaches.
+
+### Allow-lists
+
+- `POST …/keys` takes `"databases": ["analytics"]` (absent or `null`: every served database). `PATCH …/keys/{key_id}` with `{ "databases": [...] | null }` edits either kind, the public key's included; rotation keeps the list.
+- Each name is 1–63 bytes, at most 20 names, no duplicates, and must be a database of the branch (served or not; Studio marks the others "not served"). The system database is refused. An empty list is refused (422).
+- A database that doesn't exist, isn't served, or isn't on the key's list answers 404 `unknown_database` with one text for all three ("the database doesn't exist or isn't served by this key"), so a key can't discover database names.
+- A narrowed list reaches `rest` at once; the gateway's key cache can keep serving the old list for up to 30 seconds (the same window as a revoke).
+
+### Studio's console
+
+Studio's Tables view browses and edits rows in any served database and schema (`POST /v1/databases/{id}/branches/{branch_id}/console/query` with `{ "role": null | "<role>", "database": null | "<name>", "tree": <a data API request> }`). Every operation is allowed, batches included, in one transaction with the data API's `max_rows` and statement timeout. The answer is the data API's.
+
+- **As the owner** (`role: null`, Studio's default): the orchestrator runs the request itself, on a small pool per branch and database (at most 2 connections, closed after 60 seconds idle) with the owner password it holds. Row-level security doesn't apply to the owner. `rest` never sees the owner's password. When the owner's password was set in SQL, Cheladb doesn't know it: 409 `owner_password_unknown` until a reset (`POST …/branches/{branch_id}/reset-password`), which works at once.
+- **As another role** (`anon`, `authenticated`, a plain role you made): the worker checks the role the first time (remembered five minutes) and grants it to `authenticator`; `rest` then runs the request as that role. An owner-level role, or one that doesn't exist, is refused (403 `role_refused`, saying why). A role dropped after its check answers 503 `unavailable` for up to 30 seconds, then 404 `unknown_role`.
+- **Errors:** a database that isn't served is 409 `data_api_disabled` (Studio offers Enable); one that doesn't exist is 404 `not_found`; everything else is the data API's code.
+- **Audit:** every write is logged at `info` (platform user, branch, database, role, operation kind), never the values.
 
 ### Schema model
 
@@ -358,7 +391,7 @@ The first bootstrap of a database also grants the same on what already exists in
 
 ### Query language
 
-One request is one operation: a JSON tree. `"v": 1` is required at the top, and unknown fields are rejected anywhere. A table or function name is `"name"` (in the database's `default_schema`) or `"schema.name"`. These examples are the contract fixtures in `packages/client/fixtures`.
+One request is one operation: a JSON tree. `"v": 1` is required at the top, and unknown fields are rejected anywhere. A table or function name is `"name"` (in the database's `default_schema`) or `"schema.name"`. An optional top-level `"database": "<name>"` picks a served database (main when omitted); inside a `batch` only the top level may name it, so a batch runs in one database. These examples are the contract fixtures in `packages/client/fixtures`.
 
 - **`select`**: `from`, optional `select` (a list of column names or `{"col", "as"}`; omitted means every column), `where`, `orderBy`, `limit`, `offset`.
   ```json
@@ -442,6 +475,8 @@ An `update` or `delete` needs `.where()` or `.all()` before it compiles.
 const db = createClient<Database>({ url, key, types, bigint: true });
 ```
 
+**Other databases:** `db.database("analytics")` returns a client bound to that database (every request carries the top-level `database`). `cheladb gen types --database analytics` generates that database's types; `--all-databases` generates every database the key reaches (`Databases`, one key per database, and a `types` map keyed alike; main is always under the key `main`, whatever its real name). The key must reach main, since the list of databases comes from main's schema response.
+
 See `packages/client/README.md` for details and runtime requirements.
 
 ### Settings
@@ -451,9 +486,8 @@ See `packages/client/README.md` for details and runtime requirements.
 | `max_rows` | 1000 | 1 | 100000 |
 | `statement_timeout_ms` | 8000 | 100 | 120000 |
 | `max_connections` | 5 | 1 | 50 |
-| `default_schema` | `public` | — | must match `^[a-z_][a-z0-9_]{0,62}$` |
 
-Changed with `PATCH /v1/databases/{id}` in Studio's database settings. Every setting takes up to 60 seconds to take effect (the connection-info cache). `max_connections` is per branch: the size of that branch's connection pool. `statement_timeout_ms` also sets Postgres's `transaction_timeout`, so it bounds the whole request: a batch of 50 operations shares one timeout, not 50.
+Changed with `PATCH /v1/databases/{id}` in Studio's database settings; they apply to every database the branch serves. `default_schema` is per Postgres database (`public` by default; see "Serving more databases"). Every setting takes up to 60 seconds to take effect (the connection-info cache). `max_connections` is per branch: one budget shared by that branch's database pools. `statement_timeout_ms` also sets Postgres's `transaction_timeout`, so it bounds the whole request: a batch of 50 operations shares one timeout, not 50.
 
 ### Error responses
 
@@ -469,6 +503,8 @@ The response is `{"error": {"code", "message", "detail"?, "hint"?, "sqlstate"?}}
 | 403 | `permission_denied` | Postgres permission denied (42501). |
 | 404 | `unknown_table` | A table or view that doesn't exist or that the key's role can't reach. |
 | 404 | `unknown_function` | A function that doesn't exist, can't be called through the API, or that the key's role can't execute. |
+| 404 | `unknown_database` | A database that doesn't exist, isn't served, or isn't on the key's allow-list (one text for all three). |
+| 404 | `unknown_role` | Studio's console only: the chosen role doesn't exist (any more). |
 | 409 | `conflict` | Unique (23505), foreign key (23503) or exclusion (23P01) violation. |
 | 409 | `retry` | Serialization failure or deadlock (40001, 40P01). Safe to retry. |
 | 413 | `too_large` | Request body over 1 MiB, or a response over `CHELADB_REST_MAX_RESPONSE_BYTES`. |
@@ -499,10 +535,22 @@ A non-2xx response without this error body (a proxy error page) gets its code fr
 
 `KEEP=1` leaves the database in place.
 
+`just console-e2e` (same needs) checks databases and the console:
+1. `CREATE DATABASE analytics` in SQL is listed, not served; it gets the default schema `app` and is enabled through the API (`postgres` is 422, an unknown name 404).
+2. A secret key allowed only on `analytics` reads it through the gateway, main answers 404 `unknown_database`, and the schema lists `analytics` only; the public key's list is narrowed (effective within the gateway's 30 seconds) and reset.
+3. The console as the owner reads main and `analytics` and inserts, updates, deletes and batches.
+4. As `anon` under row-level security policies: it reads, inserts, updates and deletes only the rows the policies allow.
+5. A plain role reads under its policy; an owner-level role and an unknown role are refused (403); a role dropped after its check answers 404 `unknown_role` once `rest`'s 30-second check cache expires.
+6. An owner password set in SQL answers 409 `owner_password_unknown`; after a reset the owner console works at once.
+7. Main can't be switched off; disabling `analytics` answers 409 `data_api_disabled` in the console and 404 to the key at once; `?remove=true` drops the `cheladb` schema; the database is deleted.
+
+`rest_live` (`cargo test -p rest --test rest_live -- --ignored --test-threads=1`, with the slot's env loaded as `just` does) covers two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
+
 ### Known limits
 
 - **Default privileges:** cover only objects the owner role (`postgres`) creates. Objects created by any other role (a role you made, or a superuser) get no default grants; grant on them yourself.
-- **Settings and schema changes:** up to 60 seconds to take effect (connection-info cache lifetime).
+- **Settings and schema changes:** up to 60 seconds to take effect (connection-info cache lifetime); a disable, a `default_schema` change and a narrowed allow-list are pushed to `rest` at once.
+- **One database per request:** a request (a batch included) runs in one database; to join data, keep it in one database under several schemas.
 - **Revocation lag:** per gateway instance, up to 30 seconds.
 - **IPv6 rate limiting:** the limiter groups IPv6 clients by `/64` prefix; a load balancer in front collapses all clients into one address.
 - **Limiter size:** it remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds). Past that it evicts entries, and an evicted address starts again with a full allowance.

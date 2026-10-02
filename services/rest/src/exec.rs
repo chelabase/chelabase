@@ -1,129 +1,169 @@
-//! One request, one transaction:
+//! One request, one transaction: pick the database (main when the tree names none; it must
+//! be served and on the key's list, else 404 `unknown_database`); `BEGIN`; for a secret
+//! key, refuse an owner-level role ([`OWNER_LEVEL_SQL`]); run the request through
+//! [`cheladb_query::run`] (preamble, schema cache, shape cache, plans, response cap) with
+//! that database's `default_schema`; `COMMIT`.
 //!
-//! 1. `BEGIN`;
-//! 2. one round trip sets the role, the claims, the statement timeout and the transaction
-//!    timeout (the same value: it bounds the whole request) and reads
-//!    `cheladb.schema_version` ([`PREAMBLE_SQL`]);
-//! 3. a schema version not seen before is introspected in the same transaction, and the
-//!    role's view of it computed once;
-//! 4. the tree is planned through the shape cache, keyed by
-//!    `(branch, schema version, role, default_schema, shape hash)`;
-//! 5. each plan runs with its values bound (`max_rows` applied at binding), its result
-//!    counted against the response cap ([`ResponseBudget`]);
-//! 6. `COMMIT`.
-//!
-//! Every plan returns one `text` row: the operation's JSON, sent on unparsed. A batch joins
-//! its results into one array.
+//! The caches are keyed by `(branch, database)`; [`Engine::invalidate`] drops a branch's
+//! connection info, pools, schemas and plans at once.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use cheladb_auth::internal::DataIdentity;
+use cheladb_query::engine::{self, QueryCache, RunAs, RunSettings};
+use cheladb_query::schema::{RoleView, Schema, Visibility};
 use cheladb_types::data_key::DataKeyKind;
 use serde_json::Value;
 use sqlx::{Acquire, PgConnection};
 use uuid::Uuid;
 
-use crate::conn::{AcquireError, ConnError, ConnInfo, ConnSource, Pools};
-use crate::error::{ApiError, SCHEMA_MISSING};
-use crate::query::{Op, parse};
-use crate::schema::{self, IntrospectError, RoleView, Schema};
-use crate::shape::shape_hash;
-use crate::sql::{BindValue, Plan, plan, resolve_bind};
+use crate::conn::{AcquireError, ConnError, ConnInfo, ConnSource, Pools, ServedDatabase};
+use crate::error::ApiError;
 
-/// Schema versions kept (one per branch in the steady state).
-pub const SCHEMA_CACHE: u64 = 1_000;
-/// Shapes kept per branch.
-pub const SHAPES_PER_BRANCH: u32 = 1_000;
-/// Shapes kept across every branch.
-pub const SHAPES_TOTAL: u64 = 50_000;
-/// The largest query response, unless `CHELADB_REST_MAX_RESPONSE_BYTES` says otherwise.
-pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-
-/// What's left of a response's size cap. Each operation's result is counted as it arrives
-/// (Postgres builds it as one value, so it can't be counted sooner); the first past the cap
-/// aborts the request, and its transaction rolls back.
-pub struct ResponseBudget {
-    cap: usize,
-    used: usize,
-}
-
-impl ResponseBudget {
-    pub fn new(cap: usize) -> Self {
-        ResponseBudget { cap, used: 0 }
-    }
-
-    /// Counts `n` more bytes: a 413 `too_large` once the total passes the cap.
-    pub fn take(&mut self, n: usize) -> Result<(), ApiError> {
-        self.used = self.used.saturating_add(n);
-        if self.used <= self.cap {
-            return Ok(());
-        }
-        const MIB: usize = 1024 * 1024;
-        let cap = if self.cap >= MIB && self.cap.is_multiple_of(MIB) {
-            format!("{} MiB", self.cap / MIB)
-        } else {
-            format!("{} bytes", self.cap)
-        };
-        Err(ApiError::new(
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-            "too_large",
-            format!("the response is over {cap}; ask for fewer rows (limit) or fewer columns"),
-        ))
-    }
-}
-
-/// `$1` role, `$2` claims, `$3` statement timeout in ms, also the transaction timeout
-/// (Postgres 17: set inside a transaction, it starts counting then and ends with it).
-/// `set_config` returns its value; the last column is the schema version.
-pub const PREAMBLE_SQL: &str = "SELECT set_config('role', $1, true), \
-     set_config('request.jwt.claims', $2, true), set_config('statement_timeout', $3, true), \
-     set_config('transaction_timeout', $3, true), \
-     (SELECT version::text FROM cheladb.schema_version)";
+#[cfg(test)]
+use cheladb_query::engine::SchemaKey;
+pub use cheladb_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, SCHEMA_CACHE};
 
 /// Whether role `$1` is owner-level: any attribute that bypasses or administers, or
-/// membership in `neon_superuser`. The one wide definition.
+/// membership in `neon_superuser`. The one wide definition. No row: the role doesn't exist.
 pub const OWNER_LEVEL_SQL: &str = "SELECT rolsuper OR rolbypassrls OR rolcreaterole OR rolcreatedb OR rolreplication \
     OR pg_has_role(oid, 'neon_superuser', 'MEMBER') FROM pg_catalog.pg_roles WHERE rolname = $1";
 
 /// How long an owner-level answer is kept.
 const OWNER_LEVEL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn owner_level_cache() -> moka::future::Cache<(Uuid, String), bool> {
+type OwnerLevelCache = moka::future::Cache<(Uuid, String), bool>;
+
+fn owner_level_cache() -> OwnerLevelCache {
     moka::future::Cache::builder()
         .max_capacity(SCHEMA_CACHE * 10)
         .time_to_live(OWNER_LEVEL_TTL)
+        .support_invalidation_closures()
         .build()
 }
 
-/// For a secret key only: refuses a role that is owner-level (cached per branch and role).
-/// `fetch` asks Postgres on a miss.
+/// Whether `role` is owner-level on `branch` (cached), `None` when it doesn't exist (not
+/// cached: it may be created a moment later). `fetch` asks Postgres on a miss.
+async fn owner_level<F, Fut>(
+    cache: &OwnerLevelCache,
+    branch: Uuid,
+    role: &str,
+    fetch: F,
+) -> Result<Option<bool>, ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<bool>, ApiError>>,
+{
+    let key = (branch, role.to_owned());
+    if let Some(v) = cache.get(&key).await {
+        return Ok(Some(v));
+    }
+    let v = fetch().await?;
+    if let Some(v) = v {
+        cache.insert(key, v).await;
+    }
+    Ok(v)
+}
+
+/// For a secret key only: refuses a role that is owner-level. A missing role counts as
+/// plain (the preamble reports it).
 async fn ensure_not_owner_level<F, Fut>(
-    cache: &moka::future::Cache<(Uuid, String), bool>,
+    cache: &OwnerLevelCache,
     data: &DataIdentity,
     fetch: F,
 ) -> Result<(), ApiError>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<bool, ApiError>>,
+    Fut: std::future::Future<Output = Result<Option<bool>, ApiError>>,
 {
     if data.kind != DataKeyKind::Secret {
         return Ok(());
     }
-    let key = (data.branch_id, data.role.clone());
-    let owner = match cache.get(&key).await {
-        Some(v) => v,
-        None => {
-            let v = fetch().await?;
-            cache.insert(key, v).await;
-            v
-        }
-    };
-    if owner {
-        Err(ApiError::role_not_allowed(&data.role))
-    } else {
-        Ok(())
+    match owner_level(cache, data.branch_id, &data.role, fetch).await? {
+        Some(true) => Err(ApiError::role_not_allowed(&data.role)),
+        _ => Ok(()),
     }
+}
+
+/// The console's role must exist and not be owner-level (the secret key's 403).
+async fn ensure_console_role<F, Fut>(
+    cache: &OwnerLevelCache,
+    branch: Uuid,
+    role: &str,
+    fetch: F,
+) -> Result<(), ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<bool>, ApiError>>,
+{
+    match owner_level(cache, branch, role, fetch).await? {
+        None => Err(ApiError::unknown_role(role)),
+        Some(true) => Err(ApiError::role_not_allowed(role)),
+        Some(false) => Ok(()),
+    }
+}
+
+/// Who a console request runs as: `role`, through the secret-key path, with no claims and
+/// no allow-list (the orchestrator checked the caller owns the database).
+fn console_identity(branch: Uuid, role: &str) -> DataIdentity {
+    DataIdentity {
+        branch_id: branch,
+        key_id: Uuid::nil(),
+        kind: DataKeyKind::Secret,
+        role: role.to_owned(),
+        claims: Value::Object(Default::default()),
+        databases: None,
+    }
+}
+
+/// The database a request runs in: `requested`, or main; it must be served and, when the
+/// key has an allow-list, on it.
+fn pick_database<'a>(
+    info: &'a ConnInfo,
+    requested: Option<&str>,
+    allowed: Option<&[String]>,
+) -> Result<&'a ServedDatabase, ApiError> {
+    let name = requested.unwrap_or(&info.database);
+    if allowed.is_some_and(|list| !list.iter().any(|d| d == name)) {
+        return Err(ApiError::unknown_database());
+    }
+    info.served(name).ok_or_else(ApiError::unknown_database)
+}
+
+/// The roles the internal schema route describes: the console's `role`, or `anon` and
+/// `authenticated`.
+fn internal_schema_roles(role: Option<&str>) -> Vec<&str> {
+    match role {
+        Some(role) => vec![role],
+        None => vec!["anon", "authenticated"],
+    }
+}
+
+/// The check a schema read passes first.
+#[derive(Clone, Copy)]
+enum Guard<'a> {
+    None,
+    /// A secret key: its role mustn't be owner-level.
+    Key(&'a DataIdentity),
+    /// The console's role: it must exist and not be owner-level.
+    Console(&'a str),
+}
+
+/// The served databases a key may reach, main first.
+fn reachable(info: &ConnInfo, allowed: Option<&[String]>) -> Vec<String> {
+    info.databases
+        .iter()
+        .filter(|d| allowed.is_none_or(|list| list.contains(&d.name)))
+        .map(|d| d.name.clone())
+        .collect()
+}
+
+/// The schema document with the reachable databases' names as `databases`.
+fn with_databases(mut doc: Value, databases: Vec<String>) -> Value {
+    if let Value::Object(map) = &mut doc {
+        map.insert("databases".into(), Value::from(databases));
+    }
+    doc
 }
 
 /// Why a request failed before or while it ran.
@@ -140,81 +180,37 @@ impl From<ApiError> for Failure {
     }
 }
 
-type ShapeKey = (String, String, String, u64);
-
-/// One branch's shapes, and how many were ever inserted (its weight in the global bound).
-struct BranchShapes {
-    plans: moka::sync::Cache<ShapeKey, Arc<Vec<Plan>>>,
-    inserts: AtomicU32,
-}
-
-impl BranchShapes {
-    fn weight(&self) -> u32 {
-        self.inserts
-            .load(Ordering::Relaxed)
-            .clamp(1, SHAPES_PER_BRANCH)
+impl From<cheladb_query::QueryFailure> for Failure {
+    fn from(e: cheladb_query::QueryFailure) -> Self {
+        Failure::Api(e.into())
     }
 }
 
-/// Plans by shape: at most [`SHAPES_PER_BRANCH`] per branch (LRU-like), and about
-/// [`SHAPES_TOTAL`] in all. The global bound weighs each branch by the shapes it has held
-/// (capped at the per-branch bound), refreshed every 50 inserts.
-pub struct ShapeCache {
-    branches: moka::sync::Cache<Uuid, Arc<BranchShapes>>,
-}
-
-impl Default for ShapeCache {
-    fn default() -> Self {
-        ShapeCache {
-            branches: moka::sync::Cache::builder()
-                .max_capacity(SHAPES_TOTAL)
-                .weigher(|_, b: &Arc<BranchShapes>| b.weight())
-                .build(),
-        }
-    }
-}
-
-impl ShapeCache {
-    pub fn get_or_plan(
-        &self,
-        branch: Uuid,
-        key: ShapeKey,
-        make: impl FnOnce() -> Result<Vec<Plan>, crate::sql::PlanError>,
-    ) -> Result<Arc<Vec<Plan>>, crate::sql::PlanError> {
-        let shapes = self.branches.get_with(branch, || {
-            Arc::new(BranchShapes {
-                plans: moka::sync::Cache::new(u64::from(SHAPES_PER_BRANCH)),
-                inserts: AtomicU32::new(0),
-            })
-        });
-        if let Some(plans) = shapes.plans.get(&key) {
-            return Ok(plans);
-        }
-        let plans = Arc::new(make()?);
-        shapes.plans.insert(key, plans.clone());
-        let n = shapes.inserts.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(50) && n <= SHAPES_PER_BRANCH {
-            // Re-weigh the branch.
-            self.branches.insert(branch, shapes);
-        }
-        Ok(plans)
+impl From<ConnError> for Failure {
+    fn from(e: ConnError) -> Self {
+        Failure::Conn(e)
     }
 }
 
 pub struct Engine<S> {
     pools: Pools<S>,
     max_response_bytes: usize,
-    schemas: moka::future::Cache<(Uuid, String), Arc<Schema>>,
-    shapes: ShapeCache,
-    owner_level: moka::future::Cache<(Uuid, String), bool>,
+    cache: QueryCache,
+    owner_level: OwnerLevelCache,
 }
 
-fn introspect_error(e: IntrospectError, request_id: &str) -> ApiError {
-    match e {
-        IntrospectError::Db(e) => ApiError::from_sqlx(e, request_id),
-        IntrospectError::Decode(e) => ApiError::internal(request_id, e),
+/// The request limits from the branch's connection info, for `database`.
+fn run_settings(info: &ConnInfo, database: &ServedDatabase) -> RunSettings {
+    RunSettings {
+        max_rows: info.settings.max_rows,
+        statement_timeout_ms: info.settings.statement_timeout_ms,
+        default_schema: database.default_schema.clone(),
     }
 }
+
+/// What a schema read returns: the schema, each role's view, the database's
+/// `default_schema` and the connection info it was read with.
+type Schemas = (Arc<Schema>, Vec<Arc<RoleView>>, String, Arc<ConnInfo>);
 
 impl<S: ConnSource> Engine<S> {
     /// `max_connections` caps connections across every branch. Responses are capped at
@@ -223,8 +219,7 @@ impl<S: ConnSource> Engine<S> {
         Engine {
             pools: Pools::new(source, max_connections),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
-            schemas: moka::future::Cache::new(SCHEMA_CACHE),
-            shapes: ShapeCache::default(),
+            cache: QueryCache::default(),
             owner_level: owner_level_cache(),
         }
     }
@@ -235,83 +230,77 @@ impl<S: ConnSource> Engine<S> {
         self
     }
 
-    async fn acquire(&self, branch: Uuid, request_id: &str) -> Result<crate::conn::Conn, Failure> {
+    /// Drops everything held for `branch`: connection info, pools, schemas, plans and
+    /// owner-level answers (its slots stay, resized by the next info). The next request asks
+    /// the orchestrator again.
+    pub async fn invalidate(&self, branch: Uuid) {
+        self.pools.invalidate(branch).await;
+        self.cache.invalidate_branch(branch);
+        let _ = self
+            .owner_level
+            .invalidate_entries_if(move |k, _| k.0 == branch);
+    }
+
+    /// The served database a request runs in (see [`pick_database`]), with the branch's
+    /// connection info.
+    async fn database(
+        &self,
+        branch: Uuid,
+        requested: Option<&str>,
+        allowed: Option<&[String]>,
+    ) -> Result<(Arc<ConnInfo>, ServedDatabase), Failure> {
+        let mut info = self.pools.info(branch).await?;
+        let listed = |name: &str| allowed.is_none_or(|list| list.iter().any(|d| d == name));
+        // A database enabled since the info was cached: look again, at most every
+        // INFO_REFRESH_AFTER per branch (the orchestrator's invalidate may not have reached us).
+        if let Some(name) = requested
+            && listed(name)
+            && info.served(name).is_none()
+            && let Some(fresh) = self.pools.refresh_stale(branch).await?
+        {
+            info = fresh;
+        }
+        let database = pick_database(&info, requested, allowed)?.clone();
+        Ok((info, database))
+    }
+
+    async fn acquire(
+        &self,
+        branch: Uuid,
+        database: &str,
+        request_id: &str,
+    ) -> Result<crate::conn::Conn, Failure> {
         self.pools
-            .acquire(branch)
+            .acquire(branch, database)
             .await
             .map_err(|e| acquire_failure(e, branch, request_id))
     }
 
-    /// Sets the role (`none` = stay `authenticator`), the claims and the timeout, and reads
-    /// the schema version.
-    async fn preamble(
+    /// Asks Postgres whether `role` is owner-level (`None`: it doesn't exist).
+    async fn fetch_owner_level(
         conn: &mut PgConnection,
-        info: &ConnInfo,
         role: &str,
-        claims: &str,
         request_id: &str,
-    ) -> Result<String, ApiError> {
-        let row: Result<(String, String, String, String, Option<String>), _> =
-            sqlx::query_as(PREAMBLE_SQL)
-                .bind(role)
-                .bind(claims)
-                .bind(info.settings.statement_timeout_ms.to_string())
-                .fetch_one(conn)
-                .await;
-        match row {
-            Ok((_, _, _, _, Some(version))) => Ok(version),
-            Ok((_, _, _, _, None)) => Err(ApiError::unavailable(SCHEMA_MISSING)),
-            Err(sqlx::Error::Database(db)) => Err(preamble_failure(db.as_ref(), role, request_id)),
-            Err(e) => Err(ApiError::from_sqlx(e, request_id)),
-        }
+    ) -> Result<Option<bool>, ApiError> {
+        let row: Option<(Option<bool>,)> = sqlx::query_as(OWNER_LEVEL_SQL)
+            .bind(role)
+            .fetch_optional(conn)
+            .await
+            .map_err(|e| ApiError::from_sqlx(e, request_id))?;
+        Ok(row.map(|r| r.0.unwrap_or(false)))
     }
 
-    /// The owner-level check, in the request's transaction; a missing role counts as plain
-    /// (the preamble reports it).
+    /// The owner-level check, in the request's transaction.
     async fn check_owner_level(
         &self,
         conn: &mut PgConnection,
         data: &DataIdentity,
         request_id: &str,
     ) -> Result<(), ApiError> {
-        ensure_not_owner_level(&self.owner_level, data, || async {
-            let row: Option<(Option<bool>,)> = sqlx::query_as(OWNER_LEVEL_SQL)
-                .bind(&data.role)
-                .fetch_optional(conn)
-                .await
-                .map_err(|e| ApiError::from_sqlx(e, request_id))?;
-            Ok(row.and_then(|r| r.0).unwrap_or(false))
+        ensure_not_owner_level(&self.owner_level, data, || {
+            Self::fetch_owner_level(conn, &data.role, request_id)
         })
         .await
-    }
-
-    async fn schema(
-        &self,
-        conn: &mut PgConnection,
-        branch: Uuid,
-        version: String,
-        request_id: &str,
-    ) -> Result<Arc<Schema>, ApiError> {
-        self.schemas
-            .try_get_with((branch, version.clone()), async {
-                schema::introspect(conn, version).await.map(Arc::new)
-            })
-            .await
-            .map_err(|e| match Arc::try_unwrap(e) {
-                Ok(e) => introspect_error(e, request_id),
-                Err(e) => ApiError::internal(request_id, e),
-            })
-    }
-
-    async fn view(
-        conn: &mut PgConnection,
-        schema: &Schema,
-        role: &str,
-        request_id: &str,
-    ) -> Result<Arc<RoleView>, ApiError> {
-        schema::role_view(conn, schema, role)
-            .await
-            .map_err(|e| introspect_error(e, request_id))
     }
 
     /// `POST /data/v1/query`: the JSON result, unparsed.
@@ -321,117 +310,189 @@ impl<S: ConnSource> Engine<S> {
         request_id: &str,
         body: &[u8],
     ) -> Result<String, Failure> {
-        let op = parse(body).map_err(ApiError::from)?;
+        let parsed = cheladb_query::parse(body).map_err(ApiError::from)?;
+        let (_, database) = self
+            .database(
+                data.branch_id,
+                parsed.database.as_deref(),
+                data.databases.as_deref(),
+            )
+            .await?;
+        self.run(data, &database, &parsed.op, false, request_id).await
+    }
+
+    /// The internal console route: `tree` as `role` in `database` (main when neither it nor
+    /// the tree names one), with no allow-list. The role must exist and not be owner-level.
+    pub async fn console(
+        &self,
+        branch: Uuid,
+        role: &str,
+        database: Option<&str>,
+        tree: &Value,
+        request_id: &str,
+    ) -> Result<String, Failure> {
+        let body = serde_json::to_vec(tree)
+            .map_err(|e| ApiError::invalid_query(format!("the tree: {e}")))?;
+        let parsed = cheladb_query::parse(&body).map_err(ApiError::from)?;
+        let requested = match (database, parsed.database.as_deref()) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(ApiError::invalid_query(
+                    "the request and its tree name different databases",
+                )
+                .into());
+            }
+            (a, b) => a.or(b),
+        };
+        let (_, served) = self.database(branch, requested, None).await?;
+        let data = console_identity(branch, role);
+        self.run(&data, &served, &parsed.op, true, request_id).await
+    }
+
+    /// Runs `op` in `database` as `data`'s role, in one transaction. `console`: the role
+    /// must also exist.
+    async fn run(
+        &self,
+        data: &DataIdentity,
+        database: &ServedDatabase,
+        op: &cheladb_query::Op,
+        console: bool,
+        request_id: &str,
+    ) -> Result<String, Failure> {
         let branch = data.branch_id;
-        let mut conn = self.acquire(branch, request_id).await?;
+        let mut conn = self.acquire(branch, &database.name, request_id).await?;
         let info = conn.info.clone();
         let mut tx = conn
             .conn
             .begin()
             .await
             .map_err(|e| ApiError::from_sqlx(e, request_id))?;
-        let claims = data.claims.to_string();
-        self.check_owner_level(&mut tx, data, request_id).await?;
-        let version = Self::preamble(&mut tx, &info, &data.role, &claims, request_id).await?;
-        let schema = self
-            .schema(&mut tx, branch, version.clone(), request_id)
+        if console {
+            ensure_console_role(&self.owner_level, branch, &data.role, || {
+                Self::fetch_owner_level(&mut tx, &data.role, request_id)
+            })
             .await?;
-        let view = Self::view(&mut tx, &schema, &data.role, request_id).await?;
-        let default_schema = &info.settings.default_schema;
-        let key = (
-            version,
-            data.role.clone(),
-            default_schema.clone(),
-            shape_hash(&op),
-        );
-        let plans = self
-            .shapes
-            .get_or_plan(branch, key, || plan(&op, view.as_ref(), default_schema))
-            .map_err(ApiError::from)?;
-        let mut results = Vec::with_capacity(plans.len());
-        // Each result, and a separator or bracket next to it.
-        let mut budget = ResponseBudget::new(self.max_response_bytes);
-        for p in plans.iter() {
-            let result = run(&mut tx, &op, p, info.settings.max_rows, request_id).await?;
-            budget.take(result.len() + 1)?;
-            results.push(result);
+        } else {
+            self.check_owner_level(&mut tx, data, request_id).await?;
         }
+        let out = cheladb_query::run(
+            &mut tx,
+            &self.cache,
+            (branch, &database.name),
+            RunAs::Role {
+                role: &data.role,
+                claims: &data.claims,
+            },
+            &run_settings(&info, database),
+            self.max_response_bytes,
+            op,
+            request_id,
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(|e| ApiError::from_sqlx(e, request_id))?;
-        Ok(match op {
-            Op::Batch(_) => format!("[{}]", results.join(",")),
-            _ => results.pop().unwrap_or_else(|| "null".into()),
-        })
+        Ok(out)
     }
 
-    /// `GET /data/v1/schema`: what the key's role can reach, without privileges.
+    /// `GET /data/v1/schema?database=`: what the key's role can reach in the database,
+    /// without privileges, and the databases the key may reach (`databases`).
     pub async fn role_schema(
         &self,
         data: &DataIdentity,
+        database: Option<&str>,
         request_id: &str,
     ) -> Result<Value, Failure> {
-        let (schema, views, info_default) = self
+        let allowed = data.databases.as_deref();
+        let (_, served) = self.database(data.branch_id, database, allowed).await?;
+        let (schema, views, default_schema, info) = self
             .schemas_for(
                 data.branch_id,
+                &served,
                 &data.role,
                 &[&data.role],
-                Some(data),
+                Guard::Key(data),
                 request_id,
             )
             .await?;
-        let roles: Vec<(&str, &schema::Visibility)> =
-            vec![(data.role.as_str(), &views[0].visibility)];
-        Ok(schema.to_json(&info_default, &roles, false))
+        let roles: Vec<(&str, &Visibility)> = vec![(data.role.as_str(), &views[0].visibility)];
+        Ok(with_databases(
+            schema.to_json(&default_schema, &roles, false),
+            reachable(&info, allowed),
+        ))
     }
 
-    /// The internal `GET /internal/schema/{branch}`: everything `anon` or `authenticated`
-    /// can reach, with what each holds.
-    pub async fn branch_schema(&self, branch: Uuid, request_id: &str) -> Result<Value, Failure> {
-        let (schema, views, info_default) = self
-            .schemas_for(
-                branch,
-                "none",
-                &["anon", "authenticated"],
-                None,
-                request_id,
-            )
+    /// The internal `GET /internal/schema/{branch}?database=&role=`: everything `anon` or
+    /// `authenticated` can reach in the database (main by default), with what each holds; with
+    /// `role` (the console's), what that role reaches. The role must exist and not be
+    /// owner-level, as on the console route.
+    pub async fn branch_schema(
+        &self,
+        branch: Uuid,
+        database: Option<&str>,
+        role: Option<&str>,
+        request_id: &str,
+    ) -> Result<Value, Failure> {
+        let (_, served) = self.database(branch, database, None).await?;
+        let names = internal_schema_roles(role);
+        let guard = role.map_or(Guard::None, Guard::Console);
+        let (schema, views, default_schema, _) = self
+            .schemas_for(branch, &served, "none", &names, guard, request_id)
             .await?;
-        let roles: Vec<(&str, &schema::Visibility)> = vec![
-            ("anon", &views[0].visibility),
-            ("authenticated", &views[1].visibility),
-        ];
-        Ok(schema.to_json(&info_default, &roles, true))
+        let roles: Vec<(&str, &Visibility)> = names
+            .iter()
+            .zip(&views)
+            .map(|(name, view)| (*name, &view.visibility))
+            .collect();
+        Ok(schema.to_json(&default_schema, &roles, true))
     }
 
     async fn schemas_for(
         &self,
         branch: Uuid,
+        database: &ServedDatabase,
         role: &str,
         roles: &[&str],
-        guard: Option<&DataIdentity>,
+        guard: Guard<'_>,
         request_id: &str,
-    ) -> Result<(Arc<Schema>, Vec<Arc<RoleView>>, String), Failure> {
-        let mut conn = self.acquire(branch, request_id).await?;
+    ) -> Result<Schemas, Failure> {
+        let mut conn = self.acquire(branch, &database.name, request_id).await?;
         let info = conn.info.clone();
         let mut tx = conn
             .conn
             .begin()
             .await
             .map_err(|e| ApiError::from_sqlx(e, request_id))?;
-        if let Some(data) = guard {
-            self.check_owner_level(&mut tx, data, request_id).await?;
+        match guard {
+            Guard::None => {}
+            Guard::Key(data) => self.check_owner_level(&mut tx, data, request_id).await?,
+            Guard::Console(role) => {
+                ensure_console_role(&self.owner_level, branch, role, || {
+                    Self::fetch_owner_level(&mut tx, role, request_id)
+                })
+                .await?
+            }
         }
-        let version = Self::preamble(&mut tx, &info, role, "{}", request_id).await?;
-        let schema = self.schema(&mut tx, branch, version, request_id).await?;
+        let claims = Value::Object(Default::default());
+        let (schema, _, _) = cheladb_query::load_schema(
+            &mut tx,
+            &self.cache,
+            (branch, &database.name),
+            RunAs::Role {
+                role,
+                claims: &claims,
+            },
+            info.settings.statement_timeout_ms,
+            request_id,
+        )
+        .await?;
         let mut views = Vec::new();
         for r in roles {
-            views.push(Self::view(&mut tx, &schema, r, request_id).await?);
+            views.push(engine::view(&mut tx, &schema, r, request_id).await?);
         }
         tx.commit()
             .await
             .map_err(|e| ApiError::from_sqlx(e, request_id))?;
-        Ok((schema, views, info.settings.default_schema.clone()))
+        Ok((schema, views, database.default_schema.clone(), info))
     }
 }
 
@@ -443,6 +504,7 @@ fn acquire_failure(e: AcquireError, branch: Uuid, request_id: &str) -> Failure {
             ApiError::unavailable("no connection to the branch's database in time; try again")
                 .into()
         }
+        AcquireError::NotServed => ApiError::unknown_database().into(),
         AcquireError::Busy => {
             ApiError::unavailable("too many connections in use; try again").into()
         }
@@ -453,70 +515,12 @@ fn acquire_failure(e: AcquireError, branch: Uuid, request_id: &str) -> Failure {
     }
 }
 
-/// The preamble failed in Postgres: the machinery schema is missing, or the key's role
-/// can't be used. Postgres's text goes to the log only.
-fn preamble_failure(db: &dyn sqlx::error::DatabaseError, role: &str, request_id: &str) -> ApiError {
-    let code = db.code().unwrap_or_default();
-    let message = db.message();
-    if matches!(code.as_ref(), "42P01" | "3F000")
-        || message.contains("cheladb")
-        || message.contains("schema_version")
-    {
-        return ApiError::unavailable(SCHEMA_MISSING);
-    }
-    if crate::error::classify(&code).is_some_and(|(status, _)| status == 503) {
-        return ApiError::from_database(db, request_id);
-    }
-    // The key's role is gone or not granted to authenticator (a restore can rewind the
-    // grant until the bootstrap runs again).
-    tracing::warn!(request_id, role, "the preamble failed: {code}: {message}");
-    ApiError::unavailable(format!(
-        "the key's role {role} can't be used right now; try again"
-    ))
-}
-
-/// Runs one plan with `op`'s values: its one `text` row, or `null` for a NULL (a call to a
-/// `void` function).
-async fn run(
-    conn: &mut PgConnection,
-    op: &Op,
-    p: &Plan,
-    max_rows: i64,
-    request_id: &str,
-) -> Result<String, ApiError> {
-    let mut q = sqlx::query_scalar::<_, Option<String>>(
-        // The planner's text: names from the catalog, quoted; every value a parameter.
-        sqlx::AssertSqlSafe(p.sql.as_str()),
-    );
-    for bind in &p.binds {
-        q = match resolve_bind(op, bind, max_rows) {
-            Some(BindValue::Text(v)) => q.bind(v.map(|v| v.into_owned())),
-            Some(BindValue::Json(v)) => q.bind(sqlx::types::Json(v)),
-            Some(BindValue::Int(v)) => q.bind(v),
-            None => {
-                return Err(ApiError::internal(
-                    request_id,
-                    format!("a cached plan doesn't fit the tree: {bind:?}"),
-                ));
-            }
-        };
-    }
-    let out = q
-        .fetch_one(conn)
-        .await
-        .map_err(|e| ApiError::from_sqlx(e, request_id))?;
-    Ok(out.unwrap_or_else(|| "null".into()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn key(role: &str, hash: u64) -> ShapeKey {
-        ("v1".into(), role.into(), "public".into(), hash)
-    }
-
-    /// Failing to connect, or a role Postgres refuses, answers a fixed message.
+    /// Failing to connect answers a fixed message (the preamble's half of this test is in
+    /// `cheladb_query::engine`).
     #[test]
     fn connection_and_role_failures_are_fixed_messages() {
         const SECRET: &str = "10.1.2.3:5432: permission denied to set role \"x\"";
@@ -526,87 +530,8 @@ mod tests {
         };
         assert_eq!(e.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(!e.message.contains("10.1.2.3"), "{}", e.message);
-        let db = crate::error::tests::FakeDb {
-            code: "42501",
-            message: SECRET,
-        };
-        let e = preamble_failure(&db, "x", "rid-1");
-        assert_eq!(e.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            !e.message.contains("10.1.2.3") && e.message.contains("x"),
-            "{}",
-            e.message
-        );
-        let missing = crate::error::tests::FakeDb {
-            code: "42P01",
-            message: "relation \"cheladb.schema_version\" does not exist",
-        };
-        assert_eq!(
-            preamble_failure(&missing, "x", "rid-1").message,
-            SCHEMA_MISSING
-        );
     }
 
-    /// The preamble bounds the whole transaction (a batch of slow statements included) with
-    /// the same setting as each statement.
-    #[test]
-    fn preamble_sets_the_transaction_timeout() {
-        assert!(
-            PREAMBLE_SQL.contains("set_config('statement_timeout', $3, true)")
-                && PREAMBLE_SQL.contains("set_config('transaction_timeout', $3, true)"),
-            "{PREAMBLE_SQL}"
-        );
-    }
-
-    #[test]
-    fn the_response_budget_refuses_past_the_cap() {
-        assert_eq!(DEFAULT_MAX_RESPONSE_BYTES, 16 * 1024 * 1024);
-        let mut budget = ResponseBudget::new(10);
-        budget.take(4).unwrap();
-        budget.take(6).unwrap();
-        let e = budget.take(1).unwrap_err();
-        assert_eq!(e.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(e.code, "too_large");
-        assert!(e.message.contains("10 bytes"), "{}", e.message);
-        let e = ResponseBudget::new(DEFAULT_MAX_RESPONSE_BYTES)
-            .take(DEFAULT_MAX_RESPONSE_BYTES + 1)
-            .unwrap_err();
-        assert!(e.message.contains("16 MiB"), "{}", e.message);
-    }
-
-    #[test]
-    fn shape_cache_plans_once_per_key_and_keeps_roles_apart() {
-        let cache = ShapeCache::default();
-        let branch = Uuid::new_v4();
-        let made = std::cell::Cell::new(0);
-        let get = |branch: Uuid, role: &str, hash: u64| {
-            cache
-                .get_or_plan(branch, key(role, hash), || {
-                    made.set(made.get() + 1);
-                    Ok(vec![])
-                })
-                .unwrap()
-        };
-        get(branch, "anon", 1);
-        get(branch, "anon", 1);
-        assert_eq!(made.get(), 1);
-        get(branch, "authenticated", 1);
-        get(branch, "anon", 2);
-        assert_eq!(made.get(), 3);
-        // Another branch never shares a plan.
-        get(Uuid::new_v4(), "anon", 1);
-        assert_eq!(made.get(), 4);
-        // A planning error isn't cached.
-        let err = cache.get_or_plan(branch, key("anon", 3), || {
-            Err(crate::sql::PlanError::UnknownTable("t".into()))
-        });
-        assert!(err.is_err());
-        assert!(
-            cache
-                .get_or_plan(branch, key("anon", 3), || Ok(vec![]))
-                .is_ok()
-        );
-    }
     #[test]
     fn owner_level_sql_is_pinned() {
         for needle in [
@@ -629,6 +554,7 @@ mod tests {
             kind,
             role: role.into(),
             claims: serde_json::json!({}),
+            databases: None,
         }
     }
 
@@ -648,7 +574,7 @@ mod tests {
             async move {
                 ensure_not_owner_level(cache, &data, || async {
                     queries.set(queries.get() + 1);
-                    Ok(answer)
+                    Ok(Some(answer))
                 })
                 .await
             }
@@ -674,10 +600,200 @@ mod tests {
         let r = ensure_not_owner_level(&cache, &data, || async {
             panic!("a publishable key must not be checked");
             #[allow(unreachable_code)]
-            Ok(true)
+            Ok(Some(true))
         })
         .await;
         assert!(r.is_ok());
     }
 
+    /// The console runs as the role it names, through the secret-key path: an owner-level
+    /// role gets the same 403 as a secret key's, and a missing role is refused.
+    #[tokio::test]
+    async fn console_route_runs_as_the_role_and_refuses_owner_level() {
+        let branch = Uuid::new_v4();
+        let id = console_identity(branch, "editor");
+        assert_eq!(id.branch_id, branch);
+        assert_eq!(id.kind, DataKeyKind::Secret);
+        assert_eq!(id.role, "editor");
+        assert_eq!(id.databases, None);
+        assert_eq!(id.claims, serde_json::json!({}));
+
+        let cache = owner_cache();
+        let plain = ensure_console_role(&cache, branch, "editor", || async { Ok(Some(false)) });
+        assert!(plain.await.is_ok());
+        let e = ensure_console_role(&cache, branch, "boss", || async { Ok(Some(true)) })
+            .await
+            .unwrap_err();
+        assert_eq!(e, ApiError::role_not_allowed("boss"));
+        let e = ensure_console_role(&cache, branch, "ghost", || async { Ok(None) })
+            .await
+            .unwrap_err();
+        assert_eq!((e.status.as_u16(), e.code), (404, "unknown_role"));
+        // A missing role isn't cached: created a moment later, it's found.
+        let found = ensure_console_role(&cache, branch, "ghost", || async { Ok(Some(false)) });
+        assert!(found.await.is_ok());
+    }
+
+    /// The internal schema route describes `anon` and `authenticated` by default, or the one
+    /// role the console names (checked like the console's queries).
+    #[test]
+    fn the_internal_schema_describes_the_named_role_or_the_two_api_roles() {
+        assert_eq!(internal_schema_roles(None), vec!["anon", "authenticated"]);
+        assert_eq!(internal_schema_roles(Some("editor")), vec!["editor"]);
+    }
+
+    #[test]
+    fn schema_lists_reachable_databases() {
+        let info = crate::conn::test_support::two_databases();
+        assert_eq!(reachable(&info, None), vec!["main", "analytics"]);
+        let list = vec!["analytics".to_string(), "archive".to_string()];
+        assert_eq!(reachable(&info, Some(&list)), vec!["analytics"]);
+        assert!(reachable(&info, Some(&[])).is_empty());
+
+        let doc = with_databases(serde_json::json!({ "version": "1" }), reachable(&info, None));
+        assert_eq!(doc["databases"], serde_json::json!(["main", "analytics"]));
+        assert_eq!(doc["version"], "1");
+    }
+
+    #[test]
+    fn the_database_is_main_by_default_and_must_be_served_and_listed() {
+        let info = crate::conn::test_support::two_databases();
+        let pick = |requested: Option<&str>, list: Option<&[String]>| {
+            pick_database(&info, requested, list).map(|d| d.name.clone())
+        };
+        assert_eq!(pick(None, None).unwrap(), "main");
+        assert_eq!(pick(Some("analytics"), None).unwrap(), "analytics");
+        let list = vec!["analytics".to_string(), "archive".to_string()];
+        assert_eq!(pick(Some("analytics"), Some(&list)).unwrap(), "analytics");
+        for (requested, list) in [
+            (Some("ghost"), None),
+            (None, Some(&list[..])),
+            (Some("archive"), Some(&list[..])),
+            (None, Some(&[][..])),
+        ] {
+            let e = pick(requested, list).unwrap_err();
+            assert_eq!(e, ApiError::unknown_database(), "{requested:?} {list:?}");
+        }
+    }
+
+    /// Answers `main` alone until `enable` is set, then `main` and `analytics`; counts fetches.
+    struct EnablingSource {
+        enabled: std::sync::atomic::AtomicBool,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConnSource for Arc<EnablingSource> {
+        async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
+            use std::sync::atomic::Ordering;
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let mut info = crate::conn::test_support::two_databases();
+            if !self.enabled.load(Ordering::SeqCst) {
+                info.databases.truncate(1);
+            }
+            Ok(info)
+        }
+    }
+
+    /// A database enabled after the branch's info was cached is found without an invalidate:
+    /// an unknown name re-fetches the info once it is older than [`INFO_REFRESH_AFTER`] (so
+    /// a stream of unknown names asks the orchestrator at most that often).
+    #[tokio::test(start_paused = true)]
+    async fn a_newly_enabled_database_is_found_without_an_invalidate() {
+        use crate::conn::INFO_REFRESH_AFTER;
+        use std::sync::atomic::Ordering;
+        let source = Arc::new(EnablingSource {
+            enabled: false.into(),
+            fetches: 0.into(),
+        });
+        let engine = Engine::new(source.clone(), 10);
+        let branch = Uuid::new_v4();
+        let name = |r: Result<(Arc<ConnInfo>, ServedDatabase), Failure>| match r {
+            Ok((_, d)) => Ok(d.name),
+            Err(Failure::Api(e)) => Err(e.code),
+            Err(Failure::Conn(e)) => panic!("{e}"),
+        };
+        assert_eq!(name(engine.database(branch, None, None).await).unwrap(), "main");
+        source.enabled.store(true, Ordering::SeqCst);
+        // Fresh info: an unknown name is answered from it.
+        assert_eq!(
+            name(engine.database(branch, Some("analytics"), None).await),
+            Err("unknown_database")
+        );
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+        tokio::time::advance(INFO_REFRESH_AFTER + std::time::Duration::from_millis(1)).await;
+        assert_eq!(
+            name(engine.database(branch, Some("analytics"), None).await).unwrap(),
+            "analytics"
+        );
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+        // A name that still isn't served, right after: no new fetch.
+        assert_eq!(
+            name(engine.database(branch, Some("ghost"), None).await),
+            Err("unknown_database")
+        );
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+        // A name off the key's list never re-fetches.
+        tokio::time::advance(INFO_REFRESH_AFTER * 2).await;
+        let list = vec!["main".to_string()];
+        assert_eq!(
+            name(engine.database(branch, Some("ghost"), Some(&list)).await),
+            Err("unknown_database")
+        );
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+    }
+
+    /// One call drops the branch's info, pools, schemas and plans; another branch
+    /// keeps its own.
+    #[tokio::test]
+    async fn invalidate_drops_pools_and_caches_at_once() {
+        use cheladb_query::schema::Raw;
+        let engine = Engine::new(crate::conn::test_support::RefusedSource, 10);
+        let (branch, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let schema_key = |b: Uuid| SchemaKey {
+            branch: b,
+            database: "analytics".into(),
+            version: "1".into(),
+        };
+        let shape_key = |b: Uuid| (schema_key(b), "anon".to_string(), "public".to_string(), 7u64);
+        for b in [branch, other] {
+            engine.pools.warm(b).await;
+            engine
+                .cache
+                .cached_schema(schema_key(b), "rid", async {
+                    Ok(Schema::build("1".into(), Raw::default()))
+                })
+                .await
+                .unwrap();
+            engine.cache.shapes.get_or_plan(shape_key(b), || Ok(vec![])).unwrap();
+            assert_eq!(engine.pools.cached(b).await, (true, 2, true));
+        }
+
+        engine.invalidate(branch).await;
+
+        // The slots stay (connections still held count against the branch).
+        assert_eq!(engine.pools.cached(branch).await, (false, 0, true));
+        assert_eq!(engine.pools.cached(other).await, (true, 2, true));
+        for (b, dropped) in [(branch, true), (other, false)] {
+            let introspected = std::cell::Cell::new(false);
+            engine
+                .cache
+                .cached_schema(schema_key(b), "rid", async {
+                    introspected.set(true);
+                    Ok(Schema::build("1".into(), Raw::default()))
+                })
+                .await
+                .unwrap();
+            assert_eq!(introspected.get(), dropped, "schema of {b}");
+            let planned = std::cell::Cell::new(false);
+            engine
+                .cache
+                .shapes
+                .get_or_plan(shape_key(b), || {
+                    planned.set(true);
+                    Ok(vec![])
+                })
+                .unwrap();
+            assert_eq!(planned.get(), dropped, "plans of {b}");
+        }
+    }
 }

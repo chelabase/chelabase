@@ -330,8 +330,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
-        self.bootstrap_data_api_on(branch, ep, &database_name)
+        self.bootstrap_served_on(branch, ep, &database_name, &[])
             .await
+            .map(|_| ())
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
         // Recorded before the resync: the compute now runs these settings whatever the
         // resync does, and a resync that keeps failing gets a plain `Resync` from reconcile,

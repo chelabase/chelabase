@@ -28,6 +28,9 @@ pub struct ResolvedKey {
     pub branch_id: Uuid,
     pub kind: DataKeyKind,
     pub role: String,
+    /// The key's allow-list; absent or `null` means every database the branch serves.
+    #[serde(default)]
+    pub databases: Option<Vec<String>>,
 }
 
 /// Why a key was refused. Maps to 401 | 401 | 429 | 503.
@@ -231,6 +234,7 @@ pub(crate) mod test_support {
                 "service"
             }
             .to_string(),
+            databases: None,
         }
     }
 
@@ -263,6 +267,7 @@ pub(crate) mod test_support {
                                 Json(serde_json::json!({
                                     "key_id": k.key_id, "branch_id": k.branch_id,
                                     "kind": k.kind.as_str(), "role": k.role,
+                                    "databases": k.databases,
                                 })),
                             )
                                 .into_response_pair(),
@@ -298,6 +303,21 @@ mod tests {
     use std::net::Ipv4Addr;
 
     const IP: Option<IpAddr> = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+
+    /// A lookup answer without `databases` (an orchestrator from before allow-lists) or
+    /// with `null` is a key without a list.
+    #[test]
+    fn a_lookup_without_databases_has_no_list() {
+        let base = serde_json::json!({
+            "key_id": Uuid::nil(), "branch_id": Uuid::nil(), "kind": "secret", "role": "svc",
+        });
+        let k: ResolvedKey = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(k.databases, None);
+        let mut listed = base;
+        listed["databases"] = serde_json::json!(["main"]);
+        let k: ResolvedKey = serde_json::from_value(listed).unwrap();
+        assert_eq!(k.databases, Some(vec!["main".to_string()]));
+    }
 
     #[tokio::test]
     async fn malformed_key_is_401_without_lookup() {

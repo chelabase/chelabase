@@ -11,6 +11,11 @@ import type { DataKeyKind } from './dataKeyKind.ts';
  */
 export interface DataKey {
   created_at: string;
+  /**
+     * The Postgres databases the key may reach; null is every served database.
+     * @nullable
+     */
+  databases: string[] | null;
   id: string;
   /** @nullable */
   key?: string | null;

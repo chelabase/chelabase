@@ -409,6 +409,8 @@ pub mod fake {
         /// `(needle, stdout)`: SQL containing the needle answers with stdout (the first match);
         /// everything else answers "".
         pub answers: Mutex<Vec<(String, String)>>,
+        /// `(database, needle, stdout)`: like `answers`, for one database only; tried first.
+        pub answers_in: Mutex<Vec<(String, String, String)>>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -426,6 +428,16 @@ pub mod fake {
         /// SQL containing `needle` answers `stdout` from now on.
         pub fn answer(&self, needle: &str, stdout: &str) {
             lock(&self.answers).push((needle.to_string(), stdout.to_string()));
+        }
+
+        /// SQL run in `database` containing `needle` answers `stdout` from now on (before any
+        /// [`FakeBackend::answer`]).
+        pub fn answer_in(&self, database: &str, needle: &str, stdout: &str) {
+            lock(&self.answers_in).push((
+                database.to_string(),
+                needle.to_string(),
+                stdout.to_string(),
+            ));
         }
 
         /// From now on, SQL containing `needle` fails with "injected failure" (on top of any
@@ -567,6 +579,12 @@ pub mod fake {
                 database.to_string(),
                 sql.to_string(),
             ));
+            if let Some((_, _, stdout)) = lock(&self.answers_in)
+                .iter()
+                .find(|(db, needle, _)| db == database && sql.contains(needle))
+            {
+                return Ok(stdout.clone());
+            }
             Ok(lock(&self.answers)
                 .iter()
                 .find(|(needle, _)| sql.contains(needle))

@@ -10,6 +10,11 @@ import type { DataKeyKind } from './dataKeyKind.ts';
  * A key just made, with its plaintext.
  */
 export interface CreatedDataKey {
+  /**
+     * The Postgres databases the key may reach; null is every served database.
+     * @nullable
+     */
+  databases: string[] | null;
   id: string;
   key: string;
   kind: DataKeyKind;

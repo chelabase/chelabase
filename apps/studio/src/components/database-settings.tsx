@@ -30,7 +30,6 @@ export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSett
   const [maxRows, setMaxRows] = useState(String(settings.max_rows));
   const [timeoutMs, setTimeoutMs] = useState(String(settings.statement_timeout_ms));
   const [maxConnections, setMaxConnections] = useState(String(settings.max_connections));
-  const [defaultSchema, setDefaultSchema] = useState(settings.default_schema);
   const busy = update.isPending;
   const error = update.error ? errorText(update.error) : null;
   const saved = update.isSuccess;
@@ -42,7 +41,6 @@ export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSett
     maxRows,
     statementTimeoutMs: timeoutMs,
     maxConnections,
-    defaultSchema,
   });
 
   function submit(event: FormEvent) {
@@ -118,15 +116,6 @@ export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSett
             className={`${field} w-24`}
           />
         </label>
-        <label className="flex flex-col gap-1">
-          <span>Default schema</span>
-          <input
-            type="text"
-            value={defaultSchema}
-            onChange={(e) => setDefaultSchema(e.target.value)}
-            className={`${field} w-40`}
-          />
-        </label>
         <Button
           type="submit"
           size="sm"
@@ -149,7 +138,6 @@ export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSett
               parsed.maxRows,
               parsed.statementTimeoutMs,
               parsed.maxConnections,
-              parsed.defaultSchema,
             ]
               .filter((m): m is string => m !== undefined)
               .map((m) => (

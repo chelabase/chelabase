@@ -3,9 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rest::query::Name;
-use rest::schema::{Privileges, RESERVED_SCHEMAS, Raw, Schema, Visibility, is_reserved};
-use rest::sql::{Catalog, FnLookupError};
+use cheladb_query::query::Name;
+use cheladb_query::schema::{
+    INTROSPECT_SQL, Privileges, RESERVED_SCHEMAS, Raw, Schema, Visibility, is_reserved,
+};
+use cheladb_types::data_api_schema::TableDesc;
+use cheladb_query::sql::{Catalog, FnLookupError};
 use serde_json::json;
 
 const PUBLIC: u32 = 2200;
@@ -160,6 +163,7 @@ fn raw() -> Raw {
                     col("ids", 1007, "integer[]"),
                     col("weird", 90004, "\"Weird \"\"T\"\"\""),
                 ],
+                vec![],
             ),
             (
                 SECRETS,
@@ -169,6 +173,7 @@ fn raw() -> Raw {
                 true,
                 false,
                 vec![col("v", 25, "text")],
+                vec![],
             ),
             (
                 INVOICES,
@@ -178,6 +183,7 @@ fn raw() -> Raw {
                 false,
                 false,
                 vec![col("amount", 1700, "numeric")],
+                vec![],
             ),
             (
                 40003,
@@ -187,6 +193,7 @@ fn raw() -> Raw {
                 false,
                 false,
                 vec![col("version", 2950, "uuid")],
+                vec![],
             ),
         ],
         functions: vec![
@@ -513,6 +520,7 @@ fn kinds_and_security_invoker() {
             false,
             invoker,
             vec![col("x", 25, "text")],
+            vec![],
         ));
     }
     let s = Schema::build("v1".into(), r);
@@ -535,4 +543,56 @@ fn kinds_and_security_invoker() {
         assert_eq!(t["kind"], kind, "{t}");
         assert_eq!(t["security_invoker"], invoker, "{t}");
     }
+}
+
+/// Each table's primary-key columns, in the key's order (not the columns' order); a view
+/// or a table without a key has none, and the JSON leaves the field out then.
+#[test]
+fn introspection_reports_primary_keys() {
+    assert!(
+        INTROSPECT_SQL.contains("contype = 'p'") && INTROSPECT_SQL.contains("WITH ORDINALITY"),
+        "{INTROSPECT_SQL}"
+    );
+    let mut r = raw();
+    r.relations[0].7 = vec!["id".into()];
+    r.relations.push((
+        40008,
+        "public".into(),
+        "pairs".into(),
+        "r".into(),
+        false,
+        false,
+        vec![col("a", 25, "text"), col("b", 25, "text")],
+        vec!["b".into(), "a".into()],
+    ));
+    let s = Schema::build("v1".into(), r);
+    let key = |name: &str| {
+        s.tables
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .primary_key
+            .clone()
+    };
+    assert_eq!(key("Order"), ["id"]);
+    assert_eq!(key("pairs"), ["b", "a"]);
+    assert!(key("secrets").is_empty());
+    assert!(key("invoices").is_empty());
+
+    let mut v = everything();
+    v.tables.insert(40008, v.tables[&ORDERS]);
+    let json = s.to_json("public", &[("anon", &v)], false);
+    let public = &json["schemas"]["public"]["tables"];
+    assert_eq!(public["Order"]["primary_key"], json!(["id"]));
+    assert_eq!(public["pairs"]["primary_key"], json!(["b", "a"]));
+    assert!(public["secrets"].get("primary_key").is_none(), "{}", public["secrets"]);
+    let invoices = &json["schemas"]["billing"]["tables"]["invoices"];
+    assert!(invoices.get("primary_key").is_none(), "{invoices}");
+
+    // A document written before the field existed still reads, with no key.
+    let old: TableDesc = serde_json::from_value(json!({
+        "kind": "table", "rls": false, "security_invoker": false, "privileges": null, "columns": {}
+    }))
+    .unwrap();
+    assert!(old.primary_key.is_empty());
 }

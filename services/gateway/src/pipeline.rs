@@ -313,6 +313,7 @@ impl Pipeline {
                 kind: resolved.kind,
                 role: resolved.role,
                 claims: json!({}),
+                databases: resolved.databases,
             }),
         };
         self.signer.sign(service.name(), &identity).map_err(|err| {
@@ -940,6 +941,27 @@ mod tests {
         assert_eq!(data.kind, DataKeyKind::Public);
         assert_eq!(data.role, "anon");
         assert_eq!(data.claims, json!({}));
+    }
+
+    /// A key's allow-list rides in the minted identity; a key without one mints none.
+    #[tokio::test]
+    async fn the_allow_list_is_carried_in_the_minted_token() {
+        let h = data_harness().await;
+        let listed = dk::new_key(DataKeyKind::Secret);
+        let mut resolved = dk::resolved(DataKeyKind::Secret);
+        resolved.databases = Some(vec!["main".into(), "analytics".into()]);
+        h.mock.set(&listed, Answer::Known(resolved));
+        let unlisted = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&unlisted, Answer::Known(dk::resolved(DataKeyKind::Secret)));
+
+        for (key, want) in [
+            (&listed, Some(vec!["main".to_string(), "analytics".to_string()])),
+            (&unlisted, None),
+        ] {
+            let plan = expect_plan(data_call(&h, "POST", "/data/v1/query", Some(key)).await.outcome);
+            let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap();
+            assert_eq!(claims.data.unwrap().databases, want);
+        }
     }
 
     #[tokio::test]

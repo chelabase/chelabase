@@ -665,6 +665,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cheladb-query"
+version = "0.1.0"
+dependencies = [
+ "cheladb-types",
+ "http",
+ "moka",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cheladb-routes"
 version = "0.1.0"
 
@@ -2274,6 +2290,7 @@ dependencies = [
  "cheladb-metadata",
  "cheladb-nats",
  "cheladb-neon",
+ "cheladb-query",
  "cheladb-routes",
  "cheladb-secrets",
  "cheladb-types",
@@ -2281,16 +2298,19 @@ dependencies = [
  "dotenvy",
  "hex",
  "jsonwebtoken",
+ "moka",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "subtle",
  "tempfile",
  "tokio",
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "utoipa",
  "utoipa-axum",
  "uuid",
@@ -2944,6 +2964,7 @@ dependencies = [
  "cheladb-metadata",
  "cheladb-nats",
  "cheladb-neon",
+ "cheladb-query",
  "cheladb-secrets",
  "cheladb-types",
  "chrono",

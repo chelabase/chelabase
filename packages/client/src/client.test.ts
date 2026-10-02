@@ -123,3 +123,44 @@ describe("requests", () => {
     await expect(Promise.resolve(inner)).rejects.toThrow(/batch/);
   });
 });
+
+describe("databases", () => {
+  test("database_binds_the_top_level_field", async () => {
+    const fetch = fakeFetch('[{"id":1}]');
+    const db = createClient<Database>({ types, url, key, fetch });
+    await db.database("analytics").from("orders").select("id");
+    await db.from("orders").select("id");
+    const [bound, main] = fetch.calls.map((c) => JSON.parse(c.init.body as string));
+    expect(bound).toEqual({ v: 1, database: "analytics", op: "select", from: "orders", select: ["id"] });
+    expect(main).not.toHaveProperty("database");
+    expect(fetch.calls[0]!.url).toBe(`${url}/data/v1/query`);
+    expect(new Headers(fetch.calls[0]!.init.headers).get("authorization")).toBe(`Bearer ${key}`);
+  });
+
+  test("a bound client sends calls and writes with the database too", async () => {
+    const fetch = fakeFetch("null");
+    const an = createClient({ url, key, fetch }).database("analytics");
+    await an.call("next_id");
+    await an.from("orders").delete().all();
+    for (const c of fetch.calls) expect(JSON.parse(c.init.body as string).database).toBe("analytics");
+  });
+
+  test("batch_carries_database_only_at_top_level", async () => {
+    const fetch = fakeFetch("[[],[]]");
+    const an = createClient({ url, key, fetch }).database("analytics");
+    await an.batch((t) => [t.from("a").select("id"), t.call("f")]);
+    const body = JSON.parse(fetch.calls[0]!.init.body as string);
+    expect(body.database).toBe("analytics");
+    expect(body.ops).toHaveLength(2);
+    for (const op of body.ops) expect(op).not.toHaveProperty("database");
+  });
+
+  test("bound clients take their own types and bigint mode", () => {
+    const db = createClient<Database>({ types, url, key, fetch: fakeFetch("[]") });
+    // @ts-expect-error the types are required in bigint mode (the runtime check is the backstop)
+    expect(() => createClient({ url, key, bigint: true, types, fetch: fakeFetch("[]") }).database("x")).toThrow(
+      /types/,
+    );
+    expect(db.database("analytics", types)).toBeDefined();
+  });
+});

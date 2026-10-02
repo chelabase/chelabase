@@ -82,59 +82,72 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
     );
   }
   const sourceText = hasSourceText();
-  if (!sourceText) {
-    if (bigint) {
-      throw new Error(
-        `createClient({ bigint: true }) needs JSON.parse source text access (${RUNTIMES}) to read int8 values exactly.`,
-      );
-    }
-    if (opts.types !== undefined && mentionsNumeric(opts.types)) {
-      throw new Error(
-        `createClient({ types }): these types include numeric columns, which need JSON.parse source text access (${RUNTIMES}) to read exactly.`,
-      );
-    }
-  }
-
   const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
   const endpoint = `${opts.url.replace(/\/+$/, "")}/data/v1/query`;
 
-  const runner: Runner = {
-    types: opts.types,
-    async run(tree: QueryTree, spec: ResultSpec): Promise<unknown> {
-      const res = await doFetch(endpoint, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${opts.key}`,
-          "content-type": "application/json",
-          accept: "application/json",
-        },
-        body: stringify(tree),
-      });
-      const text = await res.text();
-      if (!res.ok) throw toError(res, text);
-      try {
-        return parseResult(text, spec, bigint, sourceText);
-      } catch (e) {
-        if (e instanceof SyntaxError) throw plainError(res, text, "internal");
-        throw e;
+  // One client per (database, types): `database()` builds a sibling bound to another database.
+  const make = (types: TypeMap | undefined, database: string | undefined): unknown => {
+    if (bigint && types === undefined) {
+      throw new Error(
+        "createClient({ bigint: true }) needs the generated `types` (from `cheladb gen types`) to know which values are int8.",
+      );
+    }
+    if (!sourceText) {
+      if (bigint) {
+        throw new Error(
+          `createClient({ bigint: true }) needs JSON.parse source text access (${RUNTIMES}) to read int8 values exactly.`,
+        );
       }
-    },
+      if (types !== undefined && mentionsNumeric(types)) {
+        throw new Error(
+          `createClient({ types }): these types include numeric columns, which need JSON.parse source text access (${RUNTIMES}) to read exactly.`,
+        );
+      }
+    }
+
+    const runner: Runner = {
+      types,
+      async run(tree: QueryTree, spec: ResultSpec): Promise<unknown> {
+        // The top level only: the ops of a batch are built without `v`, and never name a database.
+        const body = database === undefined ? tree : { ...tree, database };
+        const res = await doFetch(endpoint, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${opts.key}`,
+            "content-type": "application/json",
+            accept: "application/json",
+          },
+          body: stringify(body),
+        });
+        const text = await res.text();
+        if (!res.ok) throw toError(res, text);
+        try {
+          return parseResult(text, spec, bigint, sourceText);
+        } catch (e) {
+          if (e instanceof SyntaxError) throw plainError(res, text, "internal");
+          throw e;
+        }
+      },
+    };
+
+    const batchRunner: Runner = {
+      types,
+      run: () => Promise.reject(new Error("an operation built inside batch() runs only as part of its batch")),
+    };
+
+    const tx = (r: Runner) => ({
+      from: (name: string) => selectFrom(r, name),
+      call: (fn: string, args?: unknown) => callFn(r, fn, args),
+    });
+
+    return {
+      ...tx(runner),
+      batch: (fn: (t: unknown) => unknown) => batchOf(runner, fn(tx(batchRunner))),
+      database: (name: string, t?: TypeMap) => make(t, name),
+    };
   };
 
-  const batchRunner: Runner = {
-    types: opts.types,
-    run: () => Promise.reject(new Error("an operation built inside batch() runs only as part of its batch")),
-  };
-
-  const tx = (r: Runner) => ({
-    from: (name: string) => selectFrom(r, name),
-    call: (fn: string, args?: unknown) => callFn(r, fn, args),
-  });
-
-  return {
-    ...tx(runner),
-    batch: (fn: (t: unknown) => unknown) => batchOf(runner, fn(tx(batchRunner))),
-  } as unknown as Client<DB, B>;
+  return make(opts.types, undefined) as Client<DB, B>;
 }
 
 function mentionsNumeric(types: TypeMap): boolean {

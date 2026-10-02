@@ -250,8 +250,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
-        self.bootstrap_data_api_on(BranchId::from(id), ep, &rec.database_name)
+        self.bootstrap_served_on(BranchId::from(id), ep, &rec.database_name, &[])
             .await
+            .map(|_| ())
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
         phase_done(ep, "bootstrap", phase);
         self.record_compute_settings(ep).await;

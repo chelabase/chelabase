@@ -1,7 +1,9 @@
 //! The HTTP edge. The public listener serves the gateway (`POST /data/v1/query`,
 //! `GET /data/v1/schema`) and trusts only the gateway's identity token, minted for `rest`
-//! with a data key's identity. The internal listener serves the orchestrator
-//! (`GET /internal/schema/{branch_id}`) behind a static bearer.
+//! with a data key's identity. The internal listener serves the orchestrator behind a
+//! static bearer: `GET /internal/schema/{branch_id}` (`?database=&role=`),
+//! `POST /internal/branches/{id}/invalidate`
+//! and `POST /internal/console/{branch_id}/query`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,13 +11,14 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use cheladb_auth::internal::{AuthMethod, DataIdentity, IDENTITY_HEADER, InternalVerifier};
 use cheladb_types::data_key::DataKeyKind;
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -84,6 +87,12 @@ pub fn router<S: ConnSource>(state: Arc<AppState<S>>) -> Router {
 pub fn internal_router<S: ConnSource>(state: Arc<AppState<S>>) -> Router {
     Router::new()
         .route("/internal/schema/{branch_id}", get(branch_schema::<S>))
+        .route(
+            "/internal/branches/{branch_id}/invalidate",
+            post(invalidate::<S>),
+        )
+        .route("/internal/console/{branch_id}/query", post(console::<S>))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
 
@@ -104,6 +113,33 @@ fn identity<S>(
         (AuthMethod::DataKey, Some(data)) => Ok((data, claims.rid)),
         _ => Err(ApiError::unauthorized("a data API key is required")),
     }
+}
+
+/// The internal listener's bearer, compared in constant time.
+fn check_bearer<S>(state: &AppState<S>, headers: &HeaderMap) -> Result<(), ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if bool::from(bearer.as_bytes().ct_eq(state.internal_token.as_bytes())) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized("a valid bearer is required"))
+    }
+}
+
+/// `?database=` on the schema routes.
+#[derive(Deserialize)]
+struct DatabaseParam {
+    database: Option<String>,
+}
+
+/// `?database=&role=` on the internal schema route (`role`: the console's).
+#[derive(Deserialize)]
+struct InternalSchemaParam {
+    database: Option<String>,
+    role: Option<String>,
 }
 
 fn json_response(body: String) -> Response {
@@ -173,6 +209,7 @@ async fn query<S: ConnSource>(
 
 async fn role_schema<S: ConnSource>(
     State(state): State<Arc<AppState<S>>>,
+    Query(param): Query<DatabaseParam>,
     headers: HeaderMap,
 ) -> Response {
     let (data, rid) = match identity(&state, &headers) {
@@ -183,7 +220,11 @@ async fn role_schema<S: ConnSource>(
     if data.kind != DataKeyKind::Secret {
         return ApiError::unauthorized("the schema needs a secret key").into_response();
     }
-    match state.engine.role_schema(&data, &rid).await {
+    match state
+        .engine
+        .role_schema(&data, param.database.as_deref(), &rid)
+        .await
+    {
         Ok(schema) => axum::Json(schema).into_response(),
         Err(f) => public_failure(f, &rid),
     }
@@ -192,19 +233,84 @@ async fn role_schema<S: ConnSource>(
 async fn branch_schema<S: ConnSource>(
     State(state): State<Arc<AppState<S>>>,
     Path(branch): Path<Uuid>,
+    Query(param): Query<InternalSchemaParam>,
     headers: HeaderMap,
 ) -> Response {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    if !bool::from(bearer.as_bytes().ct_eq(state.internal_token.as_bytes())) {
-        return ApiError::unauthorized("a valid bearer is required").into_response();
+    if let Err(e) = check_bearer(&state, &headers) {
+        return e.into_response();
     }
     let rid = format!("internal-{}", Uuid::new_v4());
-    match state.engine.branch_schema(branch, &rid).await {
+    match state
+        .engine
+        .branch_schema(
+            branch,
+            param.database.as_deref(),
+            param.role.as_deref(),
+            &rid,
+        )
+        .await
+    {
         Ok(schema) => axum::Json(schema).into_response(),
+        Err(f) => internal_failure(f, &rid),
+    }
+}
+
+/// The orchestrator changed what the branch serves: forget it at once.
+async fn invalidate<S: ConnSource>(
+    State(state): State<Arc<AppState<S>>>,
+    Path(branch): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = check_bearer(&state, &headers) {
+        return e.into_response();
+    }
+    state.engine.invalidate(branch).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /internal/console/{branch_id}/query`'s body.
+#[derive(Deserialize)]
+struct ConsoleRequest {
+    role: String,
+    #[serde(default)]
+    database: Option<String>,
+    tree: Value,
+}
+
+/// Studio's console, as a plain role: the data API's answers, without a key's allow-list.
+async fn console<S: ConnSource>(
+    State(state): State<Arc<AppState<S>>>,
+    Path(branch): Path<Uuid>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    if let Err(e) = check_bearer(&state, &headers) {
+        return e.into_response();
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return ApiError::too_large().into_response();
+        }
+        Err(e) => return ApiError::invalid_query(e.body_text()).into_response(),
+    };
+    let request: ConsoleRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return ApiError::invalid_query(format!("the request: {e}")).into_response(),
+    };
+    let rid = format!("console-{}", Uuid::new_v4());
+    match state
+        .engine
+        .console(
+            branch,
+            &request.role,
+            request.database.as_deref(),
+            &request.tree,
+            &rid,
+        )
+        .await
+    {
+        Ok(result) => json_response(result),
         Err(f) => internal_failure(f, &rid),
     }
 }

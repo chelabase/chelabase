@@ -23,7 +23,6 @@ function detail(status: DatabaseStatus, error: string | null = null): Database {
     max_rows: 1000,
     statement_timeout_ms: 8000,
     max_connections: 5,
-    default_schema: "public",
   };
 }
 

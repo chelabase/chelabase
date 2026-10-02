@@ -10,8 +10,6 @@
  */
 export interface UpdateDatabaseRequest {
   /** @nullable */
-  default_schema?: string | null;
-  /** @nullable */
   history_window?: number | null;
   /** @nullable */
   max_branches?: number | null;

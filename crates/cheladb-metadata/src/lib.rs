@@ -19,9 +19,10 @@ pub use branches::{
 pub use ddl::DdlTx;
 pub use data_api::{
     BranchConnectionRow, DataApiSettings, DataKeyLookup, DataKeyRecord, NewDataKey,
+    ServedDatabase,
 };
 pub use neon::{
-    BranchDatabase, CopyUpsert, DatabaseOrigin, ENDPOINT_LOCK_TIMEOUT, EndpointLock,
+    BranchDatabase, CopyUpsert, DataApiState, DatabaseOrigin, EnableStart, ENDPOINT_LOCK_TIMEOUT, EndpointLock,
     EndpointState, InsertRoleOutcome, NeonDatabase, NeonEndpoint, NeonRole, NewEndpoint,
     NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied, ResyncWrite, RoleCopy,
     RoleLevel, RoleOrigin, RoleRow, SealedChange,
@@ -71,8 +72,6 @@ pub struct DatabaseRecord {
     pub statement_timeout_ms: i32,
     /// Data API: connections this database's pool may hold.
     pub max_connections: i32,
-    /// Data API: the schema requests use when they name none.
-    pub default_schema: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -664,8 +663,7 @@ impl MetadataClient {
                 d.error,
                 d.neon_tenant_id,
                 EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
-                d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections,
-                d.default_schema
+                d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE d.id = $1
@@ -704,8 +702,7 @@ impl MetadataClient {
             SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.database_name,
                    d.owner_role, d.error, d.neon_tenant_id,
                    EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
-                   d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections,
-                   d.default_schema
+                   d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE p.tenant_id = $1 AND d.status <> 'deleted'
@@ -770,7 +767,6 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
         max_rows: r.get("max_rows"),
         statement_timeout_ms: r.get("statement_timeout_ms"),
         max_connections: r.get("max_connections"),
-        default_schema: r.get("default_schema"),
     }
 }
 
@@ -794,7 +790,6 @@ mod tests {
             max_rows: 1000,
             statement_timeout_ms: 8000,
             max_connections: 5,
-            default_schema: "public".into(),
         }
     }
 

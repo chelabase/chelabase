@@ -151,7 +151,9 @@ mod tests {
     /// `DefaultHasher::new()` value an attacker could precompute collisions for.
     #[test]
     fn keyed_once_per_process() {
-        let op = crate::query::parse(br#"{"v":1,"op":"select","from":"t"}"#).unwrap();
+        let op = crate::query::parse(br#"{"v":1,"op":"select","from":"t"}"#)
+            .unwrap()
+            .op;
         assert_eq!(shape_hash(&op), shape_hash(&op));
         let mut unkeyed = DefaultHasher::new();
         hash_op(&op, &mut unkeyed);

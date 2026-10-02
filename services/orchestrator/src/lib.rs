@@ -8,14 +8,15 @@ use axum::{
 use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
 use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{
-    BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus,
+    BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus, EnableStart,
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
     PasswordState, RoleRow, SettingsPatch, TenantOverview,
 };
 use cheladb_nats::{
-    BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
+    BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
     ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
-    RoleCreateRequest, RoleReply, RoleRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_RESET_PASSWORD,
+    RoleCreateRequest, RoleReply, RoleRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
+    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_RESET_PASSWORD,
     SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
 };
 use cheladb_secrets::{open_credential, open_role_password, Purpose, SecretKey};
@@ -34,11 +35,14 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 mod branches;
+mod console;
+mod data_api_databases;
 mod data_keys;
 mod docs;
 pub mod internal;
 mod openapi;
 mod roles;
+pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, RestReply};
 pub use openapi::openapi;
 
 /// Port the Neon proxy serves the Postgres protocol on (slot 0's; `CHELADB_PROXY_PG_PORT`).
@@ -262,6 +266,32 @@ pub trait MetadataPort: Send + Sync + 'static {
         &self,
         ids: &[BranchId],
     ) -> impl Future<Output = Result<HashSet<BranchId>, MetadataError>> + Send;
+
+    /// Claims a database of the branch for the data API: its row becomes `enabling`.
+    fn begin_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        cap: u32,
+    ) -> impl Future<Output = Result<EnableStart, MetadataError>> + Send;
+
+    /// Stores the schema requests to a database use when they name none; false for an unknown
+    /// database.
+    fn set_database_default_schema(
+        &self,
+        branch: BranchId,
+        name: &str,
+        schema: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Replaces a live key's database list (`None` is every served database); false for an
+    /// unknown or revoked key.
+    fn set_key_databases(
+        &self,
+        branch: BranchId,
+        key_id: Uuid,
+        databases: Option<Vec<String>>,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -422,6 +452,33 @@ impl MetadataPort for MetadataClient {
     ) -> Result<HashSet<BranchId>, MetadataError> {
         MetadataClient::branches_with_main_database(self, ids).await
     }
+
+    async fn begin_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        cap: u32,
+    ) -> Result<EnableStart, MetadataError> {
+        MetadataClient::begin_enable_data_api(self, branch, name, cap).await
+    }
+
+    async fn set_database_default_schema(
+        &self,
+        branch: BranchId,
+        name: &str,
+        schema: &str,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::set_database_default_schema(self, branch, name, schema).await
+    }
+
+    async fn set_key_databases(
+        &self,
+        branch: BranchId,
+        key_id: Uuid,
+        databases: Option<Vec<String>>,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::set_key_databases(self, branch, key_id, databases).await
+    }
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -466,6 +523,31 @@ pub trait JobPort: Send + Sync + 'static {
         role: &str,
     ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
 
+    /// Tells the worker to bootstrap the data API in a database the orchestrator marked
+    /// `enabling` (a core publish: no reply; reconcile retries a row left `enabling`).
+    fn enable_data_api(
+        &self,
+        branch_id: BranchId,
+        name: &str,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    /// Stops serving a database; `remove` also drops the `cheladb` machinery there.
+    fn disable_data_api(
+        &self,
+        branch_id: BranchId,
+        name: &str,
+        remove: bool,
+    ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
+
+    /// Re-runs the bootstrap of a served database after its `default_schema` changed;
+    /// `grant_existing` also grants the data API roles on the schema's existing objects.
+    fn rebootstrap_data_api(
+        &self,
+        branch_id: BranchId,
+        name: &str,
+        grant_existing: bool,
+    ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
+
     /// Resets the owner password of one branch (main's id is the database's).
     fn reset_password(
         &self,
@@ -501,6 +583,28 @@ async fn role_rpc<T: Serialize>(
     subject: &'static str,
     request: &T,
 ) -> Result<RoleReply, ResetError> {
+    use async_nats::RequestErrorKind;
+    let body = serde_json::to_vec(request).map_err(|e| ResetError::Transport(e.to_string()))?;
+    let request = async_nats::Request::new()
+        .payload(body.into())
+        .timeout(Some(RESET_TIMEOUT));
+    let reply = client
+        .send_request(subject, request)
+        .await
+        .map_err(|e| match e.kind() {
+            RequestErrorKind::TimedOut => ResetError::Timeout,
+            RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
+            _ => ResetError::Transport(e.to_string()),
+        })?;
+    serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+}
+
+/// One request/reply to the worker on `subject` answering a [`CheckDataRoleReply`].
+async fn data_api_rpc(
+    client: &async_nats::Client,
+    subject: &'static str,
+    request: &DataApiDatabaseRequest,
+) -> Result<CheckDataRoleReply, ResetError> {
     use async_nats::RequestErrorKind;
     let body = serde_json::to_vec(request).map_err(|e| ResetError::Transport(e.to_string()))?;
     let request = async_nats::Request::new()
@@ -578,6 +682,37 @@ impl JobPort for NatsPorts {
         serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
     }
 
+    async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
+        let body = serde_json::to_vec(&DataApiDatabaseRequest {
+            branch_id,
+            name: name.to_string(),
+            remove: false,
+            grant_existing: false,
+        })?;
+        self.client.publish(SUBJECT_DATA_API_ENABLE, body.into()).await?;
+        Ok(())
+    }
+
+    async fn disable_data_api(
+        &self,
+        branch_id: BranchId,
+        name: &str,
+        remove: bool,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        let request = DataApiDatabaseRequest { branch_id, name: name.to_string(), remove, grant_existing: false };
+        data_api_rpc(&self.client, SUBJECT_DATA_API_DISABLE, &request).await
+    }
+
+    async fn rebootstrap_data_api(
+        &self,
+        branch_id: BranchId,
+        name: &str,
+        grant_existing: bool,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        let request = DataApiDatabaseRequest { branch_id, name: name.to_string(), remove: false, grant_existing };
+        data_api_rpc(&self.client, SUBJECT_DATA_API_REBOOTSTRAP, &request).await
+    }
+
     async fn reset_password(
         &self,
         database_id: DatabaseId,
@@ -631,14 +766,64 @@ pub struct AppState<M, J> {
     pub mode: Mode,
     /// Where the dev proxy's CA certificate is (`CHELADB_PROXY_CA_FILE`); self-hosted only.
     pub proxy_ca_file: String,
+    /// `CHELADB_BRANCH_DATA_API_DATABASE_CAP`: databases a branch serves, main included.
+    pub data_api_database_cap: u32,
+    /// Where a compute publishes Postgres: the console's owner pools connect there.
+    pub locator: Arc<dyn PostgresAddr>,
+    /// Studio's console: owner pools, the owner's query caches, checked roles.
+    pub console: Console,
+}
+
+/// `CHELADB_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
+pub fn data_api_database_cap(value: Option<&str>) -> Result<u32, String> {
+    const NAME: &str = "CHELADB_BRANCH_DATA_API_DATABASE_CAP";
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(10),
+        Some(v) => v
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=100).contains(n))
+            .ok_or_else(|| format!("{NAME}={v:?}: expected a whole number from 1 to 100")),
+    }
 }
 
 /// Where the REST service's internal listener is, and the token it takes.
+#[derive(Clone)]
 pub struct RestInternal {
     /// `http://host:port`, no path.
     pub url: String,
     pub token: String,
     pub http: reqwest::Client,
+}
+
+/// Longest wait for rest to acknowledge an invalidation.
+const INVALIDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl RestInternal {
+    /// Tells rest to forget everything it holds for the branch (pools, connection info,
+    /// cached shapes). A failure is logged and never fails the caller's request: rest's own
+    /// entries expire within 60 seconds anyway.
+    pub async fn invalidate(&self, branch: BranchId) {
+        let url = format!(
+            "{}/internal/branches/{}/invalidate",
+            self.url.trim_end_matches('/'),
+            branch.as_uuid()
+        );
+        match self
+            .http
+            .post(url)
+            .bearer_auth(&self.token)
+            .timeout(INVALIDATE_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                tracing::warn!(branch_id = %branch, status = %response.status(), "rest invalidate refused");
+            }
+            Err(err) => tracing::warn!(branch_id = %branch, "rest invalidate failed: {err}"),
+        }
+    }
 }
 
 /// Caller verified from the gateway-minted internal identity token. Does not
@@ -795,7 +980,6 @@ struct Database {
     max_rows: i32,
     statement_timeout_ms: i32,
     max_connections: i32,
-    default_schema: String,
 }
 
 /// The proxy's host and Postgres port, once the database is ready: until then its endpoint
@@ -854,7 +1038,6 @@ impl Database {
             max_rows: r.max_rows,
             statement_timeout_ms: r.statement_timeout_ms,
             max_connections: r.max_connections,
-            default_schema: r.default_schema,
         }
     }
 }
@@ -966,6 +1149,8 @@ where
         .routes(routes!(me))
         .merge(branches::routes())
         .merge(data_keys::routes())
+        .merge(data_api_databases::routes())
+        .merge(console::routes())
         .merge(roles::routes())
 }
 

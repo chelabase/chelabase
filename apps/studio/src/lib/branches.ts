@@ -154,7 +154,6 @@ export function windowParts(secs: number): { value: number; unit: WindowUnit } {
 export const MAX_ROWS_RANGE = [1, 100_000] as const;
 export const STATEMENT_TIMEOUT_RANGE = [100, 120_000] as const;
 export const MAX_CONNECTIONS_RANGE = [1, 50] as const;
-const SCHEMA_RE = /^[a-z_][a-z0-9_]{0,62}$/;
 
 export interface SettingsInput {
   window: string;
@@ -163,7 +162,6 @@ export interface SettingsInput {
   maxRows: string;
   statementTimeoutMs: string;
   maxConnections: string;
-  defaultSchema: string;
 }
 export type SettingsErrors = Partial<Record<Exclude<keyof SettingsInput, "unit">, string>>;
 
@@ -193,10 +191,6 @@ export function parseSettings(
   if (!inRange(connections, MAX_CONNECTIONS_RANGE)) {
     errors.maxConnections = "Max connections must be a whole number between 1 and 50.";
   }
-  if (!SCHEMA_RE.test(input.defaultSchema)) {
-    errors.defaultSchema =
-      "Default schema must be 1-63 characters from a-z, 0-9 and _, not starting with a digit.";
-  }
   if (Object.keys(errors).length > 0) return { ok: false, ...errors };
   return {
     ok: true,
@@ -206,7 +200,6 @@ export function parseSettings(
       max_rows: rows,
       statement_timeout_ms: timeout,
       max_connections: connections,
-      default_schema: input.defaultSchema,
     },
   };
 }

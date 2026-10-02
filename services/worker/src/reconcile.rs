@@ -21,6 +21,10 @@ pub const STALE_DELETE_SECS: i64 = 60;
 /// How many ready branches each pass checks for the `cheladb` schema (one `admin_sql` each)
 /// and resyncs the login roles of.
 pub const SCHEMA_CHECKS_PER_PASS: usize = 20;
+/// How long a database row may stay `enabling` before reconcile runs its enable bootstrap again
+/// (the orchestrator's publish has no reply, so a lost one would leave it there). Longer than
+/// [`crate::data_api::ENABLE_DEADLINE`], so a slow enable isn't started twice.
+pub const ENABLING_RETRY_SECS: u64 = 150;
 
 /// One observation. Taken in the order computes, tenants, databases, endpoints: rows are
 /// written before their compute or tenant exists, so a fresh resource never looks orphaned.
@@ -43,6 +47,12 @@ pub struct Snapshot {
     /// Branches whose data API needs its bootstrap: no public key or authenticator password
     /// (from the metadata), or no `cheladb.schema_version` (from this pass's checks).
     pub needs_data_api: HashSet<BranchId>,
+    /// `(branch, database)` pairs whose `cheladb` machinery failed this pass's check: only that
+    /// database is bootstrapped (the branch as a whole is in `needs_data_api`).
+    pub needs_data_api_databases: HashSet<(BranchId, String)>,
+    /// `(branch, database)` rows that have been `enabling` for [`ENABLING_RETRY_SECS`]: their
+    /// enable bootstrap runs again.
+    pub stale_enabling: Vec<(BranchId, String)>,
     /// Branches in this pass's health-check batch (ready, `normal`, with a compute): their
     /// login roles are resynced.
     pub resync: HashSet<BranchId>,
@@ -70,7 +80,14 @@ pub enum Action {
     ApplyPending(String),
     /// A ready `normal` branch with its compute lacks its public key, its authenticator
     /// password or the `cheladb` schema: run the data API bootstrap.
-    BootstrapDataApi { branch_id: BranchId },
+    /// `database` is `None` for the whole branch (every served database, the keys and the
+    /// password), or one database whose machinery is broken.
+    BootstrapDataApi {
+        branch_id: BranchId,
+        database: Option<String>,
+    },
+    /// A database left `enabling` past [`ENABLING_RETRY_SECS`]: run its enable bootstrap again.
+    RetryEnableDataApi(BranchId, String),
     /// `(branch, endpoint)` in this pass's health-check batch: resync its login roles (it
     /// catches a DDL forward that was lost). A failure is logged, and retried at its next turn.
     Resync(BranchId, String),
@@ -106,14 +123,15 @@ impl Action {
             Action::UpgradeCompute(..) => 6,
             Action::ApplyPending(_) => 7,
             Action::BootstrapDataApi { .. } => 8,
-            Action::Resync(..) => 9,
-            Action::RemoveCompute(_) => 10,
-            Action::RetryTeardown(_) => 11,
-            Action::PatchHistoryWindow(_) => 12,
-            Action::ReportStuckRestore(_) => 13,
-            Action::ReportUnknownTenant(_) => 14,
-            Action::ReportUnknownTimeline(..) => 15,
-            Action::ReportEndpointWithoutDatabase(_) => 16,
+            Action::RetryEnableDataApi(..) => 9,
+            Action::Resync(..) => 10,
+            Action::RemoveCompute(_) => 11,
+            Action::RetryTeardown(_) => 12,
+            Action::PatchHistoryWindow(_) => 13,
+            Action::ReportStuckRestore(_) => 14,
+            Action::ReportUnknownTenant(_) => 15,
+            Action::ReportUnknownTimeline(..) => 16,
+            Action::ReportEndpointWithoutDatabase(_) => 17,
         }
     }
 
@@ -126,7 +144,8 @@ impl Action {
             | Action::RetryBranchDelete(id)
             | Action::FinishSwitch(id)
             | Action::ReportStuckRestore(id)
-            | Action::BootstrapDataApi { branch_id: id } => id.to_string(),
+            | Action::BootstrapDataApi { branch_id: id, .. } => id.to_string(),
+            Action::RetryEnableDataApi(id, name) => format!("{id}/{name}"),
             Action::ReportUnknownTimeline(tenant, timeline) => format!("{tenant}/{timeline}"),
             Action::RecreateBranchCompute(_, s)
             | Action::UpgradeCompute(_, s)
@@ -215,7 +234,27 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
                 }
                 Some(ep) => {
                     if s.needs_data_api.contains(&b.id) {
-                        actions.push(Action::BootstrapDataApi { branch_id: b.id });
+                        actions.push(Action::BootstrapDataApi {
+                            branch_id: b.id,
+                            database: None,
+                        });
+                    } else {
+                        let mut broken: Vec<&String> = s
+                            .needs_data_api_databases
+                            .iter()
+                            .filter(|(id, _)| *id == b.id)
+                            .map(|(_, name)| name)
+                            .collect();
+                        broken.sort();
+                        for name in broken {
+                            actions.push(Action::BootstrapDataApi {
+                                branch_id: b.id,
+                                database: Some(name.clone()),
+                            });
+                        }
+                    }
+                    for (_, name) in s.stale_enabling.iter().filter(|(id, _)| *id == b.id) {
+                        actions.push(Action::RetryEnableDataApi(b.id, name.clone()));
                     }
                     if s.resync.contains(&b.id) {
                         actions.push(Action::Resync(b.id, ep.clone()));
@@ -317,6 +356,8 @@ pub fn schema_check_batch(
 struct RoundRobin {
     /// Branches whose data API machinery is broken.
     missing_data_api: Vec<BranchId>,
+    /// `(branch, database)`: one served database whose `cheladb` machinery is broken.
+    missing_databases: HashSet<(BranchId, String)>,
     /// Every branch of the batch: its login roles are resynced.
     resync: HashSet<BranchId>,
 }
@@ -405,6 +446,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .collect();
         let checked = self.round_robin_checks(&branches, &computes).await;
         needs_data_api.extend(checked.missing_data_api);
+        let enabling = match self.metadata.enabling_databases().await {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!("listing databases being enabled: {err}");
+                Vec::new()
+            }
+        };
+        let stale_enabling = self.stale_enabling_rows(enabling, std::time::Instant::now());
         let tenants: HashSet<String> = tenants.iter().map(|t| t.as_str().to_string()).collect();
         // Only the tenants `plan` may patch: ready databases' tenants on the controller.
         let mut pitr = HashMap::new();
@@ -435,8 +484,35 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             tenant_timelines,
             pitr,
             needs_data_api,
+            needs_data_api_databases: checked.missing_databases,
+            stale_enabling,
             resync: checked.resync,
         })
+    }
+
+    /// The `enabling` rows that have been listed for [`ENABLING_RETRY_SECS`] as of `now`, in
+    /// the order given. The first sighting starts a row's clock; a row due is re-armed for
+    /// another period; a row that left the list is forgotten.
+    pub(crate) fn stale_enabling_rows(
+        &self,
+        rows: Vec<(BranchId, String)>,
+        now: std::time::Instant,
+    ) -> Vec<(BranchId, String)> {
+        let period = Duration::from_secs(ENABLING_RETRY_SECS);
+        let mut seen = self
+            .enabling_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        seen.retain(|key, _| rows.contains(key));
+        let mut stale = Vec::new();
+        for row in rows {
+            let since = *seen.entry(row.clone()).or_insert(now);
+            if now.saturating_duration_since(since) >= period {
+                seen.insert(row.clone(), now);
+                stale.push(row);
+            }
+        }
+        stale
     }
 
     /// The next [`SCHEMA_CHECKS_PER_PASS`] ready `normal` branches with a compute (by id, after
@@ -473,11 +549,29 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             let Some((_, ep)) = ready.iter().find(|(b, _)| *b == id) else {
                 continue;
             };
-            match self.data_api_healthy(ep).await {
-                Ok(true) => {}
-                Ok(false) => checked.missing_data_api.push(id),
+            let served = match self.served_or_main(id, ep).await {
+                Ok(served) => served,
                 Err(err) => {
-                    warn!(branch_id = %id, endpoint_id = %ep, "checking the data API's machinery: {err:#}");
+                    warn!(branch_id = %id, endpoint_id = %ep, "listing the served databases: {err:#}");
+                    checked.resync.insert(id);
+                    continue;
+                }
+            };
+            let main_database = self.database_of(ep).await.ok();
+            for database in served {
+                match self.data_api_healthy_in(ep, &database.name).await {
+                    Ok(true) => {}
+                    // Main's goes through the whole branch bootstrap: it also re-grants the
+                    // secret keys' roles and ensures the public key.
+                    Ok(false) if main_database.as_deref() == Some(database.name.as_str()) => {
+                        checked.missing_data_api.push(id);
+                    }
+                    Ok(false) => {
+                        checked.missing_databases.insert((id, database.name));
+                    }
+                    Err(err) => {
+                        warn!(branch_id = %id, endpoint_id = %ep, database = %database.name, "checking the data API's machinery: {err:#}");
+                    }
                 }
             }
             checked.resync.insert(id);
@@ -523,7 +617,23 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     .map_err(|e| format!("removing compute: {e:#}"))?;
                 self.recreate_compute(*id, ep).await
             }
-            Action::BootstrapDataApi { branch_id } => self.reconcile_data_api(*branch_id).await,
+            Action::BootstrapDataApi { branch_id, database } => {
+                self.reconcile_data_api(*branch_id, database.as_deref()).await
+            }
+            Action::RetryEnableDataApi(branch_id, name) => {
+                let request = cheladb_nats::DataApiDatabaseRequest {
+                    branch_id: *branch_id,
+                    name: name.clone(),
+                    remove: false,
+                    grant_existing: false,
+                };
+                tokio::time::timeout(
+                    crate::data_api::ENABLE_DEADLINE,
+                    self.enable_data_api(&request),
+                )
+                .await
+                .map_err(|_| format!("enabling {name}: timed out"))
+            }
             Action::Resync(id, _) => self.resync(*id).await,
             // After a RecreateBranchCompute in the same pass, the push can reach the new container
             // before compute_ctl listens and fail. That heals itself: the flag stays set, the
@@ -987,7 +1097,7 @@ mod tests {
         let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
         let main = s.branches[0].id;
         s.needs_data_api.insert(dev);
-        assert_eq!(plan(&s), [Action::BootstrapDataApi { branch_id: dev }]);
+        assert_eq!(plan(&s), [Action::BootstrapDataApi { branch_id: dev, database: None }]);
         s.needs_data_api.insert(main);
         assert_eq!(plan(&s).len(), 2);
         // Without its compute, recreating it runs the bootstrap too.
@@ -996,7 +1106,7 @@ mod tests {
             plan(&s),
             [
                 Action::RecreateBranchCompute(dev, EP3.to_string()),
-                Action::BootstrapDataApi { branch_id: main },
+                Action::BootstrapDataApi { branch_id: main, database: None },
             ]
         );
         // Only ready branches.
@@ -2254,5 +2364,159 @@ mod tests {
 
         assert_eq!(w.metadata.branch(dev).status, BranchStatus::Pending);
         assert!(position(&journal, "metadata.fail_branch_if_stale").is_none());
+    }
+
+    #[test]
+    fn a_database_missing_its_machinery_is_bootstrapped_alone() {
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        s.needs_data_api_databases.insert((dev, "analytics".to_string()));
+        s.needs_data_api_databases.insert((dev, "accounts".to_string()));
+        assert_eq!(
+            plan(&s),
+            [
+                Action::BootstrapDataApi { branch_id: dev, database: Some("accounts".into()) },
+                Action::BootstrapDataApi { branch_id: dev, database: Some("analytics".into()) },
+            ]
+        );
+        // The whole branch covers its databases.
+        s.needs_data_api.insert(dev);
+        assert_eq!(plan(&s), [Action::BootstrapDataApi { branch_id: dev, database: None }]);
+    }
+
+    #[test]
+    fn stale_enabling_rows_are_retried_on_a_ready_branch_only() {
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        s.stale_enabling.push((dev, "analytics".to_string()));
+        assert_eq!(plan(&s), [Action::RetryEnableDataApi(dev, "analytics".to_string())]);
+        let (mut s, dev) = with_dev(BranchStatus::Resetting, 0);
+        s.stale_enabling.push((dev, "analytics".to_string()));
+        assert!(plan(&s).iter().all(|a| !matches!(a, Action::RetryEnableDataApi(..))));
+    }
+
+    #[tokio::test]
+    async fn an_enabling_row_is_stale_after_a_minute() {
+        let (w, _journal) = worker();
+        let a = (BranchId::new(), "a".to_string());
+        let b = (BranchId::new(), "b".to_string());
+        let t0 = std::time::Instant::now();
+        let minute = Duration::from_secs(ENABLING_RETRY_SECS);
+
+        assert!(w.stale_enabling_rows(vec![a.clone()], t0).is_empty(), "first seen");
+        assert!(w.stale_enabling_rows(vec![a.clone(), b.clone()], t0 + minute / 2).is_empty());
+        assert_eq!(w.stale_enabling_rows(vec![a.clone(), b.clone()], t0 + minute), std::slice::from_ref(&a));
+        // Re-armed for another minute from the retry; `b` came due at 90 s.
+        assert_eq!(w.stale_enabling_rows(vec![a.clone(), b.clone()], t0 + minute + minute / 2), std::slice::from_ref(&b));
+        assert_eq!(
+            w.stale_enabling_rows(vec![a.clone(), b.clone()], t0 + minute * 2 + minute / 2),
+            [a.clone(), b.clone()]
+        );
+        // A row that left the list is forgotten, and starts over when it returns.
+        assert!(w.stale_enabling_rows(vec![], t0 + minute * 3).is_empty());
+        assert!(w.stale_enabling_rows(vec![a], t0 + minute * 3).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_retries_a_lost_enable() {
+        let (w, journal) = worker();
+        let (id, ep) = provision(&w, &journal).await;
+        let main = BranchId::from(id);
+        w.metadata.state().db_rows.get_mut(&main).unwrap().push(crate::fakes::FakeDbRow::new(
+            "analytics",
+            cheladb_metadata::DataApiState::Enabling,
+            "reporting",
+        ));
+        w.computes.answer("to_regclass('cheladb.schema_version')", "t\n");
+        // The resync in the same passes sees both databases.
+        let d = |name: &str| format!("d|{}||{}|f||\n", hex::encode(name), hex::encode("postgres"));
+        w.computes.answer("FROM pg_authid", &[d("app"), d("analytics")].concat());
+
+        // Seen just now: not yet.
+        w.reconcile_once().await.unwrap();
+        assert_eq!(
+            w.metadata.state().db_rows[&main][1].state,
+            cheladb_metadata::DataApiState::Enabling
+        );
+        // Seen over a minute ago: the bootstrap runs there and the row is `on`.
+        let old = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(ENABLING_RETRY_SECS + 1))
+            .unwrap();
+        w.enabling_seen.lock().unwrap().insert((main, "analytics".to_string()), old);
+        w.reconcile_once().await.unwrap();
+        assert_eq!(w.metadata.state().db_rows[&main][1].state, cheladb_metadata::DataApiState::On);
+        assert!(position(&journal, &format!("compute.sql {ep} analytics SET search_path")).is_some());
+    }
+
+    #[tokio::test]
+    async fn reconcile_checks_and_heals_each_served_database() {
+        use cheladb_metadata::DataApiState::{Off, On};
+        let (w, journal) = worker();
+        let (id, ep) = provision(&w, &journal).await;
+        let main = BranchId::from(id);
+        for (name, state) in [("healthy", On), ("broken", On), ("off", Off)] {
+            w.metadata
+                .state()
+                .db_rows
+                .get_mut(&main)
+                .unwrap()
+                .push(crate::fakes::FakeDbRow::new(name, state, "reporting"));
+        }
+        let check = "to_regclass('cheladb.schema_version')";
+        w.computes.answer_in("app", check, "t\n");
+        w.computes.answer_in("healthy", check, "t\n");
+        w.computes.answer_in("broken", check, "f\n");
+        w.computes.sql.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SELECT to_regclass")).is_some();
+        assert!(checked("app") && checked("healthy") && checked("broken") && !checked("off"));
+        let healed: Vec<String> = w
+            .computes
+            .sql
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, s)| s.starts_with("SET search_path = pg_catalog, pg_temp;\nDO $$") || s.contains("CREATE SCHEMA IF NOT EXISTS cheladb"))
+            .map(|(_, d, _)| d.clone())
+            .collect();
+        assert_eq!(healed, ["broken"], "only the broken database is bootstrapped");
+    }
+
+    #[test]
+    fn the_enabling_retry_waits_longer_than_an_enable_may_run() {
+        assert!(ENABLING_RETRY_SECS > crate::data_api::ENABLE_DEADLINE.as_secs());
+        assert_eq!(ENABLING_RETRY_SECS, 150);
+    }
+
+    /// The main database's health failure goes through the whole branch bootstrap, which also
+    /// re-grants the secret keys' roles and ensures the public key.
+    #[tokio::test]
+    async fn a_failing_main_health_check_regrants_and_ensures_the_public_key() {
+        let (w, journal) = worker();
+        let (id, ep) = provision(&w, &journal).await;
+        let main = BranchId::from(id);
+        let generated = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Secret);
+        w.metadata.state().data_keys.push(cheladb_metadata::NewDataKey {
+            id: uuid::Uuid::new_v4(),
+            branch_id: main,
+            kind: cheladb_types::data_key::DataKeyKind::Secret,
+            role: "reporting".to_string(),
+            name: "reporting key".to_string(),
+            prefix: generated.prefix,
+            sha256: generated.sha256,
+            sealed: None,
+            databases: None,
+        });
+        w.computes.answer("pg_has_role", "ok\n");
+        w.computes.answer_in("app", "to_regclass('cheladb.schema_version')", "f\n");
+        w.computes.sql.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        let sql = w.computes.sql.lock().unwrap().clone();
+        assert!(
+            sql.iter().any(|(e, _, s)| *e == ep && s.starts_with("GRANT \"reporting\" TO authenticator")),
+            "the secret key's role is granted again"
+        );
     }
 }

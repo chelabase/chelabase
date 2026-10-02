@@ -154,6 +154,7 @@ pub fn build(
         ready_timeout: Duration::from_secs(60),
         claim_refresh: Duration::from_secs(60),
         schema_check_cursor: Default::default(),
+        enabling_seen: Default::default(),
         reported_unknown_tenants: Default::default(),
     })
 }

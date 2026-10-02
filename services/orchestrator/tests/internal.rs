@@ -6,7 +6,7 @@ use axum::Router;
 use axum::http::StatusCode as AxumStatus;
 use axum::routing::get;
 use cheladb_metadata::{
-    BranchConnectionRow, BranchStatus, DataApiSettings, DataKeyLookup, DatabaseOrigin,
+    BranchConnectionRow, ServedDatabase, BranchStatus, DataApiSettings, DataKeyLookup, DatabaseOrigin,
     MetadataError, NeonDatabase, NeonEndpoint, NeonRole, RoleCopy, RoleLevel, RoleOrigin,
 };
 use cheladb_secrets::{Purpose, SecretKey, seal_credential};
@@ -630,6 +630,17 @@ async fn spawn_internal_with(
     roles: RoleSettings,
     cache: FakeCache,
 ) -> Internal {
+    spawn_internal_full(neon, locator, storcon_base, roles, cache, "http://127.0.0.1:9").await
+}
+
+async fn spawn_internal_full(
+    neon: FakeNeon,
+    locator: FakeLocator,
+    storcon_base: &str,
+    roles: RoleSettings,
+    cache: FakeCache,
+    rest_url: &str,
+) -> Internal {
     let (pem, x) = generate_keypair();
     let key = SecretKey::generate();
     let state = Arc::new(InternalState {
@@ -646,6 +657,11 @@ async fn spawn_internal_with(
         roles,
         cache: Arc::new(cache),
         control_plane_uri: CONTROL_PLANE_URI.into(),
+        rest: orchestrator::RestInternal {
+            url: rest_url.into(),
+            token: REST_TOKEN.into(),
+            http: reqwest::Client::new(),
+        },
     });
     let addr = serve(build_internal_router(state)).await;
     Internal {
@@ -1230,7 +1246,7 @@ async fn key_lookup_requires_the_data_keys_bearer() {
     let branch = BranchId::new();
     neon.data_keys.lock().unwrap().push((
         sha("chk_sec_x"),
-        DataKeyLookup { key_id: KEY_ID, branch_id: branch, kind: DataKeyKind::Secret, role: "reporting".into() },
+        DataKeyLookup { key_id: KEY_ID, branch_id: branch, kind: DataKeyKind::Secret, role: "reporting".into(), databases: None },
     ));
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     let path = format!("/internal/data/keys/{}", hex::encode(sha("chk_sec_x")));
@@ -1245,7 +1261,7 @@ async fn key_lookup_requires_the_data_keys_bearer() {
     assert_eq!(status, 200);
     assert_eq!(
         body,
-        json!({ "key_id": KEY_ID, "branch_id": branch, "kind": "secret", "role": "reporting" })
+        json!({ "key_id": KEY_ID, "branch_id": branch, "kind": "secret", "role": "reporting", "databases": null })
     );
     // `last_used_at` is stamped off the response path.
     for _ in 0..50 {
@@ -1255,6 +1271,27 @@ async fn key_lookup_requires_the_data_keys_bearer() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(*neon.touched.lock().unwrap(), vec![KEY_ID]);
+}
+
+#[tokio::test]
+async fn key_lookup_returns_databases() {
+    let neon = FakeNeon::default();
+    let branch = BranchId::new();
+    neon.data_keys.lock().unwrap().push((
+        sha("chk_sec_listed"),
+        DataKeyLookup {
+            key_id: KEY_ID,
+            branch_id: branch,
+            kind: DataKeyKind::Secret,
+            role: "reporting".into(),
+            databases: Some(vec!["web1".into(), "analytics".into()]),
+        },
+    ));
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+    let path = format!("/internal/data/keys/{}", hex::encode(sha("chk_sec_listed")));
+    let (status, body) = app.get(&path, Some(DATA_KEYS_TOKEN)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["databases"], json!(["web1", "analytics"]));
 }
 
 #[tokio::test]
@@ -1288,8 +1325,8 @@ fn connection_row(status: BranchStatus, endpoint: Option<&str>, password: Option
             max_rows: 500,
             statement_timeout_ms: 4000,
             max_connections: 7,
-            default_schema: "app".into(),
         },
+        databases: vec![ServedDatabase { name: "web1".into(), default_schema: "app".into() }],
     }
 }
 
@@ -1346,6 +1383,33 @@ async fn connection_409_when_not_ready() {
 }
 
 #[tokio::test]
+async fn connection_lists_served_databases() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+    row.authenticator_password_enc =
+        Some(seal_credential(&app.key, &row.branch_id.to_string(), Purpose::Authenticator, "auth-pw"));
+    row.databases = vec![
+        ServedDatabase { name: "web1".into(), default_schema: "app".into() },
+        ServedDatabase { name: "analytics".into(), default_schema: "public".into() },
+    ];
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app
+        .get(&format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()), Some(REST_TOKEN))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    // The main database's name stays in `database`; every served one is listed, main first.
+    assert_eq!(body["database"], "web1");
+    assert_eq!(
+        body["databases"],
+        json!([{ "name": "web1", "default_schema": "app" }, { "name": "analytics", "default_schema": "public" }])
+    );
+    assert!(body["settings"].get("default_schema").is_none(), "{body}");
+}
+
+#[tokio::test]
 async fn connection_opens_the_authenticator_password() {
     let neon = FakeNeon::default();
     let locator = FakeLocator::default();
@@ -1373,8 +1437,8 @@ async fn connection_opens_the_authenticator_password() {
                 "max_rows": 500,
                 "statement_timeout_ms": 4000,
                 "max_connections": 7,
-                "default_schema": "app",
             },
+            "databases": [{ "name": "web1", "default_schema": "app" }],
         })
     );
 
@@ -1506,6 +1570,104 @@ async fn ddl_unknown_endpoint_in_metadata_is_404() {
         .ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![set("a", STRONG, SCRAM)]))
         .await;
     assert_eq!((status, text.as_str()), (404, "unknown endpoint"));
+}
+
+type Invalidations = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// A rest stand-in that records the invalidations it is sent: (branch, authorization).
+async fn mock_rest_invalidate() -> (String, Invalidations) {
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    let seen: Invalidations = Arc::default();
+    let log = seen.clone();
+    let app = Router::new().route(
+        "/internal/branches/{branch}/invalidate",
+        post(move |Path(branch): Path<String>, headers: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+                log.lock().unwrap().push((branch, auth));
+                AxumStatus::NO_CONTENT
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, seen)
+}
+
+/// The invalidation is sent off the response path: waits for `n` of them.
+async fn wait_for_invalidations(seen: &Invalidations, n: usize) {
+    for _ in 0..100 {
+        if seen.lock().unwrap().len() >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn ddl_drop_invalidates_rest() {
+    let (rest, seen) = mock_rest_invalidate().await;
+    let (neon, branch) = ddl_neon();
+    neon.edit(|s| {
+        s.dbs.insert("extra".into(), ("postgres".into(), DatabaseOrigin::Sql));
+        s.dbs.insert("other".into(), ("postgres".into(), DatabaseOrigin::Sql));
+    });
+    let app = spawn_internal_full(
+        neon.clone(),
+        FakeLocator::default(),
+        "http://127.0.0.1:9",
+        rules(Mode::SelfHosted, false),
+        FakeCache::default(),
+        &rest,
+    )
+    .await;
+    // A DROP DATABASE, then a rename: each is told to rest, with rest's bearer.
+    let (status, _, _) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "del", "name": "extra" })]))
+        .await;
+    assert_eq!(status, 200);
+    wait_for_invalidations(&seen, 1).await;
+    let (status, _, _) = app
+        .ddl(
+            "ep-d",
+            Some(COMPUTE_TOKEN),
+            &dbs_delta(vec![json!({ "op": "set", "name": "renamed", "old_name": "other" })]),
+        )
+        .await;
+    assert_eq!(status, 200);
+    wait_for_invalidations(&seen, 2).await;
+    let expected = (branch.as_uuid().to_string(), Some(format!("Bearer {REST_TOKEN}")));
+    assert_eq!(*seen.lock().unwrap(), vec![expected.clone(), expected]);
+
+    // A CREATE DATABASE, a role change and a refused delta don't touch rest.
+    for body in [
+        dbs_delta(vec![json!({ "op": "set", "name": "fresh", "owner": "postgres" })]),
+        roles_delta(vec![set("app_rw", STRONG, SCRAM)]),
+        dbs_delta(vec![json!({ "op": "set", "name": "other", "old_name": "neondb" })]),
+    ] {
+        app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn ddl_still_answers_when_rest_is_down() {
+    let (neon, _) = ddl_neon();
+    neon.edit(|s| {
+        s.dbs.insert("extra".into(), ("postgres".into(), DatabaseOrigin::Sql));
+    });
+    // Nothing listens on the discard port.
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (status, _, _) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "del", "name": "extra" })]))
+        .await;
+    assert_eq!(status, 200);
+    assert!(!neon.ddl_state().dbs.contains_key("extra"));
 }
 
 type Setup = fn(&mut DdlState);
@@ -2035,6 +2197,19 @@ async fn ddl_rename_reseals_an_api_password() {
         "the-secret"
     );
     assert!(cheladb_secrets::open_role_password(&app.key, &b, "api_r", resealed).is_err());
+}
+
+// A role made, renamed and given `PASSWORD NULL` in one transaction reaches the receiver as
+// one op for `c` (old name `b`, password null) while neither name has a row: nothing to move
+// or clear, so no row appears for either.
+#[tokio::test]
+async fn ddl_rename_of_an_unknown_role_with_null_password_leaves_no_row() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let body = roles_delta(vec![json!({ "op": "set", "name": "c", "old_name": "b", "password": null })]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let state = neon.ddl_state();
+    assert!(!state.roles.contains_key("b") && !state.roles.contains_key("c"), "{:?}", state.roles.keys());
 }
 
 fn rename(old: &str, new: &str) -> Value {

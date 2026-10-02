@@ -196,6 +196,30 @@ impl MetadataPort for Doc {
     ) -> Result<std::collections::HashSet<BranchId>, MetadataError> {
         match *self {}
     }
+    async fn begin_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        cap: u32,
+    ) -> Result<EnableStart, MetadataError> {
+        match *self {}
+    }
+    async fn set_database_default_schema(
+        &self,
+        branch: BranchId,
+        name: &str,
+        schema: &str,
+    ) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn set_key_databases(
+        &self,
+        branch: BranchId,
+        key_id: Uuid,
+        databases: Option<Vec<String>>,
+    ) -> Result<bool, MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -222,6 +246,25 @@ impl JobPort for Doc {
         &self,
         branch_id: BranchId,
         role: &str,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        match *self {}
+    }
+    async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
+        match *self {}
+    }
+    async fn disable_data_api(
+        &self,
+        branch_id: BranchId,
+        name: &str,
+        remove: bool,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        match *self {}
+    }
+    async fn rebootstrap_data_api(
+        &self,
+        branch_id: BranchId,
+        name: &str,
+        grant_existing: bool,
     ) -> Result<CheckDataRoleReply, ResetError> {
         match *self {}
     }
@@ -333,6 +376,10 @@ mod tests {
                 "revokeKey",
             ),
             (
+                "DELETE /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api",
+                "disableDataApi",
+            ),
+            (
                 "DELETE /v1/databases/{id}/branches/{branch_id}/roles/{role}",
                 "deleteRole",
             ),
@@ -341,6 +388,10 @@ mod tests {
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/connection",
                 "getBranchConnection",
+            ),
+            (
+                "GET /v1/databases/{id}/branches/{branch_id}/console/schema",
+                "getConsoleSchema",
             ),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/data-api/schema",
@@ -365,8 +416,20 @@ mod tests {
                 "PATCH /v1/databases/{id}/branches/{branch_id}",
                 "updateBranch",
             ),
+            (
+                "PATCH /v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
+                "updateKey",
+            ),
+            (
+                "PATCH /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
+                "updatePgDatabase",
+            ),
             ("POST /v1/databases", "createDatabase"),
             ("POST /v1/databases/{id}/branches", "createBranch"),
+            (
+                "POST /v1/databases/{id}/branches/{branch_id}/console/query",
+                "consoleQuery",
+            ),
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/keys",
                 "createKey",
@@ -374,6 +437,10 @@ mod tests {
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/keys/{key_id}/rotate",
                 "rotateKey",
+            ),
+            (
+                "POST /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api",
+                "enableDataApi",
             ),
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/reset-password",
@@ -479,6 +546,7 @@ mod tests {
             "BranchStatus",
             "ColumnDesc",
             "ConnectionDetails",
+            "ConsoleRequest",
             "CreateBranchRequest",
             "CreateDatabaseAccepted",
             "CreateDatabaseRequest",
@@ -486,6 +554,7 @@ mod tests {
             "CreateRoleRequest",
             "CreatedDataKey",
             "DataApiSchema",
+            "DataApiState",
             "DataKey",
             "DataKeyKind",
             "Database",
@@ -519,6 +588,8 @@ mod tests {
             "TenantId",
             "UpdateBranchRequest",
             "UpdateDatabaseRequest",
+            "UpdateKeyRequest",
+            "UpdatePgDatabaseRequest",
         ];
         // The names are map keys, so a clash between two types would drop one from this list.
         assert_eq!(names, expected);

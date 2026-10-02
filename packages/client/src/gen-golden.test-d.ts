@@ -37,3 +37,22 @@ test("results resolve Int8 and keep numeric a string", async () => {
   expectTypeOf(await db.call("next_id")).toEqualTypeOf<number>();
   expectTypeOf(await db.call("total_spent", { user_id: "u" })).toEqualTypeOf<string>();
 });
+
+// Several databases: `Databases` keys, `types` keyed alike, `Database` kept as the main one.
+test("generated multi-database types drive bound clients", async () => {
+  const m = await import("../fixtures/gen/multi.ts");
+  type Dbs = import("../fixtures/gen/multi.ts").Databases;
+  expectTypeOf<import("../fixtures/gen/multi.ts").Database>().toEqualTypeOf<Dbs["main"]>();
+  const main = createClient<Dbs["main"]>({ url: "http://x", key: "k", types: m.types.main });
+  const analytics = main.database<Dbs["analytics"]>("analytics", m.types.analytics);
+  expectTypeOf(analytics.from("reports.daily").select("day", "hits")).not.toBeAny();
+  expectTypeOf(analytics.from("daily")).not.toBeAny();
+  const rows = await analytics.from("daily").select("day", "hits");
+  expectTypeOf(rows[0]!.hits).toEqualTypeOf<number>();
+  // @ts-expect-error orders is in main, not analytics
+  analytics.from("orders");
+  // @ts-expect-error daily is in analytics, not main
+  main.from("daily");
+  const direct = createClient<Dbs["analytics"]>({ url: "http://x", key: "k", types: m.types.analytics });
+  expectTypeOf(direct).toEqualTypeOf<typeof analytics>();
+});

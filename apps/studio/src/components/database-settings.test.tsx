@@ -12,7 +12,6 @@ const DEFAULTS = {
   max_rows: 1000,
   statement_timeout_ms: 8000,
   max_connections: 5,
-  default_schema: "public",
 };
 
 const PATCH = "PATCH /v1/databases/db";
@@ -101,25 +100,22 @@ describe("DatabaseSettings", () => {
     expect(save()).toHaveAccessibleDescription("Saving the settings…");
   });
 
-  it("shows the four data API settings", () => {
+  it("shows the three data API settings and no default schema", () => {
     setup();
     expect(screen.getByLabelText("Max rows")).toHaveValue(1000);
     expect(screen.getByLabelText("Statement timeout (ms)")).toHaveValue(8000);
     expect(screen.getByLabelText("Max connections")).toHaveValue(5);
-    expect(screen.getByLabelText("Default schema")).toHaveValue("public");
+    expect(screen.queryByLabelText("Default schema")).not.toBeInTheDocument();
   });
 
   it("saves changed data API settings", async () => {
-    const { fetch, onSaved } = setup(() => jsonResponse({ ...DEFAULTS, max_rows: 50, default_schema: "app" }));
+    const { fetch, onSaved } = setup(() => jsonResponse({ ...DEFAULTS, max_rows: 50 }));
     const rows = screen.getByLabelText("Max rows");
     await userEvent.clear(rows);
     await userEvent.type(rows, "50");
-    const schema = screen.getByLabelText("Default schema");
-    await userEvent.clear(schema);
-    await userEvent.type(schema, "app");
     await userEvent.click(save());
-    await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, max_rows: 50, default_schema: "app" }));
-    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, max_rows: 50, default_schema: "app" }]);
+    await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, max_rows: 50 }));
+    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, max_rows: 50 }]);
   });
 
   it("refuses data API settings outside their bounds", async () => {
@@ -128,7 +124,6 @@ describe("DatabaseSettings", () => {
       ["Max rows", "100001", /Max rows must be a whole number between 1 and 100000/],
       ["Statement timeout (ms)", "99", /Statement timeout must be a whole number between 100 and 120000/],
       ["Max connections", "51", /Max connections must be a whole number between 1 and 50/],
-      ["Default schema", "Bad-Name", /Default schema must be 1-63 characters/],
     ];
     for (const [label, value, message] of cases) {
       const input = screen.getByLabelText(label);

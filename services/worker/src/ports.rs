@@ -5,10 +5,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use cheladb_metadata::{
-    BranchConnectionRow, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
+    BranchConnectionRow, BranchDatabase, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
     DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState,
     InsertRoleOutcome, LiveBranch, LiveDatabase, MetadataClient, MetadataError, NeonDatabase,
     NeonEndpoint, NeonRole, NewDataKey, NewEndpoint, ResyncApplied, ResyncWrite, RoleCopy,
+    ServedDatabase,
 };
 use cheladb_neon::proxy_cache::ProxyCache;
 use cheladb_neon::spec::Placement;
@@ -305,6 +306,39 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         branch: BranchId,
         sealed: &str,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// The branch's Postgres databases with their data API state: main first, then by name.
+    fn branch_databases(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<BranchDatabase>, MetadataError>> + Send;
+    /// The databases the data API serves (state `on`), main first, with their default schema.
+    fn served_databases(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<ServedDatabase>, MetadataError>> + Send;
+    /// Ends an enable: `Ok` makes the row `on`, `Err(text)` makes it `error`. Only a row still
+    /// `enabling` moves; false otherwise.
+    fn finish_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        outcome: Result<(), String>,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Switches a non-main database's data API off; false for main or an unknown name.
+    fn set_data_api_off(
+        &self,
+        branch: BranchId,
+        name: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// A new child's flags and default schemas, from its parent's rows by name (P3).
+    fn copy_parent_database_flags(
+        &self,
+        child: BranchId,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// Every `(branch, database)` currently `enabling`.
+    fn enabling_databases(
+        &self,
+    ) -> impl Future<Output = Result<Vec<(BranchId, String)>, MetadataError>> + Send;
     /// Ready `normal` branches without a live public key or an authenticator password.
     fn branches_missing_data_api(
         &self,
@@ -655,6 +689,41 @@ impl WorkerMetadata for MetadataClient {
         sealed: &str,
     ) -> Result<(), MetadataError> {
         MetadataClient::set_authenticator_password(self, branch, sealed).await
+    }
+
+    async fn branch_databases(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<BranchDatabase>, MetadataError> {
+        MetadataClient::branch_databases(self, branch).await
+    }
+
+    async fn served_databases(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<ServedDatabase>, MetadataError> {
+        MetadataClient::served_databases(self, branch).await
+    }
+
+    async fn finish_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        outcome: Result<(), String>,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::finish_enable_data_api(self, branch, name, outcome).await
+    }
+
+    async fn set_data_api_off(&self, branch: BranchId, name: &str) -> Result<bool, MetadataError> {
+        MetadataClient::set_data_api_off(self, branch, name).await
+    }
+
+    async fn copy_parent_database_flags(&self, child: BranchId) -> Result<(), MetadataError> {
+        MetadataClient::copy_parent_database_flags(self, child).await
+    }
+
+    async fn enabling_databases(&self) -> Result<Vec<(BranchId, String)>, MetadataError> {
+        MetadataClient::enabling_databases(self).await
     }
 
     async fn branches_missing_data_api(&self) -> Result<Vec<BranchId>, MetadataError> {

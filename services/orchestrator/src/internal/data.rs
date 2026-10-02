@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use super::{InternalState, NeonMetadataPort};
 
-/// `{"key_id","branch_id","kind","role"}` for the live key with this hash (64 lowercase hex
+/// `{"key_id","branch_id","kind","role","databases"}` (`databases` is null for every served
+/// database, else the key's allow-list) for the live key with this hash (64 lowercase hex
 /// characters); 404 for anything else. `last_used_at` is stamped after the answer is on its way.
 pub(super) async fn key_lookup<M, L>(
     State(state): State<Arc<InternalState<M, L>>>,
@@ -43,6 +44,7 @@ where
                 "branch_id": key.branch_id,
                 "kind": key.kind,
                 "role": key.role,
+                "databases": key.databases,
             }))
             .into_response()
         }
@@ -66,7 +68,7 @@ fn parse_hash(hash: &str) -> Option<[u8; 32]> {
     hex::decode(hash).ok()?.try_into().ok()
 }
 
-/// Where and as whom the REST service connects to a branch. 404 for an unknown or deleted
+/// Where and as whom the REST service connects to a branch, and which databases it serves. 404 for an unknown or deleted
 /// branch; 409 `{"status"}` when the branch isn't ready, has no endpoint, has no published
 /// Postgres address or has no `authenticator` password yet.
 pub(super) async fn branch_connection<M, L>(
@@ -137,8 +139,13 @@ where
             "max_rows": row.settings.max_rows,
             "statement_timeout_ms": row.settings.statement_timeout_ms,
             "max_connections": row.settings.max_connections,
-            "default_schema": row.settings.default_schema,
         },
+        // The databases the data API serves, main first.
+        "databases": row
+            .databases
+            .iter()
+            .map(|d| json!({ "name": d.name, "default_schema": d.default_schema }))
+            .collect::<Vec<_>>(),
     }))
     .into_response();
     response.headers_mut().insert(

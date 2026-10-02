@@ -270,4 +270,14 @@ export interface Client<DB extends DatabaseShape, B extends boolean> extends Tx<
    * resolves to each one's result.
    */
   batch<const T extends readonly Operation<unknown>[] | []>(fn: (tx: Tx<DB, B>) => T): Operation<Results<T>>;
+  /**
+   * A client bound to another database of the branch: every request it sends carries
+   * `database: name` (a batch carries it once, at its top level). Pass the generated
+   * `Databases["name"]` as `DB2` and `types["name"]` as `types`; without a generated type
+   * the client is untyped (in bigint mode `types` is always required: it decodes int8). The bigint mode is inherited.
+   */
+  database<DB2 extends DatabaseShape = DatabaseShape>(
+    name: string,
+    ...types: B extends true ? [types: TypeMap] : DatabaseShape extends DB2 ? [types?: TypeMap] : [types: TypeMap]
+  ): Client<DB2, B>;
 }

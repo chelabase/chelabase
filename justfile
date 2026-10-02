@@ -602,6 +602,14 @@ data-e2e:
     slot_load "$PWD"
     exec scripts/data-e2e.sh
 
+# Live data API across databases and Studio's console: a second database, a key allowed only on it, console CRUD as owner, anon under RLS and other roles, disable (needs just dev)
+console-e2e:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    . scripts/lib/slots.sh
+    slot_load "$PWD"
+    exec scripts/console-e2e.sh
+
 # Live login roles story: create a plain role, connect, back a secret key, refused delete, reset,
 # revoke, delete (needs just deps-up and just dev)
 role-e2e:

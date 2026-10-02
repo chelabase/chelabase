@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
-import { configureManagementClient, customFetch } from "./fetch";
+import { configureManagementClient, consoleQueryExact, customFetch, parseExact } from "./fetch";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
   return new Response(body, { status, headers: { "content-type": type } });
@@ -118,5 +118,26 @@ describe("unconfigured", () => {
     vi.resetModules();
     const fresh = await import("./fetch");
     await expect(fresh.customFetch("/x", {})).rejects.toThrow(/configureManagementClient/);
+  });
+});
+
+describe("parseExact", () => {
+  it("keeps numbers that don't survive a double as their source text", () => {
+    const out = parseExact('[{"id":9007199254740993,"n":0.12345678901234567890,"ok":1.5,"i":42,"p":1.50,"s":"x","z":null}]') as Record<string, unknown>[];
+    expect(out[0]).toEqual({ id: "9007199254740993", n: "0.12345678901234567890", ok: 1.5, i: 42, p: 1.5, s: "x", z: null });
+  });
+});
+
+describe("consoleQueryExact", () => {
+  it("posts the console request and reads the answer exactly", async () => {
+    const f = vi.fn(async () => res('[{"id":9007199254740993}]'));
+    setup(f as unknown as typeof fetch);
+    const out = await consoleQueryExact("d", "b", { role: null, database: null, tree: { v: 1 } });
+    expect(out).toEqual([{ id: "9007199254740993" }]);
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/v1/databases/d/branches/b/console/query");
+    expect(init.method).toBe("POST");
+    f.mockImplementationOnce(async () => res('{"error":{"code":"unknown_table","message":"m"}}', 404));
+    await expect(consoleQueryExact("d", "b", { tree: {} })).rejects.toMatchObject({ code: "unknown_table" });
   });
 });

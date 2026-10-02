@@ -150,6 +150,29 @@ pub struct CheckDataRoleRequest {
     pub role: String,
 }
 
+/// Core publish (no reply awaited): bootstrap the data API in a database the orchestrator just
+/// marked `enabling`. The worker records `on` or `error`; reconcile retries rows left `enabling`.
+pub const SUBJECT_DATA_API_ENABLE: &str = "cheladb.rpc.data_api.enable";
+/// Core request/reply: stop serving a database (`remove` also drops the `cheladb` machinery).
+/// Answers a [`CheckDataRoleReply`].
+pub const SUBJECT_DATA_API_DISABLE: &str = "cheladb.rpc.data_api.disable";
+/// Core request/reply: re-run the bootstrap of a served database after its `default_schema`
+/// changed. Answers a [`CheckDataRoleReply`].
+pub const SUBJECT_DATA_API_REBOOTSTRAP: &str = "cheladb.rpc.data_api.rebootstrap";
+
+/// Enable, disable and rebootstrap. `remove` only matters for disable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataApiDatabaseRequest {
+    pub branch_id: BranchId,
+    pub name: String,
+    #[serde(default)]
+    pub remove: bool,
+    /// Rebootstrap only: also grant the data API roles on the schema's existing objects,
+    /// whether or not a first grant ran before. Never revokes.
+    #[serde(default)]
+    pub grant_existing: bool,
+}
+
 /// Core request/reply (not JetStream): create a login role. The orchestrator waits up to
 /// `RESET_TIMEOUT` for the worker's [`RoleReply`].
 pub const SUBJECT_ROLE_CREATE: &str = "cheladb.rpc.roles.create";
@@ -611,6 +634,22 @@ mod tests {
         };
         let back: RoleReply = serde_json::from_slice(&serde_json::to_vec(&in_use).unwrap()).unwrap();
         assert_eq!(back, in_use);
+    }
+
+    #[test]
+    fn data_api_database_wire_shapes() {
+        assert_eq!(SUBJECT_DATA_API_ENABLE, "cheladb.rpc.data_api.enable");
+        assert_eq!(SUBJECT_DATA_API_DISABLE, "cheladb.rpc.data_api.disable");
+        assert_eq!(SUBJECT_DATA_API_REBOOTSTRAP, "cheladb.rpc.data_api.rebootstrap");
+        let request = DataApiDatabaseRequest { branch_id: BranchId::new(), name: "analytics".into(), remove: true, grant_existing: true };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["name"], "analytics");
+        assert_eq!(json["remove"], true);
+        assert_eq!(json["grant_existing"], true);
+        let back: DataApiDatabaseRequest =
+            serde_json::from_str(&format!(r#"{{"branch_id":{},"name":"a"}}"#, json["branch_id"])).unwrap();
+        assert!(!back.remove);
+        assert!(!back.grant_existing);
     }
 
     #[test]

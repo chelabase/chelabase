@@ -25,6 +25,8 @@ use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 
+use cheladb_metadata::{BranchDatabase, DataApiState, DatabaseOrigin, ServedDatabase};
+
 use crate::Worker;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 
@@ -43,6 +45,22 @@ pub fn position(journal: &Journal, prefix: &str) -> Option<usize> {
 
 pub fn entries(journal: &Journal) -> Vec<String> {
     lock(journal).clone()
+}
+
+/// A `branch_databases` row as the data API sees it.
+#[derive(Debug, Clone)]
+pub struct FakeDbRow {
+    pub name: String,
+    pub state: DataApiState,
+    pub error: Option<String>,
+    pub schema: String,
+    pub main: bool,
+}
+
+impl FakeDbRow {
+    pub fn new(name: &str, state: DataApiState, schema: &str) -> Self {
+        Self { name: name.to_string(), state, error: None, schema: schema.to_string(), main: false }
+    }
 }
 
 pub struct FakeEndpoint {
@@ -130,9 +148,15 @@ pub struct FakeState {
     /// Runs once, just before the next `claim_stale_reset`: a write landing between a run's
     /// first read and its claim.
     pub before_claim_stale_reset: Option<StateHook>,
+    /// `branch_databases` per branch, with the data API state. A new endpoint writes the main
+    /// row `on`, as `public`; tests add the others.
+    pub db_rows: HashMap<BranchId, Vec<FakeDbRow>>,
     /// Data API keys; live unless their id is in `revoked_keys`.
     pub data_keys: Vec<NewDataKey>,
     pub revoked_keys: HashSet<uuid::Uuid>,
+    /// Runs once, just before the next `finish_enable_data_api`: a write landing while the
+    /// enable's bootstrap ran (a `default_schema` PATCH, say).
+    pub before_finish_enable: Option<StateHook>,
     /// Runs once, just before the next `insert_data_key`: a concurrent run's insert.
     pub before_insert_data_key: Option<StateHook>,
     /// Runs once, just before the next `set_authenticator_password`: a concurrent run's write.
@@ -323,7 +347,6 @@ impl FakeMetadata {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,
                 max_connections: 5,
-                default_schema: "public".into(),
             },
         );
         state.branches.insert(
@@ -557,6 +580,13 @@ impl WorkerMetadata for FakeMetadata {
             db.database_name = Some(ep.database_name.to_string());
             db.owner_role = Some(ep.owner_role.to_string());
         }
+        state.db_rows.insert(
+            id,
+            vec![FakeDbRow {
+                main: true,
+                ..FakeDbRow::new(ep.database_name, DataApiState::On, "public")
+            }],
+        );
         state.endpoints.insert(
             ep.id.to_string(),
             FakeEndpoint {
@@ -892,7 +922,7 @@ impl WorkerMetadata for FakeMetadata {
     async fn apply_resync(
         &self,
         endpoint_id: &str,
-        _branch: BranchId,
+        branch: BranchId,
         read_version: i64,
         write: &ResyncWrite,
     ) -> Result<ResyncApplied, MetadataError> {
@@ -953,6 +983,14 @@ impl WorkerMetadata for FakeMetadata {
         ep.branch_databases = write.databases.clone();
         if !changed.is_empty() || databases_changed {
             ep.roles_version += 1;
+        }
+        // The data API rows follow the observed databases: new ones start `off`, as `set_databases`.
+        let rows = state.db_rows.entry(branch).or_default();
+        rows.retain(|r| r.main || write.databases.iter().any(|d| d.name == r.name));
+        for d in write.databases.iter().filter(|d| !d.system) {
+            if !rows.iter().any(|r| r.name == d.name) {
+                rows.push(FakeDbRow::new(&d.name, DataApiState::Off, "public"));
+            }
         }
         Ok(ResyncApplied::Applied { changed })
     }
@@ -1402,8 +1440,124 @@ impl WorkerMetadata for FakeMetadata {
                 created_at: chrono::Utc::now(),
                 last_used_at: None,
                 revoked_at: None,
+                databases: k.databases.clone(),
             })
             .collect())
+    }
+
+    async fn branch_databases(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<BranchDatabase>, MetadataError> {
+        let state = self.read("branch_databases")?;
+        let mut rows = state.db_rows.get(&branch).cloned().unwrap_or_default();
+        rows.sort_by(|a, b| (!a.main, &a.name).cmp(&(!b.main, &b.name)));
+        Ok(rows
+            .into_iter()
+            .map(|r| BranchDatabase {
+                name: r.name,
+                owner: "postgres".to_string(),
+                origin: if r.main { DatabaseOrigin::Main } else { DatabaseOrigin::Sql },
+                data_api: r.state,
+                data_api_error: r.error,
+                data_api_bootstrapped: r.main || r.state != DataApiState::Off,
+                default_schema: r.schema,
+            })
+            .collect())
+    }
+
+    async fn served_databases(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<ServedDatabase>, MetadataError> {
+        let state = self.read("served_databases")?;
+        let mut rows: Vec<FakeDbRow> = state
+            .db_rows
+            .get(&branch)
+            .map(|rows| rows.iter().filter(|r| r.state == DataApiState::On).cloned().collect())
+            .unwrap_or_default();
+        rows.sort_by(|a, b| (!a.main, &a.name).cmp(&(!b.main, &b.name)));
+        Ok(rows
+            .into_iter()
+            .map(|r| ServedDatabase { name: r.name, default_schema: r.schema })
+            .collect())
+    }
+
+    async fn finish_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        outcome: Result<(), String>,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("finish_enable_data_api")?;
+        if let Some(hook) = state.before_finish_enable.take() {
+            hook(&mut state);
+        }
+        let Some(row) = state
+            .db_rows
+            .get_mut(&branch)
+            .and_then(|rows| rows.iter_mut().find(|r| r.name == name))
+            .filter(|r| r.state == DataApiState::Enabling)
+        else {
+            return Ok(false);
+        };
+        match outcome {
+            Ok(()) => {
+                row.state = DataApiState::On;
+                row.error = None;
+            }
+            Err(text) => {
+                row.state = DataApiState::Error;
+                row.error = Some(text);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn set_data_api_off(&self, branch: BranchId, name: &str) -> Result<bool, MetadataError> {
+        let mut state = self.write("set_data_api_off")?;
+        let Some(row) = state
+            .db_rows
+            .get_mut(&branch)
+            .and_then(|rows| rows.iter_mut().find(|r| r.name == name))
+            .filter(|r| !r.main)
+        else {
+            return Ok(false);
+        };
+        row.state = DataApiState::Off;
+        row.error = None;
+        Ok(true)
+    }
+
+    async fn copy_parent_database_flags(&self, child: BranchId) -> Result<(), MetadataError> {
+        let mut state = self.write("copy_parent_database_flags")?;
+        let Some(parent) = state.branches.get(&child).and_then(|b| b.parent_branch_id) else {
+            return Ok(());
+        };
+        let parent_rows = state.db_rows.get(&parent).cloned().unwrap_or_default();
+        for row in state.db_rows.entry(child).or_default() {
+            if let Some(p) = parent_rows.iter().find(|p| p.name == row.name) {
+                row.state = if p.state == DataApiState::On { DataApiState::On } else { DataApiState::Off };
+                row.error = None;
+                row.schema = p.schema.clone();
+            }
+        }
+        Ok(())
+    }
+
+    async fn enabling_databases(&self) -> Result<Vec<(BranchId, String)>, MetadataError> {
+        let state = self.read("enabling_databases")?;
+        let mut out: Vec<(BranchId, String)> = state
+            .db_rows
+            .iter()
+            .flat_map(|(b, rows)| {
+                rows.iter()
+                    .filter(|r| r.state == DataApiState::Enabling)
+                    .map(|r| (*b, r.name.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(b, n)| (b.as_uuid(), n.clone()));
+        Ok(out)
     }
 
     async fn has_live_public_key(&self, branch: BranchId) -> Result<bool, MetadataError> {
@@ -1459,8 +1613,11 @@ impl WorkerMetadata for FakeMetadata {
                     max_rows: db.max_rows,
                     statement_timeout_ms: db.statement_timeout_ms,
                     max_connections: db.max_connections,
-                    default_schema: db.default_schema.clone(),
                 },
+                databases: vec![cheladb_metadata::ServedDatabase {
+                    name: db.database_name.clone().unwrap_or_else(|| "db".into()),
+                    default_schema: "public".into(),
+                }],
             })
         }))
     }
@@ -1992,6 +2149,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         ready_timeout: Duration::from_millis(20),
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
+        enabling_seen: Mutex::default(),
         reported_unknown_tenants: Mutex::default(),
     };
     (worker, journal)

@@ -3,8 +3,11 @@
 //! secret key's role must pass.
 
 use anyhow::{Context, bail};
-use cheladb_metadata::{BranchKind, BranchRecord, BranchStatus, MetadataError, NewDataKey};
-use cheladb_nats::{CheckDataRoleReply, CheckDataRoleRequest};
+use cheladb_metadata::{
+    BranchDatabase, BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseOrigin,
+    MetadataError, NewDataKey, ServedDatabase,
+};
+use cheladb_nats::{CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest};
 use cheladb_neon::ComputeBackend;
 use cheladb_secrets::{Purpose, open_credential, seal_credential};
 use cheladb_types::BranchId;
@@ -34,6 +37,47 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('cheladb.schema_version')
        WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['cheladb_schema_version_ddl', \
          'cheladb_schema_version_drop', 'cheladb_extension_functions']::pg_catalog.name[]) \
          AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3";
+
+/// Removes the data API machinery from a database (`DELETE …/data-api?remove=true`, P7), only
+/// when the `cheladb` schema is the one the bootstrap made (owned by `cheladb_admin`): the
+/// three event triggers, the two functions and the two tables by name, then the schema with
+/// `RESTRICT`, so anything else someone put there makes it fail rather than go with it. A
+/// `cheladb` schema with another owner is left alone (a warning). The `cheladb_admin` role
+/// stays (it's cluster-wide), and so do the default privileges and grants. The first line is a
+/// comment so the script is told apart from the bootstrap's.
+pub const REMOVE_DATA_API_SQL: &str = "-- remove the data API machinery
+SET search_path = pg_catalog, pg_temp;
+DO $$ BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+      WHERE n.nspname OPERATOR(pg_catalog.=) 'cheladb' AND r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN
+    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
+    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
+    DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
+    DROP FUNCTION IF EXISTS cheladb.bump_schema_version();
+    DROP FUNCTION IF EXISTS cheladb.grant_extension_functions();
+    DROP TABLE IF EXISTS cheladb.schema_version;
+    DROP TABLE IF EXISTS cheladb.bootstrap;
+    DROP SCHEMA cheladb RESTRICT;
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'cheladb') THEN
+    RAISE WARNING 'cheladb: the cheladb schema is not owned by cheladb_admin; nothing was removed';
+  END IF;
+END $$;
+";
+
+/// Where a data API request applies: the branch's endpoint and the database's row.
+struct DataApiTarget {
+    ep: String,
+    row: BranchDatabase,
+}
+
+/// What [`Worker::data_api_target`] found.
+enum Lookup {
+    /// The branch isn't ready or has no compute.
+    NotReady,
+    /// The branch has no such database.
+    Unknown,
+    Found(DataApiTarget),
+}
 
 /// `s` as an SQL string literal (`quote_literal`): single quotes doubled.
 pub(crate) fn quote_literal(s: &str) -> String {
@@ -78,8 +122,34 @@ pub fn valid_role_name(name: &str) -> bool {
 /// as the bootstrap superuser, so its functions are owned by cloud_admin and keep
 /// Postgres's PUBLIC `EXECUTE`. It's kept for a Neon where owners own their extensions'
 /// functions, when the owner's default privilege would strip PUBLIC from them.
-pub fn data_api_sql(owner_role: &str, authenticator_password: &str) -> String {
+pub fn data_api_sql(owner_role: &str, authenticator_password: &str, schema: &str) -> String {
+    data_api_script(owner_role, authenticator_password, schema, false)
+}
+
+/// [`data_api_sql`] for a rebootstrap that was asked to grant the schema's existing objects
+/// (`grant_existing`): the first-grants statements run whether or not `cheladb.bootstrap`
+/// has its row (still only when the schema exists). Grants only: no `REVOKE`, so a role never
+/// loses a privilege to it.
+pub fn data_api_sql_granting_existing(owner_role: &str, authenticator_password: &str, schema: &str) -> String {
+    data_api_script(owner_role, authenticator_password, schema, true)
+}
+
+fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str, grant_existing: bool) -> String {
+    // The asked-for variant only adds grants: no REVOKE, so it never narrows what a role has.
+    let (first_grants_guard, record_grant, revoke_public) = if grant_existing {
+        ("", " ON CONFLICT DO NOTHING", "")
+    } else {
+        (
+            " AND NOT EXISTS (SELECT FROM cheladb.bootstrap)",
+            "",
+            "      EXECUTE pg_catalog.format('REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC', r.f);\n",
+        )
+    };
     let password = quote_literal(authenticator_password);
+    let schema_ident = quote_ident(schema);
+    // `regnamespace` and `to_regnamespace` parse identifier syntax, so the literal is the
+    // quoted identifier.
+    let schema_literal = quote_literal(&schema_ident);
     let owner = quote_literal(owner_role);
     format!(
         "SET search_path = pg_catalog, pg_temp;
@@ -171,6 +241,8 @@ ALTER TABLE cheladb.schema_version OWNER TO cheladb_admin;
 ALTER TABLE cheladb.bootstrap OWNER TO cheladb_admin;
 REVOKE ALL ON cheladb.schema_version, cheladb.bootstrap FROM PUBLIC;
 GRANT SELECT ON cheladb.schema_version TO authenticator;
+GRANT USAGE ON SCHEMA cheladb TO {owner_role};
+GRANT SELECT ON cheladb.schema_version TO {owner_role};
 CREATE OR REPLACE FUNCTION cheladb.bump_schema_version() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
   $f$ BEGIN UPDATE cheladb.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
@@ -203,31 +275,43 @@ CREATE EVENT TRIGGER cheladb_schema_version_ddl ON ddl_command_end EXECUTE FUNCT
 CREATE EVENT TRIGGER cheladb_schema_version_drop ON sql_drop EXECUTE FUNCTION cheladb.bump_schema_version();
 CREATE EVENT TRIGGER cheladb_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION cheladb.grant_extension_functions();
 ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD {password};
-ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA public GRANT SELECT ON TABLES TO anon;
-ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
-ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
 ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
-ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO authenticated;
-GRANT USAGE ON SCHEMA public TO anon, authenticated;
+DO $$ BEGIN
+  IF pg_catalog.to_regnamespace({schema_literal}) IS NOT NULL THEN
+    ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT SELECT ON TABLES TO anon;
+    ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
+    ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
+    ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT EXECUTE ON FUNCTIONS TO authenticated;
+    GRANT USAGE ON SCHEMA {schema_ident} TO anon, authenticated;
+  END IF;
+END $$;
 DO $$ DECLARE r record; BEGIN
-  IF NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN
-    GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon;
-    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
-    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+  IF pg_catalog.to_regnamespace({schema_literal}) IS NOT NULL{first_grants_guard} THEN
+    GRANT SELECT ON ALL TABLES IN SCHEMA {schema_ident} TO anon;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema_ident} TO authenticated;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema_ident} TO authenticated;
     FOR r IN SELECT p.oid::pg_catalog.regprocedure AS f FROM pg_catalog.pg_proc p
-      WHERE p.pronamespace OPERATOR(pg_catalog.=) 'public'::pg_catalog.regnamespace
+      WHERE p.pronamespace OPERATOR(pg_catalog.=) {schema_literal}::pg_catalog.regnamespace
         AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
           AND d.objid OPERATOR(pg_catalog.=) p.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')
     LOOP
-      EXECUTE pg_catalog.format('REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC', r.f);
-      EXECUTE pg_catalog.format('GRANT EXECUTE ON ROUTINE %s TO authenticated', r.f);
+{revoke_public}      EXECUTE pg_catalog.format('GRANT EXECUTE ON ROUTINE %s TO authenticated', r.f);
     END LOOP;
-    INSERT INTO cheladb.bootstrap (existing_granted) VALUES (true);
+    INSERT INTO cheladb.bootstrap (existing_granted) VALUES (true){record_grant};
   END IF;
 END $$;
+SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace({schema_literal}) IS NULL;
 SELECT pg_catalog.current_setting('cheladb.quarantined', true);
 "
     )
+}
+
+/// Hard cap on one enable job (the NATS handler's and reconcile's).
+pub const ENABLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether the script skipped the default schema's statements (the schema doesn't exist).
+pub(crate) fn missing_schema(output: &str) -> bool {
+    output.lines().any(|l| l.trim() == "cheladb_missing_schema")
 }
 
 /// The schema the bootstrap renamed aside, from its output (the script's last line).
@@ -284,7 +368,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     Worker<M, S, C, N, P>
 {
     /// After any compute (re)creation and from reconcile. Idempotent. The record gives the
-    /// branch and its endpoint; the stored password is read afresh.
+    /// branch and its endpoint; the stored password is read afresh. Bootstraps every served
+    /// database; `database_name` is the main one.
     pub async fn bootstrap_data_api(
         &self,
         branch: &BranchRecord,
@@ -294,29 +379,109 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .endpoint_id
             .as_deref()
             .with_context(|| format!("branch {} has no endpoint", branch.id))?;
-        self.bootstrap_data_api_on(branch.id, ep, database_name)
+        self.bootstrap_served_on(branch.id, ep, database_name, &[])
             .await
+            .map(|_| ())
     }
 
-    /// [`Self::bootstrap_data_api`] for `branch` on its endpoint `ep`: the password (generated
-    /// and stored first when there's none), the script, then the public key if it has none.
+    /// The databases the data API serves on `branch`, main first. A branch without rows (none
+    /// yet) serves its main database with `public`.
+    pub(crate) async fn served_or_main(
+        &self,
+        branch: BranchId,
+        ep: &str,
+    ) -> anyhow::Result<Vec<ServedDatabase>> {
+        let served = self
+            .metadata
+            .served_databases(branch)
+            .await
+            .context("listing the served databases")?;
+        if !served.is_empty() {
+            return Ok(served);
+        }
+        Ok(vec![ServedDatabase {
+            name: self.database_of(ep).await?,
+            default_schema: "public".to_string(),
+        }])
+    }
+
+    /// The bootstrap of every served database of `branch` on `ep` (`main_database` is the
+    /// main one), then the secret keys' roles (cluster-wide, so through the main database
+    /// only) and the public key. The main database's failure fails the call; another
+    /// database's is logged (reconcile heals it), so a broken database can't keep the compute
+    /// from starting. `done` lists databases (with the schema) an earlier call already
+    /// bootstrapped: they're skipped, and the keys are left to that call. Returns the databases
+    /// bootstrapped now.
+    pub(crate) async fn bootstrap_served_on(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        main_database: &str,
+        done: &[ServedDatabase],
+    ) -> anyhow::Result<Vec<ServedDatabase>> {
+        let mut served = self.metadata.served_databases(branch).await.context("listing the served databases")?;
+        if served.is_empty() {
+            served.push(ServedDatabase {
+                name: main_database.to_string(),
+                default_schema: "public".to_string(),
+            });
+        }
+        let mut bootstrapped = Vec::new();
+        for database in served {
+            if done.contains(&database) {
+                continue;
+            }
+            let result = self
+                .bootstrap_data_api_on(branch, ep, &database.name, &database.default_schema)
+                .await;
+            match result {
+                Ok(()) => bootstrapped.push(database),
+                Err(e) if database.name == main_database => return Err(e),
+                Err(e) => {
+                    warn!(branch_id = %branch, %ep, database = %database.name, "bootstrapping a served database; reconcile retries: {e:#}");
+                }
+            }
+        }
+        if done.is_empty() {
+            self.regrant_secret_key_roles(branch, ep, main_database).await?;
+            self.ensure_public_key(branch).await?;
+        }
+        Ok(bootstrapped)
+    }
+
+    /// The data API script in one database of `ep`, with `schema` as its default schema: the
+    /// authenticator password (generated and stored first when there's none) and the script.
+    /// Neither the keys nor the roles' grants (see [`Self::bootstrap_served_on`]).
     pub(crate) async fn bootstrap_data_api_on(
         &self,
         branch: BranchId,
         ep: &str,
         database_name: &str,
+        schema: &str,
+    ) -> anyhow::Result<()> {
+        self.bootstrap_data_api_with(branch, ep, database_name, schema, false).await
+    }
+
+    /// [`Self::bootstrap_data_api_on`], granting the schema's existing objects too when
+    /// `grant_existing` (the rebootstrap a caller asked for).
+    async fn bootstrap_data_api_with(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        database_name: &str,
+        schema: &str,
+        grant_existing: bool,
     ) -> anyhow::Result<()> {
         let password = self.authenticator_password(branch).await?;
-        let output = self
-            .computes
-            .admin_sql(ep, database_name, &data_api_sql(OWNER_ROLE, &password))
-            .await?;
-        if let Some(aside) = quarantined(&output) {
-            warn!(branch_id = %branch, %ep, "a cheladb schema Cheladb didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
+        let script = data_api_script(OWNER_ROLE, &password, schema, grant_existing);
+        let output = self.computes.admin_sql(ep, database_name, &script).await?;
+        if missing_schema(&output) {
+            warn!(branch_id = %branch, %ep, database = %database_name, schema, "the default schema doesn't exist; its default privileges and grants were skipped (the machinery is installed)");
         }
-        self.regrant_secret_key_roles(branch, ep, database_name)
-            .await?;
-        self.ensure_public_key(branch).await
+        if let Some(aside) = quarantined(&output) {
+            warn!(branch_id = %branch, %ep, database = %database_name, "a cheladb schema Cheladb didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
+        }
+        Ok(())
     }
 
     /// A reset or restore rewinds `GRANT <role> TO authenticator`, but secret keys survive
@@ -417,6 +582,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 Purpose::DataKey,
                 &generated.key,
             )),
+            databases: None,
         };
         match self.metadata.insert_data_key(&key).await {
             Ok(()) => {
@@ -431,8 +597,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
     }
 
-    /// Reconcile's `BootstrapDataApi`: only a ready `normal` branch with an endpoint.
-    pub(crate) async fn reconcile_data_api(&self, id: BranchId) -> Result<(), String> {
+    /// Reconcile's `BootstrapDataApi`: only a ready `normal` branch with an endpoint. With a
+    /// `database`, only that one (if it's still served); without, all of them.
+    pub(crate) async fn reconcile_data_api(
+        &self,
+        id: BranchId,
+        database: Option<&str>,
+    ) -> Result<(), String> {
         let branch = self
             .metadata
             .get_branch(id)
@@ -446,14 +617,28 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(ep) = branch.endpoint_id.as_deref() else {
             return Ok(());
         };
-        let database_name = self.database_of(ep).await.map_err(|e| format!("{e:#}"))?;
-        self.bootstrap_data_api(&branch, &database_name)
-            .await
-            .map_err(|e| format!("bootstrapping the data API: {e:#}"))
+        let main_database = self.database_of(ep).await.map_err(|e| format!("{e:#}"))?;
+        let result = match database {
+            None => self.bootstrap_data_api(&branch, &main_database).await,
+            Some(name) => {
+                let served = self
+                    .served_or_main(id, ep)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                match served.iter().find(|d| d.name == name) {
+                    Some(d) => {
+                        self.bootstrap_data_api_on(id, ep, &d.name, &d.default_schema)
+                            .await
+                    }
+                    None => return Ok(()),
+                }
+            }
+        };
+        result.map_err(|e| format!("bootstrapping the data API: {e:#}"))
     }
 
-    /// The database inside `ep`'s compute.
-    async fn database_of(&self, ep: &str) -> anyhow::Result<String> {
+    /// The main database inside `ep`'s compute.
+    pub(crate) async fn database_of(&self, ep: &str) -> anyhow::Result<String> {
         self.metadata
             .neon_databases(ep)
             .await
@@ -464,17 +649,173 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .with_context(|| format!("endpoint {ep} has no database"))
     }
 
-    /// Whether `ep`'s data API machinery is intact ([`SCHEMA_CHECK_SQL`]).
+    /// Whether `ep`'s main database has its data API machinery intact ([`SCHEMA_CHECK_SQL`]).
     pub async fn data_api_healthy(&self, ep: &str) -> anyhow::Result<bool> {
         let database_name = self.database_of(ep).await?;
+        self.data_api_healthy_in(ep, &database_name).await
+    }
+
+    /// [`Self::data_api_healthy`] for any database of `ep`.
+    pub async fn data_api_healthy_in(&self, ep: &str, database: &str) -> anyhow::Result<bool> {
         let out = self
             .computes
-            .admin_sql(ep, &database_name, SCHEMA_CHECK_SQL)
+            .admin_sql(ep, database, SCHEMA_CHECK_SQL)
             .await?;
         match out.trim() {
             "t" => Ok(true),
             "f" => Ok(false),
             other => bail!("unexpected answer {other:?}"),
+        }
+    }
+
+    /// The enable job: bootstraps a database the orchestrator set `enabling`, with its
+    /// default schema, then records `on` (or `error` with the reason). A row that isn't
+    /// `enabling` (switched off meanwhile) is left alone; a branch that isn't ready leaves it
+    /// `enabling`, for reconcile to retry.
+    pub async fn enable_data_api(&self, request: &DataApiDatabaseRequest) {
+        let (branch, name) = (request.branch_id, request.name.as_str());
+        let target = match self.data_api_target(branch, name).await {
+            Ok(Lookup::Found(target)) => target,
+            Ok(Lookup::NotReady) => {
+                info!(branch_id = %branch, database = name, "enabling the data API: the branch isn't ready; reconcile retries");
+                return;
+            }
+            Ok(Lookup::Unknown) => return,
+            Err(why) => {
+                warn!(branch_id = %branch, database = name, "enabling the data API: {why}");
+                return;
+            }
+        };
+        if target.row.data_api != DataApiState::Enabling {
+            return;
+        }
+        let outcome = self
+            .bootstrap_data_api_on(branch, &target.ep, name, &target.row.default_schema)
+            .await
+            .map_err(|e| {
+                warn!(branch_id = %branch, database = name, "enabling the data API: {e:#}");
+                format!("{e:#}")
+            });
+        let succeeded = outcome.is_ok();
+        match self.metadata.finish_enable_data_api(branch, name, outcome).await {
+            Ok(true) if succeeded => {
+                self.rebootstrap_if_schema_changed(branch, name, &target.row.default_schema).await;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(branch_id = %branch, database = name, "recording the enable: {e}"),
+        }
+    }
+
+    /// After an enable made the row `on`: a `default_schema` stored while its bootstrap ran
+    /// (the PATCH saw `enabling` and ran nothing) gets its own bootstrap now. A failure is
+    /// logged; the database stays served with the old schema's default privileges until the
+    /// next PATCH or rebootstrap.
+    async fn rebootstrap_if_schema_changed(&self, branch: BranchId, name: &str, bootstrapped: &str) {
+        let target = match self.data_api_target(branch, name).await {
+            Ok(Lookup::Found(target)) => target,
+            Ok(_) => return,
+            Err(why) => {
+                warn!(branch_id = %branch, database = name, "re-reading the enabled database: {why}");
+                return;
+            }
+        };
+        if target.row.data_api != DataApiState::On || target.row.default_schema == bootstrapped {
+            return;
+        }
+        info!(branch_id = %branch, database = name, schema = %target.row.default_schema, "the default schema changed while enabling; bootstrapping it");
+        if let Err(e) = self
+            .bootstrap_data_api_on(branch, &target.ep, name, &target.row.default_schema)
+            .await
+        {
+            warn!(branch_id = %branch, database = name, "bootstrapping the new default schema: {e:#}");
+        }
+    }
+
+    /// The disable request: with `remove`, drops the machinery first ([`REMOVE_DATA_API_SQL`]),
+    /// then records `off`. Main's can't be switched off.
+    pub async fn disable_data_api(&self, request: &DataApiDatabaseRequest) -> CheckDataRoleReply {
+        let (branch, name) = (request.branch_id, request.name.as_str());
+        let target = match self.data_api_target(branch, name).await {
+            Ok(Lookup::Found(target)) => target,
+            Ok(Lookup::NotReady) => return CheckDataRoleReply::not_ready(),
+            Ok(Lookup::Unknown) => {
+                return CheckDataRoleReply::refused(format!("the branch has no database {name}"));
+            }
+            Err(why) => return CheckDataRoleReply::failed(why),
+        };
+        if target.row.origin == DatabaseOrigin::Main {
+            return CheckDataRoleReply::refused("the main database's data API can't be switched off");
+        }
+        if request.remove
+            && let Err(e) = self
+                .computes
+                .admin_sql(&target.ep, name, REMOVE_DATA_API_SQL)
+                .await
+        {
+            warn!(branch_id = %branch, database = name, "removing the data API machinery: {e:#}");
+            return CheckDataRoleReply::failed(format!("removing the data API machinery: {e:#}"));
+        }
+        match self.metadata.set_data_api_off(branch, name).await {
+            Ok(_) => CheckDataRoleReply::ok(),
+            Err(e) => CheckDataRoleReply::failed(format!("recording the database as off: {e}")),
+        }
+    }
+
+    /// The rebootstrap request, after the database's `default_schema` changed: the script
+    /// again, with the stored schema, in a served database.
+    pub async fn rebootstrap_data_api(&self, request: &DataApiDatabaseRequest) -> CheckDataRoleReply {
+        let (branch, name) = (request.branch_id, request.name.as_str());
+        let target = match self.data_api_target(branch, name).await {
+            Ok(Lookup::Found(target)) => target,
+            Ok(Lookup::NotReady) => return CheckDataRoleReply::not_ready(),
+            Ok(Lookup::Unknown) => {
+                return CheckDataRoleReply::refused(format!("the branch has no database {name}"));
+            }
+            Err(why) => return CheckDataRoleReply::failed(why),
+        };
+        if target.row.data_api != DataApiState::On {
+            return CheckDataRoleReply::refused("the database isn't served by the data API");
+        }
+        match self
+            .bootstrap_data_api_with(
+                branch,
+                &target.ep,
+                name,
+                &target.row.default_schema,
+                request.grant_existing,
+            )
+            .await
+        {
+            Ok(()) => CheckDataRoleReply::ok(),
+            Err(e) => {
+                warn!(branch_id = %branch, database = name, "rebootstrapping the data API: {e:#}");
+                CheckDataRoleReply::failed(format!("{e:#}"))
+            }
+        }
+    }
+
+    /// The branch's endpoint and the database's row, for the three requests above. `Err` is a
+    /// read that failed.
+    async fn data_api_target(&self, branch: BranchId, name: &str) -> Result<Lookup, String> {
+        let row = self
+            .metadata
+            .branch_connection(branch)
+            .await
+            .map_err(|e| format!("reading the branch: {e}"))?;
+        let Some(ep) = row
+            .filter(|r| r.status == BranchStatus::Ready)
+            .and_then(|r| r.endpoint_id)
+        else {
+            return Ok(Lookup::NotReady);
+        };
+        let databases = self
+            .metadata
+            .branch_databases(branch)
+            .await
+            .map_err(|e| format!("reading the branch's databases: {e}"))?;
+        match databases.into_iter().find(|d| d.name == name) {
+            Some(row) => Ok(Lookup::Found(DataApiTarget { ep, row })),
+            None => Ok(Lookup::Unknown),
         }
     }
 
@@ -747,6 +1088,8 @@ ALTER TABLE cheladb.schema_version OWNER TO cheladb_admin;
 ALTER TABLE cheladb.bootstrap OWNER TO cheladb_admin;
 REVOKE ALL ON cheladb.schema_version, cheladb.bootstrap FROM PUBLIC;
 GRANT SELECT ON cheladb.schema_version TO authenticator;
+GRANT USAGE ON SCHEMA cheladb TO postgres;
+GRANT SELECT ON cheladb.schema_version TO postgres;
 CREATE OR REPLACE FUNCTION cheladb.bump_schema_version() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
   $f$ BEGIN UPDATE cheladb.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
@@ -779,19 +1122,23 @@ CREATE EVENT TRIGGER cheladb_schema_version_ddl ON ddl_command_end EXECUTE FUNCT
 CREATE EVENT TRIGGER cheladb_schema_version_drop ON sql_drop EXECUTE FUNCTION cheladb.bump_schema_version();
 CREATE EVENT TRIGGER cheladb_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION cheladb.grant_extension_functions();
 ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD 's3cretPassw0rd';
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO anon;
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
-ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO authenticated;
-GRANT USAGE ON SCHEMA public TO anon, authenticated;
+DO $$ BEGIN
+  IF pg_catalog.to_regnamespace('\"public\"') IS NOT NULL THEN
+    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT SELECT ON TABLES TO anon;
+    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
+    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
+    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT EXECUTE ON FUNCTIONS TO authenticated;
+    GRANT USAGE ON SCHEMA \"public\" TO anon, authenticated;
+  END IF;
+END $$;
 DO $$ DECLARE r record; BEGIN
-  IF NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN
-    GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon;
-    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
-    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+  IF pg_catalog.to_regnamespace('\"public\"') IS NOT NULL AND NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN
+    GRANT SELECT ON ALL TABLES IN SCHEMA \"public\" TO anon;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"public\" TO authenticated;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"public\" TO authenticated;
     FOR r IN SELECT p.oid::pg_catalog.regprocedure AS f FROM pg_catalog.pg_proc p
-      WHERE p.pronamespace OPERATOR(pg_catalog.=) 'public'::pg_catalog.regnamespace
+      WHERE p.pronamespace OPERATOR(pg_catalog.=) '\"public\"'::pg_catalog.regnamespace
         AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
           AND d.objid OPERATOR(pg_catalog.=) p.oid AND d.deptype OPERATOR(pg_catalog.=) 'e')
     LOOP
@@ -801,11 +1148,12 @@ DO $$ DECLARE r record; BEGIN
     INSERT INTO cheladb.bootstrap (existing_granted) VALUES (true);
   END IF;
 END $$;
+SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace('\"public\"') IS NULL;
 SELECT pg_catalog.current_setting('cheladb.quarantined', true);
 ";
-        assert_eq!(data_api_sql("postgres", "s3cretPassw0rd"), expected);
+        assert_eq!(data_api_sql("postgres", "s3cretPassw0rd", "public"), expected);
         // A quoted literal, quotes doubled.
-        assert!(data_api_sql("postgres", "it's").contains("PASSWORD 'it''s';\n"));
+        assert!(data_api_sql("postgres", "it's", "public").contains("PASSWORD 'it''s';\n"));
     }
 
     /// The script runs as a superuser on a database its owner controls: nothing it calls
@@ -813,7 +1161,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     /// one tampered with) is renamed aside before anything touches it.
     #[test]
     fn the_script_pins_the_search_path_and_vets_cheladb_first() {
-        let sql = data_api_sql("postgres", "pw");
+        let sql = data_api_sql("postgres", "pw", "public");
         assert!(sql.starts_with("SET search_path = pg_catalog, pg_temp;\n"), "{sql}");
         let rename = sql.find("ALTER SCHEMA cheladb RENAME TO %I").expect("the rename aside");
         let create = sql.find("CREATE SCHEMA IF NOT EXISTS cheladb").unwrap();
@@ -833,7 +1181,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     /// is set aside.
     #[test]
     fn cheladb_admin_is_locked_down_before_the_schema_is_trusted() {
-        let sql = data_api_sql("postgres", "pw");
+        let sql = data_api_sql("postgres", "pw", "public");
         let locked = sql
             .find("ALTER ROLE cheladb_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;")
             .expect("the role is locked down");
@@ -852,7 +1200,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     /// they own, and never fails their command.
     #[test]
     fn grant_extension_functions_runs_as_the_invoker_and_never_fails() {
-        let sql = data_api_sql("postgres", "pw");
+        let sql = data_api_sql("postgres", "pw", "public");
         let start = sql.find("CREATE OR REPLACE FUNCTION cheladb.grant_extension_functions()").unwrap();
         let end = sql[start..].find("ALTER FUNCTION cheladb.grant_extension_functions()").unwrap();
         let body = &sql[start..start + end];
@@ -869,18 +1217,18 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     /// are granted, and never a superuser's.
     #[test]
     fn grant_extension_functions_only_touches_the_owner_roles_functions() {
-        let sql = data_api_sql("app_owner", "pw");
+        let sql = data_api_sql("app_owner", "pw", "public");
         assert!(sql.contains(
             "AND p.proowner OPERATOR(pg_catalog.=) (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) 'app_owner' AND NOT r.rolsuper)"
         ));
-        assert!(data_api_sql("it's", "pw").contains("OPERATOR(pg_catalog.=) 'it''s' AND NOT r.rolsuper"));
+        assert!(data_api_sql("it's", "pw", "public").contains("OPERATOR(pg_catalog.=) 'it''s' AND NOT r.rolsuper"));
     }
 
     /// A session of a former member that started before the REVOKE committed could still
     /// SET ROLE cheladb_admin: sessions are ended again once it has.
     #[test]
     fn former_members_sessions_are_ended_again_after_the_revoke_commits() {
-        let sql = data_api_sql("postgres", "pw");
+        let sql = data_api_sql("postgres", "pw", "public");
         let vet_end = sql.find("PERFORM pg_catalog.set_config('cheladb.quarantined', aside, false);").unwrap();
         let again = sql
             .find("current_setting('cheladb.former_members', true)")
@@ -924,7 +1272,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     /// cheladb_admin.
     #[test]
     fn event_trigger_functions_are_owned_by_the_bootstrap_superuser() {
-        let sql = data_api_sql("postgres", "pw");
+        let sql = data_api_sql("postgres", "pw", "public");
         for function in [
             "cheladb.bump_schema_version()",
             "cheladb.grant_extension_functions()",
@@ -952,7 +1300,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
         assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
         let scripts = data_api_scripts(&w, &ep);
         assert_eq!(scripts.len(), 1);
-        assert_eq!(scripts[0], data_api_sql("postgres", &password));
+        assert_eq!(scripts[0], data_api_sql("postgres", &password, "public"));
         assert!(
             pos(&journal, "metadata.set_authenticator_password")
                 < pos(&journal, &format!("compute.sql {ep} app {DATA_API}")),
@@ -986,7 +1334,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
         assert_ne!(new_password, password);
         assert_eq!(
             data_api_scripts(&w, &ep).last().unwrap(),
-            &data_api_sql("postgres", &new_password)
+            &data_api_sql("postgres", &new_password, "public")
         );
         w.bootstrap_data_api(&fresh, "app").await.unwrap();
         assert_eq!(
@@ -1032,7 +1380,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
         );
         assert_eq!(
             data_api_scripts(&w, &ep).last().unwrap(),
-            &data_api_sql("postgres", "theirs-password")
+            &data_api_sql("postgres", "theirs-password", "public")
         );
     }
 
@@ -1141,7 +1489,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
         assert_ne!(password, authenticator_password(&w, &main));
         assert_eq!(
             data_api_scripts(&w, &ep),
-            [data_api_sql("postgres", &password)]
+            [data_api_sql("postgres", &password, "public")]
         );
         assert_eq!(keys_of(&w, dev.id).len(), 1);
         assert_eq!(keys_of(&w, main.id).len(), 1);
@@ -1172,7 +1520,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
         let password = authenticator_password(&w, &dev);
         assert_eq!(
             data_api_scripts(&w, &ep).last().unwrap(),
-            &data_api_sql("postgres", &password)
+            &data_api_sql("postgres", &password, "public")
         );
         assert_eq!(count(&journal, "metadata.set_authenticator_password"), 0);
     }
@@ -1233,6 +1581,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             prefix: generated.prefix,
             sha256: generated.sha256,
             sealed: None,
+            databases: None,
         }
     }
 
@@ -1590,5 +1939,406 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
                 .filter(|(_, _, s)| s.starts_with("GRANT"))
                 .all(|(e, d, _)| e == &ep && d == "app")
         );
+    }
+
+    // --- Databases beyond main (6c) -----------------------------------------------------
+
+    use cheladb_metadata::DataApiState;
+    use cheladb_nats::DataApiDatabaseRequest;
+
+    use crate::fakes::FakeDbRow;
+
+    fn request(branch: BranchId, name: &str, remove: bool) -> DataApiDatabaseRequest {
+        DataApiDatabaseRequest { branch_id: branch, name: name.to_string(), remove, grant_existing: false }
+    }
+
+    fn add_row(w: &FakeWorker, branch: BranchId, name: &str, state: DataApiState, schema: &str) {
+        w.metadata
+            .state()
+            .db_rows
+            .entry(branch)
+            .or_default()
+            .push(FakeDbRow::new(name, state, schema));
+    }
+
+    fn row(w: &FakeWorker, branch: BranchId, name: &str) -> FakeDbRow {
+        w.metadata.state().db_rows[&branch]
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no row {name}"))
+    }
+
+    /// The bootstrap scripts that ran in one database of `ep`.
+    fn scripts_in(w: &FakeWorker, ep: &str, database: &str) -> Vec<String> {
+        w.computes
+            .sql
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, d, s)| {
+                e == ep && d == database && s.starts_with(&format!("{DATA_API}\n")) && !s.contains("SELECT 'r',")
+            })
+            .map(|(_, _, s)| s.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn enable_bootstraps_that_database_with_its_schema() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        add_row(&w, main.id, "analytics", DataApiState::Enabling, "reporting");
+        let password = authenticator_password(&w, &main);
+
+        w.enable_data_api(&request(main.id, "analytics", false)).await;
+
+        // Its own script, with its schema, only in that database; the row is `on`.
+        assert_eq!(
+            scripts_in(&w, &ep, "analytics"),
+            [data_api_sql("postgres", &password, "reporting")]
+        );
+        assert_eq!(scripts_in(&w, &ep, "app").len(), 1, "main is not bootstrapped again");
+        let r = row(&w, main.id, "analytics");
+        assert_eq!((r.state, r.error), (DataApiState::On, None));
+        // A row that isn't `enabling` (switched off meanwhile) is left alone.
+        add_row(&w, main.id, "gone", DataApiState::Off, "public");
+        w.enable_data_api(&request(main.id, "gone", false)).await;
+        assert!(scripts_in(&w, &ep, "gone").is_empty());
+        assert_eq!(row(&w, main.id, "gone").state, DataApiState::Off);
+    }
+
+    /// A `default_schema` stored while the enable's bootstrap ran (the PATCH saw `enabling`
+    /// and ran nothing): the enable reads the row again once it's `on` and bootstraps the new
+    /// schema too.
+    #[tokio::test]
+    async fn enable_rebootstraps_a_schema_changed_while_it_ran() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        add_row(&w, main.id, "analytics", DataApiState::Enabling, "reporting");
+        let password = authenticator_password(&w, &main);
+        let branch = main.id;
+        w.metadata.state().before_finish_enable = Some(Box::new(move |state| {
+            let row = state.db_rows.get_mut(&branch).unwrap().iter_mut().find(|r| r.name == "analytics").unwrap();
+            row.schema = "stats".into();
+        }));
+
+        w.enable_data_api(&request(main.id, "analytics", false)).await;
+
+        assert_eq!(
+            scripts_in(&w, &ep, "analytics"),
+            [data_api_sql("postgres", &password, "reporting"), data_api_sql("postgres", &password, "stats")]
+        );
+        let r = row(&w, main.id, "analytics");
+        assert_eq!((r.state, r.schema.as_str()), (DataApiState::On, "stats"));
+        // Unchanged: one bootstrap.
+        add_row(&w, main.id, "plain", DataApiState::Enabling, "public");
+        w.enable_data_api(&request(main.id, "plain", false)).await;
+        assert_eq!(scripts_in(&w, &ep, "plain").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn enable_failure_records_error() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        add_row(&w, main.id, "analytics", DataApiState::Enabling, "nosuch");
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("cheladb_admin".into(), "schema \"nosuch\" does not exist".into()));
+
+        w.enable_data_api(&request(main.id, "analytics", false)).await;
+
+        let r = row(&w, main.id, "analytics");
+        assert_eq!(r.state, DataApiState::Error);
+        assert!(r.error.unwrap().contains("does not exist"));
+        // A branch that isn't ready leaves the row `enabling` for reconcile.
+        add_row(&w, main.id, "later", DataApiState::Enabling, "public");
+        w.metadata.state().branches.get_mut(&main.id).unwrap().status = BranchStatus::Resetting;
+        w.enable_data_api(&request(main.id, "later", false)).await;
+        assert_eq!(row(&w, main.id, "later").state, DataApiState::Enabling);
+    }
+
+    #[tokio::test]
+    async fn disable_with_remove_drops_the_machinery() {
+        let (w, journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        add_row(&w, main.id, "analytics", DataApiState::On, "public");
+        add_row(&w, main.id, "keep", DataApiState::On, "public");
+
+        // Without `remove`: only the row changes.
+        let reply = w.disable_data_api(&request(main.id, "keep", false)).await;
+        assert_eq!(reply, CheckDataRoleReply::ok());
+        assert_eq!(row(&w, main.id, "keep").state, DataApiState::Off);
+        assert_eq!(count(&journal, &format!("compute.sql {ep} keep")), 0);
+
+        // With it: the three triggers and the schema, then the row.
+        journal.lock().unwrap().clear();
+        let reply = w.disable_data_api(&request(main.id, "analytics", true)).await;
+        assert_eq!(reply, CheckDataRoleReply::ok());
+        let sql: Vec<String> = w
+            .computes
+            .sql
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, d, _)| e == &ep && d == "analytics")
+            .map(|(_, _, s)| s.clone())
+            .collect();
+        let drop = sql.iter().find(|s| s.contains("DROP SCHEMA")).expect("the drop script");
+        assert_eq!(drop, REMOVE_DATA_API_SQL);
+        assert_eq!(row(&w, main.id, "analytics").state, DataApiState::Off);
+        assert!(pos(&journal, &format!("compute.sql {ep} analytics")) < pos(&journal, "metadata.set_data_api_off"));
+
+        // Main and unknown names are refused; a branch that isn't ready is not ready.
+        let reply = w.disable_data_api(&request(main.id, "app", true)).await;
+        assert_eq!(reply.kind.as_deref(), Some("refused"));
+        let reply = w.disable_data_api(&request(main.id, "missing", false)).await;
+        assert_eq!(reply.kind.as_deref(), Some("refused"));
+        // A failing drop keeps the database on and says `failed`.
+        add_row(&w, main.id, "stuck", DataApiState::On, "public");
+        *w.computes.fail_sql_containing.lock().unwrap() = Some(("DROP SCHEMA".into(), "boom".into()));
+        let reply = w.disable_data_api(&request(main.id, "stuck", true)).await;
+        assert_eq!(reply.kind.as_deref(), Some("failed"));
+        assert_eq!(row(&w, main.id, "stuck").state, DataApiState::On);
+        w.metadata.state().branches.get_mut(&main.id).unwrap().status = BranchStatus::Resetting;
+        let reply = w.disable_data_api(&request(main.id, "stuck", false)).await;
+        assert_eq!(reply.kind.as_deref(), Some("not_ready"));
+    }
+
+    /// Only what the bootstrap made is dropped, by name, and only from a `cheladb` schema owned
+    /// by `cheladb_admin`; `RESTRICT` refuses to take anything else with it. A `cheladb`
+    /// schema someone else owns is left alone with a warning. The cluster-wide role stays.
+    #[test]
+    fn remove_sql_drops_only_the_machinery_of_our_schema() {
+        assert_eq!(
+            REMOVE_DATA_API_SQL,
+            "-- remove the data API machinery
+SET search_path = pg_catalog, pg_temp;
+DO $$ BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+      WHERE n.nspname OPERATOR(pg_catalog.=) 'cheladb' AND r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN
+    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
+    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
+    DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
+    DROP FUNCTION IF EXISTS cheladb.bump_schema_version();
+    DROP FUNCTION IF EXISTS cheladb.grant_extension_functions();
+    DROP TABLE IF EXISTS cheladb.schema_version;
+    DROP TABLE IF EXISTS cheladb.bootstrap;
+    DROP SCHEMA cheladb RESTRICT;
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'cheladb') THEN
+    RAISE WARNING 'cheladb: the cheladb schema is not owned by cheladb_admin; nothing was removed';
+  END IF;
+END $$;
+"
+        );
+        assert!(!REMOVE_DATA_API_SQL.contains("CASCADE"));
+        assert!(!REMOVE_DATA_API_SQL.contains("DROP ROLE"), "the cluster-wide role stays");
+    }
+
+    #[tokio::test]
+    async fn rebootstrap_runs_the_script_with_the_stored_schema() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        add_row(&w, main.id, "analytics", DataApiState::On, "reporting");
+        add_row(&w, main.id, "off", DataApiState::Off, "public");
+        let password = authenticator_password(&w, &main);
+
+        let reply = w.rebootstrap_data_api(&request(main.id, "analytics", false)).await;
+
+        assert_eq!(reply, CheckDataRoleReply::ok());
+        assert_eq!(scripts_in(&w, &ep, "analytics"), [data_api_sql("postgres", &password, "reporting")]);
+        let reply = w.rebootstrap_data_api(&request(main.id, "off", false)).await;
+        assert_eq!(reply.kind.as_deref(), Some("refused"));
+        *w.computes.fail_sql_containing.lock().unwrap() = Some(("cheladb_admin".into(), "boom".into()));
+        let reply = w.rebootstrap_data_api(&request(main.id, "analytics", false)).await;
+        assert_eq!(reply.kind.as_deref(), Some("failed"));
+    }
+
+    #[tokio::test]
+    async fn rebootstrap_grants_existing_only_when_asked() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        add_row(&w, main.id, "analytics", DataApiState::On, "reporting");
+        let password = authenticator_password(&w, &main);
+
+        // Without the flag: the first-grants statements stay behind `cheladb.bootstrap`.
+        assert_eq!(w.rebootstrap_data_api(&request(main.id, "analytics", false)).await, CheckDataRoleReply::ok());
+        // With it: the same script, but the first-grants run whether or not a first grant ran.
+        let mut asked = request(main.id, "analytics", false);
+        asked.grant_existing = true;
+        assert_eq!(w.rebootstrap_data_api(&asked).await, CheckDataRoleReply::ok());
+
+        let scripts = scripts_in(&w, &ep, "analytics");
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[0], data_api_sql("postgres", &password, "reporting"));
+        assert_eq!(scripts[1], data_api_sql_granting_existing("postgres", &password, "reporting"));
+        let grants = "GRANT SELECT ON ALL TABLES IN SCHEMA \"reporting\" TO anon;";
+        assert!(scripts[0].contains(grants) && scripts[1].contains(grants));
+        let guard = "IF pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL AND NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN";
+        assert!(scripts[0].contains(guard) && !scripts[1].contains(guard));
+        // Still guarded by the schema's existence, never revoking anything from a role, and
+        // an existing bootstrap row isn't an error.
+        assert!(scripts[1].contains("IF pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL THEN\n    GRANT SELECT ON ALL TABLES"));
+        assert!(scripts[1].contains("INSERT INTO cheladb.bootstrap (existing_granted) VALUES (true) ON CONFLICT DO NOTHING;"));
+        assert_eq!(scripts[1].matches("GRANT SELECT ON ALL TABLES").count(), 1);
+        // Grants only (U2): the first-grants block of the granting variant has no REVOKE and
+        // still carries the same GRANTs; the first enable's block keeps its revoke.
+        let block = |s: &str| {
+            let start = s.find("DO $$ DECLARE r record; BEGIN").unwrap();
+            s[start..start + s[start..].find("END $$;").unwrap()].to_string()
+        };
+        let (first, asked) = (block(&scripts[0]), block(&scripts[1]));
+        assert!(first.contains("REVOKE EXECUTE ON ROUTINE"));
+        assert!(!asked.contains("REVOKE"), "{asked}");
+        for grant in [
+            "GRANT SELECT ON ALL TABLES IN SCHEMA \"reporting\" TO anon;",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"reporting\" TO authenticated;",
+            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"reporting\" TO authenticated;",
+            "GRANT EXECUTE ON ROUTINE %s TO authenticated",
+        ] {
+            assert!(asked.contains(grant), "{grant}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recreate_bootstraps_every_served_database() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        add_row(&w, main.id, "analytics", DataApiState::On, "reporting");
+        add_row(&w, main.id, "off", DataApiState::Off, "public");
+        add_row(&w, main.id, "broken", DataApiState::Enabling, "public");
+        w.computes.remove(&ep);
+        w.computes.sql.lock().unwrap().clear();
+        let password = authenticator_password(&w, &main);
+
+        w.recreate_compute(main.id, &ep).await.unwrap();
+
+        assert_eq!(scripts_in(&w, &ep, "app"), [data_api_sql("postgres", &password, "public")]);
+        assert_eq!(
+            scripts_in(&w, &ep, "analytics"),
+            [data_api_sql("postgres", &password, "reporting")]
+        );
+        assert!(scripts_in(&w, &ep, "off").is_empty() && scripts_in(&w, &ep, "broken").is_empty());
+
+        // A second database that can't be bootstrapped doesn't fail the re-creation; main's can.
+        w.computes.remove(&ep);
+        w.computes.sql.lock().unwrap().clear();
+        *w.computes.fail_sql_containing.lock().unwrap() = Some(("reporting".into(), "gone".into()));
+        w.recreate_compute(main.id, &ep).await.unwrap();
+        assert_eq!(scripts_in(&w, &ep, "app").len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_grants_the_owner_the_version_table() {
+        let sql = data_api_sql("postgres", "pw", "public");
+        let version = sql.find("GRANT SELECT ON cheladb.schema_version TO postgres;\n").expect("P5 table grant");
+        let usage = sql.find("GRANT USAGE ON SCHEMA cheladb TO postgres;\n").expect("P5 schema grant");
+        let created = sql.find("CREATE TABLE IF NOT EXISTS cheladb.schema_version").unwrap();
+        assert!(created < usage && usage < version);
+        // The schema is quoted wherever the script names it.
+        let sql = data_api_sql("postgres", "pw", "my\"schema");
+        assert!(sql.contains("IN SCHEMA \"my\"\"schema\" GRANT SELECT ON TABLES TO anon;"));
+        assert!(sql.contains("GRANT USAGE ON SCHEMA \"my\"\"schema\" TO anon, authenticated;"));
+        // `regnamespace` and `to_regnamespace` parse identifier syntax: the literal is the quoted
+        // identifier, so a name with a quote or capitals means the schema it names.
+        assert!(sql.contains("'\"my\"\"schema\"'::pg_catalog.regnamespace"));
+        assert!(sql.contains("pg_catalog.to_regnamespace('\"my\"\"schema\"') IS NOT NULL"));
+        assert!(!sql.contains("SCHEMA public"));
+    }
+
+    /// Review Focus 5: a child of a parent that serves a second database serves it after
+    /// creation, and the bootstrap ran there, after the flags were copied (once).
+    #[tokio::test]
+    async fn child_create_copies_flags_then_bootstraps() {
+        let (w, journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        add_row(&w, main.id, "analytics", DataApiState::On, "reporting");
+        add_row(&w, main.id, "pending", DataApiState::Enabling, "public");
+        let d = |name: &str, system: bool| {
+            format!("d|{}||{}|{}||\n", hex::encode(name), hex::encode("postgres"), if system { "t" } else { "f" })
+        };
+        let catalog = [d("postgres", true), d("app", false), d("analytics", false), d("pending", false)].concat();
+        w.computes.answer("FROM pg_authid", &catalog);
+        journal.lock().unwrap().clear();
+
+        let dev = ready_branch(&w, id, "dev", main.id).await;
+
+        let ep = w.metadata.branch(dev).endpoint_id.unwrap();
+        // Copied: `on` stays `on` with its schema; `enabling` becomes `off`.
+        let r = row(&w, dev, "analytics");
+        assert_eq!((r.state, r.schema.as_str()), (DataApiState::On, "reporting"));
+        assert_eq!(row(&w, dev, "pending").state, DataApiState::Off);
+        assert_eq!(count(&journal, "metadata.copy_parent_database_flags"), 1);
+        let password = authenticator_password(&w, &w.metadata.branch(dev));
+        assert_eq!(
+            scripts_in(&w, &ep, "analytics"),
+            [data_api_sql("postgres", &password, "reporting")]
+        );
+        assert!(scripts_in(&w, &ep, "pending").is_empty());
+        // Order: the resync wrote the rows, the flags were copied, then the bootstrap ran.
+        let resync = pos(&journal, "metadata.apply_resync");
+        let copy = pos(&journal, "metadata.copy_parent_database_flags");
+        let boot = pos(&journal, &format!("compute.sql {ep} analytics {DATA_API}"));
+        assert!(resync < copy && copy < boot, "{:?}", entries(&journal));
+        // Main is bootstrapped once, not again after the copy (its schema didn't change).
+        assert_eq!(scripts_in(&w, &ep, "app").len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_skips_a_missing_default_schema() {
+        let sql = data_api_sql("postgres", "pw", "reporting");
+        let guard = "pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL";
+        // Every statement that names the schema sits inside a guard, so a schema that's gone
+        // (a restore to before it existed, a DROP SCHEMA) doesn't fail the bootstrap.
+        let first = sql.find(&format!("  IF {guard} THEN\n    ALTER DEFAULT PRIVILEGES")).expect("guarded defaults");
+        let usage = sql.find("GRANT USAGE ON SCHEMA \"reporting\" TO anon, authenticated;").unwrap();
+        let end = first + sql[first..].find("  END IF;").unwrap();
+        assert!(first < usage && usage < end);
+        for statement in sql.match_indices("IN SCHEMA \"reporting\"").map(|(i, _)| i) {
+            assert!(statement > first, "{statement}");
+        }
+        assert!(sql.contains(&format!("  IF {guard} AND NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN")));
+        // The schema-free default privilege stays outside the guard.
+        let revoke = sql.find("REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;").unwrap();
+        assert!(revoke < first);
+        // The machinery itself is not guarded, and the marker comes before the last line.
+        assert!(sql.find("CREATE SCHEMA IF NOT EXISTS cheladb").unwrap() < first);
+        let marker = sql.find("SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace('\"reporting\"') IS NULL;\n").unwrap();
+        assert!(marker < sql.find("current_setting('cheladb.quarantined'").unwrap());
+        assert!(super::missing_schema("cheladb_missing_schema\n\n"));
+        assert!(super::missing_schema("cheladb_missing_schema\ncheladb_quarantine_1\n"));
+        assert!(!super::missing_schema("\n"));
+        assert_eq!(quarantined("cheladb_missing_schema\ncheladb_quarantine_1\n"), Some("cheladb_quarantine_1"));
+    }
+
+    #[tokio::test]
+    async fn a_child_whose_main_names_a_missing_schema_still_becomes_ready() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        w.metadata.state().db_rows.get_mut(&main.id).unwrap()[0].schema = "gone".to_string();
+        // The script reports that it skipped the schema's statements.
+        w.computes.answer("cheladb.quarantined", "cheladb_missing_schema\n");
+
+        let dev = ready_branch(&w, id, "dev", main.id).await;
+
+        assert_eq!(w.metadata.branch(dev).status, BranchStatus::Ready);
+        assert_eq!(row(&w, dev, "app").schema, "gone");
+        let ep = w.metadata.branch(dev).endpoint_id.unwrap();
+        // Main is bootstrapped again with the copied schema (the early run used `public`).
+        let scripts = scripts_in(&w, &ep, "app");
+        assert!(scripts.last().unwrap().contains("to_regnamespace('\"gone\"')"), "{}", scripts.len());
     }
 }

@@ -237,7 +237,6 @@ pub struct SettingsPatch {
     pub max_rows: Option<i32>,
     pub statement_timeout_ms: Option<i32>,
     pub max_connections: Option<i32>,
-    pub default_schema: Option<String>,
 }
 
 /// A branch that isn't deleted, as seen by the reconcile loop.
@@ -752,8 +751,14 @@ impl MetadataClient {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "INSERT INTO branch_databases (branch_id, name, owner, origin)
-             VALUES ($1, $2, $3, 'main')",
+            "INSERT INTO branch_databases
+               (branch_id, name, owner, origin, data_api, data_api_bootstrapped, default_schema)
+             VALUES ($1, $2, $3, 'main', 'on', true,
+                     coalesce((SELECT pd.default_schema
+                               FROM branches c
+                               JOIN branch_databases pd ON pd.branch_id = c.parent_branch_id
+                                                       AND pd.origin = 'main'
+                               WHERE c.id = $1), 'public'))",
         )
         .bind(id.as_uuid())
         .bind(ep.database_name)
@@ -1107,7 +1112,6 @@ impl MetadataClient {
                  max_rows = COALESCE($4, max_rows),
                  statement_timeout_ms = COALESCE($5, statement_timeout_ms),
                  max_connections = COALESCE($6, max_connections),
-                 default_schema = COALESCE($7, default_schema),
                  updated_at = now()
              WHERE id = $1 AND status NOT IN ('deleting', 'deleted')",
         )
@@ -1117,7 +1121,6 @@ impl MetadataClient {
         .bind(patch.max_rows)
         .bind(patch.statement_timeout_ms)
         .bind(patch.max_connections)
-        .bind(patch.default_schema.as_deref())
         .execute(&self.pool)
         .await?
         .rows_affected();

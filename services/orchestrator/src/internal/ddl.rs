@@ -607,13 +607,28 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
         Ok(None) => return answer(StatusCode::NOT_FOUND, text::UNKNOWN_ENDPOINT),
         Err(e) => return metadata_failure(&id, &e),
     };
-    let changed = match apply(tx, &steps(&delta), &state.roles, &state.secrets, &id).await {
-        Ok(changed) => changed,
-        Err(Failure::Refused(message)) => return answer(StatusCode::CONFLICT, message),
-        Err(Failure::Metadata(e)) => return metadata_failure(&id, &e),
-    };
+    let Applied { roles: changed, served_databases_changed } =
+        match apply(tx, &steps(&delta), &state.roles, &state.secrets, &id).await {
+            Ok(applied) => applied,
+            Err(Failure::Refused(message)) => return answer(StatusCode::CONFLICT, message),
+            Err(Failure::Metadata(e)) => return metadata_failure(&id, &e),
+        };
+    // A dropped or renamed database may be one rest serves: it must forget it. Off the response
+    // path (compute_ctl waits for us), and its failure is only logged.
+    if let Some(branch) = served_databases_changed {
+        let state = state.clone();
+        tokio::spawn(async move { state.rest.invalidate(branch).await });
+    }
     publish(state.cache.clone(), id, changed);
     StatusCode::OK.into_response()
+}
+
+/// What a committed delta changed.
+struct Applied {
+    /// The role names whose secrets changed.
+    roles: Vec<String>,
+    /// The branch whose databases lost or renamed one, if any.
+    served_databases_changed: Option<BranchId>,
 }
 
 enum Failure {
@@ -628,14 +643,14 @@ impl From<MetadataError> for Failure {
 }
 
 /// Applies every step in one transaction and commits; the first refusal drops the
-/// transaction (rolling back what came before). Returns the role names whose secrets changed.
+/// transaction (rolling back what came before).
 async fn apply<T: DdlPort>(
     mut tx: T,
     steps: &[Step<'_>],
     rules: &RoleSettings,
     key: &SecretKey,
     endpoint: &str,
-) -> Result<Vec<String>, Failure> {
+) -> Result<Applied, Failure> {
     let owner = tx.owner().to_string();
     let main_database = tx.main_database().map(str::to_string);
     let branch = tx.branch_id();
@@ -648,6 +663,7 @@ async fn apply<T: DdlPort>(
     let tag = Uuid::new_v4().simple().to_string();
     let mut role_moves: Vec<Move> = Vec::new();
     let mut db_moves: Vec<Move> = Vec::new();
+    let mut databases_changed = false;
     for step in steps {
         if !matches!(step, Step::RenameRole { .. }) {
             finish_role_moves(&mut tx, &mut role_moves).await?;
@@ -663,6 +679,7 @@ async fn apply<T: DdlPort>(
             // A branch-less endpoint has no `branch_databases` to mirror into.
             continue;
         }
+        databases_changed |= matches!(step, Step::RenameDb { .. } | Step::DelDb { .. });
         let mut facts = Facts {
             owner: &owner,
             main_database: main_database.as_deref(),
@@ -772,7 +789,10 @@ async fn apply<T: DdlPort>(
     finish_role_moves(&mut tx, &mut role_moves).await?;
     finish_db_moves(&mut tx, &mut db_moves).await?;
     tx.commit().await?;
-    Ok(changed)
+    Ok(Applied {
+        roles: changed,
+        served_databases_changed: branch.filter(|_| databases_changed),
+    })
 }
 
 /// A rename's second hop (M2). Renames move in two hops: each row first goes aside under a

@@ -169,6 +169,9 @@ pub struct InternalState<M, L> {
     pub cache: Arc<dyn CachePort>,
     /// `CHELADB_CONTROL_PLANE_URI`: the base of `neon.console_url` in the specs served.
     pub control_plane_uri: String,
+    /// The REST service's internal listener: told when a forwarded `DROP`/`RENAME DATABASE`
+    /// changes which databases a branch serves.
+    pub rest: crate::RestInternal,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router

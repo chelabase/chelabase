@@ -129,3 +129,20 @@ is also refused; floats printed with an exponent (`1e300`) are not.
 type and the `types` map; pass both (`createClient<Database>({ url, key, types })`). Without
 them (`createClient({ url, key })`), the client accepts any table, column and
 function and types values as `unknown`.
+
+## Other databases
+
+A branch can serve more than its main database. `db.database("analytics")` returns a client
+bound to that database: every request it sends carries the top-level `database` field (a
+batch carries it once; an operation inside a batch never names one). It keeps the bigint mode,
+and in that mode `db.database(name, types)` needs the `types` (they decode int8), which the type system enforces.
+
+`cheladb gen types --database analytics` writes that database as `Database`.
+`--all-databases` writes every database the key reaches: `Databases` (a key per database),
+`Database` (= `Databases["main"]`) and a `types` map keyed alike:
+
+```ts
+import { type Database, type Databases, types } from "./db";
+const db = createClient<Database>({ url, key, types: types.main });
+const analytics = db.database<Databases["analytics"]>("analytics", types.analytics);
+```

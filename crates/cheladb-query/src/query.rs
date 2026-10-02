@@ -393,17 +393,44 @@ impl From<serde_json::Error> for QueryError {
     }
 }
 
+/// The longest database name (Postgres's identifier limit).
+pub const MAX_DATABASE_BYTES: usize = 63;
+
+/// A parsed request: the database it names, if any, and its operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parsed {
+    /// The top-level `"database"`; `None` means the caller's default.
+    pub database: Option<String>,
+    pub op: Op,
+}
+
 /// Parses a request body. `v` must be 1 at the top; an op inside a batch may repeat
-/// `"v": 1` or leave it out.
-pub fn parse(body: &[u8]) -> Result<Op, QueryError> {
-    let tree: Value = serde_json::from_slice(body)?;
-    parse_op(tree, false)
+/// `"v": 1` or leave it out. Only the top level may name a `"database"` (a batch runs in
+/// one database).
+pub fn parse(body: &[u8]) -> Result<Parsed, QueryError> {
+    let mut tree: Value = serde_json::from_slice(body)?;
+    let database = match tree.as_object_mut().and_then(|o| o.remove("database")) {
+        None => None,
+        Some(Value::String(name)) if !name.is_empty() && name.len() <= MAX_DATABASE_BYTES => {
+            Some(name)
+        }
+        Some(_) => {
+            return Err(QueryError::new(format!(
+                "\"database\" is a database name of 1 to {MAX_DATABASE_BYTES} bytes"
+            )));
+        }
+    };
+    let op = parse_op(tree, false)?;
+    Ok(Parsed { database, op })
 }
 
 fn parse_op(tree: Value, in_batch: bool) -> Result<Op, QueryError> {
     let Value::Object(mut obj) = tree else {
         return Err(QueryError::new("the query is a JSON object"));
     };
+    if in_batch && obj.contains_key("database") {
+        return Err(QueryError::new("only the top level may name a database"));
+    }
     match obj.remove("v") {
         Some(Value::Number(n)) if n.as_u64() == Some(1) => {}
         None if in_batch => {}

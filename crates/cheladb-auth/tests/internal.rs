@@ -146,6 +146,7 @@ fn data_identity_round_trips_in_claims() {
         kind: DataKeyKind::Secret,
         role: "service".into(),
         claims: serde_json::json!({}),
+        databases: Some(vec!["main".into(), "analytics".into()]),
     };
     let identity = Identity {
         sub: data.key_id.to_string(),
@@ -197,4 +198,43 @@ fn management_claims_without_data_still_verify() {
     )
     .unwrap();
     assert!(json.get("data").is_none(), "{json}");
+}
+
+/// A token minted before allow-lists existed has no `databases`: it parses as "no list",
+/// and a key without a list signs without the field.
+#[test]
+fn old_tokens_without_databases_parse() {
+    let (private_pem, public_pem) = generate_keypair_pem();
+    let verifier = InternalVerifier::from_pem(public_pem.as_bytes()).unwrap();
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap();
+    let branch = Uuid::new_v4();
+    let key_id = Uuid::new_v4();
+    let claims = serde_json::json!({
+        "iss": INTERNAL_ISSUER,
+        "aud": "rest",
+        "iat": now(),
+        "exp": now() + 60,
+        "sub": key_id.to_string(),
+        "org_id": "",
+        "auth": "data_key",
+        "rid": "rid-1",
+        "data": {
+            "branch_id": branch,
+            "key_id": key_id,
+            "kind": "secret",
+            "role": "service",
+            "claims": {},
+        },
+    });
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA),
+        &claims,
+        &key,
+    )
+    .unwrap();
+    let data = verifier.verify(&token, "rest").unwrap().data.unwrap();
+    assert_eq!(data.databases, None);
+
+    let json = serde_json::to_value(&data).unwrap();
+    assert!(json.get("databases").is_none(), "{json}");
 }

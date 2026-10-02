@@ -26,9 +26,10 @@ use cheladb_auth::internal::{
 };
 use cheladb_metadata::{
     BranchRecord, BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID,
-    DatabaseStatus, MetadataClient, MetadataConfig, NewBranch,
+    DataApiState, DatabaseStatus, EnableStart, MetadataClient, MetadataConfig, NewBranch,
+    NewDataKey,
 };
-use cheladb_nats::{BranchJob, PointInTime};
+use cheladb_nats::{BranchJob, DataApiDatabaseRequest, PointInTime};
 use cheladb_neon::{ComputeBackend, ComputeLocator, NeonId};
 use cheladb_secrets::{Purpose, SecretKey, open_credential};
 use cheladb_types::data_key::DataKeyKind;
@@ -228,15 +229,129 @@ impl Live {
             .expect("branch row")
     }
 
-    /// SQL as cloud_admin on `branch` (psql's text output).
+    /// SQL as cloud_admin on `branch`, in its main database (psql's text output).
     async fn sql_on(&self, branch: BranchId, sql: &str) -> String {
+        self.sql_in(branch, &self.database_name, sql).await
+    }
+
+    /// SQL as cloud_admin on `branch`, in `database` (psql's text output).
+    async fn sql_in(&self, branch: BranchId, database: &str, sql: &str) -> String {
         let b = self.branch(branch).await;
         let ep = b.endpoint_id.as_deref().expect("branch endpoint");
         self.worker
             .computes
-            .admin_sql(ep, &self.database_name, sql)
+            .admin_sql(ep, database, sql)
             .await
-            .unwrap_or_else(|e| panic!("sql on {}: {e:#}\n{sql}", b.name))
+            .unwrap_or_else(|e| panic!("sql on {} in {database}: {e:#}\n{sql}", b.name))
+    }
+
+    /// SQL as the database owner on main, in `database`.
+    async fn owner_in(&self, database: &str, sql: &str) -> String {
+        self.sql_in(self.main_id(), database, &format!("{OWNER}{sql}"))
+            .await
+    }
+
+    /// `CREATE DATABASE` on main in the owner's own session (so the compute forwards it, as
+    /// any SQL client's would), then waits for the forwarded row in `branch_databases`.
+    async fn create_database(&self, name: &str) {
+        use sqlx::Executor;
+        let mut owner = self.owner_session().await;
+        owner
+            .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .await
+            .unwrap_or_else(|e| panic!("CREATE DATABASE {name}: {e}"));
+        self.wait_row(self.main_id(), name, true).await;
+    }
+
+    /// Waits (30 s at most) until `branch` has (`present`) or lacks a `branch_databases` row
+    /// named `name`.
+    async fn wait_row(&self, branch: BranchId, name: &str, present: bool) {
+        let started = Instant::now();
+        loop {
+            let rows = self.metadata.branch_databases(branch).await.unwrap();
+            if rows.iter().any(|d| d.name == name) == present {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the row {name} is still {} after 30 s: {rows:?}",
+                if present { "missing" } else { "there" }
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// The data API state of `name` on `branch`.
+    async fn data_api_state(&self, branch: BranchId, name: &str) -> DataApiState {
+        self.metadata
+            .branch_databases(branch)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("no row {name}"))
+            .data_api
+    }
+
+    /// What the enable route and the worker's job do: `enabling`, the bootstrap, `on`. Then
+    /// rest is told (the orchestrator would call the slot's own rest, not this one).
+    async fn enable(&self, branch: BranchId, name: &str) {
+        let start = self
+            .metadata
+            .begin_enable_data_api(branch, name, 10)
+            .await
+            .unwrap();
+        assert_eq!(start, EnableStart::Started);
+        self.worker
+            .enable_data_api(&DataApiDatabaseRequest {
+                branch_id: branch,
+                name: name.into(),
+                remove: false,
+                grant_existing: false,
+            })
+            .await;
+        let row = self
+            .metadata
+            .branch_databases(branch)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap();
+        assert_eq!(row.data_api, DataApiState::On, "{:?}", row.data_api_error);
+        // No invalidate: rest finds a newly enabled database by fetching the branch's info
+        // again once the cached one is old enough.
+        tokio::time::sleep(rest::conn::INFO_REFRESH_AFTER + Duration::from_millis(100)).await;
+    }
+
+    /// The disable request (the machinery stays).
+    async fn disable(&self, branch: BranchId, name: &str) {
+        let reply = self
+            .worker
+            .disable_data_api(&DataApiDatabaseRequest {
+                branch_id: branch,
+                name: name.into(),
+                remove: false,
+                grant_existing: false,
+            })
+            .await;
+        assert!(reply.ok, "{reply:?}");
+    }
+
+    /// rest's internal invalidate route.
+    async fn invalidate(&self, branch: BranchId) {
+        let resp = self
+            .http
+            .post(format!(
+                "http://{}/internal/branches/{}/invalidate",
+                self.internal,
+                branch.as_uuid()
+            ))
+            .bearer_auth(&self.internal_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 204);
     }
 
     /// A direct connection to main's Postgres, as `user` (the published loopback port).
@@ -285,6 +400,17 @@ impl Live {
     }
 
     fn token(&self, branch: BranchId, kind: DataKeyKind, role: &str) -> String {
+        self.token_for(branch, kind, role, None)
+    }
+
+    /// A token whose key may reach only `databases` (`None`: every served database).
+    fn token_for(
+        &self,
+        branch: BranchId,
+        kind: DataKeyKind,
+        role: &str,
+        databases: Option<Vec<String>>,
+    ) -> String {
         let key_id = Uuid::new_v4();
         let identity = Identity {
             sub: key_id.to_string(),
@@ -297,6 +423,7 @@ impl Live {
                 kind,
                 role: role.into(),
                 claims: json!({}),
+                databases,
             }),
         };
         self.signer.sign("rest", &identity).unwrap()
@@ -321,6 +448,45 @@ impl Live {
             .post(format!("http://{}/data/v1/query", self.rest))
             .header(IDENTITY_HEADER, self.token(branch, kind, role))
             .json(&body)
+            .send()
+            .await
+            .unwrap();
+        Self::answer(resp).await
+    }
+
+    /// As a key on `branch` with the allow-list `databases`.
+    async fn query_listed(
+        &self,
+        branch: BranchId,
+        kind: DataKeyKind,
+        role: &str,
+        databases: Option<Vec<String>>,
+        body: Value,
+    ) -> Answer {
+        let resp = self
+            .http
+            .post(format!("http://{}/data/v1/query", self.rest))
+            .header(IDENTITY_HEADER, self.token_for(branch, kind, role, databases))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        Self::answer(resp).await
+    }
+
+    /// `GET /data/v1/schema` as `role` on main, for `database` (`None`: main).
+    async fn schema_of(&self, role: &str, database: Option<&str>) -> Answer {
+        let mut url = format!("http://{}/data/v1/schema", self.rest);
+        if let Some(database) = database {
+            url.push_str(&format!("?database={database}"));
+        }
+        let resp = self
+            .http
+            .get(url)
+            .header(
+                IDENTITY_HEADER,
+                self.token(self.main_id(), DataKeyKind::Secret, role),
+            )
             .send()
             .await
             .unwrap();
@@ -684,6 +850,53 @@ async fn secret_key_of_an_owner_level_role_is_refused() {
     .await;
 }
 
+/// The internal schema route with `?role=` (the console's schema as a role): what that role
+/// reaches, with its privileges; a missing role is 404 `unknown_role`, an owner-level one 403.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn internal_schema_for_a_console_role() {
+    live("schemarole", |l| async move {
+        l.owner(
+            "CREATE SCHEMA hidden;
+             CREATE TABLE hidden.t (id int PRIMARY KEY, v text);
+             CREATE ROLE console_editor NOLOGIN;
+             CREATE ROLE console_boss NOLOGIN BYPASSRLS;
+             GRANT USAGE ON SCHEMA hidden TO console_editor;
+             GRANT SELECT ON hidden.t TO console_editor;",
+        )
+        .await;
+        let get = |query: String| {
+            let l = &l;
+            async move {
+                let resp = l
+                    .http
+                    .get(format!(
+                        "http://{}/internal/schema/{}{query}",
+                        l.internal,
+                        l.main_id().as_uuid()
+                    ))
+                    .bearer_auth(&l.internal_token)
+                    .send()
+                    .await
+                    .unwrap();
+                Live::answer(resp).await
+            }
+        };
+        let answer = get(format!("?role=console_editor&database={}", l.database_name)).await;
+        let doc = answer.ok();
+        let t = &doc["schemas"]["hidden"]["tables"]["t"];
+        assert_eq!(t["primary_key"], json!(["id"]), "{doc}");
+        assert!(t["privileges"].get("console_editor").is_some(), "{doc}");
+        assert!(t["privileges"].get("anon").is_none(), "{doc}");
+        // anon and authenticated can't reach it.
+        let default = l.internal_schema().await;
+        assert!(default.ok()["schemas"].get("hidden").is_none());
+        get("?role=console_ghost".into()).await.error(404, "unknown_role");
+        get("?role=console_boss".into()).await.error(403, "role_not_allowed");
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
 async fn rls_policy_is_enforced() {
@@ -814,7 +1027,10 @@ async fn dropped_cheladb_is_unavailable_then_healed_by_bootstrap() {
         l.sql_on(l.main_id(), "DROP SCHEMA cheladb CASCADE;").await;
         let down = l.anon(select.clone()).await;
         let error = down.error(503, "unavailable");
-        assert_eq!(error["message"], rest::error::SCHEMA_MISSING);
+        assert_eq!(
+            error["message"],
+            cheladb_query::error::schema_missing_in(&l.database_name)
+        );
         let main = l.branch(l.main_id()).await;
         l.worker
             .bootstrap_data_api(&main, &l.database_name)
@@ -1406,6 +1622,451 @@ async fn the_health_check_sees_what_the_bootstrap_repairs() {
                 "after {breakage}"
             );
         }
+    })
+    .await;
+}
+
+/// Selects `t`, in `database` when given (else the main one).
+fn select_t(database: Option<&str>) -> Value {
+    let mut body = json!({"v":1,"op":"select","from":"t"});
+    if let Some(database) = database {
+        body["database"] = json!(database);
+    }
+    body
+}
+
+/// A stored secret key of main with the allow-list `databases`; its hash (any 32 bytes do).
+async fn stored_key(l: &Live, name: &str, databases: Vec<String>) -> [u8; 32] {
+    let mut sha256 = [0u8; 32];
+    sha256[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    sha256[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    l.metadata
+        .insert_data_key(&NewDataKey {
+            id: Uuid::new_v4(),
+            branch_id: l.main_id(),
+            kind: DataKeyKind::Secret,
+            role: "authenticated".into(),
+            name: name.into(),
+            prefix: "chk_sec_live".into(),
+            sha256,
+            sealed: None,
+            databases: Some(databases),
+        })
+        .await
+        .expect("insert the key");
+    sha256
+}
+
+/// Ends every session in `database` on main (rest's pools included), so the owner may rename
+/// or drop it.
+async fn end_sessions(l: &Live, database: &str) {
+    l.invalidate(l.main_id()).await;
+    l.sql_on(
+        l.main_id(),
+        &format!(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE datname = '{database}' AND pid <> pg_backend_pid();"
+        ),
+    )
+    .await;
+}
+
+/// The owner's own session runs `sql` (forwarded by the compute, as any client's DDL is).
+async fn owner_ddl(l: &Live, sql: &str) {
+    use sqlx::Executor;
+    let mut owner = l.owner_session().await;
+    owner
+        .execute(sqlx::AssertSqlSafe(sql.to_owned()))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+/// A second database, enabled with its own default schema: each database answers from its own
+/// `t`, its own schema cache, and the schema endpoint lists both.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn two_databases_serve_separately_with_their_own_schema() {
+    live("twodb", |l| async move {
+        l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('main');")
+            .await;
+        l.create_database("analytics").await;
+        assert_eq!(
+            l.data_api_state(l.main_id(), "analytics").await,
+            DataApiState::Off
+        );
+        l.owner_in(
+            "analytics",
+            "CREATE SCHEMA stats; CREATE TABLE stats.t (v text, n int); \
+             INSERT INTO stats.t VALUES ('analytics', 1);",
+        )
+        .await;
+        let in_analytics = select_t(Some("analytics"));
+        let error = l.anon(in_analytics.clone()).await;
+        assert_eq!(
+            error.error(404, "unknown_database")["message"],
+            rest::error::UNKNOWN_DATABASE
+        );
+
+        assert!(
+            l.metadata
+                .set_database_default_schema(l.main_id(), "analytics", "stats")
+                .await
+                .unwrap()
+        );
+        let started = Instant::now();
+        l.enable(l.main_id(), "analytics").await;
+        println!("enable took {:?}", started.elapsed());
+
+        // Each database's own `t`, in its own default schema; the first grants covered `stats`.
+        assert_eq!(l.anon(select_t(None)).await.ok(), &json!([{"v":"main"}]));
+        assert_eq!(
+            l.anon(in_analytics.clone()).await.ok(),
+            &json!([{"v":"analytics","n":1}])
+        );
+        let main_name = l.database_name.clone();
+        assert_eq!(
+            l.anon(select_t(Some(&main_name))).await.ok(),
+            &json!([{"v":"main"}])
+        );
+        assert_eq!(
+            l.auth(json!({"v":1,"database":"analytics","op":"select","from":"stats.t","select":["n"]}))
+                .await
+                .ok(),
+            &json!([{"n":1}])
+        );
+
+        // DDL in one database moves only its own schema version.
+        l.owner_in("analytics", "ALTER TABLE stats.t ADD COLUMN w int DEFAULT 7;")
+            .await;
+        assert_eq!(
+            l.anon(in_analytics.clone()).await.ok(),
+            &json!([{"v":"analytics","n":1,"w":7}])
+        );
+        assert_eq!(l.anon(select_t(None)).await.ok(), &json!([{"v":"main"}]));
+
+        // Objects made after the enable get the default privileges in `stats`; a batch runs
+        // in the database the top level names.
+        l.owner_in(
+            "analytics",
+            "CREATE TABLE stats.later (x int); INSERT INTO stats.later VALUES (3);",
+        )
+        .await;
+        assert_eq!(
+            l.anon(json!({"v":1,"database":"analytics","op":"select","from":"later"}))
+                .await
+                .ok(),
+            &json!([{"x":3}])
+        );
+        let batch = l
+            .auth(json!({"v":1,"database":"analytics","op":"batch","ops":[
+                {"op":"insert","into":"later","values":[{"x":4}],"returning":["x"]},
+                {"op":"select","from":"later","orderBy":[{"col":"x"}]}
+            ]}))
+            .await;
+        assert_eq!(batch.ok(), &json!([[{"x":4}], [{"x":3},{"x":4}]]));
+        l.auth(json!({"v":1,"database":"analytics","op":"batch","ops":[
+                {"op":"select","from":"later","database":"analytics"}
+            ]}))
+            .await
+            .error(400, "invalid_query");
+
+        let schema = l.schema_of("authenticated", Some("analytics")).await;
+        assert!(
+            schema.ok()["schemas"]["stats"]["tables"]["t"].is_object(),
+            "{schema:?}"
+        );
+        assert_eq!(schema.json["databases"], json!([main_name, "analytics"]));
+        let schema = l.schema_of("authenticated", None).await;
+        assert!(schema.ok()["schemas"]["stats"].is_null(), "{schema:?}");
+    })
+    .await;
+}
+
+/// A key's allow-list: only the listed databases answer, everything else is the one 404 text.
+/// A stored list follows a rename made in SQL, and dropping the last listed database revokes
+/// the key (Review Focus 2).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn allow_list_limits_a_key_to_one_database() {
+    live("allow", |l| async move {
+        l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('main');")
+            .await;
+        l.create_database("analytics").await;
+        l.owner_in(
+            "analytics",
+            "CREATE TABLE t (v text); INSERT INTO t VALUES ('analytics');",
+        )
+        .await;
+        l.enable(l.main_id(), "analytics").await;
+        let main_name = l.database_name.clone();
+        let main = l.main_id();
+
+        for (kind, role) in [
+            (DataKeyKind::Public, "anon"),
+            (DataKeyKind::Secret, "authenticated"),
+        ] {
+            let only = Some(vec!["analytics".to_string()]);
+            assert_eq!(
+                l.query_listed(main, kind, role, only.clone(), select_t(Some("analytics")))
+                    .await
+                    .ok(),
+                &json!([{"v":"analytics"}])
+            );
+            for database in [None, Some(main_name.as_str()), Some("nope")] {
+                let answer = l
+                    .query_listed(main, kind, role, only.clone(), select_t(database))
+                    .await;
+                assert_eq!(
+                    answer.error(404, "unknown_database")["message"],
+                    rest::error::UNKNOWN_DATABASE,
+                    "{database:?}"
+                );
+            }
+            let main_only = Some(vec![main_name.clone()]);
+            assert_eq!(
+                l.query_listed(main, kind, role, main_only.clone(), select_t(None))
+                    .await
+                    .ok(),
+                &json!([{"v":"main"}])
+            );
+            l.query_listed(main, kind, role, main_only, select_t(Some("analytics")))
+                .await
+                .error(404, "unknown_database");
+            // No list: every served database.
+            assert_eq!(
+                l.query_listed(main, kind, role, None, select_t(Some("analytics")))
+                    .await
+                    .ok(),
+                &json!([{"v":"analytics"}])
+            );
+        }
+
+        // The schema endpoint lists only what the key reaches, and refuses the rest.
+        let schema = |database: Option<&str>| {
+            let mut url = format!("http://{}/data/v1/schema", l.rest);
+            if let Some(database) = database {
+                url.push_str(&format!("?database={database}"));
+            }
+            let token = l.token_for(
+                main,
+                DataKeyKind::Secret,
+                "authenticated",
+                Some(vec!["analytics".into()]),
+            );
+            let l = l.clone();
+            async move {
+                let resp = l
+                    .http
+                    .get(url)
+                    .header(IDENTITY_HEADER, token)
+                    .send()
+                    .await
+                    .unwrap();
+                Live::answer(resp).await
+            }
+        };
+        let listed = schema(Some("analytics")).await;
+        assert_eq!(listed.ok()["databases"], json!(["analytics"]));
+        schema(None).await.error(404, "unknown_database");
+
+        // Stored lists follow SQL: a rename is followed, a drop removes the name, and a key
+        // left with no database is revoked.
+        let only = stored_key(&l, "only-analytics", vec!["analytics".into()]).await;
+        let both = stored_key(&l, "both", vec![main_name.clone(), "analytics".into()]).await;
+        end_sessions(&l, "analytics").await;
+        owner_ddl(&l, "ALTER DATABASE analytics RENAME TO analytics_two").await;
+        l.wait_row(main, "analytics_two", true).await;
+        let lookup = |sha: [u8; 32]| {
+            let l = l.clone();
+            async move { l.metadata.lookup_data_key(&sha).await.unwrap() }
+        };
+        assert_eq!(
+            lookup(only).await.expect("live").databases,
+            Some(vec!["analytics_two".to_string()])
+        );
+        assert_eq!(
+            lookup(both).await.expect("live").databases,
+            Some(vec![main_name.clone(), "analytics_two".to_string()])
+        );
+        assert_eq!(
+            l.data_api_state(main, "analytics_two").await,
+            DataApiState::On,
+            "a rename keeps the flag"
+        );
+        l.invalidate(main).await;
+        assert_eq!(
+            l.query_listed(
+                main,
+                DataKeyKind::Secret,
+                "authenticated",
+                Some(vec!["analytics_two".into()]),
+                select_t(Some("analytics_two"))
+            )
+            .await
+            .ok(),
+            &json!([{"v":"analytics"}])
+        );
+
+        end_sessions(&l, "analytics_two").await;
+        owner_ddl(&l, "DROP DATABASE analytics_two").await;
+        l.wait_row(main, "analytics_two", false).await;
+        assert!(
+            lookup(only).await.is_none(),
+            "the key's last database is gone: revoked"
+        );
+        assert_eq!(
+            lookup(both).await.expect("live").databases,
+            Some(vec![main_name.clone()])
+        );
+    })
+    .await;
+}
+
+/// Disabling a served database while rest holds a warm pool and cached shapes for it: 404 at
+/// once after the invalidate, and within the 60 s info cache without it (Review Focus 4).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn disable_answers_unknown_database_at_once() {
+    live("disable", |l| async move {
+        l.create_database("analytics").await;
+        l.owner_in(
+            "analytics",
+            "CREATE TABLE t (v text); INSERT INTO t VALUES ('analytics');",
+        )
+        .await;
+        let main = l.main_id();
+        l.enable(main, "analytics").await;
+        let query = select_t(Some("analytics"));
+        for _ in 0..3 {
+            assert_eq!(l.anon(query.clone()).await.ok(), &json!([{"v":"analytics"}]));
+        }
+
+        l.disable(main, "analytics").await;
+        assert_eq!(l.data_api_state(main, "analytics").await, DataApiState::Off);
+        l.invalidate(main).await;
+        l.anon(query.clone()).await.error(404, "unknown_database");
+        // rest's console route answers the same.
+        let resp = l
+            .http
+            .post(format!(
+                "http://{}/internal/console/{}/query",
+                l.internal,
+                main.as_uuid()
+            ))
+            .bearer_auth(&l.internal_token)
+            .json(&json!({"role":"authenticated","database":"analytics","tree":select_t(None)}))
+            .send()
+            .await
+            .unwrap();
+        Live::answer(resp).await.error(404, "unknown_database");
+
+        // The machinery stays: re-enabling is the bootstrap again, and serves at once.
+        let ep = l.branch(main).await.endpoint_id.expect("endpoint");
+        assert!(l.worker.data_api_healthy_in(&ep, "analytics").await.unwrap());
+        l.enable(main, "analytics").await;
+        assert_eq!(l.anon(query.clone()).await.ok(), &json!([{"v":"analytics"}]));
+
+        // Without the invalidate call (it failed, say): the connection info's 60 s lifetime.
+        l.disable(main, "analytics").await;
+        let started = Instant::now();
+        loop {
+            let answer = l.anon(query.clone()).await;
+            if answer.status == 404 {
+                answer.error(404, "unknown_database");
+                break;
+            }
+            answer.ok();
+            assert!(
+                started.elapsed() < Duration::from_secs(70),
+                "still served {:?} after the disable",
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        println!("served for {:?} after the disable, without an invalidate", started.elapsed());
+    })
+    .await;
+}
+
+/// A child of a branch that serves a second database serves it too, with the parent's
+/// default schema, and its own bootstrap ran there (Review Focus 5).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+async fn child_branch_serves_the_parent_second_database() {
+    live("childdb", |l| async move {
+        l.create_database("analytics").await;
+        l.owner_in(
+            "analytics",
+            "CREATE SCHEMA stats; CREATE TABLE stats.t (v text); \
+             INSERT INTO stats.t VALUES ('parent');",
+        )
+        .await;
+        assert!(
+            l.metadata
+                .set_database_default_schema(l.main_id(), "analytics", "stats")
+                .await
+                .unwrap()
+        );
+        l.enable(l.main_id(), "analytics").await;
+
+        let dev_id = BranchId::new();
+        let outcome = l
+            .metadata
+            .create_branch(&NewBranch {
+                id: dev_id,
+                database_id: l.db,
+                name: "dev",
+                parent_branch_id: l.main_id(),
+                branched_at_time: None,
+                branched_at_lsn: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, CreateBranchOutcome::Created);
+        let started = Instant::now();
+        l.worker
+            .handle_branch_job(BranchJob::Create {
+                branch_id: dev_id,
+                at: None,
+            })
+            .await
+            .expect("create job");
+        println!("branch create took {:?}", started.elapsed());
+        let dev = l.branch(dev_id).await;
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+
+        let row = l
+            .metadata
+            .branch_databases(dev_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == "analytics")
+            .expect("the child lists analytics");
+        assert_eq!(row.data_api, DataApiState::On);
+        assert_eq!(row.default_schema, "stats");
+        let ep = dev.endpoint_id.clone().expect("endpoint");
+        assert!(l.worker.data_api_healthy_in(&ep, "analytics").await.unwrap());
+
+        let on_dev = |body: Value| l.query_on(dev_id, DataKeyKind::Secret, "authenticated", body);
+        assert_eq!(
+            on_dev(select_t(Some("analytics"))).await.ok(),
+            &json!([{"v":"parent"}])
+        );
+        on_dev(json!({"v":1,"database":"analytics","op":"insert","into":"t","values":[{"v":"child"}]}))
+            .await
+            .ok();
+        assert_eq!(
+            on_dev(json!({"v":1,"database":"analytics","op":"select","from":"t","orderBy":[{"col":"v"}]}))
+                .await
+                .ok(),
+            &json!([{"v":"child"},{"v":"parent"}])
+        );
+        assert_eq!(
+            l.anon(select_t(Some("analytics"))).await.ok(),
+            &json!([{"v":"parent"}]),
+            "the parent's data is its own"
+        );
     })
     .await;
 }

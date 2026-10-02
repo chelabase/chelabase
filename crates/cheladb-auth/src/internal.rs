@@ -37,6 +37,10 @@ pub struct DataIdentity {
     pub role: String,
     /// Extra JWT-style claims for the role's policies; `{}` until end-user auth exists.
     pub claims: serde_json::Value,
+    /// The databases the key may reach (its allow-list); `None` means every database the
+    /// branch serves. Absent in tokens minted before allow-lists existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub databases: Option<Vec<String>>,
 }
 
 /// The caller, as established by the gateway. For a data key, `sub` is the key id and

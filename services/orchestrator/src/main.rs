@@ -7,7 +7,7 @@ use cheladb_types::mode::Mode;
 use cheladb_types::role_settings::RoleSettings;
 use cheladb_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
-use orchestrator::{build_router, AppState, NatsPorts, ProxyAddress, RestInternal};
+use orchestrator::{build_router, AppState, Console, NatsPorts, ProxyAddress, RestInternal};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +46,16 @@ async fn main() -> anyhow::Result<()> {
     let secrets = SecretKey::from_env()?;
     ensure_secrets_key(&metadata, &secrets).await?;
 
+    let data_api_database_cap = orchestrator::data_api_database_cap(
+        std::env::var("CHELADB_BRANCH_DATA_API_DATABASE_CAP").ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let rest = RestInternal {
+        url: env_or("CHELADB_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
+        token: internal_config.rest_token.clone(),
+        http: reqwest::Client::new(),
+    };
+
     let internal_state = Arc::new(InternalState {
         metadata: metadata.clone(),
         locator: DockerLocator::connect(&internal_config.compute_network)?,
@@ -63,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         roles,
         cache: Arc::new(ProxyCache::new(&internal_config.valkey_url)?),
         control_plane_uri: internal_config.control_plane_uri.clone(),
+        rest: rest.clone(),
     });
 
     let state = AppState {
@@ -71,13 +82,12 @@ async fn main() -> anyhow::Result<()> {
         identity,
         secrets,
         proxy: ProxyAddress::from_lookup(|name| std::env::var(name).ok())?,
-        rest: RestInternal {
-            url: env_or("CHELADB_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
-            token: internal_config.rest_token.clone(),
-            http: reqwest::Client::new(),
-        },
+        rest,
         mode,
         proxy_ca_file: env_or("CHELADB_PROXY_CA_FILE", ".cheladb/neon/proxy-ca.crt"),
+        data_api_database_cap,
+        locator: Arc::new(DockerLocator::connect(&internal_config.compute_network)?),
+        console: Console::default(),
     };
 
     let app = build_router(Arc::new(state));

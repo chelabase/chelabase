@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 cheladb-auth = { workspace = true }
+cheladb-query = { workspace = true }
 cheladb-types = { workspace = true }
 dotenvy = { workspace = true }
 moka = { workspace = true }

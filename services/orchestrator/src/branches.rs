@@ -14,7 +14,7 @@ use axum::{
 };
 use cheladb_metadata::{
     BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
-    CreateBranchOutcome, DatabaseOrigin, DatabaseRecord, NewBranch, SettingsPatch,
+    CreateBranchOutcome, DataApiState, DatabaseOrigin, DatabaseRecord, NewBranch, SettingsPatch,
 };
 use cheladb_nats::{BranchJob, DatabaseSettingsJob, JobEnvelope, PointInTime};
 use cheladb_types::api_error::{ApiError, ErrorCode};
@@ -1071,18 +1071,34 @@ where
 
 /// A Postgres database of a branch.
 #[derive(Debug, Serialize, ToSchema)]
-struct BranchDatabaseView {
+pub(crate) struct BranchDatabaseView {
     name: String,
     /// The Postgres role that owns it.
     owner: String,
     origin: DatabaseOrigin,
-    /// The branch's main database: the one the data API serves.
+    /// The branch's main database: always served by the data API.
     main: bool,
+    /// Whether the data API serves it: `off`, `enabling` (the bootstrap is running or will be
+    /// retried), `on` or `error` (see `data_api_error`).
+    data_api: DataApiState,
+    /// Why the last enable failed; null otherwise.
+    #[schema(required = true)]
+    data_api_error: Option<String>,
+    /// The schema a request to this database uses when it names none.
+    default_schema: String,
 }
 
 impl From<BranchDatabase> for BranchDatabaseView {
     fn from(d: BranchDatabase) -> Self {
-        Self { main: d.origin == DatabaseOrigin::Main, name: d.name, owner: d.owner, origin: d.origin }
+        Self {
+            main: d.origin == DatabaseOrigin::Main,
+            name: d.name,
+            owner: d.owner,
+            origin: d.origin,
+            data_api: d.data_api,
+            data_api_error: d.data_api_error,
+            default_schema: d.default_schema,
+        }
     }
 }
 
@@ -1092,7 +1108,7 @@ impl From<BranchDatabase> for BranchDatabaseView {
     operation_id = "listBranchDatabases",
     tag = "branches",
     summary = "List a branch's Postgres databases",
-    description = "The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details.",
+    description = "The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details. Each carries its data API state and default schema.",
     params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id")),
     responses(
         (status = 200, description = "The databases, main first", body = Vec<BranchDatabaseView>),
@@ -1144,7 +1160,6 @@ struct UpdateDatabaseRequest {
     max_rows: Option<i64>,
     statement_timeout_ms: Option<i64>,
     max_connections: Option<i64>,
-    default_schema: Option<String>,
 }
 
 /// A database's settings after a change.
@@ -1156,7 +1171,6 @@ struct DatabaseSettings {
     max_rows: i32,
     statement_timeout_ms: i32,
     max_connections: i32,
-    default_schema: String,
 }
 
 /// Bounds of the data API settings.
@@ -1165,7 +1179,7 @@ const STATEMENT_TIMEOUT_MS: std::ops::RangeInclusive<i64> = 100..=120_000;
 const MAX_CONNECTIONS: std::ops::RangeInclusive<i64> = 1..=50;
 
 /// `^[a-z_][a-z0-9_]{0,62}$`.
-fn valid_schema_name(name: &str) -> bool {
+pub(crate) fn valid_schema_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     match bytes.split_first() {
         Some((first, rest)) => {
@@ -1265,21 +1279,12 @@ where
         Ok(v) => v,
         Err(resp) => return resp.into_response(),
     };
-    if let Some(schema) = &request.default_schema
-        && !valid_schema_name(schema)
-    {
-        return unprocessable(
-            "default_schema must be 1-63 characters from a-z, 0-9 and _, not starting with a digit",
-        )
-        .into_response();
-    }
     let patch = SettingsPatch {
         history_window: window,
         max_branches: max,
         max_rows,
         statement_timeout_ms,
         max_connections,
-        default_schema: request.default_schema.clone(),
     };
     match state
         .metadata
@@ -1314,7 +1319,6 @@ where
         max_rows: max_rows.unwrap_or(record.max_rows),
         statement_timeout_ms: statement_timeout_ms.unwrap_or(record.statement_timeout_ms),
         max_connections: max_connections.unwrap_or(record.max_connections),
-        default_schema: request.default_schema.unwrap_or(record.default_schema),
     })
     .into_response()
 }

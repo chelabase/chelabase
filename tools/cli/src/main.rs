@@ -46,6 +46,12 @@ enum GenCommands {
         /// Write to this file instead of stdout
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Generate this database (not the main one) as `Database`
+        #[arg(long, conflicts_with = "all_databases")]
+        database: Option<String>,
+        /// Generate every database the key reaches: `Databases` and a `types` map keyed by name
+        #[arg(long)]
+        all_databases: bool,
     },
 }
 
@@ -94,8 +100,19 @@ async fn main() -> anyhow::Result<()> {
             DevCommands::Token => dev::token::run().await,
         },
         Commands::Gen { command } => match command {
-            GenCommands::Types { url, key, out } => {
-                generate::run(&url, key, out.as_deref()).await
+            GenCommands::Types {
+                url,
+                key,
+                out,
+                database,
+                all_databases,
+            } => {
+                let which = match (database, all_databases) {
+                    (_, true) => generate::Which::All,
+                    (Some(d), false) => generate::Which::One(d),
+                    (None, false) => generate::Which::Main,
+                };
+                generate::run(&url, key, out.as_deref(), which).await
             }
         },
         Commands::Neon { command } => match command {

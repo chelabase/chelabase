@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use rest::query::{Name, Op, parse};
-use rest::sql::{
+use cheladb_query::query::{Name, Op, parse};
+use cheladb_query::sql::{
     Catalog, ColumnInfo, FnLookupError, FunctionInfo, Plan, PlanError, TableInfo, plan,
 };
 
@@ -148,7 +148,9 @@ impl Catalog for FakeCatalog {
 }
 
 pub fn op(json: &str) -> Op {
-    parse(json.as_bytes()).unwrap_or_else(|e| panic!("{json} should parse: {e}"))
+    parse(json.as_bytes())
+        .unwrap_or_else(|e| panic!("{json} should parse: {e}"))
+        .op
 }
 
 pub fn plans(json: &str) -> Result<Vec<Plan>, PlanError> {

@@ -1,8 +1,8 @@
 mod common;
 
 use common::{FakeCatalog, op};
-use rest::shape::shape_hash;
-use rest::sql::plan;
+use cheladb_query::shape::shape_hash;
+use cheladb_query::sql::plan;
 
 fn hash(json: &str) -> u64 {
     shape_hash(&op(json))

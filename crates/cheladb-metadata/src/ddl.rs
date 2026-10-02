@@ -303,7 +303,9 @@ impl DdlTx {
             DatabaseOrigin::Sql
         };
         sqlx::query(
-            "INSERT INTO branch_databases (branch_id, name, owner, origin) VALUES ($1, $2, $3, $4)
+            "INSERT INTO branch_databases (branch_id, name, owner, origin, data_api, data_api_bootstrapped)
+             VALUES ($1, $2, $3, $4, CASE WHEN $4::text = 'main' THEN 'on' ELSE 'off' END,
+                     $4::text = 'main')
              ON CONFLICT (branch_id, name) DO UPDATE SET owner = EXCLUDED.owner",
         )
         .bind(branch.as_uuid())
@@ -340,6 +342,18 @@ impl DdlTx {
                 .execute(&mut *self.tx)
                 .await?
                 .rows_affected();
+        if moved > 0 {
+            // Keys that name the database follow it (same transaction).
+            sqlx::query(
+                "UPDATE data_api_keys SET databases = array_replace(databases, $2, $3)
+                 WHERE branch_id = $1 AND databases @> ARRAY[$2]::text[]",
+            )
+            .bind(branch.as_uuid())
+            .bind(old)
+            .bind(new)
+            .execute(&mut *self.tx)
+            .await?;
+        }
         self.stamp_databases().await?;
         self.wrote |= moved > 0;
         Ok(moved > 0)
@@ -357,6 +371,9 @@ impl DdlTx {
                 .execute(&mut *self.tx)
                 .await?
                 .rows_affected();
+        if deleted > 0 {
+            drop_name_from_key_lists(&mut self.tx, branch, name).await?;
+        }
         self.stamp_databases().await?;
         self.wrote |= deleted > 0;
         Ok(deleted > 0)
@@ -376,4 +393,26 @@ impl DdlTx {
         self.tx.commit().await?;
         Ok(())
     }
+}
+
+/// A dropped database's name leaves every live key's list of the branch; a key left with none is
+/// revoked (an empty list can't be stored, and NULL would mean every database).
+pub(crate) async fn drop_name_from_key_lists(
+    conn: &mut sqlx::PgConnection,
+    branch: BranchId,
+    name: &str,
+) -> Result<(), MetadataError> {
+    sqlx::query(
+        "UPDATE data_api_keys
+         SET revoked_at = CASE WHEN cardinality(array_remove(databases, $2)) = 0
+                               THEN now() END,
+             databases = CASE WHEN cardinality(array_remove(databases, $2)) = 0
+                              THEN databases ELSE array_remove(databases, $2) END
+         WHERE branch_id = $1 AND revoked_at IS NULL AND databases @> ARRAY[$2]::text[]",
+    )
+    .bind(branch.as_uuid())
+    .bind(name)
+    .execute(conn)
+    .await?;
+    Ok(())
 }

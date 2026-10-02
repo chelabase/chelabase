@@ -1068,6 +1068,7 @@ mod tests {
             prefix: "sk_test".to_string(),
             sha256: [0; 32],
             sealed: None,
+            databases: None,
         }
     }
 

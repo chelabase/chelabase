@@ -8,6 +8,7 @@ import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
 import { DatabaseDataApi } from "./database-data-api";
+import { TablesView } from "./tables-view";
 
 export interface DashboardProps {
   /** The gateway's base URL (shown as the data API endpoint). */
@@ -140,8 +141,8 @@ function hasTransitional(me: Me): boolean {
 }
 
 function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; apiUrl: string }) {
-  const [open, setOpen] = useState<{ id: string; view: "branches" | "data-api" } | null>(null);
-  const toggle = (id: string, view: "branches" | "data-api") =>
+  const [open, setOpen] = useState<{ id: string; view: "branches" | "data-api" | "tables" } | null>(null);
+  const toggle = (id: string, view: "branches" | "data-api" | "tables") =>
     setOpen(open?.id === id && open.view === view ? null : { id, view });
   if (databases.length === 0) {
     return <p className="text-sm text-muted-foreground">No databases yet.</p>;
@@ -184,6 +185,15 @@ function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; a
                   >
                     Data API
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={db.status !== "ready"}
+                    aria-expanded={open?.id === db.database_id && open.view === "tables"}
+                    onClick={() => toggle(db.database_id, "tables")}
+                  >
+                    Tables
+                  </Button>
                 </div>
               </td>
             </tr>
@@ -192,6 +202,8 @@ function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; a
                 <td colSpan={4}>
                   {open.view === "branches" ? (
                     <DatabaseBranches database={db} />
+                  ) : open.view === "tables" ? (
+                    <TablesView databaseId={db.database_id} />
                   ) : (
                     <DatabaseDataApi apiUrl={apiUrl} database={db} />
                   )}

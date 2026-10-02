@@ -49,4 +49,7 @@ export const ErrorCode = {
   role_in_use: 'role_in_use',
   role_privilege_mismatch: 'role_privilege_mismatch',
   branch_protected: 'branch_protected',
+  conflict: 'conflict',
+  data_api_disabled: 'data_api_disabled',
+  owner_password_unknown: 'owner_password_unknown',
 } as const;

@@ -9,7 +9,6 @@
  * A database's settings after a change.
  */
 export interface DatabaseSettings {
-  default_schema: string;
   /**
      * Seconds of history the database keeps.
      * @minimum 0

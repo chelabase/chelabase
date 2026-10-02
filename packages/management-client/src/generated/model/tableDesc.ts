@@ -14,6 +14,11 @@ import type { TableKind } from './tableKind.ts';
 export interface TableDesc {
   columns: TableDescColumns;
   kind: TableKind;
+  /**
+     * The primary key's columns, in the key's order; left out when there is none (a view,
+     * or a table without a key).
+     */
+  primary_key?: string[];
   /** @nullable */
   privileges?: TableDescPrivileges;
   rls: boolean;

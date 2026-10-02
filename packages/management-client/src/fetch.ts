@@ -1,4 +1,6 @@
 import { ApiError } from "./error";
+import { getConsoleQueryUrl } from "./generated/endpoints";
+import type { ConsoleRequest } from "./generated/model";
 import type { ErrorCode } from "./generated/model/errorCode";
 
 export interface ManagementClientConfig {
@@ -43,6 +45,7 @@ export async function requestJson<T>(
   url: string,
   init: RequestInit,
   onUnauthorized?: () => boolean | void,
+  parse: (text: string) => unknown = JSON.parse,
 ): Promise<T> {
   let response: Response;
   try {
@@ -55,7 +58,7 @@ export async function requestJson<T>(
   if (response.ok) {
     try {
       const text = await response.text();
-      return (text === "" ? undefined : JSON.parse(text)) as T;
+      return (text === "" ? undefined : parse(text)) as T;
     } catch {
       throw new ApiError(response.status, "internal", "Unexpected response from Cheladb");
     }
@@ -72,11 +75,42 @@ export function buildHeaders(init: RequestInit, extra: Record<string, string> = 
   return headers;
 }
 
-/** Orval mutator for the Management API. */
-export const customFetch = async <T>(url: string, options: RequestInit): Promise<T> => {
+/** Sends one authenticated request to the configured gateway; `parse` reads a success body. */
+function send<T>(path: string, options: RequestInit, parse?: (text: string) => unknown): Promise<T> {
   if (!config) throw new Error("Management client is not configured; call configureManagementClient first");
   const token = config.getToken();
   const headers = buildHeaders(options, token ? { Authorization: `Bearer ${token}` } : {});
   const fetchImpl = config.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  return requestJson<T>(fetchImpl, `${config.baseUrl}${url}`, { ...options, headers }, config.onUnauthorized);
-};
+  return requestJson<T>(fetchImpl, `${config.baseUrl}${path}`, { ...options, headers }, config.onUnauthorized, parse);
+}
+
+/** Orval mutator for the Management API. */
+export const customFetch = async <T>(url: string, options: RequestInit): Promise<T> => send<T>(url, options);
+
+type Reviver = (this: unknown, key: string, value: unknown, context?: { source?: string }) => unknown;
+
+/**
+ * Parses JSON without losing digits: a number that doesn't read back identically from a double
+ * (an int8 or numeric the server wrote in full) comes back as its source text. Runtimes without
+ * source-text access fall back to plain `JSON.parse`.
+ */
+export function parseExact(text: string): unknown {
+  const reviver: Reviver = (_key, value, context) => {
+    const source = context?.source;
+    if (typeof value !== "number" || typeof source !== "string") return value;
+    // At most 15 significant digits in plain decimal form always survive a double.
+    if (/^-?\d+(\.\d+)?$/.test(source) && source.replace(/^-/, "").replace(".", "").replace(/^0+/, "").length <= 15) return value;
+    return String(value) === source ? value : source;
+  };
+  return (JSON.parse as (t: string, r: Reviver) => unknown)(text, reviver);
+}
+
+/**
+ * The console route with an exact read: numbers outside what a double holds arrive as strings.
+ * Studio uses it so a primary key read back is the key that gets written.
+ */
+export const consoleQueryExact = async (
+  id: string,
+  branchId: string,
+  request: ConsoleRequest,
+): Promise<unknown> => send<unknown>(getConsoleQueryUrl(id, branchId), { method: "POST", body: JSON.stringify(request) }, parseExact);

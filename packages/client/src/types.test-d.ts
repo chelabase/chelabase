@@ -228,3 +228,19 @@ void untyped;
 // @ts-expect-error
 const notInt8: Int8 = 1;
 void notInt8;
+
+// --- db.database(name, types?) returns a client typed by the other database
+type Databases = { main: Database; analytics: Database };
+const multi = createClient<Databases["main"]>({ ...opts, types });
+expectTypeOf(multi.database<Databases["analytics"]>("analytics", types)).toEqualTypeOf<
+  Client<Databases["analytics"], false>
+>();
+expectTypeOf(big.database<Database>("analytics", types)).toEqualTypeOf<Client<Database, true>>();
+expectTypeOf(multi.database("analytics")).toEqualTypeOf<Client<DatabaseShape, false>>();
+// @ts-expect-error a generated database needs its types
+multi.database<Database>("analytics");
+// @ts-expect-error in bigint mode even an untyped database needs the types (they decode int8)
+big.database("analytics");
+expectTypeOf(big.database("analytics", types)).toEqualTypeOf<Client<DatabaseShape, true>>();
+// @ts-expect-error the name is a string
+multi.database(1);

@@ -1,4 +1,4 @@
-//! The data API's management routes: a branch's keys (list, create, rotate, revoke) and its
+//! The data API's management routes: a branch's keys (list, create, update, rotate, revoke) and its
 //! schema as the data API sees it. Keys are shown once, except the public key, which is sealed
 //! so Studio can show it again.
 
@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use cheladb_metadata::{
-    BranchKind, BranchStatus, DataKeyRecord, MetadataError, NewDataKey, RoleLevel,
+    BranchKind, BranchRecord, BranchStatus, DataKeyRecord, MetadataError, NewDataKey, RoleLevel,
 };
 use cheladb_secrets::{Purpose, open_credential, seal_credential};
 use cheladb_types::api_error::{ApiError, ErrorCode};
@@ -29,6 +29,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
+use crate::data_api_databases::validate_key_databases;
 use crate::{AppState, ApiBytes, BACKUP_REFUSAL, AuthPrincipal, JobPort, MetadataPort, ResetError, load_owned};
 
 /// Longest key name.
@@ -46,7 +47,7 @@ where
     OpenApiRouter::new()
         .routes(routes!(list_keys, create_key))
         .routes(routes!(rotate_key))
-        .routes(routes!(revoke_key))
+        .routes(routes!(update_key, revoke_key))
         .routes(routes!(data_api_schema))
 }
 
@@ -66,6 +67,9 @@ struct DataKey {
     /// A secret key whose role is owner-level: the data API refuses it. Always false for the
     /// public key.
     role_blocked: bool,
+    /// The Postgres databases the key may reach; null is every served database.
+    #[schema(required = true)]
+    databases: Option<Vec<String>>,
 }
 
 /// A key just made, with its plaintext.
@@ -77,9 +81,12 @@ struct CreatedDataKey {
     name: String,
     prefix: String,
     key: String,
+    /// The Postgres databases the key may reach; null is every served database.
+    #[schema(required = true)]
+    databases: Option<Vec<String>>,
 }
 
-fn no_store(mut response: Response) -> Response {
+pub(crate) fn no_store(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(CACHE_CONTROL, "no-store".parse().unwrap());
@@ -109,6 +116,7 @@ fn summary(
         last_used_at: record.last_used_at,
         key,
         role_blocked,
+        databases: record.databases,
     })
 }
 
@@ -119,6 +127,7 @@ fn new_key(
     kind: DataKeyKind,
     role: &str,
     name: &str,
+    databases: Option<Vec<String>>,
 ) -> (NewDataKey, String) {
     let generated = data_key::generate(kind);
     let id = Uuid::new_v4();
@@ -134,6 +143,7 @@ fn new_key(
             prefix: generated.prefix,
             sha256: generated.sha256,
             sealed,
+            databases,
         },
         generated.key,
     )
@@ -150,6 +160,7 @@ fn created(key: &NewDataKey, plaintext: String) -> Response {
                 name: key.name.clone(),
                 prefix: key.prefix.clone(),
                 key: plaintext,
+                databases: key.databases.clone(),
             }),
         )
             .into_response(),
@@ -196,22 +207,7 @@ where
             return ApiError::internal().into_response();
         }
     };
-    // The owner-level roles, the same check as `blocked_keys` in `listRoles`.
-    let owner_level: HashSet<String> = match branch.endpoint_id.as_deref() {
-        None => HashSet::new(),
-        Some(endpoint) => match state.metadata.list_roles(endpoint).await {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|r| r.level == RoleLevel::OwnerLevel)
-                .map(|r| r.name)
-                .collect(),
-            Err(err) => {
-                // The flag is a hint for Studio; the keys themselves are fine.
-                warn!(branch_id = %branch.id, "list roles for data keys failed: {err}");
-                HashSet::new()
-            }
-        },
-    };
+    let owner_level = owner_level_roles(&state, &branch).await;
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         let blocked = key.kind == DataKeyKind::Secret && owner_level.contains(&key.role);
@@ -223,11 +219,37 @@ where
     no_store(Json(out).into_response())
 }
 
+/// The branch's owner-level roles, the same check as `blocked_keys` in `listRoles`. A failed
+/// lookup is logged and gives none: the flag is a hint for Studio, the keys themselves are fine.
+async fn owner_level_roles<M, J>(state: &AppState<M, J>, branch: &BranchRecord) -> HashSet<String>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    match branch.endpoint_id.as_deref() {
+        None => HashSet::new(),
+        Some(endpoint) => match state.metadata.list_roles(endpoint).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| r.level == RoleLevel::OwnerLevel)
+                .map(|r| r.name)
+                .collect(),
+            Err(err) => {
+                warn!(branch_id = %branch.id, "list roles for data keys failed: {err}");
+                HashSet::new()
+            }
+        },
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct CreateKeyRequest {
     name: String,
     role: Option<String>,
+    /// The Postgres databases the key may reach: 1 to 20 databases of the branch, disabled ones
+    /// included. Absent or null is every served database.
+    databases: Option<Vec<String>>,
 }
 
 #[utoipa::path(
@@ -246,7 +268,7 @@ struct CreateKeyRequest {
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the name or role is invalid; `role_refused`: the worker refused the role (the message says why)", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (the message says why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the worker didn't answer in time", body = ErrorEnvelope),
@@ -280,6 +302,11 @@ where
     let role = request.role.unwrap_or_else(|| DEFAULT_ROLE.to_string());
     if role.is_empty() {
         return unprocessable("role must not be empty").into_response();
+    }
+    if let Some(names) = &request.databases
+        && let Err(err) = validate_key_databases(&state, branch.id, names).await
+    {
+        return err.into_response();
     }
     if branch.kind == BranchKind::Backup {
         return conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
@@ -317,6 +344,7 @@ where
         DataKeyKind::Secret,
         &role,
         &request.name,
+        request.databases,
     );
     if let Err(err) = state.metadata.insert_data_key(&key).await {
         error!("insert data key: {err}");
@@ -366,7 +394,14 @@ where
         Err(resp) => return resp.into_response(),
     };
     // The new key is the old one's kind, role and name; the old one stops working with it.
-    let (key, plaintext) = new_key(&state.secrets, branch.id, old.kind, &old.role, &old.name);
+    let (key, plaintext) = new_key(
+        &state.secrets,
+        branch.id,
+        old.kind,
+        &old.role,
+        &old.name,
+        old.databases.clone(),
+    );
     match state
         .metadata
         .rotate_data_key(branch.id, old.id, &key)
@@ -385,6 +420,107 @@ where
             error!("rotate data key: {err}");
             ApiError::internal().into_response()
         }
+    }
+}
+
+/// Which databases a key may reach. `databases` has no default, so an empty body can't widen a
+/// key to every database by accident.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct UpdateKeyRequest {
+    /// The Postgres databases the key may reach (1 to 20 databases of the branch, disabled ones
+    /// included), or null for every served database. Required.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<Vec<String>>, required = true)]
+    databases: Option<Option<Vec<String>>>,
+}
+
+/// Distinguishes a missing field (outer `None`) from an explicit null (`Some(None)`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
+    operation_id = "updateKey",
+    tag = "keys",
+    summary = "Change which databases a key may reach",
+    description = "Replaces the key's database list on a secret or the public key. `databases` is required: a list of 1 to 20 databases of the branch (a disabled one is allowed; it is just not served), or null for every served database. Rest forgets the branch's cached state when the list changes. The gateway caches a key for up to 30 seconds, so a narrowed list applies to new requests within 30 seconds of the answer, not at once.",
+    params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id"), ("key_id" = Uuid, Path, description = "Key id")),
+    request_body = UpdateKeyRequest,
+    responses(
+        (status = 200, description = "The key after the change; only the public key carries its full value", body = DataKey),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
+        (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: `databases` is missing or isn't null or a list of 1 to 20 distinct names of the branch's databases", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+    ),
+)]
+async fn update_key<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath((id, branch_id, key_id)): ApiPath<(Uuid, Uuid, Uuid)>,
+    ApiBytes(body): ApiBytes,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let record = match load_owned(&state, &principal, id).await {
+        Ok(record) => record,
+        Err(resp) => return resp.into_response(),
+    };
+    let branch = match load_branch(&state, &record, branch_id).await {
+        Ok(branch) => branch,
+        Err(resp) => return resp.into_response(),
+    };
+    let request: UpdateKeyRequest = match parse_body(&body) {
+        Ok(request) => request,
+        Err(resp) => return resp.into_response(),
+    };
+    let Some(databases) = request.databases else {
+        return unprocessable("databases is required (null is every served database)").into_response();
+    };
+    let old = match find_live_key(&state, branch.id, key_id).await {
+        Ok(Some(old)) => old,
+        Ok(None) => return ApiError::not_found("key not found").into_response(),
+        Err(resp) => return resp.into_response(),
+    };
+    if let Some(names) = &databases
+        && let Err(err) = validate_key_databases(&state, branch.id, names).await
+    {
+        return err.into_response();
+    }
+    match state
+        .metadata
+        .set_key_databases(branch.id, old.id, databases.clone())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return ApiError::not_found("key not found").into_response(),
+        Err(err) => {
+            error!("set key databases: {err}");
+            return ApiError::internal().into_response();
+        }
+    }
+    info!(request_id = %principal.request_id, branch_id = %branch.id, key_id = %old.id, "key databases changed");
+    // Tokens already minted carry the old list; rest drops what it holds for the branch.
+    if old.databases != databases {
+        state.rest.invalidate(branch.id).await;
+    }
+    let blocked = old.kind == DataKeyKind::Secret
+        && owner_level_roles(&state, &branch).await.contains(&old.role);
+    match summary(DataKeyRecord { databases, ..old }, &state.secrets, blocked) {
+        Ok(key) => no_store(Json(key).into_response()),
+        Err(()) => ApiError::internal().into_response(),
     }
 }
 
@@ -464,6 +600,14 @@ where
     }
 }
 
+/// `?database=` on the schema route.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct SchemaQuery {
+    /// The Postgres database to describe; main when absent. It must be served by the data API.
+    database: Option<String>,
+}
+
 /// The REST service's view of the branch's schema, passed through. The REST service is
 /// internal: when it is down the answer is a 503 that doesn't say where it lives.
 #[utoipa::path(
@@ -472,14 +616,18 @@ where
     operation_id = "getDataApiSchema",
     tag = "data-api",
     summary = "The branch's schema as the data API sees it",
-    params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id")),
+    params(
+        ("id" = Uuid, Path, description = "Database id"),
+        ("branch_id" = Uuid, Path, description = "Branch id"),
+        SchemaQuery,
+    ),
     responses(
         (status = 200, description = "The schemas, tables, functions and enums the data API exposes, with each table's role privileges", body = DataApiSchema),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
-        (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the named Postgres database doesn't exist", body = ErrorEnvelope),
+        (status = 409, description = "`branch_not_ready`: the branch isn't ready; `data_api_disabled`: the named Postgres database isn't served by the data API", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 502, description = "`unavailable`: the data API answered something unexpected", body = ErrorEnvelope),
         (status = 503, description = "`unavailable`: the data API or the branch's database can't be reached; retry after `Retry-After`", body = ErrorEnvelope, headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
@@ -489,6 +637,7 @@ async fn data_api_schema<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
     ApiPath((id, branch_id)): ApiPath<(Uuid, Uuid)>,
+    query: Result<axum::extract::Query<SchemaQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response
 where
     M: MetadataPort,
@@ -502,11 +651,34 @@ where
         Ok(branch) => branch,
         Err(resp) => return resp.into_response(),
     };
+    let Ok(axum::extract::Query(SchemaQuery { database })) = query else {
+        return unprocessable("the query string is malformed").into_response();
+    };
+    if let Some(name) = &database {
+        // Known and served, from metadata, before rest is asked.
+        match state.metadata.branch_databases(branch.id).await {
+            Ok(rows) => match rows.into_iter().find(|d| &d.name == name) {
+                None => return crate::console::database_not_found().into_response(),
+                Some(row) if row.data_api != cheladb_metadata::DataApiState::On => {
+                    return crate::console::data_api_disabled(name).into_response();
+                }
+                Some(_) => {}
+            },
+            Err(err) => {
+                error!("list branch databases: {err}");
+                return ApiError::internal().into_response();
+            }
+        }
+    }
     let url = format!(
         "{}/internal/schema/{}",
         state.rest.url.trim_end_matches('/'),
         branch.id.as_uuid()
     );
+    let url = match &database {
+        Some(name) => format!("{url}?database={}", urlencoding::encode(name)),
+        None => url,
+    };
     let response = match state
         .rest
         .http
@@ -529,7 +701,25 @@ where
     match (status, body) {
         (s, Some(body)) if s.is_success() => no_store(Json(body).into_response()),
         // Rest's own bodies are rewritten into ours; the 404 is its `unknown_branch`.
-        (StatusCode::NOT_FOUND, Some(_)) => {
+        (StatusCode::NOT_FOUND, Some(body)) => {
+            if let Some(name) = &database
+                && body["error"]["code"] == "unknown_database"
+            {
+                // It stopped being served (or went) since the check above.
+                return match state.metadata.branch_databases(branch.id).await {
+                    Ok(rows) => match rows.into_iter().find(|d| &d.name == name) {
+                        Some(row) if row.data_api != cheladb_metadata::DataApiState::On => {
+                            crate::console::data_api_disabled(name)
+                        }
+                        _ => crate::console::database_not_found(),
+                    },
+                    Err(err) => {
+                        error!("list branch databases: {err}");
+                        ApiError::internal()
+                    }
+                }
+                .into_response();
+            }
             ApiError::not_found("branch not found").into_response()
         }
         (StatusCode::CONFLICT, Some(_)) => {

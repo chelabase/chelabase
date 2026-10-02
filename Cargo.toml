@@ -15,6 +15,7 @@ members = [
     "crates/cheladb-routes",
     "crates/cheladb-secrets",
     "crates/cheladb-neon",
+    "crates/cheladb-query",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ cheladb-auth = { path = "crates/cheladb-auth" }
 cheladb-routes = { path = "crates/cheladb-routes" }
 cheladb-secrets = { path = "crates/cheladb-secrets" }
 cheladb-neon = { path = "crates/cheladb-neon" }
+cheladb-query = { path = "crates/cheladb-query" }
 
 axum = "0.8.9"
 utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }

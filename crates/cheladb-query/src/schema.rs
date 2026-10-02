@@ -72,7 +72,12 @@ pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
       (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(a.attname, a.atttypid::int8,
           pg_catalog.format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
           a.atthasdef OR a.attidentity <> '', a.attgenerated <> '' OR a.attidentity = 'a') ORDER BY a.attnum), '[]')
-        FROM pg_catalog.pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped))), '[]')
+        FROM pg_catalog.pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped),
+      (SELECT coalesce(pg_catalog.json_agg(a.attname ORDER BY k.ord), '[]')
+        FROM pg_catalog.pg_constraint con
+        CROSS JOIN LATERAL pg_catalog.unnest(con.conkey) WITH ORDINALITY k(attnum, ord)
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+        WHERE con.conrelid = c.oid AND con.contype = 'p'))), '[]')
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_')),
   'functions', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(p.oid::int8, n.nspname, p.proname, p.prokind,
@@ -117,10 +122,20 @@ pub enum IntrospectError {
 type RawType = (u32, String, String, String, u32, u32, String, i16, String);
 /// `(name, type oid, format_type with typmod, nullable, has_default, generated)`.
 type RawColumn = (String, u32, String, bool, bool, bool);
-/// `(oid, schema, name, relkind, rls, security_invoker, columns)`. `security_invoker` is
-/// true only for a view whose options set it (any spelling Postgres reads as true: the
-/// value is cast to `boolean`).
-type RawRelation = (u32, String, String, String, bool, bool, Vec<RawColumn>);
+/// `(oid, schema, name, relkind, rls, security_invoker, columns, primary key columns)`.
+/// `security_invoker` is true only for a view whose options set it (any spelling Postgres
+/// reads as true: the value is cast to `boolean`). The primary key's columns come in the
+/// key's order.
+type RawRelation = (
+    u32,
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    Vec<RawColumn>,
+    Vec<String>,
+);
 /// `(oid, schema, name, prokind, retset, rettype, argtypes, allargtypes, modes, names,
 /// nargdefaults, variadic, owned by an extension)`.
 type RawFunction = (
@@ -177,6 +192,8 @@ pub struct Table {
     /// A view that runs with the caller's privileges (and so under its RLS).
     pub security_invoker: bool,
     pub columns: Vec<Column>,
+    /// The primary key's columns, in the key's order; empty without one.
+    pub primary_key: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -385,7 +402,7 @@ impl Schema {
             .into_iter()
             .filter(|r| !is_reserved(&r.1))
             .map(
-                |(oid, schema, name, relkind, rls, security_invoker, columns)| Table {
+                |(oid, schema, name, relkind, rls, security_invoker, columns, primary_key)| Table {
                     oid,
                     schema,
                     name,
@@ -425,6 +442,7 @@ impl Schema {
                             },
                         )
                         .collect(),
+                    primary_key,
                 },
             )
             .collect();
@@ -546,6 +564,7 @@ impl Schema {
                     security_invoker: t.security_invoker,
                     privileges,
                     columns,
+                    primary_key: t.primary_key.clone(),
                 },
             );
         }
@@ -799,6 +818,7 @@ mod tests {
             rls: !invoker,
             security_invoker: invoker,
             columns,
+            primary_key: vec![],
         }
     }
 

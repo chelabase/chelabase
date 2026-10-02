@@ -1,0 +1,26 @@
+[package]
+name = "cheladb-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cheladb's data API query engine: the JSON grammar, schema introspection and caches, SQL planning and running a request on a given connection"
+
+[dependencies]
+cheladb-types = { workspace = true }
+http = { workspace = true }
+moka = { workspace = true }
+serde = { workspace = true }
+# Keeps a bare JSON number's digits (a 30-digit numeric binds exactly). It changes
+# `serde_json::Number` for every crate built with this one (rest and the orchestrator).
+# It breaks deserializing numbers through serde's buffered content: an untagged, internally
+# tagged or flattened `Deserialize` type. The workspace's untagged and tagged enums
+# (the orchestrator's `PointInTime` docs type, auth's `NextStep`) only serialize, which it
+# doesn't affect; keep it that way.
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

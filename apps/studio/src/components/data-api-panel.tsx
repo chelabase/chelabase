@@ -1,9 +1,19 @@
 import { useId, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { getListKeysQueryKey, rotateKey, useGetDataApiSchema, useListKeys, type Branch } from "@cheladb/management-client";
+import {
+  getListKeysQueryKey,
+  rotateKey,
+  useGetDataApiSchema,
+  useListBranchDatabases,
+  useListKeys,
+  type Branch,
+  type BranchDatabaseView,
+} from "@cheladb/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
+import { pollWhile } from "@/lib/query";
 import { CopyButton } from "./copy-button";
+import { DataApiDatabases, KeyDatabases } from "./data-api-databases";
 import { DataApiKeys } from "./data-api-keys";
 import { RlsWarning } from "./rls-warning";
 
@@ -19,14 +29,27 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
   const queryClient = useQueryClient();
   const branchId = branch.id;
   const keyList = useListKeys(databaseId, branchId);
-  const schemaQuery = useGetDataApiSchema(databaseId, branchId);
+  // While a database is enabling, keep the list fresh until it turns on or fails.
+  const dbList = useListBranchDatabases(databaseId, branchId, {
+    query: { refetchInterval: pollWhile<BranchDatabaseView[]>((ds) => ds.some((d) => d.data_api === "enabling")) },
+  });
+  const databases = dbList.data ?? null;
+  const [pickedName, setPickedName] = useState<string | null>(null);
+  const pickedDb = databases?.find((d) => d.name === pickedName) ?? databases?.find((d) => d.main) ?? databases?.[0];
+  // The schema (and the RLS warning) are read from a served database only.
+  const schemaQuery = useGetDataApiSchema(
+    databaseId,
+    branchId,
+    { database: pickedDb?.name },
+    { query: { enabled: pickedDb?.data_api === "on" } },
+  );
   const [rotating, setRotating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [rotateError, setRotateError] = useState<string | null>(null);
   const keys = keyList.data ?? null;
-  const schema = schemaQuery.data ?? null;
-  const error = keyList.error ? errorText(keyList.error) : rotateError;
-  const schemaError = schemaQuery.error ? `Couldn't check RLS: ${errorText(schemaQuery.error)}` : null;
+  const schema = pickedDb?.data_api === "on" ? (schemaQuery.data ?? null) : null;
+  const error = keyList.error ? errorText(keyList.error) : dbList.error ? errorText(dbList.error) : rotateError;
+  const schemaError = pickedDb?.data_api === "on" && schemaQuery.error ? `Couldn't check RLS: ${errorText(schemaQuery.error)}` : null;
   const endpoint = `${apiUrl.replace(/\/+$/, "")}/data/v1/query`;
 
   const publicKey = keys?.find((k) => k.kind === "public");
@@ -97,6 +120,28 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
           </div>
         </div>
       )}
+      {databases !== null && databases.length > 0 && pickedDb && (
+        <DataApiDatabases
+          databaseId={databaseId}
+          branchId={branchId}
+          databases={databases}
+          picked={pickedDb.name}
+          onPick={setPickedName}
+        />
+      )}
+      {publicKey && databases && (
+        <section aria-label="Public key databases" className="space-y-1">
+          <h4 className="text-muted-foreground">Public key databases</h4>
+          <KeyDatabases
+            key={`${publicKey.id}/${(publicKey.databases ?? ["*"]).join(",")}`}
+            databaseId={databaseId}
+            branchId={branchId}
+            keyId={publicKey.id}
+            value={publicKey.databases}
+            databases={databases}
+          />
+        </section>
+      )}
       {error && (
         <p role="alert" className="text-destructive">
           {error}
@@ -104,7 +149,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
       )}
       {keys === null && !error && <p className="text-muted-foreground">Loading keys…</p>}
       {keys !== null && (
-        <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} />
+        <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} databases={databases ?? []} />
       )}
       {schemaError && (
         <p role="alert" className="text-destructive">

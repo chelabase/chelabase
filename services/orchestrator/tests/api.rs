@@ -17,7 +17,8 @@ use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use cheladb_secrets::{open_credential, seal_credential, Purpose, SecretKey};
 use cheladb_types::data_key::{self, DataKeyKind};
 use orchestrator::{
-    build_router, AppState, JobPort, MetadataPort, ProxyAddress, ResetError, RestInternal,
+    build_router, AppState, Console, JobPort, MetadataPort, PostgresAddr, ProxyAddress, ResetError,
+    RestInternal,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
@@ -203,6 +204,10 @@ impl FakeMetadata {
             name: name.into(),
             owner: owner.into(),
             origin,
+            data_api: cheladb_metadata::DataApiState::Off,
+            data_api_error: None,
+            default_schema: "public".into(),
+            data_api_bootstrapped: origin == DatabaseOrigin::Main,
         });
     }
 
@@ -240,7 +245,6 @@ fn sample_database(tenant_id: TenantId) -> Db {
         max_rows: 1000,
         statement_timeout_ms: 8000,
         max_connections: 5,
-        default_schema: "public".into(),
     })
 }
 
@@ -575,9 +579,6 @@ impl MetadataPort for FakeMetadata {
                 if let Some(v) = patch.max_connections {
                     db.max_connections = v;
                 }
-                if let Some(v) = &patch.default_schema {
-                    db.default_schema = v.clone();
-                }
                 Ok(true)
             }
             _ => Ok(false),
@@ -629,7 +630,10 @@ impl MetadataPort for FakeMetadata {
             return Ok(false);
         };
         keys[i].0.revoked_at = Some(chrono::Utc::now());
-        match insert_key(&mut keys, new) {
+        // As the real one does: the replacement reaches the same databases.
+        let mut new = new.clone();
+        new.databases = keys[i].0.databases.clone();
+        match insert_key(&mut keys, &new) {
             Ok(()) => Ok(true),
             Err(e) => {
                 keys[i].0.revoked_at = None;
@@ -668,6 +672,72 @@ impl MetadataPort for FakeMetadata {
             .collect())
     }
 
+    async fn begin_enable_data_api(
+        &self,
+        branch: BranchId,
+        name: &str,
+        cap: u32,
+    ) -> Result<cheladb_metadata::EnableStart, MetadataError> {
+        use cheladb_metadata::{DataApiState, EnableStart};
+        let mut all = self.branch_dbs.lock().unwrap();
+        let rows = all.entry(branch).or_default();
+        let Some(i) = rows.iter().position(|d| d.name == name) else {
+            return Ok(EnableStart::Unknown);
+        };
+        if rows[i].origin == DatabaseOrigin::System {
+            return Ok(EnableStart::System);
+        }
+        if rows[i].data_api == DataApiState::On {
+            return Ok(EnableStart::AlreadyOn);
+        }
+        let others = rows
+            .iter()
+            .filter(|d| d.name != name && matches!(d.data_api, DataApiState::On | DataApiState::Enabling))
+            .count();
+        if others >= cap as usize {
+            return Ok(EnableStart::OverCap(cap));
+        }
+        rows[i].data_api = DataApiState::Enabling;
+        rows[i].data_api_error = None;
+        rows[i].data_api_bootstrapped = true;
+        Ok(EnableStart::Started)
+    }
+
+    async fn set_database_default_schema(
+        &self,
+        branch: BranchId,
+        name: &str,
+        schema: &str,
+    ) -> Result<bool, MetadataError> {
+        let mut all = self.branch_dbs.lock().unwrap();
+        match all.entry(branch).or_default().iter_mut().find(|d| d.name == name) {
+            Some(d) => {
+                d.default_schema = schema.to_string();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_key_databases(
+        &self,
+        branch: BranchId,
+        key_id: uuid::Uuid,
+        databases: Option<Vec<String>>,
+    ) -> Result<bool, MetadataError> {
+        let mut keys = self.keys.lock().unwrap();
+        match keys
+            .iter_mut()
+            .find(|(k, _)| k.id == key_id && k.branch_id == branch && k.revoked_at.is_none())
+        {
+            Some((k, _)) => {
+                k.databases = databases;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn branch_databases(&self, branch: BranchId) -> Result<Vec<BranchDatabase>, MetadataError> {
         self.branch_db_queries.fetch_add(1, Ordering::SeqCst);
         let mut rows = self.branch_dbs.lock().unwrap().get(&branch).cloned().unwrap_or_default();
@@ -696,6 +766,7 @@ fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataEr
             created_at: chrono::Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            databases: key.databases.clone(),
         },
         key.sha256,
     ));
@@ -735,6 +806,12 @@ struct FakeJobs {
     role_calls: Arc<Mutex<Vec<String>>>,
     /// What the worker answers to the role RPCs; `ok` when unset.
     role_reply: Arc<Mutex<Option<Result<RoleReply, ResetError>>>>,
+    /// Each data API job as `enable:<name>`, `disable:<name>:<remove>` or `rebootstrap:<name>`.
+    data_api_calls: Arc<Mutex<Vec<String>>>,
+    /// What the worker answers to disable and rebootstrap; `ok` when unset.
+    data_api_reply: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
+    /// The enable message can't be published.
+    fail_enable_publish: Arc<Mutex<bool>>,
 }
 
 impl FakeJobs {
@@ -794,6 +871,39 @@ impl JobPort for FakeJobs {
         }
     }
 
+    async fn enable_data_api(
+        &self,
+        _branch_id: BranchId,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if *self.fail_enable_publish.lock().unwrap() {
+            return Err("nats is down".into());
+        }
+        self.data_api_calls.lock().unwrap().push(format!("enable:{name}"));
+        Ok(())
+    }
+
+    async fn disable_data_api(
+        &self,
+        _branch_id: BranchId,
+        name: &str,
+        remove: bool,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        self.data_api_calls.lock().unwrap().push(format!("disable:{name}:{remove}"));
+        self.data_api_answer()
+    }
+
+    async fn rebootstrap_data_api(
+        &self,
+        _branch_id: BranchId,
+        name: &str,
+        grant_existing: bool,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        let flag = if grant_existing { ":grant_existing" } else { "" };
+        self.data_api_calls.lock().unwrap().push(format!("rebootstrap:{name}{flag}"));
+        self.data_api_answer()
+    }
+
     async fn reset_password(
         &self,
         database_id: DatabaseId,
@@ -831,11 +941,37 @@ impl JobPort for FakeJobs {
 }
 
 impl FakeJobs {
+    fn data_api_answer(&self) -> Result<CheckDataRoleReply, ResetError> {
+        match self.data_api_reply.lock().unwrap().clone() {
+            Some(answer) => answer,
+            None => Ok(CheckDataRoleReply::ok()),
+        }
+    }
+
     fn role_answer(&self) -> Result<RoleReply, ResetError> {
         match self.role_reply.lock().unwrap().clone() {
             Some(answer) => answer,
             None => Ok(RoleReply { ok: true, code: None, error: None, keys: vec![] }),
         }
+    }
+}
+
+/// Where the fake Docker says each compute's Postgres is published: one address for every
+/// endpoint (`None`: no compute running), and the endpoints asked about.
+#[derive(Clone, Default)]
+struct FakeLocator {
+    addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl PostgresAddr for FakeLocator {
+    fn postgres_addr<'a>(
+        &'a self,
+        endpoint_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Option<std::net::SocketAddr>>> + Send + 'a>> {
+        self.asked.lock().unwrap().push(endpoint_id.to_string());
+        let addr = *self.addr.lock().unwrap();
+        Box::pin(async move { Ok(addr) })
     }
 }
 
@@ -845,6 +981,8 @@ struct TestApp {
     signer: InternalSigner,
     /// The secrets key the orchestrator decrypts with.
     key: SecretKey,
+    /// Where the console finds a compute's Postgres.
+    locator: FakeLocator,
 }
 
 impl TestApp {
@@ -880,8 +1018,13 @@ async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &
 }
 
 async fn spawn_app_in_mode(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, mode: Mode) -> TestApp {
+    spawn_app_full(metadata, jobs, rest_url, mode, 10).await
+}
+
+async fn spawn_app_full(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, mode: Mode, cap: u32) -> TestApp {
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
+    let locator = FakeLocator::default();
     let state = Arc::new(AppState {
         metadata,
         js: jobs,
@@ -895,6 +1038,9 @@ async fn spawn_app_in_mode(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &st
         },
         mode,
         proxy_ca_file: ".cheladb/neon/proxy-ca.crt".into(),
+        data_api_database_cap: cap,
+        locator: Arc::new(locator.clone()),
+        console: Console::default(),
     });
     let app: Router = build_router(state);
 
@@ -908,6 +1054,7 @@ async fn spawn_app_in_mode(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &st
         base: format!("http://{addr}"),
         signer: InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
         key,
+        locator,
     }
 }
 
@@ -2608,7 +2755,7 @@ async fn patch_updates_the_settings_and_returns_them() {
         body,
         json!({
             "history_window": 86400, "max_branches": 10,
-            "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 5, "default_schema": "public",
+            "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 5,
         })
     );
     let db = t.metadata.database(t.db);
@@ -2744,6 +2891,7 @@ impl Branching {
             prefix: generated.prefix.clone(),
             sha256: generated.sha256,
             sealed: Some(seal_credential(&self.app.key, &id.to_string(), Purpose::DataKey, &generated.key)),
+            databases: None,
         };
         insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
         (id, generated.key)
@@ -2761,6 +2909,7 @@ impl Branching {
             prefix: generated.prefix.clone(),
             sha256: generated.sha256,
             sealed: None,
+            databases: None,
         };
         insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
         (id, generated.key)
@@ -3028,6 +3177,47 @@ async fn another_tenant_gets_404() {
     drop(t);
 }
 
+/// Another tenant's database: every per-database data API route and the console answer 404
+/// as for a missing one, and nothing runs.
+#[tokio::test]
+async fn data_api_database_routes_of_another_tenant_are_404() {
+    let jobs = FakeJobs::default();
+    let mut other_db = None;
+    let other = lifecycle_app(jobs.clone(), |m, _t, k| {
+        let db = ready_database(TenantId::new(), k);
+        let branch = BranchId::from(db.database_id);
+        other_db = Some((db.database_id, branch));
+        m.insert_database(db);
+        m.add_branch_db(branch, "web1", "postgres", DatabaseOrigin::Main);
+        m.add_branch_db(branch, "analytics", "etl", DatabaseOrigin::Sql);
+    })
+    .await;
+    let (db, branch) = other_db.unwrap();
+    let base = format!("/v1/databases/{}/branches/{}", db.as_uuid(), branch.as_uuid());
+    let key = uuid::Uuid::new_v4();
+    for (method, path, body) in [
+        (Method::POST, format!("{base}/pg-databases/analytics/data-api"), None),
+        (Method::DELETE, format!("{base}/pg-databases/analytics/data-api?remove=true"), None),
+        (Method::PATCH, format!("{base}/pg-databases/analytics"), Some(json!({ "default_schema": "app" }))),
+        (Method::PATCH, format!("{base}/keys/{key}"), Some(json!({ "databases": null }))),
+        (Method::POST, format!("{base}/console/query"), Some(json!({ "role": null, "tree": { "v": 1, "op": "select", "from": "t" } }))),
+        (Method::POST, format!("{base}/console/query"), Some(json!({ "role": "editor", "tree": { "v": 1, "op": "select", "from": "t" } }))),
+        (Method::GET, format!("{base}/console/schema"), None),
+        (Method::GET, format!("{base}/console/schema?role=editor"), None),
+    ] {
+        let mut req = reqwest::Client::new()
+            .request(method.clone(), format!("{}{path}", other.base))
+            .header(IDENTITY_HEADER, other.token_for_org("org-1"));
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(code_of(&error_of(resp, 404).await), "not_found", "{method} {path}");
+    }
+    assert!(jobs.data_api_calls.lock().unwrap().is_empty());
+    assert!(jobs.role_checks.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn keys_of_an_unknown_branch_are_404() {
     let t = branching().await;
@@ -3056,26 +3246,14 @@ async fn settings_patch_bounds() {
         }
         assert_eq!(t.send(Method::PATCH, &path, Some(json!({ field: "many" }))).await.status(), 422);
     }
-    for schema in ["app", "_x", "a1_b2", &"a".repeat(63)] {
-        let resp = t.send(Method::PATCH, &path, Some(json!({ "default_schema": schema }))).await;
-        assert_eq!(resp.status(), 200, "{schema}");
-        let body: Value = resp.json().await.unwrap();
-        assert_eq!(body["default_schema"], schema);
-    }
-    for schema in ["", "1abc", "Public", "a-b", "a b", &"a".repeat(64), "pub\"lic", "x;drop"] {
-        assert_eq!(
-            t.send(Method::PATCH, &path, Some(json!({ "default_schema": schema }))).await.status(),
-            422,
-            "{schema:?}"
-        );
-    }
+    // `default_schema` moved to the per-database settings: this route no longer knows it.
+    let moved = t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app" }))).await;
+    assert!(moved.status().is_client_error(), "{}", moved.status());
     // Refused values change nothing, and the stored values come back on the next PATCH.
     let db = t.metadata.database(t.db);
     assert_eq!((db.max_rows, db.statement_timeout_ms, db.max_connections), (100000, 120000, 50));
-    assert_eq!(db.default_schema, "a".repeat(63));
     let body: Value = t.send(Method::PATCH, &path, Some(json!({}))).await.json().await.unwrap();
     assert_eq!(body["max_rows"], 100000);
-    assert_eq!(body["default_schema"], "a".repeat(63));
 }
 
 // ---- the data API's schema, proxied from rest
@@ -3127,6 +3305,90 @@ async fn data_api_schema_is_proxied_from_rest() {
         *seen.lock().unwrap(),
         vec![(t.main().as_uuid().to_string(), Some(format!("Bearer {REST_TOKEN}")))]
     );
+}
+
+/// A rest that records each `?database=` it is asked for (`None` when absent) and answers
+/// 404 `unknown_database` for `gone`.
+async fn mock_rest_schema_databases() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    use axum::extract::Query;
+    use axum::routing::get;
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let app = Router::new().route(
+        "/internal/schema/{branch}",
+        get(move |Query(q): Query<std::collections::HashMap<String, String>>| {
+            let log = log.clone();
+            async move {
+                let database = q.get("database").cloned();
+                log.lock().unwrap().push(database.clone());
+                if database.as_deref() == Some("gone") {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({ "error": { "code": "unknown_database", "message": "no such database" } })),
+                    );
+                }
+                (axum::http::StatusCode::OK, axum::Json(json!({ "version": "v1", "schemas": {}, "database": database })))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rest = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (rest, seen)
+}
+
+async fn branching_with_schema_rest() -> (Branching, Arc<Mutex<Vec<Option<String>>>>) {
+    let (rest, seen) = mock_rest_schema_databases().await;
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app_with_rest(metadata.clone(), jobs.clone(), &rest).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    (Branching { app, metadata, jobs, db: id }, seen)
+}
+
+#[tokio::test]
+async fn data_api_schema_forwards_the_database() {
+    let (t, seen) = branching_with_schema_rest().await;
+    let main = t.seeded();
+    t.metadata.add_branch_db(main, "my db&x", "etl", DatabaseOrigin::Sql);
+    t.metadata.set_data_api(main, "my db&x", cheladb_metadata::DataApiState::On);
+    let path = format!("{}/data-api/schema", t.branch(main));
+    // No parameter: main, as today.
+    assert_eq!(t.send(Method::GET, &path, None).await.status(), 200);
+    let resp = t.send(Method::GET, &format!("{path}?database=web1"), None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["database"], "web1");
+    // The name is percent-encoded on the way to rest and decoded there.
+    assert_eq!(t.send(Method::GET, &format!("{path}?database=my%20db%26x"), None).await.status(), 200);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![None, Some("web1".to_string()), Some("my db&x".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn data_api_schema_unknown_or_disabled_database() {
+    let (t, seen) = branching_with_schema_rest().await;
+    let main = t.seeded();
+    let path = format!("{}/data-api/schema", t.branch(main));
+    let err = error_of(t.send(Method::GET, &format!("{path}?database=nope"), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let err = error_of(t.send(Method::GET, &format!("{path}?database=analytics"), None).await, 409).await;
+    assert_eq!(code_of(&err), "data_api_disabled");
+    // Both are answered from metadata, before rest is asked.
+    assert!(seen.lock().unwrap().is_empty());
+    // Rest saying `unknown_database` for a database metadata lists as on (it vanished
+    // meanwhile): answered by what metadata says, here still not found.
+    t.metadata.add_branch_db(main, "gone", "etl", DatabaseOrigin::Sql);
+    t.metadata.set_data_api(main, "gone", cheladb_metadata::DataApiState::On);
+    let err = error_of(t.send(Method::GET, &format!("{path}?database=gone"), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -3399,6 +3661,7 @@ async fn list_roles_shapes_and_blocked_keys() {
                 prefix: "ck_x".into(),
                 sealed: None,
                 sha256: [id.as_bytes()[0]; 32],
+                databases: None,
             },
         )
         .unwrap();
@@ -3829,10 +4092,10 @@ async fn list_branch_databases() {
     assert_eq!(
         body,
         json!([
-            { "name": "web1", "owner": "postgres", "origin": "main", "main": true },
-            { "name": "alpha", "owner": "etl", "origin": "sql", "main": false },
-            { "name": "postgres", "owner": "cloud_admin", "origin": "system", "main": false },
-            { "name": "zeta", "owner": "etl", "origin": "sql", "main": false },
+            { "name": "web1", "owner": "postgres", "origin": "main", "main": true, "data_api": "off", "data_api_error": null, "default_schema": "public" },
+            { "name": "alpha", "owner": "etl", "origin": "sql", "main": false, "data_api": "off", "data_api_error": null, "default_schema": "public" },
+            { "name": "postgres", "owner": "cloud_admin", "origin": "system", "main": false, "data_api": "off", "data_api_error": null, "default_schema": "public" },
+            { "name": "zeta", "owner": "etl", "origin": "sql", "main": false, "data_api": "off", "data_api_error": null, "default_schema": "public" },
         ])
     );
     let backup = t.backup(dev);
@@ -4040,4 +4303,1190 @@ async fn role_routes_need_management_auth() {
         .unwrap();
     assert_eq!(resp.status(), 401);
     assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+}
+
+
+// ---- the data API per Postgres database (step 6c)
+
+type Invalidations = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// A rest stand-in that records each invalidation: (branch, authorization).
+async fn mock_rest_invalidate() -> (String, Invalidations) {
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    let seen: Invalidations = Arc::default();
+    let log = seen.clone();
+    let app = Router::new().route(
+        "/internal/branches/{branch}/invalidate",
+        post(move |Path(branch): Path<String>, headers: HeaderMap| {
+            let log = log.clone();
+            async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+                log.lock().unwrap().push((branch, auth));
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, seen)
+}
+
+/// Like `branching()`, with a rest that records invalidations and the given database cap.
+async fn branching_with_rest(cap: u32) -> (Branching, Invalidations) {
+    let (rest, seen) = mock_rest_invalidate().await;
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app_full(metadata.clone(), jobs.clone(), &rest, Mode::SelfHosted, cap).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    (Branching { app, metadata, jobs, db: id }, seen)
+}
+
+impl Branching {
+    fn pg(&self, branch: BranchId, name: &str) -> String {
+        format!("{}/pg-databases/{name}", self.branch(branch))
+    }
+
+    /// The main branch with `web1` (main, on) and `analytics`, `scratch` (sql, off), and the
+    /// system `postgres` database.
+    fn seeded(&self) -> BranchId {
+        let main = self.main();
+        self.metadata.add_branch_db(main, "web1", "postgres", DatabaseOrigin::Main);
+        self.metadata.set_data_api(main, "web1", cheladb_metadata::DataApiState::On);
+        self.metadata.add_branch_db(main, "analytics", "etl", DatabaseOrigin::Sql);
+        self.metadata.add_branch_db(main, "scratch", "etl", DatabaseOrigin::Sql);
+        self.metadata.add_branch_db(main, "postgres", "cloud_admin", DatabaseOrigin::System);
+        main
+    }
+
+    fn data_api_calls(&self) -> Vec<String> {
+        self.jobs.data_api_calls.lock().unwrap().clone()
+    }
+}
+
+impl FakeMetadata {
+    fn set_data_api(&self, branch: BranchId, name: &str, state: cheladb_metadata::DataApiState) {
+        let mut all = self.branch_dbs.lock().unwrap();
+        let row = all.get_mut(&branch).unwrap().iter_mut().find(|d| d.name == name).unwrap();
+        row.data_api = state;
+        // As the store does: any state but off means an enable began.
+        row.data_api_bootstrapped |= state != cheladb_metadata::DataApiState::Off;
+    }
+
+    fn pg_database(&self, branch: BranchId, name: &str) -> BranchDatabase {
+        self.branch_dbs.lock().unwrap().get(&branch).unwrap().iter().find(|d| d.name == name).cloned().unwrap()
+    }
+
+    fn key_databases(&self, id: uuid::Uuid) -> Option<Vec<String>> {
+        self.keys.lock().unwrap().iter().find(|(k, _)| k.id == id).unwrap().0.databases.clone()
+    }
+}
+
+async fn wait_for_invalidations(seen: &Invalidations, n: usize) {
+    for _ in 0..100 {
+        if seen.lock().unwrap().len() >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn enable_answers_202_and_publishes() {
+    let t = branching().await;
+    let main = t.seeded();
+    let resp = t.send(Method::POST, &format!("{}/data-api", t.pg(main, "analytics")), None).await;
+    assert_eq!(resp.status(), 202);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "analytics");
+    assert_eq!(body["data_api"], "enabling");
+    assert!(body["data_api_error"].is_null());
+    assert_eq!(t.data_api_calls(), vec!["enable:analytics"]);
+    assert_eq!(t.metadata.pg_database(main, "analytics").data_api, cheladb_metadata::DataApiState::Enabling);
+
+    // Pressing it again while it is enabling starts the job again (a retry).
+    assert_eq!(t.send(Method::POST, &format!("{}/data-api", t.pg(main, "analytics")), None).await.status(), 202);
+    assert_eq!(t.data_api_calls().len(), 2);
+
+    // Already served: 200, nothing published.
+    let resp = t.send(Method::POST, &format!("{}/data-api", t.pg(main, "web1")), None).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["data_api"], "on");
+    assert_eq!(t.data_api_calls().len(), 2);
+
+    // A lost publish is healed by reconcile (the row stays `enabling`): still 202.
+    *t.jobs.fail_enable_publish.lock().unwrap() = true;
+    assert_eq!(t.send(Method::POST, &format!("{}/data-api", t.pg(main, "scratch")), None).await.status(), 202);
+    assert_eq!(t.metadata.pg_database(main, "scratch").data_api, cheladb_metadata::DataApiState::Enabling);
+}
+
+#[tokio::test]
+async fn enable_refusals() {
+    let (t, seen) = branching_with_rest(2).await;
+    let main = t.seeded();
+    let enable = |name: &str| format!("{}/data-api", t.pg(main, name));
+    // System: 422.
+    let err = error_of(t.send(Method::POST, &enable("postgres"), None).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    // Unknown database and unknown branch: 404.
+    let err = error_of(t.send(Method::POST, &enable("nope"), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(t.send(Method::POST, &format!("{}/data-api", t.pg(BranchId::new(), "x")), None).await.status(), 404);
+    // Cap 2 with web1 on: one more fits, the next doesn't.
+    assert_eq!(t.send(Method::POST, &enable("analytics"), None).await.status(), 202);
+    let err = error_of(t.send(Method::POST, &enable("scratch"), None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(message_of(&err), "this branch already serves 2 databases (the cap is 2)");
+    assert_eq!(t.data_api_calls(), vec!["enable:analytics"]);
+    assert_eq!(t.metadata.pg_database(main, "scratch").data_api, cheladb_metadata::DataApiState::Off);
+    // A branch that isn't ready, and a backup.
+    let pending = t.add("wip", main, BranchKind::Normal, BranchStatus::Pending);
+    let err = error_of(t.send(Method::POST, &format!("{}/data-api", t.pg(pending, "x")), None).await, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    let backup = t.backup(main);
+    let err = error_of(t.send(Method::POST, &format!("{}/data-api", t.pg(backup, "x")), None).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn disable_main_is_refused() {
+    let (t, seen) = branching_with_rest(10).await;
+    let main = t.seeded();
+    let err = error_of(t.send(Method::DELETE, &format!("{}/data-api", t.pg(main, "web1")), None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert!(t.data_api_calls().is_empty());
+    assert_eq!(t.metadata.pg_database(main, "web1").data_api, cheladb_metadata::DataApiState::On);
+    assert!(seen.lock().unwrap().is_empty());
+    // Unknown: 404; the system database was never served: 422.
+    assert_eq!(t.send(Method::DELETE, &format!("{}/data-api", t.pg(main, "nope")), None).await.status(), 404);
+    assert_eq!(t.send(Method::DELETE, &format!("{}/data-api", t.pg(main, "postgres")), None).await.status(), 422);
+    assert!(t.data_api_calls().is_empty());
+}
+
+#[tokio::test]
+async fn disable_runs_the_job_then_invalidates_rest() {
+    let (t, seen) = branching_with_rest(10).await;
+    let main = t.seeded();
+    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    let path = format!("{}/data-api", t.pg(main, "analytics"));
+    assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
+    assert_eq!(t.send(Method::DELETE, &format!("{path}?remove=true"), None).await.status(), 204);
+    assert_eq!(t.data_api_calls(), vec!["disable:analytics:false", "disable:analytics:true"]);
+    // The invalidation is awaited before the answer: it is already there.
+    let expected = (main.as_uuid().to_string(), Some(format!("Bearer {REST_TOKEN}")));
+    assert_eq!(*seen.lock().unwrap(), vec![expected.clone(), expected]);
+    // A bad query is a 400, not a silent false.
+    assert_eq!(t.send(Method::DELETE, &format!("{path}?remove=maybe"), None).await.status(), 400);
+
+    // The worker's refusals map to statuses and do not invalidate.
+    for (reply, status, code) in [
+        (Ok(CheckDataRoleReply::not_ready()), 409, "branch_not_ready"),
+        (Ok(CheckDataRoleReply::refused("database is in use")), 409, "conflict"),
+        (Ok(CheckDataRoleReply::failed("boom")), 502, "unavailable"),
+        (Err(ResetError::Timeout), 504, "timeout"),
+        (Err(ResetError::Transport("no worker listening".into())), 503, "worker_unavailable"),
+    ] {
+        *t.jobs.data_api_reply.lock().unwrap() = Some(reply);
+        let err = error_of(t.send(Method::DELETE, &path, None).await, status).await;
+        assert_eq!(code_of(&err), code);
+        assert!(!err.to_string().contains("boom"), "{err}");
+    }
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    // The refused text is the worker's.
+    *t.jobs.data_api_reply.lock().unwrap() = Some(Ok(CheckDataRoleReply::refused("database is in use")));
+    let err = error_of(t.send(Method::DELETE, &path, None).await, 409).await;
+    assert_eq!(message_of(&err), "database is in use");
+}
+
+/// `remove` on a database no enable ever began on is refused: whatever `cheladb` schema it
+/// holds isn't the data API's. Disabling it (already off) without `remove` still answers 204.
+#[tokio::test]
+async fn remove_on_a_database_never_enabled_is_refused() {
+    let (t, seen) = branching_with_rest(10).await;
+    let main = t.seeded();
+    let path = format!("{}/data-api", t.pg(main, "scratch"));
+    let err = error_of(t.send(Method::DELETE, &format!("{path}?remove=true"), None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(
+        message_of(&err),
+        "the data API was never enabled on the database \"scratch\"; there is nothing to remove"
+    );
+    assert!(t.data_api_calls().is_empty());
+    assert!(seen.lock().unwrap().is_empty());
+    assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
+    // Off after an enable began: the machinery may be there, so it can be removed.
+    t.metadata.set_data_api(main, "scratch", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "scratch", cheladb_metadata::DataApiState::Off);
+    assert_eq!(t.send(Method::DELETE, &format!("{path}?remove=true"), None).await.status(), 204);
+    assert_eq!(t.data_api_calls(), vec!["disable:scratch:false", "disable:scratch:true"]);
+}
+
+#[tokio::test]
+async fn disable_survives_rest_being_down() {
+    let t = branching().await; // rest points at a closed port
+    let main = t.seeded();
+    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    let path = format!("{}/data-api", t.pg(main, "analytics"));
+    assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
+}
+
+#[tokio::test]
+async fn default_schema_patch_validates_and_invalidates() {
+    let (t, seen) = branching_with_rest(10).await;
+    let main = t.seeded();
+    let path = t.pg(main, "web1");
+    for bad in [json!({ "default_schema": "" }), json!({ "default_schema": "Public" }), json!({ "default_schema": "1app" }),
+        json!({ "default_schema": "a-b" }), json!({ "default_schema": "a".repeat(64) }), json!({ "default_schema": 5 }),
+        json!({}), json!({ "default_schema": "app", "extra": 1 })] {
+        assert_eq!(t.send(Method::PATCH, &path, Some(bad.clone())).await.status(), 422, "{bad}");
+    }
+    assert_eq!(t.metadata.pg_database(main, "web1").default_schema, "public");
+    assert!(t.data_api_calls().is_empty());
+
+    // A served database: stored, bootstrap re-run, rest told.
+    let resp = t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app" }))).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!((body["name"].as_str(), body["default_schema"].as_str()), (Some("web1"), Some("app")));
+    assert_eq!(t.metadata.pg_database(main, "web1").default_schema, "app");
+    assert_eq!(t.data_api_calls(), vec!["rebootstrap:web1"]);
+    wait_for_invalidations(&seen, 1).await;
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // The same value again changes nothing: no job, no invalidation.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app" }))).await.status(), 200);
+    assert_eq!(t.data_api_calls().len(), 1);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // A database that isn't served just stores it.
+    let resp = t.send(Method::PATCH, &t.pg(main, "analytics"), Some(json!({ "default_schema": "reports" }))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(t.metadata.pg_database(main, "analytics").default_schema, "reports");
+    assert_eq!(t.data_api_calls().len(), 1);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+
+    // Unknown database 404; the system database 422 (as enabling it); a failed bootstrap is
+    // reported.
+    assert_eq!(t.send(Method::PATCH, &t.pg(main, "nope"), Some(json!({ "default_schema": "app" }))).await.status(), 404);
+    let err = error_of(t.send(Method::PATCH, &t.pg(main, "postgres"), Some(json!({ "default_schema": "app" }))).await, 422).await;
+    assert_eq!(message_of(&err), "the system database \"postgres\" is never served");
+    assert_eq!(t.metadata.pg_database(main, "postgres").default_schema, "public");
+    *t.jobs.data_api_reply.lock().unwrap() = Some(Ok(CheckDataRoleReply::failed("boom")));
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "other" }))).await, 502).await;
+    assert_eq!(code_of(&err), "unavailable");
+    // The old schema is put back: what is stored is what the bootstrap covers. rest may
+    // have read the new one meanwhile, so it's told again.
+    assert_eq!(t.metadata.pg_database(main, "web1").default_schema, "app");
+    wait_for_invalidations(&seen, 2).await;
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn patch_default_schema_passes_grant_existing() {
+    let t = branching().await;
+    let main = t.seeded();
+    let path = t.pg(main, "web1");
+    // Off by default.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app" }))).await.status(), 200);
+    assert_eq!(t.data_api_calls(), vec!["rebootstrap:web1"]);
+    // Asked: the flag reaches the worker, with a changed schema...
+    let resp = t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app2", "grant_existing": true }))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(t.metadata.pg_database(main, "web1").default_schema, "app2");
+    // ...and with an unchanged one (so a user can grant later).
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app2", "grant_existing": true }))).await.status(), 200);
+    assert_eq!(t.data_api_calls(), vec!["rebootstrap:web1", "rebootstrap:web1:grant_existing", "rebootstrap:web1:grant_existing"]);
+    // Explicitly false and unchanged: nothing runs.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app2", "grant_existing": false }))).await.status(), 200);
+    assert_eq!(t.data_api_calls().len(), 3);
+    // A failed grant on an unchanged schema leaves the stored schema alone.
+    *t.jobs.data_api_reply.lock().unwrap() = Some(Ok(CheckDataRoleReply::failed("boom")));
+    error_of(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app2", "grant_existing": true }))).await, 502).await;
+    assert_eq!(t.metadata.pg_database(main, "web1").default_schema, "app2");
+    // Not a bool: rejected.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "app", "grant_existing": "yes" }))).await.status(), 422);
+}
+
+#[tokio::test]
+async fn grant_existing_on_a_disabled_database_is_409() {
+    let t = branching().await;
+    let main = t.seeded();
+    let path = t.pg(main, "analytics"); // off
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "public", "grant_existing": true }))).await, 409).await;
+    assert_eq!(code_of(&err), "data_api_disabled");
+    // A changed schema on a database that isn't served is only stored; without the flag too.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "public" }))).await.status(), 200);
+    assert!(t.data_api_calls().is_empty());
+}
+
+#[tokio::test]
+async fn update_database_no_longer_takes_default_schema() {
+    let t = branching().await;
+    let before = t.metadata.database(t.db);
+    let resp = t.send(Method::PATCH, &database_path(&t), Some(json!({ "default_schema": "app" }))).await;
+    assert_eq!(resp.status(), 422);
+    let after = t.metadata.database(t.db);
+    assert_eq!((before.max_rows, before.max_connections), (after.max_rows, after.max_connections));
+    let body: Value = t.send(Method::PATCH, &database_path(&t), Some(json!({}))).await.json().await.unwrap();
+    assert!(body.get("default_schema").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn key_allow_list_validation() {
+    let t = branching().await;
+    let main = t.seeded();
+    let (public_id, _) = t.seed_public_key(main);
+    let (secret_id, _) = t.seed_secret_key(main, "ci", "reporting");
+    let too_many: Vec<String> = (0..21).map(|i| format!("db{i}")).collect();
+    let long = "a".repeat(64);
+    let invalid: Vec<(&str, Value)> = vec![
+        ("empty list", json!([])),
+        ("empty name", json!([""])),
+        ("64 bytes", json!([long])),
+        ("21 names", json!(too_many)),
+        ("duplicate", json!(["web1", "web1"])),
+        ("unknown", json!(["web1", "nope"])),
+        ("system", json!(["postgres"])),
+        ("not a name", json!([1])),
+        ("not a list", json!("web1")),
+    ];
+    for (what, list) in &invalid {
+        let resp = t.send(Method::POST, &t.keys(main), Some(json!({ "name": "k", "databases": list }))).await;
+        assert_eq!(resp.status(), 422, "create: {what}");
+        assert_eq!(code_of(&resp.json::<Value>().await.unwrap()), "invalid_request");
+        for id in [secret_id, public_id] {
+            let resp = t.send(Method::PATCH, &format!("{}/{id}", t.keys(main)), Some(json!({ "databases": list }))).await;
+            assert_eq!(resp.status(), 422, "patch: {what}");
+        }
+    }
+    assert_eq!(t.metadata.keys.lock().unwrap().len(), 2, "nothing was created");
+    assert_eq!(t.metadata.key_databases(secret_id), None);
+    // PATCH must say what it means: a missing `databases` is not "every database".
+    let resp = t.send(Method::PATCH, &format!("{}/{secret_id}", t.keys(main)), Some(json!({}))).await;
+    assert_eq!(resp.status(), 422);
+
+    // A disabled database (and the main one) is allowed; the list comes back on create and list.
+    let resp = t
+        .send(Method::POST, &t.keys(main), Some(json!({ "name": "k", "databases": ["web1", "analytics"] })))
+        .await;
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    assert_eq!(created["databases"], json!(["web1", "analytics"]));
+    let id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(t.metadata.key_databases(id), Some(vec!["web1".into(), "analytics".into()]));
+    let listed = t.list_keys(main).await;
+    let by = |id: uuid::Uuid| listed.iter().find(|k| k["id"] == json!(id)).unwrap();
+    assert_eq!(by(id)["databases"], json!(["web1", "analytics"]));
+    assert!(by(secret_id)["databases"].is_null());
+    // Omitted and null both mean every database.
+    for body in [json!({ "name": "a" }), json!({ "name": "b", "databases": null })] {
+        let created: Value = t.send(Method::POST, &t.keys(main), Some(body)).await.json().await.unwrap();
+        assert!(created["databases"].is_null(), "{created}");
+    }
+    // A branch's list is checked against that branch's own databases.
+    let dev = t.ready("dev");
+    let resp = t.send(Method::POST, &t.keys(dev), Some(json!({ "name": "k", "databases": ["web1"] }))).await;
+    assert_eq!(resp.status(), 422);
+    // Rotation keeps the list.
+    let resp = t.send(Method::POST, &format!("{}/{id}/rotate", t.keys(main)), None).await;
+    assert_eq!(resp.status(), 201);
+    let rotated: Value = resp.json().await.unwrap();
+    assert_eq!(rotated["databases"], json!(["web1", "analytics"]));
+}
+
+#[tokio::test]
+async fn patch_key_databases_invalidates() {
+    let (t, seen) = branching_with_rest(10).await;
+    let main = t.seeded();
+    let (public_id, _) = t.seed_public_key(main);
+    let (id, _) = t.seed_secret_key(main, "ci", "reporting");
+    let path = format!("{}/{id}", t.keys(main));
+    let main_text = main.as_uuid().to_string();
+
+    // Narrowing from "every database": stored, the key returned, rest told.
+    let resp = t.send(Method::PATCH, &path, Some(json!({ "databases": ["web1"] }))).await;
+    assert_eq!(resp.status(), 200);
+    let key: Value = resp.json().await.unwrap();
+    assert_eq!((key["id"].as_str(), key["databases"].clone()), (Some(id.to_string().as_str()), json!(["web1"])));
+    assert_eq!(key["kind"], "secret");
+    assert!(key.get("key").is_none(), "{key}");
+    assert_eq!(t.metadata.key_databases(id), Some(vec!["web1".into()]));
+    wait_for_invalidations(&seen, 1).await;
+    assert_eq!(seen.lock().unwrap()[0], (main_text.clone(), Some(format!("Bearer {REST_TOKEN}"))));
+
+    // Changing the list invalidates; so does widening back to null (the old tokens are stale).
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "databases": ["analytics", "web1"] }))).await.status(), 200);
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "databases": null }))).await.status(), 200);
+    assert_eq!(t.metadata.key_databases(id), None);
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    // The same list again changes nothing and tells no one.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "databases": null }))).await.status(), 200);
+    assert_eq!(seen.lock().unwrap().len(), 3);
+
+    // It works on the public key too (and shows the key in full, as the list does).
+    let resp = t.send(Method::PATCH, &format!("{}/{public_id}", t.keys(main)), Some(json!({ "databases": ["web1"] }))).await;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.json::<Value>().await.unwrap()["key"].is_string());
+    assert_eq!(seen.lock().unwrap().len(), 4);
+
+    // Unknown and revoked keys, and another branch's key: 404.
+    let missing = format!("{}/{}", t.keys(main), uuid::Uuid::new_v4());
+    assert_eq!(t.send(Method::PATCH, &missing, Some(json!({ "databases": null }))).await.status(), 404);
+    assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "databases": null }))).await.status(), 404);
+    let dev = t.ready("dev");
+    let (other, _) = t.seed_secret_key(main, "other", "reporting");
+    assert_eq!(t.send(Method::PATCH, &format!("{}/{other}", t.keys(dev)), Some(json!({ "databases": null }))).await.status(), 404);
+    assert_eq!(seen.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn the_database_cap_is_read_from_the_environment() {
+    use orchestrator::data_api_database_cap;
+    assert_eq!(data_api_database_cap(None), Ok(10));
+    assert_eq!(data_api_database_cap(Some("")), Ok(10));
+    assert_eq!(data_api_database_cap(Some("  ")), Ok(10));
+    assert_eq!(data_api_database_cap(Some("1")), Ok(1));
+    assert_eq!(data_api_database_cap(Some(" 100 ")), Ok(100));
+    for bad in ["0", "101", "-1", "ten", "1.5"] {
+        let err = data_api_database_cap(Some(bad)).unwrap_err();
+        assert!(err.contains("CHELADB_BRANCH_DATA_API_DATABASE_CAP"), "{bad}: {err}");
+    }
+}
+
+// ---- Studio's console (step 6c, task 6)
+
+/// One request the rest stand-in received: its path, every header as `name: value` lines,
+/// and its body.
+#[derive(Debug, Clone)]
+struct RestCall {
+    path: String,
+    query: String,
+    headers: String,
+    body: String,
+}
+
+type RestCalls = Arc<Mutex<Vec<RestCall>>>;
+
+type RestAnswer = Arc<dyn Fn(&Value) -> (u16, Vec<(&'static str, &'static str)>, Value) + Send + Sync>;
+
+/// A rest stand-in that records every request (on any path) and answers the console route
+/// with `answer(body)` and the schema route with `answer(null)`; other paths answer 404.
+async fn mock_rest_console(answer: RestAnswer) -> (String, RestCalls) {
+    use axum::extract::Request;
+    let calls: RestCalls = Arc::default();
+    let log = calls.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let log = log.clone();
+        let answer = answer.clone();
+        async move {
+            let path = req.uri().path().to_string();
+            let query = req.uri().query().unwrap_or_default().to_string();
+            let headers = req
+                .headers()
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", v.to_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            log.lock().unwrap().push(RestCall { path: path.clone(), query, headers, body: body.clone() });
+            let schema = path.starts_with("/internal/schema/");
+            if !schema && !(path.starts_with("/internal/console/") && path.ends_with("/query")) {
+                return axum::response::IntoResponse::into_response(axum::http::StatusCode::NOT_FOUND);
+            }
+            let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let (status, headers, json) = answer(&request);
+            let mut resp = axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                axum::Json(json),
+            ));
+            for (k, v) in headers {
+                resp.headers_mut().insert(k, axum::http::HeaderValue::from_static(v));
+            }
+            resp
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, calls)
+}
+
+/// `branching()` with a rest stand-in for the console and the seeded databases: `web1`
+/// (main, on), `analytics` and `scratch` (off), and the system `postgres`.
+async fn console_app(answer: RestAnswer) -> (Branching, RestCalls) {
+    let (rest, calls) = mock_rest_console(answer).await;
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app_with_rest(metadata.clone(), jobs.clone(), &rest).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    let t = Branching { app, metadata, jobs, db: id };
+    t.seeded();
+    (t, calls)
+}
+
+fn rest_ok(body: Value) -> RestAnswer {
+    Arc::new(move |_| (200, vec![], body.clone()))
+}
+
+impl Branching {
+    async fn console(&self, branch: BranchId, body: Value) -> reqwest::Response {
+        self.send(Method::POST, &format!("{}/console/query", self.branch(branch)), Some(body)).await
+    }
+
+    /// `GET …/console/schema` with `query` (`""` or `?…`).
+    async fn console_schema(&self, branch: BranchId, query: &str) -> reqwest::Response {
+        self.send(Method::GET, &format!("{}/console/schema{query}", self.branch(branch)), None).await
+    }
+
+    fn role_checks(&self) -> Vec<(BranchId, String)> {
+        self.jobs.role_checks.lock().unwrap().clone()
+    }
+
+    fn compute_lookups(&self) -> usize {
+        self.app.locator.asked.lock().unwrap().len()
+    }
+}
+
+fn select_notes() -> Value {
+    json!({ "v": 1, "op": "select", "from": "notes" })
+}
+
+#[tokio::test]
+async fn other_roles_check_once_then_forward_to_rest() {
+    let rows = json!([{ "id": 1, "body": "hi" }]);
+    let (t, calls) = console_app(rest_ok(rows.clone())).await;
+    let main = t.main();
+    for _ in 0..2 {
+        let resp = t.console(main, json!({ "role": "editor", "database": null, "tree": select_notes() })).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "application/json");
+        assert_eq!(resp.json::<Value>().await.unwrap(), rows);
+    }
+    // The worker checked the role once (it grants it to authenticator); the second request
+    // went straight to rest.
+    assert_eq!(t.role_checks(), vec![(main, "editor".to_string())]);
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(call.path, format!("/internal/console/{}/query", main.as_uuid()));
+        assert!(call.headers.contains(&format!("authorization: Bearer {REST_TOKEN}")), "{}", call.headers);
+        let body: Value = serde_json::from_str(&call.body).unwrap();
+        // No database named: main's, by name.
+        assert_eq!(body, json!({ "role": "editor", "database": "web1", "tree": select_notes() }));
+    }
+    // Another role is checked on its own; the owner is never forwarded.
+    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    let resp = t.console(main, json!({ "role": "viewer", "database": "analytics", "tree": select_notes() })).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(t.role_checks().len(), 2);
+}
+
+#[tokio::test]
+async fn rest_answers_pass_through_with_their_status() {
+    let answer: RestAnswer = Arc::new(|request: &Value| match request["tree"]["op"].as_str() {
+        Some("delete") => (
+            409,
+            vec![],
+            json!({ "error": { "code": "conflict", "message": "duplicate key", "sqlstate": "23505" } }),
+        ),
+        _ => (
+            503,
+            vec![("retry-after", "2")],
+            json!({ "error": { "code": "unavailable", "message": "try again" } }),
+        ),
+    });
+    let (t, _) = console_app(answer).await;
+    let main = t.main();
+    let delete = json!({ "v": 1, "op": "delete", "from": "notes", "where": { "col": "id", "eq": 1 } });
+    let resp = t.console(main, json!({ "role": "editor", "tree": delete })).await;
+    let body = error_of(resp, 409).await;
+    assert_eq!(body, json!({ "error": { "code": "conflict", "message": "duplicate key", "sqlstate": "23505" } }));
+    let resp = t.console(main, json!({ "role": "editor", "tree": select_notes() })).await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.headers()["retry-after"], "2");
+}
+
+#[tokio::test]
+async fn owner_level_role_is_refused() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    let refusal = "the role `boss` can bypass row-level security; pick a plain role";
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::refused(refusal)));
+    for _ in 0..2 {
+        let resp = t.console(main, json!({ "role": "boss", "tree": select_notes() })).await;
+        let body = error_of(resp, 403).await;
+        assert_eq!(code_of(&body), "role_refused");
+        assert_eq!(message_of(&body), refusal);
+    }
+    // A refusal isn't remembered as a pass, and rest never heard of it.
+    assert_eq!(t.role_checks().len(), 2);
+    assert!(calls.lock().unwrap().is_empty());
+    // A branch the worker can't reach yet.
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::not_ready()));
+    let resp = t.console(main, json!({ "role": "boss", "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "branch_not_ready");
+    // rest's own refusal (an owner-level role that slipped through) passes through.
+    *t.jobs.role_check.lock().unwrap() = None;
+    let (t2, _) = console_app(Arc::new(|_| {
+        (403, vec![], json!({ "error": { "code": "role_not_allowed", "message": "no" } }))
+    }))
+    .await;
+    let resp = t2.console(t2.main(), json!({ "role": "boss", "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 403).await), "role_not_allowed");
+}
+
+#[tokio::test]
+async fn a_disabled_database_is_409() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    for state in [
+        cheladb_metadata::DataApiState::Off,
+        cheladb_metadata::DataApiState::Enabling,
+        cheladb_metadata::DataApiState::Error,
+    ] {
+        t.metadata.set_data_api(main, "analytics", state);
+        for role in [Value::Null, json!("editor")] {
+            let resp = t.console(main, json!({ "role": role, "database": "analytics", "tree": select_notes() })).await;
+            let body = error_of(resp, 409).await;
+            assert_eq!(code_of(&body), "data_api_disabled", "{state:?} {role}");
+        }
+        // Named by the tree instead of the request: the same.
+        let tree = json!({ "v": 1, "op": "select", "from": "notes", "database": "analytics" });
+        let resp = t.console(main, json!({ "role": null, "tree": tree })).await;
+        assert_eq!(code_of(&error_of(resp, 409).await), "data_api_disabled");
+    }
+    assert!(t.role_checks().is_empty());
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+#[tokio::test]
+async fn rest_unknown_database_maps_to_the_rows_state() {
+    // rest says the database isn't served: the orchestrator reads the row again.
+    let metadata_slot: Arc<Mutex<Option<(FakeMetadata, BranchId)>>> = Arc::default();
+    let slot = metadata_slot.clone();
+    let answer: RestAnswer = Arc::new(move |request: &Value| {
+        // A disable landed between the orchestrator's check and rest's.
+        if request["database"] == "analytics"
+            && let Some((metadata, branch)) = slot.lock().unwrap().clone()
+        {
+            metadata.set_data_api(branch, "analytics", cheladb_metadata::DataApiState::Off);
+        }
+        (404, vec![], json!({ "error": { "code": "unknown_database", "message": "the database doesn't exist or isn't served by this key" } }))
+    });
+    let (t, _) = console_app(answer).await;
+    let main = t.main();
+    *metadata_slot.lock().unwrap() = Some((t.metadata.clone(), main));
+    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    let resp = t.console(main, json!({ "role": "editor", "database": "analytics", "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "data_api_disabled");
+    // Still on in metadata: a plain 404.
+    let resp = t.console(main, json!({ "role": "editor", "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 404).await), "not_found");
+}
+
+#[tokio::test]
+async fn an_unknown_database_branch_or_tenant_is_404() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    for role in [Value::Null, json!("editor")] {
+        let resp = t.console(main, json!({ "role": role, "database": "nope", "tree": select_notes() })).await;
+        assert_eq!(code_of(&error_of(resp, 404).await), "not_found", "{role}");
+    }
+    // The system database is never served: it answers as missing.
+    let resp = t.console(main, json!({ "role": null, "database": "postgres", "tree": select_notes() })).await;
+    assert_eq!(resp.status().as_u16() / 100, 4);
+    let resp = t.console(BranchId::new(), json!({ "role": null, "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 404).await), "not_found");
+    // Another tenant asking for this database's branch.
+    t.metadata.bind_org("org-2", TenantId::new());
+    let resp = reqwest::Client::new()
+        .post(format!("{}{}/console/query", t.app.base, t.branch(main)))
+        .header(IDENTITY_HEADER, t.app.token_for_org("org-2"))
+        .json(&json!({ "role": "editor", "tree": select_notes() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(code_of(&error_of(resp, 404).await), "not_found");
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(t.role_checks().is_empty());
+}
+
+#[tokio::test]
+async fn bad_console_requests_are_refused_before_anything_runs() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    // The request and its tree name different databases.
+    let tree = json!({ "v": 1, "op": "select", "from": "notes", "database": "analytics" });
+    for role in [Value::Null, json!("editor")] {
+        let resp = t.console(main, json!({ "role": role, "database": "web1", "tree": tree })).await;
+        assert_eq!(code_of(&error_of(resp, 400).await), "invalid_query", "{role}");
+    }
+    // A tree the data API's grammar refuses.
+    for role in [Value::Null, json!("editor")] {
+        let resp = t.console(main, json!({ "role": role, "tree": { "v": 2, "op": "select", "from": "notes" } })).await;
+        assert_eq!(code_of(&error_of(resp, 400).await), "invalid_query", "{role}");
+    }
+    // Not the console's shape.
+    let resp = t.console(main, json!({ "role": 7, "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 422).await), "invalid_request");
+    let resp = t.console(main, json!({ "role": "" , "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 422).await), "invalid_request");
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(t.role_checks().is_empty());
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+/// Naming the owner's own role would skip the owner path for a forward rest can't serve:
+/// the console says how to ask for the owner instead.
+#[tokio::test]
+async fn the_owners_name_as_a_role_is_422() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    let resp = t.console(main, json!({ "role": "postgres", "tree": select_notes() })).await;
+    let body = error_of(resp, 422).await;
+    assert_eq!(code_of(&body), "invalid_request");
+    assert_eq!(message_of(&body), "use role: null to run as the owner");
+    let resp = t.console_schema(main, "?role=postgres").await;
+    let body = error_of(resp, 422).await;
+    assert_eq!(message_of(&body), "omit role to view the schema as the owner");
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(t.role_checks().is_empty());
+}
+
+#[tokio::test]
+async fn console_schema_as_a_role_checks_then_forwards_role_and_database() {
+    let schema = json!({ "version": "v1", "default_schema": "reporting", "schemas": {} });
+    let (t, calls) = console_app(rest_ok(schema.clone())).await;
+    let main = t.main();
+    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    let resp = t.console_schema(main, "?role=editor&database=analytics").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    assert_eq!(resp.json::<Value>().await.unwrap(), schema);
+    // No database: main's, by name. The role was checked once.
+    assert_eq!(t.console_schema(main, "?role=editor").await.status(), 200);
+    assert_eq!(t.role_checks(), vec![(main, "editor".to_string())]);
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    for (call, database) in calls.iter().zip(["analytics", "web1"]) {
+        assert_eq!(call.path, format!("/internal/schema/{}", main.as_uuid()));
+        assert!(call.headers.contains(&format!("authorization: Bearer {REST_TOKEN}")), "{}", call.headers);
+        let mut pairs: Vec<&str> = call.query.split('&').collect();
+        pairs.sort();
+        assert_eq!(pairs, [format!("database={database}").as_str(), "role=editor"]);
+    }
+}
+
+#[tokio::test]
+async fn console_schema_refusals() {
+    let answer: RestAnswer = Arc::new(|_| {
+        (404, vec![], json!({ "error": { "code": "unknown_database", "message": "the database doesn't exist or isn't served by this key" } }))
+    });
+    let (t, calls) = console_app(answer).await;
+    let main = t.main();
+    // Unknown, disabled (whoever asks), the system database.
+    for query in ["?database=nope", "?database=nope&role=editor", "?database=postgres"] {
+        assert_eq!(code_of(&error_of(t.console_schema(main, query).await, 404).await), "not_found", "{query}");
+    }
+    for query in ["?database=analytics", "?database=analytics&role=editor"] {
+        let body = error_of(t.console_schema(main, query).await, 409).await;
+        assert_eq!(code_of(&body), "data_api_disabled", "{query}");
+    }
+    // An empty role.
+    assert_eq!(code_of(&error_of(t.console_schema(main, "?role=").await, 422).await), "invalid_request");
+    // The owner without a sealed password; the worker refusing a role.
+    t.metadata.branches.lock().unwrap().get_mut(&main).unwrap().owner_password_enc = None;
+    assert_eq!(code_of(&error_of(t.console_schema(main, "").await, 409).await), "owner_password_unknown");
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::refused("no")));
+    assert_eq!(code_of(&error_of(t.console_schema(main, "?role=boss").await, 403).await), "role_refused");
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(t.compute_lookups(), 0);
+    // rest no longer serving it after the check: the row decides (still on: 404).
+    *t.jobs.role_check.lock().unwrap() = None;
+    assert_eq!(code_of(&error_of(t.console_schema(main, "?role=editor").await, 404).await), "not_found");
+    // Backups and branches that aren't ready.
+    let backup = t.backup(main);
+    assert_eq!(code_of(&error_of(t.console_schema(backup, "?role=editor").await, 409).await), "backup_branch");
+    let pending = t.add("dev", main, BranchKind::Normal, BranchStatus::Pending);
+    assert_eq!(code_of(&error_of(t.console_schema(pending, "").await, 409).await), "branch_not_ready");
+}
+
+#[tokio::test]
+async fn owner_password_unknown_is_409_before_any_connection() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    for sealed in [None, Some(String::new())] {
+        t.metadata.branches.lock().unwrap().get_mut(&main).unwrap().owner_password_enc = sealed;
+        let resp = t.console(main, json!({ "role": null, "tree": select_notes() })).await;
+        let body = error_of(resp, 409).await;
+        assert_eq!(code_of(&body), "owner_password_unknown");
+        assert_eq!(message_of(&body), "reset the owner's password to view as owner");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn owner_console_without_a_running_compute_is_503() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    let resp = t.console(main, json!({ "role": null, "tree": select_notes() })).await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.headers()["retry-after"], "2");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(code_of(&body), "unavailable");
+    assert_eq!(*t.app.locator.asked.lock().unwrap(), vec!["ep-0123456789ab".to_string()]);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn backups_and_unready_branches_are_refused() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let backup = t.backup(t.main());
+    let resp = t.console(backup, json!({ "role": "editor", "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "backup_branch");
+    let pending = t.add("dev", t.main(), BranchKind::Normal, BranchStatus::Pending);
+    let resp = t.console(pending, json!({ "role": null, "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "branch_not_ready");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_owner_password_never_goes_to_rest() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    let sealed = t.metadata.branch(main).owner_password_enc.unwrap();
+    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    // The owner path, with and without a compute: never forwarded.
+    for database in [Value::Null, json!("analytics")] {
+        let resp = t.console(main, json!({ "role": null, "database": database, "tree": select_notes() })).await;
+        assert_eq!(resp.status(), 503);
+    }
+    assert!(calls.lock().unwrap().is_empty(), "the owner path went to rest");
+    // Every other role, read and write: rest sees the role, the database and the tree only.
+    let insert = json!({ "v": 1, "op": "insert", "into": "notes", "values": [{ "body": "x" }] });
+    for (role, tree) in [("editor", select_notes()), ("editor", insert), ("viewer", select_notes())] {
+        let resp = t.console(main, json!({ "role": role, "tree": tree })).await;
+        assert_eq!(resp.status(), 200);
+    }
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 3);
+    for call in calls {
+        for secret in ["s3cret", sealed.as_str()] {
+            assert!(!call.body.contains(secret), "body: {}", call.body);
+            assert!(!call.headers.contains(secret), "headers: {}", call.headers);
+            assert!(!call.path.contains(secret), "path: {}", call.path);
+        }
+        let body: Value = serde_json::from_str(&call.body).unwrap();
+        let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["database", "role", "tree"]);
+    }
+}
+
+/// Collects what the orchestrator logs while a test runs (the test's runtime is
+/// single-threaded, so the server's tasks log through this thread's subscriber).
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        let logs = self.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || logs.clone())
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+}
+
+#[tokio::test]
+async fn console_writes_are_audited_without_values() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let (t, _) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    const SECRET: &str = "card-4111-1111-1111-1111";
+    let insert = json!({ "v": 1, "op": "insert", "into": "notes", "values": [{ "body": SECRET }] });
+    let update = json!({ "v": 1, "op": "update", "table": "notes", "set": { "body": SECRET }, "where": { "col": "id", "eq": 1 } });
+    let batch = json!({ "v": 1, "op": "batch", "ops": [select_notes(), { "op": "delete", "from": "notes", "where": { "col": "body", "eq": SECRET } }] });
+    let call = json!({ "v": 1, "op": "call", "fn": "touch", "args": { "note": SECRET } });
+    for tree in [select_notes(), insert, update, batch, call] {
+        let resp = t.console(main, json!({ "role": "editor", "tree": tree })).await;
+        assert_eq!(resp.status(), 200);
+    }
+    // A read isn't a write.
+    let resp = t.console(main, json!({ "role": "editor", "tree": { "v": 1, "op": "batch", "ops": [select_notes()] } })).await;
+    assert_eq!(resp.status(), 200);
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("console write")).collect();
+    assert_eq!(audit.len(), 4, "{text}");
+    for (line, op) in audit.iter().zip(["insert", "update", "batch", "call"]) {
+        assert!(line.contains("user=user-1"), "{line}");
+        assert!(line.contains(&format!("branch={}", main.as_uuid())), "{line}");
+        assert!(line.contains("database=web1"), "{line}");
+        assert!(line.contains("role=editor"), "{line}");
+        assert!(line.contains(&format!("op={op}")), "{line}");
+    }
+    assert!(!text.contains(SECRET), "a value reached the log:\n{text}");
+}
+
+// ---- the owner path against a real Postgres: the dev metadata Postgres stands in for a
+// compute (a scratch database and a scratch owner role, dropped at the end).
+
+struct ScratchCompute {
+    admin: sqlx::PgPool,
+    database: String,
+    owner: String,
+    addr: std::net::SocketAddr,
+}
+
+impl ScratchCompute {
+    async fn new() -> Self {
+        use sqlx::Executor;
+        let url = std::env::var("CHELADB_METADATA_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into());
+        let admin = sqlx::PgPool::connect(&url).await.expect("the metadata Postgres (just deps-up)");
+        let suffix = format!("{:08x}", rand_u32());
+        let database = format!("t6_console_{suffix}");
+        let owner = format!("t6_owner_{suffix}");
+        admin.execute(sqlx::AssertSqlSafe(format!("CREATE ROLE {owner} LOGIN"))).await.unwrap();
+        admin
+            .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database} OWNER {owner}")))
+            .await
+            .unwrap();
+        let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let addr = format!("{}:{}", opts.get_host(), opts.get_port()).parse().unwrap();
+        let scratch = sqlx::PgPool::connect_with(opts.database(&database)).await.unwrap();
+        scratch
+            .execute(sqlx::AssertSqlSafe(format!(
+                "CREATE SCHEMA cheladb; \
+                 CREATE TABLE cheladb.schema_version (version bigint NOT NULL); \
+                 INSERT INTO cheladb.schema_version VALUES (1); \
+                 GRANT USAGE ON SCHEMA cheladb TO {owner}; \
+                 GRANT SELECT ON cheladb.schema_version TO {owner}; \
+                 CREATE TABLE public.notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, body text NOT NULL); \
+                 ALTER TABLE public.notes OWNER TO {owner};"
+            )))
+            .await
+            .unwrap();
+        scratch.close().await;
+        ScratchCompute { admin, database, owner, addr }
+    }
+
+    async fn set_password(&self, password: &str) {
+        use sqlx::Executor;
+        self.admin
+            .execute(sqlx::AssertSqlSafe(format!("ALTER ROLE {} PASSWORD '{password}'", self.owner)))
+            .await
+            .unwrap();
+    }
+
+    /// Runs `sql` in the scratch database, as the cluster's admin.
+    async fn exec_in(&self, sql: &str) {
+        use sqlx::Executor;
+        let opts: sqlx::postgres::PgConnectOptions = (*self.admin.connect_options()).clone();
+        let pool = sqlx::PgPool::connect_with(opts.database(&self.database)).await.unwrap();
+        pool.execute(sqlx::AssertSqlSafe(sql.to_owned())).await.unwrap();
+        pool.close().await;
+    }
+
+    /// Ends every session of the owner: a pool still using the old password must reconnect.
+    async fn kick_owner(&self) {
+        sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1")
+            .bind(&self.owner)
+            .execute(&self.admin)
+            .await
+            .unwrap();
+    }
+
+    async fn drop(self) {
+        use sqlx::Executor;
+        self.admin
+            .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE {} WITH (FORCE)", self.database)))
+            .await
+            .unwrap();
+        self.admin
+            .execute(sqlx::AssertSqlSafe(format!("DROP ROLE {}", self.owner)))
+            .await
+            .unwrap();
+    }
+}
+
+fn rand_u32() -> u32 {
+    (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() ^ std::process::id().rotate_left(16))
+        .wrapping_mul(2_654_435_761)
+}
+
+/// A console app whose main database is the scratch database, owned by the scratch owner,
+/// with the compute at the metadata Postgres's address.
+async fn owner_console_app(scratch: &ScratchCompute) -> Branching {
+    let (t, _) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    {
+        let mut databases = t.metadata.databases.lock().unwrap();
+        let record = databases.get_mut(&t.db).unwrap();
+        record.owner_role = Some(scratch.owner.clone());
+        record.database_name = Some(scratch.database.clone());
+    }
+    let mut all = t.metadata.branch_dbs.lock().unwrap();
+    let rows = all.get_mut(&main).unwrap();
+    let web1 = rows.iter_mut().find(|d| d.name == "web1").unwrap();
+    web1.name = scratch.database.clone();
+    web1.owner = scratch.owner.clone();
+    drop(all);
+    *t.app.locator.addr.lock().unwrap() = Some(scratch.addr);
+    t
+}
+
+impl Branching {
+    fn seal_owner_password(&self, password: Option<&str>) {
+        let main = self.main();
+        let sealed = password.map(|p| seal_credential(&self.app.key, &main.to_string(), Purpose::Owner, p));
+        self.metadata.branches.lock().unwrap().get_mut(&main).unwrap().owner_password_enc = sealed;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn owner_console_runs_through_the_owner_pool() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("first-pass").await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("first-pass"));
+    let main = t.main();
+
+    let insert = json!({ "v": 1, "op": "insert", "into": "notes", "values": [{ "body": "private words" }] });
+    let resp = t.console(main, json!({ "role": null, "tree": insert })).await;
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    let resp = t.console(main, json!({ "role": null, "tree": select_notes() })).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    let rows: Value = resp.json().await.unwrap();
+    assert_eq!(rows, json!([{ "id": 1, "body": "private words" }]));
+    // A Postgres error comes back in the data API's shape.
+    let bad = json!({ "v": 1, "op": "insert", "into": "notes", "values": [{ "id": 5, "body": "x" }] });
+    let resp = t.console(main, json!({ "role": null, "tree": bad })).await;
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"]["code"].is_string(), "{body}");
+    // The owner pool holds at most 2 connections, under its own application name.
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = 'cheladb-console'",
+    )
+    .bind(&scratch.owner)
+    .fetch_one(&scratch.admin)
+    .await
+    .unwrap();
+    assert!((1..=2).contains(&n), "{n} owner connections");
+    // Audited as the owner, without the value.
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("console write")).collect();
+    assert_eq!(audit.len(), 2, "{text}");
+    assert!(audit[0].contains(&format!("role={}", scratch.owner)), "{}", audit[0]);
+    assert!(audit[0].contains("op=insert"), "{}", audit[0]);
+    assert!(!text.contains("private words"), "{text}");
+    assert!(!text.contains("first-pass"), "{text}");
+    // rest was never asked.
+    assert!(t.role_checks().is_empty());
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn owner_password_unknown_then_works_after_reset() {
+    let scratch = ScratchCompute::new().await;
+    let t = owner_console_app(&scratch).await;
+    let main = t.main();
+    // Set in SQL: Cheladb doesn't know it.
+    t.seal_owner_password(None);
+    let resp = t.console(main, json!({ "role": null, "tree": select_notes() })).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    // A reset: the worker sets a new password and stores it sealed. Nothing restarts.
+    scratch.set_password("after-reset").await;
+    t.seal_owner_password(Some("after-reset"));
+    let resp = t.console(main, json!({ "role": null, "tree": select_notes() })).await;
+    let status = resp.status();
+    assert_eq!(status, 200, "{}", resp.text().await.unwrap());
+    // Another reset while the first pool still holds connections: the new sealed password
+    // makes a new pool (the old one couldn't reconnect with its password).
+    scratch.set_password("second-reset").await;
+    t.seal_owner_password(Some("second-reset"));
+    scratch.kick_owner().await;
+    let resp = t.console(main, json!({ "role": null, "tree": select_notes() })).await;
+    let status = resp.status();
+    assert_eq!(status, 200, "{}", resp.text().await.unwrap());
+    scratch.drop().await;
+}
+
+/// The console's schema as the owner: everything the owner reaches, primary keys included,
+/// a schema no other role may use among it.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn owner_console_schema_shows_what_only_the_owner_reaches() {
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("schema-pass").await;
+    let owner = scratch.owner.clone();
+    scratch
+        .exec_in(&format!(
+            "CREATE SCHEMA private AUTHORIZATION {owner}; \
+             CREATE TABLE private.secret (id int PRIMARY KEY, note text); \
+             ALTER TABLE private.secret OWNER TO {owner};"
+        ))
+        .await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("schema-pass"));
+    let main = t.main();
+    let resp = t.console_schema(main, "").await;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["default_schema"], "public");
+    let secret = &body["schemas"]["private"]["tables"]["secret"];
+    assert_eq!(secret["primary_key"], json!(["id"]), "{body}");
+    assert!(secret["privileges"].get(&owner).is_some(), "{body}");
+    assert_eq!(body["schemas"]["public"]["tables"]["notes"]["primary_key"], json!(["id"]));
+    // No other role may use `private` (PUBLIC has no USAGE on it): the role path wouldn't show it.
+    let opts: sqlx::postgres::PgConnectOptions = (*scratch.admin.connect_options()).clone();
+    let pool = sqlx::PgPool::connect_with(opts.database(&scratch.database)).await.unwrap();
+    let (public_usage,): (bool,) = sqlx::query_as("SELECT has_schema_privilege('public', 'private', 'USAGE')")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(!public_usage);
+    // rest was never asked; no role was checked.
+    assert!(t.role_checks().is_empty());
+    scratch.drop().await;
 }

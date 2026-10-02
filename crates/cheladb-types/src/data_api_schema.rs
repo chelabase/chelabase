@@ -50,6 +50,10 @@ pub struct TableDesc {
     pub security_invoker: bool,
     pub privileges: Option<BTreeMap<String, Vec<Privilege>>>,
     pub columns: BTreeMap<String, ColumnDesc>,
+    /// The primary key's columns, in the key's order; left out when there is none (a view,
+    /// or a table without a key).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_key: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

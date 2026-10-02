@@ -1,7 +1,7 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getListKeysQueryKey, type CreatedDataKey, type DataKey } from "@cheladb/management-client";
+import { getListKeysQueryKey, type BranchDatabaseView, type CreatedDataKey, type DataKey } from "@cheladb/management-client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { DataApiKeys } from "./data-api-keys";
@@ -9,6 +9,7 @@ import { DataApiKeys } from "./data-api-keys";
 const key = (over: Partial<DataKey> & { id: string; name: string }): DataKey => ({
   kind: "secret",
   role: "authenticated",
+  databases: null,
   prefix: "chk_sec_ab12",
   created_at: "2026-10-01T09:00:00Z",
   last_used_at: null,
@@ -21,6 +22,7 @@ const worker = key({ id: "k2", name: "worker", role: "service" });
 const FULL = "chk_sec_ab12CDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcde";
 const created = (over: Partial<CreatedDataKey> = {}): CreatedDataKey => ({
   id: "k3",
+  databases: null,
   kind: "secret",
   role: "authenticated",
   name: "ci",
@@ -28,6 +30,18 @@ const created = (over: Partial<CreatedDataKey> = {}): CreatedDataKey => ({
   key: FULL,
   ...over,
 });
+
+const dbRow = (name: string, over: Partial<BranchDatabaseView> = {}): BranchDatabaseView => ({
+  name,
+  owner: "o",
+  origin: "sql",
+  main: false,
+  data_api: "on",
+  default_schema: "public",
+  data_api_error: null,
+  ...over,
+});
+const databases = [dbRow("web1", { origin: "main", main: true }), dbRow("app"), dbRow("later", { data_api: "off" }), dbRow("postgres", { origin: "system", data_api: "off" })];
 
 const KEYS = "/v1/databases/db/branches/br/keys";
 const CREATE = `POST ${KEYS}`;
@@ -40,7 +54,7 @@ const refused = (status: number, code: string, message: string): FakeHandler => 
 
 function setup(routes: Record<string, FakeHandler> = {}, keys: DataKey[] = [publicKey, reporting, worker]) {
   const f = fakeFetch(routes);
-  const result = renderWithQuery(<DataApiKeys databaseId="db" branchId="br" keys={keys} />, { fetch: f });
+  const result = renderWithQuery(<DataApiKeys databaseId="db" branchId="br" keys={keys} databases={databases} />, { fetch: f });
   // Seeded as the panel would have it: every change must invalidate it.
   result.queryClient.setQueryData(getListKeysQueryKey("db", "br"), keys);
   result.queryClient.setQueryData(getListKeysQueryKey("db", "other"), keys);
@@ -100,6 +114,48 @@ describe("DataApiKeys", () => {
     expect(screen.getByLabelText("Key name")).toHaveValue("");
     await userEvent.click(within(box).getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByText(FULL)).not.toBeInTheDocument();
+  });
+
+  it("create_secret_key_with_databases", async () => {
+    const { fetch } = setup({ [CREATE]: () => jsonResponse(created({ databases: ["app", "later"] }), 201) });
+    await userEvent.type(screen.getByLabelText("Key name"), "ci");
+    const group = screen.getByRole("group", { name: "Databases" });
+    await userEvent.click(within(group).getByLabelText("All served databases"));
+    // The system database is never offered; a database that isn't served is marked.
+    expect(within(group).queryByLabelText(/postgres/)).not.toBeInTheDocument();
+    // Unticking "All" starts from the served databases.
+    await userEvent.click(within(group).getByLabelText("later (not served)"));
+    await userEvent.click(within(group).getByLabelText("web1"));
+    await userEvent.click(screen.getByRole("button", { name: "Create key" }));
+    expect(await bodyOf(fetch, CREATE)).toEqual({ name: "ci", role: "authenticated", databases: ["app", "later"] });
+  });
+
+  it("resets the allow-list after a key is created", async () => {
+    const { fetch } = setup({ [CREATE]: () => jsonResponse(created({ databases: ["app", "later"] }), 201) });
+    await userEvent.type(screen.getByLabelText("Key name"), "ci");
+    const group = screen.getByRole("group", { name: "Databases" });
+    await userEvent.click(within(group).getByLabelText("All served databases"));
+    await userEvent.click(screen.getByRole("button", { name: "Create key" }));
+    await bodyOf(fetch, CREATE);
+    await screen.findByRole("region", { name: "New key" });
+    expect(within(screen.getByRole("group", { name: "Databases" })).getByLabelText("All served databases")).toBeChecked();
+  });
+
+  it("does not create a key with an empty selection", async () => {
+    setup();
+    await userEvent.type(screen.getByLabelText("Key name"), "ci");
+    const group = screen.getByRole("group", { name: "Databases" });
+    await userEvent.click(within(group).getByLabelText("All served databases"));
+    await userEvent.click(within(group).getByLabelText("web1"));
+    await userEvent.click(within(group).getByLabelText("app"));
+    expect(screen.getByRole("button", { name: "Create key" })).toBeDisabled();
+    expect(screen.getByText("Pick at least one database.")).toBeInTheDocument();
+  });
+
+  it("shows each secret key's allow-list", () => {
+    setup({}, [publicKey, key({ id: "k1", name: "reporting", databases: ["app"] }), worker]);
+    expect(within(screen.getByRole("row", { name: /reporting/ })).getByText("app")).toBeInTheDocument();
+    expect(within(screen.getByRole("row", { name: /worker/ })).getByText("All served databases")).toBeInTheDocument();
   });
 
   it("sends the role the user picked", async () => {

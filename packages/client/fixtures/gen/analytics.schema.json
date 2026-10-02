@@ -1,0 +1,23 @@
+{
+  "version": "v7",
+  "default_schema": "reports",
+  "databases": ["main", "analytics"],
+  "schemas": {
+    "reports": {
+      "enums": {},
+      "tables": {
+        "daily": {
+          "kind": "table",
+          "rls": false,
+          "security_invoker": false,
+          "privileges": null,
+          "columns": {
+            "day": { "type": "text", "array": false, "nullable": false, "has_default": false, "generated": false },
+            "hits": { "type": "int8", "array": false, "nullable": false, "has_default": true, "generated": false }
+          }
+        }
+      },
+      "functions": {}
+    }
+  }
+}

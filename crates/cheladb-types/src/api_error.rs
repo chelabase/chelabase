@@ -46,6 +46,9 @@ pub enum ErrorCode {
     RoleInUse,
     RolePrivilegeMismatch,
     BranchProtected,
+    Conflict,
+    DataApiDisabled,
+    OwnerPasswordUnknown,
 }
 
 impl ErrorCode {
@@ -88,6 +91,9 @@ impl ErrorCode {
             Self::RoleInUse => "role_in_use",
             Self::RolePrivilegeMismatch => "role_privilege_mismatch",
             Self::BranchProtected => "branch_protected",
+            Self::Conflict => "conflict",
+            Self::DataApiDisabled => "data_api_disabled",
+            Self::OwnerPasswordUnknown => "owner_password_unknown",
         }
     }
 }
@@ -190,7 +196,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 37] = [
+    const ALL: [(ErrorCode, &str); 40] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -228,6 +234,9 @@ mod tests {
         (ErrorCode::RoleInUse, "role_in_use"),
         (ErrorCode::RolePrivilegeMismatch, "role_privilege_mismatch"),
         (ErrorCode::BranchProtected, "branch_protected"),
+        (ErrorCode::Conflict, "conflict"),
+        (ErrorCode::DataApiDisabled, "data_api_disabled"),
+        (ErrorCode::OwnerPasswordUnknown, "owner_password_unknown"),
     ];
 
     #[test]

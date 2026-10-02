@@ -28,6 +28,7 @@ import type {
   BranchDatabaseView,
   BranchRole,
   ConnectionDetails,
+  ConsoleRequest,
   CreateBranchRequest,
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
@@ -38,14 +39,19 @@ import type {
   DataKey,
   Database,
   DatabaseSettings,
+  DisableDataApiParams,
   ErrorEnvelope,
   GetBranchConnectionParams,
+  GetConsoleSchemaParams,
+  GetDataApiSchemaParams,
   Me,
   OperationAccepted,
   RestoreAccepted,
   RestoreRequest,
   UpdateBranchRequest,
-  UpdateDatabaseRequest
+  UpdateDatabaseRequest,
+  UpdateKeyRequest,
+  UpdatePgDatabaseRequest
 } from './model';
 
 import { customFetch } from '../fetch.ts';
@@ -910,22 +916,248 @@ export function useGetBranchConnection<TData = Awaited<ReturnType<typeof getBran
 
 
 
-export const getGetDataApiSchemaUrl = (id: string,
+export const getConsoleQueryUrl = (id: string,
     branchId: string,) => {
 
 
 
 
-  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/data-api/schema`
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/console/query`
+}
+
+/**
+ * Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and can't bypass row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.
+ * @summary Run a data API request from the console
+ */
+export const consoleQuery = async (id: string,
+    branchId: string,
+    consoleRequest: ConsoleRequest, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getConsoleQueryUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(consoleRequest)
+  }
+);}
+
+
+
+
+
+export const getConsoleQueryMutationKey = () => ['consoleQuery'] as const;
+
+export const getConsoleQueryMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof consoleQuery>>, TError,ConsoleQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof consoleQuery>>, TError,ConsoleQueryMutationVariables, TContext> => {
+
+const mutationKey = getConsoleQueryMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof consoleQuery>>, ConsoleQueryMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  consoleQuery(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ConsoleQueryMutationResult = NonNullable<Awaited<ReturnType<typeof consoleQuery>>>
+    export type ConsoleQueryMutationBody = ConsoleRequest
+    export type ConsoleQueryMutationError = ErrorType<ErrorEnvelope>
+    export type ConsoleQueryMutationVariables = {id: string;branchId: string;data: ConsoleRequest}
+
+    /**
+ * @summary Run a data API request from the console
+ */
+export const useConsoleQuery = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof consoleQuery>>, TError,ConsoleQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof consoleQuery>>,
+        TError,
+        ConsoleQueryMutationVariables,
+        TContext
+      > => {
+      return useMutation(getConsoleQueryMutationOptions(options), queryClient);
+    }
+
+export const getGetConsoleSchemaUrl = (id: string,
+    branchId: string,
+    params?: GetConsoleSchemaParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/console/schema?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/console/schema`
+}
+
+/**
+ * What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and can't bypass row-level security).
+ * @summary The schema the console can show, as the owner or a role
+ */
+export const getConsoleSchema = async (id: string,
+    branchId: string,
+    params?: GetConsoleSchemaParams, options?: Parameters<typeof customFetch>[1]): Promise<DataApiSchema> => {
+
+  return customFetch<DataApiSchema>(getGetConsoleSchemaUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetConsoleSchemaQueryKey = (id: string,
+    branchId: string,
+    params?: GetConsoleSchemaParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/console/schema`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getGetConsoleSchemaQueryOptions = <TData = Awaited<ReturnType<typeof getConsoleSchema>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    params?: GetConsoleSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getConsoleSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetConsoleSchemaQueryKey(id,branchId,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getConsoleSchema>>> = ({ signal }) => getConsoleSchema(id,branchId,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getConsoleSchema>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetConsoleSchemaQueryResult = NonNullable<Awaited<ReturnType<typeof getConsoleSchema>>>
+export type GetConsoleSchemaQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetConsoleSchema<TData = Awaited<ReturnType<typeof getConsoleSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params: undefined |  GetConsoleSchemaParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getConsoleSchema>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getConsoleSchema>>,
+          TError,
+          Awaited<ReturnType<typeof getConsoleSchema>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetConsoleSchema<TData = Awaited<ReturnType<typeof getConsoleSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetConsoleSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getConsoleSchema>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getConsoleSchema>>,
+          TError,
+          Awaited<ReturnType<typeof getConsoleSchema>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetConsoleSchema<TData = Awaited<ReturnType<typeof getConsoleSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetConsoleSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getConsoleSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary The schema the console can show, as the owner or a role
+ */
+
+export function useGetConsoleSchema<TData = Awaited<ReturnType<typeof getConsoleSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetConsoleSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getConsoleSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetConsoleSchemaQueryOptions(id,branchId,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getGetDataApiSchemaUrl = (id: string,
+    branchId: string,
+    params?: GetDataApiSchemaParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/data-api/schema?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/data-api/schema`
 }
 
 /**
  * @summary The branch's schema as the data API sees it
  */
 export const getDataApiSchema = async (id: string,
-    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<DataApiSchema> => {
+    branchId: string,
+    params?: GetDataApiSchemaParams, options?: Parameters<typeof customFetch>[1]): Promise<DataApiSchema> => {
 
-  return customFetch<DataApiSchema>(getGetDataApiSchemaUrl(id,branchId),
+  return customFetch<DataApiSchema>(getGetDataApiSchemaUrl(id,branchId,params),
   {
     ...options,
     method: 'GET'
@@ -939,24 +1171,26 @@ export const getDataApiSchema = async (id: string,
 
 
 export const getGetDataApiSchemaQueryKey = (id: string,
-    branchId: string,) => {
+    branchId: string,
+    params?: GetDataApiSchemaParams,) => {
     return [
-    `/v1/databases/${id}/branches/${branchId}/data-api/schema`
+    `/v1/databases/${id}/branches/${branchId}/data-api/schema`, ...(params ? [params] : [])
     ] as const;
     }
 
 
 export const getGetDataApiSchemaQueryOptions = <TData = Awaited<ReturnType<typeof getDataApiSchema>>, TError = ErrorType<ErrorEnvelope>>(id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+    branchId: string,
+    params?: GetDataApiSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
 ) => {
 
 const {query: queryOptions, request: requestOptions} = options ?? {};
 
-  const queryKey =  queryOptions?.queryKey ?? getGetDataApiSchemaQueryKey(id,branchId);
+  const queryKey =  queryOptions?.queryKey ?? getGetDataApiSchemaQueryKey(id,branchId,params);
 
 
 
-    const queryFn: QueryFunction<Awaited<ReturnType<typeof getDataApiSchema>>> = ({ signal }) => getDataApiSchema(id,branchId, { signal, ...requestOptions });
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getDataApiSchema>>> = ({ signal }) => getDataApiSchema(id,branchId,params, { signal, ...requestOptions });
 
 
 
@@ -971,7 +1205,8 @@ export type GetDataApiSchemaQueryError = ErrorType<ErrorEnvelope>
 
 export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApiSchema>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>> & Pick<
+    branchId: string,
+    params: undefined |  GetDataApiSchemaParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>> & Pick<
         DefinedInitialDataOptions<
           Awaited<ReturnType<typeof getDataApiSchema>>,
           TError,
@@ -982,7 +1217,8 @@ export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApi
   ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApiSchema>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>> & Pick<
+    branchId: string,
+    params?: GetDataApiSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>> & Pick<
         UndefinedInitialDataOptions<
           Awaited<ReturnType<typeof getDataApiSchema>>,
           TError,
@@ -993,7 +1229,8 @@ export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApi
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApiSchema>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+    branchId: string,
+    params?: GetDataApiSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 /**
@@ -1002,11 +1239,12 @@ export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApi
 
 export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApiSchema>>, TError = ErrorType<ErrorEnvelope>>(
  id: string,
-    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+    branchId: string,
+    params?: GetDataApiSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
 
-  const queryOptions = getGetDataApiSchemaQueryOptions(id,branchId,options)
+  const queryOptions = getGetDataApiSchemaQueryOptions(id,branchId,params,options)
 
   const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
 
@@ -1029,7 +1267,7 @@ export const getListBranchDatabasesUrl = (id: string,
 }
 
 /**
- * The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details.
+ * The databases of the branch's Postgres cluster: the main one first, then by name. The cluster's own `postgres` database is listed with origin `system`. Pass a name as `database` to the connection details. Each carries its data API state and default schema.
  * @summary List a branch's Postgres databases
  */
 export const listBranchDatabases = async (id: string,
@@ -1407,6 +1645,100 @@ export const useRevokeKey = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getRevokeKeyMutationOptions(options), queryClient);
     }
 
+export const getUpdateKeyUrl = (id: string,
+    branchId: string,
+    keyId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/keys/${encodeURIComponent(String(keyId))}`
+}
+
+/**
+ * Replaces the key's database list on a secret or the public key. `databases` is required: a list of 1 to 20 databases of the branch (a disabled one is allowed; it is just not served), or null for every served database. Rest forgets the branch's cached state when the list changes. The gateway caches a key for up to 30 seconds, so a narrowed list applies to new requests within 30 seconds of the answer, not at once.
+ * @summary Change which databases a key may reach
+ */
+export const updateKey = async (id: string,
+    branchId: string,
+    keyId: string,
+    updateKeyRequest: UpdateKeyRequest, options?: Parameters<typeof customFetch>[1]): Promise<DataKey> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<DataKey>(getUpdateKeyUrl(id,branchId,keyId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateKeyRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateKeyMutationKey = () => ['updateKey'] as const;
+
+export const getUpdateKeyMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateKey>>, TError,UpdateKeyMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateKey>>, TError,UpdateKeyMutationVariables, TContext> => {
+
+const mutationKey = getUpdateKeyMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateKey>>, UpdateKeyMutationVariables> = (props) => {
+          const {id,branchId,keyId,data} = props ?? {};
+
+          return  updateKey(id,branchId,keyId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateKeyMutationResult = NonNullable<Awaited<ReturnType<typeof updateKey>>>
+    export type UpdateKeyMutationBody = UpdateKeyRequest
+    export type UpdateKeyMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateKeyMutationVariables = {id: string;branchId: string;keyId: string;data: UpdateKeyRequest}
+
+    /**
+ * @summary Change which databases a key may reach
+ */
+export const useUpdateKey = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateKey>>, TError,UpdateKeyMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateKey>>,
+        TError,
+        UpdateKeyMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateKeyMutationOptions(options), queryClient);
+    }
+
 export const getRotateKeyUrl = (id: string,
     branchId: string,
     keyId: string,) => {
@@ -1483,6 +1815,267 @@ export const useRotateKey = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getRotateKeyMutationOptions(options), queryClient);
+    }
+
+export const getUpdatePgDatabaseUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/pg-databases/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Stores the schema a data API request to this database uses when it names none. On a served database the bootstrap re-runs for the new schema (so default privileges cover it) before the answer, and the data API picks the change up at once. Objects already in the new schema get the data API grants only with `grant_existing: true`; that flag with an unchanged schema grants on its existing objects now.
+ * @summary Change a Postgres database's default schema
+ */
+export const updatePgDatabase = async (id: string,
+    branchId: string,
+    name: string,
+    updatePgDatabaseRequest: UpdatePgDatabaseRequest, options?: Parameters<typeof customFetch>[1]): Promise<BranchDatabaseView> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<BranchDatabaseView>(getUpdatePgDatabaseUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updatePgDatabaseRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdatePgDatabaseMutationKey = () => ['updatePgDatabase'] as const;
+
+export const getUpdatePgDatabaseMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updatePgDatabase>>, TError,UpdatePgDatabaseMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updatePgDatabase>>, TError,UpdatePgDatabaseMutationVariables, TContext> => {
+
+const mutationKey = getUpdatePgDatabaseMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updatePgDatabase>>, UpdatePgDatabaseMutationVariables> = (props) => {
+          const {id,branchId,name,data} = props ?? {};
+
+          return  updatePgDatabase(id,branchId,name,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdatePgDatabaseMutationResult = NonNullable<Awaited<ReturnType<typeof updatePgDatabase>>>
+    export type UpdatePgDatabaseMutationBody = UpdatePgDatabaseRequest
+    export type UpdatePgDatabaseMutationError = ErrorType<ErrorEnvelope>
+    export type UpdatePgDatabaseMutationVariables = {id: string;branchId: string;name: string;data: UpdatePgDatabaseRequest}
+
+    /**
+ * @summary Change a Postgres database's default schema
+ */
+export const useUpdatePgDatabase = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updatePgDatabase>>, TError,UpdatePgDatabaseMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updatePgDatabase>>,
+        TError,
+        UpdatePgDatabaseMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdatePgDatabaseMutationOptions(options), queryClient);
+    }
+
+export const getEnableDataApiUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/pg-databases/${encodeURIComponent(String(name))}/data-api`
+}
+
+/**
+ * Marks the database `enabling` and asks the worker to bootstrap it; the answer is 202 at once. Poll the branch's databases for `data_api`: `on`, or `error` with the reason. Pressing it again retries a failed or stuck enable. A database already `on` answers 200 and nothing runs. The branch serves at most `CHELADB_BRANCH_DATA_API_DATABASE_CAP` databases (default 10, main included).
+ * @summary Serve a Postgres database through the data API
+ */
+export const enableDataApi = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<BranchDatabaseView> => {
+
+  return customFetch<BranchDatabaseView>(getEnableDataApiUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getEnableDataApiMutationKey = () => ['enableDataApi'] as const;
+
+export const getEnableDataApiMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof enableDataApi>>, TError,EnableDataApiMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof enableDataApi>>, TError,EnableDataApiMutationVariables, TContext> => {
+
+const mutationKey = getEnableDataApiMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof enableDataApi>>, EnableDataApiMutationVariables> = (props) => {
+          const {id,branchId,name} = props ?? {};
+
+          return  enableDataApi(id,branchId,name,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type EnableDataApiMutationResult = NonNullable<Awaited<ReturnType<typeof enableDataApi>>>
+
+    export type EnableDataApiMutationError = ErrorType<ErrorEnvelope>
+    export type EnableDataApiMutationVariables = {id: string;branchId: string;name: string}
+
+    /**
+ * @summary Serve a Postgres database through the data API
+ */
+export const useEnableDataApi = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof enableDataApi>>, TError,EnableDataApiMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof enableDataApi>>,
+        TError,
+        EnableDataApiMutationVariables,
+        TContext
+      > => {
+      return useMutation(getEnableDataApiMutationOptions(options), queryClient);
+    }
+
+export const getDisableDataApiUrl = (id: string,
+    branchId: string,
+    name: string,
+    params?: DisableDataApiParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/pg-databases/${encodeURIComponent(String(name))}/data-api?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/pg-databases/${encodeURIComponent(String(name))}/data-api`
+}
+
+/**
+ * Stops serving the database at once. The `cheladb` schema and the grants stay, so enabling again is instant; `remove=true` also drops the `cheladb` schema and its event trigger (grants to `anon` and `authenticated` stay). Answers 204 after the worker has done it. The branch's main database can't be disabled.
+ * @summary Stop serving a Postgres database
+ */
+export const disableDataApi = async (id: string,
+    branchId: string,
+    name: string,
+    params?: DisableDataApiParams, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDisableDataApiUrl(id,branchId,name,params),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDisableDataApiMutationKey = () => ['disableDataApi'] as const;
+
+export const getDisableDataApiMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof disableDataApi>>, TError,DisableDataApiMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof disableDataApi>>, TError,DisableDataApiMutationVariables, TContext> => {
+
+const mutationKey = getDisableDataApiMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof disableDataApi>>, DisableDataApiMutationVariables> = (props) => {
+          const {id,branchId,name,params} = props ?? {};
+
+          return  disableDataApi(id,branchId,name,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DisableDataApiMutationResult = NonNullable<Awaited<ReturnType<typeof disableDataApi>>>
+
+    export type DisableDataApiMutationError = ErrorType<ErrorEnvelope>
+    export type DisableDataApiMutationVariables = {id: string;branchId: string;name: string;params?: DisableDataApiParams}
+
+    /**
+ * @summary Stop serving a Postgres database
+ */
+export const useDisableDataApi = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof disableDataApi>>, TError,DisableDataApiMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof disableDataApi>>,
+        TError,
+        DisableDataApiMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDisableDataApiMutationOptions(options), queryClient);
     }
 
 export const getResetBranchPasswordUrl = (id: string,

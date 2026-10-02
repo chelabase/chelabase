@@ -31,6 +31,8 @@ pub struct NewDataKey {
     pub prefix: String,
     pub sha256: [u8; 32],
     pub sealed: Option<String>,
+    /// The databases the key may reach; `None` is every served database.
+    pub databases: Option<Vec<String>>,
 }
 
 impl fmt::Debug for NewDataKey {
@@ -44,6 +46,7 @@ impl fmt::Debug for NewDataKey {
             .field("prefix", &self.prefix)
             .field("sha256", &"<redacted>")
             .field("sealed", &self.sealed.as_ref().map(|_| "<redacted>"))
+            .field("databases", &self.databases)
             .finish()
     }
 }
@@ -60,6 +63,8 @@ pub struct DataKeyRecord {
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// The databases the key may reach; `None` is every served database.
+    pub databases: Option<Vec<String>>,
 }
 
 impl fmt::Debug for DataKeyRecord {
@@ -75,6 +80,7 @@ impl fmt::Debug for DataKeyRecord {
             .field("created_at", &self.created_at)
             .field("last_used_at", &self.last_used_at)
             .field("revoked_at", &self.revoked_at)
+            .field("databases", &self.databases)
             .finish()
     }
 }
@@ -86,6 +92,8 @@ pub struct DataKeyLookup {
     pub branch_id: BranchId,
     pub kind: DataKeyKind,
     pub role: String,
+    /// The databases the key may reach; `None` is every served database.
+    pub databases: Option<Vec<String>>,
 }
 
 /// A database's data API settings.
@@ -94,6 +102,12 @@ pub struct DataApiSettings {
     pub max_rows: i32,
     pub statement_timeout_ms: i32,
     pub max_connections: i32,
+}
+
+/// A database the data API serves, with the schema requests use when they name none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedDatabase {
+    pub name: String,
     pub default_schema: String,
 }
 
@@ -107,10 +121,12 @@ pub struct BranchConnectionRow {
     pub database_name: Option<String>,
     pub authenticator_password_enc: Option<String>,
     pub settings: DataApiSettings,
+    /// The branch's databases in state `on`, main first.
+    pub databases: Vec<ServedDatabase>,
 }
 
 const KEY_COLUMNS: &str = "id, branch_id, kind, role, name, prefix, sealed, created_at, \
-     last_used_at, revoked_at";
+     last_used_at, revoked_at, databases";
 
 fn parse_kind(value: &str) -> Result<DataKeyKind, MetadataError> {
     DataKeyKind::parse(value)
@@ -129,12 +145,13 @@ fn key_from_row(r: &PgRow) -> Result<DataKeyRecord, MetadataError> {
         created_at: r.get("created_at"),
         last_used_at: r.get("last_used_at"),
         revoked_at: r.get("revoked_at"),
+        databases: r.get("databases"),
     })
 }
 
 const INSERT_KEY: &str =
-    "INSERT INTO data_api_keys (id, branch_id, kind, role, name, prefix, sha256, sealed)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+    "INSERT INTO data_api_keys (id, branch_id, kind, role, name, prefix, sha256, sealed, databases)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
 
 /// A second live public key on a branch is a [`MetadataError::Conflict`]; anything else passes.
 fn map_insert_error(err: sqlx::Error) -> MetadataError {
@@ -180,7 +197,7 @@ impl MetadataClient {
         sha256: &[u8; 32],
     ) -> Result<Option<DataKeyLookup>, MetadataError> {
         let row = sqlx::query(
-            "SELECT k.id, k.branch_id, k.kind, k.role
+            "SELECT k.id, k.branch_id, k.kind, k.role, k.databases
              FROM data_api_keys k
              JOIN branches b ON b.id = k.branch_id
              WHERE k.sha256 = $1 AND k.revoked_at IS NULL
@@ -195,6 +212,7 @@ impl MetadataClient {
                 branch_id: BranchId(r.get("branch_id")),
                 kind: parse_kind(r.get("kind"))?,
                 role: r.get("role"),
+                databases: r.get("databases"),
             })
         })
         .transpose()
@@ -246,19 +264,24 @@ impl MetadataClient {
             .bind(branch.as_uuid())
             .execute(&mut *tx)
             .await?;
-        let revoked = sqlx::query(
+        // The new key reaches what the old one did: its list is copied, whatever `new` carries.
+        let revoked: Option<Option<Vec<String>>> = sqlx::query_scalar(
             "UPDATE data_api_keys SET revoked_at = now()
-             WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL",
+             WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+             RETURNING databases",
         )
         .bind(old)
         .bind(branch.as_uuid())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if revoked != 1 {
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(databases) = revoked else {
             return Ok(false);
-        }
-        bind_new_key(sqlx::query(INSERT_KEY), new, branch)
+        };
+        let new = NewDataKey {
+            databases,
+            ..new.clone()
+        };
+        bind_new_key(sqlx::query(INSERT_KEY), &new, branch)
             .execute(&mut *tx)
             .await
             .map_err(map_insert_error)?;
@@ -274,6 +297,28 @@ impl MetadataClient {
         .bind(branch.as_uuid())
         .fetch_one(&self.pool)
         .await?)
+    }
+
+    /// Replaces a live key's database list (`None` is every served database). False for an
+    /// unknown or revoked key, or one of another branch. The list's bounds (1 to 20 names) are
+    /// the column's CHECK; callers validate first for a friendly message.
+    pub async fn set_key_databases(
+        &self,
+        branch: BranchId,
+        key_id: Uuid,
+        databases: Option<Vec<String>>,
+    ) -> Result<bool, MetadataError> {
+        let updated = sqlx::query(
+            "UPDATE data_api_keys SET databases = $3
+             WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(key_id)
+        .bind(branch.as_uuid())
+        .bind(databases)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
     }
 
     /// Records the sealed `authenticator` password of a live branch that has none. A branch
@@ -303,8 +348,7 @@ impl MetadataClient {
     ) -> Result<Option<BranchConnectionRow>, MetadataError> {
         let row = sqlx::query(
             "SELECT b.id, b.status, b.endpoint_id, b.authenticator_password_enc,
-                    d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections,
-                    d.default_schema
+                    d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections
              FROM branches b
              JOIN databases d ON d.id = b.database_id
              WHERE b.id = $1",
@@ -312,22 +356,23 @@ impl MetadataClient {
         .bind(branch.as_uuid())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|r| {
-            Ok(BranchConnectionRow {
-                branch_id: BranchId(r.get("id")),
-                status: BranchStatus::parse(r.get("status"))?,
-                endpoint_id: r.get("endpoint_id"),
-                database_name: r.get("database_name"),
-                authenticator_password_enc: r.get("authenticator_password_enc"),
-                settings: DataApiSettings {
-                    max_rows: r.get("max_rows"),
-                    statement_timeout_ms: r.get("statement_timeout_ms"),
-                    max_connections: r.get("max_connections"),
-                    default_schema: r.get("default_schema"),
-                },
-            })
-        })
-        .transpose()
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let databases = self.served_databases(branch).await?;
+        Ok(Some(BranchConnectionRow {
+            branch_id: BranchId(r.get("id")),
+            status: BranchStatus::parse(r.get("status"))?,
+            endpoint_id: r.get("endpoint_id"),
+            database_name: r.get("database_name"),
+            authenticator_password_enc: r.get("authenticator_password_enc"),
+            settings: DataApiSettings {
+                max_rows: r.get("max_rows"),
+                statement_timeout_ms: r.get("statement_timeout_ms"),
+                max_connections: r.get("max_connections"),
+            },
+            databases,
+        }))
     }
 
     /// Ready branches (backups have no compute and are skipped) that still need the data API
@@ -362,6 +407,7 @@ fn bind_new_key<'q>(
         .bind(key.prefix.as_str())
         .bind(key.sha256.as_slice())
         .bind(key.sealed.as_deref())
+        .bind(key.databases.as_deref())
 }
 
 #[cfg(test)]
@@ -379,6 +425,7 @@ mod tests {
             prefix: "chk_pub_abcd".into(),
             sha256: [0xab; 32],
             sealed: Some("v1:SECRETSEALED".into()),
+            databases: None,
         };
         let shown = format!("{key:?}");
         assert!(
@@ -397,6 +444,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            databases: None,
         };
         assert!(!format!("{record:?}").contains("SECRETSEALED"));
     }

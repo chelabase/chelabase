@@ -66,7 +66,7 @@ async fn harness(answer: fn() -> Result<ConnInfo, ConnError>) -> Harness {
     }
 }
 
-fn identity(kind: Option<DataKeyKind>) -> Identity {
+fn identity(kind: Option<DataKeyKind>, databases: Option<Vec<String>>) -> Identity {
     let key_id = Uuid::new_v4();
     Identity {
         sub: key_id.to_string(),
@@ -87,13 +87,37 @@ fn identity(kind: Option<DataKeyKind>) -> Identity {
                 "authenticated".into()
             },
             claims: serde_json::json!({}),
+            databases,
         }),
     }
 }
 
 impl Harness {
     fn token(&self, audience: &str, kind: Option<DataKeyKind>) -> String {
-        self.signer.sign(audience, &identity(kind)).unwrap()
+        self.signer.sign(audience, &identity(kind, None)).unwrap()
+    }
+
+    /// A data key's identity with an allow-list.
+    fn listed(&self, kind: DataKeyKind, databases: &[&str]) -> String {
+        let databases = databases.iter().map(|d| d.to_string()).collect();
+        self.signer
+            .sign("rest", &identity(Some(kind), Some(databases)))
+            .unwrap()
+    }
+
+    async fn internal_post(&self, path: &str, bearer: Option<&str>, body: Value) -> (u16, Value) {
+        let mut req = self
+            .http
+            .post(format!("http://{}{path}", self.internal))
+            .json(&body);
+        if let Some(bearer) = bearer {
+            req = req.bearer_auth(bearer);
+        }
+        let resp = req.send().await.unwrap();
+        (
+            resp.status().as_u16(),
+            resp.json().await.unwrap_or(Value::Null),
+        )
     }
 
     async fn post(&self, token: Option<&str>, body: Vec<u8>) -> (u16, Option<String>, Value) {
@@ -141,6 +165,22 @@ fn not_ready() -> Result<ConnInfo, ConnError> {
 fn unknown() -> Result<ConnInfo, ConnError> {
     Err(ConnError::UnknownBranch)
 }
+
+/// A branch serving `main` and `analytics`, at an address nothing listens on.
+fn served() -> Result<ConnInfo, ConnError> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "host": "127.0.0.1", "port": 1, "database": "main",
+        "user": "authenticator", "password": "pw", "status": "ready",
+        "settings": { "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 2 },
+        "databases": [
+            { "name": "main", "default_schema": "public" },
+            { "name": "analytics", "default_schema": "reporting" },
+        ],
+    }))
+    .unwrap())
+}
+
+const UNKNOWN_DATABASE: &str = "the database doesn't exist or isn't served by this key";
 
 #[tokio::test]
 async fn missing_identity_is_401() {
@@ -278,4 +318,154 @@ async fn internal_schema_needs_the_bearer_and_passes_branch_states_through() {
         )
         .await;
     assert_eq!(status, 404);
+}
+
+/// A database that doesn't exist, isn't served, or isn't on the key's list: one answer for
+/// all, before any connection is opened.
+#[tokio::test]
+async fn unknown_database_in_all_three_cases_has_one_text() {
+    let h = harness(served).await;
+    let query = |database: Option<&str>| {
+        let mut tree = serde_json::json!({ "v": 1, "op": "select", "from": "t" });
+        if let Some(d) = database {
+            tree["database"] = d.into();
+        }
+        serde_json::to_vec(&tree).unwrap()
+    };
+    let unlisted = h.token("rest", Some(DataKeyKind::Public));
+    let cases = [
+        // Doesn't exist.
+        (unlisted.clone(), query(Some("ghost"))),
+        // Served, but not on the key's list (main by default, too).
+        (
+            h.listed(DataKeyKind::Public, &["main"]),
+            query(Some("analytics")),
+        ),
+        (h.listed(DataKeyKind::Secret, &["analytics"]), query(None)),
+        // On the key's list, but not served.
+        (
+            h.listed(DataKeyKind::Secret, &["main", "archive"]),
+            query(Some("archive")),
+        ),
+        // A list left empty reaches nothing.
+        (h.listed(DataKeyKind::Secret, &[]), query(None)),
+    ];
+    let mut bodies = Vec::new();
+    for (token, body) in cases {
+        let (status, _, json) = h.post(Some(&token), body).await;
+        assert_eq!(status, 404, "{json}");
+        bodies.push(json);
+    }
+    for (path, token) in [
+        (
+            "/data/v1/schema?database=ghost",
+            h.token("rest", Some(DataKeyKind::Secret)),
+        ),
+        (
+            "/data/v1/schema?database=analytics",
+            h.listed(DataKeyKind::Secret, &["main"]),
+        ),
+        (
+            "/data/v1/schema",
+            h.listed(DataKeyKind::Secret, &["analytics"]),
+        ),
+    ] {
+        let (status, json) = h.get(h.addr, path, Some((IDENTITY_HEADER, token))).await;
+        assert_eq!(status, 404, "{path}: {json}");
+        bodies.push(json);
+    }
+    for body in &bodies {
+        assert_eq!(
+            body,
+            &serde_json::json!({ "error": { "code": "unknown_database", "message": UNKNOWN_DATABASE } })
+        );
+    }
+}
+
+/// Only the top level names a database: a batch can't span two.
+#[tokio::test]
+async fn a_batch_cannot_name_a_database_inside() {
+    let h = harness(served).await;
+    let token = h.token("rest", Some(DataKeyKind::Secret));
+    let body = serde_json::json!({
+        "v": 1, "op": "batch", "database": "main",
+        "ops": [
+            { "op": "select", "from": "t" },
+            { "op": "select", "from": "t", "database": "analytics" },
+        ],
+    });
+    let (status, _, json) = h
+        .post(Some(&token), serde_json::to_vec(&body).unwrap())
+        .await;
+    assert_eq!(status, 400, "{json}");
+    assert_eq!(json["error"]["code"], "invalid_query");
+    assert_eq!(
+        json["error"]["message"],
+        "ops[1]: only the top level may name a database"
+    );
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn invalidate_needs_the_bearer() {
+    let h = harness(served).await;
+    let branch = Uuid::new_v4();
+    let path = format!("/internal/branches/{branch}/invalidate");
+    for bearer in [None, Some("nope")] {
+        let (status, json) = h.internal_post(&path, bearer, Value::Null).await;
+        assert_eq!(status, 401, "{bearer:?}");
+        assert_eq!(json["error"]["code"], "unauthorized");
+    }
+    let (status, _) = h.internal_post(&path, Some(TOKEN), Value::Null).await;
+    assert_eq!(status, 204);
+}
+
+/// The connection info is cached until the orchestrator says the branch changed.
+#[tokio::test]
+async fn invalidate_makes_the_next_request_ask_again() {
+    let h = harness(served).await;
+    let mut data = identity(Some(DataKeyKind::Secret), None);
+    let branch = data.data.as_ref().unwrap().branch_id;
+    data.data.as_mut().unwrap().databases = Some(vec!["ghost".into()]);
+    let token = h.signer.sign("rest", &data).unwrap();
+    for _ in 0..2 {
+        let (status, _, _) = h.post(Some(&token), SELECT.to_vec()).await;
+        assert_eq!(status, 404);
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 1);
+    let path = format!("/internal/branches/{branch}/invalidate");
+    let (status, _) = h.internal_post(&path, Some(TOKEN), Value::Null).await;
+    assert_eq!(status, 204);
+    let (status, _, _) = h.post(Some(&token), SELECT.to_vec()).await;
+    assert_eq!(status, 404);
+    assert_eq!(h.calls.load(Ordering::SeqCst), 2);
+}
+
+/// The console route: the bearer, a well-formed body, a served database, one database.
+#[tokio::test]
+async fn console_route_checks_the_bearer_the_body_and_the_database() {
+    let h = harness(served).await;
+    let path = format!("/internal/console/{}/query", Uuid::new_v4());
+    let tree = serde_json::json!({ "v": 1, "op": "select", "from": "t" });
+    let request = serde_json::json!({ "role": "editor", "database": "ghost", "tree": tree });
+    for bearer in [None, Some("nope")] {
+        let (status, _) = h.internal_post(&path, bearer, request.clone()).await;
+        assert_eq!(status, 401, "{bearer:?}");
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+    for bad in [
+        serde_json::json!({ "database": null, "tree": tree }),
+        serde_json::json!({ "role": "editor", "database": null, "tree": [] }),
+        serde_json::json!({ "role": "editor", "database": "main", "tree": { "v": 2, "op": "select", "from": "t" } }),
+        serde_json::json!({ "role": "editor", "database": "main",
+            "tree": { "v": 1, "op": "select", "from": "t", "database": "analytics" } }),
+    ] {
+        let (status, json) = h.internal_post(&path, Some(TOKEN), bad.clone()).await;
+        assert_eq!(status, 400, "{bad}: {json}");
+        assert_eq!(json["error"]["code"], "invalid_query", "{bad}");
+    }
+    let (status, json) = h.internal_post(&path, Some(TOKEN), request).await;
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(json["error"]["code"], "unknown_database");
+    assert_eq!(json["error"]["message"], UNKNOWN_DATABASE);
 }

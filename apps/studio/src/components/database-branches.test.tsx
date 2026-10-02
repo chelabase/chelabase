@@ -29,7 +29,6 @@ const detail: Database = {
   max_rows: 1000,
   statement_timeout_ms: 8000,
   max_connections: 5,
-  default_schema: "public",
   branch_count: 3,
 };
 const b = (name: string, over: Partial<Branch> = {}): Branch => ({

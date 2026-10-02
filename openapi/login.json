@@ -892,7 +892,10 @@
           "role_cap_reached",
           "role_in_use",
           "role_privilege_mismatch",
-          "branch_protected"
+          "branch_protected",
+          "conflict",
+          "data_api_disabled",
+          "owner_password_unknown"
         ]
       },
       "ErrorEnvelope": {
