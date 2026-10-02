@@ -20,12 +20,13 @@ use cheladb_nats::{
 };
 use cheladb_secrets::{open_credential, open_role_password, Purpose, SecretKey};
 use cheladb_types::api_error::{ApiError, ErrorCode};
+use cheladb_types::mode::Mode;
 use cheladb_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
 use cheladb_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -210,6 +211,12 @@ pub trait MetadataPort: Send + Sync + 'static {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Vec<BranchDatabase>, MetadataError>> + Send;
+
+    /// Of `ids`, the branches with a `main` database row, in one query.
+    fn branches_with_main_database(
+        &self,
+        ids: &[BranchId],
+    ) -> impl Future<Output = Result<HashSet<BranchId>, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -362,6 +369,13 @@ impl MetadataPort for MetadataClient {
         branch: BranchId,
     ) -> Result<Vec<BranchDatabase>, MetadataError> {
         MetadataClient::branch_databases(self, branch).await
+    }
+
+    async fn branches_with_main_database(
+        &self,
+        ids: &[BranchId],
+    ) -> Result<HashSet<BranchId>, MetadataError> {
+        MetadataClient::branches_with_main_database(self, ids).await
     }
 }
 
@@ -568,6 +582,10 @@ pub struct AppState<M, J> {
     pub proxy_domain: String,
     /// The REST service's internal listener (the data API's schema).
     pub rest: RestInternal,
+    /// Self-hosted mode reveals the dev CA's path next to the connection details.
+    pub mode: Mode,
+    /// Where the dev proxy's CA certificate is (`CHELADB_PROXY_CA_FILE`); self-hosted only.
+    pub proxy_ca_file: String,
 }
 
 /// Where the REST service's internal listener is, and the token it takes.
@@ -1193,12 +1211,17 @@ pub(crate) struct ConnectionDetails {
     password: Option<String>,
     /// `generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is
     /// stored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy
-    /// can't use; set a new password.
+    /// can't use; set a new password. `unreadable`: the stored password could not be opened
+    /// (a rename or branch copy dropped it); reset it.
     password_state: PasswordState,
     /// Without a password when `password` is null. The user and database are
     /// percent-encoded.
     uri: String,
     http_url: String,
+    /// Self-hosted mode only: the file holding the dev proxy's CA certificate, for
+    /// `sslrootcert=` (the URI keeps `sslmode=verify-full`). Null in platform mode.
+    #[schema(required = true)]
+    ca_file: Option<String>,
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.
@@ -1425,6 +1448,7 @@ where
             password_state,
             uri,
             http_url,
+            ca_file: (state.mode == Mode::SelfHosted).then(|| state.proxy_ca_file.clone()),
         }),
     )
         .into_response()

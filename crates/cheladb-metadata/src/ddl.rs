@@ -158,7 +158,7 @@ impl DdlTx {
              VALUES ($1, $2, $3, 'sql', now())
              ON CONFLICT (endpoint_id, name) DO UPDATE
                  SET scram_verifier = EXCLUDED.scram_verifier, password_enc = NULL,
-                     forwarded_at = now()
+                     password_unreadable = false, forwarded_at = now()
                  WHERE neon_roles.origin <> 'owner'",
         )
         .bind(&self.endpoint_id)
@@ -174,7 +174,7 @@ impl DdlTx {
     /// NULL (the sealed password no longer matches).
     pub async fn set_owner_verifier(&mut self, verifier: &str) -> Result<(), MetadataError> {
         sqlx::query(
-            "UPDATE neon_roles SET scram_verifier = $2, forwarded_at = now()
+            "UPDATE neon_roles SET scram_verifier = $2, password_unreadable = false, forwarded_at = now()
              WHERE endpoint_id = $1 AND origin = 'owner'",
         )
         .bind(&self.endpoint_id)
@@ -191,6 +191,22 @@ impl DdlTx {
             .map_err(|e| lock_timeout(e, &self.endpoint_id))?;
         }
         self.wrote = true;
+        Ok(())
+    }
+
+    /// The sealed password of `name` couldn't be resealed: it's dropped and the row shows
+    /// [`crate::PasswordState::Unreadable`]. Does not touch `forwarded_at`. No such row is a no-op.
+    pub async fn mark_password_unreadable(&mut self, name: &str) -> Result<(), MetadataError> {
+        let marked = sqlx::query(
+            "UPDATE neon_roles SET password_enc = NULL, password_unreadable = true
+             WHERE endpoint_id = $1 AND name = $2",
+        )
+        .bind(&self.endpoint_id)
+        .bind(name)
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected();
+        self.wrote |= marked > 0;
         Ok(())
     }
 
@@ -218,7 +234,9 @@ impl DdlTx {
         resealed: Option<&str>,
     ) -> Result<bool, MetadataError> {
         let moved = sqlx::query(
-            "UPDATE neon_roles SET name = $3, password_enc = $4, forwarded_at = now()
+            "UPDATE neon_roles SET name = $3, password_enc = $4,
+                 password_unreadable = CASE WHEN $4 IS NULL THEN password_unreadable ELSE false END,
+                 forwarded_at = now()
              WHERE endpoint_id = $1 AND name = $2",
         )
         .bind(&self.endpoint_id)
@@ -294,7 +312,18 @@ impl DdlTx {
         .bind(origin.as_str())
         .execute(&mut *self.tx)
         .await?;
+        self.stamp_databases().await?;
         self.wrote = true;
+        Ok(())
+    }
+
+    /// Stamps the endpoint's `dbs_forwarded_at` (the resync leaves `branch_databases` alone for
+    /// 10 s after a database DDL).
+    async fn stamp_databases(&mut self) -> Result<(), MetadataError> {
+        sqlx::query("UPDATE neon_endpoints SET dbs_forwarded_at = now() WHERE id = $1")
+            .bind(&self.endpoint_id)
+            .execute(&mut *self.tx)
+            .await?;
         Ok(())
     }
 
@@ -311,6 +340,7 @@ impl DdlTx {
                 .execute(&mut *self.tx)
                 .await?
                 .rows_affected();
+        self.stamp_databases().await?;
         self.wrote |= moved > 0;
         Ok(moved > 0)
     }
@@ -327,6 +357,7 @@ impl DdlTx {
                 .execute(&mut *self.tx)
                 .await?
                 .rows_affected();
+        self.stamp_databases().await?;
         self.wrote |= deleted > 0;
         Ok(deleted > 0)
     }

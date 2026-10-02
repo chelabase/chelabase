@@ -261,6 +261,11 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
               <CopyButton value={shown.details.uri} label="Copy URI" />
             </dd>
           </dl>
+          {shown.details.ca_file && (
+            <p className="text-xs text-muted-foreground">
+              Local dev: pass the proxy&apos;s CA with <code>sslrootcert={shown.details.ca_file}</code>.
+            </p>
+          )}
           <Button size="sm" variant="outline" onClick={() => setShown(null)}>
             Dismiss
           </Button>

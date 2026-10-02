@@ -184,13 +184,32 @@ fn retried_reset(row: &RoleCopy) -> bool {
         && row.password_enc.is_some()
 }
 
-/// The SQL repairs for `api` rows and for [`retried_reset`] rows (run as `cloud_admin`), and
-/// the metadata write. The owner's row is never touched.
+/// One role's SQL statements, run as one script of their own (C1): a failure stops only
+/// that role's group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairGroup {
+    pub role: String,
+    pub statements: Vec<String>,
+}
+
+/// Appends `statement` to `role`'s group (the last one when it's `role`'s, else a new one).
+fn push_repair(groups: &mut Vec<RepairGroup>, role: &str, statement: String) {
+    match groups.last_mut() {
+        Some(g) if g.role == role => g.statements.push(statement),
+        _ => groups.push(RepairGroup {
+            role: role.to_string(),
+            statements: vec![statement],
+        }),
+    }
+}
+
+/// The SQL repairs for `api` rows and for [`retried_reset`] rows (run as `cloud_admin`), one
+/// [`RepairGroup`] per role, and the metadata write. The owner's row is never touched.
 pub fn plan_resync(
     owner: &str,
     copies: &[RoleCopy],
     observed: &Observed,
-) -> (Vec<String>, ResyncWrite) {
+) -> (Vec<RepairGroup>, ResyncWrite) {
     let level = |owner_level: bool| {
         if owner_level {
             RoleLevel::OwnerLevel
@@ -220,30 +239,30 @@ pub fn plan_resync(
         };
         let (login, row_level) = match observed.roles.iter().find(|o| o.name == row.name) {
             None => {
-                repairs.push(create_role_sql(
-                    owner,
+                push_repair(
+                    &mut repairs,
                     &row.name,
-                    stored,
-                    row.api_owner_level,
-                ));
+                    create_role_sql(owner, &row.name, stored, row.api_owner_level),
+                );
                 (true, level(row.api_owner_level))
             }
             Some(o) => {
                 if o.password.as_deref() != Some(stored) {
-                    repairs.push(set_password_sql(&row.name, stored));
+                    push_repair(&mut repairs, &row.name, set_password_sql(&row.name, stored));
                 }
                 // N1: an owner-level role has the owner's attributes and neon_superuser; a
                 // role that lost any of them (or whose create's GRANT failed) gets them back.
                 let restore = row.api_owner_level && !o.owner_attributes;
                 if restore {
-                    repairs.push(owner_attributes_sql(&row.name));
+                    push_repair(&mut repairs, &row.name, owner_attributes_sql(&row.name));
                 }
                 if !o.owner_admin {
-                    repairs.push(format!(
+                    let grant = format!(
                         "GRANT {} TO {} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE;",
                         quote_ident(&row.name),
                         quote_ident(owner)
-                    ));
+                    );
+                    push_repair(&mut repairs, &row.name, grant);
                 }
                 (o.login, level(o.owner_level || restore))
             }
@@ -269,7 +288,7 @@ pub fn plan_resync(
         if let Some(r) = row.filter(|r| retried_reset(r)) {
             let stored = r.scram_verifier.as_deref().unwrap_or_default();
             if o.password.as_deref() != Some(stored) {
-                repairs.push(set_password_sql(&o.name, stored));
+                push_repair(&mut repairs, &o.name, set_password_sql(&o.name, stored));
             }
             write.upserts.push(CopyUpsert {
                 name: o.name.clone(),
@@ -340,13 +359,13 @@ impl FreshPasswords {
     /// For each role of `observed` (never `owner`) with a password that isn't its fresh one:
     /// its recorded fresh verifier, or a new one from `generate` (`(verifier, sealed)`). The
     /// role's observed password becomes that verifier (the caller sets it before planning),
-    /// and the statements that set them are returned.
+    /// and the statements that set them are returned, one group per role.
     pub(crate) fn assign(
         &mut self,
         owner: &str,
         observed: &mut Observed,
         mut generate: impl FnMut(&str) -> (String, String),
-    ) -> Vec<String> {
+    ) -> Vec<RepairGroup> {
         let mut script = Vec::new();
         for o in observed.roles.iter_mut().filter(|o| o.name != owner) {
             let Some(current) = o.password.as_deref() else {
@@ -357,7 +376,7 @@ impl FreshPasswords {
                 (verifier, Some(sealed))
             });
             if current != verifier.as_str() {
-                script.push(set_password_sql(&o.name, verifier));
+                push_repair(&mut script, &o.name, set_password_sql(&o.name, verifier));
                 o.password = Some(verifier.clone());
             }
         }
@@ -416,6 +435,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(|e| fail("reading the catalog", &format_args!("{e:#}")))?;
             let mut observed = parse_observed(&out).map_err(|e| fail("reading the catalog", &e))?;
+            // `(role, what failed)` for each group that failed this try.
+            let mut failed: Vec<(String, String)> = Vec::new();
             if let Some(fresh) = fresh.as_deref_mut() {
                 let aad = branch.to_string();
                 let script = fresh.assign(OWNER_ROLE, &mut observed, |name| {
@@ -425,31 +446,26 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         seal_role_password(&self.key, &aad, name, &password),
                     )
                 });
-                if !script.is_empty() {
-                    let script = format!(
-                        "SET search_path = pg_catalog, pg_temp;\n{}",
-                        script.join("\n")
-                    );
-                    self.computes
-                        .admin_sql(ep, database, &script)
-                        .await
-                        .map_err(|e| fail("setting the fresh passwords", &format_args!("{e:#}")))?;
-                }
+                self.run_groups(
+                    ep,
+                    database,
+                    &script,
+                    "setting a fresh password",
+                    &mut failed,
+                )
+                .await;
             }
             let (repairs, mut write) = plan_resync(OWNER_ROLE, &copies, &observed);
             if let Some(fresh) = fresh.as_deref() {
                 fresh.seal(&mut write);
             }
-            if !repairs.is_empty() {
-                let script = format!(
-                    "SET search_path = pg_catalog, pg_temp;\n{}",
-                    repairs.join("\n")
-                );
-                self.computes
-                    .admin_sql(ep, database, &script)
-                    .await
-                    .map_err(|e| fail("repairing API-made roles", &format_args!("{e:#}")))?;
-            }
+            self.run_groups(ep, database, &repairs, "repairing", &mut failed)
+                .await;
+            // A failed role's row is left as it was: its catalog state isn't what the write
+            // would record.
+            write
+                .upserts
+                .retain(|up| !failed.iter().any(|(role, _)| *role == up.name));
             let changed = match self
                 .metadata
                 .apply_resync(ep, branch, version, &write)
@@ -473,7 +489,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         .roles
                         .iter()
                         .any(|o| o.name == row.name && o.password == row.scram_verifier);
-                if set_back && !names.contains(&row.name) {
+                let failed_role = failed.iter().any(|(role, _)| *role == row.name);
+                if set_back && !failed_role && !names.contains(&row.name) {
                     names.push(row.name.clone());
                 }
             }
@@ -481,11 +498,41 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             if !names.is_empty() {
                 info!(branch_id = %branch, endpoint_id = %ep, roles = %names.join(","), "login roles resynced");
             }
+            if !failed.is_empty() {
+                let failures: Vec<String> = failed.into_iter().map(|(_, what)| what).collect();
+                return Err(format!("syncing login roles: {}", failures.join("; ")));
+            }
             return Ok(());
         }
         Err(format!(
             "syncing login roles: roles kept changing; gave up after {RESYNC_TRIES} tries"
         ))
+    }
+
+    /// Runs each group as its own script (C1: psql stops at a script's first error, so one
+    /// role's failure would stop the others'). A failure is logged and recorded in `failed`
+    /// as `(role, "<what> <role>: <error>")`.
+    async fn run_groups(
+        &self,
+        ep: &str,
+        database: &str,
+        groups: &[RepairGroup],
+        what: &str,
+        failed: &mut Vec<(String, String)>,
+    ) {
+        for group in groups {
+            let script = format!(
+                "SET search_path = pg_catalog, pg_temp;\n{}",
+                group.statements.join("\n")
+            );
+            if let Err(e) = self.computes.admin_sql(ep, database, &script).await {
+                error!(endpoint_id = %ep, role = %group.role, "{what} failed: {e:#}");
+                failed.push((
+                    group.role.clone(),
+                    format!("{what} {}: {e:#}", quote_ident(&group.role)),
+                ));
+            }
+        }
     }
 
     /// [`Self::resync_locked`] under the endpoint's lock, through [`SYSTEM_DATABASE`].
@@ -619,6 +666,11 @@ mod tests {
         }
     }
 
+    /// The groups' statements in order.
+    fn flat(groups: &[RepairGroup]) -> Vec<String> {
+        groups.iter().flat_map(|g| g.statements.clone()).collect()
+    }
+
     fn upsert(write: &ResyncWrite, name: &str) -> Option<CopyUpsert> {
         write.upserts.iter().find(|u| u.name == name).cloned()
     }
@@ -645,6 +697,9 @@ mod tests {
             )
         });
         assert_eq!(generated, ["late", "old"]);
+        let roles: Vec<&str> = script.iter().map(|g| g.role.as_str()).collect();
+        assert_eq!(roles, ["rec", "late", "old"]);
+        let script = flat(&script);
         let late = "SCRAM-SHA-256$4096:c2FsdA==$late:x";
         let old = "SCRAM-SHA-256$4096:c2FsdA==$old:x";
         assert_eq!(
@@ -940,7 +995,13 @@ mod tests {
 
         let (repairs, write) = plan_resync(OWNER_ROLE, &copies, &seen);
 
-        assert_eq!(repairs, [set_password_sql("reset", SCRAM_B)]);
+        assert_eq!(
+            repairs,
+            [RepairGroup {
+                role: "reset".into(),
+                statements: vec![set_password_sql("reset", SCRAM_B)],
+            }]
+        );
         let reset = upsert(&write, "reset").unwrap();
         assert_eq!(
             (
@@ -1020,8 +1081,21 @@ mod tests {
                  GRANT neon_superuser TO \"{name}\";"
             )
         };
+        let roles: Vec<&str> = repairs.iter().map(|g| g.role.as_str()).collect();
         assert_eq!(
-            repairs,
+            roles,
+            [
+                "admin",
+                "boss_stripped",
+                "boss_partial",
+                "plain_gone",
+                "drifted",
+                "cleared",
+                "no_admin"
+            ]
+        );
+        assert_eq!(
+            flat(&repairs),
             [
                 format!(
                     "SET ROLE \"postgres\";\nCREATE ROLE \"admin\" LOGIN CREATEROLE CREATEDB \
@@ -1074,6 +1148,25 @@ mod tests {
         assert!(upsert(&write, "broken").is_none());
         assert!(upsert(&write, OWNER_ROLE).is_none());
         assert!(write.removals.is_empty(), "{:?}", write.removals);
+    }
+
+    // C1: a role's repairs (password, attributes, ADMIN) share one group.
+    #[test]
+    fn plan_resync_groups_a_roles_repairs() {
+        let mut boss = copy("boss", RoleOrigin::Api, Some(SCRAM_A));
+        boss.api_owner_level = true;
+        let copies = [boss, copy("plain", RoleOrigin::Api, Some(SCRAM_A))];
+        let mut seen_boss = role("boss", Some(SCRAM_B));
+        seen_boss.owner_admin = false;
+        let roles = vec![seen_boss, role("plain", Some(SCRAM_B))];
+
+        let (repairs, _) = plan_resync(OWNER_ROLE, &copies, &observed(roles));
+
+        let shape: Vec<(&str, usize)> = repairs
+            .iter()
+            .map(|g| (g.role.as_str(), g.statements.len()))
+            .collect();
+        assert_eq!(shape, [("boss", 3), ("plain", 1)]);
     }
 
     /// Main of a ready database: `(branch, endpoint)`; the journal starts empty.
@@ -1135,6 +1228,118 @@ mod tests {
                 .unwrap_err()
                 .starts_with("syncing login roles: ")
         );
+    }
+
+    /// An API-made row of `ep` with `verifier`, still pending.
+    fn api_row(w: &FakeWorker, ep: &str, name: &str, verifier: &str) {
+        let mut state = w.metadata.state();
+        let endpoint = state.endpoints.get_mut(ep).unwrap();
+        endpoint.set_verifier(name, Some(verifier));
+        endpoint.logins.insert(
+            name.into(),
+            FakeLogin {
+                origin: RoleOrigin::Api,
+                password_enc: Some("sealed".into()),
+                pending: true,
+                login: true,
+                level: RoleLevel::Plain,
+                api_owner_level: false,
+            },
+        );
+    }
+
+    // C1: each role's repairs run as their own script; one that fails is logged and its
+    // role's write skipped, the others still run and are written, and the resync fails
+    // afterwards naming the failed role.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_repair_does_not_stop_the_others() {
+        let (w, journal) = worker();
+        let (branch, ep) = ready(&w, &journal).await;
+        api_row(&w, &ep, "aaa", SCRAM_A);
+        api_row(&w, &ep, "bbb", SCRAM_B);
+        // The catalog lost both: each is re-created, and `aaa`'s create fails.
+        w.computes
+            .answer("FROM pg_authid", &d_line("app", "postgres", false));
+        w.computes.fail_when("CREATE ROLE \"aaa\"");
+
+        let err = w.resync(branch).await.unwrap_err();
+
+        assert!(err.starts_with("syncing login roles: "), "{err}");
+        assert!(err.contains("aaa"), "{err}");
+        assert!(!err.contains("bbb"), "{err}");
+        let sql = w.computes.sql.lock().unwrap().clone();
+        assert!(
+            sql.iter()
+                .any(|(_, _, s)| s.contains("CREATE ROLE \"bbb\"")),
+            "{sql:?}"
+        );
+        assert!(position(&journal, "metadata.apply_resync").is_some());
+        let state = w.metadata.state();
+        let endpoint = &state.endpoints[&ep];
+        assert!(!endpoint.logins["bbb"].pending, "bbb's row is written");
+        assert!(endpoint.logins["aaa"].pending, "aaa's write is skipped");
+        assert_eq!(endpoint.branch_databases, observed(vec![]).databases);
+    }
+
+    // A role whose repair failed isn't published: its catalog password is not the stored one,
+    // and the proxy must not be told it changed. The role that was repaired is.
+    #[tokio::test(start_paused = true)]
+    async fn a_role_whose_repair_failed_is_not_published() {
+        let (w, journal) = worker();
+        let (branch, ep) = ready(&w, &journal).await;
+        api_row(&w, &ep, "aaa", SCRAM_A);
+        api_row(&w, &ep, "bbb", SCRAM_B);
+        // Both were set back in SQL: the catalog holds the other role's verifier.
+        w.computes.answer(
+            "FROM pg_authid",
+            &format!(
+                "{}{}{}",
+                r_line("aaa", true, Some(SCRAM_B), false, true, false),
+                r_line("bbb", true, Some(SCRAM_A), false, true, false),
+                d_line("app", "postgres", false),
+            ),
+        );
+        w.computes.fail_when("ALTER ROLE \"aaa\" PASSWORD");
+
+        let err = w.resync(branch).await.unwrap_err();
+
+        assert!(err.contains("aaa") && !err.contains("bbb"), "{err}");
+        assert_eq!(count(&journal, &format!("cache.password_updated {ep} aaa")), 0);
+        assert_eq!(count(&journal, &format!("cache.password_updated {ep} bbb")), 1);
+    }
+
+    // C1, the fresh passwords: one role's failed script doesn't stop the others'; the failed
+    // role isn't written (so it keeps no fresh password it doesn't have), the resync fails
+    // naming it.
+    #[tokio::test(start_paused = true)]
+    async fn failed_fresh_password_group_is_isolated() {
+        let (w, journal) = worker();
+        let (branch, ep) = ready(&w, &journal).await;
+        w.computes.answer(
+            "FROM pg_authid",
+            &format!(
+                "{}{}",
+                r_line("aaa", true, Some(SCRAM_A), false, true, false),
+                r_line("bbb", true, Some(SCRAM_B), false, true, false),
+            ),
+        );
+        w.computes.fail_when("ALTER ROLE \"aaa\" PASSWORD");
+        let mut fresh = FreshPasswords::new([]);
+
+        let err = w
+            .resync_locked_with(branch, &ep, SYSTEM_DATABASE, Some(&mut fresh))
+            .await
+            .unwrap_err();
+
+        assert!(err.starts_with("syncing login roles: "), "{err}");
+        assert!(err.contains("aaa"), "{err}");
+        assert!(!err.contains("bbb"), "{err}");
+        let state = w.metadata.state();
+        let endpoint = &state.endpoints[&ep];
+        let bbb = endpoint.verifier("bbb").expect("bbb is written");
+        assert_ne!(bbb, SCRAM_B, "bbb has its fresh verifier");
+        assert!(endpoint.logins["bbb"].password_enc.is_some());
+        assert!(!endpoint.logins.contains_key("aaa"), "aaa isn't written");
     }
 
     #[tokio::test(start_paused = true)]

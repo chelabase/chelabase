@@ -15,4 +15,5 @@ export const PasswordState = {
   generated: 'generated',
   set_in_sql: 'set_in_sql',
   md5_unusable: 'md5_unusable',
+  unreadable: 'unreadable',
 } as const;

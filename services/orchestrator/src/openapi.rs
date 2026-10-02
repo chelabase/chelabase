@@ -190,6 +190,12 @@ impl MetadataPort for Doc {
     ) -> Result<Vec<BranchDatabase>, MetadataError> {
         match *self {}
     }
+    async fn branches_with_main_database(
+        &self,
+        ids: &[BranchId],
+    ) -> Result<std::collections::HashSet<BranchId>, MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]

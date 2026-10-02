@@ -12,11 +12,12 @@ use cheladb_nats::{
     ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RESET_NOT_APPLIED,
 };
 use cheladb_routes::{Service, ENDPOINTS};
+use cheladb_types::mode::Mode;
 use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use cheladb_secrets::{open_credential, seal_credential, Purpose, SecretKey};
 use cheladb_types::data_key::{self, DataKeyKind};
 use orchestrator::{build_router, AppState, JobPort, MetadataPort, ResetError, RestInternal};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,8 @@ struct FakeMetadata {
     missing_projects: Arc<Mutex<Vec<ProjectId>>>,
     /// The next `get_branch` fails with a database error.
     fail_get_branch: Arc<Mutex<bool>>,
+    /// `list_roles` fails with a database error while set.
+    fail_list_roles: Arc<Mutex<bool>>,
     databases: Arc<Mutex<HashMap<DatabaseId, DatabaseRecord>>>,
     branches: Arc<Mutex<HashMap<BranchId, BranchRecord>>>,
     overviews: Arc<Mutex<HashMap<TenantId, TenantOverview>>>,
@@ -48,6 +51,9 @@ struct FakeMetadata {
     branch_dbs: Arc<Mutex<HashMap<BranchId, Vec<BranchDatabase>>>>,
     /// `begin_branch_delete` protects this branch first: a flag set after the API's check.
     protect_on_delete: Arc<Mutex<Option<BranchId>>>,
+    /// Calls to `branch_databases` and to `branches_with_main_database`.
+    branch_db_queries: Arc<AtomicUsize>,
+    main_db_batch_queries: Arc<AtomicUsize>,
 }
 
 /// A database row and its main branch, which holds the endpoint and the sealed password.
@@ -631,6 +637,9 @@ impl MetadataPort for FakeMetadata {
     }
 
     async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
+        if *self.fail_list_roles.lock().unwrap() {
+            return Err(MetadataError::Config("injected".into()));
+        }
         Ok(self.roles.lock().unwrap().get(endpoint_id).cloned().unwrap_or_default())
     }
 
@@ -647,7 +656,18 @@ impl MetadataPort for FakeMetadata {
             .cloned())
     }
 
+    async fn branches_with_main_database(&self, ids: &[BranchId]) -> Result<HashSet<BranchId>, MetadataError> {
+        self.main_db_batch_queries.fetch_add(1, Ordering::SeqCst);
+        let dbs = self.branch_dbs.lock().unwrap();
+        Ok(ids
+            .iter()
+            .filter(|id| dbs.get(id).is_some_and(|rows| rows.iter().any(|d| d.origin == DatabaseOrigin::Main)))
+            .copied()
+            .collect())
+    }
+
     async fn branch_databases(&self, branch: BranchId) -> Result<Vec<BranchDatabase>, MetadataError> {
+        self.branch_db_queries.fetch_add(1, Ordering::SeqCst);
         let mut rows = self.branch_dbs.lock().unwrap().get(&branch).cloned().unwrap_or_default();
         rows.sort_by_key(|d| (d.origin != DatabaseOrigin::Main, d.name.clone()));
         Ok(rows)
@@ -854,6 +874,10 @@ async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
 const REST_TOKEN: &str = "rest-internal-token";
 
 async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str) -> TestApp {
+    spawn_app_in_mode(metadata, jobs, rest_url, Mode::SelfHosted).await
+}
+
+async fn spawn_app_in_mode(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, mode: Mode) -> TestApp {
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
     let state = Arc::new(AppState {
@@ -867,6 +891,8 @@ async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &
             token: REST_TOKEN.into(),
             http: reqwest::Client::new(),
         },
+        mode,
+        proxy_ca_file: ".cheladb/neon/proxy-ca.crt".into(),
     });
     let app: Router = build_router(state);
 
@@ -1435,6 +1461,34 @@ async fn reveal_ready_database_returns_decrypted_owner_credentials() {
         "postgresql://postgres:s3cret@ep-0123456789ab.localtest.me:4432/web1?sslmode=verify-full"
     );
     assert_eq!(body["http_url"], "https://ep-0123456789ab.localtest.me:4444/sql");
+}
+
+async fn reveal_in_mode(mode: Mode) -> serde_json::Value {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let app = spawn_app_in_mode(metadata.clone(), FakeJobs::default(), "http://127.0.0.1:9", mode).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    let resp = call(&app, reqwest::Method::GET, &format!("/v1/databases/{}/connection", id.as_uuid()), "org-1").await;
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+// C5: self-hosted mode names the dev CA's file; the URI is unchanged.
+#[tokio::test]
+async fn reveal_carries_the_ca_file_in_self_hosted_mode() {
+    let body = reveal_in_mode(Mode::SelfHosted).await;
+    assert_eq!(body["ca_file"], ".cheladb/neon/proxy-ca.crt");
+    assert!(body["uri"].as_str().unwrap().ends_with("?sslmode=verify-full"));
+}
+
+#[tokio::test]
+async fn reveal_has_no_ca_file_in_platform_mode() {
+    let body = reveal_in_mode(Mode::Platform).await;
+    assert!(body["ca_file"].is_null(), "{body}");
+    assert!(body["uri"].as_str().unwrap().ends_with("?sslmode=verify-full"));
 }
 
 // Review fix: a replaced secrets key gets an explicit message, not a bare 500.
@@ -3379,6 +3433,53 @@ async fn list_roles_shapes_and_blocked_keys() {
 }
 
 #[tokio::test]
+async fn list_roles_reports_unreadable() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role_row(&ep, role_row("lost", RoleOrigin::Api, RoleLevel::Plain, PasswordState::Unreadable));
+    let body: Value = t.send(Method::GET, &t.roles(dev), None).await.json().await.unwrap();
+    let row = body.as_array().unwrap().iter().find(|r| r["name"] == "lost").unwrap();
+    assert_eq!(row["password"], "unreadable");
+}
+
+// C10: a key says whether its role is owner-level (the data API refuses such a key), so Studio
+// needn't list the roles.
+#[tokio::test]
+async fn data_keys_mark_blocked_roles() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role_row(&ep, role_row("etl", RoleOrigin::Sql, RoleLevel::OwnerLevel, PasswordState::SetInSql));
+    t.metadata.add_role_row(&ep, role_row("app", RoleOrigin::Api, RoleLevel::Plain, PasswordState::Generated));
+    let (blocked, _) = t.seed_secret_key(dev, "ci", "etl");
+    let (plain, _) = t.seed_secret_key(dev, "web", "app");
+    let (gone, _) = t.seed_secret_key(dev, "ghost", "dropped");
+    let (public, _) = t.seed_public_key(dev);
+    let list = t.list_keys(dev).await;
+    let flag = |id: uuid::Uuid| list.iter().find(|k| k["id"] == json!(id)).unwrap()["role_blocked"].clone();
+    assert_eq!(flag(blocked), true);
+    assert_eq!(flag(plain), false);
+    assert_eq!(flag(gone), false);
+    assert_eq!(flag(public), false);
+}
+
+// A failing role lookup doesn't fail the key list: the flag is a hint, so every key answers
+// `role_blocked: false`.
+#[tokio::test]
+async fn data_keys_list_survives_a_failing_role_lookup() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role_row(&ep, role_row("etl", RoleOrigin::Sql, RoleLevel::OwnerLevel, PasswordState::SetInSql));
+    let (key, _) = t.seed_secret_key(dev, "ci", "etl");
+    *t.metadata.fail_list_roles.lock().unwrap() = true;
+    let list = t.list_keys(dev).await;
+    let entry = list.iter().find(|k| k["id"] == json!(key)).unwrap();
+    assert_eq!(entry["role_blocked"], false);
+}
+
+#[tokio::test]
 async fn create_role_takes_owner_level_and_refuses_privileged() {
     let t = branching().await;
     let dev = t.ready("dev");
@@ -3755,6 +3856,22 @@ async fn main_database_missing_is_reported() {
     let list: Vec<Value> = t.send(Method::GET, &t.branches(), None).await.json().await.unwrap();
     let dev_row = list.iter().find(|b| b["id"] == dev.as_uuid().to_string()).unwrap();
     assert_eq!(dev_row["main_database_missing"], false);
+}
+
+// C9: the list asks for the main databases of all its ready branches in one query.
+#[tokio::test]
+async fn list_branches_reads_databases_once() {
+    let t = branching().await;
+    let a = t.ready("a");
+    let b = t.ready("b");
+    t.ready("c");
+    t.metadata.add_branch_db(a, "web1", "postgres", DatabaseOrigin::Main);
+    let list: Vec<Value> = t.send(Method::GET, &t.branches(), None).await.json().await.unwrap();
+    let missing = |id: BranchId| list.iter().find(|x| x["id"] == id.as_uuid().to_string()).unwrap()["main_database_missing"].clone();
+    assert_eq!(missing(a), false);
+    assert_eq!(missing(b), true);
+    assert_eq!(t.metadata.main_db_batch_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(t.metadata.branch_db_queries.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -150,12 +150,12 @@ check "a failed pull says to log in or build" \
 
 # --- scripts/neon-smoke.sh (offline: nothing listens on port 1) ----------------------------
 status=0
-STORCON_URL=http://127.0.0.1:1 PAGESERVER_URL=http://127.0.0.1:1 \
+STORCON_URL=http://127.0.0.1:1 PAGESERVER_URL=http://127.0.0.1:1 NEON_SMOKE_MAX_TIME=3 \
   "$root/scripts/neon-smoke.sh" >/dev/null 2>"$stub/smoke-err" || status=$?
 check "smoke against a dead stack exits 1" test "$status" -eq 1
 check "smoke names the failing call" \
   grep -qF "FAIL: GET http://127.0.0.1:1/control/v1/safekeeper" "$stub/smoke-err"
-check "smoke passes on curl's own error" grep -qF "curl: (7)" "$stub/smoke-err"
+check "smoke passes on curl's own error" grep -qE "curl: \((7|28)\)" "$stub/smoke-err"
 
 # --- scripts/neon-smoke.sh cleanup (against a stub storage controller) --------------------
 if command -v python3 >/dev/null; then

@@ -141,6 +141,9 @@ pub enum PasswordState {
     SetInSql,
     /// An MD5 hash: the proxy can't use it.
     Md5Unusable,
+    /// Made by Cheladb, but the sealed password was dropped (it didn't open under the key in
+    /// use); a new password can be set.
+    Unreadable,
 }
 
 /// One `neon_roles` row with its secrets. Debug redacts the verifier and the sealed password.
@@ -317,7 +320,7 @@ pub struct EndpointState {
 type VersionedRoleRow = (i64, Option<String>, Option<String>);
 
 /// `list_roles`' row: name, origin, level, login, no verifier, sealed, pending, created, owner sealed.
-type RoleRowTuple = (String, String, String, bool, bool, bool, bool, DateTime<Utc>, bool);
+type RoleRowTuple = (String, String, String, bool, bool, bool, bool, DateTime<Utc>, bool, bool);
 
 /// `roles_version` and a left-joined row's columns, as [`copy_from_tuple`] reads them.
 type VersionedCopyRow = (
@@ -515,6 +518,7 @@ impl MetadataClient {
         let rows: Vec<RoleRowTuple> = sqlx::query_as(
             "SELECT r.name, r.origin, r.level, r.login, r.scram_verifier IS NULL,
                     r.password_enc IS NOT NULL, r.pending, r.created_at,
+                    r.password_unreadable,
                     coalesce((SELECT b.owner_password_enc IS NOT NULL FROM branches b
                               WHERE b.endpoint_id = r.endpoint_id LIMIT 1), false)
              FROM neon_roles r
@@ -526,12 +530,13 @@ impl MetadataClient {
         .await?;
         rows.into_iter()
             .map(
-                |(name, origin, level, login, md5, sealed, pending, created_at, owner_sealed)| {
+                |(name, origin, level, login, md5, sealed, pending, created_at, unreadable, owner_sealed)| {
                     let origin = RoleOrigin::parse(&origin)?;
                     let password = match origin {
                         RoleOrigin::Owner if owner_sealed => PasswordState::Generated,
                         RoleOrigin::Owner => PasswordState::SetInSql,
                         _ if md5 => PasswordState::Md5Unusable,
+                        _ if unreadable => PasswordState::Unreadable,
                         _ if sealed => PasswordState::Generated,
                         _ => PasswordState::SetInSql,
                     };
@@ -738,7 +743,7 @@ impl MetadataClient {
             return Ok(false);
         }
         let verified = sqlx::query(
-            "UPDATE neon_roles SET scram_verifier = $3, pending = true
+            "UPDATE neon_roles SET scram_verifier = $3, pending = true, password_unreadable = false
              WHERE endpoint_id = $1 AND name = $2 AND origin = 'owner'",
         )
         .bind(endpoint_id)
@@ -782,8 +787,8 @@ impl MetadataClient {
         let inserted = sqlx::query(
             "INSERT INTO neon_roles
                  (endpoint_id, name, scram_verifier, origin, level, api_owner_level, password_enc,
-                  pending)
-             VALUES ($1, $2, $3, 'api', $4, $5, $6, true)
+                  pending, password_unreadable)
+             VALUES ($1, $2, $3, 'api', $4, $5, $6, true, false)
              ON CONFLICT DO NOTHING",
         )
         .bind(endpoint_id)
@@ -818,7 +823,8 @@ impl MetadataClient {
             return Ok(false);
         }
         let updated = sqlx::query(
-            "UPDATE neon_roles SET scram_verifier = $3, password_enc = $4, pending = true
+            "UPDATE neon_roles SET scram_verifier = $3, password_enc = $4, pending = true,
+                 password_unreadable = false
              WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
         )
         .bind(endpoint_id)
@@ -895,6 +901,48 @@ impl MetadataClient {
         Ok(true)
     }
 
+    /// Lifts both resync guards of the endpoint: every role's `forwarded_at` and the endpoint's
+    /// `dbs_forwarded_at` become NULL (the catalog was replaced, so nothing in flight is
+    /// pending). Locks the endpoint row first, as the other writers do.
+    pub async fn clear_forwarded(&self, endpoint_id: &str) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_endpoint_row(&mut tx, endpoint_id).await?;
+        sqlx::query("UPDATE neon_roles SET forwarded_at = NULL WHERE endpoint_id = $1")
+            .bind(endpoint_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE neon_endpoints SET dbs_forwarded_at = NULL WHERE id = $1")
+            .bind(endpoint_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Marks a row whose sealed password was dropped (it didn't open): `password_enc` becomes
+    /// NULL and `password_unreadable` true, so [`PasswordState::Unreadable`] shows. Any later
+    /// write of a password or verifier to the row clears the mark. No such row is a no-op.
+    pub async fn mark_password_unreadable(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        if !lock_endpoint_row(&mut tx, endpoint_id).await? {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE neon_roles SET password_enc = NULL, password_unreadable = true
+             WHERE endpoint_id = $1 AND name = $2",
+        )
+        .bind(endpoint_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// The resync's one transaction. Locks the endpoint row; if `roles_version` isn't
     /// `read_version` nothing is written (`VersionMoved`). Otherwise applies `write`, skipping
     /// in SQL every row whose `forwarded_at` is under 10 s old (a DDL the receiver answered
@@ -937,7 +985,10 @@ impl MetadataClient {
                                     ELSE $8 END,
                      login = EXCLUDED.login,
                      level = EXCLUDED.level,
-                     pending = EXCLUDED.pending
+                     pending = EXCLUDED.pending,
+                     password_unreadable = CASE WHEN r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
+                                                  OR $7::int <> 0
+                                                THEN false ELSE r.password_unreadable END
                  WHERE r.origin <> 'owner'
                    AND (r.forwarded_at IS NULL OR r.forwarded_at <= now() - interval '10 seconds')
                    AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
@@ -1118,12 +1169,25 @@ pub(crate) async fn copy_count(
 }
 
 /// Sets the branch's `branch_databases` to exactly `observed`. True when anything changed.
+/// Does nothing while the endpoint's `dbs_forwarded_at` is under 10 s old.
 async fn set_databases(
     tx: &mut Transaction<'_, Postgres>,
     endpoint_id: &str,
     branch: BranchId,
     observed: &[ObservedDatabase],
 ) -> Result<bool, MetadataError> {
+    // A database DDL the receiver answered stamps the endpoint; the catalog read may not have
+    // seen its commit (and a drop leaves no row to stamp), so leave the rows alone for 10 s.
+    let recent: bool = sqlx::query_scalar(
+        "SELECT coalesce(dbs_forwarded_at > now() - interval '10 seconds', false)
+         FROM neon_endpoints WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if recent {
+        return Ok(false);
+    }
     let main: Option<String> = sqlx::query_scalar(
         "SELECT name FROM neon_databases WHERE endpoint_id = $1 ORDER BY name LIMIT 1",
     )

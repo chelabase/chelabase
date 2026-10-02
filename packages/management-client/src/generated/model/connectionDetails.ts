@@ -10,6 +10,12 @@ import type { PasswordState } from './passwordState.ts';
  * How to connect to a branch as one of its roles.
  */
 export interface ConnectionDetails {
+  /**
+     * Self-hosted mode only: the file holding the dev proxy's CA certificate, for
+     * `sslrootcert=` (the URI keeps `sslmode=verify-full`). Null in platform mode.
+     * @nullable
+     */
+  ca_file: string | null;
   database: string;
   host: string;
   http_url: string;
@@ -21,7 +27,8 @@ export interface ConnectionDetails {
   /**
      * `generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is
      * stored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy
-     * can't use; set a new password.
+     * can't use; set a new password. `unreadable`: the stored password could not be opened
+     * (a rename or branch copy dropped it); reset it.
      */
   password_state: PasswordState;
   /** @minimum 0 */

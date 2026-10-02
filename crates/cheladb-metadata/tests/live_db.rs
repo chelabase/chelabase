@@ -138,7 +138,7 @@ async fn link_branch(client: &MetadataClient, branch: BranchId) -> String {
     let ep = ep_id();
     let (tenant, timeline) = (hex32(), hex32());
     assert!(client
-        .create_endpoint_for_branch(branch, &timeline, &new_endpoint(&ep, &tenant, &timeline))
+        .create_endpoint_for_branch(branch, &timeline, &new_endpoint(&ep, &tenant, &timeline), false)
         .await
         .unwrap());
     ep
@@ -581,7 +581,7 @@ async fn create_endpoint_links_and_refuses_a_deleting_database() {
     let ep = ep_id();
     let (tenant, timeline) = (hex32(), hex32());
     let created = client
-        .create_endpoint_for_branch(main_of(id), &timeline, &new_endpoint(&ep, &tenant, &timeline))
+        .create_endpoint_for_branch(main_of(id), &timeline, &new_endpoint(&ep, &tenant, &timeline), false)
         .await
         .unwrap();
     let main = main_branch(&client, id).await;
@@ -592,7 +592,7 @@ async fn create_endpoint_links_and_refuses_a_deleting_database() {
     // Already linked: refused, and the second endpoint isn't written.
     let ep2 = ep_id();
     let again = client
-        .create_endpoint_for_branch(main_of(id), &timeline, &new_endpoint(&ep2, &tenant, &timeline))
+        .create_endpoint_for_branch(main_of(id), &timeline, &new_endpoint(&ep2, &tenant, &timeline), false)
         .await
         .unwrap();
     let ep2_written = endpoint_exists(&client, &ep2).await;
@@ -608,7 +608,7 @@ async fn create_endpoint_links_and_refuses_a_deleting_database() {
     for target in [main_of(deleting), main_of(deleted), BranchId::new()] {
         let ep = ep_id();
         let ok = client
-            .create_endpoint_for_branch(target, &timeline, &new_endpoint(&ep, &tenant, &timeline))
+            .create_endpoint_for_branch(target, &timeline, &new_endpoint(&ep, &tenant, &timeline), false)
             .await
             .unwrap();
         refused.push((ok, endpoint_exists(&client, &ep).await));
@@ -1393,7 +1393,7 @@ async fn begin_delete_racing_main_endpoint_never_deadlocks() {
     let ep_racer = ep.clone();
     let (delete, linked) = delete_holding_the_database_row(&client, id, move |c| async move {
         let (tenant, timeline) = (hex32(), hex32());
-        c.create_endpoint_for_branch(main_of(id), &timeline, &new_endpoint(&ep_racer, &tenant, &timeline)).await
+        c.create_endpoint_for_branch(main_of(id), &timeline, &new_endpoint(&ep_racer, &tenant, &timeline), false).await
     })
     .await;
     let written = endpoint_exists(&client, &ep).await;
@@ -3507,7 +3507,7 @@ async fn branch_copy_writes_role_copies_and_main_database() {
     ];
     let mut new = new_endpoint(&ep, &tenant, &timeline);
     new.role_copies = &copies;
-    assert!(client.create_endpoint_for_branch(main_of(id), &timeline, &new).await.unwrap());
+    assert!(client.create_endpoint_for_branch(main_of(id), &timeline, &new, false).await.unwrap());
     let rows = client.list_roles(&ep).await.unwrap();
     let (all, _) = client.role_copies(&ep).await.unwrap();
     let dbs = databases_of(&client, main_of(id)).await;
@@ -3582,4 +3582,273 @@ async fn begin_delete_refuses_with_a_protected_branch() {
     assert_eq!(branch_status, BranchStatus::Ready);
     assert_eq!(started, BeginDelete::Started);
     assert_eq!(again, BeginDelete::NotReady);
+}
+
+// ---- login-roles follow-ups (Task 1) ----
+
+async fn dbs_stamp_age_secs(client: &MetadataClient, ep: &str) -> Option<f64> {
+    sqlx::query_scalar(
+        "SELECT extract(epoch FROM now() - dbs_forwarded_at)::float8 FROM neon_endpoints WHERE id = $1",
+    )
+    .bind(ep)
+    .fetch_one(client.pool())
+    .await
+    .unwrap()
+}
+
+async fn set_dbs_stamp(client: &MetadataClient, ep: &str, secs_ago: Option<i32>) {
+    sqlx::query(
+        "UPDATE neon_endpoints SET dbs_forwarded_at = CASE WHEN $2::float8 IS NULL THEN NULL
+                                    ELSE now() - make_interval(secs => $2::float8) END WHERE id = $1",
+    )
+    .bind(ep)
+    .bind(secs_ago.map(f64::from))
+    .execute(client.pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn database_ddl_stamps_the_endpoint() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let fresh = dbs_stamp_age_secs(&client, &ep).await;
+    let mut seen = Vec::new();
+    for step in 0..3 {
+        set_dbs_stamp(&client, &ep, None).await;
+        let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+        match step {
+            0 => tx.upsert_database("extra", "postgres").await.unwrap(),
+            1 => assert!(tx.rename_database("extra", "extra2").await.unwrap()),
+            _ => assert!(tx.remove_database("extra2").await.unwrap()),
+        }
+        tx.commit().await.unwrap();
+        seen.push(dbs_stamp_age_secs(&client, &ep).await);
+    }
+    cleanup(&client, id).await;
+    assert!(fresh.is_none());
+    for age in seen {
+        assert!(age.is_some_and(|a| (0.0..5.0).contains(&a)), "{age:?}");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_skips_databases_after_a_recent_ddl() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let write = ResyncWrite {
+        upserts: vec![],
+        removals: vec![],
+        databases: vec![observed("db", "postgres", false), observed("kept", "postgres", false)],
+    };
+    set_dbs_stamp(&client, &ep, Some(1)).await;
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let skipped = databases_of(&client, branch).await.len();
+    set_dbs_stamp(&client, &ep, Some(11)).await;
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let applied = databases_of(&client, branch).await.len();
+    cleanup(&client, id).await;
+    assert_eq!(skipped, 1, "a stamp under 10 s old leaves branch_databases alone");
+    assert_eq!(applied, 2);
+}
+
+#[tokio::test]
+#[ignore]
+async fn clear_forwarded_lifts_both_guards() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), None).await;
+    set_forwarded(&client, &ep, "app", 1).await;
+    set_dbs_stamp(&client, &ep, Some(1)).await;
+    client.clear_forwarded(&ep).await.unwrap();
+    let roles_stamp: Option<f64> = sqlx::query_scalar(
+        "SELECT extract(epoch FROM forwarded_at)::float8 FROM neon_roles WHERE endpoint_id = $1 AND name = 'app'",
+    )
+    .bind(&ep)
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    let dbs_stamp = dbs_stamp_age_secs(&client, &ep).await;
+    cleanup(&client, id).await;
+    assert!(roles_stamp.is_none() && dbs_stamp.is_none());
+}
+
+#[tokio::test]
+#[ignore]
+async fn unreadable_password_state() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), Some("v1:a")).await;
+    let before = password_of(&client, &ep, "app").await;
+    client.mark_password_unreadable(&ep, "app").await.unwrap();
+    let marked = password_of(&client, &ep, "app").await;
+    assert!(client.replace_role_secret(&ep, "app", "SCRAM-SHA-256$b", "v1:b").await.unwrap());
+    let resealed = password_of(&client, &ep, "app").await;
+    // The receiver's path: mark inside the DDL transaction, then a new verifier clears it.
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.mark_password_unreadable("app").await.unwrap();
+    tx.commit().await.unwrap();
+    let marked_in_tx = password_of(&client, &ep, "app").await;
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.upsert_sql_copy("app", "SCRAM-SHA-256$c").await.unwrap();
+    tx.commit().await.unwrap();
+    let after_sql = password_of(&client, &ep, "app").await;
+    cleanup(&client, id).await;
+    assert_eq!(before, PasswordState::Generated);
+    assert_eq!(marked, PasswordState::Unreadable);
+    assert_eq!(resealed, PasswordState::Generated);
+    assert_eq!(marked_in_tx, PasswordState::Unreadable);
+    assert_eq!(after_sql, PasswordState::SetInSql);
+}
+
+async fn password_of(client: &MetadataClient, ep: &str, name: &str) -> PasswordState {
+    client.list_roles(ep).await.unwrap().into_iter().find(|r| r.name == name).unwrap().password
+}
+
+#[tokio::test]
+#[ignore]
+async fn endpoint_insert_refuses_a_changed_parent_protection() {
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let parent = main_of(id);
+    let b = new_branch(id, "child", parent);
+    assert_eq!(client.create_branch(&b).await.unwrap(), CreateBranchOutcome::Created);
+    assert!(client.set_branch_protected(parent, true).await.unwrap().is_some());
+    let (ep, tenant, timeline) = (ep_id(), hex32(), hex32());
+    let stale = client
+        .create_endpoint_for_branch(b.id, &timeline, &new_endpoint(&ep, &tenant, &timeline), false)
+        .await;
+    let linked_after_stale = branch(&client, b.id).await.endpoint_id.is_some();
+    let current = client
+        .create_endpoint_for_branch(b.id, &timeline, &new_endpoint(&ep, &tenant, &timeline), true)
+        .await;
+    cleanup(&client, id).await;
+    assert!(matches!(stale, Err(MetadataError::ParentProtectionChanged)), "{stale:?}");
+    assert!(!linked_after_stale);
+    assert!(matches!(current, Ok(true)), "{current:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn branches_with_main_database_in_one_query() {
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let with = ready_branch(&client, id, "with", main_of(id)).await;
+    let without = ready_branch(&client, id, "without", main_of(id)).await;
+    sqlx::query("DELETE FROM branch_databases WHERE branch_id = $1")
+        .bind(without.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let found = client
+        .branches_with_main_database(&[with, without, BranchId::new()])
+        .await
+        .unwrap();
+    let none = client.branches_with_main_database(&[]).await.unwrap();
+    cleanup(&client, id).await;
+    assert!(found.contains(&with) && !found.contains(&without) && found.len() == 1, "{found:?}");
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn resync_password_change_clears_the_unreadable_mark() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), Some("v1:a")).await;
+    client.mark_password_unreadable(&ep, "app").await.unwrap();
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    // The same verifier with the sealed value kept: still unreadable.
+    let same = ResyncWrite {
+        upserts: vec![upsert("app", RoleOrigin::Sql, "SCRAM-SHA-256$a")],
+        removals: vec![],
+        databases: vec![observed("db", "postgres", false)],
+    };
+    client.apply_resync(&ep, main_of(id), v, &same).await.unwrap();
+    let kept = password_of(&client, &ep, "app").await;
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let changed = ResyncWrite {
+        upserts: vec![upsert("app", RoleOrigin::Sql, "SCRAM-SHA-256$b")],
+        removals: vec![],
+        databases: vec![observed("db", "postgres", false)],
+    };
+    client.apply_resync(&ep, main_of(id), v, &changed).await.unwrap();
+    let after = password_of(&client, &ep, "app").await;
+    cleanup(&client, id).await;
+    assert_eq!(kept, PasswordState::Unreadable);
+    assert_eq!(after, PasswordState::SetInSql);
+}
+
+#[tokio::test]
+#[ignore]
+async fn rename_copy_keeps_the_unreadable_mark_when_nothing_was_resealed() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), Some("v1:a")).await;
+    client.mark_password_unreadable(&ep, "app").await.unwrap();
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.rename_copy("app", "app2", None).await.unwrap();
+    tx.commit().await.unwrap();
+    let kept = password_of(&client, &ep, "app2").await;
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.rename_copy("app2", "app3", Some("v1:fresh")).await.unwrap();
+    tx.commit().await.unwrap();
+    let resealed = password_of(&client, &ep, "app3").await;
+    cleanup(&client, id).await;
+    assert_eq!(kept, PasswordState::Unreadable);
+    assert_eq!(resealed, PasswordState::Generated);
+}
+
+/// The endpoint insert for a child branch takes the database row before any branch row, the
+/// order `begin_delete` uses. While another transaction holds the database row, the insert
+/// waits there and has not touched the child (or parent) branch row, so a third transaction
+/// can still lock those rows with NOWAIT. With the old order (child row first) that NOWAIT
+/// lock fails.
+#[tokio::test]
+#[ignore]
+async fn child_endpoint_insert_waits_on_the_database_row_before_branch_rows() {
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let parent = main_of(id);
+    let b = new_branch(id, "child", parent);
+    assert_eq!(client.create_branch(&b).await.unwrap(), CreateBranchOutcome::Created);
+
+    let mut holder = client.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM databases WHERE id = $1 FOR UPDATE")
+        .bind(id.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let (ep, tenant, timeline) = (ep_id(), hex32(), hex32());
+    let task = {
+        let client = client.clone();
+        let (timeline, ep, tenant) = (timeline.clone(), ep.clone(), tenant.clone());
+        tokio::spawn(async move {
+            client
+                .create_endpoint_for_branch(b.id, &timeline, &new_endpoint(&ep, &tenant, &timeline), false)
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let still_waiting = !task.is_finished();
+    let mut probe = client.pool().begin().await.unwrap();
+    let rows_free = sqlx::query(
+        "SELECT 1 FROM branches WHERE id = ANY($1) FOR NO KEY UPDATE NOWAIT",
+    )
+    .bind(vec![b.id.as_uuid(), parent.as_uuid()])
+    .fetch_all(&mut *probe)
+    .await;
+    probe.rollback().await.unwrap();
+    holder.commit().await.unwrap();
+    let linked = task.await.unwrap();
+    cleanup(&client, id).await;
+    assert!(still_waiting, "the insert should wait on the database row");
+    assert!(rows_free.is_ok(), "branch rows were locked before the database row: {rows_free:?}");
+    assert!(matches!(linked, Ok(true)), "{linked:?}");
 }

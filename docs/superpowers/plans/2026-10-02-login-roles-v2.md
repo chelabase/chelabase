@@ -21,7 +21,7 @@
 
 ## Status
 
-- **Current (2026-10-02): AT THE MERGE PAUSE. Step 6a is done on `login-roles` (`fca0934`) and nothing is merged; merge only when the user says.** Tasks 1–12, the Playwright pass, the end-of-step review, its fix batch and one follow-up fix are all done and re-reviewed clean. Final verification:
+- **Current (2026-10-02): MERGED into `main` (`c43a56d`) at the user's word. After the merge, `main` has 940/940 tests passing, clippy clean, Studio typecheck and 298/298. Step 6a is done.** The open follow-ups (below) go to a small chore branch later. Tasks 1–12, the Playwright pass, the end-of-step review, its fix batch and one follow-up fix are all done and re-reviewed clean. Final verification:
   - `cargo nextest run --workspace` 940/940, clippy (`-D warnings`) clean, `just check`, Studio build and tests, `live_db` 80/80;
   - live: `roles_live` 29/29 (plus a 4-test rerun after the last fix), `rest_live` 24/24, and the `role-e2e`, `data-e2e`, `neon-e2e` and `branch-e2e` runs.
   - The deps stack and `just dev` are still running from `.worktrees/login-roles`.
@@ -212,6 +212,7 @@
     - provisioning is slower on the new image;
     - the pre-existing `neon-test` curl check;
     - the revealed URI's `sslmode=verify-full` needs the dev CA in psql.
+  - These follow-ups are handled by the follow-up chore `docs/superpowers/plans/2026-10-02-login-roles-followups.md` (branch `login-roles-followups`).
 - **Note:** Task 1's live tests applied migration `20261004000001` to this machine's dev metadata database.
 - **Running:** `just dev` from `.worktrees/login-roles` (stop with `just dev-down` there). Deps stack up.
 

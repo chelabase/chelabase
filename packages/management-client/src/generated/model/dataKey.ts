@@ -20,4 +20,9 @@ export interface DataKey {
   name: string;
   prefix: string;
   role: string;
+  /**
+     * A secret key whose role is owner-level: the data API refuses it. Always false for the
+     * public key.
+     */
+  role_blocked: boolean;
 }

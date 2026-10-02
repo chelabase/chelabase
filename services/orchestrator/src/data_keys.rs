@@ -2,6 +2,7 @@
 //! schema as the data API sees it. Keys are shown once, except the public key, which is sealed
 //! so Studio can show it again.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,9 @@ use axum::{
     http::{StatusCode, header, header::CACHE_CONTROL},
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{BranchKind, BranchStatus, DataKeyRecord, MetadataError, NewDataKey};
+use cheladb_metadata::{
+    BranchKind, BranchStatus, DataKeyRecord, MetadataError, NewDataKey, RoleLevel,
+};
 use cheladb_secrets::{Purpose, open_credential, seal_credential};
 use cheladb_types::api_error::{ApiError, ErrorCode};
 use cheladb_types::{ApiPath, BranchId};
@@ -60,6 +63,9 @@ struct DataKey {
     last_used_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
+    /// A secret key whose role is owner-level: the data API refuses it. Always false for the
+    /// public key.
+    role_blocked: bool,
 }
 
 /// A key just made, with its plaintext.
@@ -81,7 +87,11 @@ fn no_store(mut response: Response) -> Response {
 }
 
 /// The branch's key row for the response, opening the public key's sealed value.
-fn summary(record: DataKeyRecord, secrets: &cheladb_secrets::SecretKey) -> Result<DataKey, ()> {
+fn summary(
+    record: DataKeyRecord,
+    secrets: &cheladb_secrets::SecretKey,
+    role_blocked: bool,
+) -> Result<DataKey, ()> {
     let key = match (record.kind, record.sealed.as_deref()) {
         (DataKeyKind::Public, Some(sealed)) => Some(
             open_credential(secrets, &record.id.to_string(), Purpose::DataKey, sealed)
@@ -98,6 +108,7 @@ fn summary(record: DataKeyRecord, secrets: &cheladb_secrets::SecretKey) -> Resul
         created_at: record.created_at,
         last_used_at: record.last_used_at,
         key,
+        role_blocked,
     })
 }
 
@@ -185,9 +196,26 @@ where
             return ApiError::internal().into_response();
         }
     };
+    // The owner-level roles, the same check as `blocked_keys` in `listRoles`.
+    let owner_level: HashSet<String> = match branch.endpoint_id.as_deref() {
+        None => HashSet::new(),
+        Some(endpoint) => match state.metadata.list_roles(endpoint).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| r.level == RoleLevel::OwnerLevel)
+                .map(|r| r.name)
+                .collect(),
+            Err(err) => {
+                // The flag is a hint for Studio; the keys themselves are fine.
+                warn!(branch_id = %branch.id, "list roles for data keys failed: {err}");
+                HashSet::new()
+            }
+        },
+    };
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
-        match summary(key, &state.secrets) {
+        let blocked = key.kind == DataKeyKind::Secret && owner_level.contains(&key.role);
+        match summary(key, &state.secrets, blocked) {
             Ok(s) => out.push(s),
             Err(()) => return ApiError::internal().into_response(),
         }

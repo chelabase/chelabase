@@ -9,7 +9,7 @@ mod hooks;
 mod proxy;
 mod spec;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::{self, Next};
@@ -32,7 +32,7 @@ use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
 /// The DDL receiver's body limit (T5): a forwarded delta is a few hundred bytes.
-const DDL_BODY_LIMIT: usize = 64 * 1024;
+pub(crate) const DDL_BODY_LIMIT: usize = 64 * 1024;
 
 /// The metadata the internal routes read. Abstracted so tests can use an in-memory fake.
 pub trait NeonMetadataPort: Send + Sync + 'static {
@@ -220,8 +220,9 @@ where
         )
         .route(
             "/compute/api/v2/computes/{id}/ddl",
-            // Reachable from every compute's network; a delta is a few hundred bytes.
-            patch(ddl::receive::<M, L>).layer(DefaultBodyLimit::max(DDL_BODY_LIMIT)),
+            // Reachable from every compute's network; the handler buffers the body (up to
+            // `DDL_BODY_LIMIT`) only after the compute token checks out.
+            patch(ddl::receive::<M, L>),
         )
         .merge(proxy)
         .merge(storcon)

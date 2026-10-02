@@ -12,6 +12,7 @@ const key = (over: Partial<DataKey> & { id: string; name: string }): DataKey => 
   prefix: "chk_sec_ab12",
   created_at: "2026-10-01T09:00:00Z",
   last_used_at: null,
+  role_blocked: false,
   ...over,
 });
 const publicKey = key({ id: "pub", name: "public", kind: "public", role: "anon", prefix: "chk_pub_zz99", key: "chk_pub_secretvalue" });
@@ -208,16 +209,11 @@ describe("DataApiKeys", () => {
   });
 
   it("blocked_key_badge", async () => {
-    const roleRow = (name: string, blocked: { id: string; name: string }[]) => ({
-      name, origin: "sql", level: blocked.length ? "owner_level" : "plain", login: true, password: "generated",
-      blocked_keys: blocked, pending: false, created_at: "2026-10-01T09:00:00Z",
-    });
-    setup(
-      { "GET /v1/databases/db/branches/br/roles": () => jsonResponse([roleRow("service", [{ id: "k2", name: "worker" }]), roleRow("authenticated", [])]) },
-    );
+    const f = setup({}, [publicKey, reporting, { ...worker, role_blocked: true }]).fetch;
     const row = within(await screen.findByRole("row", { name: /worker/ }));
-    expect(await row.findByText("Blocked")).toBeInTheDocument();
+    expect(row.getByText("Blocked")).toBeInTheDocument();
     expect(row.getByText("the role service can bypass row-level security")).toBeInTheDocument();
     expect(within(screen.getByRole("row", { name: /reporting/ })).queryByText("Blocked")).toBeNull();
+    expect(f.calls.some((r) => new URL(r.url).pathname.endsWith("/roles"))).toBe(false);
   });
 });

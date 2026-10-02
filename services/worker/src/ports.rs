@@ -50,6 +50,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         id: BranchId,
         timeline_id: &str,
         ep: &NewEndpoint<'_>,
+        parent_protected_seen: bool,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn set_neon_tenant(
         &self,
@@ -154,6 +155,19 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         read_version: i64,
         write: &ResyncWrite,
     ) -> impl Future<Output = Result<ResyncApplied, MetadataError>> + Send;
+    /// Lifts the endpoint's resync guards (`forwarded_at`, `dbs_forwarded_at`): its catalog
+    /// was replaced (C3). Unknown endpoint: a no-op.
+    fn clear_forwarded(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// A row whose sealed password was dropped: `password_enc` NULL, `password_unreadable`
+    /// true (C4).
+    fn mark_password_unreadable(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     /// Records the compute settings version the endpoint's compute was created with.
     fn set_compute_settings_version(
         &self,
@@ -335,8 +349,9 @@ impl WorkerMetadata for MetadataClient {
         id: BranchId,
         timeline_id: &str,
         ep: &NewEndpoint<'_>,
+        parent_protected_seen: bool,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::create_endpoint_for_branch(self, id, timeline_id, ep).await
+        MetadataClient::create_endpoint_for_branch(self, id, timeline_id, ep, parent_protected_seen).await
     }
 
     async fn set_neon_tenant(&self, db: DatabaseId, tenant: &str) -> Result<bool, MetadataError> {
@@ -463,6 +478,18 @@ impl WorkerMetadata for MetadataClient {
         write: &ResyncWrite,
     ) -> Result<ResyncApplied, MetadataError> {
         MetadataClient::apply_resync(self, endpoint_id, branch, read_version, write).await
+    }
+
+    async fn clear_forwarded(&self, endpoint_id: &str) -> Result<(), MetadataError> {
+        MetadataClient::clear_forwarded(self, endpoint_id).await
+    }
+
+    async fn mark_password_unreadable(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::mark_password_unreadable(self, endpoint_id, name).await
     }
 
     async fn set_compute_settings_version(

@@ -10,6 +10,7 @@
 //! Use `FOR NO KEY UPDATE`, never `FOR UPDATE`, on `databases`: inserting a branch takes a
 //! KEY SHARE lock on its database row (the foreign key), which `FOR UPDATE` would block.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use cheladb_types::{BranchId, DatabaseId, TenantId};
@@ -668,14 +669,23 @@ impl MetadataClient {
     /// One transaction: endpoint + role + database rows, link to the branch, and record
     /// timeline_id. False (nothing written) if the branch is deleting/deleted or already linked.
     /// For main, the database row also records the database name and owner role.
+    ///
+    /// `parent_protected_seen` is the parent's `protected` flag as the caller read it when it
+    /// chose the role copies; the transaction reads it again (`FOR SHARE`) and returns
+    /// [`MetadataError::ParentProtectionChanged`] (nothing written) when it differs. A branch
+    /// with no parent (main) skips the check.
+    ///
+    /// Lock order: the database row first (main's own row, or the child's database row), then
+    /// the branch rows, the same order `begin_delete` uses, so the two cannot deadlock.
     pub async fn create_endpoint_for_branch(
         &self,
         id: BranchId,
         timeline_id: &str,
         ep: &NewEndpoint<'_>,
+        parent_protected_seen: bool,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
-        lock_database_of_main(&mut tx, id).await?;
+        lock_database_of_branch(&mut tx, id).await?;
         let claimed: Option<Uuid> = sqlx::query_scalar(
             "SELECT database_id FROM branches
              WHERE id = $1 AND status NOT IN ('deleting', 'deleted') AND endpoint_id IS NULL
@@ -687,6 +697,16 @@ impl MetadataClient {
         let Some(database_id) = claimed else {
             return Ok(false);
         };
+        let parent_protected: Option<bool> = sqlx::query_scalar(
+            "SELECT p.protected FROM branches c JOIN branches p ON p.id = c.parent_branch_id
+             WHERE c.id = $1 FOR SHARE OF p",
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if parent_protected.is_some_and(|p| p != parent_protected_seen) {
+            return Err(MetadataError::ParentProtectionChanged);
+        }
         sqlx::query(
             "INSERT INTO neon_endpoints (id, tenant_id, timeline_id, compute_token_sha256)
              VALUES ($1, $2, $3, $4)",
@@ -762,6 +782,25 @@ impl MetadataClient {
         }
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Of `ids`, the branches that have a `branch_databases` row of origin `main`, in one query.
+    pub async fn branches_with_main_database(
+        &self,
+        ids: &[BranchId],
+    ) -> Result<HashSet<BranchId>, MetadataError> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let uuids: Vec<Uuid> = ids.iter().map(|b| b.as_uuid()).collect();
+        let found: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT branch_id FROM branch_databases
+             WHERE branch_id = ANY($1) AND origin = 'main'",
+        )
+        .bind(&uuids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(found.into_iter().map(BranchId).collect())
     }
 
     /// ready + sealed password + branched_at_lsn + history_start (`created_at` when `None`),

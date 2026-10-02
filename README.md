@@ -123,7 +123,7 @@ How it's wired:
 1. `just dev` (needs Docker; the worker starts each database's compute container)
 2. `just create-db-demo demo1` (positional; `name=demo1` would become the literal name)
 3. Poll `GET http://127.0.0.1:8000/v1/databases/<id>` with a minted Bearer token until `status` is `ready`
-4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.cheladb/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first
+4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.cheladb/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). `CHELADB_PROXY_CA_FILE` (default `.cheladb/neon/proxy-ca.crt`) only sets the path reported in `ca_file`; it doesn't change which CA the proxy uses.
 5. `DELETE http://127.0.0.1:8000/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset.
 
 ## Database lifecycle
@@ -168,7 +168,7 @@ Projects run their own migrations and setup scripts through Cheladb's proxy. `CR
 **What works in SQL:**
 - `CREATE ROLE <name> LOGIN PASSWORD <secret>`: the role can log in through the proxy. The password may be plain or a pre-hashed SCRAM verifier (see the password rules); an MD5 one is refused.
 - `ALTER ROLE <name> PASSWORD <secret>`: stored and synced to the proxy.
-- `ALTER ROLE <name> RENAME TO <new>`: the role's login works under its new name.
+- `ALTER ROLE <name> RENAME TO <new>`: the role's login works under its new name. A rename with `PASSWORD NULL` in the same transaction needs a compute image with fork task F3 (not pinned yet). With the current image the copy keeps its old password under the new name until the next periodic resync removes it; run `ALTER ROLE <new> PASSWORD NULL` in its own transaction to remove it at once.
 - `DROP ROLE <name>`: removed from the proxy's cache. Deleting a role while a live secret data key uses it is refused.
 - `GRANT <role> TO <app>`: role inheritance is active; `SET ROLE app` and `INHERIT` work after creation.
 - `CREATE DATABASE <name>`: tracked and shown in Studio. The cap per branch is `CHELADB_BRANCH_DATABASE_CAP` (default 20, range 1–1000).
@@ -180,8 +180,11 @@ Projects run their own migrations and setup scripts through Cheladb's proxy. `CR
 - `CHELADB_PASSWORD_STRENGTH` (self-hosted mode: `off` by default, opt-in `on`; platform mode: forced `on`): when on, at least 12 characters and an estimated 60 bits of entropy (character classes × length).
 - **MD5 passwords are refused** (`MD5 passwords can't be used through Cheladb; set a plain password`). A role that already has an MD5 password (from an older dump, say) is listed as unusable through the proxy until its password is reset.
 - A pre-hashed SCRAM password is **accepted in self-hosted mode** (strength rules don't apply to pre-hashed ones), and **refused in platform mode**.
+- **Unreadable password:** `unreadable` means a rename or a branch copy couldn't reseal the stored password, so it was dropped; reset the password. (A wrong secrets key instead gives a 500 `credentials_unavailable` when the password is revealed.) Studio shows "Stored password can't be read; reset it."
 - `PASSWORD NULL` removes a role's login copy; a group role with no password has no proxy copy.
 - `PASSWORD ''` (which Postgres takes as no password) fails in the compute with `Failed to get encrypted password: User "<name>" has no password assigned.`, and nothing changes; use `PASSWORD NULL` instead.
+- **Database DDL resync guard:** after any `CREATE DATABASE`, `ALTER DATABASE … RENAME` or `DROP DATABASE`, the resync leaves that branch's databases alone for 10 seconds. A restore or reset to parent clears this guard before the resync runs.
+- **Role repairs during resync:** a failing role repair (create, set password, owner attributes, or grant admin) is logged and skipped; other repairs continue. The resync returns an error naming the failed roles after all repairs complete.
 
 **The branch password rule:**
 - The owner `postgres` gets its own password on every branch.

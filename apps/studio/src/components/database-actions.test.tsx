@@ -28,6 +28,7 @@ const details = (password: string): ConnectionDetails => ({
   uri: uriFor(password),
   http_url: HTTP_URL,
   password_state: "generated",
+  ca_file: null,
 });
 
 const CONNECTION = "GET /v1/databases/d1/connection";
@@ -92,13 +93,21 @@ describe("DatabaseActions", () => {
     expect(writeText).toHaveBeenCalledWith(HTTP_URL);
   });
 
-  it("shows_the_local_dev_note", async () => {
-    setup({ [CONNECTION]: connection("s3cret") });
+  it("connection_shows_ca_file_hint", async () => {
+    setup({ [CONNECTION]: () => jsonResponse({ ...details("s3cret"), ca_file: ".cheladb/neon/proxy-ca.crt" }) });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     const note = await screen.findByText(/Local dev: pass the proxy's CA with/);
     expect(note).toHaveTextContent(
       "Local dev: pass the proxy's CA with sslrootcert=.cheladb/neon/proxy-ca.crt. If localtest.me resolves to ::1 first on your machine, add hostaddr=127.0.0.1.",
     );
+  });
+
+  it("no_ca_hint_without_ca_file", async () => {
+    setup({ [CONNECTION]: connection("s3cret") });
+    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
+    await screen.findByText("postgres");
+    expect(screen.queryByText(/sslrootcert/)).toBeNull();
+    expect(screen.getByText(/hostaddr=127\.0\.0\.1/)).toBeInTheDocument();
   });
 
   it("forgets revealed details when the panel is closed", async () => {
@@ -351,8 +360,22 @@ describe("DatabaseActions", () => {
       "GET /v1/databases/d1/branches": () => jsonResponse([{ ...branchB2, protected: true }]),
     });
     renderWithQuery(<DatabaseActions database={ready} />, { fetch: f });
-    const del = screen.getByRole("button", { name: "Delete" });
-    await vi.waitFor(() => expect(del).toBeDisabled());
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Delete permanently" })).toBeDisabled());
     expect(screen.getByText("A branch is protected")).toBeInTheDocument();
+    await userEvent.type(screen.getByRole("textbox"), "web1");
+    expect(screen.getByRole("button", { name: "Delete permanently" })).toBeDisabled();
+  });
+
+  it("branches_list_fetched_only_for_delete_panel", async () => {
+    const f = fakeFetch({ "GET /v1/databases/d1/branches": () => jsonResponse([branchB2]) });
+    renderWithQuery(<DatabaseActions database={ready} />, { fetch: f });
+    const listed = () => count(f, "GET /v1/databases/d1/branches");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(listed()).toBe(0);
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await vi.waitFor(() => expect(listed()).toBe(1));
+    await userEvent.type(screen.getByRole("textbox"), "web1");
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Delete permanently" })).toBeEnabled());
   });
 });

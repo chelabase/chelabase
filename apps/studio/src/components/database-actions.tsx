@@ -85,9 +85,11 @@ export function DatabaseActions({
   const dbRank = (d: { origin: string }) => (d.origin === "main" ? 0 : d.origin === "system" ? 2 : 1);
   const dbRows = [...(databases.data ?? [])].sort((a, b) => dbRank(a) - dbRank(b));
   const mainDb = dbRows.find((d) => d.main)?.name ?? "";
-  // The database-level Delete waits until no branch is protected.
-  const branchList = useListBranches(id, { query: { enabled: !branch && ready } });
+  // The branches are only listed once the Delete panel is open; its confirm button waits for
+  // the list and stays off while any branch is protected.
+  const branchList = useListBranches(id, { query: { enabled: !branch && ready && panel === "delete" } });
   const hasProtected = !branch && (branchList.data?.some((b) => b.protected) ?? false);
+  const branchesPending = !branch && branchList.data === undefined && !branchList.isError;
   function open(next: Panel) {
     setError(null);
     setNotice(null);
@@ -209,8 +211,7 @@ export function DatabaseActions({
           <Button
             size="sm"
             variant="outline"
-            disabled={database.status === "deleting" || hasProtected || busy}
-            title={hasProtected ? PROTECTED_DB_REASON : undefined}
+            disabled={database.status === "deleting" || busy}
             onClick={() => {
               setTypedName("");
               open("delete");
@@ -222,7 +223,6 @@ export function DatabaseActions({
         {children}
       </div>
       {below}
-      {hasProtected && <p className="text-xs text-muted-foreground">{PROTECTED_DB_REASON}</p>}
 
       {panel === "connection" && details && (
         <div className="space-y-2 rounded-lg border p-3 text-sm">
@@ -305,8 +305,12 @@ export function DatabaseActions({
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Local dev: pass the proxy&apos;s CA with <code>sslrootcert=.cheladb/neon/proxy-ca.crt</code>. If{" "}
-            <code>localtest.me</code> resolves to <code>::1</code> first on your machine, add{" "}
+            {details.ca_file && (
+              <>
+                Local dev: pass the proxy&apos;s CA with <code>sslrootcert={details.ca_file}</code>.{" "}
+              </>
+            )}
+            If <code>localtest.me</code> resolves to <code>::1</code> first on your machine, add{" "}
             <code>hostaddr=127.0.0.1</code>.
           </p>
         </div>
@@ -338,8 +342,14 @@ export function DatabaseActions({
               className="h-8 w-64 rounded-lg border border-input bg-background px-2"
             />
           </label>
+          {hasProtected && <p className="text-xs text-muted-foreground">{PROTECTED_DB_REASON}</p>}
+          {branchesPending && <p className="text-xs text-muted-foreground">Checking branches…</p>}
           <div className="flex gap-2">
-            <Button size="sm" disabled={busy || typedName !== database.name} onClick={() => void remove()}>
+            <Button
+              size="sm"
+              disabled={busy || typedName !== database.name || hasProtected || branchesPending}
+              onClick={() => void remove()}
+            >
               Delete permanently
             </Button>
             <Button size="sm" variant="outline" onClick={() => open("none")}>

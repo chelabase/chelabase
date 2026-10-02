@@ -381,6 +381,8 @@ pub mod fake {
         pub sql_failures_left: Mutex<u32>,
         /// `(needle, message)`: SQL containing the needle fails with the message.
         pub fail_sql_containing: Mutex<Option<(String, String)>>,
+        /// Needles set by [`FakeBackend::fail_when`].
+        fail_needles: Mutex<Vec<String>>,
         pub fail_delete: Mutex<Option<String>>,
         /// `control_addr` never answers, like a hung Docker daemon.
         pub hang_control_addr: Mutex<bool>,
@@ -404,6 +406,12 @@ pub mod fake {
         /// SQL containing `needle` answers `stdout` from now on.
         pub fn answer(&self, needle: &str, stdout: &str) {
             lock(&self.answers).push((needle.to_string(), stdout.to_string()));
+        }
+
+        /// From now on, SQL containing `needle` fails with "injected failure" (on top of any
+        /// earlier needles).
+        pub fn fail_when(&self, needle: &str) {
+            lock(&self.fail_needles).push(needle.to_string());
         }
 
         fn record(&self, entry: String) {
@@ -530,6 +538,9 @@ pub mod fake {
                 && sql.contains(&needle)
             {
                 bail!(message);
+            }
+            if lock(&self.fail_needles).iter().any(|n| sql.contains(n)) {
+                bail!("injected failure");
             }
             lock(&self.sql).push((
                 endpoint_id.to_string(),
@@ -765,6 +776,23 @@ mod tests {
         );
         assert_eq!(fake.admin_sql("ep-1", "app", "SELECT 1").await.unwrap(), "");
         assert_eq!(fake.status("ep-3").await.unwrap(), None);
+    }
+
+    // `fail_when`: every SQL containing one of the needles fails; the rest still runs.
+    #[tokio::test]
+    async fn the_fake_fails_sql_containing_any_needle() {
+        let fake = FakeBackend::default();
+        fake.fail_when("ALTER ROLE \"a\"");
+        fake.fail_when("ALTER ROLE \"b\"");
+        for name in ["a", "b"] {
+            let sql = format!("SET x;\nALTER ROLE \"{name}\" PASSWORD 'p';");
+            let err = fake.admin_sql("ep-1", "postgres", &sql).await.unwrap_err();
+            assert_eq!(err.to_string(), "injected failure");
+        }
+        fake.admin_sql("ep-1", "postgres", "ALTER ROLE \"c\" PASSWORD 'p';")
+            .await
+            .unwrap();
+        assert_eq!(fake.sql.lock().unwrap().len(), 1);
     }
 
     #[test]

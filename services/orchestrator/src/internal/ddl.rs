@@ -8,8 +8,8 @@
 //! A refusal never echoes a password: the texts name roles, databases, keys and settings only.
 
 use super::spec::authorize_compute;
-use super::{InternalState, NeonMetadataPort};
-use axum::body::Bytes;
+use super::{DDL_BODY_LIMIT, InternalState, NeonMetadataPort};
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -76,6 +76,10 @@ pub trait DdlPort: Send + Sized + 'static {
         &mut self,
         verifier: &str,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    fn mark_password_unreadable(
+        &mut self,
+        name: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     fn remove_copy(
         &mut self,
         name: &str,
@@ -135,6 +139,9 @@ impl DdlPort for cheladb_metadata::DdlTx {
     async fn set_owner_verifier(&mut self, verifier: &str) -> Result<(), MetadataError> {
         cheladb_metadata::DdlTx::set_owner_verifier(self, verifier).await
     }
+    async fn mark_password_unreadable(&mut self, name: &str) -> Result<(), MetadataError> {
+        cheladb_metadata::DdlTx::mark_password_unreadable(self, name).await
+    }
     async fn remove_copy(&mut self, name: &str) -> Result<bool, MetadataError> {
         cheladb_metadata::DdlTx::remove_copy(self, name).await
     }
@@ -183,8 +190,16 @@ struct RoleOp {
     op: Op,
     name: String,
     old_name: Option<String>,
-    password: Option<String>,
+    /// `None`: no key; `Some(None)`: an explicit JSON null (a rename that also sets
+    /// `PASSWORD NULL`).
+    #[serde(default, deserialize_with = "nullable")]
+    password: Option<Option<String>>,
     encrypted_password: Option<String>,
+}
+
+/// Tells an absent key (`None`, through `default`) from an explicit null (`Some(None)`).
+fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -260,12 +275,15 @@ fn steps(delta: &Delta) -> Vec<Step<'_>> {
         if r.op != Op::Set {
             continue;
         }
-        let password = r.password.as_deref().map(|plain| Password {
+        let password = r.password.as_ref().and_then(|p| p.as_deref()).map(|plain| Password {
             plain,
             // Neon sends both or neither; a missing hash fails the SCRAM check.
             encrypted: r.encrypted_password.as_deref().unwrap_or(""),
         });
-        if r.old_name.is_none() || password.is_some() {
+        // An explicit null next to `old_name` removes the copy (or is refused for the owner);
+        // without `old_name` it is the same as a missing password.
+        let explicit_null = matches!(r.password, Some(None));
+        if r.old_name.is_none() || password.is_some() || explicit_null {
             out.push(Step::SetRole {
                 name: &r.name,
                 password,
@@ -460,6 +478,7 @@ mod text {
     pub const UNKNOWN_ENDPOINT: &str = "unknown endpoint";
     pub const BUSY: &str = "role changes are busy; try again";
     pub const UNAVAILABLE: &str = "role changes are unavailable right now; try again";
+    pub const TOO_LARGE: &str = "request body too large";
     pub const OWNER_PASSWORD: &str =
         "the branch owner's password can't be removed; reset it instead";
 
@@ -559,7 +578,7 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
     State(state): State<Arc<InternalState<M, L>>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // The token first (the spec route's path and timing), so a caller without it learns
     // nothing about the body format.
@@ -569,6 +588,11 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
             _ => answer(StatusCode::SERVICE_UNAVAILABLE, text::UNAVAILABLE),
         };
     }
+    // Buffered only now, after the token (C6); an oversized body is still 413.
+    let body = match axum::body::to_bytes(body, DDL_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(_) => return answer(StatusCode::PAYLOAD_TOO_LARGE, text::TOO_LARGE),
+    };
     // The parse error isn't logged or returned: it can quote a value from the body.
     let Ok(delta) = serde_json::from_slice::<Delta>(&body) else {
         warn!(endpoint = %id, "ddl: malformed request body");
@@ -680,6 +704,7 @@ async fn apply<T: DdlPort>(
                     aside: None,
                     new: new.to_string(),
                     resealed: None,
+                    unreadable: false,
                 });
                 touch(new);
             }
@@ -690,6 +715,7 @@ async fn apply<T: DdlPort>(
                     aside: moved.then_some(aside),
                     new: new.to_string(),
                     resealed: None,
+                    unreadable: false,
                 });
                 continue;
             }
@@ -713,10 +739,10 @@ async fn apply<T: DdlPort>(
                 touch(name);
             }
             Action::RenameCopy { old, new, reseal } => {
-                let resealed = if reseal {
+                let (resealed, unreadable) = if reseal {
                     reseal_password(&mut tx, key, branch, old, new, endpoint).await?
                 } else {
-                    None
+                    (None, false)
                 };
                 let aside = aside_name(&tag, role_moves.len());
                 tx.rename_copy(old, &aside, resealed.as_deref()).await?;
@@ -724,6 +750,7 @@ async fn apply<T: DdlPort>(
                     aside: Some(aside),
                     new: new.to_string(),
                     resealed,
+                    unreadable,
                 });
                 touch(old);
                 touch(new);
@@ -760,6 +787,8 @@ struct Move {
     new: String,
     /// The sealed password for the new name (`rename_copy` sets it on each hop).
     resealed: Option<String>,
+    /// The old sealed password won't open: mark the row unreadable once it has its new name.
+    unreadable: bool,
 }
 
 /// The `i`-th rename's temporary name in one request: a control character, a per-request
@@ -798,6 +827,9 @@ async fn finish_role_moves<T: DdlPort>(tx: &mut T, moves: &mut Vec<Move>) -> Res
         if let Some(aside) = m.aside {
             tx.rename_copy(&aside, &m.new, m.resealed.as_deref())
                 .await?;
+            if m.unreadable {
+                tx.mark_password_unreadable(&m.new).await?;
+            }
         }
     }
     Ok(())
@@ -817,8 +849,9 @@ async fn finish_db_moves<T: DdlPort>(
 }
 
 /// The `api` row's sealed password, opened under `old`'s AAD and sealed under `new`'s. A
-/// value that won't open (or no branch to bind it to) is dropped with a warning: the copy
-/// still works, and the reveal then reports the password as set in SQL.
+/// value that won't open is dropped with a warning (the second field is then true, so the
+/// row gets marked `unreadable`); the copy still works. No branch to bind it to: dropped
+/// quietly.
 async fn reseal_password<T: DdlPort>(
     tx: &mut T,
     key: &SecretKey,
@@ -826,20 +859,20 @@ async fn reseal_password<T: DdlPort>(
     old: &str,
     new: &str,
     endpoint: &str,
-) -> Result<Option<String>, MetadataError> {
+) -> Result<(Option<String>, bool), MetadataError> {
     let sealed = tx.role(old).await?.and_then(|r| r.password_enc);
     let (Some(sealed), Some(branch)) = (sealed, branch) else {
-        return Ok(None);
+        return Ok((None, false));
     };
     let branch = branch.to_string();
     match open_role_password(key, &branch, old, &sealed) {
-        Ok(password) => Ok(Some(seal_role_password(key, &branch, new, &password))),
+        Ok(password) => Ok((Some(seal_role_password(key, &branch, new, &password)), false)),
         Err(e) => {
             warn!(
                 endpoint,
                 "ddl: a renamed role's sealed password won't open ({e}); dropped"
             );
-            Ok(None)
+            Ok((None, true))
         }
     }
 }

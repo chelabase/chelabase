@@ -30,8 +30,9 @@ async fn main() -> anyhow::Result<()> {
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
     let internal_config = InternalConfig::from_env()?;
     let signer = internal_config.load_signer()?;
+    let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
     let roles = RoleSettings::from_lookup(
-        Mode::from_env().map_err(anyhow::Error::msg)?,
+        mode,
         |name| std::env::var(name).ok(),
     )
     .map_err(anyhow::Error::msg)?;
@@ -75,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
             token: internal_config.rest_token.clone(),
             http: reqwest::Client::new(),
         },
+        mode,
+        proxy_ca_file: env_or("CHELADB_PROXY_CA_FILE", ".cheladb/neon/proxy-ca.crt"),
     };
 
     let app = build_router(Arc::new(state));

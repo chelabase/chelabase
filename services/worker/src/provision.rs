@@ -7,7 +7,7 @@ use cheladb_secrets::{Purpose, seal_credential};
 use cheladb_types::{BranchId, DatabaseId};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::names::sanitize_db_name;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
@@ -55,6 +55,21 @@ pub fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
+/// Milliseconds since `since`, for the timing logs.
+pub(crate) fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Logs (at debug) that `phase` of a provision or branch create took since `since`.
+pub(crate) fn phase_done(endpoint_id: &str, phase: &str, since: Instant) {
+    debug!(
+        endpoint_id,
+        phase,
+        elapsed_ms = elapsed_ms(since),
+        "phase done"
+    );
+}
+
 /// Everything step 2 generated and recorded. Once it exists, a failure tears down.
 struct Recorded {
     endpoint_id: String,
@@ -80,6 +95,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// Provisions `id`. A failure is recorded on the row (and everything built is torn down);
     /// `Err` only means metadata trouble, and the job is retried.
     pub async fn handle_provision(&self, id: DatabaseId, name: &str) -> Result<(), String> {
+        let started = Instant::now();
         info!(database_id = %id, %name, "provisioning database");
         match self.metadata.get_database(id).await {
             Ok(Some(existing)) if existing.status == DatabaseStatus::Ready => {
@@ -118,7 +134,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         // Steps 3-6.
         match self.build(id, &rec).await {
-            Ok(Built::Compute) => self.finish(id, &rec).await,
+            Ok(Built::Compute) => self.finish(id, &rec, started).await,
             Ok(Built::EndpointGone) => {
                 info!(database_id = %id, "endpoint row gone while provisioning; tearing down");
                 self.abandon_gone(id, &rec).await
@@ -169,7 +185,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         match self
             .metadata
-            .create_endpoint_for_branch(BranchId::from(id), rec.timeline.as_str(), &endpoint)
+            .create_endpoint_for_branch(BranchId::from(id), rec.timeline.as_str(), &endpoint, false)
             .await
         {
             Ok(true) => Ok(rec),
@@ -194,18 +210,22 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .set_neon_tenant(id, rec.tenant.as_str())
             .await
             .map_err(|e| format!("recording the tenant: {e}"))?;
+        let phase = Instant::now();
         self.storage
             .create_tenant(&rec.tenant)
             .await
             .map_err(|e| format!("creating tenant: {e:#}"))?;
+        phase_done(ep, "create_tenant", phase);
         // The history window (`pitr_interval`). Reconcile patches it if this fails.
         if let Err(err) = self.handle_database_settings(id).await {
             warn!(database_id = %id, "applying the history window failed; reconcile retries: {err}");
         }
+        let phase = Instant::now();
         self.storage
             .create_timeline(&rec.tenant, &rec.timeline)
             .await
             .map_err(|e| format!("creating timeline: {e:#}"))?;
+        phase_done(ep, "create_timeline", phase);
         // A delete that finished since step 2 found no tenant to delete, and took the
         // endpoint row with it: nothing else would ever remove this tenant.
         let endpoint = self
@@ -216,11 +236,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if endpoint.is_none() {
             return Ok(Built::EndpointGone);
         }
+        let phase = Instant::now();
         self.computes
             .create(ep, &rec.compute_token)
             .await
             .map_err(|e| format!("starting compute: {e:#}"))?;
+        phase_done(ep, "computes.create", phase);
+        let phase = Instant::now();
         self.wait_until_ready(ep, &rec.database_name).await?;
+        phase_done(ep, "wait_until_ready", phase);
+        let phase = Instant::now();
         self.computes
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
             .await
@@ -228,12 +253,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.bootstrap_data_api_on(BranchId::from(id), ep, &rec.database_name)
             .await
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
+        phase_done(ep, "bootstrap", phase);
         self.record_compute_settings(ep).await;
         // Lists the branch's databases (the system `postgres` one included) from the start. A
         // failure only logs: reconcile's resync catches up.
+        let phase = Instant::now();
         if let Err(err) = self.resync(BranchId::from(id)).await {
             warn!(database_id = %id, endpoint_id = %ep, "{err}; reconcile retries");
         }
+        phase_done(ep, "resync", phase);
         Ok(Built::Compute)
     }
 
@@ -265,7 +293,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Step 7: re-check for a delete that landed meanwhile, then `set_branch_ready` (which sets
     /// the database ready too).
-    async fn finish(&self, id: DatabaseId, rec: &Recorded) -> Result<(), String> {
+    async fn finish(&self, id: DatabaseId, rec: &Recorded, started: Instant) -> Result<(), String> {
         let current = match self.metadata.get_database(id).await {
             Ok(current) => current,
             Err(err) => {
@@ -298,7 +326,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             info!(database_id = %id, "no longer provisioning just before ready; tearing down");
             return self.abandon_gone(id, rec).await;
         }
-        info!(database_id = %id, endpoint_id = %rec.endpoint_id, "database ready");
+        info!(database_id = %id, endpoint_id = %rec.endpoint_id, elapsed_ms = elapsed_ms(started), "database ready");
         Ok(())
     }
 

@@ -2,18 +2,22 @@
 //! the data API roles and bootstrap inside it.
 
 use cheladb_metadata::{
-    BranchKind, BranchRecord, BranchStatus, NewEndpoint, NewRoleCopy, RoleLevel, RoleOrigin,
+    BranchKind, BranchRecord, BranchStatus, MetadataError, NewEndpoint, NewRoleCopy, RoleLevel,
+    RoleOrigin,
 };
 use cheladb_nats::PointInTime;
 use cheladb_neon::{ComputeBackend, Lsn, NeonId};
 use cheladb_secrets::{Purpose, open_role_password, seal_credential, seal_role_password};
 use cheladb_types::{BranchId, DatabaseId};
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use crate::Worker;
 use crate::branch_job::{Attempt, StepFailure};
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
-use crate::provision::{bootstrap_sql, new_compute_token, new_endpoint_id, sha256_hex};
+use crate::provision::{
+    bootstrap_sql, elapsed_ms, new_compute_token, new_endpoint_id, phase_done, sha256_hex,
+};
 use crate::resync::{FreshPasswords, SYSTEM_DATABASE};
 use crate::{OWNER_ROLE, credentials};
 
@@ -45,7 +49,13 @@ struct ChildCopy {
     api_owner_level: bool,
     /// A fresh password not yet set in the child's catalog.
     fresh: bool,
+    /// The parent's sealed password didn't open: the row is marked unreadable (C4).
+    unreadable: bool,
 }
+
+/// How many times step 3 re-reads the copies and inserts again after the parent's Protect
+/// flag changed underneath it (C8).
+const PROTECTION_RETRIES: usize = 2;
 
 /// How [`Worker::build_branch`] ended when nothing failed.
 enum Built {
@@ -82,6 +92,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         at: Option<PointInTime>,
         attempt: Attempt,
     ) -> Result<(), String> {
+        let started = Instant::now();
         let branch = self
             .metadata
             .get_branch(branch_id)
@@ -143,7 +154,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // Steps 4-7.
         match self.build_branch(&rec, &parent_timeline, lsn).await {
             Ok(Built::Compute) => {
-                self.finish_branch(branch_id, &rec, &parent_timeline, lsn)
+                self.finish_branch(branch_id, &rec, &parent_timeline, lsn, started)
                     .await
             }
             Ok(Built::EndpointGone) => {
@@ -195,22 +206,52 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Step 3: ids and secrets; the endpoint, its role and database, and the link to the
-    /// branch (with its new timeline id), in one transaction.
+    /// branch (with its new timeline id), in one transaction. The insert re-checks the
+    /// parent's Protect flag; when it changed since the copies were read, they're read again
+    /// (at most [`PROTECTION_RETRIES`] more times, C8).
     async fn record_branch_endpoint(
         &self,
         branch: &BranchRecord,
         tenant: NeonId,
     ) -> Result<Recorded, String> {
         let database_name = self.main_database_name(branch.database_id).await?;
+        let mut retries = 0;
+        loop {
+            match self
+                .try_record_branch_endpoint(branch, &tenant, &database_name)
+                .await
+            {
+                Err(MetadataError::ParentProtectionChanged) if retries < PROTECTION_RETRIES => {
+                    retries += 1;
+                    info!(branch_id = %branch.id, retries, "the parent's protection changed; reading its roles again");
+                }
+                Err(err) => return Err(format!("recording the endpoint: {err}")),
+                Ok(Ok(rec)) => return Ok(rec),
+                Ok(Err(err)) => return Err(err),
+            }
+        }
+    }
+
+    /// One try of [`Self::record_branch_endpoint`]: `Err` is the insert's error, `Ok(Err)`
+    /// any other failure.
+    async fn try_record_branch_endpoint(
+        &self,
+        branch: &BranchRecord,
+        tenant: &NeonId,
+        database_name: &str,
+    ) -> Result<Result<Recorded, String>, MetadataError> {
         // The parent's role copies (the owner's excluded: it gets its own password).
-        let (copies, protected) = self.child_role_copies(branch).await?;
+        let (copies, protected) = match self.child_role_copies(branch).await {
+            Ok(found) => found,
+            Err(err) => return Ok(Err(err)),
+        };
         let rec = Recorded {
             branch: branch.id,
             endpoint_id: new_endpoint_id(),
-            tenant,
+            tenant: tenant.clone(),
             timeline: NeonId::new(),
             compute_token: new_compute_token(),
-            database_name,
+            database_name: database_name.to_string(),
             password: credentials::generate_password(),
             protected,
             fresh: copies
@@ -244,21 +285,30 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             database_name: &rec.database_name,
             role_copies: &role_copies,
         };
-        match self
+        let recorded = self
             .metadata
-            .create_endpoint_for_branch(branch.id, rec.timeline.as_str(), &endpoint)
-            .await
-        {
-            Ok(true) => Ok(rec),
+            .create_endpoint_for_branch(branch.id, rec.timeline.as_str(), &endpoint, rec.protected)
+            .await?;
+        if !recorded {
             // Already linked by an interrupted attempt (or a delete began, and then the failure
             // writes nothing). Reconcile tears down the endpoint of a failed branch.
-            Ok(false) => Err(
+            return Ok(Err(
                 "recording the endpoint: a previous attempt was interrupted; its resources \
                  will be cleaned up"
                     .to_string(),
-            ),
-            Err(err) => Err(format!("recording the endpoint: {err}")),
+            ));
         }
+        for copy in copies.iter().filter(|c| c.unreadable) {
+            // Only the reveal is at stake: the row reads as "no password stored" meanwhile.
+            if let Err(e) = self
+                .metadata
+                .mark_password_unreadable(&rec.endpoint_id, &copy.name)
+                .await
+            {
+                warn!(branch_id = %branch.id, role = %copy.name, "marking the password unreadable: {e}");
+            }
+        }
+        Ok(Ok(rec))
     }
 
     /// Each non-owner row of `branch`'s parent, copied for `branch` (none when the parent has
@@ -303,6 +353,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     level: r.level,
                     api_owner_level: r.api_owner_level,
                     fresh: false,
+                    unreadable: false,
                 };
                 if protected && copy.verifier.is_some() {
                     let password = credentials::generate_password();
@@ -313,11 +364,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     match open_role_password(&self.key, &parent_aad, &copy.name, &sealed) {
                         Ok(password) => copy.sealed = Some(seal(&copy.name, &password)),
                         // The copy still works; only its reveal is lost.
-                        Err(e) => warn!(
-                            branch_id = %branch.id,
-                            role = %copy.name,
-                            "the parent's sealed password doesn't open ({e}); copied without it"
-                        ),
+                        Err(e) => {
+                            warn!(
+                                branch_id = %branch.id,
+                                role = %copy.name,
+                                "the parent's sealed password doesn't open ({e}); copied without it"
+                            );
+                            copy.unreadable = true;
+                        }
                     }
                 }
                 copy
@@ -360,10 +414,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         parent_timeline: &NeonId,
         lsn: Lsn,
     ) -> Result<Built, StepFailure> {
+        let phase = Instant::now();
         self.storage
             .create_branch_timeline(&rec.tenant, &rec.timeline, parent_timeline, lsn)
             .await
             .map_err(|e| StepFailure::storage("creating timeline", &e))?;
+        phase_done(&rec.endpoint_id, "create_timeline", phase);
         self.build_compute(rec)
             .await
             .map_err(StepFailure::permanent)
@@ -382,11 +438,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if endpoint.is_none() {
             return Ok(Built::EndpointGone);
         }
+        let phase = Instant::now();
         self.computes
             .create(ep, &rec.compute_token)
             .await
             .map_err(|e| format!("starting compute: {e:#}"))?;
+        phase_done(ep, "computes.create", phase);
+        let phase = Instant::now();
         self.wait_until_ready(ep, &rec.database_name).await?;
+        phase_done(ep, "wait_until_ready", phase);
+        let phase = Instant::now();
         // Only matters when the branch point predates the roles.
         self.computes
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
@@ -395,9 +456,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.bootstrap_data_api_on(rec.branch, ep, &rec.database_name)
             .await
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
+        phase_done(ep, "bootstrap", phase);
         // Before the resync, as in `recreate_compute`.
         self.record_compute_settings(ep).await;
+        let phase = Instant::now();
         self.sync_child_roles(rec).await?;
+        phase_done(ep, "resync", phase);
         Ok(Built::Compute)
     }
 
@@ -449,6 +513,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         rec: &Recorded,
         parent_timeline: &NeonId,
         lsn: Lsn,
+        started: Instant,
     ) -> Result<(), String> {
         let current = match self.metadata.get_branch(id).await {
             Ok(current) => current,
@@ -477,7 +542,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             info!(branch_id = %id, "no longer provisioning just before ready; tearing down");
             return self.abandon_branch_gone(id, rec).await;
         }
-        info!(branch_id = %id, endpoint_id = %rec.endpoint_id, %lsn, "branch ready");
+        info!(branch_id = %id, endpoint_id = %rec.endpoint_id, %lsn, elapsed_ms = elapsed_ms(started), "branch ready");
         Ok(())
     }
 
@@ -1404,7 +1469,8 @@ mod tests {
             .protected = true;
     }
 
-    /// The script that set the protected child's fresh passwords, on `dev_ep`.
+    /// The scripts that set the protected child's fresh passwords, on `dev_ep` (one per role,
+    /// C1), joined.
     fn fresh_script(w: &FakeWorker, dev_ep: &str) -> String {
         let sql = w.computes.sql.lock().unwrap().clone();
         let scripts: Vec<&String> = sql
@@ -1415,8 +1481,15 @@ mod tests {
             })
             .map(|(_, _, s)| s)
             .collect();
-        assert_eq!(scripts.len(), 1, "one script: {sql:?}");
-        scripts[0].clone()
+        assert!(!scripts.is_empty(), "no script: {sql:?}");
+        for script in &scripts {
+            assert_eq!(script.lines().count(), 2, "one role per script: {script}");
+        }
+        scripts
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The child's row for `name`: its verifier is new, its sealed password (the child's AAD)
@@ -1587,6 +1660,93 @@ mod tests {
             "{script}"
         );
         assert!(!script.contains(&verifier), "a fresh verifier: {script}");
+    }
+
+    fn count(journal: &Journal, prefix: &str) -> usize {
+        entries(journal)
+            .iter()
+            .filter(|e| e.starts_with(prefix))
+            .count()
+    }
+
+    // C8: Protect toggled between the copies' read and the insert refuses the insert; the
+    // copies are read again (now protected: fresh passwords) and the insert retried.
+    #[tokio::test]
+    async fn child_create_retries_on_changed_protection() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+        let parent: Vec<(&str, String)> = ["app", "sqlrole"]
+            .iter()
+            .map(|n| (*n, row(&w, &s.main_ep, n).unwrap().verifier.unwrap()))
+            .collect();
+        w.metadata.state().protection_flips = 1;
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        assert_eq!(count(&journal, "metadata.create_endpoint_for_branch"), 2);
+        let dev_ep = dev.endpoint_id.unwrap();
+        let script = fresh_script(&w, &dev_ep);
+        for (name, old) in &parent {
+            assert_fresh(&w, s.dev, &dev_ep, name, old, &script);
+        }
+        assert_eq!(w.metadata.endpoint_ids().len(), 2);
+    }
+
+    // C8: at most two retries; then the branch fails and nothing was recorded.
+    #[tokio::test]
+    async fn child_create_gives_up_when_protection_keeps_changing() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+        w.metadata.state().protection_flips = 3;
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Failed);
+        let error = dev.error.unwrap();
+        assert!(error.starts_with("recording the endpoint: "), "{error}");
+        assert_eq!(count(&journal, "metadata.create_endpoint_for_branch"), 3);
+        assert_eq!(w.metadata.endpoint_ids(), std::slice::from_ref(&s.main_ep));
+    }
+
+    // C4: a parent's sealed password that doesn't open is dropped from the copy (the copy
+    // still works), and the child's row is marked unreadable after the insert.
+    #[tokio::test]
+    async fn child_create_marks_unopenable_passwords_unreadable() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+        // Sealed for another branch: the parent's AAD doesn't open it.
+        let wrong = seal_role_password(&w.key, &BranchId::new().to_string(), "sqlrole", "pw");
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&s.main_ep)
+            .unwrap()
+            .logins
+            .get_mut("sqlrole")
+            .unwrap()
+            .password_enc = Some(wrong);
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        let dev_ep = dev.endpoint_id.unwrap();
+        let mark = pos(
+            &journal,
+            &format!("metadata.mark_password_unreadable {dev_ep} sqlrole"),
+        );
+        assert!(pos(&journal, "metadata.create_endpoint_for_branch") < mark);
+        assert_eq!(count(&journal, "metadata.mark_password_unreadable"), 1);
+        let sqlrole = row(&w, &dev_ep, "sqlrole").unwrap();
+        assert_eq!(sqlrole.sealed, None);
+        assert!(sqlrole.verifier.is_some(), "the copy still works");
+        let state = w.metadata.state();
+        let unreadable = &state.endpoints[&dev_ep].unreadable;
+        assert!(unreadable.contains("sqlrole"), "{unreadable:?}");
+        assert_eq!(unreadable.len(), 1, "{unreadable:?}");
     }
 
     #[tokio::test]

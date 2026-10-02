@@ -38,6 +38,15 @@ pub const STUCK_DETACH_SECS: i64 = 2 * cheladb_neon::storcon::DETACH_TIMEOUT.as_
 pub const INTERRUPTED: &str = "The last reset or restore was interrupted before it switched \
                                 timelines; the branch is unchanged. Try again.";
 
+/// Whether a re-created compute's catalog is the one it had before (C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Catalog {
+    /// The same timeline: forwarded DDL may still be in flight, the guards stay.
+    Kept,
+    /// A reset or restore switched the timeline: nothing forwarded applies any more.
+    Replaced,
+}
+
 /// The claimed branch's endpoint, tenant and current timeline.
 struct Target {
     id: BranchId,
@@ -284,8 +293,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// token's hash is written first (the compute's first spec request must already pass), then
     /// the container is created and waited for, then the role and data API bootstraps run (a
     /// restore can rewind both); then the endpoint records [`COMPUTE_SETTINGS_VERSION`], and
-    /// last the login-role resync runs.
+    /// last the login-role resync runs. The catalog is the one the compute had: the forwarded
+    /// guards stay (an upgrade, a missing compute, a restart on the old timeline).
     pub(crate) async fn recreate_compute(&self, branch: BranchId, ep: &str) -> Result<(), String> {
+        self.recreate_compute_with(branch, ep, Catalog::Kept).await
+    }
+
+    /// [`Self::recreate_compute`]; with [`Catalog::Replaced`] (after a reset or restore's
+    /// switch), the resync first lifts the forwarded guards (C3).
+    pub(crate) async fn recreate_compute_with(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        catalog: Catalog,
+    ) -> Result<(), String> {
         let database_name = self
             .metadata
             .neon_databases(ep)
@@ -316,7 +337,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // resync does, and a resync that keeps failing gets a plain `Resync` from reconcile,
         // not a re-creation every pass.
         self.record_compute_settings(ep).await;
-        self.resync_endpoint(branch, ep).await
+        self.resync_endpoint(branch, ep, catalog).await
     }
 
     /// Records that `ep`'s compute runs [`COMPUTE_SETTINGS_VERSION`]'s settings. A failure
@@ -332,13 +353,25 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// The resync under `ep`'s lock, through the system database (the main one may be
-    /// dropped).
-    pub(crate) async fn resync_endpoint(&self, branch: BranchId, ep: &str) -> Result<(), String> {
+    /// dropped). A [`Catalog::Replaced`] catalog has nothing in flight: the forwarded guards
+    /// are lifted first, under the same lock (C3).
+    pub(crate) async fn resync_endpoint(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        catalog: Catalog,
+    ) -> Result<(), String> {
         let _lock = self
             .metadata
             .lock_endpoint(ep)
             .await
             .map_err(|e| format!("syncing login roles: locking the endpoint: {e}"))?;
+        if catalog == Catalog::Replaced {
+            self.metadata
+                .clear_forwarded(ep)
+                .await
+                .map_err(|e| format!("syncing login roles: clearing the forwarded marks: {e}"))?;
+        }
         self.resync_locked(branch, ep, SYSTEM_DATABASE).await
     }
 
@@ -395,7 +428,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // Even when the pending timeline stays: the branch keeps working on its current one.
         let restarted = match self.computes.status(&target.ep).await {
             Ok(Some(_)) => Ok(()),
-            Ok(None) => self.recreate_compute(target.id, &target.ep).await,
+            Ok(None) => {
+                self.recreate_compute_with(target.id, &target.ep, Catalog::Replaced)
+                    .await
+            }
             Err(e) => Err(format!("starting compute: {e:#}")),
         };
         if self.gone_meanwhile(&target).await? {
@@ -937,7 +973,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Steps 7-9 of reset: the compute on the new timeline, then the old timeline goes.
     async fn finish_reset(&self, target: &Target, superseded: &NeonId) -> Result<(), String> {
-        if let Err(err) = self.recreate_compute(target.id, &target.ep).await {
+        if let Err(err) = self
+            .recreate_compute_with(target.id, &target.ep, Catalog::Replaced)
+            .await
+        {
             return self.fail_after_switch(target, err).await;
         }
         if self.gone_meanwhile(target).await? {
@@ -960,7 +999,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Steps 6-7 of restore: the compute on the restored timeline.
     async fn finish_restore(&self, target: &Target) -> Result<(), String> {
-        if let Err(err) = self.recreate_compute(target.id, &target.ep).await {
+        if let Err(err) = self
+            .recreate_compute_with(target.id, &target.ep, Catalog::Replaced)
+            .await
+        {
             return self.fail_after_switch(target, err).await;
         }
         if self.gone_meanwhile(target).await? {
@@ -1291,6 +1333,62 @@ mod tests {
         ];
         assert!(order.is_sorted(), "{:?}", entries(&journal));
         assert!(!has(&journal, "storage.delete_timeline"));
+    }
+
+    /// C3: the entry for `ep`'s guard clear comes right after a `lock_endpoint`, and the
+    /// resync's first read of the copies follows it.
+    fn assert_cleared_before_resync(journal: &Journal, ep: &str) {
+        let all = entries(journal);
+        let clear = pos(journal, &format!("metadata.clear_forwarded {ep}"));
+        assert!(clear > 0, "{all:?}");
+        assert_eq!(all[clear - 1], "metadata.lock_endpoint", "{all:?}");
+        let resync = all[clear..]
+            .iter()
+            .position(|e| *e == format!("metadata.role_copies {ep}"))
+            .unwrap_or_else(|| panic!("no resync after the clear: {all:?}"));
+        assert!(resync > 0, "{all:?}");
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.starts_with("metadata.clear_forwarded"))
+                .count(),
+            1,
+            "{all:?}"
+        );
+    }
+
+    // C3: a reset or restore replaced the catalog, so the forwarded guards are lifted under
+    // the endpoint's lock before the resync reads it.
+    #[tokio::test]
+    async fn restore_clears_the_forwarded_guard_before_resync() {
+        for flow in [Flow::Restore, Flow::Reset] {
+            let (w, journal) = worker();
+            let s = setup(&w, &journal).await;
+            claim(&w, s.dev);
+
+            run(&w, flow, s.dev).await.unwrap();
+
+            let dev = w.metadata.branch(s.dev);
+            assert_eq!(dev.status, BranchStatus::Ready, "{flow:?}: {:?}", dev.error);
+            assert_cleared_before_resync(&journal, &s.dev_ep);
+        }
+    }
+
+    // Restarting the compute on the old timeline (a failure before the switch) keeps the
+    // guards: the catalog wasn't replaced.
+    #[tokio::test]
+    async fn a_restart_before_the_switch_keeps_the_guard() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        claim(&w, s.dev);
+
+        w.recreate_compute(s.dev, &s.dev_ep).await.unwrap();
+
+        assert!(position(&journal, "metadata.role_copies").is_some());
+        assert!(
+            position(&journal, "metadata.clear_forwarded").is_none(),
+            "{:?}",
+            entries(&journal)
+        );
     }
 
     fn created_all_at(w: &FakeWorker, at: &str) {

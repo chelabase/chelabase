@@ -121,6 +121,38 @@ impl Branch {
     }
 }
 
+/// A ready `normal` branch with an endpoint is the one that should have a `main` row.
+fn main_database_expected(b: &BranchRecord) -> bool {
+    b.kind == BranchKind::Normal && b.status == BranchStatus::Ready && b.endpoint_id.is_some()
+}
+
+/// Of the list's branches that should have one, those that do, in one query. `None` when
+/// nothing was asked or the lookup failed (logged): every branch then reads as present.
+async fn branches_with_main_database<M, J>(
+    state: &AppState<M, J>,
+    branches: &[BranchRecord],
+) -> Option<std::collections::HashSet<BranchId>>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let ids: Vec<BranchId> = branches
+        .iter()
+        .filter(|b| main_database_expected(b))
+        .map(|b| b.id)
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    match state.metadata.branches_with_main_database(&ids).await {
+        Ok(set) => Some(set),
+        Err(err) => {
+            warn!("load branch databases: {err}");
+            None
+        }
+    }
+}
+
 /// Whether a ready `normal` branch has no `main` row in `branch_databases`. A branch that
 /// isn't ready has nothing recorded yet, and a failed lookup is logged and reads as present.
 async fn main_database_missing<M, J>(state: &AppState<M, J>, b: &BranchRecord) -> bool
@@ -128,7 +160,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    if b.kind != BranchKind::Normal || b.status != BranchStatus::Ready || b.endpoint_id.is_none() {
+    if !main_database_expected(b) {
         return false;
     }
     match state.metadata.branch_databases(b.id).await {
@@ -299,10 +331,15 @@ where
     };
     match state.metadata.list_branches(record.database_id).await {
         Ok(branches) => {
-            let mut views = Vec::with_capacity(branches.len());
-            for b in branches {
-                views.push(branch_view(&state, b).await);
-            }
+            let with_main = branches_with_main_database(&state, &branches).await;
+            let views: Vec<Branch> = branches
+                .into_iter()
+                .map(|b| {
+                    let missing = main_database_expected(&b)
+                        && with_main.as_ref().is_some_and(|set| !set.contains(&b.id));
+                    Branch::new(b, &state.proxy_domain, missing)
+                })
+                .collect();
             Json(views).into_response()
         }
         Err(err) => {

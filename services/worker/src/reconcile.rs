@@ -1781,6 +1781,67 @@ mod tests {
         }
     }
 
+    // C3: reconcile's end of a reset or restore lifts the forwarded guards before its resync.
+    #[tokio::test]
+    async fn finish_switch_clears_the_guard_before_resync() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let new = crash_before_switch(&w, &d);
+        let switched = futures_util::FutureExt::now_or_never(
+            w.metadata.switch_to_pending_timeline(d.dev, &new, None),
+        )
+        .expect("the fake never waits");
+        assert!(switched.unwrap());
+        set_branch(&w, d.dev, BranchStatus::Resetting, STALE_PROVISION_SECS + 1);
+        journal.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Ready);
+        let all = entries(&journal);
+        let clear = pos(&journal, &format!("metadata.clear_forwarded {}", d.ep));
+        assert_eq!(all[clear - 1], "metadata.lock_endpoint", "{all:?}");
+        assert!(
+            all[clear..].contains(&format!("metadata.role_copies {}", d.ep)),
+            "{all:?}"
+        );
+    }
+
+    // C3: an upgrade or a missing compute's re-creation keeps the catalog, so the forwarded
+    // guards stay.
+    #[tokio::test]
+    async fn upgrade_does_not_clear_the_guard() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        journal.lock().unwrap().clear();
+
+        w.execute(&Action::UpgradeCompute(d.dev, d.ep.clone()))
+            .await
+            .unwrap();
+        w.computes.remove(&d.ep);
+        w.execute(&Action::RecreateBranchCompute(d.dev, d.ep.clone()))
+            .await
+            .unwrap();
+
+        let all = entries(&journal);
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.starts_with(&format!("compute.create {}", d.ep)))
+                .count(),
+            2,
+            "{all:?}"
+        );
+        assert!(
+            all.iter().any(|e| e.starts_with("metadata.role_copies")),
+            "{all:?}"
+        );
+        assert!(
+            !all.iter()
+                .any(|e| e.starts_with("metadata.clear_forwarded")),
+            "{all:?}"
+        );
+    }
+
     // A crash between creating the pending timeline and the switch: the pending timeline is
     // cleared (compare-and-swap) before it's deleted, the compute comes back on the old
     // timeline, and the branch is ready again.

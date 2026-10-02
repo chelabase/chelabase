@@ -3255,9 +3255,17 @@
           "password",
           "password_state",
           "uri",
-          "http_url"
+          "http_url",
+          "ca_file"
         ],
         "properties": {
+          "ca_file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Self-hosted mode only: the file holding the dev proxy's CA certificate, for\n`sslrootcert=` (the URI keeps `sslmode=verify-full`). Null in platform mode."
+          },
           "database": {
             "type": "string"
           },
@@ -3276,7 +3284,7 @@
           },
           "password_state": {
             "$ref": "#/components/schemas/PasswordState",
-            "description": "`generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is\nstored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy\ncan't use; set a new password."
+            "description": "`generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is\nstored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy\ncan't use; set a new password. `unreadable`: the stored password could not be opened\n(a rename or branch copy dropped it); reset it."
           },
           "port": {
             "type": "integer",
@@ -3469,7 +3477,8 @@
           "name",
           "prefix",
           "created_at",
-          "last_used_at"
+          "last_used_at",
+          "role_blocked"
         ],
         "properties": {
           "created_at": {
@@ -3504,6 +3513,10 @@
           },
           "role": {
             "type": "string"
+          },
+          "role_blocked": {
+            "type": "boolean",
+            "description": "A secret key whose role is owner-level: the data API refuses it. Always false for the\npublic key."
           }
         }
       },
@@ -3852,7 +3865,8 @@
         "enum": [
           "generated",
           "set_in_sql",
-          "md5_unusable"
+          "md5_unusable",
+          "unreadable"
         ]
       },
       "PointInTime": {

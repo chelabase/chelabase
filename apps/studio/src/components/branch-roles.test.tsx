@@ -29,6 +29,7 @@ const details = (user: string, password: string): ConnectionDetails => ({
   user,
   password,
   password_state: "generated",
+  ca_file: null,
   http_url: "https://ep-aaaaaaaaaaaa.localtest.me",
   uri: `postgres://${user}:${password}@ep-aaaaaaaaaaaa.localtest.me:4432/neondb`,
 });
@@ -119,6 +120,18 @@ describe("BranchRoles", () => {
     const section = await screen.findByRole("region", { name: "Connection for analyst" });
     expect(within(section).getAllByText("Password set in SQL — reset to get a revealable one").length).toBe(1);
     expect(within(section).queryByRole("button", { name: "Copy password" })).not.toBeInTheDocument();
+  });
+
+  it("role_reveal_shows_ca_file_hint", async () => {
+    setup(
+      { [`GET ${CONNECTION}`]: () => jsonResponse({ ...details("cheladb_owner", "pw-xyz"), ca_file: ".cheladb/neon/proxy-ca.crt" }) },
+      [owner, reader],
+    );
+    await userEvent.click((await rowOf("cheladb_owner")).getByRole("button", { name: "Reveal cheladb_owner" }));
+    const section = await screen.findByRole("region", { name: "Connection for cheladb_owner" });
+    expect(within(section).getByText(/Local dev: pass the proxy's CA with/)).toHaveTextContent(
+      "sslrootcert=.cheladb/neon/proxy-ca.crt",
+    );
   });
 
   it("polls_while_a_role_is_pending", async () => {

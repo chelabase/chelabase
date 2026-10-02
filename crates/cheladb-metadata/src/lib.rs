@@ -133,6 +133,10 @@ pub enum MetadataError {
     DuplicateDatabaseName,
     #[error("invalid status: {0}")]
     InvalidStatus(String),
+    /// The parent's `protected` flag changed between choosing a child's role copies and
+    /// recording its endpoint; the copies must be chosen again.
+    #[error("the parent branch's protection changed")]
+    ParentProtectionChanged,
     #[error("invalid branch kind: {0}")]
     InvalidBranchKind(String),
     /// A branch this write would insert has the name of a live one (`branches_live_name`).

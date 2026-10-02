@@ -76,6 +76,8 @@ struct DdlState {
     keys: Vec<(uuid::Uuid, String, String, bool)>,
     /// `set_owner_verifier` cleared the branch's sealed owner password.
     owner_password_cleared: bool,
+    /// Rows `mark_password_unreadable` was called for.
+    unreadable: std::collections::BTreeSet<String>,
     roles_version: u64,
 }
 
@@ -167,6 +169,14 @@ impl DdlPort for FakeDdl {
             self.state.owner_password_cleared = true;
         }
         self.wrote = true;
+        Ok(())
+    }
+    async fn mark_password_unreadable(&mut self, name: &str) -> Result<(), MetadataError> {
+        if let Some(r) = self.state.roles.get_mut(name) {
+            r.password_enc = None;
+            self.state.unreadable.insert(name.into());
+            self.wrote = true;
+        }
         Ok(())
     }
     async fn remove_copy(&mut self, name: &str) -> Result<bool, MetadataError> {
@@ -1427,7 +1437,7 @@ async fn ddl_needs_the_compute_token() {
         assert!(ctype.starts_with("text/plain"), "{ctype}");
         assert_eq!(text, "compute token refused");
     }
-    // The token is checked before the body is read.
+    // The token is checked before the body is buffered.
     assert_eq!(app.ddl("ep-d", None, "not json").await.0, 401);
     assert_eq!(neon.begins.load(Ordering::SeqCst), 0);
     assert!(!neon.ddl_state().roles.contains_key("app_rw"));
@@ -2207,6 +2217,104 @@ async fn ddl_body_is_limited_to_64_kib() {
     assert_eq!(status, 200);
     let (status, _, _) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &padded(64 * 1024 + 1)).await;
     assert_eq!(status, 413);
+}
+
+// C6: the token is checked before the body is buffered. A raw request announces a body over
+// the limit but never sends it: without the token the answer is 401 (not 413) and arrives
+// while the body is still unread.
+#[tokio::test]
+async fn ddl_token_is_checked_before_the_body_is_buffered() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+    let addr = app.base.trim_start_matches("http://").to_string();
+    for (auth, expected) in [("", "401"), ("Authorization: Bearer wrong\r\n", "401")] {
+        let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "PATCH /compute/api/v2/computes/ep-d/ddl HTTP/1.1\r\nHost: x\r\n{auth}\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            64 * 1024 + 1
+        );
+        sock.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 12];
+        tokio::time::timeout(std::time::Duration::from_secs(5), sock.read_exact(&mut buf))
+            .await
+            .expect("answered without the body")
+            .unwrap();
+        assert_eq!(&buf[9..12], expected.as_bytes(), "{auth}");
+    }
+}
+
+// C7: an explicit `"password": null` next to `old_name` is a rename that removes the copy.
+#[tokio::test]
+async fn ddl_rename_with_explicit_null_password_removes_the_copy() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| {
+        s.roles
+            .insert("r1".into(), copy("r1", RoleOrigin::Sql, Some(SCRAM), None));
+    });
+    let body = roles_delta(vec![
+        json!({ "op": "set", "name": "r2", "old_name": "r1", "password": null }),
+    ]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let state = neon.ddl_state();
+    assert!(!state.roles.contains_key("r1"));
+    assert!(!state.roles.contains_key("r2"));
+}
+
+// C7 and E8: the owner can't lose its password, with or without a rename.
+#[tokio::test]
+async fn ddl_rename_with_explicit_null_on_the_owner_is_refused() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let body = roles_delta(vec![json!({ "op": "set", "name": "postgres", "password": null })]);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await;
+    assert_eq!(status, 409);
+    assert_eq!(text, "the branch owner's password can't be removed; reset it instead");
+    let body = roles_delta(vec![
+        json!({ "op": "set", "name": "pg2", "old_name": "postgres", "password": null }),
+    ]);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await;
+    assert_eq!(status, 409);
+    assert_eq!(text, "the branch owner \"postgres\" can't be dropped or renamed");
+    assert!(neon.ddl_state().roles.contains_key("postgres"));
+}
+
+// C7: no `password` key at all is a plain rename; the copy (and its verifier) is kept.
+#[tokio::test]
+async fn ddl_rename_without_password_key_keeps_the_copy() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| {
+        s.roles
+            .insert("r1".into(), copy("r1", RoleOrigin::Sql, Some(SCRAM), None));
+    });
+    let body = roles_delta(vec![rename("r1", "r2")]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let state = neon.ddl_state();
+    assert!(!state.roles.contains_key("r1"));
+    assert_eq!(state.roles["r2"].scram_verifier.as_deref(), Some(SCRAM));
+}
+
+// C4: a sealed password that won't open is dropped and the row is marked unreadable.
+#[tokio::test]
+async fn ddl_rename_marks_an_unopenable_password_unreadable() {
+    let (neon, branch) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    // Sealed under another name's AAD, so it won't open for `api_r`.
+    let sealed =
+        cheladb_secrets::seal_role_password(&app.key, &branch.to_string(), "other", "the-secret");
+    neon.edit(|s| {
+        s.roles
+            .insert("api_r".into(), copy("api_r", RoleOrigin::Api, Some(SCRAM), Some(&sealed)));
+    });
+    let body = roles_delta(vec![rename("api_r", "api_r2")]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let state = neon.ddl_state();
+    assert!(state.roles["api_r2"].password_enc.is_none());
+    assert!(state.unreadable.contains("api_r2"));
+    assert!(!state.unreadable.contains("api_r"));
 }
 
 // T5: the owner's password set in SQL reaches the proxies too (at once and again later).

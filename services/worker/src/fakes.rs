@@ -58,6 +58,8 @@ pub struct FakeEndpoint {
     pub branch_databases: Vec<ObservedDatabase>,
     /// 0 for a new row, as the column's default.
     pub compute_settings_version: i32,
+    /// Rows marked `password_unreadable` (C4); a new verifier or sealed password unmarks.
+    pub unreadable: HashSet<String>,
 }
 
 /// A non-owner `neon_roles` row beyond its verifier.
@@ -141,6 +143,9 @@ pub struct FakeState {
     /// `delete_role_copy` finds the row already gone (removed meanwhile, say by a forwarded
     /// `DROP ROLE`).
     pub role_row_vanishes: bool,
+    /// The next N `create_endpoint_for_branch` calls first flip the parent's `protected`, as
+    /// a user toggling Protect between the read and the insert (C8).
+    pub protection_flips: u32,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -521,8 +526,23 @@ impl WorkerMetadata for FakeMetadata {
         id: BranchId,
         timeline_id: &str,
         ep: &NewEndpoint<'_>,
+        parent_protected_seen: bool,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("create_endpoint_for_branch")?;
+        // C8: the parent's flag is checked inside the insert; a change refuses it.
+        let parent_id = state.branches.get(&id).and_then(|b| b.parent_branch_id);
+        let flip = state.protection_flips > 0;
+        if flip {
+            state.protection_flips -= 1;
+        }
+        if let Some(parent) = parent_id.and_then(|p| state.branches.get_mut(&p)) {
+            if flip {
+                parent.protected = !parent.protected;
+            }
+            if parent.protected != parent_protected_seen {
+                return Err(MetadataError::ParentProtectionChanged);
+            }
+        }
         let database_id = match state.branches.get_mut(&id) {
             Some(b) if branch_live(b.status) && b.endpoint_id.is_none() => {
                 b.endpoint_id = Some(ep.id.to_string());
@@ -580,6 +600,7 @@ impl WorkerMetadata for FakeMetadata {
                     .collect(),
                 branch_databases: Vec::new(),
                 compute_settings_version: 0,
+                unreadable: HashSet::new(),
             },
         );
         Ok(true)
@@ -912,6 +933,9 @@ impl WorkerMetadata for FakeMetadata {
             row.login = up.login;
             row.level = up.level;
             row.pending = up.pending;
+            if before_verifier != up.verifier || matches!(up.password_enc, SealedChange::Set(_)) {
+                ep.unreadable.remove(&up.name);
+            }
             if before.as_ref() != Some(&row) || before_verifier != up.verifier {
                 ep.logins.insert(up.name.clone(), row);
                 ep.set_verifier(&up.name, up.verifier.as_deref());
@@ -920,6 +944,7 @@ impl WorkerMetadata for FakeMetadata {
         }
         for name in &write.removals {
             if owner.as_deref() != Some(name.as_str()) && ep.logins.remove(name).is_some() {
+                ep.unreadable.remove(name);
                 ep.set_verifier(name, None);
                 changed.push(name.clone());
             }
@@ -930,6 +955,34 @@ impl WorkerMetadata for FakeMetadata {
             ep.roles_version += 1;
         }
         Ok(ResyncApplied::Applied { changed })
+    }
+
+    async fn clear_forwarded(&self, endpoint_id: &str) -> Result<(), MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.clear_forwarded {endpoint_id}"),
+        );
+        drop(self.read("clear_forwarded")?);
+        Ok(())
+    }
+
+    async fn mark_password_unreadable(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<(), MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.mark_password_unreadable {endpoint_id} {name}"),
+        );
+        let mut state = self.read("mark_password_unreadable")?;
+        if let Some(ep) = state.endpoints.get_mut(endpoint_id)
+            && let Some(login) = ep.logins.get_mut(name)
+        {
+            login.password_enc = None;
+            ep.unreadable.insert(name.to_string());
+        }
+        Ok(())
     }
 
     async fn set_compute_settings_version(
