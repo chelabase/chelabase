@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
-import { configureManagementClient, consoleQueryExact, customFetch, parseExact } from "./fetch";
+import { configureManagementClient, consoleQueryExact, customFetch, parseExact, streamRequest } from "./fetch";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
   return new Response(body, { status, headers: { "content-type": type } });
@@ -139,5 +139,38 @@ describe("consoleQueryExact", () => {
     expect(init.method).toBe("POST");
     f.mockImplementationOnce(async () => res('{"error":{"code":"unknown_table","message":"m"}}', 404));
     await expect(consoleQueryExact("d", "b", { tree: {} })).rejects.toMatchObject({ code: "unknown_table" });
+  });
+});
+
+describe("streamRequest", () => {
+  it("streamRequest_throws_ApiError_on_409", async () => {
+    setup((async () => res('{"error":{"code":"sql_confirm_required","message":"Confirm","statements":["DROP TABLE t"]}}', 409)) as typeof fetch);
+    const e = await streamRequest("/v1/sql", { sql: "x" }, new AbortController().signal).catch((x) => x);
+    expect(e).toBeInstanceOf(ApiError);
+    expect(e).toMatchObject({ status: 409, code: "sql_confirm_required" });
+    expect((e as ApiError).extra).toEqual({ statements: ["DROP TABLE t"] });
+  });
+
+  it("streamRequest_calls_onUnauthorized_on_401", async () => {
+    const onUnauthorized = vi.fn(() => true);
+    setup((async () => res('{"error":{"code":"unauthorized","message":"No"}}', 401)) as typeof fetch, "tok", onUnauthorized);
+    const e = await streamRequest("/v1/sql", {}, new AbortController().signal).catch((x) => x);
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(e).toMatchObject({ status: 401, signInRestarted: true });
+  });
+
+  it("returns_the_body_stream_with_bearer_and_ndjson_accept", async () => {
+    const f = vi.fn(async () => res('{"t":"done"}\n', 200, "application/x-ndjson"));
+    setup(f as unknown as typeof fetch);
+    const stream = await streamRequest("/v1/sql", { a: 1 }, new AbortController().signal);
+    expect(await new Response(stream).text()).toBe('{"t":"done"}\n');
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/v1/sql");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBe('{"a":1}');
+    const h = new Headers(init.headers);
+    expect(h.get("authorization")).toBe("Bearer tok");
+    expect(h.get("content-type")).toBe("application/json");
+    expect(h.get("accept")).toContain("application/x-ndjson");
   });
 });

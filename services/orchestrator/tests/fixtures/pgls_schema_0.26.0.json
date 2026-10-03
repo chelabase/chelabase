@@ -1,0 +1,220 @@
+{
+  "columns": [
+    {
+      "class_kind": "OrdinaryTable",
+      "comment": null,
+      "default_expr": null,
+      "is_nullable": false,
+      "is_primary_key": true,
+      "is_unique": true,
+      "name": "id",
+      "number": 1,
+      "schema_name": "public",
+      "table_name": "notes",
+      "table_oid": 16400,
+      "type_id": 20,
+      "type_name": "int8",
+      "varchar_length": null
+    }
+  ],
+  "extensions": [
+    {
+      "comment": null,
+      "default_version": "1.0",
+      "installed_version": "1.0",
+      "name": "plpgsql",
+      "schema": "pg_catalog"
+    }
+  ],
+  "functions": [
+    {
+      "args": {
+        "args": [
+          {
+            "has_default": false,
+            "mode": "in",
+            "name": "x",
+            "type_id": 23
+          }
+        ]
+      },
+      "argument_types": "x integer",
+      "behavior": "Volatile",
+      "body": "begin return new; end",
+      "definition": "create function ...",
+      "id": 16500,
+      "identity_argument_types": "x integer",
+      "is_set_returning_function": false,
+      "kind": "Function",
+      "language": "plpgsql",
+      "name": "touch",
+      "return_type": "trigger",
+      "return_type_id": 2279,
+      "return_type_relation_id": null,
+      "schema": "public",
+      "security_definer": false
+    },
+    {
+      "args": {
+        "args": []
+      },
+      "argument_types": null,
+      "behavior": "Immutable",
+      "body": null,
+      "definition": null,
+      "id": 16501,
+      "identity_argument_types": null,
+      "is_set_returning_function": false,
+      "kind": "Aggregate",
+      "language": "internal",
+      "name": "total",
+      "return_type": "bigint",
+      "return_type_id": 20,
+      "return_type_relation_id": null,
+      "schema": "public",
+      "security_definer": true
+    }
+  ],
+  "indexes": [
+    {
+      "id": 16410,
+      "name": "notes_pkey",
+      "schema": "public",
+      "table_name": "notes"
+    }
+  ],
+  "policies": [
+    {
+      "command": "All",
+      "is_permissive": true,
+      "name": "own",
+      "role_names": [
+        "app"
+      ],
+      "schema_name": "public",
+      "security_qualification": "true",
+      "table_name": "notes",
+      "with_check": null
+    },
+    {
+      "command": "Delete",
+      "is_permissive": false,
+      "name": "no",
+      "role_names": [],
+      "schema_name": "public",
+      "security_qualification": null,
+      "table_name": "notes",
+      "with_check": null
+    }
+  ],
+  "roles": [
+    {
+      "can_bypass_rls": false,
+      "can_create_db": false,
+      "can_create_roles": false,
+      "can_login": true,
+      "comment": null,
+      "has_member": [],
+      "is_super_user": false,
+      "member_of": [],
+      "name": "app"
+    }
+  ],
+  "schemas": [
+    {
+      "allowed_creators": [],
+      "allowed_users": [
+        "app"
+      ],
+      "comment": null,
+      "function_count": 1,
+      "id": 2200,
+      "name": "public",
+      "owner": "pg",
+      "table_count": 1,
+      "total_size": "16 kB",
+      "view_count": 0
+    }
+  ],
+  "sequences": [
+    {
+      "id": 16420,
+      "name": "notes_id_seq",
+      "schema": "public"
+    }
+  ],
+  "tables": [
+    {
+      "bytes": 16384,
+      "comment": null,
+      "dead_rows_estimate": 0,
+      "id": 16400,
+      "live_rows_estimate": 3,
+      "name": "notes",
+      "replica_identity": "Full",
+      "rls_enabled": true,
+      "rls_forced": false,
+      "schema": "public",
+      "size": "16 kB",
+      "table_kind": "Ordinary"
+    }
+  ],
+  "triggers": [
+    {
+      "affected": "Row",
+      "events": [
+        "Insert",
+        "Update"
+      ],
+      "name": "t",
+      "proc_name": "touch",
+      "proc_schema": "public",
+      "table_name": "notes",
+      "table_schema": "public",
+      "timing": "Before"
+    }
+  ],
+  "types": [
+    {
+      "attributes": {
+        "attrs": []
+      },
+      "comment": null,
+      "enums": {
+        "values": [
+          "sad",
+          "ok"
+        ]
+      },
+      "format": "mood",
+      "id": 16600,
+      "name": "mood",
+      "schema": "public"
+    },
+    {
+      "attributes": {
+        "attrs": [
+          {
+            "name": "a",
+            "type_id": 23
+          }
+        ]
+      },
+      "comment": "c",
+      "enums": {
+        "values": []
+      },
+      "format": "pair",
+      "id": 16601,
+      "name": "pair",
+      "schema": "public"
+    }
+  ],
+  "version": {
+    "active_connections": 4,
+    "major_version": 17,
+    "max_connections": 100,
+    "version": "PostgreSQL 17.5",
+    "version_num": 170005
+  }
+}

@@ -81,6 +81,11 @@ aes-gcm = "0.11.1"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
 getrandom = "0.4.3"
 hex = "0.4.3"
+# Our fork of 0.7.18 (step 6d): simple queries expose command tags, the empty-query marker and
+# column types. Upstream PR pending; return to crates.io once it's released.
+tokio-postgres = { git = "https://github.com/ChelaDB/rust-postgres", rev = "b52c5ababff3dd453cf398d28f0405b91c970a8b", default-features = false, features = ["runtime"] }
+pg_query = "6.2.1"
+tokio-util = "0.7.19"
 moka = { version = "0.12.16", features = ["future", "sync"] }
 hmac = "0.13.0"
 pbkdf2 = "0.13.0"

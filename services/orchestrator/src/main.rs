@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "orchestrator=info,tower_http=info,cheladb_auth=info".into()),
+                .unwrap_or_else(|_| orchestrator::DEFAULT_LOG_FILTER.into()),
         )
         .init();
 
@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         console: Console::default(),
         zitadel: zitadel_admin(),
         users_db: Arc::new(PgUsersDb::new()),
+        sql_editor: Default::default(),
     };
 
     let app = build_router(Arc::new(state));

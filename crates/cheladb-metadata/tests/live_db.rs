@@ -16,6 +16,7 @@ use cheladb_metadata::{
     DataApiState, EnableStart, ServedDatabase,
     BeginEnable, BeginProjectDelete, NewAppSession, NewProjectAuth, OnDelete, ProjectStatus, RefreshNext,
     RefreshOutcome, RenameProject, AppUsersStatus,
+    SAVED_QUERY_CAP, SavedQuery, SavedQueryPatch, SavedQueryWrite,
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
 };
 use cheladb_types::data_key::{self, DataKeyKind};
@@ -114,6 +115,7 @@ async fn sweep_leftovers(client: &MetadataClient) {
         .await
         .unwrap();
     for sql in [
+        "DELETE FROM saved_queries WHERE database_id = ANY($1)",
         "DELETE FROM branches WHERE database_id = ANY($1)",
         "DELETE FROM databases WHERE id = ANY($1)",
     ] {
@@ -5216,4 +5218,120 @@ async fn tenant_overview_hides_deleted_projects() {
     assert_eq!(d.map(|(_, s)| s), Some(ProjectStatus::Deleting));
     assert!(g.is_none());
     assert_eq!(seed, Some(ProjectStatus::Active), "the seed project stays active");
+}
+
+// ---- saved queries
+
+fn saved(write: SavedQueryWrite) -> SavedQuery {
+    match write {
+        SavedQueryWrite::Saved(q) => q,
+        other => panic!("expected Saved, got {other:?}"),
+    }
+}
+
+async fn create_saved(client: &MetadataClient, db: DatabaseId, user: &str, name: &str) -> SavedQueryWrite {
+    client
+        .create_saved_query(db.as_uuid(), user, uuid::Uuid::new_v4(), name, "select 1", None, None)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore]
+async fn saved_query_round_trip() {
+    let client = client().await;
+    let db = insert_pending(&client).await;
+    let d = db.as_uuid();
+    let id = uuid::Uuid::new_v4();
+    let created = saved(
+        client.create_saved_query(d, "u1", id, "Beta", "select 2", Some("app"), Some("anon")).await.unwrap(),
+    );
+    saved(create_saved(&client, db, "u1", "alpha").await);
+    assert_eq!((created.version, created.pg_database.as_deref(), created.role.as_deref()), (1, Some("app"), Some("anon")));
+
+    let list = client.list_saved_queries(d, "u1").await.unwrap();
+    assert_eq!(list.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(), ["alpha", "Beta"]);
+    assert_eq!(client.get_saved_query(d, "u1", id).await.unwrap(), Some(created.clone()));
+    assert_eq!(client.get_saved_query(d, "u2", id).await.unwrap(), None);
+    assert!(client.list_saved_queries(d, "u2").await.unwrap().is_empty());
+
+    // null clears a hint, an absent field stays.
+    let patch = SavedQueryPatch { sql: Some("select 3".into()), role: Some(None), ..Default::default() };
+    let updated = saved(client.update_saved_query(d, "u1", id, 1, &patch).await.unwrap());
+    assert_eq!((updated.version, updated.sql.as_str(), updated.role.clone()), (2, "select 3", None));
+    assert_eq!((updated.pg_database.as_deref(), updated.name.as_str()), (Some("app"), "Beta"));
+    assert!(updated.updated_at >= created.updated_at);
+
+    assert!(!client.delete_saved_query(d, "u2", id).await.unwrap());
+    assert!(client.delete_saved_query(d, "u1", id).await.unwrap());
+    assert!(!client.delete_saved_query(d, "u1", id).await.unwrap());
+    cleanup(&client, db).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn saved_query_names_are_unique_per_user_case_insensitive() {
+    let client = client().await;
+    let db = insert_pending(&client).await;
+    saved(create_saved(&client, db, "u1", "Report").await);
+    assert_eq!(create_saved(&client, db, "u1", "REPORT").await, SavedQueryWrite::NameTaken);
+    saved(create_saved(&client, db, "u2", "report").await);
+    let other = saved(create_saved(&client, db, "u1", "other").await);
+    let patch = SavedQueryPatch { name: Some("rePort".into()), ..Default::default() };
+    let renamed = client.update_saved_query(db.as_uuid(), "u1", other.id, 1, &patch).await.unwrap();
+    assert_eq!(renamed, SavedQueryWrite::NameTaken);
+    cleanup(&client, db).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn saved_query_update_detects_stale_versions() {
+    let client = client().await;
+    let db = insert_pending(&client).await;
+    let d = db.as_uuid();
+    let q = saved(create_saved(&client, db, "u1", "q").await);
+    let patch = SavedQueryPatch { sql: Some("select 2".into()), ..Default::default() };
+    let first = saved(client.update_saved_query(d, "u1", q.id, 1, &patch).await.unwrap());
+    let again = client.update_saved_query(d, "u1", q.id, 1, &patch).await.unwrap();
+    assert_eq!(again, SavedQueryWrite::Stale(first));
+    let missing = client.update_saved_query(d, "u1", uuid::Uuid::new_v4(), 1, &patch).await.unwrap();
+    assert_eq!(missing, SavedQueryWrite::NotFound);
+    let foreign = client.update_saved_query(d, "u2", q.id, 2, &patch).await.unwrap();
+    assert_eq!(foreign, SavedQueryWrite::NotFound);
+    cleanup(&client, db).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn saved_query_cap_is_enforced() {
+    let client = client().await;
+    let db = insert_pending(&client).await;
+    sqlx::query(
+        "INSERT INTO saved_queries (id, database_id, user_id, name, sql)
+         SELECT gen_random_uuid(), $1, 'u1', 'q' || n, 'select 1' FROM generate_series(1, $2) n",
+    )
+    .bind(db.as_uuid())
+    .bind(SAVED_QUERY_CAP as i32)
+    .execute(client.pool())
+    .await
+    .unwrap();
+    assert_eq!(create_saved(&client, db, "u1", "one more").await, SavedQueryWrite::CapReached);
+    // The cap is per user.
+    saved(create_saved(&client, db, "u2", "mine").await);
+    cleanup(&client, db).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn saved_queries_cascade_with_their_database() {
+    let client = client().await;
+    let db = insert_pending(&client).await;
+    saved(create_saved(&client, db, "u1", "q").await);
+    cleanup(&client, db).await;
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM saved_queries WHERE database_id = $1")
+        .bind(db.as_uuid())
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }

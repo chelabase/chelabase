@@ -65,6 +65,13 @@ pub enum ErrorCode {
     UserTokenExpired,
     UserSessionRevoked,
     UserTokenWithSecretKey,
+    RunIdInUse,
+    SqlConfirmRequired,
+    SqlRunLimit,
+    SchemaTooLarge,
+    SavedQueryNameTaken,
+    SavedQueryConflict,
+    SavedQueryCap,
 }
 
 impl ErrorCode {
@@ -126,6 +133,13 @@ impl ErrorCode {
             Self::UserTokenExpired => "user_token_expired",
             Self::UserSessionRevoked => "user_session_revoked",
             Self::UserTokenWithSecretKey => "user_token_with_secret_key",
+            Self::RunIdInUse => "run_id_in_use",
+            Self::SqlConfirmRequired => "sql_confirm_required",
+            Self::SqlRunLimit => "sql_run_limit",
+            Self::SchemaTooLarge => "schema_too_large",
+            Self::SavedQueryNameTaken => "saved_query_name_taken",
+            Self::SavedQueryConflict => "saved_query_conflict",
+            Self::SavedQueryCap => "saved_query_cap",
         }
     }
 }
@@ -228,7 +242,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 56] = [
+    const ALL: [(ErrorCode, &str); 63] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -285,6 +299,13 @@ mod tests {
         (ErrorCode::UserTokenExpired, "user_token_expired"),
         (ErrorCode::UserSessionRevoked, "user_session_revoked"),
         (ErrorCode::UserTokenWithSecretKey, "user_token_with_secret_key"),
+        (ErrorCode::RunIdInUse, "run_id_in_use"),
+        (ErrorCode::SqlConfirmRequired, "sql_confirm_required"),
+        (ErrorCode::SqlRunLimit, "sql_run_limit"),
+        (ErrorCode::SchemaTooLarge, "schema_too_large"),
+        (ErrorCode::SavedQueryNameTaken, "saved_query_name_taken"),
+        (ErrorCode::SavedQueryConflict, "saved_query_conflict"),
+        (ErrorCode::SavedQueryCap, "saved_query_cap"),
     ];
 
     #[test]

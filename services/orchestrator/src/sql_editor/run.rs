@@ -1,0 +1,638 @@
+//! One script run on a branch's database.
+//!
+//! [`connect`] opens a fresh connection as the branch's owner; [`run`] sends the script in one
+//! simple-protocol query (so multi-statement scripts and explicit transactions work) and turns
+//! the server's messages into [`RunEvent`]s. The run task sends Postgres's cancel request
+//! whenever it stops early: cancelled, deadline passed, response cap hit or client gone.
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::pin::pin;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use cheladb_types::role_name::quote_ident;
+use futures_util::{Stream, StreamExt, stream};
+use tokio::sync::mpsc;
+use tokio::time::{Instant, sleep_until};
+use tokio_postgres::error::{DbError, ErrorPosition, SqlState};
+use tokio_postgres::{AsyncMessage, Client, NoTls, SimpleQueryMessage};
+use tokio_util::sync::CancellationToken;
+
+use super::events::{ColumnInfo, Outcome, RunEvent};
+use super::registry::RunGuard;
+use super::{
+    APPLICATION_NAME, HEARTBEAT, MAX_RESPONSE_BYTES, MAX_ROWS_PER_STATEMENT, ROWS_PER_EVENT,
+};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Events buffered between the run task and the response body.
+const EVENT_BUFFER: usize = 64;
+/// Notices queued between the connection task and the run task. When the queue is full the
+/// connection task stops reading the socket until the run task catches up (backpressure), so
+/// a notice flood against a slow reader can't grow the orchestrator's memory.
+const NOTICE_BUFFER: usize = 256;
+/// How early a server-side `query_canceled` may arrive and still count as the deadline.
+const TIMEOUT_SLACK: Duration = Duration::from_millis(50);
+/// SQLSTATE for errors that aren't the server's (the connection broke).
+const CONNECTION_FAILURE: &str = "08006";
+
+/// The built-in types whose names a `columns` event carries, by OID (with their arrays).
+const TYPE_NAMES: &[(u32, &str)] = &[
+    (16, "bool"),
+    (17, "bytea"),
+    (19, "name"),
+    (20, "int8"),
+    (21, "int2"),
+    (23, "int4"),
+    (25, "text"),
+    (26, "oid"),
+    (114, "json"),
+    (700, "float4"),
+    (701, "float8"),
+    (1042, "bpchar"),
+    (1043, "varchar"),
+    (1082, "date"),
+    (1083, "time"),
+    (1114, "timestamp"),
+    (1184, "timestamptz"),
+    (1186, "interval"),
+    (1266, "timetz"),
+    (1700, "numeric"),
+    (2950, "uuid"),
+    (3802, "jsonb"),
+    (199, "_json"),
+    (1000, "_bool"),
+    (1001, "_bytea"),
+    (1003, "_name"),
+    (1005, "_int2"),
+    (1007, "_int4"),
+    (1009, "_text"),
+    (1014, "_bpchar"),
+    (1015, "_varchar"),
+    (1016, "_int8"),
+    (1021, "_float4"),
+    (1022, "_float8"),
+    (1028, "_oid"),
+    (1115, "_timestamp"),
+    (1182, "_date"),
+    (1183, "_time"),
+    (1185, "_timestamptz"),
+    (1187, "_interval"),
+    (1231, "_numeric"),
+    (1270, "_timetz"),
+    (2951, "_uuid"),
+    (3807, "_jsonb"),
+];
+
+/// A column type's name for the `columns` event: built-ins only, `""` for any other OID.
+pub fn type_name(oid: u32) -> &'static str {
+    TYPE_NAMES
+        .iter()
+        .find(|(o, _)| *o == oid)
+        .map_or("", |(_, name)| name)
+}
+
+/// The row count at the end of a command tag (`SELECT 3` → 3, `INSERT 0 5` → 5), or 0.
+pub fn tag_rows(tag: &str) -> u64 {
+    tag.rsplit(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Where to run: the compute's address, the owner's credentials and the Postgres database.
+pub struct RunTarget {
+    pub addr: SocketAddr,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+}
+
+/// What to run.
+pub struct RunSpec {
+    pub sql: String,
+    /// `SET ROLE` to this role first; `None` runs as the owner.
+    pub role: Option<String>,
+    pub timeout: Duration,
+}
+
+/// An open editor connection: the client and the notices its connection task receives.
+pub struct Connected {
+    client: Client,
+    notices: mpsc::Receiver<DbError>,
+}
+
+impl Connected {
+    /// The connection's client (the schema read runs on it before a run would).
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+}
+
+/// Why [`connect`] failed.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// No answer from the compute (refused, timed out, broken).
+    Unreachable(String),
+    /// The server answered with an error (authentication, missing database, ...): its
+    /// SQLSTATE and message.
+    Rejected { code: String, message: String },
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectError::Unreachable(m) => write!(f, "the compute can't be reached: {m}"),
+            ConnectError::Rejected { code, message } => {
+                write!(f, "the compute refused the connection ({code}): {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+/// A fresh NoTls connection (R6), `application_name` = [`APPLICATION_NAME`], connect timeout 5 s.
+pub async fn connect(target: &RunTarget) -> Result<Connected, ConnectError> {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(target.addr.ip().to_string())
+        .port(target.addr.port())
+        .user(&target.user)
+        .password(&target.password)
+        .dbname(&target.database)
+        .application_name(APPLICATION_NAME)
+        .connect_timeout(CONNECT_TIMEOUT);
+    let (client, mut connection) =
+        config
+            .connect(NoTls)
+            .await
+            .map_err(|err| match err.as_db_error() {
+                Some(db) => ConnectError::Rejected {
+                    code: db.code().code().to_string(),
+                    message: db.message().to_string(),
+                },
+                None => ConnectError::Unreachable(err.to_string()),
+            })?;
+    let (tx, notices) = mpsc::channel(NOTICE_BUFFER);
+    tokio::spawn(async move {
+        let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
+        // The first error is terminal (`poll_message`'s contract): the connection is done.
+        while let Some(Ok(message)) = messages.next().await {
+            if let AsyncMessage::Notice(notice) = message {
+                // Waits while the queue is full; fails (and drops the notice) once the run
+                // task let go of the receiver.
+                let _ = tx.send(notice).await;
+            }
+        }
+    });
+    Ok(Connected { client, notices })
+}
+
+/// How a run ended (`done`'s outcome and duration), set before `done` is sent: the audit's
+/// record even when a slow reader never takes `done`. Unset when the client went first.
+pub type Finished = Arc<OnceLock<(Outcome, u64)>>;
+
+/// Runs `spec` and yields its events; always ends with `Done`. Dropping the stream cancels the run.
+pub fn run(
+    connected: Connected,
+    spec: RunSpec,
+    guard: RunGuard,
+) -> impl Stream<Item = RunEvent> + Send + 'static {
+    run_reporting(connected, spec, guard, Finished::default())
+}
+
+/// [`run`], recording how it ended in `finished`.
+pub fn run_reporting(
+    connected: Connected,
+    spec: RunSpec,
+    guard: RunGuard,
+    finished: Finished,
+) -> impl Stream<Item = RunEvent> + Send + 'static {
+    let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+    tokio::spawn(drive(connected, spec, guard, tx, finished));
+    stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
+}
+
+/// Why a run stopped before the server finished it.
+enum Stop {
+    Gone,
+    Cancelled,
+    Timeout,
+    Cap,
+}
+
+/// Sends events within the response cap, watching the token and the deadline.
+struct Emitter {
+    tx: mpsc::Sender<RunEvent>,
+    token: CancellationToken,
+    deadline: Instant,
+    bytes: usize,
+    last: Instant,
+}
+
+impl Emitter {
+    async fn send(&mut self, event: RunEvent) -> Result<(), Stop> {
+        let len = event.to_line().len();
+        if self.bytes + len > MAX_RESPONSE_BYTES {
+            return Err(Stop::Cap);
+        }
+        tokio::select! {
+            biased;
+            _ = self.token.cancelled() => Err(Stop::Cancelled),
+            _ = sleep_until(self.deadline) => Err(Stop::Timeout),
+            sent = self.tx.send(event) => {
+                sent.map_err(|_| Stop::Gone)?;
+                self.bytes += len;
+                self.last = Instant::now();
+                Ok(())
+            }
+        }
+    }
+
+    /// Waits for `future` unless the run is cancelled, times out or loses its client first.
+    async fn guarded<T>(&self, future: impl Future<Output = T>) -> Result<T, Stop> {
+        tokio::select! {
+            biased;
+            _ = self.token.cancelled() => Err(Stop::Cancelled),
+            _ = sleep_until(self.deadline) => Err(Stop::Timeout),
+            _ = self.tx.closed() => Err(Stop::Gone),
+            value = future => Ok(value),
+        }
+    }
+}
+
+async fn drive(
+    connected: Connected,
+    spec: RunSpec,
+    guard: RunGuard,
+    tx: mpsc::Sender<RunEvent>,
+    finished: Finished,
+) {
+    let started = Instant::now();
+    let Connected {
+        client,
+        mut notices,
+    } = connected;
+    let mut out = Emitter {
+        tx,
+        token: guard.token(),
+        deadline: started + spec.timeout,
+        bytes: 0,
+        last: started,
+    };
+    let outcome = match execute(&client, &mut notices, &spec, &mut out).await {
+        Ok(outcome) => outcome,
+        Err(stop) => {
+            // The backend may still be busy: stop it before the connection goes.
+            let cancel = client.cancel_token();
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, cancel.cancel_query(NoTls)).await;
+            match stop {
+                Stop::Gone => return,
+                Stop::Cancelled => Outcome::Cancelled,
+                Stop::Timeout => Outcome::Timeout,
+                Stop::Cap => Outcome::TruncatedResponse,
+            }
+        }
+    };
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let _ = finished.set((outcome, duration_ms));
+    let done = RunEvent::Done {
+        outcome,
+        duration_ms,
+    };
+    // Free the connection and the registry slot first: a client that stopped reading must
+    // not pin them. `done` goes out past the cap, but only waits so long for a slow reader.
+    drop(client);
+    drop(notices);
+    drop(guard);
+    let _ = tokio::time::timeout(HEARTBEAT, out.tx.send(done)).await;
+}
+
+enum Next {
+    Message(Option<Result<SimpleQueryMessage, tokio_postgres::Error>>),
+    Notice(Box<DbError>),
+    Heartbeat,
+}
+
+async fn execute(
+    client: &Client,
+    notices: &mut mpsc::Receiver<DbError>,
+    spec: &RunSpec,
+    out: &mut Emitter,
+) -> Result<Outcome, Stop> {
+    let mut setup = vec![format!(
+        "SET statement_timeout = {}",
+        spec.timeout.as_millis()
+    )];
+    if let Some(role) = &spec.role {
+        setup.push(format!("SET ROLE {}", quote_ident(role)));
+    }
+    for sql in setup {
+        let result = out.guarded(client.simple_query(&sql)).await?;
+        drain_notices(notices, out).await?;
+        if let Err(err) = result {
+            out.send(error_event(0, &err)).await?;
+            return Ok(Outcome::Error);
+        }
+    }
+
+    let stream = match out.guarded(client.simple_query_raw(&spec.sql)).await? {
+        Ok(stream) => stream.with_command_tags(),
+        Err(err) => {
+            out.send(error_event(0, &err)).await?;
+            return Ok(Outcome::Error);
+        }
+    };
+    let mut stream = pin!(stream);
+    let mut statement = 0usize;
+    let mut seen = 0usize;
+    let mut buffer = RowBuffer::default();
+    loop {
+        let beat = out.last + HEARTBEAT;
+        let next = tokio::select! {
+            biased;
+            _ = out.token.cancelled() => return Err(Stop::Cancelled),
+            _ = sleep_until(out.deadline) => return Err(Stop::Timeout),
+            _ = out.tx.closed() => return Err(Stop::Gone),
+            Some(notice) = notices.recv() => Next::Notice(Box::new(notice)),
+            message = stream.next() => Next::Message(message),
+            _ = sleep_until(beat) => Next::Heartbeat,
+        };
+        let message = match next {
+            Next::Notice(notice) => {
+                out.send(notice_event(&notice)).await?;
+                continue;
+            }
+            Next::Heartbeat => {
+                out.send(RunEvent::Heartbeat).await?;
+                continue;
+            }
+            Next::Message(message) => message,
+        };
+        // Notices the server sent before this message are already queued: keep wire order.
+        drain_notices(notices, out).await?;
+        match message {
+            None => return Ok(Outcome::Ok),
+            Some(Err(err)) => {
+                if is_statement_timeout(&err, out.deadline) {
+                    return Err(Stop::Timeout);
+                }
+                flush(&mut buffer, statement, out).await?;
+                out.send(error_event(statement, &err)).await?;
+                return Ok(Outcome::Error);
+            }
+            Some(Ok(SimpleQueryMessage::RowDescription(columns))) => {
+                seen = 0;
+                let columns = columns
+                    .iter()
+                    .map(|c| ColumnInfo {
+                        name: c.name().to_string(),
+                        type_name: type_name(c.type_oid()).to_string(),
+                    })
+                    .collect();
+                out.send(RunEvent::Columns { statement, columns }).await?;
+            }
+            Some(Ok(SimpleQueryMessage::Row(row))) => {
+                if seen < MAX_ROWS_PER_STATEMENT {
+                    let row: Vec<Option<String>> = (0..row.len())
+                        .map(|i| row.get(i).map(str::to_owned))
+                        .collect();
+                    // Send what fits before this row would carry the buffer past the cap.
+                    if buffer.would_overflow(out.bytes, row_cost(&row)) {
+                        flush(&mut buffer, statement, out).await?;
+                    }
+                    buffer.push(row);
+                    if buffer.full(out.bytes) {
+                        flush(&mut buffer, statement, out).await?;
+                    }
+                }
+                seen += 1;
+            }
+            Some(Ok(SimpleQueryMessage::CommandTag(tag))) => {
+                flush(&mut buffer, statement, out).await?;
+                out.send(RunEvent::Complete {
+                    statement,
+                    tag: tag.tag().to_string(),
+                    rows: tag_rows(tag.tag()),
+                    truncated: seen > MAX_ROWS_PER_STATEMENT,
+                })
+                .await?;
+                statement += 1;
+                seen = 0;
+            }
+            Some(Ok(SimpleQueryMessage::EmptyQuery)) => statement += 1,
+            // `CommandComplete` doesn't occur with command tags on.
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+async fn drain_notices(
+    notices: &mut mpsc::Receiver<DbError>,
+    out: &mut Emitter,
+) -> Result<(), Stop> {
+    while let Ok(notice) = notices.try_recv() {
+        out.send(notice_event(&notice)).await?;
+    }
+    Ok(())
+}
+
+/// A lower bound of `row`'s size in a `rows` event's JSON: `[`, `]`, the commas, and each
+/// value as `null` or its text in quotes (escaping only adds to it).
+fn row_cost(row: &[Option<String>]) -> usize {
+    let values: usize = row
+        .iter()
+        .map(|v| v.as_ref().map_or(4, |text| text.len() + 2))
+        .sum();
+    2 + values + row.len().saturating_sub(1)
+}
+
+/// The rows waiting for their `rows` event, with a lower bound of their JSON size, so the
+/// response cap bounds the orchestrator's memory too: a flush that would pass the cap stops
+/// the run, at most one row past it.
+#[derive(Default)]
+struct RowBuffer {
+    rows: Vec<Vec<Option<String>>>,
+    bytes: usize,
+}
+
+impl RowBuffer {
+    /// Whether a row of `cost` would carry the rows buffered past the cap, given `sent`
+    /// bytes already sent: flush first. An empty buffer always takes the row.
+    fn would_overflow(&self, sent: usize, cost: usize) -> bool {
+        !self.rows.is_empty() && sent + self.bytes + cost > MAX_RESPONSE_BYTES
+    }
+
+    fn push(&mut self, row: Vec<Option<String>>) {
+        self.bytes += row_cost(&row);
+        self.rows.push(row);
+    }
+
+    /// Whether to flush now: an event's worth of rows, or past the cap (the send then stops
+    /// the run with `truncated_response`).
+    fn full(&self, sent: usize) -> bool {
+        self.rows.len() >= ROWS_PER_EVENT || sent + self.bytes > MAX_RESPONSE_BYTES
+    }
+
+    fn take(&mut self) -> Vec<Vec<Option<String>>> {
+        self.bytes = 0;
+        std::mem::take(&mut self.rows)
+    }
+}
+
+async fn flush(buffer: &mut RowBuffer, statement: usize, out: &mut Emitter) -> Result<(), Stop> {
+    if buffer.rows.is_empty() {
+        return Ok(());
+    }
+    let rows = buffer.take();
+    out.send(RunEvent::Rows { statement, rows }).await
+}
+
+/// The server's own statement timeout (set to the run's timeout) counts as the deadline: a
+/// `query_canceled` at or near the deadline is a timeout, one before it (another session's
+/// `pg_cancel_backend`) stays an error. Locale-independent: the message text isn't read.
+fn is_statement_timeout(err: &tokio_postgres::Error, deadline: Instant) -> bool {
+    err.code() == Some(&SqlState::QUERY_CANCELED) && Instant::now() + TIMEOUT_SLACK >= deadline
+}
+
+fn original_position(db: &DbError) -> Option<u32> {
+    match db.position() {
+        Some(ErrorPosition::Original(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+fn notice_event(notice: &DbError) -> RunEvent {
+    RunEvent::Notice {
+        severity: notice.severity().to_string(),
+        code: notice.code().code().to_string(),
+        message: notice.message().to_string(),
+        detail: notice.detail().map(str::to_owned),
+        hint: notice.hint().map(str::to_owned),
+        position: original_position(notice),
+    }
+}
+
+fn error_event(statement: usize, err: &tokio_postgres::Error) -> RunEvent {
+    match err.as_db_error() {
+        Some(db) => RunEvent::Error {
+            statement,
+            code: db.code().code().to_string(),
+            message: db.message().to_string(),
+            detail: db.detail().map(str::to_owned),
+            hint: db.hint().map(str::to_owned),
+            position: original_position(db),
+        },
+        None => RunEvent::Error {
+            statement,
+            code: CONNECTION_FAILURE.to_string(),
+            message: err.to_string(),
+            detail: None,
+            hint: None,
+            position: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_cost_is_a_lower_bound_of_the_json() {
+        let rows: Vec<Vec<Option<String>>> = vec![
+            vec![],
+            vec![None],
+            vec![Some(String::new())],
+            vec![Some("abc".into()), None, Some("12".into())],
+            vec![Some("quote \" back \\ nl \n nul \u{0}".into())],
+            vec![Some("é ✓ 😀".into()), None],
+        ];
+        for row in &rows {
+            let json = serde_json::to_string(row).unwrap().len();
+            assert!(row_cost(row) <= json, "{row:?}: {} > {json}", row_cost(row));
+        }
+        // Exact for plain text.
+        let plain = vec![Some("abc".into()), None, Some("12".into())];
+        assert_eq!(row_cost(&plain), serde_json::to_string(&plain).unwrap().len());
+    }
+
+    #[test]
+    fn row_buffer_flushes_before_the_cap() {
+        let third = vec![Some("x".repeat(MAX_RESPONSE_BYTES / 3 - 4))];
+        let cost = row_cost(&third);
+        let mut buffer = RowBuffer::default();
+        for _ in 0..3 {
+            assert!(!buffer.would_overflow(0, cost));
+            buffer.push(third.clone());
+            assert!(!buffer.full(0));
+        }
+        // A fourth would carry the buffer past the cap: flush the three first.
+        assert!(buffer.would_overflow(0, cost));
+        // What was sent already counts.
+        assert!(buffer.full(MAX_RESPONSE_BYTES - cost));
+        assert_eq!(buffer.take().len(), 3);
+        assert_eq!(buffer.bytes, 0);
+        // An empty buffer takes any row; one row past the cap is full at once.
+        let huge = vec![Some("x".repeat(MAX_RESPONSE_BYTES + 1))];
+        assert!(!buffer.would_overflow(0, row_cost(&huge)));
+        buffer.push(huge);
+        assert!(buffer.full(0));
+        buffer.take();
+        // 200 small rows fill an event.
+        for _ in 0..ROWS_PER_EVENT {
+            assert!(!buffer.full(0));
+            buffer.push(vec![Some("1".into())]);
+        }
+        assert!(buffer.full(0));
+    }
+
+    #[test]
+    fn tag_row_counts() {
+        assert_eq!(tag_rows("SELECT 3"), 3);
+        assert_eq!(tag_rows("INSERT 0 5"), 5);
+        assert_eq!(tag_rows("CREATE TABLE"), 0);
+        assert_eq!(tag_rows(""), 0);
+    }
+
+    #[test]
+    fn type_names_cover_the_builtins_only() {
+        use tokio_postgres::types::Type;
+        let listed = [
+            "int2",
+            "int4",
+            "int8",
+            "numeric",
+            "float4",
+            "float8",
+            "bool",
+            "text",
+            "varchar",
+            "bpchar",
+            "name",
+            "uuid",
+            "date",
+            "time",
+            "timetz",
+            "timestamp",
+            "timestamptz",
+            "interval",
+            "json",
+            "jsonb",
+            "bytea",
+            "oid",
+        ];
+        for oid in 0..10_000u32 {
+            let expected = Type::from_oid(oid)
+                .map(|t| t.name().to_string())
+                .filter(|n| listed.contains(&n.trim_start_matches('_')))
+                .unwrap_or_default();
+            assert_eq!(type_name(oid), expected, "oid {oid}");
+        }
+        assert_eq!(type_name(23), "int4");
+        assert_eq!(type_name(1007), "_int4");
+        assert_eq!(type_name(600), ""); // point
+    }
+}

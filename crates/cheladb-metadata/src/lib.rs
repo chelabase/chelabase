@@ -14,6 +14,7 @@ mod data_api;
 mod ddl;
 mod neon;
 mod projects;
+mod saved_queries;
 pub use app_users::{
     AppSession, AppUsersStatus, BeginEnable, BranchAuthSync, NewAppSession, NewProjectAuth, OnDelete,
     ProjectAuth, RefreshNext, RefreshOutcome,
@@ -24,6 +25,9 @@ pub use projects::{
 pub use branches::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
     CreateBranchOutcome, DatabaseSettings, LiveBranch, NewBranch, SettingsPatch,
+};
+pub use saved_queries::{
+    SAVED_QUERY_CAP, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
 };
 pub use ddl::DdlTx;
 pub use data_api::{

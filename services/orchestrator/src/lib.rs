@@ -10,13 +10,14 @@ use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{
     AppSession, AppUsersStatus, BeginDelete, BeginEnable, BeginProjectDelete, BranchAuthSync, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus, EnableStart,
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
-    NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SettingsPatch, TenantOverview,
+    NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite, SettingsPatch, TenantOverview,
 };
 use cheladb_nats::{
-    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
+    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, GrantDataRoleRequest,
+    JetStreamContext, JobEnvelope,
     ProjectDeleteJob, ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
     RoleCreateRequest, RoleReply, RoleRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
-    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_RESET_PASSWORD,
+    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_GRANT_DATA_ROLE_TO_OWNER, SUBJECT_RESET_PASSWORD,
     SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
 };
 use cheladb_secrets::{open_credential, open_role_password, Purpose, SecretKey};
@@ -45,8 +46,12 @@ pub mod internal;
 mod openapi;
 pub mod projects;
 mod roles;
+pub mod sql_editor;
 pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, RestReply};
 pub use openapi::openapi;
+
+/// The orchestrator's log filter when `RUST_LOG` is unset.
+pub const DEFAULT_LOG_FILTER: &str = "orchestrator=info,tower_http=info,cheladb_auth=info";
 
 /// Port the Neon proxy serves the Postgres protocol on (default of `CHELADB_PROXY_PG_PORT`).
 pub const PROXY_PG_PORT: u16 = 4432;
@@ -401,6 +406,47 @@ pub trait MetadataPort: Send + Sync + 'static {
         &self,
         db: DatabaseId,
     ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
+
+    fn list_saved_queries(
+        &self,
+        database: Uuid,
+        user: &str,
+    ) -> impl Future<Output = Result<Vec<SavedQuerySummary>, MetadataError>> + Send;
+
+    fn get_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+    ) -> impl Future<Output = Result<Option<SavedQuery>, MetadataError>> + Send;
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+        name: &str,
+        sql: &str,
+        pg_database: Option<&str>,
+        role: Option<&str>,
+    ) -> impl Future<Output = Result<SavedQueryWrite, MetadataError>> + Send;
+
+    fn update_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+        version: i32,
+        patch: &SavedQueryPatch,
+    ) -> impl Future<Output = Result<SavedQueryWrite, MetadataError>> + Send;
+
+    fn delete_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -711,6 +757,56 @@ impl MetadataPort for MetadataClient {
     ) -> Result<Option<ProjectAuth>, MetadataError> {
         MetadataClient::app_auth_for_database(self, db).await
     }
+
+    async fn list_saved_queries(
+        &self,
+        database: Uuid,
+        user: &str,
+    ) -> Result<Vec<SavedQuerySummary>, MetadataError> {
+        MetadataClient::list_saved_queries(self, database, user).await
+    }
+
+    async fn get_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+    ) -> Result<Option<SavedQuery>, MetadataError> {
+        MetadataClient::get_saved_query(self, database, user, id).await
+    }
+
+    async fn create_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+        name: &str,
+        sql: &str,
+        pg_database: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<SavedQueryWrite, MetadataError> {
+        MetadataClient::create_saved_query(self, database, user, id, name, sql, pg_database, role).await
+    }
+
+    async fn update_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+        version: i32,
+        patch: &SavedQueryPatch,
+    ) -> Result<SavedQueryWrite, MetadataError> {
+        MetadataClient::update_saved_query(self, database, user, id, version, patch).await
+    }
+
+    async fn delete_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::delete_saved_query(self, database, user, id).await
+    }
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -753,6 +849,15 @@ pub trait JobPort: Send + Sync + 'static {
         &self,
         branch_id: BranchId,
         role: &str,
+    ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
+
+    /// Asks the worker to grant `anon` or `authenticated` to the branch's owner (`WITH INHERIT
+    /// FALSE, SET TRUE`), so the SQL editor can `SET ROLE` to it.
+    fn grant_data_role_to_owner(
+        &self,
+        branch: BranchId,
+        role: &str,
+        owner: &str,
     ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
 
     /// Tells the worker to bootstrap the data API in a database the orchestrator marked
@@ -939,6 +1044,34 @@ impl JobPort for NatsPorts {
         serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
     }
 
+    async fn grant_data_role_to_owner(
+        &self,
+        branch: BranchId,
+        role: &str,
+        owner: &str,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        use async_nats::RequestErrorKind;
+        let body = serde_json::to_vec(&GrantDataRoleRequest {
+            branch_id: branch,
+            role: role.to_string(),
+            owner: owner.to_string(),
+        })
+        .map_err(|e| ResetError::Transport(e.to_string()))?;
+        let request = async_nats::Request::new()
+            .payload(body.into())
+            .timeout(Some(RESET_TIMEOUT));
+        let reply = self
+            .client
+            .send_request(SUBJECT_GRANT_DATA_ROLE_TO_OWNER, request)
+            .await
+            .map_err(|e| match e.kind() {
+                RequestErrorKind::TimedOut => ResetError::Timeout,
+                RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
+                _ => ResetError::Transport(e.to_string()),
+            })?;
+        serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+    }
+
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
         let body = serde_json::to_vec(&DataApiDatabaseRequest {
             branch_id,
@@ -1064,6 +1197,8 @@ pub struct AppState<M, J> {
     pub zitadel: Option<cheladb_zitadel::client::Zitadel>,
     /// The one write path to a project's users table.
     pub users_db: Arc<dyn cheladb_query::app_users::UsersDb>,
+    /// Studio's SQL editor: runs in flight and the data-role grant cache.
+    pub sql_editor: sql_editor::SqlEditor,
 }
 
 /// `CHELADB_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
@@ -1162,7 +1297,6 @@ where
 /// Caller whose org is bound to a Cheladb tenant (soft-bind).
 #[derive(Debug, Clone)]
 struct AuthPrincipal {
-    #[allow(dead_code)]
     sub: String,
     #[allow(dead_code)]
     org_id: String,
@@ -1447,6 +1581,7 @@ where
         .merge(data_keys::routes())
         .merge(data_api_databases::routes())
         .merge(console::routes())
+        .merge(sql_editor::routes())
         .merge(roles::routes())
         .merge(projects::routes())
         .merge(app_users::routes())

@@ -22,6 +22,10 @@ export default defineConfig({
     tanstackRouter({ target: "react", autoCodeSplitting: true }),
     viteReact(),
   ],
+  // The pgls worker (src/lib/pgls) is an ES module worker; its package loads pgls.wasm via
+  // `new URL(..., import.meta.url)`, which pre-bundling would break.
+  worker: { format: "es" },
+  optimizeDeps: { exclude: ["@postgres-language-server/wasm"] },
   server: {
     // 3000 (or CHELADB_STUDIO_PORT). The Zitadel redirect URI is registered for :3000; never
     // drift to another port.

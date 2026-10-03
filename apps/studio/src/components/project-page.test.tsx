@@ -169,4 +169,17 @@ describe("ProjectPage", () => {
     expect(await screen.findByLabelText("View as")).toBeInTheDocument();
     expect(screen.getByText(/Viewing as owner/)).toBeInTheDocument();
   });
+
+  it("opens the SQL editor of a database", async () => {
+    setup({
+      "GET /v1/databases/d1/branches/b-main/databases": () =>
+        jsonResponse([{ name: "app", main: true, data_api: "on", data_api_error: null, default_schema: "public", origin: "main", owner: "o" }]),
+      "GET /v1/databases/d1/branches/b-main/roles": () => jsonResponse([]),
+      "GET /v1/databases/d1/branches/b-main/sql/schema": () => jsonResponse({}),
+      "GET /v1/databases/d1/sql-queries": () => jsonResponse([]),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "SQL" }));
+    expect(await screen.findByLabelText("Run as", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByText("Running as owner: row-level security is bypassed.")).toBeInTheDocument();
+  });
 });

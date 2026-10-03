@@ -114,3 +114,29 @@ export const consoleQueryExact = async (
   branchId: string,
   request: ConsoleRequest,
 ): Promise<unknown> => send<unknown>(getConsoleQueryUrl(id, branchId), { method: "POST", body: JSON.stringify(request) }, parseExact);
+
+/**
+ * POSTs `body` as JSON and returns the response body stream (for NDJSON endpoints).
+ * Throws ApiError on non-2xx (calling onUnauthorized on a 401); `signal` aborts the request and the read.
+ */
+export async function streamRequest(path: string, body: unknown, signal: AbortSignal): Promise<ReadableStream<Uint8Array>> {
+  if (!config) throw new Error("Management client is not configured; call configureManagementClient first");
+  const token = config.getToken();
+  const init: RequestInit = { method: "POST", body: JSON.stringify(body), signal };
+  const headers = buildHeaders(init, token ? { Authorization: `Bearer ${token}` } : {});
+  headers.set("Accept", "application/x-ndjson, application/json");
+  const fetchImpl = config.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  let response: Response;
+  try {
+    response = await fetchImpl(`${config.baseUrl}${path}`, { ...init, headers });
+  } catch (e) {
+    if (signal.aborted || (e instanceof Error && e.name === "AbortError")) throw e;
+    throw new ApiError(0, "network", NETWORK_MESSAGE);
+  }
+  if (!response.ok) {
+    const restarted = response.status === 401 ? config.onUnauthorized() === true : false;
+    throw await readApiError(response, restarted);
+  }
+  if (!response.body) throw new ApiError(response.status, "internal", "Unexpected response from Cheladb");
+  return response.body;
+}

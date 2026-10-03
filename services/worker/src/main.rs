@@ -2,10 +2,10 @@ use axum::{Json, Router, routing::get};
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
-    DataApiDatabaseRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
+    DataApiDatabaseRequest, GrantDataRoleRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
     ResetPasswordRequest, RoleReply, SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE,
     SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP,
-    SUBJECT_RESET_PASSWORD, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, connect,
+    SUBJECT_GRANT_DATA_ROLE_TO_OWNER, SUBJECT_RESET_PASSWORD, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, connect,
     ensure_control_stream, run_app_users_consumer, run_app_users_sync_consumer,
     run_branch_consumer, run_delete_consumer, run_project_delete_consumer, run_provision_consumer,
     run_settings_consumer,
@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(serve_reset_password(worker.clone(), nats.clone()));
     tokio::spawn(serve_check_data_role(worker.clone(), nats.clone()));
+    tokio::spawn(serve_grant_data_role_to_owner(worker.clone(), nats.clone()));
     tokio::spawn(serve_enable_data_api(worker.clone(), nats.clone()));
     for subject in [SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_REBOOTSTRAP] {
         tokio::spawn(serve_data_api_rpc(worker.clone(), nats.clone(), subject));
@@ -399,6 +400,49 @@ async fn serve_check_data_role(worker: Arc<RealWorker>, client: async_nats::Clie
                 let body = serde_json::to_vec(&reply).unwrap_or_default();
                 if let Err(err) = client.publish(reply_to, body.into()).await {
                     warn!("check-data-role reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+async fn serve_grant_data_role_to_owner(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_GRANT_DATA_ROLE_TO_OWNER, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("grant-data-role-to-owner subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_GRANT_DATA_ROLE_TO_OWNER, "serving grant-data-role-to-owner requests");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply = match serde_json::from_slice::<GrantDataRoleRequest>(&message.payload) {
+                Ok(request) => {
+                    match tokio::time::timeout(
+                        CHECK_ROLE_DEADLINE,
+                        worker.grant_data_role_to_owner_reply(&request),
+                    )
+                    .await
+                    {
+                        Ok(reply) => reply,
+                        Err(_) => {
+                            warn!(branch_id = %request.branch_id, "grant data role to owner timed out");
+                            CheckDataRoleReply::not_ready()
+                        }
+                    }
+                }
+                Err(err) => CheckDataRoleReply::failed(format!("bad request: {err}")),
+            };
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("grant-data-role-to-owner reply failed: {err}");
                 }
             }
         });

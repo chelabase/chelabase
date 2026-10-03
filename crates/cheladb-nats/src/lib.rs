@@ -205,6 +205,18 @@ pub struct CheckDataRoleRequest {
     pub role: String,
 }
 
+/// Core request/reply: grant `anon` or `authenticated` to the branch's owner (`WITH INHERIT
+/// FALSE, SET TRUE`) so the SQL editor can `SET ROLE` to it. Answers a [`CheckDataRoleReply`].
+pub const SUBJECT_GRANT_DATA_ROLE_TO_OWNER: &str = "cheladb.rpc.grant_data_role_to_owner";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrantDataRoleRequest {
+    pub branch_id: BranchId,
+    pub role: String,
+    /// The login role to grant it to (the branch owner's name).
+    pub owner: String,
+}
+
 /// Core publish (no reply awaited): bootstrap the data API in a database the orchestrator just
 /// marked `enabling`. The worker records `on` or `error`; reconcile retries rows left `enabling`.
 pub const SUBJECT_DATA_API_ENABLE: &str = "cheladb.rpc.data_api.enable";
@@ -783,6 +795,18 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"branch_id":{},"name":"a"}}"#, json["branch_id"])).unwrap();
         assert!(!back.remove);
         assert!(!back.grant_existing);
+    }
+
+    #[test]
+    fn grant_data_role_to_owner_wire_shapes() {
+        let request = GrantDataRoleRequest { branch_id: BranchId::new(), role: "anon".into(), owner: "postgres".into() };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["role"], "anon");
+        assert_eq!(json["owner"], "postgres");
+        assert!(json["branch_id"].is_string());
+        assert_eq!(SUBJECT_GRANT_DATA_ROLE_TO_OWNER, "cheladb.rpc.grant_data_role_to_owner");
+        let back: GrantDataRoleRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, request);
     }
 
     #[test]

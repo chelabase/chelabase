@@ -7,7 +7,7 @@ use cheladb_metadata::{
     DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, ProjectStatus, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
     TenantOverview,
     AppSession, AppUsersStatus, BeginEnable, BeginProjectDelete, BranchAuthSync, NewProjectAuth, OnDelete, ProjectAuth,
-    ProjectRecord, RenameProject,
+    ProjectRecord, RenameProject, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
 };
 use cheladb_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
@@ -69,6 +69,8 @@ struct FakeMetadata {
     fail_revoke: Arc<Mutex<bool>>,
     project_auth_reads: Arc<AtomicUsize>,
     project_auth_batch_reads: Arc<AtomicUsize>,
+    /// Saved queries with their (database, user).
+    saved_queries: Arc<Mutex<Vec<(uuid::Uuid, String, SavedQuery)>>>,
 }
 
 /// A database row and its main branch, which holds the endpoint and the sealed password.
@@ -1040,6 +1042,116 @@ impl MetadataPort for FakeMetadata {
     async fn app_auth_for_database(&self, db: DatabaseId) -> Result<Option<ProjectAuth>, MetadataError> {
         Ok(self.project_auths.lock().unwrap().values().find(|a| a.database_id == db).cloned())
     }
+
+    async fn list_saved_queries(&self, database: uuid::Uuid, user: &str) -> Result<Vec<SavedQuerySummary>, MetadataError> {
+        let mut rows: Vec<SavedQuerySummary> = self
+            .saved_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, u, _)| *d == database && u == user)
+            .map(|(_, _, q)| SavedQuerySummary {
+                id: q.id,
+                name: q.name.clone(),
+                pg_database: q.pg_database.clone(),
+                role: q.role.clone(),
+                version: q.version,
+                updated_at: q.updated_at,
+            })
+            .collect();
+        rows.sort_by_key(|q| q.name.to_lowercase());
+        Ok(rows)
+    }
+
+    async fn get_saved_query(&self, database: uuid::Uuid, user: &str, id: uuid::Uuid) -> Result<Option<SavedQuery>, MetadataError> {
+        Ok(self
+            .saved_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(d, u, q)| *d == database && u == user && q.id == id)
+            .map(|(_, _, q)| q.clone()))
+    }
+
+    async fn create_saved_query(
+        &self,
+        database: uuid::Uuid,
+        user: &str,
+        id: uuid::Uuid,
+        name: &str,
+        sql: &str,
+        pg_database: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<SavedQueryWrite, MetadataError> {
+        let mut rows = self.saved_queries.lock().unwrap();
+        let mine = || rows.iter().filter(|(d, u, _)| *d == database && u == user);
+        if mine().count() as i64 >= orchestrator::sql_editor::SAVED_QUERY_CAP {
+            return Ok(SavedQueryWrite::CapReached);
+        }
+        if mine().any(|(_, _, q)| q.name.to_lowercase() == name.to_lowercase()) {
+            return Ok(SavedQueryWrite::NameTaken);
+        }
+        let now = chrono::Utc::now();
+        let q = SavedQuery {
+            id,
+            name: name.into(),
+            sql: sql.into(),
+            pg_database: pg_database.map(Into::into),
+            role: role.map(Into::into),
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        rows.push((database, user.into(), q.clone()));
+        Ok(SavedQueryWrite::Saved(q))
+    }
+
+    async fn update_saved_query(
+        &self,
+        database: uuid::Uuid,
+        user: &str,
+        id: uuid::Uuid,
+        version: i32,
+        patch: &SavedQueryPatch,
+    ) -> Result<SavedQueryWrite, MetadataError> {
+        let mut rows = self.saved_queries.lock().unwrap();
+        let Some(at) = rows.iter().position(|(d, u, q)| *d == database && u == user && q.id == id) else {
+            return Ok(SavedQueryWrite::NotFound);
+        };
+        if rows[at].2.version != version {
+            return Ok(SavedQueryWrite::Stale(rows[at].2.clone()));
+        }
+        if let Some(name) = &patch.name
+            && rows.iter().any(|(d, u, q)| {
+                *d == database && u == user && q.id != id && q.name.to_lowercase() == name.to_lowercase()
+            })
+        {
+            return Ok(SavedQueryWrite::NameTaken);
+        }
+        let q = &mut rows[at].2;
+        if let Some(name) = &patch.name {
+            q.name = name.clone();
+        }
+        if let Some(sql) = &patch.sql {
+            q.sql = sql.clone();
+        }
+        if let Some(v) = &patch.pg_database {
+            q.pg_database = v.clone();
+        }
+        if let Some(v) = &patch.role {
+            q.role = v.clone();
+        }
+        q.version += 1;
+        q.updated_at = chrono::Utc::now();
+        Ok(SavedQueryWrite::Saved(q.clone()))
+    }
+
+    async fn delete_saved_query(&self, database: uuid::Uuid, user: &str, id: uuid::Uuid) -> Result<bool, MetadataError> {
+        let mut rows = self.saved_queries.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|(d, u, q)| !(*d == database && u == user && q.id == id));
+        Ok(rows.len() < before)
+    }
 }
 
 fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataError> {
@@ -1098,6 +1210,10 @@ struct FakeJobs {
     /// (branch, role) of each check-role request.
     role_checks: Arc<Mutex<Vec<(BranchId, String)>>>,
     role_check: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
+    /// (branch, role, owner) of each grant-to-owner request.
+    role_grants: Arc<Mutex<Vec<(BranchId, String, String)>>>,
+    /// What the worker answers to a grant-to-owner request; `ok` when unset.
+    role_grant: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
     /// Each login-role RPC as `create:<name>:<privileged>`, `reset:<name>` or `delete:<name>`.
     role_calls: Arc<Mutex<Vec<String>>>,
     /// What the worker answers to the role RPCs; `ok` when unset.
@@ -1169,6 +1285,19 @@ impl JobPort for FakeJobs {
     ) -> Result<CheckDataRoleReply, ResetError> {
         self.role_checks.lock().unwrap().push((branch_id, role.to_string()));
         match self.role_check.lock().unwrap().clone() {
+            Some(answer) => answer,
+            None => Ok(CheckDataRoleReply::ok()),
+        }
+    }
+
+    async fn grant_data_role_to_owner(
+        &self,
+        branch: BranchId,
+        role: &str,
+        owner: &str,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        self.role_grants.lock().unwrap().push((branch, role.to_string(), owner.to_string()));
+        match self.role_grant.lock().unwrap().clone() {
             Some(answer) => answer,
             None => Ok(CheckDataRoleReply::ok()),
         }
@@ -1326,6 +1455,8 @@ struct TestApp {
     key: SecretKey,
     /// Where the console finds a compute's Postgres.
     locator: FakeLocator,
+    /// The orchestrator's state (the SQL editor's run registry).
+    state: Arc<AppState<FakeMetadata, FakeJobs>>,
 }
 
 impl TestApp {
@@ -1407,8 +1538,9 @@ async fn spawn_app_parts(
         console: Console::default(),
         zitadel,
         users_db,
+        sql_editor: Default::default(),
     });
-    let app: Router = build_router(state);
+    let app: Router = build_router(state.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1421,6 +1553,7 @@ async fn spawn_app_parts(
         signer: InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
         key,
         locator,
+        state,
     }
 }
 
@@ -6973,4 +7106,781 @@ async fn update_with_a_weak_password_changes_nothing() {
     let user = au.mock().user_by_id(&id.to_string()).unwrap();
     assert_eq!((user.email.as_str(), user.password.as_str()), ("a@x.test", AU_PASSWORD));
     assert!(au.syncs().is_empty());
+}
+
+// ---- saved queries
+
+impl Branching {
+    fn queries(&self) -> String {
+        format!("/v1/databases/{}/sql-queries", self.db.as_uuid())
+    }
+
+    /// A request as another user of org-1.
+    async fn send_as(&self, sub: &str, method: Method, path: &str, body: Option<Value>) -> reqwest::Response {
+        let mut id = identity("org-1");
+        id.sub = sub.into();
+        let token = self.app.signer.sign(Service::Orchestrator.name(), &id).unwrap();
+        let mut req = reqwest::Client::new()
+            .request(method, format!("{}{path}", self.app.base))
+            .header(IDENTITY_HEADER, token);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        req.send().await.unwrap()
+    }
+
+    async fn save(&self, name: &str, sql: &str) -> Value {
+        let resp = self
+            .send(Method::POST, &self.queries(), Some(serde_json::json!({"name": name, "sql": sql})))
+            .await;
+        assert_eq!(resp.status(), 201);
+        resp.json().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn saved_queries_list_create_get_update_delete() {
+    let t = branching().await;
+    let b = t.save("Beta", "select 2").await;
+    let a = t
+        .send(
+            Method::POST,
+            &t.queries(),
+            Some(serde_json::json!({"name": "alpha", "sql": "select 1", "pg_database": "app", "role": "anon"})),
+        )
+        .await;
+    assert_eq!(a.status(), 201);
+    let a: Value = a.json().await.unwrap();
+    assert_eq!(a["version"], 1);
+    assert_eq!(a["pg_database"], "app");
+
+    let list: Vec<Value> = t.send(Method::GET, &t.queries(), None).await.json().await.unwrap();
+    assert_eq!(list.iter().map(|q| q["name"].as_str().unwrap()).collect::<Vec<_>>(), ["alpha", "Beta"]);
+    assert!(list[0].get("sql").is_none(), "the list omits the text");
+
+    let one = format!("{}/{}", t.queries(), a["id"].as_str().unwrap());
+    let got: Value = t.send(Method::GET, &one, None).await.json().await.unwrap();
+    assert_eq!(got["sql"], "select 1");
+
+    // null clears a hint, an absent field stays.
+    let resp = t
+        .send(Method::PATCH, &one, Some(serde_json::json!({"version": 1, "sql": "select 3", "role": null})))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let upd: Value = resp.json().await.unwrap();
+    assert_eq!((upd["version"].as_i64(), upd["sql"].as_str()), (Some(2), Some("select 3")));
+    assert!(upd["role"].is_null());
+    assert_eq!(upd["pg_database"], "app");
+    assert_eq!(upd["name"], "alpha");
+
+    assert_eq!(t.send(Method::DELETE, &one, None).await.status(), 204);
+    assert_eq!(t.send(Method::GET, &one, None).await.status(), 404);
+    assert_eq!(t.send(Method::DELETE, &one, None).await.status(), 404);
+    let list: Vec<Value> = t.send(Method::GET, &t.queries(), None).await.json().await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], b["id"]);
+}
+
+#[tokio::test]
+async fn another_users_saved_query_is_404() {
+    let t = branching().await;
+    let q = t.save("mine", "select 1").await;
+    let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+    for (method, body) in [
+        (Method::GET, None),
+        (Method::PATCH, Some(serde_json::json!({"version": 1, "name": "x"}))),
+        (Method::DELETE, None),
+    ] {
+        let body = error_of(t.send_as("user-2", method, &one, body).await, 404).await;
+        assert_eq!(code_of(&body), "not_found");
+        assert_eq!(message_of(&body), "saved query not found");
+    }
+    let list: Vec<Value> = t.send_as("user-2", Method::GET, &t.queries(), None).await.json().await.unwrap();
+    assert!(list.is_empty());
+    // Same name for the other user is fine.
+    let resp = t
+        .send_as("user-2", Method::POST, &t.queries(), Some(serde_json::json!({"name": "MINE", "sql": "select 9"})))
+        .await;
+    assert_eq!(resp.status(), 201);
+    // A query of another database is 404 too.
+    let other = format!("/v1/databases/{}/sql-queries/{}", uuid::Uuid::new_v4(), q["id"].as_str().unwrap());
+    assert_eq!(t.send(Method::GET, &other, None).await.status(), 404);
+}
+
+#[tokio::test]
+async fn saved_query_conflict_carries_the_current_row() {
+    let t = branching().await;
+    let q = t.save("q", "select 1").await;
+    let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+    let resp = t.send(Method::PATCH, &one, Some(serde_json::json!({"version": 1, "sql": "select 2"}))).await;
+    assert_eq!(resp.status(), 200);
+    let body = error_of(
+        t.send(Method::PATCH, &one, Some(serde_json::json!({"version": 1, "sql": "select 3"}))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&body), "saved_query_conflict");
+    assert_eq!(body["error"]["current"]["sql"], "select 2");
+    assert_eq!(body["error"]["current"]["version"], 2);
+}
+
+#[tokio::test]
+async fn saved_query_name_taken_is_409() {
+    let t = branching().await;
+    t.save("Report", "select 1").await;
+    let other = t.save("other", "select 2").await;
+    let body = error_of(
+        t.send(Method::POST, &t.queries(), Some(serde_json::json!({"name": " report ", "sql": "select 3"}))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&body), "saved_query_name_taken");
+    let one = format!("{}/{}", t.queries(), other["id"].as_str().unwrap());
+    let body = error_of(
+        t.send(Method::PATCH, &one, Some(serde_json::json!({"version": 1, "name": "REPORT"}))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&body), "saved_query_name_taken");
+}
+
+#[tokio::test]
+async fn saved_query_cap_is_409() {
+    let t = branching().await;
+    let now = chrono::Utc::now();
+    for i in 0..orchestrator::sql_editor::SAVED_QUERY_CAP {
+        let q = SavedQuery {
+            id: uuid::Uuid::new_v4(),
+            name: format!("q{i}"),
+            sql: "select 1".into(),
+            pg_database: None,
+            role: None,
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        t.metadata.saved_queries.lock().unwrap().push((t.db.as_uuid(), "user-1".into(), q));
+    }
+    let body = error_of(
+        t.send(Method::POST, &t.queries(), Some(serde_json::json!({"name": "one more", "sql": "select 1"}))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&body), "saved_query_cap");
+}
+
+#[tokio::test]
+async fn saved_query_validation_is_422() {
+    let t = branching().await;
+    let q = t.save("q", "select 1").await;
+    let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+    let long_name = "n".repeat(121);
+    let big_sql = "s".repeat(1_048_577);
+    let long_hint = "h".repeat(64);
+    for body in [
+        serde_json::json!({"name": "", "sql": "select 1"}),
+        serde_json::json!({"name": "   ", "sql": "select 1"}),
+        serde_json::json!({"name": long_name, "sql": "select 1"}),
+        serde_json::json!({"name": "a", "sql": ""}),
+        serde_json::json!({"name": "a", "sql": big_sql}),
+        serde_json::json!({"name": "a", "sql": "select 1", "role": long_hint}),
+        serde_json::json!({"name": "a", "sql": "select 1", "pg_database": long_hint}),
+        serde_json::json!({"name": "a", "sql": "select 1", "extra": 1}),
+        serde_json::json!({"sql": "select 1"}),
+    ] {
+        let resp = t.send(Method::POST, &t.queries(), Some(body.clone())).await;
+        let err = error_of(resp, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{body}");
+    }
+    for body in [
+        serde_json::json!({"version": 1, "name": ""}),
+        serde_json::json!({"version": 1, "sql": ""}),
+        serde_json::json!({"version": 1, "role": long_hint}),
+        serde_json::json!({"name": "x"}),
+        serde_json::json!({"version": 1, "bogus": true}),
+    ] {
+        let resp = t.send(Method::PATCH, &one, Some(body.clone())).await;
+        let err = error_of(resp, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn empty_saved_query_hints_are_null() {
+    let t = branching().await;
+    let resp = t
+        .send(
+            Method::POST,
+            &t.queries(),
+            Some(serde_json::json!({"name": "q", "sql": "select 1", "pg_database": "", "role": ""})),
+        )
+        .await;
+    assert_eq!(resp.status(), 201);
+    let q: Value = resp.json().await.unwrap();
+    assert!(q["pg_database"].is_null() && q["role"].is_null(), "{q}");
+    let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+    let resp = t
+        .send(Method::PATCH, &one, Some(serde_json::json!({"version": 1, "pg_database": "app", "role": "anon"})))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let resp = t
+        .send(Method::PATCH, &one, Some(serde_json::json!({"version": 2, "pg_database": "", "role": ""})))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let q: Value = resp.json().await.unwrap();
+    assert!(q["pg_database"].is_null() && q["role"].is_null(), "{q}");
+}
+
+#[tokio::test]
+async fn saved_query_with_a_nul_byte_is_422() {
+    let t = branching().await;
+    let resp = t
+        .send(Method::POST, &t.queries(), Some(serde_json::json!({"name": "q", "sql": "select 1\u{0}"})))
+        .await;
+    assert_eq!(code_of(&error_of(resp, 422).await), "invalid_request");
+    let q = t.save("q", "select 1").await;
+    let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+    let resp = t.send(Method::PATCH, &one, Some(serde_json::json!({"version": 1, "sql": "\u{0}"}))).await;
+    assert_eq!(code_of(&error_of(resp, 422).await), "invalid_request");
+}
+
+#[tokio::test]
+async fn saved_queries_of_a_deleted_database_are_404() {
+    let t = branching().await;
+    let q = t.save("q", "select 1").await;
+    t.metadata
+        .databases
+        .lock()
+        .unwrap()
+        .get_mut(&t.db)
+        .unwrap()
+        .status = DatabaseStatus::Deleted;
+    let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+    assert_eq!(t.send(Method::GET, &t.queries(), None).await.status(), 404);
+    assert_eq!(t.send(Method::GET, &one, None).await.status(), 404);
+    assert_eq!(t.send(Method::DELETE, &one, None).await.status(), 404);
+}
+
+// ---- SQL editor: run, cancel, schema ---------------------------------------------------
+
+/// A ready database with the console's seeded Postgres databases (`web1` main and served,
+/// `analytics` and `scratch` made in SQL, the system `postgres`) and a plain API role
+/// `editor` on main.
+async fn sql_app() -> Branching {
+    let t = branching().await;
+    let main = t.seeded();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    t.metadata.add_role(&ep, "postgres", RoleOrigin::Owner, true, false);
+    t.metadata.add_role(&ep, "editor", RoleOrigin::Api, false, false);
+    t
+}
+
+impl Branching {
+    async fn run_sql(&self, branch: BranchId, body: Value) -> reqwest::Response {
+        self.send(Method::POST, &format!("{}/sql", self.branch(branch)), Some(body)).await
+    }
+
+    async fn sql_schema(&self, branch: BranchId, query: &str) -> reqwest::Response {
+        self.send(Method::GET, &format!("{}/sql/schema{query}", self.branch(branch)), None).await
+    }
+
+    async fn cancel_run(&self, branch: BranchId, run_id: uuid::Uuid) -> reqwest::Response {
+        self.send(Method::POST, &format!("{}/sql/runs/{run_id}/cancel", self.branch(branch)), None).await
+    }
+
+    fn role_grants(&self) -> Vec<(BranchId, String, String)> {
+        self.jobs.role_grants.lock().unwrap().clone()
+    }
+
+    fn set_protected(&self, branch: BranchId) {
+        self.metadata.branches.lock().unwrap().get_mut(&branch).unwrap().protected = true;
+    }
+}
+
+fn run_body(sql: &str) -> Value {
+    json!({ "run_id": uuid::Uuid::new_v4(), "sql": sql })
+}
+
+/// `body` with `key` set to `value`.
+fn with(mut body: Value, key: &str, value: Value) -> Value {
+    body[key] = value;
+    body
+}
+
+#[tokio::test]
+async fn run_validation_is_422() {
+    let t = sql_app().await;
+    let main = t.main();
+    let big = "x".repeat(1_048_577);
+    for body in [
+        run_body(""),
+        run_body(&big),
+        with(run_body("select 1"), "timeout_ms", json!(99)),
+        with(run_body("select 1"), "timeout_ms", json!(900_001)),
+        with(run_body("select 1"), "bogus", json!(true)),
+        with(run_body("select 1"), "role", json!("")),
+        json!({ "sql": "select 1" }),
+        with(run_body("select 1"), "run_id", json!("not-a-uuid")),
+    ] {
+        let resp = t.run_sql(main, body.clone()).await;
+        let err = error_of(resp, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{}", &body.to_string()[..body.to_string().len().min(200)]);
+    }
+    // The bounds themselves are accepted (and get as far as the compute lookup).
+    for timeout in [100, 900_000] {
+        let resp = t.run_sql(main, with(run_body("select 1"), "timeout_ms", json!(timeout))).await;
+        assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    }
+    assert_eq!(t.compute_lookups(), 2);
+    assert!(t.role_grants().is_empty());
+}
+
+#[tokio::test]
+async fn run_with_a_nul_byte_is_422() {
+    let t = sql_app().await;
+    let main = t.main();
+    for confirm in [false, true] {
+        let body = with(run_body("select 1;\u{0} select 2"), "confirm", json!(confirm));
+        let err = error_of(t.run_sql(main, body).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request");
+        assert!(message_of(&err).contains("NUL"), "{err}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+#[tokio::test]
+async fn run_unknown_database_or_role_is_404() {
+    let t = sql_app().await;
+    let main = t.main();
+    for body in [
+        with(run_body("select 1"), "database", json!("nope")),
+        with(run_body("select 1"), "database", json!("postgres")),
+        with(run_body("select 1"), "role", json!("ghost")),
+        // `analytics` never had the data API's machinery: no `anon` there.
+        with(with(run_body("select 1"), "database", json!("analytics")), "role", json!("anon")),
+    ] {
+        let resp = t.run_sql(main, body.clone()).await;
+        assert_eq!(code_of(&error_of(resp, 404).await), "not_found", "{body}");
+    }
+    let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("ghost"))).await;
+    assert_eq!(message_of(&error_of(resp, 404).await), "role not found");
+    assert_eq!(t.compute_lookups(), 0);
+    // A database made in SQL (not served by the data API) and a known role are accepted.
+    let ok = with(with(run_body("select 1"), "database", json!("analytics")), "role", json!("editor"));
+    assert_eq!(code_of(&error_of(t.run_sql(main, ok).await, 503).await), "unavailable");
+    assert!(t.role_grants().is_empty(), "only anon and authenticated are granted");
+}
+
+#[tokio::test]
+async fn run_reserved_role_is_422() {
+    let t = sql_app().await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    // Even when listed (a resync might show one), a reserved name is refused.
+    t.metadata.add_role(&ep, "cloud_admin", RoleOrigin::Sql, true, false);
+    for role in ["cloud_admin", "neon_superuser", "authenticator", "cheladb_admin", "pg_read_all_data", "PG_monitor"] {
+        let resp = t.run_sql(main, with(run_body("select 1"), "role", json!(role))).await;
+        assert_eq!(code_of(&error_of(resp, 422).await), "invalid_request", "{role}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+#[tokio::test]
+async fn risky_statement_needs_confirm() {
+    let t = sql_app().await;
+    let main = t.main();
+    let resp = t.run_sql(main, run_body("SELECT 1; DROP TABLE notes")).await;
+    let err = error_of(resp, 409).await;
+    assert_eq!(code_of(&err), "sql_confirm_required");
+    let statements = err["error"]["statements"].as_array().unwrap();
+    assert_eq!(statements.len(), 1, "{err}");
+    assert_eq!(statements[0]["index"], 1);
+    assert_eq!(statements[0]["kind"], "DropStmt");
+    assert_eq!(statements[0]["reason"], "risky");
+    assert_eq!(statements[0]["text_preview"], "DROP TABLE notes");
+    // Nothing was connected or granted.
+    assert_eq!(t.compute_lookups(), 0);
+    assert!(t.role_grants().is_empty());
+    // `confirm: false` is the same as absent.
+    let resp = t.run_sql(main, with(run_body("TRUNCATE notes"), "confirm", json!(false))).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "sql_confirm_required");
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+#[tokio::test]
+async fn protected_branch_holds_inserts() {
+    let t = sql_app().await;
+    let main = t.main();
+    t.set_protected(main);
+    let resp = t.run_sql(main, run_body("INSERT INTO notes (body) VALUES ('x')")).await;
+    let err = error_of(resp, 409).await;
+    assert_eq!(code_of(&err), "sql_confirm_required");
+    assert_eq!(err["error"]["statements"][0]["kind"], "InsertStmt");
+    assert_eq!(err["error"]["statements"][0]["reason"], "protected");
+    assert_eq!(t.compute_lookups(), 0);
+    // A read passes the guard.
+    let resp = t.run_sql(main, run_body("SELECT * FROM notes")).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+}
+
+#[tokio::test]
+async fn confirm_skips_the_guard() {
+    let t = sql_app().await;
+    let main = t.main();
+    t.set_protected(main);
+    let resp = t.run_sql(main, with(run_body("DROP TABLE notes"), "confirm", json!(true))).await;
+    // Past the guard: the compute isn't running in the fake.
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    assert_eq!(t.compute_lookups(), 1);
+}
+
+#[tokio::test]
+async fn anon_is_granted_once_then_cached() {
+    let t = sql_app().await;
+    let main = t.main();
+    for _ in 0..2 {
+        let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("anon"))).await;
+        assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    }
+    // The owner the editor connects as is the one granted the role.
+    assert_eq!(t.role_grants(), vec![(main, "anon".to_string(), "postgres".to_string())]);
+    let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("authenticated"))).await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(t.role_grants().len(), 2);
+    assert_eq!(t.compute_lookups(), 3);
+}
+
+#[tokio::test]
+async fn grant_refusal_is_403() {
+    let t = sql_app().await;
+    let main = t.main();
+    *t.jobs.role_grant.lock().unwrap() =
+        Some(Ok(CheckDataRoleReply::refused("the data API isn't set up on this branch")));
+    for _ in 0..2 {
+        let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("anon"))).await;
+        let err = error_of(resp, 403).await;
+        assert_eq!(code_of(&err), "role_refused");
+        assert_eq!(message_of(&err), "the data API isn't set up on this branch");
+    }
+    // A refusal isn't remembered.
+    assert_eq!(t.role_grants().len(), 2);
+    assert_eq!(t.compute_lookups(), 0);
+    // The other answers map as the console's role check does.
+    for (answer, status, code) in [
+        (Ok(CheckDataRoleReply::not_ready()), 409, "branch_not_ready"),
+        (Err(ResetError::Timeout), 504, "timeout"),
+        (Err(ResetError::Transport("no worker".into())), 503, "worker_unavailable"),
+        (Ok(CheckDataRoleReply::failed("boom")), 500, "internal"),
+    ] {
+        *t.jobs.role_grant.lock().unwrap() = Some(answer);
+        let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("anon"))).await;
+        assert_eq!(code_of(&error_of(resp, status).await), code);
+    }
+}
+
+#[tokio::test]
+async fn fifth_run_is_429() {
+    let t = sql_app().await;
+    let main = t.main();
+    let runs = t.app.state.sql_editor.runs();
+    let held: Vec<_> = (0..4)
+        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), BranchId::new(), "web1").unwrap())
+        .collect();
+    let resp = t.run_sql(main, run_body("select 1")).await;
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers()["retry-after"], "2");
+    assert_eq!(code_of(&resp.json().await.unwrap()), "sql_run_limit");
+    assert_eq!(t.compute_lookups(), 0);
+    drop(held);
+    let resp = t.run_sql(main, run_body("select 1")).await;
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn duplicate_run_id_is_409() {
+    let t = sql_app().await;
+    let main = t.main();
+    let id = uuid::Uuid::new_v4();
+    let _held = t.app.state.sql_editor.runs().reserve("user-1", id, main, "web1").unwrap();
+    let resp = t.run_sql(main, json!({ "run_id": id, "sql": "select 1" })).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "run_id_in_use");
+    // Another user may use the same id.
+    let resp = t
+        .send_as("user-2", Method::POST, &format!("{}/sql", t.branch(main)), Some(json!({ "run_id": id, "sql": "select 1" })))
+        .await;
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn cancel_unknown_run_is_404() {
+    let t = sql_app().await;
+    let main = t.main();
+    let resp = t.cancel_run(main, uuid::Uuid::new_v4()).await;
+    let err = error_of(resp, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(message_of(&err), "run not found");
+    // A run in flight is cancelled: 202 `{}` and its token fires.
+    let id = uuid::Uuid::new_v4();
+    let held = t.app.state.sql_editor.runs().reserve("user-1", id, main, "web1").unwrap();
+    // Another user's cancel doesn't reach it.
+    let resp = t
+        .send_as("user-2", Method::POST, &format!("{}/sql/runs/{id}/cancel", t.branch(main)), None)
+        .await;
+    assert_eq!(resp.status(), 404);
+    assert!(!held.token().is_cancelled());
+    let resp = t.cancel_run(main, id).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.json::<Value>().await.unwrap(), json!({}));
+    assert!(held.token().is_cancelled());
+    // The branch must still be the caller's.
+    let backup = t.backup(main);
+    assert_eq!(code_of(&error_of(t.cancel_run(backup, id).await, 409).await), "backup_branch");
+    let other = uuid::Uuid::new_v4();
+    let resp = t.send(Method::POST, &format!("{}/{other}/sql/runs/{id}/cancel", t.branches()), None).await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn owner_password_unknown_is_409() {
+    let t = sql_app().await;
+    let main = t.main();
+    t.seal_owner_password(None);
+    let id = uuid::Uuid::new_v4();
+    let resp = t.run_sql(main, json!({ "run_id": id, "sql": "select 1" })).await;
+    let err = error_of(resp, 409).await;
+    assert_eq!(code_of(&err), "owner_password_unknown");
+    assert_eq!(t.compute_lookups(), 0);
+    // The slot was given back.
+    assert!(t.app.state.sql_editor.runs().reserve("user-1", id, main, "web1").is_ok());
+}
+
+#[tokio::test]
+async fn run_refuses_backups_unready_branches_and_strangers() {
+    let t = sql_app().await;
+    let main = t.main();
+    let backup = t.backup(main);
+    assert_eq!(code_of(&error_of(t.run_sql(backup, run_body("select 1")).await, 409).await), "backup_branch");
+    let pending = t.add("dev", main, BranchKind::Normal, BranchStatus::Pending);
+    assert_eq!(code_of(&error_of(t.run_sql(pending, run_body("select 1")).await, 409).await), "branch_not_ready");
+    // The branch checks come before the body's.
+    assert_eq!(code_of(&error_of(t.run_sql(pending, json!({})).await, 409).await), "branch_not_ready");
+    let resp = t
+        .send(Method::POST, &format!("{}/{}/sql", t.branches(), uuid::Uuid::new_v4()), Some(run_body("select 1")))
+        .await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn sql_confirm_required_is_audited_without_sql() {
+    use sha2::Digest;
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let t = sql_app().await;
+    let main = t.main();
+    let sql = "DROP TABLE secret_table_4111";
+    let id = uuid::Uuid::new_v4();
+    let resp = t.run_sql(main, json!({ "run_id": id, "sql": sql })).await;
+    assert_eq!(resp.status(), 409);
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("sql run")).collect();
+    assert_eq!(audit.len(), 1, "{text}");
+    let line = audit[0];
+    let sha = hex::encode(sha2::Sha256::digest(sql.as_bytes()));
+    for field in [
+        "user=user-1".to_string(),
+        format!("database_id={}", t.db.as_uuid()),
+        format!("branch_id={}", main.as_uuid()),
+        "pg_database=web1".to_string(),
+        "role=owner".to_string(),
+        format!("run_id={id}"),
+        "outcome=confirm_required".to_string(),
+        "held=DropStmt".to_string(),
+        format!("sql_sha256={sha}"),
+        "protected=false".to_string(),
+        "confirmed=false".to_string(),
+    ] {
+        assert!(line.contains(&field), "{field} missing from {line}");
+    }
+    assert!(!text.contains("secret_table_4111"), "SQL reached the log:\n{text}");
+}
+
+#[tokio::test]
+async fn sql_schema_refusals() {
+    let t = sql_app().await;
+    let main = t.main();
+    for query in ["?database=nope", "?database=postgres"] {
+        assert_eq!(code_of(&error_of(t.sql_schema(main, query).await, 404).await), "not_found", "{query}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+    // No compute running.
+    assert_eq!(code_of(&error_of(t.sql_schema(main, "").await, 503).await), "unavailable");
+    assert_eq!(code_of(&error_of(t.sql_schema(main, "?database=analytics").await, 503).await), "unavailable");
+    t.seal_owner_password(None);
+    assert_eq!(code_of(&error_of(t.sql_schema(main, "").await, 409).await), "owner_password_unknown");
+    let backup = t.backup(main);
+    assert_eq!(code_of(&error_of(t.sql_schema(backup, "").await, 409).await), "backup_branch");
+}
+
+#[tokio::test]
+async fn sql_schema_counts_against_the_run_limits() {
+    let t = sql_app().await;
+    let main = t.main();
+    let runs = t.app.state.sql_editor.runs();
+    let held: Vec<_> = (0..4)
+        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), BranchId::new(), "web1").unwrap())
+        .collect();
+    let resp = t.sql_schema(main, "").await;
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers()["retry-after"], "2");
+    assert_eq!(code_of(&resp.json().await.unwrap()), "sql_run_limit");
+    assert_eq!(t.compute_lookups(), 0);
+    drop(held);
+    // A schema read's slot is given back when it ends.
+    assert_eq!(code_of(&error_of(t.sql_schema(main, "").await, 503).await), "unavailable");
+    let held: Vec<_> = (0..4)
+        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), main, "web1").unwrap())
+        .collect();
+    drop(held);
+}
+
+// ---- the SQL editor against a real Postgres (scratch database, scratch owner)
+
+/// Reads an NDJSON run stream to its end: the events in order.
+async fn read_events(mut resp: reqwest::Response) -> Vec<Value> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// Owner sessions of the SQL editor on the scratch compute.
+async fn editor_sessions(scratch: &ScratchCompute) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = 'cheladb-sql-editor'",
+    )
+    .bind(&scratch.owner)
+    .fetch_one(&scratch.admin)
+    .await
+    .unwrap();
+    n
+}
+
+/// Waits (up to 10 s) until the scratch compute has no SQL editor session.
+async fn wait_no_editor_sessions(scratch: &ScratchCompute) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while editor_sessions(scratch).await > 0 {
+        assert!(std::time::Instant::now() < deadline, "an editor session outlived its run");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn run_streams_events_over_http() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("run-pass").await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("run-pass"));
+    let main = t.main();
+    let id = uuid::Uuid::new_v4();
+    let sql = "INSERT INTO notes (body) VALUES ('streamed words'); SELECT id, body FROM notes";
+    let resp = t.run_sql(main, json!({ "run_id": id, "sql": sql })).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/x-ndjson");
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    assert_eq!(resp.headers()["x-accel-buffering"], "no");
+    let events = read_events(resp).await;
+    let kinds: Vec<&str> = events.iter().map(|e| e["t"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["complete", "columns", "rows", "complete", "done"], "{events:?}");
+    assert_eq!(events[0]["tag"], "INSERT 0 1");
+    assert_eq!(events[2]["rows"], json!([["1", "streamed words"]]));
+    assert_eq!(events[3]["tag"], "SELECT 1");
+    assert_eq!(events[4]["outcome"], "ok");
+    // The connection is closed and the slot given back.
+    wait_no_editor_sessions(&scratch).await;
+    assert!(t.app.state.sql_editor.runs().reserve("user-1", id, main, &scratch.database).is_ok());
+    // One audit line, with the tags, without the SQL or its values.
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("sql run")).collect();
+    assert_eq!(audit.len(), 1, "{text}");
+    for field in ["outcome=ok", "statements=2", "tags=INSERT 0 1,SELECT 1", "role=owner", "confirmed=false"] {
+        assert!(audit[0].contains(field), "{field} missing from {}", audit[0]);
+    }
+    assert!(!audit[0].contains("held="), "{}", audit[0]);
+    assert!(!text.contains("streamed words"), "{text}");
+    assert!(!text.contains("run-pass"), "{text}");
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn closing_the_stream_cancels_the_run() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("cancel-pass").await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("cancel-pass"));
+    let main = t.main();
+
+    // Cancelled through the route: the stream ends with `cancelled`.
+    let id = uuid::Uuid::new_v4();
+    let resp = t.run_sql(main, json!({ "run_id": id, "sql": "SELECT pg_sleep(30)" })).await;
+    assert_eq!(resp.status(), 200);
+    let started = std::time::Instant::now();
+    assert_eq!(t.cancel_run(main, id).await.status(), 202);
+    let events = read_events(resp).await;
+    assert_eq!(events.last().unwrap()["t"], "done", "{events:?}");
+    assert_eq!(events.last().unwrap()["outcome"], "cancelled", "{events:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    // Closed by the client: the server's session ends and the slot is given back.
+    let id = uuid::Uuid::new_v4();
+    let resp = t.run_sql(main, json!({ "run_id": id, "sql": "SELECT pg_sleep(30)" })).await;
+    assert_eq!(resp.status(), 200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while editor_sessions(&scratch).await == 0 {
+        assert!(std::time::Instant::now() < deadline, "the run never started");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(resp);
+    wait_no_editor_sessions(&scratch).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while t.cancel_run(main, id).await.status() != 404 {
+        assert!(std::time::Instant::now() < deadline, "the run is still registered");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("sql run")).collect();
+    assert_eq!(audit.len(), 2, "{text}");
+    assert!(audit.iter().all(|l| l.contains("outcome=cancelled")), "{text}");
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn schema_route_returns_pgls_json() {
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("schema-pass").await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("schema-pass"));
+    let main = t.main();
+    let resp = t.sql_schema(main, "").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body: Value = resp.json().await.unwrap();
+    let tables = body["tables"].as_array().unwrap_or_else(|| panic!("no tables in {body}"));
+    assert!(tables.iter().any(|t| t["name"] == "notes" && t["schema"] == "public"), "{body}");
+    let columns = body["columns"].as_array().unwrap();
+    assert!(columns.iter().any(|c| c["table_name"] == "notes" && c["name"] == "body"));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
 }

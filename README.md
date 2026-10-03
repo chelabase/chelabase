@@ -20,6 +20,7 @@ infra/compose/       metadata Postgres, NATS JetStream, Zitadel
 - Docker (Compose deps **and** Docker socket for the worker)
 - Rust toolchain (edition 2021; rustc 1.98+ works)
 - cmake (Pingora builds zlib-ng): `sudo apt-get install -y cmake`
+- clang and protoc (`pg_query` builds Postgres's parser for the SQL editor's guard): `sudo apt-get install -y clang protobuf-compiler`
 
 ```bash
 proto install   # moon, node, pnpm, just from .prototools
@@ -681,6 +682,57 @@ Zitadel is the source of truth; three paths copy users into the table on every l
 
 - `just app-users-e2e` (needs `just dev`): a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `cheladb.user_id()` policy; a new branch gets the rows; an email changed in Zitadel reaches the row through the webhook; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its Zitadel org. `KEEP=1` leaves everything in place.
 - `app_users_live` (`cargo test -p worker --test app_users_live -- --ignored --test-threads=1`, with `demo.env` and `scripts/neon-images.sh` sourced as the file's header shows): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real Zitadel.
+
+## SQL editor
+
+Studio's SQL view runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. The API is `POST /v1/databases/{id}/branches/{branch_id}/sql` (the run, an NDJSON stream), `POST …/sql/runs/{run_id}/cancel`, `GET …/sql/schema?database=` (the schema document that feeds completion) and `/v1/databases/{id}/sql-queries[/{query_id}]` (saved queries). It uses the owner's credentials, so it is for people who already own the database.
+
+### Execution
+
+- A script is sent as **one simple query**: Postgres runs its statements in order inside an implicit transaction, so an error rolls the whole script back. `BEGIN` / `COMMIT` in the script are honoured and end that implicit transaction as you wrote it.
+- `VACUUM`, `CREATE INDEX CONCURRENTLY` and `CREATE DATABASE` can't run in a transaction block; they are accepted only as the script's single statement.
+- `COPY … FROM STDIN` isn't supported in the editor (there is no way to send the data). Use psql through the proxy for it.
+- Limits:
+  - 1 MiB of SQL per run (no NUL bytes);
+  - `timeout_ms` from 100 to 900000: 60 s by default, up to 15 min;
+  - 1,000 rows per result set (more set `truncated` on its `complete` event), sent in `rows` events of up to 200;
+  - 10 MiB per response, notices included: past it the run stops with `truncated_response`. A single `rows` event that would cross the cap isn't sent, so a very wide row can end a run with no rows shown. The orchestrator buffers at most the cap plus one row, and a notice flood is held back at the socket rather than queued;
+  - 4 runs in flight per user and 4 per Postgres database (429 `sql_run_limit` with `Retry-After`); a schema read takes a slot while it lasts;
+  - a `heartbeat` after 15 s without another event;
+  - the schema document is at most 8 MiB (422 `schema_too_large`; Studio falls back to keyword completion). pgls's introspection of the system catalogs alone is about 2.5 MiB.
+- Column types in `columns` events name the built-in types only (`int4`, `text`, `jsonb`, … and their arrays); any other type (enums, domains, extension types) is `""`.
+- The stream carries `columns`, `rows`, `complete` (with the command tag), `notice`, `error` (with the `position` in the script), `heartbeat` (it keeps the gateway's connection open during a long statement) and a final `done` whose `outcome` is `ok`, `error`, `cancelled`, `timeout` or `truncated_response`. Closing the stream, or the cancel route, sends Postgres's cancel request.
+
+### The guard
+
+Before running, the script is parsed (pg_query, Postgres's own parser) and each statement is classified.
+
+- On a normal branch the guard holds back **risky** statements: `DROP`, `TRUNCATE`, `DELETE` and `UPDATE` without a `WHERE`, and the like. The run answers 409 `sql_confirm_required` with the held statements; the client asks the user and sends the run again with `confirm: true`.
+- On a **protected** branch (`PATCH …/branches/{id}` with `protected: true`) every statement that isn't a read is held, with reason `protected`; `confirm: true` still runs them.
+- `EXPLAIN ANALYZE` (it runs its statement) and `PREPARE` of a risky statement count as risky.
+- Known limits: the guard looks at the statement, not at what it calls. On a protected branch, a `SELECT` that calls a function which writes, `SELECT … FOR UPDATE` inside a subquery or CTE, and writing functions such as `nextval` all pass as reads, so a protected branch isn't a safety boundary against them. On a normal branch, `EXECUTE` of a prepared risky statement, a data-modifying CTE (`WITH d AS (DELETE FROM t) …`), `MERGE`, `DO` blocks, functions and rules that delete pass without confirmation. A script that doesn't parse is held as `unparsed`. The guard is a confirmation step, not an authorization boundary: a client that sends `confirm: true` skips it.
+
+### Run as
+
+The run's role picker (`role` in the request) does `SET ROLE` first, to preview what `anon`, `authenticated` or a custom role would see under row-level security. It is a **preview, not a security boundary**: the connection is the owner's. For `anon` and `authenticated` (offered where the data API was set up), the worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE` (so `SET ROLE` works without the owner inheriting the role's privileges); the orchestrator re-checks that grant at most every 5 minutes per branch. Other roles of the branch need no grant: roles the owner created are already its own (Postgres's `createrole_self_grant`).
+
+### Saved queries and history
+
+Saved queries are private to their author, per database (unique name ignoring case, up to 500, 1 MiB of SQL each), and updates carry the `version` the client saw: a stale one answers 409 `saved_query_conflict` with the current row. An empty `pg_database` or `role` hint is stored as null. Studio keeps a history of runs (and the open buffer) in the browser.
+
+### Audit
+
+Every run writes one `info` line on the `orchestrator::sql_editor::audit` log target (on with the default log filter): user, database, branch, Postgres database, role (`owner` when none), run id, the number of statements and their command tags (the first 50), duration, outcome, a SHA-256 of the script (never its text), whether the branch is protected and whether the run was confirmed. A run the guard held logs one line with outcome `confirm_required`. A run whose client went away first logs `cancelled`. Requests answered with a JSON error before the connection opens (validation, limits, a compute that can't be reached) log no audit line: nothing ran.
+
+### Dependencies
+
+- **tokio-postgres is a fork** (`ChelaDB/rust-postgres`, pinned by `rev` in the workspace `Cargo.toml`) because the editor needs what simple queries don't expose upstream: command tags, the empty-query marker and column types. Upstream PR: https://github.com/rust-postgres/rust-postgres/pull/1391. Return to crates.io once it is released.
+- The language server in Studio is **pgls 0.26.0** (`supabase-community/postgres-language-server`, MIT). The introspection queries are copied from it byte-for-byte; the upgrade steps are in `services/orchestrator/src/sql_editor/pgls/README.md`.
+- `pg_query` builds Postgres's parser from C: it needs clang and protoc (see Prerequisites).
+
+### Testing
+
+`just live sql-editor-e2e` (needs `just deps-up` and `just dev`): a script as owner and as `anon` under RLS, a notice, an error with its position, a cancel, closing the stream through the gateway (the run's slot is freed), a 75 s `pg_sleep` through the gateway (heartbeats), the guard (`DROP` needs `confirm`; a protected branch holds writes), saved queries (including a stale version) and the schema document. `KEEP=1` leaves the database in place.
 
 ## Neon
 

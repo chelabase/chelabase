@@ -39,6 +39,11 @@ cheladb-neon = { workspace = true, features = ["metadata"] }
 getrandom = { workspace = true }
 hex = { workspace = true }
 moka = { workspace = true }
+tokio-postgres = { workspace = true }
+pg_query = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }

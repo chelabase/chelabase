@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { Fragment, lazy, Suspense, useEffect, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   ApiError,
@@ -19,6 +19,9 @@ import { ProjectSettings } from "./project-settings";
 import { StudioShell } from "./studio-shell";
 import { TablesView } from "./tables-view";
 import { UsersTab } from "./users-tab";
+
+// The editor, CodeMirror and the pgls worker load only when a SQL view opens.
+const SqlEditor = lazy(() => import("./sql-editor/sql-editor").then((m) => ({ default: m.SqlEditor })));
 
 export type ProjectTab = "databases" | "users" | "settings";
 
@@ -163,9 +166,11 @@ function TabButton({ active, onClick, children }: { active: boolean; onClick: ()
   );
 }
 
+type DatabaseView = "branches" | "data-api" | "tables" | "sql";
+
 function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; apiUrl: string }) {
-  const [open, setOpen] = useState<{ id: string; view: "branches" | "data-api" | "tables" } | null>(null);
-  const toggle = (id: string, view: "branches" | "data-api" | "tables") =>
+  const [open, setOpen] = useState<{ id: string; view: DatabaseView } | null>(null);
+  const toggle = (id: string, view: DatabaseView) =>
     setOpen(open?.id === id && open.view === view ? null : { id, view });
   if (databases.length === 0) {
     return <p className="text-sm text-muted-foreground">No databases yet.</p>;
@@ -217,6 +222,15 @@ function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; a
                   >
                     Tables
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={db.status !== "ready"}
+                    aria-expanded={open?.id === db.database_id && open.view === "sql"}
+                    onClick={() => toggle(db.database_id, "sql")}
+                  >
+                    SQL
+                  </Button>
                 </div>
               </td>
             </tr>
@@ -227,6 +241,10 @@ function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; a
                     <DatabaseBranches database={db} />
                   ) : open.view === "tables" ? (
                     <TablesView databaseId={db.database_id} />
+                  ) : open.view === "sql" ? (
+                    <Suspense fallback={<p className="py-3 text-sm text-muted-foreground">Loading the editor…</p>}>
+                      <SqlEditor databaseId={db.database_id} />
+                    </Suspense>
                   ) : (
                     <DatabaseDataApi apiUrl={apiUrl} database={db} />
                   )}

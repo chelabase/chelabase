@@ -327,6 +327,56 @@ impl MetadataPort for Doc {
     ) -> Result<Option<ProjectAuth>, MetadataError> {
         match *self {}
     }
+
+    async fn list_saved_queries(
+        &self,
+        database: Uuid,
+        user: &str,
+    ) -> Result<Vec<SavedQuerySummary>, MetadataError> {
+        match *self {}
+    }
+
+    async fn get_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+    ) -> Result<Option<SavedQuery>, MetadataError> {
+        match *self {}
+    }
+
+    async fn create_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+        name: &str,
+        sql: &str,
+        pg_database: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<SavedQueryWrite, MetadataError> {
+        match *self {}
+    }
+
+    async fn update_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+        version: i32,
+        patch: &SavedQueryPatch,
+    ) -> Result<SavedQueryWrite, MetadataError> {
+        match *self {}
+    }
+
+    async fn delete_saved_query(
+        &self,
+        database: Uuid,
+        user: &str,
+        id: Uuid,
+    ) -> Result<bool, MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -353,6 +403,14 @@ impl JobPort for Doc {
         &self,
         branch_id: BranchId,
         role: &str,
+    ) -> Result<CheckDataRoleReply, ResetError> {
+        match *self {}
+    }
+    async fn grant_data_role_to_owner(
+        &self,
+        branch: BranchId,
+        role: &str,
+        owner: &str,
     ) -> Result<CheckDataRoleReply, ResetError> {
         match *self {}
     }
@@ -505,6 +563,7 @@ mod tests {
                 "DELETE /v1/databases/{id}/branches/{branch_id}/roles/{role}",
                 "deleteRole",
             ),
+            ("DELETE /v1/databases/{id}/sql-queries/{query_id}", "deleteSavedQuery"),
             ("DELETE /v1/projects/{id}", "deleteProject"),
             ("DELETE /v1/projects/{id}/app-users", "disableAppUsers"),
             ("DELETE /v1/projects/{id}/users/{user_id}", "deleteAppUser"),
@@ -535,7 +594,13 @@ mod tests {
                 "GET /v1/databases/{id}/branches/{branch_id}/roles",
                 "listRoles",
             ),
+            (
+                "GET /v1/databases/{id}/branches/{branch_id}/sql/schema",
+                "getSqlSchema",
+            ),
             ("GET /v1/databases/{id}/connection", "getDatabaseConnection"),
+            ("GET /v1/databases/{id}/sql-queries", "listSavedQueries"),
+            ("GET /v1/databases/{id}/sql-queries/{query_id}", "getSavedQuery"),
             ("GET /v1/me", "getMe"),
             ("GET /v1/projects", "listProjects"),
             ("GET /v1/projects/{id}", "getProject"),
@@ -556,6 +621,7 @@ mod tests {
                 "PATCH /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
                 "updatePgDatabase",
             ),
+            ("PATCH /v1/databases/{id}/sql-queries/{query_id}", "updateSavedQuery"),
             ("PATCH /v1/projects/{id}", "updateProject"),
             ("PATCH /v1/projects/{id}/users/{user_id}", "updateAppUser"),
             ("POST /v1/databases", "createDatabase"),
@@ -596,10 +662,16 @@ mod tests {
                 "POST /v1/databases/{id}/branches/{branch_id}/roles/{role}/reset-password",
                 "resetRolePassword",
             ),
+            ("POST /v1/databases/{id}/branches/{branch_id}/sql", "runSql"),
+            (
+                "POST /v1/databases/{id}/branches/{branch_id}/sql/runs/{run_id}/cancel",
+                "cancelSqlRun",
+            ),
             (
                 "POST /v1/databases/{id}/reset-password",
                 "resetDatabasePassword",
             ),
+            ("POST /v1/databases/{id}/sql-queries", "createSavedQuery"),
             ("POST /v1/projects", "createProject"),
             ("POST /v1/projects/{id}/users", "createAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/deactivate", "deactivateAppUser"),
@@ -633,7 +705,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -700,6 +772,7 @@ mod tests {
             "CreateKeyRequest",
             "CreateProjectRequest",
             "CreateRoleRequest",
+            "CreateSavedQueryRequest",
             "CreatedDataKey",
             "DataApiSchema",
             "DataApiState",
@@ -734,6 +807,9 @@ mod tests {
             "RoleInUseKey",
             "RoleLevel",
             "RoleOrigin",
+            "RunSqlRequest",
+            "SavedQuery",
+            "SavedQuerySummary",
             "SchemaEntry",
             "TableDesc",
             "TableKind",
@@ -745,6 +821,7 @@ mod tests {
             "UpdateKeyRequest",
             "UpdatePgDatabaseRequest",
             "UpdateProjectRequest",
+            "UpdateSavedQueryRequest",
         ];
         // The names are map keys, so a clash between two types would drop one from this list.
         assert_eq!(names, expected);

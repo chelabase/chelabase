@@ -24,9 +24,9 @@ import {
   type Tree,
 } from "@/lib/console";
 import { errorText } from "@/lib/errors";
-import { BranchRoles } from "./branch-roles";
 import { ConsoleFilters } from "./console-filters";
 import { ConsoleGrid, rowKey, type Row } from "./console-grid";
+import { OwnerPasswordNotice } from "./owner-password-notice";
 import { InsertForm } from "./row-editor";
 
 export interface TablesViewProps {
@@ -240,7 +240,6 @@ function TableData({ databaseId, branchId, database, role, schemaName, tableName
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [showRoles, setShowRoles] = useState(false);
 
   const tree = buildSelect({ schema: schemaName, table: tableName, page, sort, filters: where, pk, pageSize });
   const send = (t: Tree) => consoleQueryExact(databaseId, branchId, { role, database, tree: t });
@@ -321,23 +320,7 @@ function TableData({ databaseId, branchId, database, role, schemaName, tableName
       {readOnlyReason && <p className="text-sm text-muted-foreground">{readOnlyReason}</p>}
       <ConsoleFilters columns={columns} value={filters} onChange={setFilters} onApply={apply} error={filterError} />
 
-      {ownerUnknown && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
-          <p>
-            The owner password isn&apos;t known to Cheladb (it was set in SQL), so the console can&apos;t connect as the
-            owner. Reset it to continue.
-          </p>
-          <div className="flex gap-2">
-            <Button size="sm" onClick={() => setShowRoles(true)}>
-              Reset the owner password
-            </Button>
-            <Button size="sm" variant="outline" onClick={refetch}>
-              Retry
-            </Button>
-          </div>
-          {showRoles && <BranchRoles databaseId={databaseId} branchId={branchId} />}
-        </div>
-      )}
+      {ownerUnknown && <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={refetch} />}
       {failure && !ownerUnknown && (
         <p role="alert" className="text-sm text-destructive">
           {text(failure, "select")}

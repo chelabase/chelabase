@@ -31,6 +31,7 @@ import type {
   Branch,
   BranchDatabaseView,
   BranchRole,
+  CancelSqlRun202,
   ConnectionDetails,
   ConsoleRequest,
   CreateAppUserRequest,
@@ -40,6 +41,7 @@ import type {
   CreateKeyRequest,
   CreateProjectRequest,
   CreateRoleRequest,
+  CreateSavedQueryRequest,
   CreatedDataKey,
   DataApiSchema,
   DataKey,
@@ -51,6 +53,8 @@ import type {
   GetBranchConnectionParams,
   GetConsoleSchemaParams,
   GetDataApiSchemaParams,
+  GetSqlSchema200,
+  GetSqlSchemaParams,
   ListAppUsersParams,
   Me,
   OperationAccepted,
@@ -58,12 +62,16 @@ import type {
   PutAppUsersRequest,
   RestoreAccepted,
   RestoreRequest,
+  RunSqlRequest,
+  SavedQuery,
+  SavedQuerySummary,
   UpdateAppUserRequest,
   UpdateBranchRequest,
   UpdateDatabaseRequest,
   UpdateKeyRequest,
   UpdatePgDatabaseRequest,
-  UpdateProjectRequest
+  UpdateProjectRequest,
+  UpdateSavedQueryRequest
 } from './model';
 
 import { customFetch } from '../fetch.ts';
@@ -2693,6 +2701,302 @@ export const useResetRolePassword = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getResetRolePasswordMutationOptions(options), queryClient);
     }
 
+export const getRunSqlUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/sql`
+}
+
+/**
+ * Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (or, with `role`, after `SET ROLE` to it: a preview of that role's view, not a security boundary). The script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. Unless `confirm` is true, risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.
+ * @summary Run SQL on a branch
+ */
+export const runSql = async (id: string,
+    branchId: string,
+    runSqlRequest: RunSqlRequest, options?: Parameters<typeof customFetch>[1]): Promise<Response> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Response>(getRunSqlUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(runSqlRequest)
+  }
+);}
+
+
+
+
+
+export const getRunSqlMutationKey = () => ['runSql'] as const;
+
+export const getRunSqlMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof runSql>>, TError,RunSqlMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof runSql>>, TError,RunSqlMutationVariables, TContext> => {
+
+const mutationKey = getRunSqlMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof runSql>>, RunSqlMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  runSql(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RunSqlMutationResult = NonNullable<Awaited<ReturnType<typeof runSql>>>
+    export type RunSqlMutationBody = RunSqlRequest
+    export type RunSqlMutationError = ErrorType<ErrorEnvelope>
+    export type RunSqlMutationVariables = {id: string;branchId: string;data: RunSqlRequest}
+
+    /**
+ * @summary Run SQL on a branch
+ */
+export const useRunSql = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof runSql>>, TError,RunSqlMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof runSql>>,
+        TError,
+        RunSqlMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRunSqlMutationOptions(options), queryClient);
+    }
+
+export const getCancelSqlRunUrl = (id: string,
+    branchId: string,
+    runId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/sql/runs/${encodeURIComponent(String(runId))}/cancel`
+}
+
+/**
+ * Cancels one of your runs in flight: Postgres's cancel request is sent and the run's stream ends with `done` (`outcome: cancelled`). Closing the stream cancels too.
+ * @summary Cancel a SQL run
+ */
+export const cancelSqlRun = async (id: string,
+    branchId: string,
+    runId: string, options?: Parameters<typeof customFetch>[1]): Promise<CancelSqlRun202> => {
+
+  return customFetch<CancelSqlRun202>(getCancelSqlRunUrl(id,branchId,runId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getCancelSqlRunMutationKey = () => ['cancelSqlRun'] as const;
+
+export const getCancelSqlRunMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof cancelSqlRun>>, TError,CancelSqlRunMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof cancelSqlRun>>, TError,CancelSqlRunMutationVariables, TContext> => {
+
+const mutationKey = getCancelSqlRunMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof cancelSqlRun>>, CancelSqlRunMutationVariables> = (props) => {
+          const {id,branchId,runId} = props ?? {};
+
+          return  cancelSqlRun(id,branchId,runId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CancelSqlRunMutationResult = NonNullable<Awaited<ReturnType<typeof cancelSqlRun>>>
+
+    export type CancelSqlRunMutationError = ErrorType<ErrorEnvelope>
+    export type CancelSqlRunMutationVariables = {id: string;branchId: string;runId: string}
+
+    /**
+ * @summary Cancel a SQL run
+ */
+export const useCancelSqlRun = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof cancelSqlRun>>, TError,CancelSqlRunMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof cancelSqlRun>>,
+        TError,
+        CancelSqlRunMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCancelSqlRunMutationOptions(options), queryClient);
+    }
+
+export const getGetSqlSchemaUrl = (id: string,
+    branchId: string,
+    params?: GetSqlSchemaParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/sql/schema?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/sql/schema`
+}
+
+/**
+ * Everything the database's owner sees in one Postgres database of the branch, read on a fresh owner connection with postgres-language-server's own introspection (the version `PGLS_VERSION` pins), as the JSON its WASM build's `setSchema` takes. Not cached on the server.
+ * @summary The schema for the SQL editor's completion
+ */
+export const getSqlSchema = async (id: string,
+    branchId: string,
+    params?: GetSqlSchemaParams, options?: Parameters<typeof customFetch>[1]): Promise<GetSqlSchema200> => {
+
+  return customFetch<GetSqlSchema200>(getGetSqlSchemaUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetSqlSchemaQueryKey = (id: string,
+    branchId: string,
+    params?: GetSqlSchemaParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/sql/schema`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getGetSqlSchemaQueryOptions = <TData = Awaited<ReturnType<typeof getSqlSchema>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    params?: GetSqlSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSqlSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetSqlSchemaQueryKey(id,branchId,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getSqlSchema>>> = ({ signal }) => getSqlSchema(id,branchId,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getSqlSchema>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetSqlSchemaQueryResult = NonNullable<Awaited<ReturnType<typeof getSqlSchema>>>
+export type GetSqlSchemaQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetSqlSchema<TData = Awaited<ReturnType<typeof getSqlSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params: undefined |  GetSqlSchemaParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSqlSchema>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getSqlSchema>>,
+          TError,
+          Awaited<ReturnType<typeof getSqlSchema>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetSqlSchema<TData = Awaited<ReturnType<typeof getSqlSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetSqlSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSqlSchema>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getSqlSchema>>,
+          TError,
+          Awaited<ReturnType<typeof getSqlSchema>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetSqlSchema<TData = Awaited<ReturnType<typeof getSqlSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetSqlSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSqlSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary The schema for the SQL editor's completion
+ */
+
+export function useGetSqlSchema<TData = Awaited<ReturnType<typeof getSqlSchema>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetSqlSchemaParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSqlSchema>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetSqlSchemaQueryOptions(id,branchId,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
 export const getGetDatabaseConnectionUrl = (id: string,) => {
 
 
@@ -2867,6 +3171,476 @@ export const useResetDatabasePassword = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getResetDatabasePasswordMutationOptions(options), queryClient);
+    }
+
+export const getListSavedQueriesUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/sql-queries`
+}
+
+/**
+ * The caller's saved queries for the database, by name (ignoring case), without their SQL text. Saved queries are private to their author.
+ * @summary List your saved SQL queries
+ */
+export const listSavedQueries = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<SavedQuerySummary[]> => {
+
+  return customFetch<SavedQuerySummary[]>(getListSavedQueriesUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListSavedQueriesQueryKey = (id: string,) => {
+    return [
+    `/v1/databases/${id}/sql-queries`
+    ] as const;
+    }
+
+
+export const getListSavedQueriesQueryOptions = <TData = Awaited<ReturnType<typeof listSavedQueries>>, TError = ErrorType<ErrorEnvelope>>(id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listSavedQueries>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListSavedQueriesQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listSavedQueries>>> = ({ signal }) => listSavedQueries(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listSavedQueries>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListSavedQueriesQueryResult = NonNullable<Awaited<ReturnType<typeof listSavedQueries>>>
+export type ListSavedQueriesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListSavedQueries<TData = Awaited<ReturnType<typeof listSavedQueries>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listSavedQueries>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listSavedQueries>>,
+          TError,
+          Awaited<ReturnType<typeof listSavedQueries>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListSavedQueries<TData = Awaited<ReturnType<typeof listSavedQueries>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listSavedQueries>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listSavedQueries>>,
+          TError,
+          Awaited<ReturnType<typeof listSavedQueries>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListSavedQueries<TData = Awaited<ReturnType<typeof listSavedQueries>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listSavedQueries>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List your saved SQL queries
+ */
+
+export function useListSavedQueries<TData = Awaited<ReturnType<typeof listSavedQueries>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listSavedQueries>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListSavedQueriesQueryOptions(id,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateSavedQueryUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/sql-queries`
+}
+
+/**
+ * Saves a query for the caller. A user keeps at most 500 per database.
+ * @summary Save a SQL query
+ */
+export const createSavedQuery = async (id: string,
+    createSavedQueryRequest: CreateSavedQueryRequest, options?: Parameters<typeof customFetch>[1]): Promise<SavedQuery> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<SavedQuery>(getCreateSavedQueryUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createSavedQueryRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateSavedQueryMutationKey = () => ['createSavedQuery'] as const;
+
+export const getCreateSavedQueryMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createSavedQuery>>, TError,CreateSavedQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createSavedQuery>>, TError,CreateSavedQueryMutationVariables, TContext> => {
+
+const mutationKey = getCreateSavedQueryMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createSavedQuery>>, CreateSavedQueryMutationVariables> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  createSavedQuery(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateSavedQueryMutationResult = NonNullable<Awaited<ReturnType<typeof createSavedQuery>>>
+    export type CreateSavedQueryMutationBody = CreateSavedQueryRequest
+    export type CreateSavedQueryMutationError = ErrorType<ErrorEnvelope>
+    export type CreateSavedQueryMutationVariables = {id: string;data: CreateSavedQueryRequest}
+
+    /**
+ * @summary Save a SQL query
+ */
+export const useCreateSavedQuery = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createSavedQuery>>, TError,CreateSavedQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createSavedQuery>>,
+        TError,
+        CreateSavedQueryMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateSavedQueryMutationOptions(options), queryClient);
+    }
+
+export const getGetSavedQueryUrl = (id: string,
+    queryId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/sql-queries/${encodeURIComponent(String(queryId))}`
+}
+
+/**
+ * One of the caller's saved queries, with its SQL text.
+ * @summary Get a saved SQL query
+ */
+export const getSavedQuery = async (id: string,
+    queryId: string, options?: Parameters<typeof customFetch>[1]): Promise<SavedQuery> => {
+
+  return customFetch<SavedQuery>(getGetSavedQueryUrl(id,queryId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetSavedQueryQueryKey = (id: string,
+    queryId: string,) => {
+    return [
+    `/v1/databases/${id}/sql-queries/${queryId}`
+    ] as const;
+    }
+
+
+export const getGetSavedQueryQueryOptions = <TData = Awaited<ReturnType<typeof getSavedQuery>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    queryId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSavedQuery>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetSavedQueryQueryKey(id,queryId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getSavedQuery>>> = ({ signal }) => getSavedQuery(id,queryId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && queryId !== null && queryId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getSavedQuery>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetSavedQueryQueryResult = NonNullable<Awaited<ReturnType<typeof getSavedQuery>>>
+export type GetSavedQueryQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetSavedQuery<TData = Awaited<ReturnType<typeof getSavedQuery>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    queryId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSavedQuery>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getSavedQuery>>,
+          TError,
+          Awaited<ReturnType<typeof getSavedQuery>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetSavedQuery<TData = Awaited<ReturnType<typeof getSavedQuery>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    queryId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSavedQuery>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getSavedQuery>>,
+          TError,
+          Awaited<ReturnType<typeof getSavedQuery>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetSavedQuery<TData = Awaited<ReturnType<typeof getSavedQuery>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    queryId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSavedQuery>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Get a saved SQL query
+ */
+
+export function useGetSavedQuery<TData = Awaited<ReturnType<typeof getSavedQuery>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    queryId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getSavedQuery>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetSavedQueryQueryOptions(id,queryId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getDeleteSavedQueryUrl = (id: string,
+    queryId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/sql-queries/${encodeURIComponent(String(queryId))}`
+}
+
+/**
+ * @summary Delete a saved SQL query
+ */
+export const deleteSavedQuery = async (id: string,
+    queryId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteSavedQueryUrl(id,queryId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteSavedQueryMutationKey = () => ['deleteSavedQuery'] as const;
+
+export const getDeleteSavedQueryMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteSavedQuery>>, TError,DeleteSavedQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteSavedQuery>>, TError,DeleteSavedQueryMutationVariables, TContext> => {
+
+const mutationKey = getDeleteSavedQueryMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteSavedQuery>>, DeleteSavedQueryMutationVariables> = (props) => {
+          const {id,queryId} = props ?? {};
+
+          return  deleteSavedQuery(id,queryId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteSavedQueryMutationResult = NonNullable<Awaited<ReturnType<typeof deleteSavedQuery>>>
+
+    export type DeleteSavedQueryMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteSavedQueryMutationVariables = {id: string;queryId: string}
+
+    /**
+ * @summary Delete a saved SQL query
+ */
+export const useDeleteSavedQuery = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteSavedQuery>>, TError,DeleteSavedQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteSavedQuery>>,
+        TError,
+        DeleteSavedQueryMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteSavedQueryMutationOptions(options), queryClient);
+    }
+
+export const getUpdateSavedQueryUrl = (id: string,
+    queryId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/sql-queries/${encodeURIComponent(String(queryId))}`
+}
+
+/**
+ * Changes the given fields of one of the caller's saved queries. `version` must be the version last seen; the version goes up by one with each change. `pg_database` and `role` accept `null` to clear them.
+ * @summary Update a saved SQL query
+ */
+export const updateSavedQuery = async (id: string,
+    queryId: string,
+    updateSavedQueryRequest: UpdateSavedQueryRequest, options?: Parameters<typeof customFetch>[1]): Promise<SavedQuery> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<SavedQuery>(getUpdateSavedQueryUrl(id,queryId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateSavedQueryRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateSavedQueryMutationKey = () => ['updateSavedQuery'] as const;
+
+export const getUpdateSavedQueryMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateSavedQuery>>, TError,UpdateSavedQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateSavedQuery>>, TError,UpdateSavedQueryMutationVariables, TContext> => {
+
+const mutationKey = getUpdateSavedQueryMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateSavedQuery>>, UpdateSavedQueryMutationVariables> = (props) => {
+          const {id,queryId,data} = props ?? {};
+
+          return  updateSavedQuery(id,queryId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateSavedQueryMutationResult = NonNullable<Awaited<ReturnType<typeof updateSavedQuery>>>
+    export type UpdateSavedQueryMutationBody = UpdateSavedQueryRequest
+    export type UpdateSavedQueryMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateSavedQueryMutationVariables = {id: string;queryId: string;data: UpdateSavedQueryRequest}
+
+    /**
+ * @summary Update a saved SQL query
+ */
+export const useUpdateSavedQuery = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateSavedQuery>>, TError,UpdateSavedQueryMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateSavedQuery>>,
+        TError,
+        UpdateSavedQueryMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateSavedQueryMutationOptions(options), queryClient);
     }
 
 export const getGetMeUrl = () => {

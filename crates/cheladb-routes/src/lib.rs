@@ -399,6 +399,45 @@ pub mod orchestrator {
         "/v1/databases/{id}/branches/{branch_id}/console/query",
     );
 
+    /// Studio's SQL editor: each user's saved queries, per database.
+    pub const LIST_SAVED_QUERIES: Endpoint =
+        key_endpoint("orchestrator.list_saved_queries", Method::Get, "/v1/databases/{id}/sql-queries");
+    pub const CREATE_SAVED_QUERY: Endpoint =
+        key_endpoint("orchestrator.create_saved_query", Method::Post, "/v1/databases/{id}/sql-queries");
+    pub const GET_SAVED_QUERY: Endpoint = key_endpoint(
+        "orchestrator.get_saved_query",
+        Method::Get,
+        "/v1/databases/{id}/sql-queries/{query_id}",
+    );
+    pub const UPDATE_SAVED_QUERY: Endpoint = key_endpoint(
+        "orchestrator.update_saved_query",
+        Method::Patch,
+        "/v1/databases/{id}/sql-queries/{query_id}",
+    );
+    pub const DELETE_SAVED_QUERY: Endpoint = key_endpoint(
+        "orchestrator.delete_saved_query",
+        Method::Delete,
+        "/v1/databases/{id}/sql-queries/{query_id}",
+    );
+
+    /// Studio's SQL editor: runs a script on a branch (an NDJSON stream), cancels a run, and
+    /// serves the schema for completion.
+    pub const RUN_SQL: Endpoint = key_endpoint(
+        "orchestrator.run_sql",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/sql",
+    );
+    pub const CANCEL_SQL_RUN: Endpoint = key_endpoint(
+        "orchestrator.cancel_sql_run",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/sql/runs/{run_id}/cancel",
+    );
+    pub const GET_SQL_SCHEMA: Endpoint = key_endpoint(
+        "orchestrator.get_sql_schema",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/sql/schema",
+    );
+
     /// Studio's console: the schema it may show, as the owner or a named role.
     pub const CONSOLE_SCHEMA: Endpoint = key_endpoint(
         "orchestrator.console_schema",
@@ -656,6 +695,14 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::UPDATE_KEY,
     orchestrator::CONSOLE_QUERY,
     orchestrator::CONSOLE_SCHEMA,
+    orchestrator::LIST_SAVED_QUERIES,
+    orchestrator::CREATE_SAVED_QUERY,
+    orchestrator::GET_SAVED_QUERY,
+    orchestrator::UPDATE_SAVED_QUERY,
+    orchestrator::DELETE_SAVED_QUERY,
+    orchestrator::RUN_SQL,
+    orchestrator::CANCEL_SQL_RUN,
+    orchestrator::GET_SQL_SCHEMA,
     orchestrator::LIST_ROLES,
     orchestrator::CREATE_ROLE,
     orchestrator::RESET_ROLE,
@@ -1108,6 +1155,52 @@ mod tests {
             .expect("console_schema is in ENDPOINTS");
         assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio });
         assert_eq!(ep.service, Service::Orchestrator);
+    }
+
+    #[test]
+    fn saved_query_routes_are_management_auth_with_studio_cors() {
+        let db = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/sql-queries";
+        let one = format!("{db}/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e");
+        for (method, path, name) in [
+            ("GET", db.to_string(), "orchestrator.list_saved_queries"),
+            ("POST", db.to_string(), "orchestrator.create_saved_query"),
+            ("GET", one.clone(), "orchestrator.get_saved_query"),
+            ("PATCH", one.clone(), "orchestrator.update_saved_query"),
+            ("DELETE", one.clone(), "orchestrator.delete_saved_query"),
+        ] {
+            assert_eq!(found(method, &path), name);
+            let ep = ENDPOINTS.iter().find(|e| e.name == name).expect(name);
+            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!(ep.service, Service::Orchestrator);
+        }
+        assert_eq!(
+            match_endpoint(Scope::Api, "PUT", &one),
+            Match::MethodNotAllowed(vec![Method::Get, Method::Patch, Method::Delete])
+        );
+    }
+
+    #[test]
+    fn sql_editor_routes_are_management_auth_with_studio_cors() {
+        let branch = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e";
+        let cancel = format!("{branch}/sql/runs/9a510d8f-2f1d-4c52-9a51-6c0f1c2e2f7e/cancel");
+        for (method, path, name) in [
+            ("POST", format!("{branch}/sql"), "orchestrator.run_sql"),
+            ("POST", cancel.clone(), "orchestrator.cancel_sql_run"),
+            ("GET", format!("{branch}/sql/schema"), "orchestrator.get_sql_schema"),
+        ] {
+            assert_eq!(found(method, &path), name);
+            let ep = ENDPOINTS.iter().find(|e| e.name == name).expect(name);
+            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!(ep.service, Service::Orchestrator);
+        }
+        assert_eq!(
+            match_endpoint(Scope::Api, "GET", &format!("{branch}/sql")),
+            Match::MethodNotAllowed(vec![Method::Post])
+        );
+        assert_eq!(
+            match_endpoint(Scope::Api, "GET", &cancel),
+            Match::MethodNotAllowed(vec![Method::Post])
+        );
     }
 
     #[test]

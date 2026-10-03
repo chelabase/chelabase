@@ -245,13 +245,13 @@ pub(crate) fn database_not_found() -> ApiError {
     ApiError::not_found("database not found")
 }
 
-fn unavailable(message: &str) -> ApiError {
+pub(crate) fn unavailable(message: &str) -> ApiError {
     ApiError::new(503, ErrorCode::Unavailable, message).retry_after(RETRY_AFTER_SECS)
 }
 
 /// The branch's database the request names (`None`: its main one); the system database is
 /// never served, so it's missing here too.
-fn pick_database(rows: Vec<BranchDatabase>, name: Option<&str>) -> Option<BranchDatabase> {
+pub(crate) fn pick_database(rows: Vec<BranchDatabase>, name: Option<&str>) -> Option<BranchDatabase> {
     rows.into_iter().find(|d| match name {
         None => d.origin == DatabaseOrigin::Main,
         Some(name) => d.name == name && d.origin != DatabaseOrigin::System,
@@ -409,14 +409,23 @@ where
     response
 }
 
-/// The owner pool of `row`'s database on `branch`: 409 when Cheladb doesn't know the owner
-/// password, 503 when the compute can't be found.
-async fn owner_pool_for<M, J>(
+/// Where and as whom to reach a branch's compute as its owner.
+pub(crate) struct OwnerTarget {
+    pub addr: SocketAddr,
+    pub user: String,
+    pub password: String,
+    pub sealed: String,
+}
+
+/// The owner's address and credentials on `branch`: 409 `owner_password_unknown` when
+/// Cheladb doesn't know the owner password, 409 `branch_not_ready`, 500
+/// `credentials_unavailable` when the sealed password can't be opened, 503 when the compute
+/// can't be found.
+pub(crate) async fn owner_target<M, J>(
     state: &AppState<M, J>,
     branch: &cheladb_metadata::BranchRecord,
-    row: &BranchDatabase,
     owner: &str,
-) -> Result<PgPool, ApiError>
+) -> Result<OwnerTarget, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
@@ -464,18 +473,38 @@ where
             ));
         }
     };
+    Ok(OwnerTarget {
+        addr,
+        user: owner.to_string(),
+        password,
+        sealed: sealed.to_string(),
+    })
+}
+
+/// The owner pool of `row`'s database on `branch`; errors as [`owner_target`].
+async fn owner_pool_for<M, J>(
+    state: &AppState<M, J>,
+    branch: &cheladb_metadata::BranchRecord,
+    row: &BranchDatabase,
+    owner: &str,
+) -> Result<PgPool, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let target = owner_target(state, branch, owner).await?;
     let options = PgConnectOptions::new()
-        .host(&addr.ip().to_string())
-        .port(addr.port())
-        .username(owner)
-        .password(&password)
+        .host(&target.addr.ip().to_string())
+        .port(target.addr.port())
+        .username(&target.user)
+        .password(&target.password)
         .database(&row.name)
         .ssl_mode(PgSslMode::Prefer)
         .application_name(APPLICATION_NAME);
     Ok(state
         .console
         .owner_pool(
-            OwnerPoolKey::new(branch.id, &row.name, sealed, addr),
+            OwnerPoolKey::new(branch.id, &row.name, &target.sealed, target.addr),
             options,
         )
         .await)
