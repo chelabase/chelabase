@@ -7,7 +7,9 @@
 # 3. deleting a branch removes only its timeline;
 # 4. restore keeps main's new timeline and the backup's old one;
 # 5. deleting the backup branch removes only its timeline;
-# 6. deleting the database removes the tenant's directory and its S3 prefix.
+# 6. deleting the database removes the tenant's directory and its S3 prefix, and the storage
+#    controller forgets the tenant: storcon-db keeps no timelines or
+#    safekeeper_timeline_pending_ops rows for it.
 # "Removed" means: safekeeper1 answers 404 for it, /data/<tenant>/<timeline> is gone and no object
 # is left under s3://neon/safekeeper/<tenant>/<timeline>/, within 60 s.
 # S3 uses marker objects: the safekeeper uploads a short-lived timeline's WAL only after
@@ -122,6 +124,25 @@ psql_on() {
 }
 # timeline_of <branch id>: its current Neon timeline id.
 timeline_of() { metadata_sql -v id="$1" <<<"SELECT timeline_id FROM branches WHERE id = :'id';"; }
+
+# storcon_sql <psql args>: the storage controller's database.
+storcon_sql() { "${compose[@]}" exec -T storcon-db psql -U storcon -d storage_controller -v ON_ERROR_STOP=1 -qtA "$@"; }
+# wait_storcon_clean <tenant>: until storcon-db has no timelines and no pending-op rows for the
+# tenant, 60 s at most. A tenant delete op left behind (timeline_id '') keeps the controller from
+# removing the timelines rows (fork storage_controller/src/service/safekeeper_reconciler.rs, `delete_timeline_from_db`).
+wait_storcon_clean() {
+  local tls="" ops=""
+  for _ in $(seq 60); do
+    tls="$(storcon_sql -v t="$1" <<<"SELECT count(*) FROM timelines WHERE tenant_id = :'t';")" || die "querying storcon-db failed"
+    ops="$(storcon_sql -v t="$1" <<<"SELECT count(*) FROM safekeeper_timeline_pending_ops WHERE tenant_id = :'t';")" || die "querying storcon-db failed"
+    if [[ "$tls" == 0 && "$ops" == 0 ]]; then
+      pass "database delete: storcon-db has no timelines or pending ops for tenant $1"
+      return 0
+    fi
+    sleep 1
+  done
+  die "database delete: storcon-db still has $tls timelines row(s) and $ops safekeeper_timeline_pending_ops row(s) for tenant $1 after 60 s"
+}
 
 # --- the safekeeper and SeaweedFS views ---
 sk() { "${compose[@]}" exec -T safekeeper1 "$@"; }
@@ -270,4 +291,5 @@ for i in $(seq 120); do
 done
 db_id=""
 wait_removed "database delete: tenant $tenant" "$tenant" ""
+wait_storcon_clean "$tenant"
 echo "all passed ($((SECONDS - t0)) s)"

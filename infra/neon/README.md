@@ -3,7 +3,7 @@
 Cheladb runs Neon's storage stack (pageserver, safekeepers, storage broker, storage
 controller, proxy) and a compute image. Both come from our hard fork,
 [ChelaDB/neon](https://github.com/ChelaDB/neon), at the commit in `NEON_REF`
-(`39b641053212a25645384df1eabd843a5d117b69`). Design: `docs/superpowers/specs/` and
+(`2d2a6acd7be2c82c652d83d3276bfa1ed5d57292`). Design: `docs/superpowers/specs/` and
 `docs/superpowers/plans/2026-10-01-neon-fork.md`.
 
 ## Pull (default)
@@ -44,9 +44,10 @@ predate these flags still leak (a tenant with any controller-managed timeline ge
 safekeeper delete that removes its old timelines too): another machine needs the same L8 (the Neon
 storage reset) in `docs/superpowers/plans/2026-10-03-live-queue.md` to reclaim them.
 
-Known fork issue: each deleted database leaves a few `timelines` rows and a tenant `Delete` pending
-op in the storage controller's database (generation mismatch in `tenant_delete_safekeepers`); they
-clear on a controller restart, and the safekeeper and S3 data are removed.
+Each deleted database used to leave its `timelines` rows and a tenant `Delete` pending op in the
+storage controller's database (a generation mismatch in `tenant_delete_safekeepers`). The fix
+landed in ChelaDB/neon#25 (https://github.com/ChelaDB/neon/pull/25, `NEON_REF` `2d2a6acd7be2`);
+`just storage-leak-e2e` checks that the controller forgets a deleted database's tenant.
 
 ## Bump `NEON_REF`
 
@@ -60,7 +61,7 @@ clear on a controller restart, and the safekeeper and S3 data are removed.
    `:<sha12>-dev@sha256:`).
 5. Move the stack onto the new pins with `just live just deps-up`, then run the e2e scripts
    through the queue (`just live just neon-e2e`, and likewise `branch-e2e`, `data-e2e`,
-   `console-e2e`, `role-e2e` and `auth-e2e`).
+   `console-e2e`, `role-e2e`, `auth-e2e` and `storage-leak-e2e`).
 
 The compute image runs Postgres 17.11 (the fork's `REL_17_STABLE_cheladb`).
 
