@@ -240,6 +240,11 @@ services:
       - --control-plane-url=http://host.docker.internal:8083/storcon
       - --control-plane-jwt-token=${CHELADB_STORCON_HOOK_TOKEN:-cheladb-dev-storcon-hook}
       - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
+      # The controller creates and deletes each timeline on the safekeepers (one, here). Without
+      # these, the compute creates them implicitly and a deleted database, branch or superseded
+      # timeline leaves its WAL on the safekeeper and in S3. Count 1: the default 3 needs three.
+      - --timelines-onto-safekeepers
+      - --timeline-safekeeper-count=1
     ports:
       # The control plane runs on the host.
       - "127.0.0.1:1234:1234"

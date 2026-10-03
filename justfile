@@ -548,6 +548,11 @@ neon-e2e: _live-check
 branch-e2e: _live-check
     scripts/branch-e2e.sh
 
+# Live check that deleting a database, a branch or a superseded timeline reclaims the safekeeper's
+# local WAL and S3 backup (needs just deps-up and just dev)
+storage-leak-e2e: _live-check
+    scripts/storage-leak-e2e.sh
+
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke (needs just deps-up and just dev)
 data-e2e: _live-check
     scripts/data-e2e.sh

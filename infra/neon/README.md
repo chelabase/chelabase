@@ -35,6 +35,19 @@ instead of pulling. Reclaim the build cache afterwards with
 `EXTENSIONS=<set>` overrides the compute's extension set for either variant. Only the dev
 tag is picked up by `just deps-up`.
 
+## Safekeeper timelines
+
+The storage controller runs with `--timelines-onto-safekeepers --timeline-safekeeper-count=1`, so it
+creates each safekeeper timeline and deletes it (local WAL and the S3 backup) with the database,
+branch or superseded timeline; `just storage-leak-e2e` checks this. Databases whose timelines ALL
+predate these flags still leak (a tenant with any controller-managed timeline gets a tenant-wide
+safekeeper delete that removes its old timelines too): another machine needs the same L8 (the Neon
+storage reset) in `docs/superpowers/plans/2026-10-03-live-queue.md` to reclaim them.
+
+Known fork issue: each deleted database leaves a few `timelines` rows and a tenant `Delete` pending
+op in the storage controller's database (generation mismatch in `tenant_delete_safekeepers`); they
+clear on a controller restart, and the safekeeper and S3 data are removed.
+
 ## Bump `NEON_REF`
 
 1. Merge the change in `ChelaDB/neon` (`main`).

@@ -53,6 +53,7 @@ pnpm install
 | `just cleanup` | Fresh start: stops dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps (keeps keys and the seeded tenant). Asks first |
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
 | `just data-e2e` | Live data API story: keys, queries, generated types, RLS, revoke (needs `just deps-up` and `just dev`) |
+| `just storage-leak-e2e` | Live check that deleting a database, a branch or a superseded timeline reclaims the safekeeper's WAL and S3 backup (needs `just deps-up` and `just dev`) |
 | `just role-e2e` | Live login roles story: create, connect, back a secret key, refused delete, reset, delete (needs `just deps-up` and `just dev`) |
 | `just console-e2e` | Live data API across databases and Studio's console: a second database, a key allowed only on it, console CRUD as owner, `anon` under RLS and other roles, disable (needs `just deps-up` and `just dev`) |
 
