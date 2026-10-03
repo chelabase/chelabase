@@ -229,7 +229,7 @@
 - **Secrets:** never overwrite `.cheladb/secrets/secrets.key`, the gateway key pair, the cookie key or the compute-JWT key pair.
 - **Strict TDD:** a failing test run (RED) before any implementation, in every task. Reports show the RED and GREEN commands and output. A compile error counts as RED only when the missing item is the code under test.
 - **Dependencies:** none new.
-- **Compute image:** planned unchanged (`compute-node-v17:fa6917ea6ba6-dev`). Task 12 pinned the fork's F1/F2 image `ghcr.io/cheladb/neon-compute-v17:b2402faa2394-dev@sha256:7816c6b0543d9ea83a9c925ba5da733d39a38e6845cae6888ecd297123859e43`.
+- **Compute image:** planned unchanged (`compute-node-v17:fa6917ea6ba6-dev`). Task 12 pinned the fork's F1/F2 image `ghcr.io/chelabase/neon-compute-v17:b2402faa2394-dev@sha256:7816c6b0543d9ea83a9c925ba5da733d39a38e6845cae6888ecd297123859e43`.
 - **Caps and settings.** The orchestrator (receiver) and the worker (API creates) both read these, through one parser in `cheladb-types`:
   - `CHELADB_BRANCH_ROLE_CAP`: **50 login roles per branch** by default, allowed **0..=500**. Group roles without a password don't count. A refusal names the setting.
   - `CHELADB_BRANCH_DATABASE_CAP`: default **20**, allowed **1..=1000**, a per-branch limit on Postgres databases. It counts every tracked database including main, but not the system `postgres` database (Q4, R23). The existing branch cap is unchanged.

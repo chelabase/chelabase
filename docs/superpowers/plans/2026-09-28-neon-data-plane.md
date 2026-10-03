@@ -22,15 +22,15 @@
   Claude-Session: https://claude.ai/code/session_01KESSEqEbiuKm7pMwCPe2Wg
   ```
 - **Pinned images** (exact):
-  - `ghcr.io/cheladb/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a`
-  - `ghcr.io/cheladb/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93`
+  - `ghcr.io/chelabase/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a`
+  - `ghcr.io/chelabase/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93`
 - **`NEON_REF`:** `fa504217c61bbcaf5c512d75830564541f917f8f`; `neon_tag` is its first 12 chars; local builds are `cheladb/neon:<neon_tag>` and `cheladb/compute-node-v17:<neon_tag>`.
 - **Profile:** every new service has `profiles: ["neon"]`. `just deps-up` and `just dev` must not start them.
 - **Host ports:** only `127.0.0.1:1234` (storage controller) and `127.0.0.1:9898` (pageserver HTTP). Nothing new binds `0.0.0.0`.
 - **Storage-controller hook:** `http://host.docker.internal:8083/storcon`, token `cheladb-dev-storcon-hook`.
 - **Dev credentials (inline, commented "local dev only"):** S3 `cheladb-dev` / `cheladb-dev-secret`; storcon-db user `storcon`, password `storcon`, database `storage_controller`.
 - **Volumes:** `neon_seaweedfs_data`, `neon_pageserver_data`, `neon_safekeeper1_data`, `neon_storcon_pg_data`.
-- **Pull-failure message (exact):** `can't pull ghcr.io/cheladb/neon (the packages are private). Run docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk).` (with the image name that failed).
+- **Pull-failure message (exact):** `can't pull ghcr.io/chelabase/neon (the packages are private). Run docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk).` (with the image name that failed).
 - **Never** run `just sweep-dbs`, touch the `cheladb-db-*` containers or their volumes, run `cargo fmt` across the workspace, overwrite `.cheladb/secrets/secrets.key` or the gateway key pair, or run `just down`/`just stop` (the user's stack is up; use `--dry-run` to check `down`).
 - The old repo is at `<repo root>`; copy from it only what this plan names.
 - Lint every new shell script with `docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 -x <files>` (no local shellcheck).
@@ -254,7 +254,7 @@ controller) and, from roadmap step 4, its compute image. Both come from
 
 ## Pull (default)
 
-`just neon-up` pulls `ghcr.io/cheladb/neon` and `ghcr.io/cheladb/compute-node-v17`, pinned
+`just neon-up` pulls `ghcr.io/chelabase/neon` and `ghcr.io/chelabase/compute-node-v17`, pinned
 by digest in `infra/compose/docker-compose.yml`. **The packages are private:** run
 `docker login ghcr.io` first (a token with `read:packages`).
 
@@ -400,7 +400,7 @@ status=0
 images "" fail >/dev/null || status=$?
 check "a failed pull exits 1" test "$status" -eq 1
 check "a failed pull says to log in or build" \
-  grep -qF "can't pull ghcr.io/cheladb/neon (the packages are private). Run docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk)." "$stub/err"
+  grep -qF "can't pull ghcr.io/chelabase/neon (the packages are private). Run docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk)." "$stub/err"
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -418,9 +418,9 @@ In `infra/compose/docker-compose.yml`, after the `name: cheladb` line add:
 # Pinned by digest; `just neon-up` overrides these with a local `just neon-build` when present.
 # The packages are private: `docker login ghcr.io` first (infra/neon/README.md).
 x-neon-images:
-  neon: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a}
+  neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a}
   # Not run until roadmap step 4; recorded here so the pin lives in one place.
-  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/cheladb/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93}
+  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93}
 
 # S3 credentials for SeaweedFS. Local dev only.
 x-neon-s3-env: &neon-s3-env

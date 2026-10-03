@@ -726,7 +726,7 @@ Every run writes one `info` line on the `orchestrator::sql_editor::audit` log ta
 
 ### Dependencies
 
-- **tokio-postgres is a fork** (`ChelaDB/rust-postgres`, pinned by `rev` in the workspace `Cargo.toml`) because the editor needs what simple queries don't expose upstream: command tags, the empty-query marker and column types. Upstream PR: https://github.com/rust-postgres/rust-postgres/pull/1391. Return to crates.io once it is released.
+- **tokio-postgres is a fork** (`chelabase/rust-postgres`, pinned by `rev` in the workspace `Cargo.toml`) because the editor needs what simple queries don't expose upstream: command tags, the empty-query marker and column types. Upstream PR: https://github.com/rust-postgres/rust-postgres/pull/1391. Return to crates.io once it is released.
 - The language server in Studio is **pgls 0.26.0** (`supabase-community/postgres-language-server`, MIT). The introspection queries are copied from it byte-for-byte; the upgrade steps are in `services/orchestrator/src/sql_editor/pgls/README.md`.
 - `pg_query` builds Postgres's parser from C: it needs clang and protoc (see Prerequisites).
 

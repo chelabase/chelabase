@@ -1,6 +1,6 @@
 # PR draft (not opened)
 
-Branch: ChelaDB/rust-postgres `upstream/simple-query-tags` (8bf6bc1), based on upstream master 6c161e32.
+Branch: chelabase/rust-postgres `upstream/simple-query-tags` (8bf6bc1), based on upstream master 6c161e32.
 
 ## Title
 

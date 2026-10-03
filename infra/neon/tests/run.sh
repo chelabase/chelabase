@@ -33,23 +33,23 @@ check "neon_dev_tag is neon_tag plus -dev" test "${neon_dev_tag:-}" = "${neon_ta
 
 # --- the fork -------------------------------------------------------------------------------
 neon_ref_on_fork() {
-  if command -v gh >/dev/null && gh api "repos/ChelaDB/neon/commits/$neon_ref" >/dev/null 2>&1; then
+  if command -v gh >/dev/null && gh api "repos/chelabase/neon/commits/$neon_ref" >/dev/null 2>&1; then
     return 0
   fi
   # No gh: a one-commit fetch of the sha (ls-remote only matches ref names).
   local tmp
   tmp="$(mktemp -d)"
   git -C "$tmp" init -q &&
-    git -C "$tmp" fetch -q --depth 1 https://github.com/ChelaDB/neon "$neon_ref" 2>/dev/null
+    git -C "$tmp" fetch -q --depth 1 https://github.com/chelabase/neon "$neon_ref" 2>/dev/null
   local status=$?
   rm -rf "$tmp"
   return $status
 }
-if git ls-remote --exit-code https://github.com/ChelaDB/neon HEAD >/dev/null 2>&1 ||
-  { command -v gh >/dev/null && gh api repos/ChelaDB/neon >/dev/null 2>&1; }; then
+if git ls-remote --exit-code https://github.com/chelabase/neon HEAD >/dev/null 2>&1 ||
+  { command -v gh >/dev/null && gh api repos/chelabase/neon >/dev/null 2>&1; }; then
   check "neon_ref_on_fork" neon_ref_on_fork
 else
-  pass "offline or no access to ChelaDB/neon: skipped neon_ref_on_fork"
+  pass "offline or no access to chelabase/neon: skipped neon_ref_on_fork"
 fi
 compose_defaults_match_ref() { # both pins (storage and compute) carry NEON_REF's tag
   test "$(grep -c ":${neon_tag}-dev@sha256:" "$root/infra/compose/docker-compose.yml")" -eq 2
@@ -61,13 +61,13 @@ readme_names_the_compose_file() { # the README points at the one file that holds
 }
 check "the README names the Compose file that holds the pins" readme_names_the_compose_file
 build_sh_uses_fork() {
-  grep -q 'ChelaDB/neon' "$here/build.sh" && ! grep -q 'neondatabase/neon' "$here/build.sh"
+  grep -q 'chelabase/neon' "$here/build.sh" && ! grep -q 'neondatabase/neon' "$here/build.sh"
 }
 check "build_sh_uses_fork" build_sh_uses_fork
 build_sh_pins_build_tools() {
   grep -q 'sha256sum "\$src/build-tools/Dockerfile" | cut -c1-12' "$here/build.sh" &&
     grep -q -- '--build-arg "TAG=\$build_tools_tag"' "$here/build.sh" &&
-    grep -q -- '--build-arg REPOSITORY=ghcr.io/cheladb' "$here/build.sh" &&
+    grep -q -- '--build-arg REPOSITORY=ghcr.io/chelabase' "$here/build.sh" &&
     grep -q -- '--build-arg IMAGE=neon-build-tools' "$here/build.sh"
 }
 check "build_sh_pins_build_tools" build_sh_pins_build_tools
@@ -85,9 +85,9 @@ check "one Compose file" \
 check "no hook-relay image or service left" \
   bash -c '! test -e "$1/infra/compose/hook-relay.Dockerfile" && ! grep -q "hook-relay" "$2"' _ "$root" "$compose_file"
 check "NEON_IMAGE defaults to a digest-pinned GHCR image" \
-  grep -Eq '\$\{NEON_IMAGE:-ghcr\.io/cheladb/neon-storage:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
+  grep -Eq '\$\{NEON_IMAGE:-ghcr\.io/chelabase/neon-storage:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
 check "COMPUTE_NODE_IMAGE defaults to a digest-pinned GHCR image" \
-  grep -Eq '\$\{COMPUTE_NODE_IMAGE:-ghcr\.io/cheladb/neon-compute-v17:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
+  grep -Eq '\$\{COMPUTE_NODE_IMAGE:-ghcr\.io/chelabase/neon-compute-v17:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
 
 if command -v docker >/dev/null; then
   # env -u: the check must hold with nothing set, as for a plain `just deps-up`.
@@ -177,8 +177,8 @@ images() { # images <local images> <ok|fail>: runs neon-images.sh against the st
 }
 local_neon="cheladb/neon-storage:$neon_dev_tag"
 local_compute="cheladb/neon-compute-v17:$neon_dev_tag"
-pinned_neon='NEON_IMAGE=ghcr\.io/cheladb/neon-storage:[^@]+@sha256:[0-9a-f]{64}'
-pinned_compute='COMPUTE_NODE_IMAGE=ghcr\.io/cheladb/neon-compute-v17:[^@]+@sha256:[0-9a-f]{64}'
+pinned_neon='NEON_IMAGE=ghcr\.io/chelabase/neon-storage:[^@]+@sha256:[0-9a-f]{64}'
+pinned_compute='COMPUTE_NODE_IMAGE=ghcr\.io/chelabase/neon-compute-v17:[^@]+@sha256:[0-9a-f]{64}'
 
 out="$(images "$local_neon $local_compute" fail || true)"
 check "local builds are used for both images" \
@@ -197,7 +197,7 @@ status=0
 images "" fail >/dev/null || status=$?
 check "a failed pull exits 1" test "$status" -eq 1
 check "a failed pull says to log in or build" \
-  grep -qF "can't pull ghcr.io/cheladb/neon-storage (docker's error is above). The images are public on ghcr.io; build locally with just neon-build (~40 min, ~40 GB free disk)." "$stub/err"
+  grep -qF "can't pull ghcr.io/chelabase/neon-storage (docker's error is above). The images are public on ghcr.io; build locally with just neon-build (~40 min, ~40 GB free disk)." "$stub/err"
 
 # --- scripts/neon-smoke.sh (offline: nothing listens on port 1) ----------------------------
 status=0

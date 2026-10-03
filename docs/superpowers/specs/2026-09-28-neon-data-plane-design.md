@@ -15,7 +15,7 @@ stays on plain `postgres:17` containers until step 4.
 
 | Question | Decision |
 |---|---|
-| Where the images come from | Pull `ghcr.io/cheladb/{neon,compute-node-v17}:0.1.0`, pinned by digest. A local build from `just neon-build` wins when it exists. |
+| Where the images come from | Pull `ghcr.io/chelabase/{neon,compute-node-v17}:0.1.0`, pinned by digest. A local build from `just neon-build` wins when it exists. |
 | GHCR visibility | The packages stay **private**. A failed pull stops with a message: log in, or build locally. |
 | Always on or opt-in | **Opt-in until step 4.** The services carry `profiles: ["neon"]`; `just deps-up` / `just dev` don't start them. Step 4 removes the profile lines. |
 | Compose layout | The **same** `infra/compose/docker-compose.yml`, so it stays one project on one network and `down` stops everything. |
@@ -61,10 +61,10 @@ scripts/
 
   ```yaml
   x-neon-images:
-    neon: &neon-image ${NEON_IMAGE:-ghcr.io/cheladb/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a}
+    neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon:0.1.0@sha256:c84e9c991957184bf7aa88c70b3e1657720812ef0800226753d3ce95c8860f8a}
   ```
 
-  `ghcr.io/cheladb/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93`
+  `ghcr.io/chelabase/compute-node-v17:0.1.0@sha256:7a39900c5f59ba428ecee67658fdf679706d556a53d149b237a0e9bbfa361a93`
   is recorded the same way (`COMPUTE_NODE_IMAGE`), for step 4. Defaults (`:-`) are used, not
   `:?`, because Compose interpolates every service, including inactive profiles, so a
   required variable would break plain `just deps-up`.
@@ -73,7 +73,7 @@ scripts/
   - if `cheladb/neon:<neon_tag>` exists locally, exports `NEON_IMAGE` pointing at it
     (likewise `COMPUTE_NODE_IMAGE` for `cheladb/compute-node-v17:<neon_tag>`), and says so;
   - otherwise pulls the pinned refs. On failure it exits non-zero with:
-    `can't pull ghcr.io/cheladb/neon (docker's error is above). The packages are private: run
+    `can't pull ghcr.io/chelabase/neon (docker's error is above). The packages are private: run
     docker login ghcr.io, or build locally with just neon-build (~40 min, ~40 GB free disk).`
 - The compute image is pulled now so step 4 finds it; nothing runs it in step 1.
 

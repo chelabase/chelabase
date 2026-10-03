@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Neon images from the ChelaDB/neon fork at the commit pinned in NEON_REF.
+# Build Neon images from the chelabase/neon fork at the commit pinned in NEON_REF.
 #   build.sh neon          storage image (pageserver, safekeeper, storage_broker,
 #                          storage_controller, proxy, ...): cheladb/neon-storage
 #   build.sh compute-node  compute image (Postgres 17 + neon extension + compute_ctl), run as a
@@ -51,7 +51,7 @@ checkout() {
   if [ ! -d "$src/.git" ]; then
     mkdir -p "$src"
     git -C "$src" init -q
-    git -C "$src" remote add origin https://github.com/ChelaDB/neon.git
+    git -C "$src" remote add origin https://github.com/chelabase/neon.git
   fi
   if [ "$(git -C "$src" rev-parse HEAD 2>/dev/null || true)" != "$ref" ]; then
     git -C "$src" fetch --depth 1 origin "$ref"
@@ -69,7 +69,7 @@ case "${1:-}" in
     # publish-dev.sh and build-tools.yml do.
     build_tools_tag="$(sha256sum "$src/build-tools/Dockerfile" | cut -c1-12)"
     DOCKER_BUILDKIT=1 docker build "$src" \
-      --build-arg REPOSITORY=ghcr.io/cheladb \
+      --build-arg REPOSITORY=ghcr.io/chelabase \
       --build-arg IMAGE=neon-build-tools \
       --build-arg "TAG=$build_tools_tag" \
       --build-arg GIT_VERSION="$ref" \

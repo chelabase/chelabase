@@ -2,18 +2,18 @@
 
 Cheladb runs Neon's storage stack (pageserver, safekeepers, storage broker, storage
 controller, proxy) and a compute image. Both come from our hard fork,
-[ChelaDB/neon](https://github.com/ChelaDB/neon), at the commit in `NEON_REF`
+[chelabase/neon](https://github.com/chelabase/neon), at the commit in `NEON_REF`
 (`8ae1b8f227e974a4c5e15dd0831925291aed2438`). Design: `docs/superpowers/specs/` and
 `docs/superpowers/plans/2026-10-01-neon-fork.md`.
 
 ## Pull (default)
 
-`just deps-up` pulls `ghcr.io/cheladb/neon-storage` and `ghcr.io/cheladb/neon-compute-v17`
+`just deps-up` pulls `ghcr.io/chelabase/neon-storage` and `ghcr.io/chelabase/neon-compute-v17`
 (the fork's dev images, tagged `<sha12>-dev`), pinned by digest in `infra/compose/docker-compose.yml`.
 The packages are public on ghcr.io, so pulling needs no login. (Pushing from a fork checkout needs `docker login ghcr.io` with a
 token that has `write:packages`.)
 
-The old `ghcr.io/cheladb/neon` and `compute-node-v17` packages hold images built from
+The old `ghcr.io/chelabase/neon` and `compute-node-v17` packages hold images built from
 upstream Neon; they stay for old pins and are no longer used.
 
 ## Build from source
@@ -46,14 +46,14 @@ storage reset) in `docs/superpowers/plans/2026-10-03-live-queue.md` to reclaim t
 
 Each deleted database used to leave its `timelines` rows and a tenant `Delete` pending op in the
 storage controller's database (a generation mismatch in `tenant_delete_safekeepers`). The fix
-landed in ChelaDB/neon#25 (https://github.com/ChelaDB/neon/pull/25, `NEON_REF` `8ae1b8f227e9`);
+landed in chelabase/neon-pre-replay#25 (https://github.com/chelabase/neon-pre-replay/pull/25, `NEON_REF` `8ae1b8f227e9`);
 `just storage-leak-e2e` checks that the controller forgets a deleted database's tenant.
 
 ## Bump `NEON_REF`
 
 > **Tag names after the 2026-10-04 history replay:** images published before that date carry pre-replay fork SHAs in their tags (e.g. `39b641053212-dev`), and those tags are kept as they are. The current `8ae1b8f227e9-dev` images are re-tags of the `2d2a6acd7be2-dev` builds (same digests), so their binaries may still report the old `GIT_VERSION`. The next real bump publishes images built from a post-replay commit.
 
-1. Merge the change in `ChelaDB/neon` (`main`).
+1. Merge the change in `chelabase/neon` (`main`).
 2. In a fork checkout, run `.github/scripts/publish-dev.sh`. It builds the dev images, pushes
    them to GHCR and prints the digests. (Publishing is by hand: pushes to `main` publish
    nothing, and cheladb-v1 has no copy of the script.)
@@ -71,7 +71,7 @@ The compute image runs Postgres 17.11 (the fork's `REL_17_STABLE_cheladb`).
 
 Upstream Neon releases and the Postgres minors flow into the fork through its minor watcher
 and the process in
-[`FORK.md`](https://github.com/ChelaDB/neon/blob/main/FORK.md). The fork carries our
+[`FORK.md`](https://github.com/chelabase/neon/blob/main/FORK.md). The fork carries our
 patches; cheladb-v1 only moves `NEON_REF` forward as above.
 
 ## Recipes
