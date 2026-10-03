@@ -220,6 +220,113 @@ impl MetadataPort for Doc {
     ) -> Result<bool, MetadataError> {
         match *self {}
     }
+    async fn list_projects(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<ProjectRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn get_project(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+    ) -> Result<Option<ProjectRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn project_by_id(
+        &self,
+        id: ProjectId,
+    ) -> Result<Option<ProjectRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn create_project(
+        &self,
+        tenant: TenantId,
+        name: &str,
+    ) -> Result<ProjectRecord, MetadataError> {
+        match *self {}
+    }
+    async fn rename_project(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+        name: &str,
+    ) -> Result<RenameProject, MetadataError> {
+        match *self {}
+    }
+    async fn begin_project_delete(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+    ) -> Result<BeginProjectDelete, MetadataError> {
+        match *self {}
+    }
+    async fn project_databases(
+        &self,
+        id: ProjectId,
+    ) -> Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError> {
+        match *self {}
+    }
+    async fn project_auth(
+        &self,
+        project: ProjectId,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        match *self {}
+    }
+    async fn project_auth_statuses(
+        &self,
+        tenant: TenantId,
+    ) -> Result<std::collections::HashMap<ProjectId, AppUsersStatus>, MetadataError> {
+        match *self {}
+    }
+    async fn begin_enable_app_users(
+        &self,
+        new: &NewProjectAuth<'_>,
+    ) -> Result<BeginEnable, MetadataError> {
+        match *self {}
+    }
+    async fn update_app_users_settings(
+        &self,
+        project: ProjectId,
+        email_verification: Option<bool>,
+        on_delete: Option<OnDelete>,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        match *self {}
+    }
+    async fn begin_disable_app_users(
+        &self,
+        project: ProjectId,
+    ) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn branch_auth_sync(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchAuthSync>, MetadataError> {
+        match *self {}
+    }
+    async fn list_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        match *self {}
+    }
+    async fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+        keep: Option<Uuid>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        match *self {}
+    }
+    async fn app_auth_for_database(
+        &self,
+        db: DatabaseId,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -282,6 +389,21 @@ impl JobPort for Doc {
         match *self {}
     }
     async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+        match *self {}
+    }
+    async fn publish_project_delete(&self, job: &JobEnvelope<ProjectDeleteJob>) -> Result<(), BoxError> {
+        match *self {}
+    }
+    async fn publish_app_users(&self, job: &JobEnvelope<AppUsersJob>) -> Result<(), BoxError> {
+        match *self {}
+    }
+    async fn publish_app_users_sync(&self, job: &JobEnvelope<AppUsersSyncJob>) -> Result<(), BoxError> {
+        match *self {}
+    }
+    async fn check_app_users_location(
+        &self,
+        request: &AppUsersCheckRequest,
+    ) -> Result<AppUsersCheckReply, BoxError> {
         match *self {}
     }
 }
@@ -383,6 +505,10 @@ mod tests {
                 "DELETE /v1/databases/{id}/branches/{branch_id}/roles/{role}",
                 "deleteRole",
             ),
+            ("DELETE /v1/projects/{id}", "deleteProject"),
+            ("DELETE /v1/projects/{id}/app-users", "disableAppUsers"),
+            ("DELETE /v1/projects/{id}/users/{user_id}", "deleteAppUser"),
+            ("DELETE /v1/projects/{id}/users/{user_id}/sessions", "revokeAppUserSessions"),
             ("GET /v1/databases/{id}", "getDatabase"),
             ("GET /v1/databases/{id}/branches", "listBranches"),
             (
@@ -411,6 +537,12 @@ mod tests {
             ),
             ("GET /v1/databases/{id}/connection", "getDatabaseConnection"),
             ("GET /v1/me", "getMe"),
+            ("GET /v1/projects", "listProjects"),
+            ("GET /v1/projects/{id}", "getProject"),
+            ("GET /v1/projects/{id}/app-users", "getAppUsers"),
+            ("GET /v1/projects/{id}/users", "listAppUsers"),
+            ("GET /v1/projects/{id}/users/{user_id}", "getAppUser"),
+            ("GET /v1/projects/{id}/users/{user_id}/sessions", "listAppUserSessions"),
             ("PATCH /v1/databases/{id}", "updateDatabase"),
             (
                 "PATCH /v1/databases/{id}/branches/{branch_id}",
@@ -424,6 +556,8 @@ mod tests {
                 "PATCH /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
                 "updatePgDatabase",
             ),
+            ("PATCH /v1/projects/{id}", "updateProject"),
+            ("PATCH /v1/projects/{id}/users/{user_id}", "updateAppUser"),
             ("POST /v1/databases", "createDatabase"),
             ("POST /v1/databases/{id}/branches", "createBranch"),
             (
@@ -466,6 +600,11 @@ mod tests {
                 "POST /v1/databases/{id}/reset-password",
                 "resetDatabasePassword",
             ),
+            ("POST /v1/projects", "createProject"),
+            ("POST /v1/projects/{id}/users", "createAppUser"),
+            ("POST /v1/projects/{id}/users/{user_id}/deactivate", "deactivateAppUser"),
+            ("POST /v1/projects/{id}/users/{user_id}/reactivate", "reactivateAppUser"),
+            ("PUT /v1/projects/{id}/app-users", "putAppUsers"),
         ];
         let expected: Vec<(String, String)> = expected
             .iter()
@@ -494,7 +633,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -537,6 +676,13 @@ mod tests {
             .map(String::as_str)
             .collect();
         let expected = [
+            "AppUser",
+            "AppUserPage",
+            "AppUserSession",
+            "AppUserState",
+            "AppUsersSettings",
+            "AppUsersStatusView",
+            "AppUsersTable",
             "ArgDesc",
             "Branch",
             "BranchDatabaseView",
@@ -547,10 +693,12 @@ mod tests {
             "ColumnDesc",
             "ConnectionDetails",
             "ConsoleRequest",
+            "CreateAppUserRequest",
             "CreateBranchRequest",
             "CreateDatabaseAccepted",
             "CreateDatabaseRequest",
             "CreateKeyRequest",
+            "CreateProjectRequest",
             "CreateRoleRequest",
             "CreatedDataKey",
             "DataApiSchema",
@@ -563,18 +711,23 @@ mod tests {
             "DatabaseSettings",
             "DatabaseStatus",
             "DatabaseSummary",
+            "DeleteProjectRequest",
             "ErrorBody",
             "ErrorCode",
             "ErrorEnvelope",
             "FunctionDesc",
             "Me",
             "MeUser",
+            "OnDelete",
             "OperationAccepted",
             "PasswordState",
             "PointInTime",
             "Privilege",
             "Project",
             "ProjectId",
+            "ProjectInfo",
+            "ProjectStatusView",
+            "PutAppUsersRequest",
             "RestoreAccepted",
             "RestoreRequest",
             "ReturnDesc",
@@ -586,10 +739,12 @@ mod tests {
             "TableKind",
             "Tenant",
             "TenantId",
+            "UpdateAppUserRequest",
             "UpdateBranchRequest",
             "UpdateDatabaseRequest",
             "UpdateKeyRequest",
             "UpdatePgDatabaseRequest",
+            "UpdateProjectRequest",
         ];
         // The names are map keys, so a clash between two types would drop one from this list.
         assert_eq!(names, expected);

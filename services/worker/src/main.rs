@@ -1,12 +1,14 @@
 use axum::{Json, Router, routing::get};
 use cheladb_metadata::{MetadataClient, MetadataConfig};
 use cheladb_nats::{
-    CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, NatsConfig,
-    RESET_NOT_APPLIED, ResetPasswordReply, ResetPasswordRequest, RoleReply,
-    SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_ENABLE,
-    SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_RESET_PASSWORD,
-    SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, connect, ensure_control_stream,
-    run_branch_consumer, run_delete_consumer, run_provision_consumer, run_settings_consumer,
+    AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
+    DataApiDatabaseRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
+    ResetPasswordRequest, RoleReply, SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE,
+    SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP,
+    SUBJECT_RESET_PASSWORD, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, connect,
+    ensure_control_stream, run_app_users_consumer, run_app_users_sync_consumer,
+    run_branch_consumer, run_delete_consumer, run_project_delete_consumer, run_provision_consumer,
+    run_settings_consumer,
 };
 use cheladb_secrets::{SecretKey, key_check_value, verify_key_check};
 use cheladb_types::mode::Mode;
@@ -81,6 +83,50 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(serve_role_rpc(worker.clone(), nats.clone(), subject));
     }
     tokio::spawn(reconcile_loop(worker.clone()));
+    tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
+    tokio::spawn(app_users_reconcile_loop(worker.clone()));
+    if worker.zitadel.is_none() {
+        warn!("Zitadel admin access isn't configured: app users and project delete jobs wait (CHELADB_ZITADEL_ISSUER, CHELADB_ZITADEL_ADMIN_PAT_FILE)");
+    }
+
+    let project_delete_worker = worker.clone();
+    let project_delete_js = js.clone();
+    tokio::spawn(async move {
+        let result = run_project_delete_consumer(project_delete_js, move |job| {
+            let worker = project_delete_worker.clone();
+            async move { worker.handle_project_delete(job.payload.project_id).await }
+        })
+        .await;
+        if let Err(err) = result {
+            warn!("project delete consumer exited: {err}");
+        }
+    });
+
+    let app_users_worker = worker.clone();
+    let app_users_js = js.clone();
+    tokio::spawn(async move {
+        let result = run_app_users_consumer(app_users_js, move |job| {
+            let worker = app_users_worker.clone();
+            async move { worker.handle_app_users_job(&job.payload).await }
+        })
+        .await;
+        if let Err(err) = result {
+            warn!("app users consumer exited: {err}");
+        }
+    });
+
+    let sync_worker = worker.clone();
+    let sync_js = js.clone();
+    tokio::spawn(async move {
+        let result = run_app_users_sync_consumer(sync_js, move |job| {
+            let worker = sync_worker.clone();
+            async move { worker.handle_app_users_sync(&job.payload).await }
+        })
+        .await;
+        if let Err(err) = result {
+            warn!("app users sync consumer exited: {err}");
+        }
+    });
 
     let delete_worker = worker.clone();
     let delete_js = js.clone();
@@ -125,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("worker consuming provision, delete, branch and settings jobs");
+    info!("worker consuming provision, delete, branch, settings, project delete and app users jobs");
     run_provision_consumer(js, move |job| {
         let worker = worker.clone();
         async move {
@@ -245,6 +291,69 @@ async fn reconcile_loop(worker: Arc<RealWorker>) {
         if let Err(err) = worker.reconcile_once().await {
             warn!("reconcile: {err}");
         }
+    }
+}
+
+/// Every enabled project's users reconciled, old sessions purged, and stale app users jobs
+/// and project deletes run again.
+async fn app_users_reconcile_loop(worker: Arc<RealWorker>) {
+    let every = worker.app_users_reconcile_every;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        worker.app_users_reconcile_once().await;
+    }
+}
+
+// --- App users location check (core NATS request/reply) -------------------------
+
+/// Hard cap on one check, below the orchestrator's request timeout.
+const APP_USERS_CHECK_DEADLINE: Duration = Duration::from_secs(25);
+
+async fn serve_app_users_check(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_APP_USERS_CHECK, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("app-users-check subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_APP_USERS_CHECK, "serving app users location checks");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let unavailable = |error: String| AppUsersCheckReply {
+                ok: false,
+                code: Some("unavailable".to_string()),
+                error: Some(error),
+            };
+            let reply = match serde_json::from_slice::<AppUsersCheckRequest>(&message.payload) {
+                Ok(request) => match tokio::time::timeout(
+                    APP_USERS_CHECK_DEADLINE,
+                    worker.check_app_users_location(&request),
+                )
+                .await
+                {
+                    Ok(reply) => reply,
+                    Err(_) => {
+                        warn!(database_id = %request.database_id, "app users location check timed out");
+                        unavailable("timed out".to_string())
+                    }
+                },
+                Err(err) => unavailable(format!("bad request: {err}")),
+            };
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("app-users-check reply failed: {err}");
+                }
+            }
+        });
     }
 }
 

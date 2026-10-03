@@ -35,6 +35,7 @@ pub async fn harness_with(skip: bool, min_ms: u64) -> Harness {
         zitadel: Zitadel::new(&mock.base, TOKEN),
         config,
         limiter: RateLimiter::default(),
+        app: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -844,6 +845,32 @@ async fn sign_up_never_duplicates_an_existing_email() {
         (StatusCode::OK, json!({"next": "verify"}))
     );
     assert_eq!(h.mock.users_with_email("ada@example.com"), 1);
+}
+
+// N2: two accounts already sharing an email (made outside these checks) still mean "taken".
+#[tokio::test]
+async fn sign_up_never_adds_to_an_ambiguous_email() {
+    let h = harness().await;
+    h.mock.allow_duplicate_emails();
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.mock.add_user("ADA@example.com", "Secret-pass1", true);
+    let a = h
+        .post(
+            "/auth/v1/sign-up",
+            signup(
+                &h.mock.add_auth_request(true),
+                "ada@example.com",
+                "Secret-pass1",
+            ),
+            None,
+            "1.1.1.1",
+        )
+        .await;
+    assert_eq!(
+        (a.status, a.body),
+        (StatusCode::OK, json!({"next": "verify"}))
+    );
+    assert_eq!(h.mock.users_with_email("ada@example.com"), 2);
 }
 
 // I5: the weak-password answer doesn't depend on whether the user id exists.

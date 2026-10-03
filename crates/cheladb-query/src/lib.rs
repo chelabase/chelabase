@@ -8,6 +8,7 @@
 //! and shape caches ([`QueryCache`]), and [`error`] maps failures to the data API's codes.
 //! The crate is given a connection, inside a transaction its caller began; it holds none.
 
+pub mod app_users;
 pub mod engine;
 pub mod error;
 pub mod query;

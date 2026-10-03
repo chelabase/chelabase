@@ -391,6 +391,9 @@ pub mod fake {
         pub answers: Mutex<Vec<(String, String)>>,
         /// `(database, needle, stdout)`: like `answers`, for one database only; tried first.
         pub answers_in: Mutex<Vec<(String, String, String)>>,
+        /// `(endpoint, needle, stdout)`: like `answers`, for one endpoint only; tried before
+        /// `answers_in`.
+        pub answers_at: Mutex<Vec<(String, String, String)>>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -415,6 +418,16 @@ pub mod fake {
         pub fn answer_in(&self, database: &str, needle: &str, stdout: &str) {
             lock(&self.answers_in).push((
                 database.to_string(),
+                needle.to_string(),
+                stdout.to_string(),
+            ));
+        }
+
+        /// SQL run on `endpoint` containing `needle` answers `stdout` from now on (before any
+        /// other answer).
+        pub fn answer_at(&self, endpoint: &str, needle: &str, stdout: &str) {
+            lock(&self.answers_at).push((
+                endpoint.to_string(),
                 needle.to_string(),
                 stdout.to_string(),
             ));
@@ -559,6 +572,12 @@ pub mod fake {
                 database.to_string(),
                 sql.to_string(),
             ));
+            if let Some((_, _, stdout)) = lock(&self.answers_at)
+                .iter()
+                .find(|(ep, needle, _)| ep == endpoint_id && sql.contains(needle))
+            {
+                return Ok(stdout.clone());
+            }
             if let Some((_, _, stdout)) = lock(&self.answers_in)
                 .iter()
                 .find(|(db, needle, _)| db == database && sql.contains(needle))

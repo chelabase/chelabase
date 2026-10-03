@@ -39,6 +39,8 @@ export interface TypeMap {
 /** The `Database` shape that `cheladb gen types` emits. */
 export interface DatabaseShape {
   defaultSchema: string;
+  /** Where the project's app users table lives; `cheladb gen types` writes it when app users are enabled. */
+  appUsers?: { schema: string; table: string };
   schemas: Record<
     string,
     {
@@ -264,7 +266,71 @@ export interface Tx<DB extends DatabaseShape, B extends boolean> {
 
 type Results<T extends readonly unknown[]> = { -readonly [I in keyof T]: T[I] extends PromiseLike<infer R> ? R : never };
 
+// --- app users (db.auth) -----------------------------------------------------------------
+
+/** Where the refresh token is kept: sync or async. The default is `localStorage`, else memory. */
+export interface AuthStorage {
+  get(key: string): string | null | Promise<string | null>;
+  set(key: string, value: string): void | Promise<void>;
+  remove(key: string): void | Promise<void>;
+}
+
+export interface AuthOptions {
+  storage?: AuthStorage;
+  /**
+   * Refresh the access token 60 s before it expires. Default `true`. This only controls the
+   * background timer; a request with an expiring token (under 5 s left) still refreshes first.
+   */
+  autoRefresh?: boolean;
+}
+
+export interface AppUser {
+  id: string;
+  email: string;
+  email_verified: boolean;
+  created_at: string;
+}
+
+export interface Session {
+  access_token: string;
+  token_type: "bearer";
+  expires_in: number;
+  refresh_token: string;
+  user: AppUser;
+}
+
+export type AuthEvent = "signed_in" | "signed_out" | "refreshed";
+
+/** `signUp`'s `data`: the app users table's insertable columns, minus the managed ones. */
+export type SignUpData<DB extends DatabaseShape> = DB extends {
+  appUsers: { schema: infer S extends string; table: infer T extends string };
+}
+  ? Omit<DB["schemas"][S]["tables"][T]["Insert"], "id" | "email" | "email_verified" | "created_at" | "deleted_at">
+  : Record<string, Json>;
+
+export interface Auth<DB extends DatabaseShape> {
+  signUp(p: {
+    email: string;
+    password: string;
+    data?: SignUpData<DB>;
+  }): Promise<{ user: AppUser; session: Session | null; verificationRequired: boolean }>;
+  signIn(p: { email: string; password: string }): Promise<Session>;
+  signOut(): Promise<void>;
+  refresh(): Promise<Session>;
+  getUser(): Promise<AppUser>;
+  verifyEmail(p: { email: string; code: string }): Promise<void>;
+  resendCode(p: { email: string }): Promise<void>;
+  requestPasswordReset(p: { email: string }): Promise<void>;
+  confirmPasswordReset(p: { email: string; code: string; password: string }): Promise<void>;
+  changeEmail(p: { email: string }): Promise<void>;
+  changePassword(p: { currentPassword: string; password: string }): Promise<Session>;
+  /** Subscribe to sign-in, sign-out and refresh; returns the unsubscribe function. */
+  onChange(cb: (event: AuthEvent, user: AppUser | null) => void): () => void;
+}
+
 export interface Client<DB extends DatabaseShape, B extends boolean> extends Tx<DB, B> {
+  /** App user sign-up, sign-in and session handling. Shared by `database()` siblings. */
+  readonly auth: Auth<DB>;
   /**
    * Runs the operations in order in one transaction, all or nothing (at most 50), and
    * resolves to each one's result.

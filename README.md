@@ -148,7 +148,7 @@ The data API roles `anon` (NOLOGIN), `authenticated` (NOLOGIN) and `authenticato
   - retries deletes stuck for more than a minute;
   - starts a new compute for a ready database whose container is gone (an exited container is left to Docker's restart policy);
   - applies a password reset that was stored but not applied;
-  - removes compute containers that have no endpoint row;
+  - removes compute containers that have no endpoint row (unless `CHELADB_WORKER_REMOVE_ORPHANS=false`, for a worker on its own metadata database that shares the machine's Docker with another stack: it then logs them and keeps them);
   - retries the teardown of an endpoint whose database is failed or deleted.
 
   A storage-controller tenant with no endpoint row, or an endpoint row with no database, is only reported in the worker log, never removed: it may hold the only copy of someone's data. In local dev, `just sweep-dbs` removes every database, endpoint and endpoint tenant; delete an unknown tenant by hand.
@@ -156,6 +156,14 @@ The data API roles `anon` (NOLOGIN), `authenticated` (NOLOGIN) and `authenticato
 - Connections go through Neon's proxy (above), never straight to a compute.
 - **Upgrading from before this feature is one-way.** The migration drops the old plaintext `admin_password` column, so older binaries can't run against the upgraded metadata database (and sqlx refuses to start with a migration it doesn't know). Existing databases keep running; recreate them to get revealable credentials.
 - Metadata tests that need a real database are opt-in: `cargo test -p cheladb-metadata -- --ignored --test-threads=1` (with `just deps-up`).
+
+## Projects
+
+A tenant's databases live in projects. `/v1/me` lists them; each has a display `name` (1–64 characters, renamable) and a `slug` made from the name when it's created (lowercase `[a-z0-9-]`, up to 40 characters, `-2`, `-3`… on a clash), which never changes.
+
+- `GET /v1/projects`, `POST /v1/projects {name}` (201), `GET` and `PATCH /v1/projects/{id} {name}`. Another tenant's project is 404.
+- **Delete** (`DELETE /v1/projects/{id} {"confirm": "<slug>"}`, 202; a wrong `confirm` is 422): the project turns `deleting`, every database in it is deleted (computes, tenants, S3 data), then the worker revokes the app sessions, deletes the project's Zitadel org (when app users were on) and the project. A failure leaves it `deleting` with `error` set, and the worker retries. It's refused (409) while a database is still provisioning, a branch is protected, or app users are enabling or disabling. A `deleting` project refuses every change (409 `project_deleting`), and `POST /v1/databases` refuses it too.
+- Studio: the dashboard lists the projects and has **New project**; the project page has **Databases** and **Settings** tabs (rename, app users, and the danger zone, where deleting asks for the slug and lists the databases that go with it).
 
 ## Branches
 
@@ -590,6 +598,89 @@ A non-2xx response without this error body (a proxy error page) gets its code fr
 - **Revocation lag:** per gateway instance, up to 30 seconds.
 - **IPv6 rate limiting:** the limiter groups IPv6 clients by `/64` prefix; a load balancer in front collapses all clients into one address.
 - **Limiter size:** it remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds). Past that it evicts entries, and an evicted address starts again with a full allowance.
+
+## App users
+
+Apps sign their own end users up and in through `db.auth`, and the data API runs their requests as `authenticated` with the user's claims. Zitadel holds the identities (one organization per project, its id the project's id); Cheladb issues the tokens; each user also has a row in a users table the app owns.
+
+### Enabling
+
+`PUT /v1/projects/{id}/app-users {database_id, pg_database?, schema?, table?, email_verification?, on_delete?}` (Studio: the project's **Settings → App users**). The first call enables (202, then `enabling` → `enabled`, or `failed` with `error`; the same PUT again retries); later calls change `email_verification` and `on_delete` only (`app_users_location_fixed` for the rest). It needs:
+- the database in this project and `ready`;
+- the data API on in that Postgres database on **every** live branch (409 `data_api_not_enabled`);
+- no table at `schema.table` (default `public.users`) on any branch (409 `app_users_table_exists`).
+
+The worker creates the Zitadel org, runs the users bootstrap on every branch of the auth database, and installs the claim helpers in every other database the data API serves in the project. New branches of the auth database get the bootstrap (with their own `cheladb_auth_sync` password) and the users' rows. While app users are on, the auth database's data API can't be switched off or removed (409).
+
+`DELETE /v1/projects/{id}/app-users` disables them: refused with 409 `app_users_has_users` while the org has users; otherwise the worker removes the guard machinery and the sync role from every branch, revokes the sessions and deletes the org. The table stays as an ordinary table, **with RLS still on and no policies** (the two built-in policies go, since they call the helpers): add your own or switch RLS off.
+
+Defaults in self-hosted mode: `email_verification` off (no code is sent and new users are verified), `on_delete = delete`.
+
+### The users table
+
+- Managed columns: `id uuid` (primary key, the Zitadel user id), `email`, `email_verified`, `created_at`, `deleted_at`. Every other column is yours: add columns, constraints, indexes and foreign keys with ordinary migrations (the table is owned by `postgres`).
+- **Rows are Cheladb's.** A guard trigger refuses INSERT, DELETE and TRUNCATE, and any change to a managed column, by any role but `cheladb_auth_sync` (42501, "rows of public.users are created and deleted by Cheladb app users", "column email is managed by Cheladb app users"). Your own columns can be updated, by the owner or by users through their policy.
+- **Its shape is protected.** Event triggers refuse dropping or renaming the table, moving it to another schema, dropping, renaming or retyping a managed column, and dropping, renaming or disabling the guard triggers. A superuser can still get around them (with `event_triggers = off`); the users bootstrap, which runs again when the branch's compute is re-created, reset or restored, puts back a dropped table and the triggers.
+- **It starts locked down:** no privileges for `anon`, RLS on, and two own-row policies for `authenticated`: `cheladb_users_select_own` (`USING (id = cheladb.user_id())`) and `cheladb_users_update_own`. They aren't protected; change or drop them like any policy.
+- **Sign-up data is opt-in per column.** `signUp`'s `data` reaches a column only when `authenticated` may insert into it: `GRANT INSERT (display_name) ON users TO authenticated`. Any other key is 422 `unknown_column`; `REVOKE INSERT (col) ON users FROM authenticated` takes a column out again. The values go through your types and constraints: a failure is 422 `constraint_violation` with Postgres' message, and no Zitadel user is created.
+- **Defaults and triggers run as `cheladb_auth_sync`.** Rows are written by the sync role, so a column default or a `BEFORE INSERT` trigger of yours on the users table runs with its privileges: grant it what they touch (for example `GRANT INSERT ON profiles TO cheladb_auth_sync`), or make the trigger function `SECURITY DEFINER`.
+- `on_delete`: a user deleted in Zitadel deletes the row (`delete`; your foreign keys cascade as you defined them) or sets `deleted_at` (`mark`). The unique email index skips marked rows, so the address can sign up again.
+- `cheladb gen types` marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
+
+### Claim helpers
+
+In schema `cheladb` of every database the data API serves (`STABLE`, executable by every role, so a policy written without `TO` works for custom data API roles and the console too; they only read the request's claims): `cheladb.claims()` (the request's claims as `jsonb`, `{}` without a user), `cheladb.user_id()` (`uuid`, null without a user) and `cheladb.user_email()`. Use them in policies and defaults:
+
+```sql
+CREATE TABLE notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner uuid NOT NULL DEFAULT cheladb.user_id(), body text NOT NULL);
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_own ON notes FOR ALL TO authenticated
+  USING (owner = cheladb.user_id()) WITH CHECK (owner = cheladb.user_id());
+```
+
+Removing the data API (`DELETE …/data-api?remove=true`) drops the helpers too; while a policy or view still uses one, it's refused (409) with Postgres' dependency message: drop those first.
+
+### Tokens, sessions and the SDK
+
+```ts
+const db = createClient({ url: "http://127.0.0.1:8000", key: "chk_pub_…" });
+await db.auth.signUp({ email, password, data: { display_name: "Ann" } });
+const mine = await db.from("users").select("id", "display_name"); // only the signed-in user's row
+```
+
+- The flows live under `/auth/v1/app/` and take a **public** key: `sign-up`, `sign-in`, `refresh`, `sign-out`, `user`, `verify-email`, `resend-code`, `password-reset`, `password-reset/confirm`, `change-email`, `change-password`, and `GET jwks` (public: your own servers can verify tokens with it). They're padded and rate-limited like the platform's sign-in.
+- **Access token:** an EdDSA JWT (`iss = cheladb-auth`, `aud = cheladb-project:<project id>`, `sub`, `sid`, `email`, `email_verified`, `role = authenticated`), valid `CHELADB_APP_ACCESS_TTL_SECS` (default 900). Requests send it as `Cheladb-User: <token>` beside `Authorization: Bearer <public key>`. The gateway checks it and that its session is still live (cached 30 s, so a revocation lands within 30 s), and never falls back to `anon`: an invalid, expired or revoked token is 401 `user_token_invalid`, `user_token_expired` or `user_session_revoked`; a secret key with the header is 400.
+- **Refresh token:** `<session id>.<secret>`, kept by the SDK in its storage (`localStorage` in browsers, memory otherwise, or your `{get, set, remove}`), with a sliding expiry of `CHELADB_APP_REFRESH_TTL_SECS` (default 30 days) and a 90-day cap. Every refresh rotates it. Within 10 s of a rotation the previous token gets the same new pair back (two tabs refreshing at once); after that, presenting it revokes the session (401 `refresh_token_reused`). The SDK refreshes 60 s before expiry and once after a 401 `user_token_expired`, and signs out locally (emitting `signed_out`) on `refresh_token_reused`, `refresh_token_invalid` or `user_inactive` from a refresh, or `user_session_revoked` from any request.
+- Passwords follow the platform's rules. A password change revokes the user's other sessions (the caller gets a fresh pair); a reset revokes them all.
+- Platform admin: `GET/POST /v1/projects/{id}/users`, `GET/PATCH/DELETE …/users/{user_id}`, `POST …/deactivate` and `…/reactivate` (deactivating revokes the sessions), `GET/DELETE …/sessions` (sign out everywhere). Studio's **Users** tab has all of it.
+
+### Sync, webhooks and reconcile
+
+Zitadel is the source of truth; three paths copy users into the table on every live branch of the auth database:
+- **write-through** from Cheladb's own flows (sign-up, the platform admin);
+- **webhooks:** `cheladb dev bootstrap` creates one instance-wide Zitadel Actions v2 target pointing at the orchestrator's internal listener (`POST /internal/zitadel/events`), with an execution on user events, and writes its signing key to `.cheladb/zitadel/actions.env` (sourced by `just`). The orchestrator checks the signature and ignores other orgs. Compose relaxes Zitadel's `ZITADEL_HTTPCLIENT_DENYLIST` so it may call the host (self-hosted dev only);
+- **reconcile:** every `CHELADB_APP_USERS_RECONCILE_SECS` (default 300) per enabled project, and right after a branch of the auth database is created, the worker compares the org's users with each branch's rows and syncs every difference. It also reruns enables, disables and project deletes stuck for 5 minutes and purges old sessions.
+
+### Settings
+
+| Variable | Default | Read by |
+|---|---|---|
+| `CHELADB_ZITADEL_ADMIN_PAT_FILE` | from `demo.env` (`.cheladb/zitadel/admin.pat`) | orchestrator, worker, auth (org and user admin; without it app-user routes answer 503 and jobs wait) |
+| `CHELADB_APP_JWT_PRIVATE_KEY` / `CHELADB_APP_JWT_PUBLIC_KEY` | from `demo.env` (`.cheladb/auth/app-jwt.{key,pub}`, made once by bootstrap, never overwritten) | auth signs, the gateway verifies |
+| `CHELADB_APP_AUTH_INTERNAL_TOKEN` | `cheladb-dev-app-auth` | auth → orchestrator internal app routes |
+| `CHELADB_APP_SESSIONS_INTERNAL_TOKEN` | `cheladb-dev-app-sessions` | gateway → session liveness |
+| `CHELADB_ZITADEL_ACTIONS_SIGNING_KEY` | from `.cheladb/zitadel/actions.env` | orchestrator (webhook signatures) |
+| `CHELADB_APP_ACCESS_TTL_SECS` | `900` (60–86400) | auth |
+| `CHELADB_APP_REFRESH_TTL_SECS` | `2592000` (30 days; at most 90 days) | orchestrator |
+| `CHELADB_APP_USERS_RECONCILE_SECS` | `300` (30–86400) | worker |
+| `CHELADB_INTERNAL_URL` | `http://127.0.0.1:8083` | auth (the orchestrator's internal listener) |
+| `CHELADB_WORKER_REMOVE_ORPHANS` | `true` | worker (see Database lifecycle → Reconcile) |
+
+### Testing
+
+- `just app-users-e2e` (needs `just dev`): a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `cheladb.user_id()` policy; a new branch gets the rows; an email changed in Zitadel reaches the row through the webhook; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its Zitadel org. `KEEP=1` leaves everything in place.
+- `app_users_live` (`cargo test -p worker --test app_users_live -- --ignored --test-threads=1`, with `demo.env` and `scripts/neon-images.sh` sourced as the file's header shows): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real Zitadel.
 
 ## Neon
 

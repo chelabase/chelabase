@@ -255,13 +255,19 @@ name = "auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "cheladb-auth",
+ "cheladb-query",
  "cheladb-routes",
  "cheladb-secrets",
  "cheladb-types",
+ "cheladb-zitadel",
+ "chrono",
  "dotenvy",
  "hex",
  "http",
+ "moka",
  "reqwest",
  "serde",
  "serde_json",
@@ -273,6 +279,7 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "utoipa-axum",
+ "uuid",
 ]
 
 [[package]]
@@ -575,12 +582,14 @@ dependencies = [
  "cheladb-types",
  "ed25519-dalek",
  "getrandom 0.4.3",
+ "hex",
  "jsonwebtoken",
  "parking_lot",
  "reqwest",
  "rsa",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tracing",
@@ -654,11 +663,13 @@ dependencies = [
 name = "cheladb-query"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "cheladb-types",
  "http",
  "moka",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror",
  "tokio",
@@ -693,6 +704,24 @@ dependencies = [
  "tower",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "cheladb-zitadel"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cheladb-zitadel",
+ "chrono",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1400,6 +1429,7 @@ dependencies = [
  "cheladb-auth",
  "cheladb-routes",
  "cheladb-types",
+ "chrono",
  "dotenvy",
  "hex",
  "http",
@@ -2271,7 +2301,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "cheladb-auth",
  "cheladb-metadata",
  "cheladb-nats",
@@ -2280,9 +2312,12 @@ dependencies = [
  "cheladb-routes",
  "cheladb-secrets",
  "cheladb-types",
+ "cheladb-zitadel",
  "chrono",
  "dotenvy",
+ "getrandom 0.4.3",
  "hex",
+ "hmac",
  "jsonwebtoken",
  "moka",
  "reqwest",
@@ -4598,17 +4633,20 @@ dependencies = [
  "async-nats",
  "axum",
  "base64 0.23.1",
+ "cheladb-auth",
  "cheladb-metadata",
  "cheladb-nats",
  "cheladb-neon",
  "cheladb-secrets",
  "cheladb-types",
+ "cheladb-zitadel",
  "chrono",
  "dotenvy",
  "futures-util",
  "hex",
  "rand 0.10.3",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",

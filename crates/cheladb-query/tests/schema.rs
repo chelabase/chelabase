@@ -214,6 +214,7 @@ fn raw() -> Raw {
             variadic,
             procedure,
         ],
+        app_users: None,
     }
 }
 
@@ -595,4 +596,24 @@ fn introspection_reports_primary_keys() {
     }))
     .unwrap();
     assert!(old.primary_key.is_empty());
+}
+
+#[test]
+fn schema_reports_app_users_table() {
+    let without = schema().to_json("public", &[], false);
+    assert!(without.get("app_users").is_none(), "{without}");
+
+    let mut r = raw();
+    r.app_users = Some(("public".into(), "users".into()));
+    let with = Schema::build("v1".into(), r).to_json("public", &[], false);
+    assert_eq!(with["app_users"], json!({"schema": "public", "table": "users"}));
+
+    // The marker rides in the introspection JSON as an optional key.
+    let parsed: Raw = serde_json::from_str(r#"{"namespaces":[],"types":[],"enums":[],"relations":[],"functions":[],"app_users":["public","users"]}"#).unwrap();
+    assert_eq!(parsed.app_users, Some(("public".into(), "users".into())));
+    let parsed: Raw = serde_json::from_str(
+        r#"{"namespaces":[],"types":[],"enums":[],"relations":[],"functions":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(parsed.app_users, None);
 }

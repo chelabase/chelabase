@@ -1,3 +1,4 @@
+pub mod app_keys;
 pub mod bootstrap;
 pub mod env_files;
 pub mod internal_keys;

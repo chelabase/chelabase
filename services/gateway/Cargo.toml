@@ -36,6 +36,7 @@ reqwest = { workspace = true }
 moka = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 cheladb-auth = { workspace = true, features = ["test-support"] }

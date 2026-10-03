@@ -6,6 +6,8 @@ use gateway::config::GatewayConfig;
 use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
 use gateway::proxy::Gateway;
+use gateway::user_tokens::UserTokens;
+use cheladb_auth::app_token::AppTokenVerifier;
 use gateway::registry::{Registry, SharedRegistry};
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::Server;
@@ -28,7 +30,17 @@ fn main() -> anyhow::Result<()> {
         Registry::from_config(&config.api_hosts).map_err(anyhow::Error::msg)?,
     ));
     let keys = Arc::new(DataKeyResolver::new(&config.internal_url, &config.data_keys_token));
-    let pipeline = Pipeline::new(registry, config.studio_origins.clone(), verifier, signer, keys);
+    let app_verifier = config
+        .app_jwt_public_key
+        .as_deref()
+        .map(|path| AppTokenVerifier::from_pem_file(std::path::Path::new(path)))
+        .transpose()?;
+    let users = Arc::new(UserTokens::new(
+        app_verifier,
+        &config.internal_url,
+        &config.app_sessions_token,
+    ));
+    let pipeline = Pipeline::new(registry, config.studio_origins.clone(), verifier, signer, keys, users);
 
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
     // periods. Under `just dev`, Compose, or k8s a process manager restarts us,

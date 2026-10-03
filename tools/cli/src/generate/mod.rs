@@ -20,6 +20,15 @@ pub struct Schema {
     /// The databases the key may reach (main's response only; older servers omit it).
     #[serde(default)]
     databases: Vec<String>,
+    /// The table app users are mirrored into, when the branch has one.
+    #[serde(default)]
+    app_users: Option<AppUsersRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppUsersRef {
+    schema: String,
+    table: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -328,6 +337,7 @@ struct Rendered {
     db: String,
     rt: String,
     dflt: String,
+    app_users: Option<String>,
     version: String,
     uses_int8: bool,
     uses_json: bool,
@@ -336,8 +346,13 @@ struct Rendered {
 impl Rendered {
     /// `{ defaultSchema: …; schemas: {…}; }` (no trailing `;`).
     fn db_type(&self) -> String {
+        let app_users = self
+            .app_users
+            .as_ref()
+            .map(|a| format!("  appUsers: {a};\n"))
+            .unwrap_or_default();
         format!(
-            "{{\n  defaultSchema: {};\n  schemas: {{\n{}  }};\n}}",
+            "{{\n  defaultSchema: {};\n  schemas: {{\n{}  }};\n{app_users}}}",
             self.dflt, self.db
         )
     }
@@ -529,6 +544,13 @@ fn render(schema: &Schema) -> Result<Rendered> {
         db,
         rt,
         dflt: quote(&schema.default_schema),
+        app_users: schema.app_users.as_ref().map(|a| {
+            format!(
+                "{{ schema: {}; table: {} }}",
+                quote(&a.schema),
+                quote(&a.table)
+            )
+        }),
         version: schema.version.clone(),
         uses_int8: cx.uses_int8,
         uses_json: cx.uses_json,
@@ -656,6 +678,33 @@ mod tests {
         }
         assert_eq!(out, GOLDEN);
         assert_eq!(from(SCHEMA), out, "deterministic");
+    }
+
+    /// A branch with an app users table marks it on `Database`; one without leaves it out.
+    #[test]
+    fn gen_marks_app_users_table() {
+        let plain = from(SCHEMA);
+        assert!(!plain.contains("appUsers"));
+        let mut value: serde_json::Value = serde_json::from_str(SCHEMA).unwrap();
+        value["app_users"] = serde_json::json!({"schema": "public", "table": "users"});
+        let out = from(&value.to_string());
+        let marked = "  schemas: {\n";
+        assert!(out.contains(marked));
+        assert!(
+            out.contains("  };\n  appUsers: { schema: \"public\"; table: \"users\" };\n}"),
+            "{out}"
+        );
+        // Everything else is unchanged.
+        assert_eq!(
+            out.replace("  appUsers: { schema: \"public\"; table: \"users\" };\n", ""),
+            plain
+        );
+        // Several databases: the mark sits in that database's entry only.
+        let main: Schema = serde_json::from_str(&value.to_string()).unwrap();
+        let other: Schema = serde_json::from_str(SCHEMA).unwrap();
+        let multi = generate_all(&[("main".into(), main), ("other".into(), other)]).unwrap();
+        assert_eq!(multi.matches("appUsers:").count(), 1, "{multi}");
+        assert!(multi.contains("    appUsers: { schema: \"public\"; table: \"users\" };\n  };"));
     }
 
     #[test]

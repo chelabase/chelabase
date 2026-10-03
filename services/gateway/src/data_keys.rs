@@ -26,6 +26,9 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ResolvedKey {
     pub key_id: Uuid,
     pub branch_id: Uuid,
+    /// The project the key's branch belongs to (absent in answers from an older orchestrator).
+    #[serde(default)]
+    pub project_id: Uuid,
     pub kind: DataKeyKind,
     pub role: String,
     /// The key's allow-list; absent or `null` means every database the branch serves.
@@ -227,6 +230,7 @@ pub(crate) mod test_support {
         ResolvedKey {
             key_id: Uuid::new_v4(),
             branch_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
             kind,
             role: if kind == DataKeyKind::Public {
                 "anon"
@@ -265,7 +269,7 @@ pub(crate) mod test_support {
                             Some(Answer::Known(k)) => (
                                 StatusCode::OK,
                                 Json(serde_json::json!({
-                                    "key_id": k.key_id, "branch_id": k.branch_id,
+                                    "key_id": k.key_id, "branch_id": k.branch_id, "project_id": k.project_id,
                                     "kind": k.kind.as_str(), "role": k.role,
                                     "databases": k.databases,
                                 })),

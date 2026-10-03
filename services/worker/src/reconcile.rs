@@ -631,6 +631,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             // before compute_ctl listens and fail. That heals itself: the flag stays set, the
             // next pass retries, and meanwhile the new compute boots with the current spec.
             Action::ApplyPending(ep) => self.apply_pending(ep).await.map_err(|e| format!("{e:#}")),
+            Action::RemoveCompute(ep) if !self.remove_orphans => {
+                info!(
+                    endpoint_id = %ep,
+                    "compute has no endpoint row; keeping it (CHELADB_WORKER_REMOVE_ORPHANS is off)"
+                );
+                Ok(())
+            }
             Action::RemoveCompute(ep) => self
                 .computes
                 .delete(ep)
@@ -1718,6 +1725,27 @@ mod tests {
         );
         assert_eq!(w.computes.list().await.unwrap(), Vec::<String>::new());
         assert_eq!(w.storage.tenants.lock().unwrap().len(), 2);
+    }
+
+    /// With orphan removal off (a worker on its own metadata database sharing the machine's
+    /// computes), a compute with no endpoint row is kept.
+    #[tokio::test]
+    async fn orphan_computes_are_kept_when_removal_is_off() {
+        let (mut w, journal) = worker();
+        w.remove_orphans = false;
+        let (_id, ep) = provision(&w, &journal).await;
+        w.computes.insert(EP2);
+        journal.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        let delete = position(&journal, &format!("compute.delete {EP2}"));
+        assert!(delete.is_none(), "{:?}", entries(&journal));
+        let mut listed = w.computes.list().await.unwrap();
+        listed.sort();
+        let mut want = vec![ep, EP2.to_string()];
+        want.sort();
+        assert_eq!(listed, want);
     }
 
     #[tokio::test]

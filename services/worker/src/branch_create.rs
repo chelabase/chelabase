@@ -8,7 +8,7 @@ use cheladb_metadata::{
 use cheladb_nats::PointInTime;
 use cheladb_neon::{ComputeBackend, Lsn, NeonId};
 use cheladb_secrets::{Purpose, open_role_password, seal_credential, seal_role_password};
-use cheladb_types::{BranchId, DatabaseId};
+use cheladb_types::{BranchId, DatabaseId, ProjectId};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -24,6 +24,7 @@ use crate::{OWNER_ROLE, credentials};
 /// Everything step 3 generated and recorded. Once it exists, a failure tears down.
 struct Recorded {
     branch: BranchId,
+    database_id: DatabaseId,
     endpoint_id: String,
     tenant: NeonId,
     timeline: NeonId,
@@ -59,8 +60,8 @@ const PROTECTION_RETRIES: usize = 2;
 
 /// How [`Worker::build_branch`] ended when nothing failed.
 enum Built {
-    /// Steps 4-7 done.
-    Compute,
+    /// Steps 4-7 done; the project whose app users were bootstrapped on the branch, if any.
+    Compute(Option<ProjectId>),
     /// A delete removed the endpoint row meanwhile; stopped after the timeline.
     EndpointGone,
 }
@@ -153,9 +154,17 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         // Steps 4-7.
         match self.build_branch(&rec, &parent_timeline, lsn).await {
-            Ok(Built::Compute) => {
+            Ok(Built::Compute(users)) => {
                 self.finish_branch(branch_id, &rec, &parent_timeline, lsn, started)
-                    .await
+                    .await?;
+                // The users that changed since the branch point (best effort; the periodic
+                // pass catches up otherwise).
+                if let Some(project) = users
+                    && let Err(err) = self.reconcile_app_users(project).await
+                {
+                    warn!(%branch_id, %project, "reconciling app users onto the new branch: {err}");
+                }
+                Ok(())
             }
             Ok(Built::EndpointGone) => {
                 info!(%branch_id, "endpoint row gone while creating; tearing down");
@@ -247,6 +256,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         let rec = Recorded {
             branch: branch.id,
+            database_id: branch.database_id,
             endpoint_id: new_endpoint_id(),
             tenant: tenant.clone(),
             timeline: NeonId::new(),
@@ -475,7 +485,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
         phase_done(ep, "bootstrap_databases", phase);
-        Ok(Built::Compute)
+        // A branch of the auth database gets its own sync password and the users machinery
+        // (it relies on the data API roles just bootstrapped).
+        let users = self
+            .bootstrap_users_for(rec.branch, rec.database_id, ep)
+            .await
+            .map_err(|e| format!("bootstrapping app users: {e:#}"))?;
+        Ok(Built::Compute(users))
     }
 
     /// Under the endpoint's lock, the resync, which takes the catalog's SQL roles as they were

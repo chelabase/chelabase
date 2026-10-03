@@ -49,6 +49,22 @@ pub enum ErrorCode {
     Conflict,
     DataApiDisabled,
     OwnerPasswordUnknown,
+    ProjectDeleting,
+    AppUsersDisabled,
+    AppUsersLocationFixed,
+    AppUsersHasUsers,
+    AppUsersTableExists,
+    DataApiNotEnabled,
+    UnknownColumn,
+    ConstraintViolation,
+    EmailNotVerified,
+    UserInactive,
+    RefreshTokenInvalid,
+    RefreshTokenReused,
+    UserTokenInvalid,
+    UserTokenExpired,
+    UserSessionRevoked,
+    UserTokenWithSecretKey,
 }
 
 impl ErrorCode {
@@ -94,6 +110,22 @@ impl ErrorCode {
             Self::Conflict => "conflict",
             Self::DataApiDisabled => "data_api_disabled",
             Self::OwnerPasswordUnknown => "owner_password_unknown",
+            Self::ProjectDeleting => "project_deleting",
+            Self::AppUsersDisabled => "app_users_disabled",
+            Self::AppUsersLocationFixed => "app_users_location_fixed",
+            Self::AppUsersHasUsers => "app_users_has_users",
+            Self::AppUsersTableExists => "app_users_table_exists",
+            Self::DataApiNotEnabled => "data_api_not_enabled",
+            Self::UnknownColumn => "unknown_column",
+            Self::ConstraintViolation => "constraint_violation",
+            Self::EmailNotVerified => "email_not_verified",
+            Self::UserInactive => "user_inactive",
+            Self::RefreshTokenInvalid => "refresh_token_invalid",
+            Self::RefreshTokenReused => "refresh_token_reused",
+            Self::UserTokenInvalid => "user_token_invalid",
+            Self::UserTokenExpired => "user_token_expired",
+            Self::UserSessionRevoked => "user_session_revoked",
+            Self::UserTokenWithSecretKey => "user_token_with_secret_key",
         }
     }
 }
@@ -196,7 +228,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 40] = [
+    const ALL: [(ErrorCode, &str); 56] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -237,6 +269,22 @@ mod tests {
         (ErrorCode::Conflict, "conflict"),
         (ErrorCode::DataApiDisabled, "data_api_disabled"),
         (ErrorCode::OwnerPasswordUnknown, "owner_password_unknown"),
+        (ErrorCode::ProjectDeleting, "project_deleting"),
+        (ErrorCode::AppUsersDisabled, "app_users_disabled"),
+        (ErrorCode::AppUsersLocationFixed, "app_users_location_fixed"),
+        (ErrorCode::AppUsersHasUsers, "app_users_has_users"),
+        (ErrorCode::AppUsersTableExists, "app_users_table_exists"),
+        (ErrorCode::DataApiNotEnabled, "data_api_not_enabled"),
+        (ErrorCode::UnknownColumn, "unknown_column"),
+        (ErrorCode::ConstraintViolation, "constraint_violation"),
+        (ErrorCode::EmailNotVerified, "email_not_verified"),
+        (ErrorCode::UserInactive, "user_inactive"),
+        (ErrorCode::RefreshTokenInvalid, "refresh_token_invalid"),
+        (ErrorCode::RefreshTokenReused, "refresh_token_reused"),
+        (ErrorCode::UserTokenInvalid, "user_token_invalid"),
+        (ErrorCode::UserTokenExpired, "user_token_expired"),
+        (ErrorCode::UserSessionRevoked, "user_session_revoked"),
+        (ErrorCode::UserTokenWithSecretKey, "user_token_with_secret_key"),
     ];
 
     #[test]

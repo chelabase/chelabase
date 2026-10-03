@@ -237,6 +237,45 @@ pub fn find_smtp(listed: &Value, host: &str) -> Option<(String, bool)> {
     let active = config.get("state").and_then(Value::as_str) == Some("SMTP_CONFIG_ACTIVE");
     Some((config.get("id")?.as_str()?.to_string(), active))
 }
+pub fn actions_target_search(name: &str) -> Value {
+    json!({"filters": [{"targetNameFilter": {"targetName": name, "method": "TEXT_FILTER_METHOD_EQUALS"}}]})
+}
+
+/// The ids of the listed targets called `name`.
+pub fn actions_target_ids(listed: &Value, name: &str) -> Vec<String> {
+    listed
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("name").and_then(Value::as_str) == Some(name))
+        .filter_map(|t| t.get("id")?.as_str().map(str::to_string))
+        .collect()
+}
+
+/// An asynchronous REST target: Zitadel doesn't wait for (or use) the answer.
+pub fn actions_target_create(name: &str, endpoint: &str) -> Value {
+    json!({"name": name, "restAsync": {}, "endpoint": endpoint,
+           "timeout": "10s", "payloadType": "PAYLOAD_TYPE_JSON"})
+}
+
+/// `(id, signingKey)` of a created target.
+pub fn actions_target_created(created: &Value) -> Result<(String, String)> {
+    let field = |k: &str| {
+        created
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .with_context(|| format!("CreateTarget: no {k} in {created}"))
+    };
+    Ok((field("id")?, field("signingKey")?))
+}
+
+/// Routes every user event to the target.
+pub fn actions_execution_set(target_id: &str) -> Value {
+    json!({"condition": {"event": {"group": "user"}}, "targets": [target_id]})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

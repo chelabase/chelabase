@@ -11,6 +11,8 @@ use cheladb_secrets::SecretKey;
 use cheladb_types::BranchId;
 use cheladb_types::role_settings::RoleSettings;
 
+pub mod app_users;
+pub mod app_users_sql;
 pub mod branch_create;
 pub mod branch_delete;
 pub mod branch_job;
@@ -23,6 +25,7 @@ pub mod delete;
 mod fakes;
 pub mod names;
 pub mod point;
+pub mod project_delete;
 pub mod ports;
 pub mod provision;
 pub mod reconcile;
@@ -67,4 +70,13 @@ pub struct Worker<M, S, C, N, P> {
     /// When reconcile first saw each `enabling` database row: one still there after
     /// [`reconcile::ENABLING_RETRY_SECS`] has its enable bootstrap run again.
     pub enabling_seen: Mutex<std::collections::HashMap<(BranchId, String), std::time::Instant>>,
+    /// Zitadel with the admin PAT (`CHELADB_ZITADEL_ADMIN_PAT_FILE`, `CHELADB_ZITADEL_ISSUER`):
+    /// org create/delete, user reads and session deletes. `None` when either is unset; app
+    /// users jobs that need it then fail and are retried (P2).
+    pub zitadel: Option<cheladb_zitadel::client::Zitadel>,
+    /// How often every enabled project's users are reconciled (`CHELADB_APP_USERS_RECONCILE_SECS`).
+    pub app_users_reconcile_every: Duration,
+    /// `CHELADB_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
+    /// endpoint row records (off: they're logged and kept).
+    pub remove_orphans: bool,
 }

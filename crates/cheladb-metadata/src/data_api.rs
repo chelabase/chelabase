@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use cheladb_types::BranchId;
+use cheladb_types::{BranchId, ProjectId};
 use cheladb_types::data_key::DataKeyKind;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -90,6 +90,8 @@ impl fmt::Debug for DataKeyRecord {
 pub struct DataKeyLookup {
     pub key_id: Uuid,
     pub branch_id: BranchId,
+    /// The project the key's database belongs to.
+    pub project_id: ProjectId,
     pub kind: DataKeyKind,
     pub role: String,
     /// The databases the key may reach; `None` is every served database.
@@ -197,9 +199,10 @@ impl MetadataClient {
         sha256: &[u8; 32],
     ) -> Result<Option<DataKeyLookup>, MetadataError> {
         let row = sqlx::query(
-            "SELECT k.id, k.branch_id, k.kind, k.role, k.databases
+            "SELECT k.id, k.branch_id, d.project_id, k.kind, k.role, k.databases
              FROM data_api_keys k
              JOIN branches b ON b.id = k.branch_id
+             JOIN databases d ON d.id = b.database_id
              WHERE k.sha256 = $1 AND k.revoked_at IS NULL
                AND b.status NOT IN ('deleting', 'deleted')",
         )
@@ -210,6 +213,7 @@ impl MetadataClient {
             Ok(DataKeyLookup {
                 key_id: r.get("id"),
                 branch_id: BranchId(r.get("branch_id")),
+                project_id: ProjectId(r.get("project_id")),
                 kind: parse_kind(r.get("kind"))?,
                 role: r.get("role"),
                 databases: r.get("databases"),

@@ -83,7 +83,7 @@ FROM pg_authid a
 WHERE a.oid >= 16384
   AND a.rolname <> $OWNER
   AND a.rolname NOT IN ('cloud_admin', 'neon_superuser', 'anon', 'authenticated',
-                        'authenticator', 'cheladb_admin')
+                        'authenticator', 'cheladb_admin', 'cheladb_auth_sync')
   AND a.rolname !~ '^pg_'
 UNION ALL
 SELECT 'd',
@@ -798,6 +798,18 @@ mod tests {
              AND EXISTS (SELECT 1 FROM pg_auth_members s\n                    \
              WHERE s.member = a.oid AND s.roleid = 'neon_superuser'::regrole))"
         ));
+    }
+
+    /// I1: the app users sync login is Cheladb's, like `authenticator`: the catalog read
+    /// leaves it out, so it never becomes a `neon_roles` row.
+    #[test]
+    fn resync_ignores_the_sync_role() {
+        let sql = resync_sql("postgres");
+        let start = sql.find("AND a.rolname NOT IN (").unwrap();
+        let list = &sql[start..start + sql[start..].find(')').unwrap()];
+        for role in ["authenticator", "cheladb_admin", crate::app_users_sql::USERS_SYNC_ROLE] {
+            assert!(list.contains(&format!("'{role}'")), "{role} in {list}");
+        }
     }
 
     #[test]

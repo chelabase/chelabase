@@ -56,9 +56,7 @@ pub fn client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-pub fn normalize_email(email: &str) -> String {
-    email.trim().to_lowercase()
-}
+pub use cheladb_zitadel::rules::normalize_email;
 
 /// A short, stable tag for logs, so emails never appear in them.
 pub fn email_tag(email: &str) -> String {

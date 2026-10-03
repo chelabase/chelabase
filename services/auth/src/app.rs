@@ -2,7 +2,8 @@
 
 use crate::config::Config;
 use crate::cookie::*;
-use crate::guard::{RateLimiter, client_ip, email_tag, normalize_email, pad};
+use crate::guard::{RateLimiter, client_ip, email_tag, pad};
+use cheladb_zitadel::rules::{normalize_email, strong_password};
 use crate::zitadel::{NewUser, Session, ZError, Zitadel};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -35,12 +36,19 @@ pub struct AppState {
     pub zitadel: Zitadel,
     pub config: Config,
     pub limiter: RateLimiter,
+    /// App users' flows; `None` (their routes answer 503) without the app keys.
+    pub app: Option<crate::app_users::AppUsers>,
 }
 
 type S = State<Arc<AppState>>;
 
 /// The documented routes; `openapi()` reads the document from here.
 pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
+    platform_router().merge(crate::app_users::flows::api_router())
+}
+
+/// Studio's sign-in pages' routes.
+fn platform_router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(auth_request))
         .routes(routes!(sign_in))
@@ -53,10 +61,13 @@ pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    let (router, _) = api_router().split_for_parts();
-    router
+    let (platform, _) = platform_router().split_for_parts();
+    let (app_users, _) = crate::app_users::flows::api_router().split_for_parts();
+    platform
         // Every body here is a few short fields; this also bounds rate-limit keys.
         .layer(DefaultBodyLimit::max(8 * 1024))
+        // Sign-up's `data` may carry a few columns' values.
+        .merge(app_users.layer(DefaultBodyLimit::max(64 * 1024)))
         .with_state(state)
 }
 
@@ -105,7 +116,7 @@ struct AuthRequestInfo {
 const MINUTE: Duration = Duration::from_secs(60);
 /// Sign-up may wait up to a second for Zitadel to see the new user (`new_user_session`), so its
 /// answers are padded this much beyond sign-in's, or a new email would answer slower than a taken one.
-const SIGN_UP_EXTRA: Duration = Duration::from_secs(1);
+pub(crate) const SIGN_UP_EXTRA: Duration = Duration::from_secs(1);
 const HOUR: Duration = Duration::from_secs(3600);
 
 /// Counts one attempt against each key in order, stopping at the first that is over its
@@ -125,16 +136,6 @@ fn is_auth_request_id(id: &str) -> bool {
 
 fn is_user_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Zitadel's default complexity policy, checked here first so the answer never depends on
-/// whether an account exists.
-fn strong_password(password: &str) -> bool {
-    password.chars().count() >= 8
-        && password.chars().any(|c| c.is_lowercase())
-        && password.chars().any(|c| c.is_uppercase())
-        && password.chars().any(|c| c.is_ascii_digit())
-        && password.chars().any(|c| !c.is_alphanumeric())
 }
 
 fn reply(status: StatusCode, body: Value, cookies: Vec<String>) -> Response {
@@ -405,9 +406,10 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     }
     // Zitadel checks usernames, not emails, for uniqueness: never make a second account
     // for an email that already has one.
-    match s.zitadel.find_user_by_email(&s.config.org_id, &email).await {
-        Ok(None) => {}
-        Ok(Some(_)) => return taken(s, &email, b.auth_request),
+    // Two accounts already sharing the email (made outside this check) count as taken too.
+    match s.zitadel.find_user_in_org(&s.config.org_id, &email).await {
+        Ok(crate::zitadel::EmailMatch::None) => {}
+        Ok(_) => return taken(s, &email, b.auth_request),
         Err(e) => return unavailable(&e),
     }
     let template = verify_template(s);
@@ -416,7 +418,10 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         email: &email,
         given_name: b.given_name.trim(),
         family_name: b.family_name.trim(),
-        password: &b.password,
+        password: Some(&b.password),
+        user_id: None,
+        username: None,
+        send_code: true,
         verified: s.config.skip_email_verification,
         url_template: &template,
     };

@@ -1,0 +1,29 @@
+[package]
+name = "cheladb-zitadel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zitadel v4 REST client, Actions v2 signature check and a stateful mock for tests"
+
+[features]
+# A stateful stand-in for Zitadel's REST API (axum), for tests.
+mock = ["dep:axum", "dep:tokio"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+# Enables the mock for this crate's own tests.
+cheladb-zitadel = { path = ".", features = ["mock"] }

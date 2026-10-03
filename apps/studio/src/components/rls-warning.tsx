@@ -16,6 +16,10 @@ interface Exposed {
   anonReach: boolean;
   /** Writes by anon, or (for an authenticated-only relation) by authenticated. */
   writes: boolean;
+  /** The project's app users table. */
+  appUsers?: boolean;
+  /** Nobody can reach it yet (the app users table before any GRANT). */
+  unreached?: boolean;
 }
 
 /** Relations that anon or authenticated can reach without RLS protecting them. */
@@ -63,6 +67,21 @@ function exposed(schema: DataApiSchema): Exposed[] {
       }
     }
   }
+  // The app users table is named even before any role can reach it: it holds the users' emails.
+  const au = schema.app_users;
+  const info = au ? schema.schemas[au.schema]?.tables[au.table] : undefined;
+  if (au && info?.kind === "table" && !info.rls) {
+    const existing = found.find((f) => f.schema === au.schema && f.name === au.table);
+    if (existing) existing.appUsers = true;
+    else {
+      const id = `${quote(au.schema)}.${quote(au.table)}`;
+      found.push({
+        schema: au.schema, name: au.table, note: "", sql: `ALTER TABLE ${id} ENABLE ROW LEVEL SECURITY;`,
+        copyLabel: `Copy ALTER TABLE for ${au.schema}.${au.table}`, rlsApplies: true, anonReach: false, writes: false,
+        appUsers: true, unreached: true,
+      });
+    }
+  }
   return found;
 }
 
@@ -71,7 +90,8 @@ export function RlsWarning({ schema }: { schema: DataApiSchema }) {
   const items = exposed(schema);
   if (items.length === 0) return null;
   const anonItems = items.filter((i) => i.anonReach);
-  const authOnly = items.filter((i) => !i.anonReach);
+  const authOnly = items.filter((i) => !i.anonReach && !i.unreached);
+  const unreached = items.filter((i) => i.unreached);
   const anonWrites = anonItems.some((i) => i.writes);
   const authWrites = authOnly.some((i) => i.writes);
   const hasPolicies = items.some((i) => i.rlsApplies);
@@ -87,12 +107,18 @@ export function RlsWarning({ schema }: { schema: DataApiSchema }) {
           {`Anyone with a secret key for the authenticated role can read these rows${authWrites ? " and change them" : ""}. Enable RLS before production.`}
         </p>
       )}
+      {unreached.length > 0 && (
+        <p className="font-medium text-destructive">
+          The app users table has RLS off. Enable RLS before you grant any role access to it.
+        </p>
+      )}
       <ul className="space-y-2">
         {items.map((t) => (
           <li key={`${t.schema}.${t.name}`} data-table={`${t.schema}.${t.name}`} className="space-y-1">
             <div className="font-mono">
               {t.schema}.{t.name}
             </div>
+            {t.appUsers && <p className="text-xs text-muted-foreground">This is the app users table.</p>}
             {t.note !== "" && <p className="text-xs text-muted-foreground">{t.note}</p>}
             <div className="flex flex-wrap items-center gap-2">
               <code className="rounded bg-muted px-1.5 py-0.5 text-xs break-all">{t.sql}</code>

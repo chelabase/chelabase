@@ -33,6 +33,17 @@ pub struct WorkerConfig {
     /// `CHELADB_BRANCH_ROLE_CAP`, `CHELADB_BRANCH_DATABASE_CAP` and
     /// `CHELADB_PASSWORD_STRENGTH` (platform mode forces strength on).
     pub roles: RoleSettings,
+    /// `CHELADB_ZITADEL_ISSUER`: Zitadel's base URL.
+    pub zitadel_issuer: Option<String>,
+    /// `CHELADB_ZITADEL_ADMIN_PAT_FILE`: the admin PAT (org create/delete, user reads,
+    /// session deletes). Read by [`build`].
+    pub zitadel_admin_pat_file: Option<PathBuf>,
+    /// `CHELADB_APP_USERS_RECONCILE_SECS` (default 300, 30 to 86,400).
+    pub app_users_reconcile_every: Duration,
+    /// `CHELADB_WORKER_REMOVE_ORPHANS` (default on): reconcile removes compute containers no
+    /// endpoint row records. Off for a worker on its own metadata database that shares the
+    /// machine's Docker with another stack (a branch's separate dev database).
+    pub remove_orphans: bool,
 }
 
 /// The value of `name`, or `None` when it's unset or blank.
@@ -78,6 +89,14 @@ impl WorkerConfig {
             mode,
             owner_superuser_requested,
             roles,
+            zitadel_issuer: non_blank(&get, "CHELADB_ZITADEL_ISSUER"),
+            zitadel_admin_pat_file: non_blank(&get, "CHELADB_ZITADEL_ADMIN_PAT_FILE")
+                .map(PathBuf::from),
+            app_users_reconcile_every: reconcile_every(non_blank(
+                &get,
+                "CHELADB_APP_USERS_RECONCILE_SECS",
+            ))?,
+            remove_orphans: remove_orphans(non_blank(&get, "CHELADB_WORKER_REMOVE_ORPHANS"))?,
         };
         check_control_plane_uri(&config.control_plane_uri)?;
         Ok(config)
@@ -86,6 +105,28 @@ impl WorkerConfig {
     /// Requested, and in self-hosted mode: platform mode ignores the switch.
     pub fn owner_superuser(&self) -> bool {
         self.owner_superuser_requested && self.mode == Mode::SelfHosted
+    }
+}
+
+/// `CHELADB_APP_USERS_RECONCILE_SECS`: whole seconds from 30 to 86,400; 300 when unset.
+fn reconcile_every(value: Option<String>) -> anyhow::Result<Duration> {
+    const NAME: &str = "CHELADB_APP_USERS_RECONCILE_SECS";
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(300));
+    };
+    match value.parse::<u64>() {
+        Ok(secs) if (30..=86_400).contains(&secs) => Ok(Duration::from_secs(secs)),
+        _ => Err(anyhow!("{NAME}={value:?}: expected whole seconds from 30 to 86400")),
+    }
+}
+
+/// `CHELADB_WORKER_REMOVE_ORPHANS`: on when unset; `true/1/yes/on` or `false/0/no/off`.
+fn remove_orphans(value: Option<String>) -> anyhow::Result<bool> {
+    const NAME: &str = "CHELADB_WORKER_REMOVE_ORPHANS";
+    match value.map(|v| v.to_ascii_lowercase()).as_deref() {
+        None | Some("true" | "1" | "yes" | "on") => Ok(true),
+        Some("false" | "0" | "no" | "off") => Ok(false),
+        Some(other) => Err(anyhow!("{NAME}={other:?}: expected true or false")),
     }
 }
 
@@ -108,6 +149,31 @@ pub fn check_control_plane_uri(uri: &str) -> anyhow::Result<()> {
         return Err(bad("it needs an explicit port"));
     }
     Ok(())
+}
+
+/// Zitadel with the admin PAT, when both settings are given and the file reads; otherwise
+/// `None` (logged), and app users jobs fail and are retried until it's configured.
+pub fn zitadel_client(config: &WorkerConfig) -> Option<cheladb_zitadel::client::Zitadel> {
+    let (Some(issuer), Some(file)) = (&config.zitadel_issuer, &config.zitadel_admin_pat_file)
+    else {
+        tracing::warn!(
+            "CHELADB_ZITADEL_ISSUER or CHELADB_ZITADEL_ADMIN_PAT_FILE is unset: app users jobs wait until both are set"
+        );
+        return None;
+    };
+    match std::fs::read_to_string(file) {
+        Ok(pat) if !pat.trim().is_empty() => {
+            Some(cheladb_zitadel::client::Zitadel::new(issuer, pat.trim()))
+        }
+        Ok(_) => {
+            tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty: app users jobs wait until it's set");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(file = %file.display(), "reading the Zitadel admin PAT: {e}; app users jobs wait until it's readable");
+            None
+        }
+    }
 }
 
 /// Wires the real ports. Nothing is contacted: Docker, Valkey and the storage controller are
@@ -142,6 +208,9 @@ pub fn build(
         claim_refresh: Duration::from_secs(60),
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
+        zitadel: zitadel_client(config),
+        app_users_reconcile_every: config.app_users_reconcile_every,
+        remove_orphans: config.remove_orphans,
     })
 }
 
@@ -274,6 +343,87 @@ mod tests {
                 .to_string();
             assert!(err.contains(name), "{name}={bad}: {err}");
         }
+    }
+
+    #[test]
+    fn config_reads_reconcile_interval() {
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert_eq!(c.app_users_reconcile_every, Duration::from_secs(300));
+        assert_eq!(c.zitadel_issuer, None);
+        assert_eq!(c.zitadel_admin_pat_file, None);
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELADB_APP_USERS_RECONCILE_SECS", "45"),
+            ("CHELADB_ZITADEL_ISSUER", "http://localhost:8080"),
+            ("CHELADB_ZITADEL_ADMIN_PAT_FILE", ".cheladb/zitadel/admin.pat"),
+        ]))
+        .unwrap();
+        assert_eq!(c.app_users_reconcile_every, Duration::from_secs(45));
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(
+            c.zitadel_admin_pat_file,
+            Some(PathBuf::from(".cheladb/zitadel/admin.pat"))
+        );
+        for edge in ["30", "86400"] {
+            let c = WorkerConfig::from_lookup(lookup(&[
+                IMAGE,
+                ("CHELADB_APP_USERS_RECONCILE_SECS", edge),
+            ]))
+            .unwrap();
+            assert_eq!(c.app_users_reconcile_every.as_secs().to_string(), edge);
+        }
+        for bad in ["29", "86401", "0", "five", "-1"] {
+            let err = WorkerConfig::from_lookup(lookup(&[
+                IMAGE,
+                ("CHELADB_APP_USERS_RECONCILE_SECS", bad),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("CHELADB_APP_USERS_RECONCILE_SECS"), "{bad}: {err}");
+        }
+        // Blank counts as unset.
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELADB_APP_USERS_RECONCILE_SECS", " "),
+            ("CHELADB_ZITADEL_ADMIN_PAT_FILE", ""),
+        ]))
+        .unwrap();
+        assert_eq!(c.app_users_reconcile_every, Duration::from_secs(300));
+        assert_eq!(c.zitadel_admin_pat_file, None);
+    }
+
+    /// `CHELADB_WORKER_REMOVE_ORPHANS`: on unless explicitly false (a worker sharing the
+    /// machine's computes with another metadata database must keep the ones it doesn't know).
+    #[test]
+    fn config_reads_remove_orphans() {
+        const VAR: &str = "CHELADB_WORKER_REMOVE_ORPHANS";
+        let with = |v: &str| WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, v)]));
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert!(c.remove_orphans);
+        for off in ["false", "0", "no", "off", " FALSE "] {
+            assert!(!with(off).unwrap().remove_orphans, "{off:?}");
+        }
+        for on in ["true", "1", "yes", "on", ""] {
+            assert!(with(on).unwrap().remove_orphans, "{on:?}");
+        }
+        let err = with("maybe").unwrap_err().to_string();
+        assert!(err.contains(VAR), "{err}");
+    }
+
+    /// Both settings and a readable file give a client; anything less gives none.
+    #[test]
+    fn zitadel_client_needs_issuer_and_pat_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pat = dir.path().join("admin.pat");
+        std::fs::write(&pat, "secret-pat\n").unwrap();
+        let mut c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert!(zitadel_client(&c).is_none());
+        c.zitadel_issuer = Some("http://localhost:8080".into());
+        assert!(zitadel_client(&c).is_none());
+        c.zitadel_admin_pat_file = Some(dir.path().join("missing.pat"));
+        assert!(zitadel_client(&c).is_none());
+        c.zitadel_admin_pat_file = Some(pat);
+        assert!(zitadel_client(&c).is_some());
     }
 
     #[test]

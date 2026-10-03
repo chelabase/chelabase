@@ -73,6 +73,8 @@ pub enum Auth {
     DataKey,
     /// Only a secret data API key.
     SecretDataKey,
+    /// A public data key; a secret key is refused.
+    PublicDataKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,6 +438,65 @@ pub mod orchestrator {
         "/v1/databases/{id}/branches/{branch_id}/roles/{role}",
     );
 
+    /// The tenant's projects.
+    pub const LIST_PROJECTS: Endpoint = key_endpoint("orchestrator.list_projects", Method::Get, "/v1/projects");
+
+    pub const CREATE_PROJECT: Endpoint =
+        key_endpoint("orchestrator.create_project", Method::Post, "/v1/projects");
+
+    pub const GET_PROJECT: Endpoint =
+        key_endpoint("orchestrator.get_project", Method::Get, "/v1/projects/{id}");
+
+    /// Renames a project (the slug stays).
+    pub const UPDATE_PROJECT: Endpoint =
+        key_endpoint("orchestrator.update_project", Method::Patch, "/v1/projects/{id}");
+
+    /// Starts deleting a project and its databases.
+    pub const DELETE_PROJECT: Endpoint =
+        key_endpoint("orchestrator.delete_project", Method::Delete, "/v1/projects/{id}");
+
+    /// The project's app-users settings.
+    pub const GET_APP_USERS: Endpoint =
+        key_endpoint("orchestrator.get_app_users", Method::Get, "/v1/projects/{id}/app-users");
+
+    /// Enables app users, or changes their settings.
+    pub const PUT_APP_USERS: Endpoint =
+        key_endpoint("orchestrator.put_app_users", Method::Put, "/v1/projects/{id}/app-users");
+
+    /// Disables app users (refused while users exist).
+    pub const DISABLE_APP_USERS: Endpoint =
+        key_endpoint("orchestrator.disable_app_users", Method::Delete, "/v1/projects/{id}/app-users");
+
+    /// The project's users, 50 per page.
+    pub const LIST_APP_USERS: Endpoint =
+        key_endpoint("orchestrator.list_app_users", Method::Get, "/v1/projects/{id}/users");
+
+    /// Creates a user.
+    pub const CREATE_APP_USER: Endpoint =
+        key_endpoint("orchestrator.create_app_user", Method::Post, "/v1/projects/{id}/users");
+
+    pub const GET_APP_USER: Endpoint =
+        key_endpoint("orchestrator.get_app_user", Method::Get, "/v1/projects/{id}/users/{user_id}");
+
+    /// Changes a user's email, verified flag or password.
+    pub const UPDATE_APP_USER: Endpoint =
+        key_endpoint("orchestrator.update_app_user", Method::Patch, "/v1/projects/{id}/users/{user_id}");
+
+    pub const DEACTIVATE_APP_USER: Endpoint =
+        key_endpoint("orchestrator.deactivate_app_user", Method::Post, "/v1/projects/{id}/users/{user_id}/deactivate");
+
+    pub const REACTIVATE_APP_USER: Endpoint =
+        key_endpoint("orchestrator.reactivate_app_user", Method::Post, "/v1/projects/{id}/users/{user_id}/reactivate");
+
+    pub const LIST_APP_USER_SESSIONS: Endpoint =
+        key_endpoint("orchestrator.list_app_user_sessions", Method::Get, "/v1/projects/{id}/users/{user_id}/sessions");
+
+    pub const REVOKE_APP_USER_SESSIONS: Endpoint =
+        key_endpoint("orchestrator.revoke_app_user_sessions", Method::Delete, "/v1/projects/{id}/users/{user_id}/sessions");
+
+    pub const DELETE_APP_USER: Endpoint =
+        key_endpoint("orchestrator.delete_app_user", Method::Delete, "/v1/projects/{id}/users/{user_id}");
+
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str) -> Endpoint {
         Endpoint {
             name,
@@ -509,6 +570,57 @@ pub mod auth {
     pub const PASSWORD_RESET_CONFIRM: Endpoint =
         post("auth.password_reset_confirm", "/auth/v1/password-reset/confirm");
     pub const LOGOUT: Endpoint = post("auth.logout", "/auth/v1/logout");
+
+    /// App users' flows: a public data key, from any origin (apps call them from the browser).
+    const APP_POLICY: Policy = Policy {
+        auth: Auth::PublicDataKey,
+        cors: Cors::Any,
+    };
+
+    const fn app(name: &'static str, method: Method, path: &'static str) -> Endpoint {
+        Endpoint {
+            name,
+            method,
+            path,
+            scope: Scope::Api,
+            service: Service::Auth,
+            policy: APP_POLICY,
+        }
+    }
+
+    pub const APP_SIGN_UP: Endpoint = app("auth.app_sign_up", Method::Post, "/auth/v1/app/sign-up");
+    pub const APP_SIGN_IN: Endpoint = app("auth.app_sign_in", Method::Post, "/auth/v1/app/sign-in");
+    pub const APP_REFRESH: Endpoint = app("auth.app_refresh", Method::Post, "/auth/v1/app/refresh");
+    pub const APP_SIGN_OUT: Endpoint =
+        app("auth.app_sign_out", Method::Post, "/auth/v1/app/sign-out");
+    pub const APP_USER: Endpoint = app("auth.app_user", Method::Get, "/auth/v1/app/user");
+    pub const APP_VERIFY_EMAIL: Endpoint =
+        app("auth.app_verify_email", Method::Post, "/auth/v1/app/verify-email");
+    pub const APP_RESEND_CODE: Endpoint =
+        app("auth.app_resend_code", Method::Post, "/auth/v1/app/resend-code");
+    pub const APP_PASSWORD_RESET: Endpoint =
+        app("auth.app_password_reset", Method::Post, "/auth/v1/app/password-reset");
+    pub const APP_PASSWORD_RESET_CONFIRM: Endpoint = app(
+        "auth.app_password_reset_confirm",
+        Method::Post,
+        "/auth/v1/app/password-reset/confirm",
+    );
+    pub const APP_CHANGE_EMAIL: Endpoint =
+        app("auth.app_change_email", Method::Post, "/auth/v1/app/change-email");
+    pub const APP_CHANGE_PASSWORD: Endpoint =
+        app("auth.app_change_password", Method::Post, "/auth/v1/app/change-password");
+    /// The app token signing key, for apps' own servers: no key needed.
+    pub const APP_JWKS: Endpoint = Endpoint {
+        name: "auth.app_jwks",
+        method: Method::Get,
+        path: "/auth/v1/app/jwks",
+        scope: Scope::Api,
+        service: Service::Auth,
+        policy: Policy {
+            auth: Auth::Public,
+            cors: Cors::Any,
+        },
+    };
 }
 
 /// Every public endpoint the gateway exposes.
@@ -548,6 +660,23 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::CREATE_ROLE,
     orchestrator::RESET_ROLE,
     orchestrator::DELETE_ROLE,
+    orchestrator::LIST_PROJECTS,
+    orchestrator::CREATE_PROJECT,
+    orchestrator::GET_PROJECT,
+    orchestrator::UPDATE_PROJECT,
+    orchestrator::DELETE_PROJECT,
+    orchestrator::GET_APP_USERS,
+    orchestrator::PUT_APP_USERS,
+    orchestrator::DISABLE_APP_USERS,
+    orchestrator::LIST_APP_USERS,
+    orchestrator::CREATE_APP_USER,
+    orchestrator::GET_APP_USER,
+    orchestrator::UPDATE_APP_USER,
+    orchestrator::DEACTIVATE_APP_USER,
+    orchestrator::REACTIVATE_APP_USER,
+    orchestrator::LIST_APP_USER_SESSIONS,
+    orchestrator::REVOKE_APP_USER_SESSIONS,
+    orchestrator::DELETE_APP_USER,
     rest::QUERY,
     rest::SCHEMA,
     auth::AUTH_REQUEST,
@@ -558,6 +687,18 @@ pub const ENDPOINTS: &[Endpoint] = &[
     auth::PASSWORD_RESET,
     auth::PASSWORD_RESET_CONFIRM,
     auth::LOGOUT,
+    auth::APP_SIGN_UP,
+    auth::APP_SIGN_IN,
+    auth::APP_REFRESH,
+    auth::APP_SIGN_OUT,
+    auth::APP_USER,
+    auth::APP_VERIFY_EMAIL,
+    auth::APP_RESEND_CODE,
+    auth::APP_PASSWORD_RESET,
+    auth::APP_PASSWORD_RESET_CONFIRM,
+    auth::APP_CHANGE_EMAIL,
+    auth::APP_CHANGE_PASSWORD,
+    auth::APP_JWKS,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -867,15 +1008,47 @@ mod tests {
 
     #[test]
     fn auth_endpoints_are_public_posts_with_credentialed_cors() {
-        for ep in ENDPOINTS.iter().filter(|e| e.service == Service::Auth) {
+        let platform = |e: &&Endpoint| e.service == Service::Auth && !e.path.starts_with("/auth/v1/app/");
+        for ep in ENDPOINTS.iter().filter(platform) {
             assert_eq!(ep.method, Method::Post, "{}", ep.path);
             assert_eq!(ep.policy.auth, Auth::Public, "{}", ep.path);
             assert_eq!(ep.policy.cors, Cors::StudioCredentials, "{}", ep.path);
             assert!(ep.path.starts_with("/auth/v1/"), "{}", ep.path);
         }
-        assert_eq!(ENDPOINTS.iter().filter(|e| e.service == Service::Auth).count(), 8);
+        assert_eq!(ENDPOINTS.iter().filter(platform).count(), 8);
         assert!(matches!(match_endpoint(Scope::Api, "POST", "/auth/v1/password-reset/confirm"),
             Match::Found(ep) if ep.name == "auth.password_reset_confirm"));
+    }
+
+    #[test]
+    fn app_auth_endpoints_take_a_public_key_from_any_origin() {
+        let want = [
+            ("auth.app_sign_up", "POST", "/auth/v1/app/sign-up"),
+            ("auth.app_sign_in", "POST", "/auth/v1/app/sign-in"),
+            ("auth.app_refresh", "POST", "/auth/v1/app/refresh"),
+            ("auth.app_sign_out", "POST", "/auth/v1/app/sign-out"),
+            ("auth.app_user", "GET", "/auth/v1/app/user"),
+            ("auth.app_verify_email", "POST", "/auth/v1/app/verify-email"),
+            ("auth.app_resend_code", "POST", "/auth/v1/app/resend-code"),
+            ("auth.app_password_reset", "POST", "/auth/v1/app/password-reset"),
+            ("auth.app_password_reset_confirm", "POST", "/auth/v1/app/password-reset/confirm"),
+            ("auth.app_change_email", "POST", "/auth/v1/app/change-email"),
+            ("auth.app_change_password", "POST", "/auth/v1/app/change-password"),
+            ("auth.app_jwks", "GET", "/auth/v1/app/jwks"),
+        ];
+        let app: Vec<&Endpoint> = ENDPOINTS
+            .iter()
+            .filter(|e| e.path.starts_with("/auth/v1/app/"))
+            .collect();
+        assert_eq!(app.len(), want.len());
+        for (name, method, path) in want {
+            assert_eq!(found(method, path), name, "{method} {path}");
+            let ep = app.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(ep.service, Service::Auth, "{name}");
+            assert_eq!(ep.scope, Scope::Api, "{name}");
+            let auth = if name == "auth.app_jwks" { Auth::Public } else { Auth::PublicDataKey };
+            assert_eq!(ep.policy, Policy { auth, cors: Cors::Any }, "{name}");
+        }
     }
 
     const KEYS: &str = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/keys";

@@ -10,6 +10,17 @@ pub struct DataApiSchema {
     pub version: String,
     pub default_schema: String,
     pub schemas: BTreeMap<String, SchemaEntry>,
+    /// The table app users are mirrored into, when the branch has one (left out otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_users: Option<AppUsersTable>,
+}
+
+/// The branch's app users table: where `cheladb.app_users_table` points.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AppUsersTable {
+    pub schema: String,
+    pub table: String,
 }
 
 /// One schema's tables, functions (overloads by name) and enums (labels by name).
@@ -118,5 +129,23 @@ mod tests {
             t["Order"].columns["mood"].r#enum.as_deref(),
             Some("public.mood")
         );
+    }
+
+    #[test]
+    fn data_api_schema_omits_app_users_when_absent() {
+        let parsed: DataApiSchema = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(parsed.app_users, None);
+        assert!(!serde_json::to_string(&parsed).unwrap().contains("app_users"));
+        let with = DataApiSchema {
+            app_users: Some(AppUsersTable {
+                schema: "public".into(),
+                table: "users".into(),
+            }),
+            ..parsed
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["app_users"], serde_json::json!({"schema":"public","table":"users"}));
+        let back: DataApiSchema = serde_json::from_value(json).unwrap();
+        assert_eq!(back, with);
     }
 }

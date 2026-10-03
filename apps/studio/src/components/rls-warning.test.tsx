@@ -23,6 +23,20 @@ const one = (t: DataApiTable, name = "notes", schema = "public") => schemaOf({ [
 afterEach(() => vi.unstubAllGlobals());
 
 describe("RlsWarning", () => {
+  it("names_the_users_table_when_rls_is_off", () => {
+    const schema = { ...schemaOf({ public: { users: table(false), other: table(false) } }), app_users: { schema: "public", table: "users" } };
+    render(<RlsWarning schema={schema} />);
+    const item = screen.getByText("public.users").closest("li")!;
+    expect(item).toHaveTextContent(/app users table/i);
+    expect(screen.queryByText("public.other")).toBeNull();
+  });
+
+  it("users_table_with_rls_on_is_quiet", () => {
+    const schema = { ...schemaOf({ public: { users: table(true) } }), app_users: { schema: "public", table: "users" } };
+    const { container } = render(<RlsWarning schema={schema} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("lists only reachable relations that bypass RLS", () => {
     render(
       <RlsWarning

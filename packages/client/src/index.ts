@@ -4,13 +4,19 @@
  *
  * @module
  */
+import { createAuth, SESSION_GONE, USER_HEADER } from "./auth.ts";
 import { DataApiError } from "./error.ts";
 import { hasSourceText, parseResult, type ResultSpec, stringify } from "./json.ts";
 import { batchOf, callFn, type Runner, selectFrom } from "./query.ts";
-import type { Client, DatabaseShape, QueryTree, TypeMap } from "./types.ts";
+import type { AuthOptions, Client, DatabaseShape, QueryTree, TypeMap } from "./types.ts";
 
 export { DataApiError, UnsafeIntegerError } from "./error.ts";
 export type {
+  AppUser,
+  Auth,
+  AuthEvent,
+  AuthOptions,
+  AuthStorage,
   Client,
   Condition,
   DatabaseShape,
@@ -26,6 +32,8 @@ export type {
   QueryTree,
   Resolve,
   ResolveRow,
+  Session,
+  SignUpData,
   SelectItem,
   SelectQuery,
   TableName,
@@ -47,6 +55,8 @@ export interface ClientOptions {
   fetch?: typeof fetch;
   /** The generated `types` map: which columns, arguments and returns are int8 or numeric. */
   types?: TypeMap;
+  /** App user sessions (`db.auth`): where the refresh token is kept, and automatic refresh. */
+  auth?: AuthOptions;
 }
 
 const RUNTIMES = "Node 21+, Chrome 114+, Firefox 135+ or Safari 18.4+";
@@ -83,7 +93,10 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
   }
   const sourceText = hasSourceText();
   const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
-  const endpoint = `${opts.url.replace(/\/+$/, "")}/data/v1/query`;
+  const base = opts.url.replace(/\/+$/, "");
+  const endpoint = `${base}/data/v1/query`;
+  // One session per client, shared by every `database()` sibling.
+  const core = createAuth<DB>({ base, key: opts.key, fetch: doFetch, options: opts.auth, toError });
 
   // One client per (database, types): `database()` builds a sibling bound to another database.
   const make = (types: TypeMap | undefined, database: string | undefined): unknown => {
@@ -110,17 +123,32 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
       async run(tree: QueryTree, spec: ResultSpec): Promise<unknown> {
         // The top level only: the ops of a batch are built without `v`, and never name a database.
         const body = database === undefined ? tree : { ...tree, database };
-        const res = await doFetch(endpoint, {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${opts.key}`,
-            "content-type": "application/json",
-            accept: "application/json",
-          },
-          body: stringify(body),
-        });
-        const text = await res.text();
-        if (!res.ok) throw toError(res, text);
+        const payload = stringify(body);
+        const send = (userToken: string | undefined) =>
+          doFetch(endpoint, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${opts.key}`,
+              "content-type": "application/json",
+              accept: "application/json",
+              ...(userToken === undefined ? {} : { [USER_HEADER]: userToken }),
+            },
+            body: payload,
+          });
+        let token = await core.accessToken();
+        let res = await send(token);
+        let text = await res.text();
+        if (!res.ok && token !== undefined && res.status === 401 && toError(res, text).code === "user_token_expired") {
+          // One refresh, one retry.
+          token = await core.refreshAfterExpiry(token);
+          res = await send(token);
+          text = await res.text();
+        }
+        if (!res.ok) {
+          const e = toError(res, text);
+          if (token !== undefined && e.code === SESSION_GONE) await core.dropSession(token);
+          throw e;
+        }
         try {
           return parseResult(text, spec, bigint, sourceText);
         } catch (e) {
@@ -144,6 +172,7 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
       ...tx(runner),
       batch: (fn: (t: unknown) => unknown) => batchOf(runner, fn(tx(batchRunner))),
       database: (name: string, t?: TypeMap) => make(t, name),
+      auth: core.auth,
     };
   };
 

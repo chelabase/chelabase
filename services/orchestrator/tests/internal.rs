@@ -6,9 +6,16 @@ use axum::Router;
 use axum::http::StatusCode as AxumStatus;
 use axum::routing::get;
 use cheladb_metadata::{
-    BranchConnectionRow, ServedDatabase, BranchStatus, DataApiSettings, DataKeyLookup, DatabaseOrigin,
-    MetadataError, NeonDatabase, NeonEndpoint, NeonRole, RoleCopy, RoleLevel, RoleOrigin,
+    AppSession, AppUsersStatus, BranchAuthSync, BranchConnectionRow, BranchKind, BranchRecord,
+    ServedDatabase, BranchStatus, DataApiSettings, DataKeyLookup, DatabaseOrigin, MetadataError,
+    NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, OnDelete, ProjectAuth, ProjectRecord,
+    ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
 };
+use cheladb_nats::{AppUsersSyncJob, JobEnvelope};
+use cheladb_types::{DatabaseId, ProjectId, TenantId};
+use cheladb_zitadel::client::Zitadel;
+use cheladb_zitadel::mock::MockZitadel;
+use orchestrator::internal::app::AppJobPort;
 use cheladb_secrets::{Purpose, SecretKey, seal_credential};
 use cheladb_types::BranchId;
 use cheladb_types::data_key::DataKeyKind;
@@ -34,6 +41,10 @@ const COMPUTE_TOKEN: &str = "compute-token";
 const DATA_KEYS_TOKEN: &str = "data-keys-token";
 const REST_TOKEN: &str = "rest-token";
 const CONTROL_PLANE_URI: &str = "http://host.docker.internal:8083";
+const APP_AUTH_TOKEN: &str = "app-auth-token";
+const APP_SESSIONS_TOKEN: &str = "app-sessions-token";
+const SIGNING_KEY: &str = "actions-signing-key";
+const REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -62,6 +73,29 @@ struct FakeNeon {
     begins: Arc<AtomicUsize>,
     /// `begin_ddl` answers a lock timeout.
     ddl_lock_timeout: Arc<Mutex<bool>>,
+    /// App users (step 6b).
+    app: Arc<Mutex<AppRows>>,
+}
+
+/// The app-user rows the fake holds.
+#[derive(Default)]
+struct AppRows {
+    projects: Vec<ProjectRecord>,
+    auths: Vec<ProjectAuth>,
+    branches: Vec<BranchRecord>,
+    db_projects: HashMap<DatabaseId, ProjectId>,
+    syncs: HashMap<BranchId, BranchAuthSync>,
+    sessions: Vec<FakeSession>,
+}
+
+/// A session row with its token hashes, as T1's table keeps it.
+#[derive(Clone)]
+struct FakeSession {
+    s: AppSession,
+    hash: [u8; 32],
+    prev: Option<[u8; 32]>,
+    sealed: Option<String>,
+    grace_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One endpoint's rows as the DDL receiver's transaction sees them.
@@ -450,6 +484,216 @@ impl NeonMetadataPort for FakeNeon {
             .map(|e| e.id.clone())
             .collect())
     }
+
+    async fn project_by_id(&self, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
+        self.check()?;
+        Ok(self.app.lock().unwrap().projects.iter().find(|p| p.id == id).cloned())
+    }
+
+    async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
+        self.check()?;
+        Ok(self
+            .app
+            .lock()
+            .unwrap()
+            .auths
+            .iter()
+            .find(|a| a.project_id == project)
+            .cloned())
+    }
+
+    async fn project_auth_by_org(&self, org_id: &str) -> Result<Option<ProjectAuth>, MetadataError> {
+        self.check()?;
+        Ok(self
+            .app
+            .lock()
+            .unwrap()
+            .auths
+            .iter()
+            .find(|a| a.zitadel_org_id.as_deref() == Some(org_id))
+            .cloned())
+    }
+
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        self.check()?;
+        Ok(self.app.lock().unwrap().branches.iter().find(|b| b.id == id).cloned())
+    }
+
+    async fn database_project(&self, db: DatabaseId) -> Result<Option<ProjectId>, MetadataError> {
+        self.check()?;
+        Ok(self.app.lock().unwrap().db_projects.get(&db).copied())
+    }
+
+    async fn main_branch(&self, db: DatabaseId) -> Result<Option<BranchRecord>, MetadataError> {
+        self.check()?;
+        Ok(self
+            .app
+            .lock()
+            .unwrap()
+            .branches
+            .iter()
+            .find(|b| {
+                b.database_id == db
+                    && b.parent_branch_id.is_none()
+                    && b.status != BranchStatus::Deleted
+            })
+            .cloned())
+    }
+
+    async fn branch_auth_sync(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchAuthSync>, MetadataError> {
+        self.check()?;
+        Ok(self.app.lock().unwrap().syncs.get(&branch).cloned())
+    }
+
+    async fn insert_app_session(&self, n: &NewAppSession<'_>) -> Result<(), MetadataError> {
+        self.check()?;
+        let now = chrono::Utc::now();
+        self.app.lock().unwrap().sessions.push(FakeSession {
+            s: AppSession {
+                id: n.id,
+                project_id: n.project_id,
+                user_id: n.user_id,
+                zitadel_session_id: n.zitadel_session_id.into(),
+                created_at: now,
+                last_used_at: now,
+                expires_at: n.expires_at,
+                revoked_at: None,
+            },
+            hash: n.refresh_hash,
+            prev: None,
+            sealed: None,
+            grace_until: None,
+        });
+        Ok(())
+    }
+
+    async fn app_session(&self, id: uuid::Uuid) -> Result<Option<AppSession>, MetadataError> {
+        self.check()?;
+        Ok(self
+            .app
+            .lock()
+            .unwrap()
+            .sessions
+            .iter()
+            .find(|f| f.s.id == id)
+            .map(|f| f.s.clone()))
+    }
+
+    /// T1's rules, on the in-memory row.
+    async fn refresh_app_session(
+        &self,
+        id: uuid::Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        next: &RefreshNext,
+    ) -> Result<RefreshOutcome, MetadataError> {
+        self.check()?;
+        let mut app = self.app.lock().unwrap();
+        let Some(f) = app.sessions.iter_mut().find(|f| f.s.id == id) else {
+            return Ok(RefreshOutcome::Invalid);
+        };
+        if f.s.project_id != project || f.s.revoked_at.is_some() {
+            return Ok(RefreshOutcome::Invalid);
+        }
+        let now = chrono::Utc::now();
+        let cap_end = f.s.created_at + chrono::Duration::from_std(next.cap).unwrap();
+        if now >= f.s.expires_at || now >= cap_end {
+            f.s.revoked_at = Some(now);
+            return Ok(RefreshOutcome::Invalid);
+        }
+        if f.hash == presented {
+            f.prev = Some(f.hash);
+            f.hash = next.new_hash;
+            f.sealed = Some(next.new_sealed.clone());
+            f.grace_until = Some(now + chrono::Duration::from_std(next.grace).unwrap());
+            f.s.last_used_at = now;
+            f.s.expires_at = (now + chrono::Duration::from_std(next.sliding).unwrap()).min(cap_end);
+            Ok(RefreshOutcome::Rotated(f.s.clone()))
+        } else if f.prev == Some(presented) {
+            match (f.grace_until, &f.sealed) {
+                (Some(until), Some(sealed)) if until > now => Ok(RefreshOutcome::Grace {
+                    session: f.s.clone(),
+                    sealed: sealed.clone(),
+                }),
+                _ => {
+                    f.s.revoked_at = Some(now);
+                    Ok(RefreshOutcome::Reused(f.s.clone()))
+                }
+            }
+        } else {
+            Ok(RefreshOutcome::Invalid)
+        }
+    }
+
+    async fn revoke_app_session(
+        &self,
+        id: uuid::Uuid,
+        project: ProjectId,
+    ) -> Result<Option<AppSession>, MetadataError> {
+        self.check()?;
+        let mut app = self.app.lock().unwrap();
+        Ok(app
+            .sessions
+            .iter_mut()
+            .find(|f| f.s.id == id && f.s.project_id == project && f.s.revoked_at.is_none())
+            .map(|f| {
+                f.s.revoked_at = Some(chrono::Utc::now());
+                f.s.clone()
+            }))
+    }
+
+    async fn revoke_app_session_by_hash(
+        &self,
+        id: uuid::Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+    ) -> Result<Option<AppSession>, MetadataError> {
+        self.check()?;
+        let mut app = self.app.lock().unwrap();
+        Ok(app
+            .sessions
+            .iter_mut()
+            .find(|f| {
+                f.s.id == id
+                    && f.s.project_id == project
+                    && f.s.revoked_at.is_none()
+                    && (f.hash == presented || f.prev == Some(presented))
+            })
+            .map(|f| {
+                f.s.revoked_at = Some(chrono::Utc::now());
+                f.s.clone()
+            }))
+    }
+
+    async fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: uuid::Uuid,
+        keep: Option<uuid::Uuid>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        self.check()?;
+        let mut app = self.app.lock().unwrap();
+        let now = chrono::Utc::now();
+        Ok(app
+            .sessions
+            .iter_mut()
+            .filter(|f| {
+                f.s.project_id == project
+                    && f.s.user_id == user
+                    && f.s.revoked_at.is_none()
+                    && Some(f.s.id) != keep
+                    && created_before.is_none_or(|t| f.s.created_at < t)
+            })
+            .map(|f| {
+                f.s.revoked_at = Some(now);
+                f.s.clone()
+            })
+            .collect())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -641,8 +885,66 @@ async fn spawn_internal_full(
     cache: FakeCache,
     rest_url: &str,
 ) -> Internal {
+    spawn_with_app(
+        neon,
+        locator,
+        storcon_base,
+        roles,
+        cache,
+        rest_url,
+        AppSetup::default(),
+    )
+    .await
+}
+
+/// The app-user parts of the state a test chooses.
+struct AppSetup {
+    key: SecretKey,
+    signing_key: Option<String>,
+    zitadel: Option<String>,
+    jobs: FakeJobs,
+}
+
+impl Default for AppSetup {
+    fn default() -> Self {
+        Self {
+            key: SecretKey::generate(),
+            signing_key: Some(SIGNING_KEY.into()),
+            zitadel: None,
+            jobs: FakeJobs::default(),
+        }
+    }
+}
+
+/// Records each sync job; with `down`, publishing fails.
+#[derive(Clone, Default)]
+struct FakeJobs {
+    published: Arc<Mutex<Vec<AppUsersSyncJob>>>,
+}
+
+impl AppJobPort for FakeJobs {
+    fn publish_app_users_sync(
+        &self,
+        job: JobEnvelope<AppUsersSyncJob>,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.published.lock().unwrap().push(job.payload);
+            Ok(())
+        })
+    }
+}
+
+async fn spawn_with_app(
+    neon: FakeNeon,
+    locator: FakeLocator,
+    storcon_base: &str,
+    roles: RoleSettings,
+    cache: FakeCache,
+    rest_url: &str,
+    app: AppSetup,
+) -> Internal {
     let (pem, x) = generate_keypair();
-    let key = SecretKey::generate();
+    let key = app.key;
     let state = Arc::new(InternalState {
         metadata: neon,
         locator,
@@ -662,6 +964,14 @@ async fn spawn_internal_full(
             token: REST_TOKEN.into(),
             http: reqwest::Client::new(),
         },
+        app_auth_token: APP_AUTH_TOKEN.into(),
+        app_sessions_token: APP_SESSIONS_TOKEN.into(),
+        app_refresh_ttl: REFRESH_TTL,
+        actions_signing_key: app.signing_key,
+        zitadel: app
+            .zitadel
+            .map(|base| Zitadel::new(&base, cheladb_zitadel::mock::ADMIN_TOKEN)),
+        app_jobs: Arc::new(app.jobs),
     });
     let addr = serve(build_internal_router(state)).await;
     Internal {
@@ -1238,6 +1548,7 @@ async fn a_metadata_failure_is_retried() {
 // --- Data API: key lookup and connection info ---------------------------------
 
 const KEY_ID: uuid::Uuid = uuid::Uuid::from_u128(0x1234);
+const PROJECT_ID: cheladb_types::ProjectId = cheladb_types::ProjectId(uuid::Uuid::from_u128(0x5678));
 
 fn sha(key: &str) -> [u8; 32] {
     cheladb_types::data_key::hash(key)
@@ -1249,7 +1560,7 @@ async fn key_lookup_requires_the_data_keys_bearer() {
     let branch = BranchId::new();
     neon.data_keys.lock().unwrap().push((
         sha("chk_sec_x"),
-        DataKeyLookup { key_id: KEY_ID, branch_id: branch, kind: DataKeyKind::Secret, role: "reporting".into(), databases: None },
+        DataKeyLookup { key_id: KEY_ID, branch_id: branch, project_id: PROJECT_ID, kind: DataKeyKind::Secret, role: "reporting".into(), databases: None },
     ));
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     let path = format!("/internal/data/keys/{}", hex::encode(sha("chk_sec_x")));
@@ -1264,7 +1575,7 @@ async fn key_lookup_requires_the_data_keys_bearer() {
     assert_eq!(status, 200);
     assert_eq!(
         body,
-        json!({ "key_id": KEY_ID, "branch_id": branch, "kind": "secret", "role": "reporting", "databases": null })
+        json!({ "key_id": KEY_ID, "branch_id": branch, "project_id": PROJECT_ID, "kind": "secret", "role": "reporting", "databases": null })
     );
     // `last_used_at` is stamped off the response path.
     for _ in 0..50 {
@@ -1285,6 +1596,7 @@ async fn key_lookup_returns_databases() {
         DataKeyLookup {
             key_id: KEY_ID,
             branch_id: branch,
+            project_id: PROJECT_ID,
             kind: DataKeyKind::Secret,
             role: "reporting".into(),
             databases: Some(vec!["web1".into(), "analytics".into()]),
@@ -1295,6 +1607,27 @@ async fn key_lookup_returns_databases() {
     let (status, body) = app.get(&path, Some(DATA_KEYS_TOKEN)).await;
     assert_eq!(status, 200);
     assert_eq!(body["databases"], json!(["web1", "analytics"]));
+}
+
+#[tokio::test]
+async fn key_lookup_returns_project_id() {
+    let neon = FakeNeon::default();
+    neon.data_keys.lock().unwrap().push((
+        sha("chk_sec_proj"),
+        DataKeyLookup {
+            key_id: KEY_ID,
+            branch_id: BranchId::new(),
+            project_id: PROJECT_ID,
+            kind: DataKeyKind::Secret,
+            role: "reporting".into(),
+            databases: None,
+        },
+    ));
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+    let path = format!("/internal/data/keys/{}", hex::encode(sha("chk_sec_proj")));
+    let (status, body) = app.get(&path, Some(DATA_KEYS_TOKEN)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["project_id"], json!(PROJECT_ID));
 }
 
 #[tokio::test]
@@ -2644,4 +2977,1036 @@ async fn spec_route_sets_console_url() {
         console["value"],
         cheladb_neon::spec::ddl_url(CONTROL_PLANE_URI, "ep-a")
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// App users (step 6b): branch info, sessions, sync and the Zitadel Actions webhook.
+// ---------------------------------------------------------------------------------------------
+
+const ORG: &str = "o1";
+const SYNC_PW: &str = "sync-password";
+const MAIN_PG: &str = "127.0.0.1:55432";
+const CHILD_PG: &str = "127.0.0.1:55433";
+
+/// A project with app users on, and one without.
+struct AppWorld {
+    neon: FakeNeon,
+    locator: FakeLocator,
+    key: SecretKey,
+    project: ProjectId,
+    /// No `project_auth`.
+    bare_project: ProjectId,
+    auth_db: DatabaseId,
+    /// The auth database's main branch (endpoint `ep-main`, running, with a sync row).
+    main: BranchId,
+    /// A normal branch of the auth database (`ep-child`, running, no sync row).
+    child: BranchId,
+    /// A backup of the auth database's main.
+    backup: BranchId,
+    /// The main branch of another database in the same project.
+    other: BranchId,
+    /// A branch of `bare_project`.
+    bare: BranchId,
+    /// A deleted branch of the auth database.
+    gone: BranchId,
+}
+
+fn branch_record(
+    id: BranchId,
+    db: DatabaseId,
+    parent: Option<BranchId>,
+    kind: BranchKind,
+    status: BranchStatus,
+    endpoint: Option<&str>,
+) -> BranchRecord {
+    let now = chrono::Utc::now();
+    BranchRecord {
+        id,
+        database_id: db,
+        name: if parent.is_none() { "main".into() } else { format!("b-{id}") },
+        parent_branch_id: parent,
+        kind,
+        status,
+        timeline_id: None,
+        pending_timeline_id: None,
+        pending_timeline_at: None,
+        superseded_timeline_id: None,
+        endpoint_id: endpoint.map(str::to_string),
+        owner_password_enc: None,
+        branched_at_time: None,
+        branched_at_lsn: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+        history_start: None,
+        authenticator_password_enc: None,
+        protected: false,
+    }
+}
+
+fn project_record(id: ProjectId) -> ProjectRecord {
+    let now = chrono::Utc::now();
+    ProjectRecord {
+        id,
+        tenant_id: TenantId::new(),
+        name: "shop".into(),
+        slug: format!("shop-{id}"),
+        status: ProjectStatus::Active,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn app_world() -> AppWorld {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let key = SecretKey::generate();
+    let (project, bare_project) = (ProjectId::new(), ProjectId::new());
+    let (auth_db, other_db, bare_db) = (DatabaseId::new(), DatabaseId::new(), DatabaseId::new());
+    let (main, child, backup, other, bare, gone) = (
+        BranchId::new(),
+        BranchId::new(),
+        BranchId::new(),
+        BranchId::new(),
+        BranchId::new(),
+        BranchId::new(),
+    );
+    {
+        let mut app = neon.app.lock().unwrap();
+        app.projects.push(project_record(project));
+        app.projects.push(project_record(bare_project));
+        app.db_projects.insert(auth_db, project);
+        app.db_projects.insert(other_db, project);
+        app.db_projects.insert(bare_db, bare_project);
+        use BranchKind::*;
+        use BranchStatus::*;
+        app.branches.extend([
+            branch_record(main, auth_db, None, Normal, Ready, Some("ep-main")),
+            branch_record(child, auth_db, Some(main), Normal, Ready, Some("ep-child")),
+            branch_record(backup, auth_db, Some(main), Backup, Ready, None),
+            branch_record(other, other_db, None, Normal, Ready, Some("ep-other")),
+            branch_record(bare, bare_db, None, Normal, Ready, Some("ep-bare")),
+            branch_record(gone, auth_db, Some(main), Normal, Deleted, None),
+        ]);
+        let now = chrono::Utc::now();
+        app.auths.push(ProjectAuth {
+            project_id: project,
+            status: AppUsersStatus::Enabled,
+            error: None,
+            zitadel_org_id: Some(ORG.into()),
+            database_id: auth_db,
+            pg_database: "shop".into(),
+            schema_name: "public".into(),
+            table_name: "users".into(),
+            email_verification: false,
+            on_delete: OnDelete::Delete,
+            created_at: now,
+            updated_at: now,
+        });
+        app.syncs.insert(
+            main,
+            BranchAuthSync {
+                branch_id: main,
+                pg_database: "shop".into(),
+                password_sealed: cheladb_secrets::seal_role_password(
+                    &key,
+                    &main.to_string(),
+                    "cheladb_auth_sync",
+                    SYNC_PW,
+                ),
+            },
+        );
+    }
+    {
+        let mut pg = locator.pg.lock().unwrap();
+        pg.insert("ep-main".into(), MAIN_PG.parse().unwrap());
+        pg.insert("ep-child".into(), CHILD_PG.parse().unwrap());
+        pg.insert("ep-other".into(), "127.0.0.1:55434".parse().unwrap());
+    }
+    AppWorld {
+        neon,
+        locator,
+        key,
+        project,
+        bare_project,
+        auth_db,
+        main,
+        child,
+        backup,
+        other,
+        bare,
+        gone,
+    }
+}
+
+struct AppApp {
+    app: Internal,
+    neon: FakeNeon,
+    jobs: FakeJobs,
+}
+
+async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<&MockZitadel>) -> AppApp {
+    let jobs = FakeJobs::default();
+    let app = spawn_with_app(
+        world.neon.clone(),
+        world.locator.clone(),
+        "http://127.0.0.1:9",
+        rules(Mode::SelfHosted, false),
+        FakeCache::default(),
+        "http://127.0.0.1:9",
+        AppSetup {
+            key: world.key.clone(),
+            signing_key: signing_key.map(str::to_string),
+            zitadel: zitadel.map(|z| z.base.clone()),
+            jobs: jobs.clone(),
+        },
+    )
+    .await;
+    AppApp {
+        app,
+        neon: world.neon.clone(),
+        jobs,
+    }
+}
+
+impl Internal {
+    async fn post_json(&self, path: &str, token: Option<&str>, body: Value) -> (u16, Value) {
+        let mut req = self.http.post(format!("{}{path}", self.base)).json(&body);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    /// The webhook: `signature` is the `zitadel-signature` header, if any.
+    async fn event(&self, body: &str, signature: Option<String>) -> u16 {
+        let mut req = self
+            .http
+            .post(format!("{}/internal/zitadel/events", self.base))
+            .header("content-type", "application/json")
+            .body(body.to_string());
+        if let Some(sig) = signature {
+            req = req.header("zitadel-signature", sig);
+        }
+        req.send().await.unwrap().status().as_u16()
+    }
+}
+
+fn error_code(body: &Value) -> &str {
+    body["error"]["code"].as_str().unwrap_or("")
+}
+
+/// `t=…,v1=…` for `body`, signed with `key` at `t`.
+fn sign(body: &str, key: &str, t: i64) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key.as_bytes()).unwrap();
+    mac.update(format!("{t}.{body}").as_bytes());
+    format!("t={t},v1={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn signed(body: &str) -> Option<String> {
+    Some(sign(body, SIGNING_KEY, chrono::Utc::now().timestamp()))
+}
+
+fn user_event(event_type: &str, org: &str, user: &str, created_at: chrono::DateTime<chrono::Utc>) -> String {
+    json!({
+        "aggregateID": user,
+        "aggregateType": "user",
+        "resourceOwner": org,
+        "instanceID": "i1",
+        "event_type": event_type,
+        "created_at": created_at.to_rfc3339(),
+        "userID": user,
+    })
+    .to_string()
+}
+
+impl AppApp {
+    async fn create_session(&self, project: ProjectId, user: uuid::Uuid, zsid: &str) -> (uuid::Uuid, String) {
+        let (status, body) = self
+            .app
+            .post_json(
+                "/internal/app/sessions",
+                Some(APP_AUTH_TOKEN),
+                json!({ "project_id": project, "user_id": user, "zitadel_session_id": zsid }),
+            )
+            .await;
+        assert_eq!(status, 201, "{body}");
+        (
+            body["session_id"].as_str().unwrap().parse().unwrap(),
+            body["refresh_token"].as_str().unwrap().to_string(),
+        )
+    }
+
+    async fn refresh(&self, project: ProjectId, token: &str) -> (u16, Value) {
+        self.app
+            .post_json(
+                "/internal/app/sessions/refresh",
+                Some(APP_AUTH_TOKEN),
+                json!({ "project_id": project, "refresh_token": token }),
+            )
+            .await
+    }
+
+    fn session(&self, id: uuid::Uuid) -> FakeSession {
+        self.neon
+            .app
+            .lock()
+            .unwrap()
+            .sessions
+            .iter()
+            .find(|f| f.s.id == id)
+            .cloned()
+            .unwrap()
+    }
+
+    fn edit_session(&self, id: uuid::Uuid, edit: impl FnOnce(&mut FakeSession)) {
+        let mut app = self.neon.app.lock().unwrap();
+        edit(app.sessions.iter_mut().find(|f| f.s.id == id).unwrap());
+    }
+
+    fn revoked(&self, id: uuid::Uuid) -> bool {
+        self.session(id).s.revoked_at.is_some()
+    }
+
+    fn published(&self) -> Vec<AppUsersSyncJob> {
+        self.jobs.published.lock().unwrap().clone()
+    }
+}
+
+fn sha256(s: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes()).into()
+}
+
+/// A Zitadel mock holding session `id` of some user.
+async fn zitadel_with_sessions(ids: &[&str]) -> MockZitadel {
+    let z = MockZitadel::start().await;
+    {
+        let mut inner = z.inner.lock().unwrap();
+        for id in ids {
+            inner
+                .sessions
+                .insert((*id).into(), ("u1".into(), format!("tok-{id}")));
+        }
+    }
+    z
+}
+
+/// Waits up to 2 s for `check` (background work such as the webhook's Zitadel deletes).
+async fn eventually(check: impl Fn() -> bool) -> bool {
+    for _ in 0..100 {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Every route of the `auth` group, with a body that would be accepted.
+fn auth_routes(w: &AppWorld) -> Vec<(&'static str, String, Value)> {
+    let sid = uuid::Uuid::new_v4();
+    let user = uuid::Uuid::new_v4();
+    vec![
+        ("GET", format!("/internal/app/branches/{}", w.main), Value::Null),
+        (
+            "POST",
+            "/internal/app/sessions".into(),
+            json!({ "project_id": w.project, "user_id": user, "zitadel_session_id": "zs" }),
+        ),
+        (
+            "POST",
+            "/internal/app/sessions/refresh".into(),
+            json!({ "project_id": w.project, "refresh_token": format!("{sid}.x") }),
+        ),
+        (
+            "POST",
+            "/internal/app/sessions/revoke-by-token".into(),
+            json!({ "project_id": w.project, "refresh_token": format!("{sid}.x") }),
+        ),
+        (
+            "POST",
+            format!("/internal/app/sessions/{sid}/revoke"),
+            json!({ "project_id": w.project }),
+        ),
+        (
+            "POST",
+            format!("/internal/app/users/{user}/revoke-sessions"),
+            json!({ "project_id": w.project }),
+        ),
+        (
+            "POST",
+            "/internal/app/sync".into(),
+            json!({ "project_id": w.project, "user_id": user }),
+        ),
+    ]
+}
+
+/// The status, with the middleware's bodiless 401 told apart: a handler's 401 (a bad refresh
+/// token) carries an error code and comes back as 4010.
+async fn call(app: &Internal, method: &str, path: &str, token: Option<&str>, body: &Value) -> u16 {
+    let (status, body) = if method == "GET" {
+        app.get(path, token).await
+    } else {
+        app.post_json(path, token, body.clone()).await
+    };
+    if status == 401 && body != Value::Null {
+        return 4010;
+    }
+    status
+}
+
+#[tokio::test]
+async fn app_routes_need_the_app_bearer() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let sid = uuid::Uuid::new_v4();
+    let mut routes = auth_routes(&w);
+    routes.push(("GET", format!("/internal/app/sessions/{sid}"), Value::Null));
+    for (method, path, body) in &routes {
+        for token in [None, Some("wrong"), Some(PROXY_TOKEN), Some(REST_TOKEN)] {
+            assert_eq!(
+                call(&a.app, method, path, token, body).await,
+                401,
+                "{method} {path} with {token:?}"
+            );
+        }
+        let status = call(&a.app, method, path, Some(APP_AUTH_TOKEN), body).await;
+        assert_ne!(status, 401, "{method} {path} with the app bearer");
+        assert!(status < 500 || status == 4010, "{method} {path}: {status}");
+    }
+}
+
+#[tokio::test]
+async fn branch_info_for_auth_branch_targets_itself() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (status, body) = a
+        .app
+        .get(&format!("/internal/app/branches/{}", w.main), Some(APP_AUTH_TOKEN))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "project_id": w.project,
+            "status": "enabled",
+            "zitadel_org_id": ORG,
+            "email_verification": false,
+            "on_delete": "delete",
+            "auth_database_id": w.auth_db,
+            "pg_database": "shop",
+            "schema": "public",
+            "table": "users",
+            "target_branch_id": w.main,
+            "sync": {
+                "branch_id": w.main,
+                "host": "127.0.0.1",
+                "port": 55432,
+                "database": "shop",
+                "user": "cheladb_auth_sync",
+                "password": SYNC_PW,
+                "schema": "public",
+                "table": "users",
+            },
+        })
+    );
+    // A normal child branch of the auth database is its own target too.
+    let (status, body) = a
+        .app
+        .get(&format!("/internal/app/branches/{}", w.child), Some(APP_AUTH_TOKEN))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["target_branch_id"], json!(w.child));
+}
+
+#[tokio::test]
+async fn branch_info_for_other_database_targets_auth_main() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    // Another database of the project, and a backup branch of the auth database (R5).
+    for branch in [w.other, w.backup] {
+        let (status, body) = a
+            .app
+            .get(&format!("/internal/app/branches/{branch}"), Some(APP_AUTH_TOKEN))
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["project_id"], json!(w.project));
+        assert_eq!(body["target_branch_id"], json!(w.main), "{branch}");
+        assert_eq!(body["sync"]["branch_id"], json!(w.main));
+        assert_eq!(body["sync"]["port"], json!(55432));
+        assert_eq!(body["sync"]["password"], json!(SYNC_PW));
+    }
+}
+
+#[tokio::test]
+async fn branch_info_without_app_users_404() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    for branch in [w.bare, w.gone, BranchId::new()] {
+        let (status, body) = a
+            .app
+            .get(&format!("/internal/app/branches/{branch}"), Some(APP_AUTH_TOKEN))
+            .await;
+        assert_eq!(status, 404, "{branch}: {body}");
+        assert_eq!(error_code(&body), "app_users_disabled", "{body}");
+    }
+    // A project being deleted has no app users either.
+    w.neon.app.lock().unwrap().projects[0].status = ProjectStatus::Deleting;
+    let (status, body) = a
+        .app
+        .get(&format!("/internal/app/branches/{}", w.main), Some(APP_AUTH_TOKEN))
+        .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(error_code(&body), "app_users_disabled");
+    let _ = w.bare_project;
+}
+
+#[tokio::test]
+async fn branch_info_sync_null_without_compute() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    // `child` runs but has no sync row yet.
+    let (status, body) = a
+        .app
+        .get(&format!("/internal/app/branches/{}", w.child), Some(APP_AUTH_TOKEN))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["target_branch_id"], json!(w.child));
+    assert_eq!(body["sync"], Value::Null);
+    // A sync row for another Postgres database (the location moved) doesn't count.
+    w.neon.app.lock().unwrap().syncs.get_mut(&w.main).unwrap().pg_database = "old".into();
+    let (_, body) = a
+        .app
+        .get(&format!("/internal/app/branches/{}", w.main), Some(APP_AUTH_TOKEN))
+        .await;
+    assert_eq!(body["sync"], Value::Null, "{body}");
+    w.neon.app.lock().unwrap().syncs.get_mut(&w.main).unwrap().pg_database = "shop".into();
+    // `main`'s compute stops.
+    w.locator.pg.lock().unwrap().remove("ep-main");
+    let (status, body) = a
+        .app
+        .get(&format!("/internal/app/branches/{}", w.other), Some(APP_AUTH_TOKEN))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["target_branch_id"], json!(w.main));
+    assert_eq!(body["sync"], Value::Null);
+}
+
+#[tokio::test]
+async fn create_session_returns_a_token_of_the_right_shape() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4();
+    let before = chrono::Utc::now();
+    let (status, body) = a
+        .app
+        .post_json(
+            "/internal/app/sessions",
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.project, "user_id": user, "zitadel_session_id": "zs1" }),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let sid: uuid::Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
+    let token = body["refresh_token"].as_str().unwrap();
+    let (id_part, secret) = token.split_once('.').unwrap();
+    assert_eq!(id_part, sid.to_string());
+    assert_eq!(secret.len(), 43, "{secret}");
+    assert!(
+        secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "{secret}"
+    );
+    let expires: chrono::DateTime<chrono::Utc> = body["expires_at"].as_str().unwrap().parse().unwrap();
+    let ttl = chrono::Duration::from_std(REFRESH_TTL).unwrap();
+    assert!(expires >= before + ttl && expires <= chrono::Utc::now() + ttl, "{expires}");
+    let stored = a.session(sid);
+    assert_eq!(stored.hash, sha256(token), "the hash covers the whole token");
+    assert_eq!(stored.s.user_id, user);
+    assert_eq!(stored.s.project_id, w.project);
+    assert_eq!(stored.s.zitadel_session_id, "zs1");
+    // Two sessions never share a secret.
+    let (_, other) = a.create_session(w.project, user, "zs2").await;
+    assert_ne!(other.split_once('.').unwrap().1, secret);
+}
+
+#[tokio::test]
+async fn refresh_rotates() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4();
+    let (sid, t0) = a.create_session(w.project, user, "zs1").await;
+    let (status, body) = a.refresh(w.project, &t0).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["session_id"], json!(sid));
+    assert_eq!(body["user_id"], json!(user));
+    let t1 = body["refresh_token"].as_str().unwrap().to_string();
+    assert_ne!(t1, t0);
+    assert!(t1.starts_with(&format!("{sid}.")), "{t1}");
+    assert!(body["expires_at"].as_str().is_some());
+    assert_eq!(a.session(sid).hash, sha256(&t1));
+    // The new token rotates again.
+    let (status, body) = a.refresh(w.project, &t1).await;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(body["refresh_token"], json!(t1));
+}
+
+// Review Focus 1.
+#[tokio::test]
+async fn refresh_grace_returns_the_same_token() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let (_, body) = a.refresh(w.project, &t0).await;
+    let t1 = body["refresh_token"].as_str().unwrap().to_string();
+    // A retry with the old token inside the grace gets the same new token, unchanged.
+    let (status, body) = a.refresh(w.project, &t0).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["refresh_token"], json!(t1));
+    assert_eq!(body["session_id"], json!(sid));
+    assert!(!a.revoked(sid));
+    assert_eq!(a.session(sid).hash, sha256(&t1));
+    // The grace is 10 s.
+    let grace = a.session(sid).grace_until.unwrap() - chrono::Utc::now();
+    assert!(grace <= chrono::Duration::seconds(10) && grace > chrono::Duration::seconds(5), "{grace}");
+}
+
+// Review Focus 1.
+#[tokio::test]
+async fn refresh_reuse_revokes_and_deletes_the_zitadel_session() {
+    let w = app_world();
+    let z = zitadel_with_sessions(&["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let (_, body) = a.refresh(w.project, &t0).await;
+    let t1 = body["refresh_token"].as_str().unwrap().to_string();
+    a.edit_session(sid, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    let (status, body) = a.refresh(w.project, &t0).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(error_code(&body), "refresh_token_reused");
+    assert!(a.revoked(sid));
+    assert!(eventually(|| z.session_count() == 0).await, "{:?}", z.calls());
+    assert!(z.calls().contains(&"DELETE /v2/sessions/zs1".to_string()), "{:?}", z.calls());
+    // The current token is dead too.
+    let (status, body) = a.refresh(w.project, &t1).await;
+    assert_eq!(status, 401);
+    assert_eq!(error_code(&body), "refresh_token_invalid");
+}
+
+#[tokio::test]
+async fn refresh_other_project_is_invalid() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let (status, body) = a.refresh(w.bare_project, &t0).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(error_code(&body), "refresh_token_invalid");
+    assert!(!a.revoked(sid));
+    assert_eq!(a.session(sid).hash, sha256(&t0), "unchanged");
+    let (status, _) = a.refresh(w.project, &t0).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn malformed_refresh_token_invalid() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let unknown = format!("{}.{}", uuid::Uuid::new_v4(), t0.split_once('.').unwrap().1);
+    for bad in [
+        "".to_string(),
+        "garbage".to_string(),
+        sid.to_string(),
+        format!("not-a-uuid.{}", t0.split_once('.').unwrap().1),
+        format!("{sid}.wrong-secret"),
+        unknown,
+    ] {
+        let (status, body) = a.refresh(w.project, &bad).await;
+        assert_eq!(status, 401, "{bad:?}: {body}");
+        assert_eq!(error_code(&body), "refresh_token_invalid", "{bad:?}");
+    }
+    assert!(!a.revoked(sid), "garbage never revokes");
+}
+
+#[tokio::test]
+async fn session_liveness() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4();
+    let (sid, _) = a.create_session(w.project, user, "zs1").await;
+    let path = format!("/internal/app/sessions/{sid}");
+    let (status, body) = a.app.get(&path, Some(APP_SESSIONS_TOKEN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "live": true, "project_id": w.project, "user_id": user }));
+    // Expired.
+    a.edit_session(sid, |f| f.s.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1));
+    let (_, body) = a.app.get(&path, Some(APP_SESSIONS_TOKEN)).await;
+    assert_eq!(body["live"], json!(false), "{body}");
+    // Revoked.
+    a.edit_session(sid, |f| {
+        f.s.expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        f.s.revoked_at = Some(chrono::Utc::now());
+    });
+    let (_, body) = a.app.get(&path, Some(APP_SESSIONS_TOKEN)).await;
+    assert_eq!(body["live"], json!(false), "{body}");
+    // Unknown.
+    let (status, _) = a
+        .app
+        .get(&format!("/internal/app/sessions/{}", uuid::Uuid::new_v4()), Some(APP_SESSIONS_TOKEN))
+        .await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn revoke_user_sessions_keeps_one() {
+    let w = app_world();
+    let z = zitadel_with_sessions(&["z1", "z2", "z3", "z4"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let (u, v) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (s1, _) = a.create_session(w.project, u, "z1").await;
+    let (s2, _) = a.create_session(w.project, u, "z2").await;
+    let (s3, _) = a.create_session(w.project, u, "z3").await;
+    let (s4, _) = a.create_session(w.project, v, "z4").await;
+    let (status, body) = a
+        .app
+        .post_json(
+            &format!("/internal/app/users/{u}/revoke-sessions"),
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.project, "keep_session_id": s2 }),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    assert!(a.revoked(s1) && a.revoked(s3));
+    assert!(!a.revoked(s2) && !a.revoked(s4));
+    assert!(eventually(|| z.calls().iter().filter(|c| c.starts_with("DELETE")).count() == 2).await, "{:?}", z.calls());
+    let calls = z.calls();
+    assert!(calls.contains(&"DELETE /v2/sessions/z1".to_string()), "{calls:?}");
+    assert!(calls.contains(&"DELETE /v2/sessions/z3".to_string()), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.ends_with("/z2") || c.ends_with("/z4")), "{calls:?}");
+    // Another project's revoke leaves the user's sessions alone (I5).
+    let (status, _) = a
+        .app
+        .post_json(
+            &format!("/internal/app/users/{u}/revoke-sessions"),
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.bare_project }),
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(!a.revoked(s2));
+    // `created_before` limits it to older sessions.
+    let cut = a.session(s2).s.created_at;
+    let (s5, _) = a.create_session(w.project, u, "z5").await;
+    a.edit_session(s5, |f| f.s.created_at = cut + chrono::Duration::seconds(5));
+    let (status, _) = a
+        .app
+        .post_json(
+            &format!("/internal/app/users/{u}/revoke-sessions"),
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.project, "created_before": cut + chrono::Duration::seconds(1) }),
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(a.revoked(s2) && !a.revoked(s5));
+}
+
+/// T7: every revoke path answers without waiting for Zitadel to end the sessions (a slow
+/// or hung Zitadel would otherwise hold sign-out everywhere and change-password for up to
+/// 10 s per session).
+#[tokio::test]
+async fn revokes_answer_before_zitadel_ends_the_sessions() {
+    let w = app_world();
+    let z = zitadel_with_sessions(&["z1", "z2", "z3", "z4", "z5"]).await;
+    z.set_session_delete_delay(std::time::Duration::from_millis(600));
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let u = uuid::Uuid::new_v4();
+    let (s1, _) = a.create_session(w.project, u, "z1").await;
+    let (s2, _) = a.create_session(w.project, u, "z2").await;
+    let (s3, t3) = a.create_session(w.project, uuid::Uuid::new_v4(), "z3").await;
+    let (s4, t4) = a.create_session(w.project, uuid::Uuid::new_v4(), "z4").await;
+    let fast = std::time::Duration::from_millis(400);
+
+    let start = std::time::Instant::now();
+    let (status, body) = a
+        .app
+        .post_json(
+            &format!("/internal/app/users/{u}/revoke-sessions"),
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.project }),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    assert!(start.elapsed() < fast, "revoke-sessions waited {:?}", start.elapsed());
+    assert!(a.revoked(s1) && a.revoked(s2));
+
+    let start = std::time::Instant::now();
+    let (status, _) = a
+        .app
+        .post_json(&format!("/internal/app/sessions/{s3}/revoke"), Some(APP_AUTH_TOKEN), json!({ "project_id": w.project }))
+        .await;
+    assert_eq!(status, 204);
+    assert!(start.elapsed() < fast, "revoke waited {:?}", start.elapsed());
+    let _ = t3;
+
+    let start = std::time::Instant::now();
+    let (status, _) = a
+        .app
+        .post_json(
+            "/internal/app/sessions/revoke-by-token",
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.project, "refresh_token": t4 }),
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(start.elapsed() < fast, "revoke-by-token waited {:?}", start.elapsed());
+    assert!(a.revoked(s4));
+
+    let (s5, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "z5").await;
+    let (_, _) = a.refresh(w.project, &t0).await;
+    a.edit_session(s5, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    let start = std::time::Instant::now();
+    let (status, body) = a.refresh(w.project, &t0).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"));
+    assert!(start.elapsed() < fast, "refresh reuse waited {:?}", start.elapsed());
+
+    // They still end, in the background.
+    let mut done = false;
+    for _ in 0..200 {
+        if z.session_count() == 0 {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(done, "{:?}", z.calls());
+}
+
+#[tokio::test]
+async fn revoke_by_token_ignores_a_wrong_token_or_project() {
+    let w = app_world();
+    let z = zitadel_with_sessions(&["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let revoke = |project: ProjectId, token: String| {
+        let a = &a;
+        async move {
+            a.app
+                .post_json(
+                    "/internal/app/sessions/revoke-by-token",
+                    Some(APP_AUTH_TOKEN),
+                    json!({ "project_id": project, "refresh_token": token }),
+                )
+                .await
+                .0
+        }
+    };
+    assert_eq!(revoke(w.project, format!("{sid}.wrong")).await, 204);
+    assert_eq!(revoke(w.project, "garbage".into()).await, 204);
+    assert_eq!(revoke(w.bare_project, t0.clone()).await, 204);
+    assert!(!a.revoked(sid));
+    assert_eq!(z.session_count(), 1);
+    assert_eq!(revoke(w.project, t0.clone()).await, 204);
+    assert!(a.revoked(sid));
+    assert!(eventually(|| z.session_count() == 0).await, "{:?}", z.calls());
+    // Idempotent.
+    assert_eq!(revoke(w.project, t0).await, 204);
+}
+
+// I5.
+#[tokio::test]
+async fn revoke_other_project_session_is_a_no_op() {
+    let w = app_world();
+    let z = zitadel_with_sessions(&["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let path = format!("/internal/app/sessions/{sid}/revoke");
+    let (status, _) = a
+        .app
+        .post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.bare_project }))
+        .await;
+    assert_eq!(status, 204);
+    assert!(!a.revoked(sid));
+    assert!(!z.calls().iter().any(|c| c.starts_with("DELETE")), "{:?}", z.calls());
+    let (status, _) = a
+        .app
+        .post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project }))
+        .await;
+    assert_eq!(status, 204);
+    assert!(a.revoked(sid));
+    assert!(
+        eventually(|| z.calls().contains(&"DELETE /v2/sessions/zs1".to_string())).await,
+        "{:?}",
+        z.calls()
+    );
+    // Idempotent, and an unknown session is fine too.
+    let (status, _) = a
+        .app
+        .post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project }))
+        .await;
+    assert_eq!(status, 204);
+    let (status, _) = a
+        .app
+        .post_json(
+            &format!("/internal/app/sessions/{}/revoke", uuid::Uuid::new_v4()),
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.project }),
+        )
+        .await;
+    assert_eq!(status, 204);
+}
+
+// P31.
+#[tokio::test]
+async fn gateway_bearer_reaches_only_session_liveness() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let path = format!("/internal/app/sessions/{sid}");
+    assert_eq!(a.app.get(&path, Some(APP_SESSIONS_TOKEN)).await.0, 200);
+    assert_eq!(a.app.get(&path, Some(APP_AUTH_TOKEN)).await.0, 200);
+    for (method, path, body) in auth_routes(&w) {
+        assert_eq!(
+            call(&a.app, method, &path, Some(APP_SESSIONS_TOKEN), &body).await,
+            401,
+            "{method} {path}"
+        );
+    }
+    assert!(a.published().is_empty());
+}
+
+#[tokio::test]
+async fn sync_publishes() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4();
+    let (status, body) = a
+        .app
+        .post_json(
+            "/internal/app/sync",
+            Some(APP_AUTH_TOKEN),
+            json!({
+                "project_id": w.project,
+                "user_id": user,
+                "data": { "nickname": "ada" },
+                "origin_branch_id": w.child,
+            }),
+        )
+        .await;
+    assert_eq!(status, 202, "{body}");
+    let (status, _) = a
+        .app
+        .post_json(
+            "/internal/app/sync",
+            Some(APP_AUTH_TOKEN),
+            json!({ "project_id": w.project, "user_id": user }),
+        )
+        .await;
+    assert_eq!(status, 202);
+    assert_eq!(
+        a.published(),
+        vec![
+            AppUsersSyncJob {
+                project_id: w.project,
+                user_id: user,
+                data: Some(json!({ "nickname": "ada" })),
+                origin_branch_id: Some(w.child),
+            },
+            AppUsersSyncJob {
+                project_id: w.project,
+                user_id: user,
+                data: None,
+                origin_branch_id: None,
+            },
+        ]
+    );
+}
+
+// Review Focus 5.
+#[tokio::test]
+async fn webhook_rejects_bad_signature_and_ignores_other_orgs() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let body = user_event("user.human.added", ORG, &user, chrono::Utc::now());
+    let now = chrono::Utc::now().timestamp();
+    // No header, a bad header, the wrong key, an old timestamp, another body's signature.
+    assert_eq!(a.app.event(&body, None).await, 401);
+    assert_eq!(a.app.event(&body, Some("nonsense".into())).await, 401);
+    assert_eq!(a.app.event(&body, Some(sign(&body, "other-key", now))).await, 401);
+    assert_eq!(a.app.event(&body, Some(sign(&body, SIGNING_KEY, now - 600))).await, 401);
+    assert_eq!(a.app.event(&body, Some(sign("{}", SIGNING_KEY, now))).await, 401);
+    // Signed but ignored: another org, a non-user event, a non-uuid id, a body that isn't an event.
+    let other_org = user_event("user.human.added", "o2", &user, chrono::Utc::now());
+    let not_user = user_event("user.human.phone.changed", ORG, &user, chrono::Utc::now());
+    let not_uuid = user_event("user.human.added", ORG, "3001", chrono::Utc::now());
+    for ignored in [other_org, not_user, not_uuid, "not json".to_string(), "[]".to_string()] {
+        assert_eq!(a.app.event(&ignored, signed(&ignored)).await, 200, "{ignored}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(a.published().is_empty(), "{:?}", a.published());
+}
+
+#[tokio::test]
+async fn webhook_publishes_sync_for_user_events() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4();
+    let kinds = ["user.human.added", "user.human.email.verified", "user.removed", "user.locked"];
+    for kind in kinds {
+        let body = user_event(kind, ORG, &user.to_string(), chrono::Utc::now());
+        assert_eq!(a.app.event(&body, signed(&body)).await, 200, "{kind}");
+    }
+    assert!(eventually(|| a.published().len() == kinds.len()).await, "{:?}", a.published());
+    for job in a.published() {
+        assert_eq!(
+            job,
+            AppUsersSyncJob {
+                project_id: w.project,
+                user_id: user,
+                data: None,
+                origin_branch_id: None,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn webhook_password_changed_revokes_older_sessions_only() {
+    let w = app_world();
+    let z = zitadel_with_sessions(&["z-old", "z-new"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let user = uuid::Uuid::new_v4();
+    let (old, _) = a.create_session(w.project, user, "z-old").await;
+    let (new, _) = a.create_session(w.project, user, "z-new").await;
+    let changed = chrono::Utc::now();
+    a.edit_session(old, |f| f.s.created_at = changed - chrono::Duration::minutes(5));
+    a.edit_session(new, |f| f.s.created_at = changed + chrono::Duration::seconds(1));
+    let body = user_event("user.human.password.changed", ORG, &user.to_string(), changed);
+    assert_eq!(a.app.event(&body, signed(&body)).await, 200);
+    // Revoked before the answer.
+    assert!(a.revoked(old));
+    assert!(!a.revoked(new), "the session that changed the password stays");
+    assert!(
+        eventually(|| z.calls().contains(&"DELETE /v2/sessions/z-old".to_string())).await,
+        "{:?}",
+        z.calls()
+    );
+    assert!(!z.calls().iter().any(|c| c.ends_with("/z-new")));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(a.published().is_empty(), "no sync for a password change");
+}
+
+#[tokio::test]
+async fn webhook_503_without_signing_key() {
+    let w = app_world();
+    let a = spawn_app(&w, None, None).await;
+    let body = user_event("user.human.added", ORG, &uuid::Uuid::new_v4().to_string(), chrono::Utc::now());
+    assert_eq!(a.app.event(&body, signed(&body)).await, 503);
+    assert_eq!(a.app.event(&body, None).await, 503);
 }

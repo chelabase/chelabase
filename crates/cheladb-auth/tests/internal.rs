@@ -147,6 +147,7 @@ fn data_identity_round_trips_in_claims() {
         role: "service".into(),
         claims: serde_json::json!({}),
         databases: Some(vec!["main".into(), "analytics".into()]),
+        project_id: None,
     };
     let identity = Identity {
         sub: data.key_id.to_string(),
@@ -237,4 +238,22 @@ fn old_tokens_without_databases_parse() {
 
     let json = serde_json::to_value(&data).unwrap();
     assert!(json.get("databases").is_none(), "{json}");
+}
+
+#[test]
+fn old_identity_tokens_without_project_parse() {
+    let old = serde_json::json!({
+        "branch_id": Uuid::new_v4(),
+        "key_id": Uuid::new_v4(),
+        "kind": "secret",
+        "role": "service",
+        "claims": {},
+    });
+    let data: DataIdentity = serde_json::from_value(old).unwrap();
+    assert_eq!(data.project_id, None);
+    // None is not serialised; Some round-trips.
+    assert!(serde_json::to_value(&data).unwrap().get("project_id").is_none());
+    let with = DataIdentity { project_id: Some(Uuid::new_v4()), ..data };
+    let back: DataIdentity = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+    assert_eq!(back, with);
 }

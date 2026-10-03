@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use cheladb_metadata::{
+    AppSession, BranchAuthSync, ProjectAuth, ProjectRecord,
     BranchConnectionRow, BranchDatabase, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
     DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState,
     InsertRoleOutcome, LiveBranch, LiveDatabase, MetadataClient, MetadataError, NeonDatabase,
@@ -15,7 +16,8 @@ use cheladb_neon::proxy_cache::ProxyCache;
 use cheladb_neon::spec::Placement;
 use cheladb_neon::storcon::LsnAtTime;
 use cheladb_neon::{ComputeSigner, Lsn, NeonId, StorconClient, StorconError};
-use cheladb_types::{BranchId, DatabaseId};
+use cheladb_types::{BranchId, DatabaseId, ProjectId};
+use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
 /// The metadata calls the worker makes. See [`MetadataClient`] for each one's guards.
@@ -347,6 +349,113 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<BranchConnectionRow>, MetadataError>> + Send;
+
+    // Projects and app users (see `cheladb_metadata::projects` and `::app_users`).
+
+    /// Projects `deleting` and untouched for `older_than`.
+    fn deleting_projects(
+        &self,
+        older_than: Duration,
+    ) -> impl Future<Output = Result<Vec<ProjectId>, MetadataError>> + Send;
+    /// `project_auth` rows `enabling` or `disabling` and untouched for `older_than`.
+    fn app_users_in_transition(
+        &self,
+        older_than: Duration,
+    ) -> impl Future<Output = Result<Vec<ProjectAuth>, MetadataError>> + Send;
+    fn project_by_id(
+        &self,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectRecord>, MetadataError>> + Send;
+    /// The project's databases that aren't deleted, with their last error.
+    fn project_databases(
+        &self,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError>> + Send;
+    fn set_project_error(
+        &self,
+        id: ProjectId,
+        error: Option<&str>,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// Revokes the project's sessions, drops its sync passwords and `project_auth`, and
+    /// tombstones the project, in one transaction.
+    fn finish_project_delete(
+        &self,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    fn project_auth(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
+    /// The `project_auth` row whose auth database is `db`, if any.
+    fn app_auth_for_database(
+        &self,
+        db: DatabaseId,
+    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
+    /// A second project claiming the org is [`MetadataError::Conflict`].
+    fn set_app_users_org(
+        &self,
+        project: ProjectId,
+        org_id: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// `enabled`, or `failed` with the error; only a row still `enabling` moves.
+    fn finish_enable_app_users(
+        &self,
+        project: ProjectId,
+        outcome: Result<(), String>,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    fn delete_project_auth(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    fn enabled_app_projects(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ProjectAuth>, MetadataError>> + Send;
+    fn branch_auth_sync(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchAuthSync>, MetadataError>> + Send;
+    /// Upserts the branch's `cheladb_auth_sync` password (sealed) and its Postgres database.
+    fn set_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        sealed: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// Stores the sealed sync password unless one is stored for the same Postgres database;
+    /// returns the stored one.
+    fn claim_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        sealed: &str,
+    ) -> impl Future<Output = Result<String, MetadataError>> + Send;
+    /// Replaces the sync password only while it still holds `expected`; returns the stored one.
+    fn swap_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        expected: &str,
+        sealed: &str,
+    ) -> impl Future<Output = Result<String, MetadataError>> + Send;
+    /// Revokes the user's live sessions (but `keep`; only those created before
+    /// `created_before` when given); returns them.
+    fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+        keep: Option<Uuid>,
+        created_before: Option<DateTime<Utc>>,
+    ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
+    /// Revokes every live session of the project; returns them.
+    fn revoke_project_sessions(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
+    /// Deletes sessions revoked or expired more than `older_than` ago; the count.
+    fn purge_app_sessions(
+        &self,
+        older_than: Duration,
+    ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
 }
 
 // Each method calls the inherent one by its full path: a bare `self.method()` would recurse
@@ -735,6 +844,117 @@ impl WorkerMetadata for MetadataClient {
         branch: BranchId,
     ) -> Result<Option<BranchConnectionRow>, MetadataError> {
         MetadataClient::branch_connection(self, branch).await
+    }
+
+    async fn deleting_projects(&self, older_than: Duration) -> Result<Vec<ProjectId>, MetadataError> {
+        MetadataClient::deleting_projects(self, older_than).await
+    }
+
+    async fn app_users_in_transition(
+        &self,
+        older_than: Duration,
+    ) -> Result<Vec<ProjectAuth>, MetadataError> {
+        MetadataClient::app_users_in_transition(self, older_than).await
+    }
+
+    async fn project_by_id(&self, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
+        MetadataClient::project_by_id(self, id).await
+    }
+
+    async fn project_databases(
+        &self,
+        id: ProjectId,
+    ) -> Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError> {
+        MetadataClient::project_databases(self, id).await
+    }
+
+    async fn set_project_error(&self, id: ProjectId, error: Option<&str>) -> Result<(), MetadataError> {
+        MetadataClient::set_project_error(self, id, error).await
+    }
+
+    async fn finish_project_delete(&self, id: ProjectId) -> Result<(), MetadataError> {
+        MetadataClient::finish_project_delete(self, id).await
+    }
+
+    async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
+        MetadataClient::project_auth(self, project).await
+    }
+
+    async fn app_auth_for_database(
+        &self,
+        db: DatabaseId,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        MetadataClient::app_auth_for_database(self, db).await
+    }
+
+    async fn set_app_users_org(&self, project: ProjectId, org_id: &str) -> Result<(), MetadataError> {
+        MetadataClient::set_app_users_org(self, project, org_id).await
+    }
+
+    async fn finish_enable_app_users(
+        &self,
+        project: ProjectId,
+        outcome: Result<(), String>,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::finish_enable_app_users(self, project, outcome).await
+    }
+
+    async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
+        MetadataClient::delete_project_auth(self, project).await
+    }
+
+    async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {
+        MetadataClient::enabled_app_projects(self).await
+    }
+
+    async fn branch_auth_sync(&self, branch: BranchId) -> Result<Option<BranchAuthSync>, MetadataError> {
+        MetadataClient::branch_auth_sync(self, branch).await
+    }
+
+    async fn set_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        sealed: &str,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_branch_auth_sync(self, branch, pg_database, sealed).await
+    }
+
+    async fn claim_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        sealed: &str,
+    ) -> Result<String, MetadataError> {
+        MetadataClient::claim_branch_auth_sync(self, branch, pg_database, sealed).await
+    }
+
+    async fn swap_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        expected: &str,
+        sealed: &str,
+    ) -> Result<String, MetadataError> {
+        MetadataClient::swap_branch_auth_sync(self, branch, pg_database, expected, sealed).await
+    }
+
+    async fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+        keep: Option<Uuid>,
+        created_before: Option<DateTime<Utc>>,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        MetadataClient::revoke_user_sessions(self, project, user, keep, created_before).await
+    }
+
+    async fn revoke_project_sessions(&self, project: ProjectId) -> Result<Vec<AppSession>, MetadataError> {
+        MetadataClient::revoke_project_sessions(self, project).await
+    }
+
+    async fn purge_app_sessions(&self, older_than: Duration) -> Result<u64, MetadataError> {
+        MetadataClient::purge_app_sessions(self, older_than).await
     }
 }
 

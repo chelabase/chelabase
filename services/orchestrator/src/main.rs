@@ -1,5 +1,6 @@
 use cheladb_auth::internal::InternalVerifier;
 use cheladb_metadata::{MetadataClient, MetadataConfig};
+use cheladb_query::app_users::PgUsersDb;
 use cheladb_nats::{connect, ensure_control_stream, NatsConfig};
 use cheladb_neon::proxy_cache::ProxyCache;
 use cheladb_neon::{DockerLocator, StorconClient};
@@ -11,7 +12,7 @@ use orchestrator::{build_router, AppState, Console, NatsPorts, ProxyAddress, Res
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -74,6 +75,12 @@ async fn main() -> anyhow::Result<()> {
         cache: Arc::new(ProxyCache::new(&internal_config.valkey_url)?),
         control_plane_uri: internal_config.control_plane_uri.clone(),
         rest: rest.clone(),
+        app_auth_token: internal_config.app_auth_token.clone(),
+        app_sessions_token: internal_config.app_sessions_token.clone(),
+        app_refresh_ttl: internal_config.app_refresh_ttl,
+        actions_signing_key: internal_config.actions_signing_key.clone(),
+        zitadel: internal_config.load_zitadel(),
+        app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
     });
 
     let state = AppState {
@@ -88,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
         data_api_database_cap,
         locator: Arc::new(DockerLocator::connect(&internal_config.compute_network)?),
         console: Console::default(),
+        zitadel: zitadel_admin(),
+        users_db: Arc::new(PgUsersDb::new()),
     };
 
     let app = build_router(Arc::new(state));
@@ -126,6 +135,28 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
              Restore the original .cheladb/secrets/secrets.key; in local dev you can instead \
              remove every database with `just sweep-dbs`."
         ),
+    }
+}
+
+/// Zitadel's admin API with the admin PAT from `CHELADB_ZITADEL_ADMIN_PAT_FILE`; `None`
+/// (warned) when that or `CHELADB_ZITADEL_ISSUER` is missing or the file can't be read.
+fn zitadel_admin() -> Option<cheladb_zitadel::client::Zitadel> {
+    let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let (Some(file), Some(issuer)) = (var("CHELADB_ZITADEL_ADMIN_PAT_FILE"), var("CHELADB_ZITADEL_ISSUER"))
+    else {
+        warn!("CHELADB_ZITADEL_ADMIN_PAT_FILE or CHELADB_ZITADEL_ISSUER is not set; app users can't be enabled");
+        return None;
+    };
+    match std::fs::read_to_string(&file) {
+        Ok(pat) if !pat.trim().is_empty() => Some(cheladb_zitadel::client::Zitadel::new(&issuer, pat.trim())),
+        Ok(_) => {
+            warn!("{file} is empty; app users can't be enabled");
+            None
+        }
+        Err(err) => {
+            warn!("can't read {file}: {err}; app users can't be enabled");
+            None
+        }
     }
 }
 

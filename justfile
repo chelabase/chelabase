@@ -173,6 +173,12 @@ orchestrator:
       source .cheladb/zitadel/demo.env
       set +a
     fi
+    if [[ -f .cheladb/zitadel/actions.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source .cheladb/zitadel/actions.env
+      set +a
+    fi
     cargo run -p orchestrator
 
 worker:
@@ -247,6 +253,19 @@ dev: _live-check deps-up
       sleep 1
     done
 
+    # A metadata database other than cheladb_metadata (CHELADB_METADATA_DATABASE_URL) is created
+    # when missing; the orchestrator migrates it below.
+    metadata_db="${CHELADB_METADATA_DATABASE_URL:-}"
+    metadata_db="${metadata_db##*/}"
+    metadata_db="${metadata_db%%\?*}"
+    if [[ -n "$metadata_db" && "$metadata_db" != cheladb_metadata ]]; then
+      psql_meta=(docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db psql -U cheladb -d cheladb_metadata -qtA)
+      if [[ "$("${psql_meta[@]}" -c "SELECT 1 FROM pg_database WHERE datname = '$metadata_db'")" != 1 ]]; then
+        echo "creating metadata database $metadata_db"
+        "${psql_meta[@]}" -c "CREATE DATABASE \"$metadata_db\" OWNER cheladb"
+      fi
+    fi
+
     echo "bootstrapping Zitadel IAM…"
     if ! cargo run -q -p cheladb -- dev bootstrap; then
       echo ""
@@ -261,6 +280,12 @@ dev: _live-check deps-up
       set -a
       # shellcheck disable=SC1091
       source .cheladb/zitadel/demo.env
+      set +a
+    fi
+    if [[ -f .cheladb/zitadel/actions.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source .cheladb/zitadel/actions.env
       set +a
     fi
 
@@ -552,6 +577,12 @@ branch-e2e: _live-check
 # local WAL and S3 backup (needs just deps-up and just dev)
 storage-leak-e2e: _live-check
     scripts/storage-leak-e2e.sh
+
+# Live projects and app users story: a project and its database, enable app users, SDK sign-up
+# with data, own-row RLS, a branch gets the rows, a Zitadel email change through the webhook,
+# refresh rotation and reuse, a user deleted, the project deleted with its org (needs just dev)
+app-users-e2e: _live-check
+    scripts/app-users-e2e.sh
 
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke (needs just deps-up and just dev)
 data-e2e: _live-check

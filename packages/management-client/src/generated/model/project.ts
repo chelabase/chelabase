@@ -6,9 +6,12 @@
  */
 import type { DatabaseSummary } from './databaseSummary.ts';
 import type { ProjectId } from './projectId.ts';
+import type { ProjectStatusView } from './projectStatusView.ts';
 
 export interface Project {
   databases: DatabaseSummary[];
   id: ProjectId;
+  name: string;
   slug: string;
+  status: ProjectStatusView;
 }

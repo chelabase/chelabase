@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use cheladb_secrets::SecretKey;
 pub use cheladb_types::mode::Mode;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Sign-in and sign-up answers take at least this long. It must exceed Zitadel's slowest real
@@ -150,9 +151,122 @@ impl Config {
     }
 }
 
+/// Settings for app users' flows (`/auth/v1/app/*`). Without the app key pair, the identity
+/// verify key or the admin token file, those routes answer 503 and the platform flows run as
+/// before.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppConfig {
+    pub private_key: PathBuf,
+    pub public_key: PathBuf,
+    pub access_ttl: Duration,
+    pub internal_url: String,
+    pub internal_token: String,
+    /// The gateway's identity verify key (tokens with `aud = "auth"`).
+    pub verify_key: PathBuf,
+    /// Zitadel's admin token: the login client can't delete users (P32), and a sign-up whose
+    /// commit fails deletes the user it made.
+    pub admin_pat_file: PathBuf,
+}
+
+pub const DEFAULT_APP_ACCESS_TTL_SECS: u64 = 900;
+pub const DEFAULT_INTERNAL_URL: &str = "http://127.0.0.1:8083";
+pub const DEFAULT_APP_AUTH_INTERNAL_TOKEN: &str = "cheladb-dev-app-auth";
+
+impl AppConfig {
+    pub fn from_env() -> Result<Option<Self>> {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let get = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let (Some(private_key), Some(public_key)) = (
+            get("CHELADB_APP_JWT_PRIVATE_KEY"),
+            get("CHELADB_APP_JWT_PUBLIC_KEY"),
+        ) else {
+            tracing::info!("app users are off: CHELADB_APP_JWT_PRIVATE_KEY/PUBLIC_KEY are not set");
+            return Ok(None);
+        };
+        let mut missing = Vec::new();
+        let verify_key = get("CHELADB_INTERNAL_VERIFY_KEY");
+        if verify_key.is_none() {
+            missing.push("CHELADB_INTERNAL_VERIFY_KEY");
+        }
+        let admin_pat_file = get("CHELADB_ZITADEL_ADMIN_PAT_FILE");
+        if admin_pat_file.is_none() {
+            missing.push("CHELADB_ZITADEL_ADMIN_PAT_FILE");
+        }
+        let (Some(verify_key), Some(admin_pat_file)) = (verify_key, admin_pat_file) else {
+            tracing::warn!("app users are off: {} not set", missing.join(" and "));
+            return Ok(None);
+        };
+        let access_ttl = match get("CHELADB_APP_ACCESS_TTL_SECS") {
+            None => DEFAULT_APP_ACCESS_TTL_SECS,
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (60..=86_400).contains(n))
+                .with_context(|| {
+                    format!("CHELADB_APP_ACCESS_TTL_SECS={v}: expected seconds from 60 to 86400")
+                })?,
+        };
+        Ok(Some(Self {
+            private_key: private_key.into(),
+            public_key: public_key.into(),
+            access_ttl: Duration::from_secs(access_ttl),
+            internal_url: get("CHELADB_INTERNAL_URL").unwrap_or_else(|| DEFAULT_INTERNAL_URL.into()),
+            internal_token: get("CHELADB_APP_AUTH_INTERNAL_TOKEN")
+                .unwrap_or_else(|| DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()),
+            verify_key: verify_key.into(),
+            admin_pat_file: admin_pat_file.into(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    const FULL: [(&str, &str); 4] = [
+        ("CHELADB_APP_JWT_PRIVATE_KEY", "/k/app-jwt.key"),
+        ("CHELADB_APP_JWT_PUBLIC_KEY", "/k/app-jwt.pub"),
+        ("CHELADB_INTERNAL_VERIFY_KEY", "/k/internal.pub"),
+        ("CHELADB_ZITADEL_ADMIN_PAT_FILE", "/k/admin.pat"),
+    ];
+
+    #[test]
+    fn app_config_defaults() {
+        let c = AppConfig::from_vars(vars(&FULL)).unwrap().unwrap();
+        assert_eq!(c.access_ttl, Duration::from_secs(900));
+        assert_eq!(c.internal_url, "http://127.0.0.1:8083");
+        assert_eq!(c.internal_token, "cheladb-dev-app-auth");
+        assert_eq!(c.admin_pat_file, PathBuf::from("/k/admin.pat"));
+        let mut more = FULL.to_vec();
+        more.push(("CHELADB_APP_ACCESS_TTL_SECS", "300"));
+        more.push(("CHELADB_INTERNAL_URL", "http://10.0.0.1:9000"));
+        let c = AppConfig::from_vars(vars(&more)).unwrap().unwrap();
+        assert_eq!(c.access_ttl, Duration::from_secs(300));
+        assert_eq!(c.internal_url, "http://10.0.0.1:9000");
+    }
+
+    #[test]
+    fn app_config_is_off_without_keys_verify_key_or_admin_token() {
+        assert_eq!(AppConfig::from_vars(vars(&[])).unwrap(), None);
+        for (name, _) in FULL {
+            let some: Vec<_> = FULL.iter().filter(|(n, _)| *n != name).copied().collect();
+            assert_eq!(AppConfig::from_vars(vars(&some)).unwrap(), None, "without {name}");
+        }
+        let mut bad = FULL.to_vec();
+        bad.push(("CHELADB_APP_ACCESS_TTL_SECS", "soon"));
+        assert!(AppConfig::from_vars(vars(&bad)).is_err());
+    }
 
     #[test]
     fn cookies_are_secure_on_platform_unless_overridden() {

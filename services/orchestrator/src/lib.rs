@@ -8,16 +8,16 @@ use axum::{
 use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
 use cheladb_routes::{orchestrator as routes, Service};
 use cheladb_metadata::{
-    BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus, EnableStart,
+    AppSession, AppUsersStatus, BeginDelete, BeginEnable, BeginProjectDelete, BranchAuthSync, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus, EnableStart,
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
-    PasswordState, RoleRow, SettingsPatch, TenantOverview,
+    NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SettingsPatch, TenantOverview,
 };
 use cheladb_nats::{
-    BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
-    ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
+    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, JetStreamContext, JobEnvelope,
+    ProjectDeleteJob, ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
     RoleCreateRequest, RoleReply, RoleRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
     SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_RESET_PASSWORD,
-    SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
+    SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
 };
 use cheladb_secrets::{open_credential, open_role_password, Purpose, SecretKey};
 use cheladb_types::api_error::{ApiError, ErrorCode};
@@ -37,10 +37,13 @@ use uuid::Uuid;
 mod branches;
 mod console;
 mod data_api_databases;
+mod app_user_admin;
+mod app_users;
 mod data_keys;
 mod docs;
 pub mod internal;
 mod openapi;
+pub mod projects;
 mod roles;
 pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, RestReply};
 pub use openapi::openapi;
@@ -291,6 +294,113 @@ pub trait MetadataPort: Send + Sync + 'static {
         key_id: Uuid,
         databases: Option<Vec<String>>,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// The tenant's projects that aren't deleted, oldest first.
+    fn list_projects(
+        &self,
+        tenant: TenantId,
+    ) -> impl Future<Output = Result<Vec<ProjectRecord>, MetadataError>> + Send;
+
+    /// `None` for another tenant's project and for a deleted one.
+    fn get_project(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectRecord>, MetadataError>> + Send;
+
+    /// Any tenant's project that isn't deleted.
+    fn project_by_id(
+        &self,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectRecord>, MetadataError>> + Send;
+
+    /// Creates a project with the first free slug.
+    fn create_project(
+        &self,
+        tenant: TenantId,
+        name: &str,
+    ) -> impl Future<Output = Result<ProjectRecord, MetadataError>> + Send;
+
+    /// Changes the name only; the slug stays.
+    fn rename_project(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+        name: &str,
+    ) -> impl Future<Output = Result<RenameProject, MetadataError>> + Send;
+
+    /// Starts deleting a project and its ready or failed databases.
+    fn begin_project_delete(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<BeginProjectDelete, MetadataError>> + Send;
+
+    /// The project's databases that aren't deleted, with their last error.
+    fn project_databases(
+        &self,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError>> + Send;
+
+    /// The project's app-users settings, if any.
+    fn project_auth(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
+
+    /// The app-users status of each of the tenant's projects that has settings, in one query.
+    fn project_auth_statuses(
+        &self,
+        tenant: TenantId,
+    ) -> impl Future<Output = Result<HashMap<ProjectId, AppUsersStatus>, MetadataError>> + Send;
+
+    /// Starts enabling app users for a project.
+    fn begin_enable_app_users(
+        &self,
+        new: &NewProjectAuth<'_>,
+    ) -> impl Future<Output = Result<BeginEnable, MetadataError>> + Send;
+
+    /// Changes the given app-users settings; the row, or `None` without one.
+    fn update_app_users_settings(
+        &self,
+        project: ProjectId,
+        email_verification: Option<bool>,
+        on_delete: Option<OnDelete>,
+    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
+
+    /// Moves `enabled` or `failed` to `disabling`; true when it moved.
+    fn begin_disable_app_users(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// The branch's sync-role record, if any.
+    fn branch_auth_sync(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchAuthSync>, MetadataError>> + Send;
+
+    /// The user's sessions that aren't revoked, oldest first.
+    fn list_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+    ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
+
+    /// Revokes the user's live sessions except `keep` (and only those created before `created_before` when given); returns them.
+    fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+        keep: Option<Uuid>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
+
+    /// The `project_auth` row whose auth database is `db`, if any.
+    fn app_auth_for_database(
+        &self,
+        db: DatabaseId,
+    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -478,6 +588,129 @@ impl MetadataPort for MetadataClient {
     ) -> Result<bool, MetadataError> {
         MetadataClient::set_key_databases(self, branch, key_id, databases).await
     }
+
+    async fn list_projects(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<ProjectRecord>, MetadataError> {
+        MetadataClient::list_projects(self, tenant).await
+    }
+
+    async fn get_project(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+    ) -> Result<Option<ProjectRecord>, MetadataError> {
+        MetadataClient::get_project(self, tenant, id).await
+    }
+
+    async fn project_by_id(
+        &self,
+        id: ProjectId,
+    ) -> Result<Option<ProjectRecord>, MetadataError> {
+        MetadataClient::project_by_id(self, id).await
+    }
+
+    async fn create_project(
+        &self,
+        tenant: TenantId,
+        name: &str,
+    ) -> Result<ProjectRecord, MetadataError> {
+        MetadataClient::create_project(self, tenant, name).await
+    }
+
+    async fn rename_project(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+        name: &str,
+    ) -> Result<RenameProject, MetadataError> {
+        MetadataClient::rename_project(self, tenant, id, name).await
+    }
+
+    async fn begin_project_delete(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+    ) -> Result<BeginProjectDelete, MetadataError> {
+        MetadataClient::begin_project_delete(self, tenant, id).await
+    }
+
+    async fn project_databases(
+        &self,
+        id: ProjectId,
+    ) -> Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError> {
+        MetadataClient::project_databases(self, id).await
+    }
+
+    async fn project_auth(
+        &self,
+        project: ProjectId,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        MetadataClient::project_auth(self, project).await
+    }
+
+    async fn project_auth_statuses(
+        &self,
+        tenant: TenantId,
+    ) -> Result<HashMap<ProjectId, AppUsersStatus>, MetadataError> {
+        MetadataClient::project_auth_statuses(self, tenant).await
+    }
+
+    async fn begin_enable_app_users(
+        &self,
+        new: &NewProjectAuth<'_>,
+    ) -> Result<BeginEnable, MetadataError> {
+        MetadataClient::begin_enable_app_users(self, new).await
+    }
+
+    async fn update_app_users_settings(
+        &self,
+        project: ProjectId,
+        email_verification: Option<bool>,
+        on_delete: Option<OnDelete>,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        MetadataClient::update_app_users_settings(self, project, email_verification, on_delete).await
+    }
+
+    async fn begin_disable_app_users(
+        &self,
+        project: ProjectId,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::begin_disable_app_users(self, project).await
+    }
+
+    async fn branch_auth_sync(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchAuthSync>, MetadataError> {
+        MetadataClient::branch_auth_sync(self, branch).await
+    }
+
+    async fn list_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        MetadataClient::list_user_sessions(self, project, user).await
+    }
+
+    async fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+        keep: Option<Uuid>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        MetadataClient::revoke_user_sessions(self, project, user, keep, created_before).await
+    }
+
+    async fn app_auth_for_database(
+        &self,
+        db: DatabaseId,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        MetadataClient::app_auth_for_database(self, db).await
+    }
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -571,7 +804,32 @@ pub trait JobPort: Send + Sync + 'static {
         &self,
         request: RoleRequest,
     ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
+
+    fn publish_project_delete(
+        &self,
+        job: &JobEnvelope<ProjectDeleteJob>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    fn publish_app_users(
+        &self,
+        job: &JobEnvelope<AppUsersJob>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    fn publish_app_users_sync(
+        &self,
+        job: &JobEnvelope<AppUsersSyncJob>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    /// Asks the worker whether a table can hold the app-users location (a request with a
+    /// 30 s timeout).
+    fn check_app_users_location(
+        &self,
+        request: &AppUsersCheckRequest,
+    ) -> impl Future<Output = Result<AppUsersCheckReply, BoxError>> + Send;
 }
+
+/// How long the orchestrator waits for the worker to check an app-users location.
+const APP_USERS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long the orchestrator waits for the worker to reset a password.
 const RESET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -748,6 +1006,36 @@ impl JobPort for NatsPorts {
     async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
         role_rpc(&self.client, SUBJECT_ROLE_DELETE, &request).await
     }
+
+    async fn publish_project_delete(&self, job: &JobEnvelope<ProjectDeleteJob>) -> Result<(), BoxError> {
+        cheladb_nats::publish_project_delete(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_app_users(&self, job: &JobEnvelope<AppUsersJob>) -> Result<(), BoxError> {
+        cheladb_nats::publish_app_users(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_app_users_sync(&self, job: &JobEnvelope<AppUsersSyncJob>) -> Result<(), BoxError> {
+        cheladb_nats::publish_app_users_sync(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn check_app_users_location(
+        &self,
+        request: &AppUsersCheckRequest,
+    ) -> Result<AppUsersCheckReply, BoxError> {
+        let body = serde_json::to_vec(request)?;
+        let request = async_nats::Request::new()
+            .payload(body.into())
+            .timeout(Some(APP_USERS_CHECK_TIMEOUT));
+        let reply = self.client.send_request(SUBJECT_APP_USERS_CHECK, request).await?;
+        Ok(serde_json::from_slice(&reply.payload)?)
+    }
 }
 
 pub struct AppState<M, J> {
@@ -771,6 +1059,11 @@ pub struct AppState<M, J> {
     pub locator: Arc<dyn PostgresAddr>,
     /// Studio's console: owner pools, the owner's query caches, checked roles.
     pub console: Console,
+    /// Zitadel's admin API (admin PAT); `None` when `CHELADB_ZITADEL_ADMIN_PAT_FILE` or
+    /// `CHELADB_ZITADEL_ISSUER` isn't set.
+    pub zitadel: Option<cheladb_zitadel::client::Zitadel>,
+    /// The one write path to a project's users table.
+    pub users_db: Arc<dyn cheladb_query::app_users::UsersDb>,
 }
 
 /// `CHELADB_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
@@ -1065,7 +1358,9 @@ struct Tenant {
 #[derive(Debug, Serialize, ToSchema)]
 struct Project {
     id: ProjectId,
+    name: String,
     slug: String,
+    status: projects::ProjectStatusView,
     databases: Vec<DatabaseSummary>,
 }
 
@@ -1109,7 +1404,9 @@ impl Project {
     ) -> Self {
         Self {
             id: p.id,
+            name: p.name,
             slug: p.slug,
+            status: p.status.into(),
             databases: p
                 .databases
                 .into_iter()
@@ -1151,6 +1448,9 @@ where
         .merge(data_api_databases::routes())
         .merge(console::routes())
         .merge(roles::routes())
+        .merge(projects::routes())
+        .merge(app_users::routes())
+        .merge(app_user_admin::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
@@ -1230,7 +1530,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `forbidden`: `tenant_id` isn't the caller's tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the tenant or project doesn't exist (another tenant's project answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`name_taken`: a database with this name exists in the project", body = ErrorEnvelope),
+        (status = 409, description = "`name_taken`: a database with this name exists in the project; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the body is valid JSON but a field is missing, has the wrong type, or the name is blank or invalid", body = ErrorEnvelope),
@@ -1870,6 +2170,9 @@ fn map_metadata_error(err: MetadataError) -> Response {
         MetadataError::ProjectTenantMismatch { project_id, .. } => {
             ApiError::not_found(MetadataError::ProjectNotFound(project_id).to_string())
                 .into_response()
+        }
+        MetadataError::ProjectDeleting(_) => {
+            ApiError::new(409, ErrorCode::ProjectDeleting, "project is being deleted").into_response()
         }
         MetadataError::DuplicateDatabaseName => ApiError::new(
             409,

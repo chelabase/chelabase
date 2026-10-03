@@ -3,7 +3,8 @@
 
 use utoipa::openapi::{InfoBuilder, LicenseBuilder, OpenApi};
 
-/// The document for `/auth/v1/*`, the sign-in pages' API.
+/// The document for `/auth/v1/*`: the sign-in pages' API (tag `login`) and app users' flows
+/// (tag `app-users`).
 pub fn openapi() -> OpenApi {
     let (_, mut doc) = crate::app::api_router().split_for_parts();
     doc.info = InfoBuilder::new()
@@ -93,10 +94,28 @@ mod tests {
         .into_iter()
         .map(|(p, id)| ("POST".to_string(), p.to_string(), id.to_string()))
         .collect();
+        want.extend(
+            [
+                ("POST", "/auth/v1/app/sign-up", "appSignUp"),
+                ("POST", "/auth/v1/app/sign-in", "appSignIn"),
+                ("POST", "/auth/v1/app/refresh", "appRefresh"),
+                ("POST", "/auth/v1/app/sign-out", "appSignOut"),
+                ("GET", "/auth/v1/app/user", "appGetUser"),
+                ("POST", "/auth/v1/app/verify-email", "appVerifyEmail"),
+                ("POST", "/auth/v1/app/resend-code", "appResendCode"),
+                ("POST", "/auth/v1/app/password-reset", "appRequestPasswordReset"),
+                ("POST", "/auth/v1/app/password-reset/confirm", "appConfirmPasswordReset"),
+                ("POST", "/auth/v1/app/change-email", "appChangeEmail"),
+                ("POST", "/auth/v1/app/change-password", "appChangePassword"),
+                ("GET", "/auth/v1/app/jwks", "appJwks"),
+            ]
+            .map(|(m, p, id)| (m.to_string(), p.to_string(), id.to_string())),
+        );
         want.sort();
         assert_eq!(got, want);
-        for (_, _, op) in operations() {
-            assert_eq!(op.tags.as_deref(), Some(&["login".to_string()][..]));
+        for (_, path, op) in operations() {
+            let tag = if path.starts_with("/auth/v1/app/") { "app-users" } else { "login" };
+            assert_eq!(op.tags.as_deref(), Some(&[tag.to_string()][..]), "{path}");
         }
     }
 

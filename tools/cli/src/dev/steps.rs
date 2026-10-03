@@ -213,6 +213,55 @@ pub async fn ensure_smtp(api: &impl ZitadelApi) -> Result<()> {
     Ok(())
 }
 
+const ACTIONS_TARGET: &str = "cheladb-app-users";
+const ACTIONS_ENDPOINT: &str = "http://host.docker.internal:8083/internal/zitadel/events";
+const ACTIONS_KEY_VAR: &str = "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY";
+
+/// The Actions target that posts user events to auth's internal listener, and the execution
+/// that routes the `user` event group to it. Zitadel shows a target's signing key only when it
+/// is created, so a target without its `actions.env` is deleted and created again.
+pub async fn ensure_actions_target(api: &impl ZitadelApi, env_file: &Path) -> Result<()> {
+    let listed = api
+        .rest(
+            Method::POST,
+            "/v2/actions/targets/search",
+            actions_target_search(ACTIONS_TARGET),
+        )
+        .await?;
+    let existing = actions_target_ids(&listed, ACTIONS_TARGET);
+    let id = match existing.first() {
+        Some(id) if env_file.is_file() => id.clone(),
+        _ => {
+            for id in &existing {
+                api.rest(
+                    Method::DELETE,
+                    &format!("/v2/actions/targets/{id}"),
+                    Value::Null,
+                )
+                .await?;
+            }
+            let created = api
+                .rest(
+                    Method::POST,
+                    "/v2/actions/targets",
+                    actions_target_create(ACTIONS_TARGET, ACTIONS_ENDPOINT),
+                )
+                .await?;
+            let (id, key) = actions_target_created(&created)?;
+            write_private(env_file, &format!("{ACTIONS_KEY_VAR}={key}\n"))?;
+            info!("created Actions target {ACTIONS_TARGET}; wrote {}", env_file.display());
+            id
+        }
+    };
+    api.rest(
+        Method::PUT,
+        "/v2/actions/executions",
+        actions_execution_set(&id),
+    )
+    .await?;
+    Ok(())
+}
+
 fn write_private(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
     #[cfg(unix)]
@@ -555,5 +604,96 @@ mod tests {
         );
         ensure_demo_key(&fake, "u1", &path).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+    }
+
+    const TARGETS_SEARCH: &str = "POST /v2/actions/targets/search";
+    const TARGETS_CREATE: &str = "POST /v2/actions/targets";
+    const EXECUTIONS: &str = "PUT /v2/actions/executions";
+
+    fn target_listing(ids: &[&str]) -> Value {
+        json!({"targets": ids.iter().map(|id| json!({"id": id, "name": "cheladb-app-users"})).collect::<Vec<_>>()})
+    }
+
+    fn actions_fake(existing: &[&str]) -> Fake {
+        let mut fake = Fake::default()
+            .with(TARGETS_SEARCH, target_listing(existing))
+            .with(TARGETS_CREATE, json!({"id": "t-new", "signingKey": "sk-new"}))
+            .with(EXECUTIONS, json!({}));
+        for id in existing {
+            fake = fake.with(&format!("DELETE /v2/actions/targets/{id}"), json!({}));
+        }
+        fake
+    }
+
+    #[tokio::test]
+    async fn actions_target_created_and_key_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("actions.env");
+        let fake = actions_fake(&[]);
+        ensure_actions_target(&fake, &file).await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![TARGETS_SEARCH, TARGETS_CREATE, EXECUTIONS]
+        );
+        let body = &fake.bodies(TARGETS_CREATE)[0];
+        assert_eq!(body["name"], "cheladb-app-users");
+        assert_eq!(body["restAsync"], json!({}));
+        assert_eq!(
+            body["endpoint"],
+            "http://host.docker.internal:8083/internal/zitadel/events"
+        );
+        assert_eq!(body["payloadType"], "PAYLOAD_TYPE_JSON");
+        assert_eq!(
+            fake.bodies(EXECUTIONS)[0],
+            json!({"condition": {"event": {"group": "user"}}, "targets": ["t-new"]})
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn actions_target_reused_when_key_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("actions.env");
+        std::fs::write(&file, "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=old\n").unwrap();
+        let fake = actions_fake(&["t-old"]);
+        ensure_actions_target(&fake, &file).await.unwrap();
+        // Kept: no delete, no create; the execution is still PUT (idempotent) with the old id.
+        assert_eq!(fake.calls(), vec![TARGETS_SEARCH, EXECUTIONS]);
+        assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-old"]));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=old\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn actions_target_recreated_when_key_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("actions.env");
+        let fake = actions_fake(&["t-old"]);
+        ensure_actions_target(&fake, &file).await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                TARGETS_SEARCH,
+                "DELETE /v2/actions/targets/t-old",
+                TARGETS_CREATE,
+                EXECUTIONS
+            ]
+        );
+        assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-new"]));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
+        );
     }
 }

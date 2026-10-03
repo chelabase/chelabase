@@ -14,6 +14,8 @@ use cheladb_metadata::{
     MetadataError, NewBranch, NewDataKey, NewEndpoint, NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied,
     ResyncWrite, RoleLevel, RoleOrigin, SealedChange, SettingsPatch,
     DataApiState, EnableStart, ServedDatabase,
+    BeginEnable, BeginProjectDelete, NewAppSession, NewProjectAuth, OnDelete, ProjectStatus, RefreshNext,
+    RefreshOutcome, RenameProject, AppUsersStatus,
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
 };
 use cheladb_types::data_key::{self, DataKeyKind};
@@ -51,10 +53,35 @@ const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
 /// database rows, then their branch rows, then endpoints.
 async fn sweep_leftovers(client: &MetadataClient) {
     let mut tx = client.pool().begin().await.unwrap();
+    // Projects the harness made (this run's, or older than STALE_AFTER and a run's): their
+    // sessions and app-user rows go, and the projects are tombstoned.
+    let mut projects: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM projects
+         WHERE tenant_id = $1
+           AND (name LIKE 'live-test-' || $2 || '%'
+                OR (created_at < now() - make_interval(secs => $3)
+                    AND name ~ '^live-test-[0-9a-f]{8}'))
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(DEMO_TENANT_ID)
+    .bind(run_id())
+    .bind(STALE_AFTER.as_secs_f64())
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    for sql in [
+        "DELETE FROM app_sessions WHERE project_id = ANY($1)",
+        "DELETE FROM project_auth WHERE project_id = ANY($1)",
+        "UPDATE projects SET status = 'deleted', deleted_at = now(), updated_at = now()
+         WHERE id = ANY($1) AND status <> 'deleted'",
+    ] {
+        sqlx::query(sql).bind(&projects).execute(&mut *tx).await.unwrap();
+    }
+    projects.push(DEMO_PROJECT_ID);
     // FOR UPDATE, not the usual FOR NO KEY UPDATE: the rows are deleted below anyway.
     let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
         "SELECT id FROM databases
-         WHERE project_id = $1
+         WHERE project_id = ANY($4)
            AND (name = 'live-test-' || $2 || '-' || id::text
                 OR (created_at < now() - make_interval(secs => $3)
                     AND (name = 'live-test-' || id::text
@@ -64,10 +91,12 @@ async fn sweep_leftovers(client: &MetadataClient) {
     .bind(DEMO_PROJECT_ID)
     .bind(run_id())
     .bind(STALE_AFTER.as_secs_f64())
+    .bind(&projects)
     .fetch_all(&mut *tx)
     .await
     .unwrap();
     if ids.is_empty() {
+        tx.commit().await.unwrap();
         return;
     }
     let endpoints: Vec<String> = sqlx::query_scalar(
@@ -4437,4 +4466,754 @@ async fn enabling_databases_lists_only_enabling_rows() {
     cleanup(&client, id).await;
     let mine: Vec<_> = listed.into_iter().filter(|(b, _)| *b == branch).collect();
     assert_eq!(mine, vec![(branch, "pending".to_string())]);
+}
+
+// ---- Step 6b: projects and app users ----
+
+/// A project of this run in the demo tenant, named `live-test-<run> <tag>` (slug
+/// `live-test-<run>-<tag>`).
+async fn new_project(client: &MetadataClient, tag: &str) -> ProjectId {
+    client
+        .create_project(TenantId(DEMO_TENANT_ID), &format!("live-test-{} {tag}", run_id()))
+        .await
+        .unwrap()
+        .id
+}
+
+async fn insert_pending_in(client: &MetadataClient, project: ProjectId) -> DatabaseId {
+    let id = DatabaseId::new();
+    client
+        .insert_database_pending(id, TenantId(DEMO_TENANT_ID), project, &format!("live-test-{}-{id}", run_id()))
+        .await
+        .unwrap();
+    id
+}
+
+/// A ready database (main with an endpoint) in `project`. Hold `sealed_lock` while it lives.
+async fn ready_database_in(client: &MetadataClient, project: ProjectId) -> DatabaseId {
+    let id = insert_pending_in(client, project).await;
+    link_endpoint(client, id).await;
+    assert!(make_ready(client, id, "v1:owner").await);
+    id
+}
+
+/// Removes everything a test made in `project`: sessions, app-user rows, databases, the project.
+async fn cleanup_project(client: &MetadataClient, project: ProjectId, databases: &[DatabaseId]) {
+    sqlx::query("DELETE FROM app_sessions WHERE project_id = $1")
+        .bind(project.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM project_auth WHERE project_id = $1")
+        .bind(project.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    for db in databases {
+        cleanup(client, *db).await;
+    }
+    sqlx::query("DELETE FROM projects WHERE id = $1")
+        .bind(project.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+}
+
+fn demo() -> TenantId {
+    TenantId(DEMO_TENANT_ID)
+}
+
+fn new_auth<'a>(project: ProjectId, db: DatabaseId) -> NewProjectAuth<'a> {
+    NewProjectAuth {
+        project_id: project,
+        database_id: db,
+        pg_database: "db",
+        schema_name: "public",
+        table_name: "users",
+        email_verification: false,
+        on_delete: OnDelete::Delete,
+    }
+}
+
+async fn auth_status(client: &MetadataClient, project: ProjectId) -> Option<AppUsersStatus> {
+    client.project_auth(project).await.unwrap().map(|a| a.status)
+}
+
+fn hash(n: u8) -> [u8; 32] {
+    [n; 32]
+}
+
+fn new_session<'a>(project: ProjectId, user: uuid::Uuid, refresh: u8) -> NewAppSession<'a> {
+    NewAppSession {
+        id: uuid::Uuid::new_v4(),
+        project_id: project,
+        user_id: user,
+        zitadel_session_id: "zs-1",
+        refresh_hash: hash(refresh),
+        expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+    }
+}
+
+fn next(new: u8, grace_secs: u64) -> RefreshNext {
+    RefreshNext {
+        new_hash: hash(new),
+        new_sealed: format!("sealed-{new}"),
+        sliding: std::time::Duration::from_secs(3600),
+        cap: std::time::Duration::from_secs(30 * 86400),
+        grace: std::time::Duration::from_secs(grace_secs),
+    }
+}
+
+async fn backdate_session(client: &MetadataClient, id: uuid::Uuid, secs: i64) {
+    sqlx::query("UPDATE app_sessions SET created_at = now() - make_interval(secs => $2) WHERE id = $1")
+        .bind(id)
+        .bind(secs as f64)
+        .execute(client.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn project_slug_collisions_get_suffixes() {
+    let client = client().await;
+    let name = format!("live-test-{} My App", run_id());
+    let first = client.create_project(demo(), &name).await.unwrap();
+    let second = client.create_project(demo(), &name).await.unwrap();
+    let base = format!("live-test-{}-my-app", run_id());
+    cleanup_project(&client, first.id, &[]).await;
+    cleanup_project(&client, second.id, &[]).await;
+    assert_eq!(first.slug, base);
+    assert_eq!(second.slug, format!("{base}-2"));
+    assert_eq!(first.status, ProjectStatus::Active);
+    assert_eq!(first.name, name);
+}
+
+#[tokio::test]
+#[ignore]
+async fn rename_changes_name_only() {
+    let client = client().await;
+    let project = new_project(&client, "rename").await;
+    let before = client.get_project(demo(), project).await.unwrap().unwrap();
+    let renamed = client.rename_project(demo(), project, "Renamed").await.unwrap();
+    let other_tenant = client.rename_project(TenantId::new(), project, "Nope").await.unwrap();
+    let after = client.get_project(demo(), project).await.unwrap().unwrap();
+    cleanup_project(&client, project, &[]).await;
+    let RenameProject::Renamed(record) = renamed else { panic!("{renamed:?}") };
+    assert_eq!(record.name, "Renamed");
+    assert_eq!(record.slug, before.slug);
+    assert_eq!(after.name, "Renamed");
+    assert_eq!(after.slug, before.slug);
+    assert_eq!(other_tenant, RenameProject::NotFound);
+}
+
+#[tokio::test]
+#[ignore]
+async fn begin_project_delete_marks_databases() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "del").await;
+    let (a, b) = (ready_database_in(&client, project).await, ready_database_in(&client, project).await);
+    let started = client.begin_project_delete(demo(), project).await.unwrap();
+    let statuses = [
+        client.get_database(a).await.unwrap().unwrap().status,
+        client.get_database(b).await.unwrap().unwrap().status,
+    ];
+    let mains = [main_branch(&client, a).await.status, main_branch(&client, b).await.status];
+    let record = client.get_project(demo(), project).await.unwrap().unwrap();
+    let listed = client.project_databases(project).await.unwrap();
+    cleanup_project(&client, project, &[a, b]).await;
+    let BeginProjectDelete::Started(mut ids) = started else { panic!("{started:?}") };
+    ids.sort_by_key(|d| d.as_uuid());
+    let mut want = vec![a, b];
+    want.sort_by_key(|d| d.as_uuid());
+    assert_eq!(ids, want);
+    assert_eq!(statuses, [DatabaseStatus::Deleting; 2]);
+    assert_eq!(mains, [BranchStatus::Deleting; 2]);
+    assert_eq!(record.status, ProjectStatus::Deleting);
+    assert_eq!(listed.len(), 2);
+}
+
+#[tokio::test]
+#[ignore]
+async fn begin_project_delete_refusals() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+
+    // Another tenant's project is not found.
+    let project = new_project(&client, "ref-tenant").await;
+    let other = client.begin_project_delete(TenantId::new(), project).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(other, BeginProjectDelete::NotFound);
+    assert_eq!(
+        client.begin_project_delete(demo(), ProjectId::new()).await.unwrap(),
+        BeginProjectDelete::NotFound
+    );
+
+    // A database still provisioning.
+    let project = new_project(&client, "ref-pending").await;
+    let pending = insert_pending_in(&client, project).await;
+    let refused = client.begin_project_delete(demo(), project).await.unwrap();
+    let status = client.get_project(demo(), project).await.unwrap().unwrap().status;
+    cleanup_project(&client, project, &[pending]).await;
+    assert_eq!(refused, BeginProjectDelete::NotReady(pending));
+    assert_eq!(status, ProjectStatus::Active, "nothing written");
+
+    // A protected branch.
+    let project = new_project(&client, "ref-protected").await;
+    let db = ready_database_in(&client, project).await;
+    let dev = ready_branch(&client, db, "dev", main_of(db)).await;
+    assert!(client.set_branch_protected(dev, true).await.unwrap().is_some());
+    let refused = client.begin_project_delete(demo(), project).await.unwrap();
+    let db_status = client.get_database(db).await.unwrap().unwrap().status;
+    cleanup_project(&client, project, &[db]).await;
+    assert_eq!(refused, BeginProjectDelete::Protected(db));
+    assert_eq!(db_status, DatabaseStatus::Ready, "nothing written");
+
+    // App users being enabled.
+    let project = new_project(&client, "ref-busy").await;
+    let db = ready_database_in(&client, project).await;
+    assert_eq!(client.begin_enable_app_users(&new_auth(project, db)).await.unwrap(), BeginEnable::Started);
+    let busy = client.begin_project_delete(demo(), project).await.unwrap();
+    assert!(client.finish_enable_app_users(project, Ok(())).await.unwrap());
+    assert!(client.begin_disable_app_users(project).await.unwrap());
+    let busy_disabling = client.begin_project_delete(demo(), project).await.unwrap();
+    cleanup_project(&client, project, &[db]).await;
+    assert_eq!(busy, BeginProjectDelete::AppUsersBusy);
+    assert_eq!(busy_disabling, BeginProjectDelete::AppUsersBusy);
+
+    // Already deleting.
+    let project = new_project(&client, "ref-twice").await;
+    let first = client.begin_project_delete(demo(), project).await.unwrap();
+    let second = client.begin_project_delete(demo(), project).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(first, BeginProjectDelete::Started(vec![]));
+    assert_eq!(second, BeginProjectDelete::AlreadyDeleting);
+}
+
+#[tokio::test]
+#[ignore]
+async fn insert_database_refuses_a_deleting_project() {
+    let client = client().await;
+    let project = new_project(&client, "ins").await;
+    assert_eq!(client.begin_project_delete(demo(), project).await.unwrap(), BeginProjectDelete::Started(vec![]));
+    let err = client
+        .insert_database_pending(DatabaseId::new(), demo(), project, "never")
+        .await
+        .unwrap_err();
+    cleanup_project(&client, project, &[]).await;
+    assert!(matches!(err, MetadataError::ProjectDeleting(p) if p == project), "{err:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn finish_project_delete_cleans_up() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "fin").await;
+    let slug = client.get_project(demo(), project).await.unwrap().unwrap().slug;
+    let db = ready_database_in(&client, project).await;
+    assert_eq!(client.begin_enable_app_users(&new_auth(project, db)).await.unwrap(), BeginEnable::Started);
+    assert!(client.finish_enable_app_users(project, Ok(())).await.unwrap());
+    client.set_branch_auth_sync(main_of(db), "db", "v1:sync").await.unwrap();
+    let session = new_session(project, uuid::Uuid::new_v4(), 1);
+    client.insert_app_session(&session).await.unwrap();
+    client.set_project_error(project, Some("waiting")).await.unwrap();
+    assert!(matches!(
+        client.begin_project_delete(demo(), project).await.unwrap(),
+        BeginProjectDelete::Started(_)
+    ));
+
+    client.finish_project_delete(project).await.unwrap();
+    let revoked = client.app_session(session.id).await.unwrap().unwrap().revoked_at;
+    let auth = client.project_auth(project).await.unwrap();
+    let sync = client.branch_auth_sync(main_of(db)).await.unwrap();
+    let live = client.get_project(demo(), project).await.unwrap();
+    let by_id = client.project_by_id(project).await.unwrap();
+    let (status, error, deleted_at): (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT status, error, deleted_at FROM projects WHERE id = $1")
+            .bind(project.as_uuid())
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+    let again = client.create_project(demo(), &format!("live-test-{} fin", run_id())).await.unwrap();
+    cleanup_project(&client, project, &[db]).await;
+    cleanup_project(&client, again.id, &[]).await;
+    assert!(revoked.is_some());
+    assert!(auth.is_none() && sync.is_none() && live.is_none() && by_id.is_none());
+    assert_eq!((status.as_str(), error), ("deleted", None));
+    assert!(deleted_at.is_some());
+    assert_eq!(again.slug, slug, "the slug is free again");
+}
+
+#[tokio::test]
+#[ignore]
+async fn enable_app_users_start_retry_exists() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "enable").await;
+    let db = ready_database_in(&client, project).await;
+    let auth = new_auth(project, db);
+
+    let started = client.begin_enable_app_users(&auth).await.unwrap();
+    let again = client.begin_enable_app_users(&auth).await.unwrap();
+    assert!(client.finish_enable_app_users(project, Err("boom".into())).await.unwrap());
+    let failed = client.project_auth(project).await.unwrap().unwrap();
+    // The same place retries, with the new settings.
+    let changed = NewProjectAuth { email_verification: true, on_delete: OnDelete::Mark, ..auth };
+    let retry = client.begin_enable_app_users(&changed).await.unwrap();
+    let retried = client.project_auth(project).await.unwrap().unwrap();
+    // Another place doesn't, even from `failed`.
+    assert!(client.finish_enable_app_users(project, Err("boom".into())).await.unwrap());
+    let elsewhere = client.begin_enable_app_users(&NewProjectAuth { table_name: "members", ..auth }).await.unwrap();
+    // Nor does an enabled row.
+    assert!(client.begin_enable_app_users(&changed).await.unwrap() == BeginEnable::Retry);
+    assert!(client.finish_enable_app_users(project, Ok(())).await.unwrap());
+    let enabled = client.begin_enable_app_users(&changed).await.unwrap();
+    let by_db = client.app_auth_for_database(db).await.unwrap();
+    let listed = client.enabled_app_projects().await.unwrap();
+    client.set_app_users_org(project, "org-live-test").await.unwrap();
+    let by_org = client.project_auth_by_org("org-live-test").await.unwrap();
+    let settings = client
+        .update_app_users_settings(project, Some(false), None)
+        .await
+        .unwrap()
+        .unwrap();
+    cleanup_project(&client, project, &[db]).await;
+    assert_eq!(started, BeginEnable::Started);
+    assert!(matches!(again, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Enabling));
+    assert_eq!((failed.status, failed.error.as_deref()), (AppUsersStatus::Failed, Some("boom")));
+    assert_eq!(retry, BeginEnable::Retry);
+    assert_eq!((retried.status, retried.error), (AppUsersStatus::Enabling, None));
+    assert!(retried.email_verification && retried.on_delete == OnDelete::Mark);
+    assert!(matches!(elsewhere, BeginEnable::Exists(ref a) if a.table_name == "users"));
+    assert!(matches!(enabled, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Enabled));
+    assert_eq!(by_db.map(|a| a.project_id), Some(project));
+    assert!(listed.iter().any(|a| a.project_id == project));
+    assert_eq!(by_org.map(|a| a.project_id), Some(project));
+    assert!(!settings.email_verification && settings.on_delete == OnDelete::Mark);
+}
+
+#[tokio::test]
+#[ignore]
+async fn finish_enable_moves_only_enabling() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "finish-enable").await;
+    let db = ready_database_in(&client, project).await;
+    assert!(!client.finish_enable_app_users(project, Ok(())).await.unwrap(), "no row");
+    client.begin_enable_app_users(&new_auth(project, db)).await.unwrap();
+    let first = client.finish_enable_app_users(project, Ok(())).await.unwrap();
+    let second = client.finish_enable_app_users(project, Err("late".into())).await.unwrap();
+    let status = auth_status(&client, project).await;
+    let disabled = client.begin_disable_app_users(project).await.unwrap();
+    let disabled_again = client.begin_disable_app_users(project).await.unwrap();
+    let finish_disabling = client.finish_enable_app_users(project, Ok(())).await.unwrap();
+    let still = auth_status(&client, project).await;
+    cleanup_project(&client, project, &[db]).await;
+    assert!(first && !second);
+    assert_eq!(status, Some(AppUsersStatus::Enabled));
+    assert!(disabled && !disabled_again && !finish_disabling);
+    assert_eq!(still, Some(AppUsersStatus::Disabling));
+}
+
+#[tokio::test]
+#[ignore]
+async fn enable_refuses_a_deleting_project() {
+    let client = client().await;
+    let project = new_project(&client, "enable-deleting").await;
+    client.begin_project_delete(demo(), project).await.unwrap();
+    let err = client
+        .begin_enable_app_users(&new_auth(project, DatabaseId::new()))
+        .await
+        .unwrap_err();
+    cleanup_project(&client, project, &[]).await;
+    assert!(matches!(err, MetadataError::ProjectDeleting(p) if p == project), "{err:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn branch_auth_sync_upserts() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let none = client.branch_auth_sync(branch).await.unwrap();
+    client.set_branch_auth_sync(branch, "db", "v1:one").await.unwrap();
+    let one = client.branch_auth_sync(branch).await.unwrap().unwrap();
+    client.set_branch_auth_sync(branch, "db2", "v1:two").await.unwrap();
+    let two = client.branch_auth_sync(branch).await.unwrap().unwrap();
+    cleanup(&client, id).await;
+    assert!(none.is_none());
+    assert_eq!((one.pg_database.as_str(), one.password_sealed.as_str()), ("db", "v1:one"));
+    assert_eq!((two.pg_database.as_str(), two.password_sealed.as_str()), ("db2", "v1:two"));
+    assert_eq!(two.branch_id, branch);
+}
+
+// End-of-step fix (T8 race): two bootstraps of one branch end up with one stored password.
+#[tokio::test]
+#[ignore]
+async fn branch_auth_sync_claim_keeps_the_first_for_the_same_database() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let first = client.claim_branch_auth_sync(branch, "db", "v1:a").await.unwrap();
+    let second = client.claim_branch_auth_sync(branch, "db", "v1:b").await.unwrap();
+    let stored = client.branch_auth_sync(branch).await.unwrap().unwrap();
+    // A row made for another Postgres database is replaced.
+    let moved = client.claim_branch_auth_sync(branch, "db2", "v1:c").await.unwrap();
+    let after = client.branch_auth_sync(branch).await.unwrap().unwrap();
+    cleanup(&client, id).await;
+    assert_eq!((first.as_str(), second.as_str()), ("v1:a", "v1:a"));
+    assert_eq!((stored.pg_database.as_str(), stored.password_sealed.as_str()), ("db", "v1:a"));
+    assert_eq!(moved, "v1:c");
+    assert_eq!((after.pg_database.as_str(), after.password_sealed.as_str()), ("db2", "v1:c"));
+}
+
+// Fix follow-up (M3): replacing an unreadable password is a compare-and-swap, so a concurrent
+// replacement wins once and the loser gets the winner's value back.
+#[tokio::test]
+#[ignore]
+async fn branch_auth_sync_swap_replaces_only_the_expected_value() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.claim_branch_auth_sync(branch, "db", "v1:old").await.unwrap();
+    let first = client.swap_branch_auth_sync(branch, "db", "v1:old", "v1:a").await.unwrap();
+    let second = client.swap_branch_auth_sync(branch, "db", "v1:old", "v1:b").await.unwrap();
+    let stored = client.branch_auth_sync(branch).await.unwrap().unwrap();
+    // No row (or one for another database): the swap stores the new value.
+    client.claim_branch_auth_sync(branch, "db2", "v1:other").await.unwrap();
+    let moved = client.swap_branch_auth_sync(branch, "db", "v1:a", "v1:c").await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!((first.as_str(), second.as_str()), ("v1:a", "v1:a"));
+    assert_eq!(stored.password_sealed, "v1:a");
+    assert_eq!(moved, "v1:c");
+}
+
+// End-of-step fix (T1): Studio's session list leaves out expired sessions.
+#[tokio::test]
+#[ignore]
+async fn list_user_sessions_leaves_out_expired_ones() {
+    let client = client().await;
+    let project = new_project(&client, "list-expired").await;
+    let user = uuid::Uuid::new_v4();
+    let (live, expired) = (new_session(project, user, 1), new_session(project, user, 2));
+    for s in [&live, &expired] {
+        client.insert_app_session(s).await.unwrap();
+    }
+    sqlx::query("UPDATE app_sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(expired.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let listed = client.list_user_sessions(project, user).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(listed.iter().map(|s| s.id).collect::<Vec<_>>(), vec![live.id]);
+}
+
+// End-of-step fix (N5): the sealed grace token doesn't outlive the grace window.
+#[tokio::test]
+#[ignore]
+async fn purge_app_sessions_clears_grace_tokens_past_the_window() {
+    let client = client().await;
+    let project = new_project(&client, "purge-grace").await;
+    let user = uuid::Uuid::new_v4();
+    let (past, within) = (new_session(project, user, 1), new_session(project, user, 3));
+    client.insert_app_session(&past).await.unwrap();
+    client.insert_app_session(&within).await.unwrap();
+    client.refresh_app_session(past.id, project, hash(1), &next(2, 60)).await.unwrap();
+    client.refresh_app_session(within.id, project, hash(3), &next(4, 60)).await.unwrap();
+    sqlx::query("UPDATE app_sessions SET grace_until = now() - interval '1 second' WHERE id = $1")
+        .bind(past.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    client.purge_app_sessions(std::time::Duration::from_secs(86400)).await.unwrap();
+    let sealed = |id: uuid::Uuid| {
+        let client = &client;
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT grace_refresh_sealed FROM app_sessions WHERE id = $1")
+                .bind(id)
+                .fetch_one(client.pool())
+                .await
+                .unwrap()
+        }
+    };
+    let (past_sealed, within_sealed) = (sealed(past.id).await, sealed(within.id).await);
+    // The previous token past the window is reuse, not grace.
+    let reused = client.refresh_app_session(past.id, project, hash(1), &next(5, 60)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(past_sealed, None);
+    assert_eq!(within_sealed.as_deref(), Some("sealed-4"));
+    assert!(matches!(reused, RefreshOutcome::Reused(_)), "{reused:?}");
+}
+
+// Review Focus 1 (SQL half): rotation, the grace window and reuse detection.
+#[tokio::test]
+#[ignore]
+async fn refresh_rotates_grace_and_reuse() {
+    let client = client().await;
+    let project = new_project(&client, "refresh").await;
+    let session = new_session(project, uuid::Uuid::new_v4(), 1);
+    client.insert_app_session(&session).await.unwrap();
+
+    let rotated = client.refresh_app_session(session.id, project, hash(1), &next(2, 2)).await.unwrap();
+    let within = client.refresh_app_session(session.id, project, hash(1), &next(3, 2)).await.unwrap();
+    let after_grace_check = client.app_session(session.id).await.unwrap().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reused = client.refresh_app_session(session.id, project, hash(1), &next(4, 2)).await.unwrap();
+    let current = client.refresh_app_session(session.id, project, hash(2), &next(5, 2)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+
+    let RefreshOutcome::Rotated(r) = rotated else { panic!("{rotated:?}") };
+    assert_eq!(r.id, session.id);
+    assert!(r.expires_at < chrono::Utc::now() + chrono::Duration::hours(2), "sliding applied");
+    let RefreshOutcome::Grace { sealed, session: g } = within else { panic!("{within:?}") };
+    assert_eq!(sealed, "sealed-2", "the grace hands out the token the rotation made");
+    assert_eq!(g.revoked_at, None);
+    assert_eq!(after_grace_check.revoked_at, None);
+    let RefreshOutcome::Reused(u) = reused else { panic!("{reused:?}") };
+    assert!(u.revoked_at.is_some());
+    assert_eq!(current, RefreshOutcome::Invalid, "a revoked session refuses even its current token");
+}
+
+#[tokio::test]
+#[ignore]
+async fn refresh_expires_on_cap() {
+    let client = client().await;
+    let project = new_project(&client, "cap").await;
+    let capped = new_session(project, uuid::Uuid::new_v4(), 1);
+    let expired = new_session(project, uuid::Uuid::new_v4(), 2);
+    client.insert_app_session(&capped).await.unwrap();
+    client.insert_app_session(&expired).await.unwrap();
+    backdate_session(&client, capped.id, 2 * 86400).await;
+    sqlx::query("UPDATE app_sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(expired.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let mut one_day = next(9, 2);
+    one_day.cap = std::time::Duration::from_secs(86400);
+
+    let a = client.refresh_app_session(capped.id, project, hash(1), &one_day).await.unwrap();
+    let b = client.refresh_app_session(expired.id, project, hash(2), &one_day).await.unwrap();
+    let a_row = client.app_session(capped.id).await.unwrap().unwrap();
+    let b_row = client.app_session(expired.id).await.unwrap().unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!((a, b), (RefreshOutcome::Invalid, RefreshOutcome::Invalid));
+    assert!(a_row.revoked_at.is_some() && b_row.revoked_at.is_some());
+}
+
+#[tokio::test]
+#[ignore]
+async fn unknown_secret_is_invalid_without_revoking() {
+    let client = client().await;
+    let project = new_project(&client, "unknown").await;
+    let session = new_session(project, uuid::Uuid::new_v4(), 1);
+    client.insert_app_session(&session).await.unwrap();
+    let wrong = client.refresh_app_session(session.id, project, hash(77), &next(2, 2)).await.unwrap();
+    let missing = client
+        .refresh_app_session(uuid::Uuid::new_v4(), project, hash(1), &next(2, 2))
+        .await
+        .unwrap();
+    let row = client.app_session(session.id).await.unwrap().unwrap();
+    // Nothing changed: the real token still rotates.
+    let rotated = client.refresh_app_session(session.id, project, hash(1), &next(2, 2)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!((wrong, missing), (RefreshOutcome::Invalid, RefreshOutcome::Invalid));
+    assert_eq!(row.revoked_at, None);
+    assert!(matches!(rotated, RefreshOutcome::Rotated(_)));
+}
+
+#[tokio::test]
+#[ignore]
+async fn revoke_by_hash_needs_a_matching_token() {
+    let client = client().await;
+    let project = new_project(&client, "by-hash").await;
+    let (a, b) = (new_session(project, uuid::Uuid::new_v4(), 1), new_session(project, uuid::Uuid::new_v4(), 2));
+    client.insert_app_session(&a).await.unwrap();
+    client.insert_app_session(&b).await.unwrap();
+    // `b` rotated once: both its tokens match.
+    client.refresh_app_session(b.id, project, hash(2), &next(3, 2)).await.unwrap();
+
+    let wrong = client.revoke_app_session_by_hash(a.id, project, hash(9)).await.unwrap();
+    let live = client.app_session(a.id).await.unwrap().unwrap().revoked_at;
+    let right = client.revoke_app_session_by_hash(a.id, project, hash(1)).await.unwrap();
+    let twice = client.revoke_app_session_by_hash(a.id, project, hash(1)).await.unwrap();
+    let previous = client.revoke_app_session_by_hash(b.id, project, hash(2)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert!(wrong.is_none());
+    assert_eq!(live, None);
+    assert!(right.is_some_and(|s| s.revoked_at.is_some()));
+    assert!(twice.is_none(), "already revoked");
+    assert!(previous.is_some(), "the previous token matches too");
+}
+
+#[tokio::test]
+#[ignore]
+async fn session_functions_refuse_another_project() {
+    let client = client().await;
+    let (mine, other) = (new_project(&client, "mine").await, new_project(&client, "other").await);
+    let session = new_session(mine, uuid::Uuid::new_v4(), 1);
+    client.insert_app_session(&session).await.unwrap();
+
+    let refreshed = client.refresh_app_session(session.id, other, hash(1), &next(2, 2)).await.unwrap();
+    let revoked = client.revoke_app_session(session.id, other).await.unwrap();
+    let by_hash = client.revoke_app_session_by_hash(session.id, other, hash(1)).await.unwrap();
+    let user_wide = client.revoke_user_sessions(other, session.user_id, None, None).await.unwrap();
+    let project_wide = client.revoke_project_sessions(other).await.unwrap();
+    let row = client.app_session(session.id).await.unwrap().unwrap();
+    // The current token is unchanged: it still rotates in the right project.
+    let rotated = client.refresh_app_session(session.id, mine, hash(1), &next(2, 2)).await.unwrap();
+    cleanup_project(&client, mine, &[]).await;
+    cleanup_project(&client, other, &[]).await;
+    assert_eq!(refreshed, RefreshOutcome::Invalid);
+    assert!(revoked.is_none() && by_hash.is_none() && user_wide.is_empty() && project_wide.is_empty());
+    assert_eq!(row.revoked_at, None);
+    assert!(matches!(rotated, RefreshOutcome::Rotated(_)));
+}
+
+#[tokio::test]
+#[ignore]
+async fn revoke_user_sessions_keeps_and_filters_by_time() {
+    let client = client().await;
+    let project = new_project(&client, "user-sessions").await;
+    let (user, other_user) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (s1, s2, s3) = (new_session(project, user, 1), new_session(project, user, 2), new_session(project, user, 3));
+    let theirs = new_session(project, other_user, 4);
+    for s in [&s1, &s2, &s3, &theirs] {
+        client.insert_app_session(s).await.unwrap();
+    }
+    backdate_session(&client, s1.id, 7200).await;
+
+    let before = chrono::Utc::now() - chrono::Duration::hours(1);
+    let old_only = client.revoke_user_sessions(project, user, None, Some(before)).await.unwrap();
+    let listed = client.list_user_sessions(project, user).await.unwrap();
+    let rest = client.revoke_user_sessions(project, user, Some(s3.id), None).await.unwrap();
+    let kept = client.list_user_sessions(project, user).await.unwrap();
+    let others = client.list_user_sessions(project, other_user).await.unwrap();
+    let all = client.revoke_project_sessions(project).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(old_only.iter().map(|s| s.id).collect::<Vec<_>>(), vec![s1.id]);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(rest.iter().map(|s| s.id).collect::<Vec<_>>(), vec![s2.id]);
+    assert_eq!(kept.iter().map(|s| s.id).collect::<Vec<_>>(), vec![s3.id]);
+    assert_eq!(others.len(), 1);
+    assert_eq!(all.len(), 2, "s3 and the other user's session were still live");
+}
+
+#[tokio::test]
+#[ignore]
+async fn purge_app_sessions_drops_old_revoked_and_expired() {
+    let client = client().await;
+    let project = new_project(&client, "purge").await;
+    let user = uuid::Uuid::new_v4();
+    let (old_revoked, fresh_revoked, old_expired, live) =
+        (new_session(project, user, 1), new_session(project, user, 2), new_session(project, user, 3), new_session(project, user, 4));
+    for s in [&old_revoked, &fresh_revoked, &old_expired, &live] {
+        client.insert_app_session(s).await.unwrap();
+    }
+    client.revoke_app_session(old_revoked.id, project).await.unwrap();
+    client.revoke_app_session(fresh_revoked.id, project).await.unwrap();
+    sqlx::query("UPDATE app_sessions SET revoked_at = now() - interval '2 days' WHERE id = $1")
+        .bind(old_revoked.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE app_sessions SET expires_at = now() - interval '2 days' WHERE id = $1")
+        .bind(old_expired.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    client.purge_app_sessions(std::time::Duration::from_secs(86400)).await.unwrap();
+    let left = [
+        client.app_session(old_revoked.id).await.unwrap().is_some(),
+        client.app_session(fresh_revoked.id).await.unwrap().is_some(),
+        client.app_session(old_expired.id).await.unwrap().is_some(),
+        client.app_session(live.id).await.unwrap().is_some(),
+    ];
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(left, [false, true, false, true]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn listers_find_stale_transitions_and_deleting_projects() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (enabling, disabling, deleting) = (
+        new_project(&client, "stale-enabling").await,
+        new_project(&client, "stale-disabling").await,
+        new_project(&client, "stale-deleting").await,
+    );
+    let (db1, db2) = (ready_database_in(&client, enabling).await, ready_database_in(&client, disabling).await);
+    client.begin_enable_app_users(&new_auth(enabling, db1)).await.unwrap();
+    client.begin_enable_app_users(&new_auth(disabling, db2)).await.unwrap();
+    client.finish_enable_app_users(disabling, Ok(())).await.unwrap();
+    client.begin_disable_app_users(disabling).await.unwrap();
+    client.begin_project_delete(demo(), deleting).await.unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    let fresh_transitions = client.app_users_in_transition(hour).await.unwrap();
+    let fresh_deleting = client.deleting_projects(hour).await.unwrap();
+    sqlx::query("UPDATE project_auth SET updated_at = now() - interval '2 hours' WHERE project_id = ANY($1)")
+        .bind([enabling.as_uuid(), disabling.as_uuid()].as_slice())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE projects SET updated_at = now() - interval '2 hours' WHERE id = $1")
+        .bind(deleting.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let stale: Vec<ProjectId> = client.app_users_in_transition(hour).await.unwrap().iter().map(|a| a.project_id).collect();
+    let stale_deleting = client.deleting_projects(hour).await.unwrap();
+    cleanup_project(&client, enabling, &[db1]).await;
+    cleanup_project(&client, disabling, &[db2]).await;
+    cleanup_project(&client, deleting, &[]).await;
+    assert!(fresh_transitions.iter().all(|a| a.project_id != enabling && a.project_id != disabling));
+    assert!(!fresh_deleting.contains(&deleting));
+    assert!(stale.contains(&enabling) && stale.contains(&disabling));
+    assert!(stale_deleting.contains(&deleting));
+}
+
+#[tokio::test]
+#[ignore]
+async fn key_lookup_returns_the_project() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "key").await;
+    let db = ready_database_in(&client, project).await;
+    let (key, _) = new_key(main_of(db), DataKeyKind::Secret, "service_role", "backend");
+    client.insert_data_key(&key).await.unwrap();
+    let found = client.lookup_data_key(&key.sha256).await.unwrap();
+    cleanup_project(&client, project, &[db]).await;
+    let found = found.expect("the key is live");
+    assert_eq!(found.project_id, project);
+    assert_eq!(found.branch_id, main_of(db));
+}
+
+#[tokio::test]
+#[ignore]
+async fn tenant_overview_hides_deleted_projects() {
+    let client = client().await;
+    let live = new_project(&client, "ov-live").await;
+    let deleting = new_project(&client, "ov-deleting").await;
+    let gone = new_project(&client, "ov-gone").await;
+    client.begin_project_delete(demo(), deleting).await.unwrap();
+    client.begin_project_delete(demo(), gone).await.unwrap();
+    client.finish_project_delete(gone).await.unwrap();
+    let overview = client.tenant_overview(demo()).await.unwrap().unwrap();
+    let find = |id: ProjectId| overview.projects.iter().find(|p| p.id == id).map(|p| (p.name.clone(), p.status));
+    let seed = overview.projects.iter().find(|p| p.id == ProjectId(DEMO_PROJECT_ID)).map(|p| p.status);
+    let (l, d, g) = (find(live), find(deleting), find(gone));
+    for p in [live, deleting, gone] {
+        cleanup_project(&client, p, &[]).await;
+    }
+    assert_eq!(l.map(|(_, s)| s), Some(ProjectStatus::Active));
+    assert_eq!(d.map(|(_, s)| s), Some(ProjectStatus::Deleting));
+    assert!(g.is_none());
+    assert_eq!(seed, Some(ProjectStatus::Active), "the seed project stays active");
 }

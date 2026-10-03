@@ -112,6 +112,11 @@ services:
       ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: http://localhost:3000/
       ZITADEL_OIDC_DEFAULTLOGINURLV2: "http://localhost:3000/login?authRequest="
       ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "http://localhost:3000/logout?post_logout_redirect="
+      # self-hosted dev only: lets Actions call the host's internal listener (R11)
+      ZITADEL_HTTPCLIENT_DENYLIST: "localhost,0.0.0.0/8,127.0.0.0/8,169.254.0.0/16,::1/128"
+    # self-hosted dev only: lets Actions call the host's internal listener (R11)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       zitadel-db:
         condition: service_healthy

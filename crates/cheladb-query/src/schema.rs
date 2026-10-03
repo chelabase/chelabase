@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use cheladb_types::data_api_schema::{
-    ArgDesc, ColumnDesc, DataApiSchema, FunctionDesc, Privilege, ReturnDesc, SchemaEntry, TableDesc,
+    AppUsersTable, ArgDesc, ColumnDesc, DataApiSchema, FunctionDesc, Privilege, ReturnDesc, SchemaEntry, TableDesc,
     TableKind,
 };
 use serde::Deserialize;
@@ -162,6 +162,10 @@ pub struct Raw {
     pub enums: Vec<(u32, String)>,
     pub relations: Vec<RawRelation>,
     pub functions: Vec<RawFunction>,
+    /// `(schema, table)` of the app users table; not in [`INTROSPECT_SQL`]: [`introspect`]
+    /// fills it from [`APP_USERS_TABLE_SQL`].
+    #[serde(default)]
+    pub app_users: Option<(String, String)>,
 }
 
 /// A type as the API describes it: the base type's name (domains resolved, the element
@@ -309,6 +313,8 @@ pub struct Schema {
     namespaces: Vec<(u32, String)>,
     pub tables: Vec<Table>,
     pub functions: Vec<Function>,
+    /// `(schema, table)` of the branch's app users table, when it has one.
+    pub app_users: Option<(String, String)>,
     /// Enum type oid → (schema, name, labels in order).
     enums: HashMap<u32, (String, String, Vec<String>)>,
     views: moka::sync::Cache<String, Arc<RoleView>>,
@@ -461,6 +467,7 @@ impl Schema {
                 .collect(),
             tables,
             functions,
+            app_users: raw.app_users,
             enums,
             views: moka::sync::Cache::new(ROLE_VIEWS),
         }
@@ -634,6 +641,13 @@ impl Schema {
             version: self.version.clone(),
             default_schema: default_schema.to_owned(),
             schemas: out,
+            app_users: self
+                .app_users
+                .as_ref()
+                .map(|(schema, table)| AppUsersTable {
+                    schema: schema.clone(),
+                    table: table.clone(),
+                }),
         })
         .expect("the schema document serialises")
     }
@@ -752,8 +766,27 @@ pub async fn introspect(
         .bind(RESERVED_SCHEMAS)
         .fetch_one(&mut *conn)
         .await?;
-    Ok(Schema::build(version, serde_json::from_str(&json)?))
+    let mut raw: Raw = serde_json::from_str(&json)?;
+    raw.app_users = sqlx::query_as(APP_USERS_TABLE_SQL)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(Schema::build(version, raw))
 }
+
+/// The app users table, from the catalogs alone: the table carrying the guard trigger that
+/// calls `cheladb.users_guard()`. Introspection runs as the request's role, which may have no
+/// access to schema `cheladb` (a custom role), and the schema it builds is shared by every
+/// role, so the marker can't depend on what the role may read.
+pub const APP_USERS_TABLE_SQL: &str = "SELECT n.nspname::text, c.relname::text \
+     FROM pg_catalog.pg_trigger t \
+     JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+     JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) t.tgfoid \
+     JOIN pg_catalog.pg_namespace pn ON pn.oid OPERATOR(pg_catalog.=) p.pronamespace \
+     WHERE t.tgname OPERATOR(pg_catalog.=) 'cheladb_users_guard' \
+       AND p.proname OPERATOR(pg_catalog.=) 'users_guard' \
+       AND pn.nspname OPERATOR(pg_catalog.=) 'cheladb' \
+     ORDER BY c.oid LIMIT 1";
 
 /// What `role` can reach (inside the request's transaction).
 pub async fn visibility(
@@ -844,6 +877,7 @@ mod tests {
         enums.insert(102, ("other".to_owned(), "unused".to_owned(), vec!["x".to_owned()]));
         Schema {
             version: "17.2".into(),
+            app_users: None,
             namespaces: vec![(1, "public".into()), (2, "billing".into())],
             tables: vec![
                 table(

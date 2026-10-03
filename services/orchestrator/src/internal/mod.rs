@@ -2,6 +2,7 @@
 //! storage controller. It binds `CHELADB_INTERNAL_ADDR` (loopback by default) and never goes
 //! through the gateway. Each caller has its own bearer token and can open only its own routes.
 
+pub mod app;
 pub mod config;
 mod data;
 mod ddl;
@@ -17,9 +18,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, put};
 use axum::{Json, Router};
 use cheladb_metadata::{
-    BranchConnectionRow, DataKeyLookup, MetadataClient, MetadataError, NeonDatabase, NeonEndpoint,
-    NeonRole,
+    AppSession, BranchAuthSync, BranchConnectionRow, BranchRecord, DataKeyLookup, MetadataClient,
+    MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, ProjectAuth,
+    ProjectRecord, RefreshNext, RefreshOutcome,
 };
+use cheladb_types::{DatabaseId, ProjectId};
+use chrono::{DateTime, Utc};
 use cheladb_secrets::SecretKey;
 use cheladb_types::BranchId;
 use uuid::Uuid;
@@ -88,6 +92,72 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<BranchConnectionRow>, MetadataError>> + Send;
+
+    // App users (step 6b): what the `auth` service, the gateway and Zitadel's webhook need.
+
+    fn project_by_id(
+        &self,
+        id: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectRecord>, MetadataError>> + Send;
+    fn project_auth(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
+    fn project_auth_by_org(
+        &self,
+        org_id: &str,
+    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
+    fn get_branch(
+        &self,
+        id: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+    /// The project the database belongs to, deleted or not.
+    fn database_project(
+        &self,
+        db: DatabaseId,
+    ) -> impl Future<Output = Result<Option<ProjectId>, MetadataError>> + Send;
+    /// The database's main branch, unless it's deleted.
+    fn main_branch(
+        &self,
+        db: DatabaseId,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+    fn branch_auth_sync(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchAuthSync>, MetadataError>> + Send;
+    fn insert_app_session(
+        &self,
+        s: &NewAppSession<'_>,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    fn app_session(
+        &self,
+        id: Uuid,
+    ) -> impl Future<Output = Result<Option<AppSession>, MetadataError>> + Send;
+    fn refresh_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        next: &RefreshNext,
+    ) -> impl Future<Output = Result<RefreshOutcome, MetadataError>> + Send;
+    fn revoke_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<Option<AppSession>, MetadataError>> + Send;
+    fn revoke_app_session_by_hash(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+    ) -> impl Future<Output = Result<Option<AppSession>, MetadataError>> + Send;
+    fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+        keep: Option<Uuid>,
+        created_before: Option<DateTime<Utc>>,
+    ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
 }
 
 // As for `MetadataPort`: each method must call `MetadataClient`'s inherent method by its full
@@ -144,6 +214,74 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Option<BranchConnectionRow>, MetadataError> {
         MetadataClient::branch_connection(self, branch).await
     }
+    async fn project_by_id(&self, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
+        MetadataClient::project_by_id(self, id).await
+    }
+    async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
+        MetadataClient::project_auth(self, project).await
+    }
+    async fn project_auth_by_org(&self, org_id: &str) -> Result<Option<ProjectAuth>, MetadataError> {
+        MetadataClient::project_auth_by_org(self, org_id).await
+    }
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::get_branch(self, id).await
+    }
+    async fn database_project(&self, db: DatabaseId) -> Result<Option<ProjectId>, MetadataError> {
+        Ok(MetadataClient::get_database(self, db)
+            .await?
+            .map(|d| d.project_id))
+    }
+    async fn main_branch(&self, db: DatabaseId) -> Result<Option<BranchRecord>, MetadataError> {
+        Ok(MetadataClient::list_branches(self, db)
+            .await?
+            .into_iter()
+            .find(|b| b.parent_branch_id.is_none()))
+    }
+    async fn branch_auth_sync(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<BranchAuthSync>, MetadataError> {
+        MetadataClient::branch_auth_sync(self, branch).await
+    }
+    async fn insert_app_session(&self, s: &NewAppSession<'_>) -> Result<(), MetadataError> {
+        MetadataClient::insert_app_session(self, s).await
+    }
+    async fn app_session(&self, id: Uuid) -> Result<Option<AppSession>, MetadataError> {
+        MetadataClient::app_session(self, id).await
+    }
+    async fn refresh_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        next: &RefreshNext,
+    ) -> Result<RefreshOutcome, MetadataError> {
+        MetadataClient::refresh_app_session(self, id, project, presented, next).await
+    }
+    async fn revoke_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+    ) -> Result<Option<AppSession>, MetadataError> {
+        MetadataClient::revoke_app_session(self, id, project).await
+    }
+    async fn revoke_app_session_by_hash(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+    ) -> Result<Option<AppSession>, MetadataError> {
+        MetadataClient::revoke_app_session_by_hash(self, id, project, presented).await
+    }
+    async fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: Uuid,
+        keep: Option<Uuid>,
+        created_before: Option<DateTime<Utc>>,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        MetadataClient::revoke_user_sessions(self, project, user, keep, created_before).await
+    }
 }
 
 pub struct InternalState<M, L> {
@@ -172,6 +310,18 @@ pub struct InternalState<M, L> {
     /// The REST service's internal listener: told when a forwarded `DROP`/`RENAME DATABASE`
     /// changes which databases a branch serves.
     pub rest: crate::RestInternal,
+    /// The `auth` service's bearer for the app routes.
+    pub app_auth_token: String,
+    /// The gateway's bearer: a session's liveness only.
+    pub app_sessions_token: String,
+    /// How much longer a refresh keeps an app session alive (capped at 90 days by creation).
+    pub app_refresh_ttl: std::time::Duration,
+    /// Checks the Zitadel Actions webhook; `None` makes it answer 503.
+    pub actions_signing_key: Option<String>,
+    /// Admin access to Zitadel, to delete its sessions (best effort); `None` skips that.
+    pub zitadel: Option<cheladb_zitadel::client::Zitadel>,
+    /// Publishes app-user sync jobs.
+    pub app_jobs: Arc<dyn app::AppJobPort>,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router
@@ -231,6 +381,7 @@ where
         .merge(storcon)
         .merge(data_keys)
         .merge(rest)
+        .merge(app::routes(&state))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -251,6 +402,24 @@ pub(crate) fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
 async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: Next) -> Response {
     match bearer(request.headers()) {
         Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => next.run(request).await,
+        _ => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Like [`require_bearer`], for routes two callers share.
+async fn require_any_bearer(
+    State(tokens): State<Arc<[Arc<str>]>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match bearer(request.headers()) {
+        // Every token is compared, so timing doesn't show which one matched.
+        Some(t) if tokens
+            .iter()
+            .fold(false, |hit, token| constant_time_eq(t.as_bytes(), token.as_bytes()) | hit) =>
+        {
+            next.run(request).await
+        }
         _ => StatusCode::UNAUTHORIZED.into_response(),
     }
 }

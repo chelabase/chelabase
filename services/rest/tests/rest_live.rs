@@ -424,6 +424,7 @@ impl Live {
                 role: role.into(),
                 claims: json!({}),
                 databases,
+                project_id: None,
             }),
         };
         self.signer.sign("rest", &identity).unwrap()
@@ -1041,7 +1042,7 @@ async fn dropped_cheladb_is_unavailable_then_healed_by_bootstrap() {
         // Revoked grants answer the same way, until the bootstrap runs again.
         l.sql_on(
             l.main_id(),
-            "REVOKE USAGE ON SCHEMA cheladb FROM authenticator;",
+            "REVOKE USAGE ON SCHEMA cheladb FROM PUBLIC, authenticator;",
         )
         .await;
         l.anon(select.clone()).await.error(503, "unavailable");
@@ -1607,7 +1608,7 @@ async fn the_health_check_sees_what_the_bootstrap_repairs() {
             "ALTER EVENT TRIGGER cheladb_schema_version_ddl DISABLE;",
             "ALTER EVENT TRIGGER cheladb_extension_functions DISABLE;",
             "ALTER ROLE authenticator NOLOGIN;",
-            "REVOKE USAGE ON SCHEMA cheladb FROM authenticator;",
+            "REVOKE USAGE ON SCHEMA cheladb FROM PUBLIC, authenticator;",
             "REVOKE SELECT ON cheladb.schema_version FROM authenticator;",
             "DROP EVENT TRIGGER cheladb_schema_version_drop;",
         ] {

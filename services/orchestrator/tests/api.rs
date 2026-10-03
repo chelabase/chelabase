@@ -4,11 +4,13 @@ use cheladb_auth::internal::{
 };
 use cheladb_metadata::{
     BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseOrigin, DataKeyRecord, DatabaseRecord,
-    DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
+    DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, ProjectStatus, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
     TenantOverview,
+    AppSession, AppUsersStatus, BeginEnable, BeginProjectDelete, BranchAuthSync, NewProjectAuth, OnDelete, ProjectAuth,
+    ProjectRecord, RenameProject,
 };
 use cheladb_nats::{
-    BranchJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
+    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
     ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RESET_NOT_APPLIED,
 };
 use cheladb_routes::{Service, ENDPOINTS};
@@ -57,6 +59,16 @@ struct FakeMetadata {
     /// Calls to `branch_databases` and to `branches_with_main_database`.
     branch_db_queries: Arc<AtomicUsize>,
     main_db_batch_queries: Arc<AtomicUsize>,
+    /// Project rows (the fake's own `projects` table) and their app-users settings.
+    projects: Arc<Mutex<Vec<ProjectRecord>>>,
+    project_auths: Arc<Mutex<HashMap<ProjectId, ProjectAuth>>>,
+    branch_syncs: Arc<Mutex<HashMap<BranchId, BranchAuthSync>>>,
+    app_sessions: Arc<Mutex<Vec<AppSession>>>,
+    /// Calls to `project_auth` and to `project_auth_statuses`.
+    /// `revoke_user_sessions` fails while set.
+    fail_revoke: Arc<Mutex<bool>>,
+    project_auth_reads: Arc<AtomicUsize>,
+    project_auth_batch_reads: Arc<AtomicUsize>,
 }
 
 /// A database row and its main branch, which holds the endpoint and the sealed password.
@@ -268,6 +280,15 @@ impl MetadataPort for FakeMetadata {
         }
         if self.missing_projects.lock().unwrap().contains(&project_id) {
             return Err(MetadataError::ProjectNotFound(project_id));
+        }
+        if self
+            .projects
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.id == project_id && p.status != ProjectStatus::Active)
+        {
+            return Err(MetadataError::ProjectDeleting(project_id));
         }
         if *self.fail_insert.lock().unwrap() {
             return Err(MetadataError::DuplicateDatabaseName);
@@ -744,6 +765,281 @@ impl MetadataPort for FakeMetadata {
         rows.sort_by_key(|d| (d.origin != DatabaseOrigin::Main, d.name.clone()));
         Ok(rows)
     }
+
+    async fn list_projects(&self, tenant: TenantId) -> Result<Vec<ProjectRecord>, MetadataError> {
+        Ok(self
+            .projects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_project(&self, tenant: TenantId, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
+        Ok(self
+            .projects
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.id == id && p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
+            .cloned())
+    }
+
+    async fn project_by_id(&self, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
+        Ok(self
+            .projects
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.id == id && p.status != ProjectStatus::Deleted)
+            .cloned())
+    }
+
+    async fn create_project(&self, tenant: TenantId, name: &str) -> Result<ProjectRecord, MetadataError> {
+        let mut projects = self.projects.lock().unwrap();
+        let taken: HashSet<String> = projects
+            .iter()
+            .filter(|p| p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
+            .map(|p| p.slug.clone())
+            .collect();
+        let base = cheladb_metadata::slug_base(name);
+        let mut slug = base.clone();
+        let mut n = 2;
+        while taken.contains(&slug) {
+            slug = format!("{base}-{n}");
+            n += 1;
+        }
+        let now = chrono::Utc::now();
+        let record = ProjectRecord {
+            id: ProjectId::new(),
+            tenant_id: tenant,
+            name: name.to_string(),
+            slug,
+            status: ProjectStatus::Active,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        projects.push(record.clone());
+        Ok(record)
+    }
+
+    async fn rename_project(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+        name: &str,
+    ) -> Result<RenameProject, MetadataError> {
+        let mut projects = self.projects.lock().unwrap();
+        let Some(p) = projects
+            .iter_mut()
+            .find(|p| p.id == id && p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
+        else {
+            return Ok(RenameProject::NotFound);
+        };
+        if p.status != ProjectStatus::Active {
+            return Ok(RenameProject::Deleting);
+        }
+        p.name = name.to_string();
+        p.updated_at = chrono::Utc::now();
+        Ok(RenameProject::Renamed(p.clone()))
+    }
+
+    /// Mirrors the real function's refusal order; the databases are the fake's own rows.
+    async fn begin_project_delete(
+        &self,
+        tenant: TenantId,
+        id: ProjectId,
+    ) -> Result<BeginProjectDelete, MetadataError> {
+        let mut projects = self.projects.lock().unwrap();
+        let Some(project) = projects
+            .iter_mut()
+            .find(|p| p.id == id && p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
+        else {
+            return Ok(BeginProjectDelete::NotFound);
+        };
+        if project.status == ProjectStatus::Deleting {
+            return Ok(BeginProjectDelete::AlreadyDeleting);
+        }
+        let mut databases = self.databases.lock().unwrap();
+        let branches = self.branches.lock().unwrap();
+        let mut ids: Vec<DatabaseId> = databases
+            .values()
+            .filter(|d| d.project_id == id && d.status != DatabaseStatus::Deleted)
+            .map(|d| d.database_id)
+            .collect();
+        ids.sort_by_key(|d| d.as_uuid());
+        for db in &ids {
+            if matches!(databases[db].status, DatabaseStatus::Pending | DatabaseStatus::Provisioning) {
+                return Ok(BeginProjectDelete::NotReady(*db));
+            }
+        }
+        if let Some(b) = branches
+            .values()
+            .find(|b| ids.contains(&b.database_id) && b.protected && b.status != BranchStatus::Deleting)
+        {
+            return Ok(BeginProjectDelete::Protected(b.database_id));
+        }
+        if let Some(auth) = self.project_auths.lock().unwrap().get(&id)
+            && matches!(auth.status, AppUsersStatus::Enabling | AppUsersStatus::Disabling)
+        {
+            return Ok(BeginProjectDelete::AppUsersBusy);
+        }
+        project.status = ProjectStatus::Deleting;
+        let mut started = Vec::new();
+        for db in ids {
+            let record = databases.get_mut(&db).unwrap();
+            if matches!(record.status, DatabaseStatus::Ready | DatabaseStatus::Failed) {
+                record.status = DatabaseStatus::Deleting;
+                started.push(db);
+            }
+        }
+        Ok(BeginProjectDelete::Started(started))
+    }
+
+    async fn project_databases(
+        &self,
+        id: ProjectId,
+    ) -> Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError> {
+        Ok(self
+            .databases
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|d| d.project_id == id && d.status != DatabaseStatus::Deleted)
+            .map(|d| (d.database_id, d.status, d.error.clone()))
+            .collect())
+    }
+
+    async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
+        self.project_auth_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.project_auths.lock().unwrap().get(&project).cloned())
+    }
+
+    async fn project_auth_statuses(&self, tenant: TenantId) -> Result<HashMap<ProjectId, AppUsersStatus>, MetadataError> {
+        self.project_auth_batch_reads.fetch_add(1, Ordering::SeqCst);
+        let projects = self.projects.lock().unwrap();
+        Ok(self
+            .project_auths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| projects.iter().any(|p| p.id == **id && p.tenant_id == tenant))
+            .map(|(id, a)| (*id, a.status))
+            .collect())
+    }
+
+    async fn begin_enable_app_users(&self, new: &NewProjectAuth<'_>) -> Result<BeginEnable, MetadataError> {
+        let mut auths = self.project_auths.lock().unwrap();
+        if let Some(existing) = auths.get_mut(&new.project_id) {
+            let same = existing.database_id == new.database_id
+                && existing.pg_database == new.pg_database
+                && existing.schema_name == new.schema_name
+                && existing.table_name == new.table_name;
+            if existing.status == AppUsersStatus::Failed && same {
+                existing.status = AppUsersStatus::Enabling;
+                existing.error = None;
+                existing.email_verification = new.email_verification;
+                existing.on_delete = new.on_delete;
+                return Ok(BeginEnable::Retry);
+            }
+            return Ok(BeginEnable::Exists(existing.clone()));
+        }
+        let now = chrono::Utc::now();
+        auths.insert(
+            new.project_id,
+            ProjectAuth {
+                project_id: new.project_id,
+                status: AppUsersStatus::Enabling,
+                error: None,
+                zitadel_org_id: None,
+                database_id: new.database_id,
+                pg_database: new.pg_database.to_string(),
+                schema_name: new.schema_name.to_string(),
+                table_name: new.table_name.to_string(),
+                email_verification: new.email_verification,
+                on_delete: new.on_delete,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        Ok(BeginEnable::Started)
+    }
+
+    async fn update_app_users_settings(
+        &self,
+        project: ProjectId,
+        email_verification: Option<bool>,
+        on_delete: Option<OnDelete>,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        let mut auths = self.project_auths.lock().unwrap();
+        let Some(auth) = auths.get_mut(&project) else { return Ok(None) };
+        if let Some(v) = email_verification {
+            auth.email_verification = v;
+        }
+        if let Some(v) = on_delete {
+            auth.on_delete = v;
+        }
+        Ok(Some(auth.clone()))
+    }
+
+    async fn begin_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
+        let mut auths = self.project_auths.lock().unwrap();
+        match auths.get_mut(&project) {
+            Some(a) if matches!(a.status, AppUsersStatus::Enabled | AppUsersStatus::Failed) => {
+                a.status = AppUsersStatus::Disabling;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn branch_auth_sync(&self, branch: BranchId) -> Result<Option<BranchAuthSync>, MetadataError> {
+        Ok(self.branch_syncs.lock().unwrap().get(&branch).cloned())
+    }
+
+    async fn list_user_sessions(&self, project: ProjectId, user: uuid::Uuid) -> Result<Vec<AppSession>, MetadataError> {
+        Ok(self
+            .app_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            // Like the real query: live only (not revoked, not expired).
+            .filter(|s| s.project_id == project && s.user_id == user && s.revoked_at.is_none() && s.expires_at > chrono::Utc::now())
+            .cloned()
+            .collect())
+    }
+
+    async fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: uuid::Uuid,
+        keep: Option<uuid::Uuid>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        if *self.fail_revoke.lock().unwrap() {
+            return Err(MetadataError::Conflict);
+        }
+        let mut revoked = Vec::new();
+        for s in self.app_sessions.lock().unwrap().iter_mut() {
+            if s.project_id == project
+                && s.user_id == user
+                && s.revoked_at.is_none()
+                && Some(s.id) != keep
+                && created_before.is_none_or(|t| s.created_at < t)
+            {
+                s.revoked_at = Some(chrono::Utc::now());
+                revoked.push(s.clone());
+            }
+        }
+        Ok(revoked)
+    }
+
+    async fn app_auth_for_database(&self, db: DatabaseId) -> Result<Option<ProjectAuth>, MetadataError> {
+        Ok(self.project_auths.lock().unwrap().values().find(|a| a.database_id == db).cloned())
+    }
 }
 
 fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataError> {
@@ -812,6 +1108,13 @@ struct FakeJobs {
     data_api_reply: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
     /// The enable message can't be published.
     fail_enable_publish: Arc<Mutex<bool>>,
+    project_deletes: Arc<Mutex<Vec<ProjectId>>>,
+    app_users_jobs: Arc<Mutex<Vec<AppUsersJob>>>,
+    app_users_sync_jobs: Arc<Mutex<Vec<AppUsersSyncJob>>>,
+    /// Each app-users location check as `<pg_database>.<schema>.<table>`.
+    app_users_checks: Arc<Mutex<Vec<String>>>,
+    /// What the worker answers to a location check; ok when unset.
+    app_users_check_reply: Arc<Mutex<Option<AppUsersCheckReply>>>,
 }
 
 impl FakeJobs {
@@ -938,6 +1241,46 @@ impl JobPort for FakeJobs {
         self.role_calls.lock().unwrap().push(format!("delete:{}", request.name));
         self.role_answer()
     }
+
+    async fn publish_project_delete(
+        &self,
+        job: &JobEnvelope<ProjectDeleteJob>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.project_deletes.lock().unwrap().push(job.payload.project_id);
+        Ok(())
+    }
+
+    async fn publish_app_users(
+        &self,
+        job: &JobEnvelope<AppUsersJob>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.app_users_jobs.lock().unwrap().push(job.payload.clone());
+        Ok(())
+    }
+
+    async fn publish_app_users_sync(
+        &self,
+        job: &JobEnvelope<AppUsersSyncJob>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.app_users_sync_jobs.lock().unwrap().push(job.payload.clone());
+        Ok(())
+    }
+
+    async fn check_app_users_location(
+        &self,
+        request: &AppUsersCheckRequest,
+    ) -> Result<AppUsersCheckReply, Box<dyn std::error::Error + Send + Sync>> {
+        self.app_users_checks
+            .lock()
+            .unwrap()
+            .push(format!("{}.{}.{}", request.pg_database, request.schema, request.table));
+        Ok(self
+            .app_users_check_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(AppUsersCheckReply { ok: true, code: None, error: None }))
+    }
 }
 
 impl FakeJobs {
@@ -1022,6 +1365,27 @@ async fn spawn_app_in_mode(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &st
 }
 
 async fn spawn_app_full(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, mode: Mode, cap: u32) -> TestApp {
+    spawn_app_parts(
+        metadata,
+        jobs,
+        rest_url,
+        mode,
+        cap,
+        None,
+        Arc::new(cheladb_query::app_users::PgUsersDb::new()),
+    )
+    .await
+}
+
+async fn spawn_app_parts(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    cap: u32,
+    zitadel: Option<cheladb_zitadel::client::Zitadel>,
+    users_db: Arc<dyn cheladb_query::app_users::UsersDb>,
+) -> TestApp {
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
     let locator = FakeLocator::default();
@@ -1041,6 +1405,8 @@ async fn spawn_app_full(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, 
         data_api_database_cap: cap,
         locator: Arc::new(locator.clone()),
         console: Console::default(),
+        zitadel,
+        users_db,
     });
     let app: Router = build_router(state);
 
@@ -1424,7 +1790,9 @@ fn overview_with_database(tenant_id: TenantId) -> TenantOverview {
         slug: "demo".into(),
         projects: vec![ProjectOverview {
             id: project_id,
+            name: "Default".into(),
             slug: "default".into(),
+            status: ProjectStatus::Active,
             databases: vec![db.record],
         }],
     }
@@ -5489,4 +5857,1120 @@ async fn owner_console_schema_shows_what_only_the_owner_reaches() {
     // rest was never asked; no role was checked.
     assert!(t.role_checks().is_empty());
     scratch.drop().await;
+}
+
+// ---- Projects ---------------------------------------------------------------------
+
+async fn send(app: &TestApp, method: Method, path: &str, org: &str, body: Option<Value>) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .request(method, format!("{}{path}", app.base))
+        .header(IDENTITY_HEADER, app.token_for_org(org));
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    req.send().await.unwrap()
+}
+
+/// org-1's tenant with the app running.
+async fn projects_app(jobs: FakeJobs) -> (TestApp, FakeMetadata, TenantId) {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let app = spawn_app(metadata.clone(), jobs).await;
+    (app, metadata, tenant)
+}
+
+fn project_database(tenant: TenantId, project: ProjectId, status: DatabaseStatus) -> Db {
+    let mut db = sample_database(tenant);
+    db.project_id = project;
+    db.status = status;
+    db.main.status = BranchStatus::from(status);
+    db
+}
+
+#[tokio::test]
+async fn list_projects_only_mine() {
+    let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
+    let mine = metadata.create_project(tenant, "Mine").await.unwrap();
+    metadata.create_project(TenantId::new(), "Theirs").await.unwrap();
+    let body: Value = send(&app, Method::GET, "/v1/projects", "org-1", None).await.json().await.unwrap();
+    let list = body.as_array().unwrap();
+    assert_eq!(list.len(), 1, "{body}");
+    assert_eq!(list[0]["id"], json!(mine.id));
+    assert_eq!(list[0]["name"], "Mine");
+    assert_eq!(list[0]["status"], "active");
+    assert!(list[0]["app_users"].is_null());
+}
+
+#[tokio::test]
+async fn create_project_201_with_slug() {
+    let (app, _, _) = projects_app(FakeJobs::default()).await;
+    let resp = send(&app, Method::POST, "/v1/projects", "org-1", Some(json!({ "name": "  My App " }))).await;
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "My App");
+    assert_eq!(body["slug"], "my-app");
+    assert_eq!(body["status"], "active");
+    assert!(body["error"].is_null());
+    assert!(body["id"].is_string() && body["created_at"].is_string() && body["updated_at"].is_string());
+    let again: Value = send(&app, Method::POST, "/v1/projects", "org-1", Some(json!({ "name": "My App" })))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["slug"], "my-app-2");
+}
+
+#[tokio::test]
+async fn create_project_name_validation_422() {
+    let (app, _, _) = projects_app(FakeJobs::default()).await;
+    for name in ["", "   ", &"x".repeat(65)] {
+        let resp = send(&app, Method::POST, "/v1/projects", "org-1", Some(json!({ "name": name }))).await;
+        let body = error_of(resp, 422).await;
+        assert_eq!(code_of(&body), "invalid_request");
+    }
+    let resp = send(&app, Method::POST, "/v1/projects", "org-1", Some(json!({}))).await;
+    assert_eq!(resp.status(), 422);
+}
+
+#[tokio::test]
+async fn get_other_tenant_project_404() {
+    let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
+    let mine = metadata.create_project(tenant, "Mine").await.unwrap();
+    let theirs = metadata.create_project(TenantId::new(), "Theirs").await.unwrap();
+    let resp = send(&app, Method::GET, &format!("/v1/projects/{}", mine.id), "org-1", None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["slug"], "mine");
+    for id in [theirs.id, ProjectId::new()] {
+        let resp = send(&app, Method::GET, &format!("/v1/projects/{id}"), "org-1", None).await;
+        assert_eq!(code_of(&error_of(resp, 404).await), "not_found");
+    }
+}
+
+#[tokio::test]
+async fn rename_project_changes_name_not_slug() {
+    let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
+    let p = metadata.create_project(tenant, "Old name").await.unwrap();
+    let path = format!("/v1/projects/{}", p.id);
+    let resp = send(&app, Method::PATCH, &path, "org-1", Some(json!({ "name": " New name " }))).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "New name");
+    assert_eq!(body["slug"], "old-name");
+    let resp = send(&app, Method::PATCH, &path, "org-1", Some(json!({ "name": "" }))).await;
+    assert_eq!(resp.status(), 422);
+    let resp = send(&app, Method::PATCH, &format!("/v1/projects/{}", ProjectId::new()), "org-1", Some(json!({ "name": "x" }))).await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn rename_deleting_project_409() {
+    let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
+    let p = metadata.create_project(tenant, "Going").await.unwrap();
+    metadata.begin_project_delete(tenant, p.id).await.unwrap();
+    let resp = send(&app, Method::PATCH, &format!("/v1/projects/{}", p.id), "org-1", Some(json!({ "name": "Back" }))).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "project_deleting");
+}
+
+#[tokio::test]
+async fn delete_project_needs_the_slug() {
+    let jobs = FakeJobs::default();
+    let (app, metadata, tenant) = projects_app(jobs.clone()).await;
+    let p = metadata.create_project(tenant, "Shop").await.unwrap();
+    let path = format!("/v1/projects/{}", p.id);
+    for confirm in ["Shop", "shop ", "other", ""] {
+        let resp = send(&app, Method::DELETE, &path, "org-1", Some(json!({ "confirm": confirm }))).await;
+        let body = error_of(resp, 422).await;
+        assert_eq!(message_of(&body), "type the project's slug to confirm");
+    }
+    assert_eq!(send(&app, Method::DELETE, &path, "org-1", Some(json!({}))).await.status(), 422);
+    assert!(jobs.project_deletes.lock().unwrap().is_empty());
+    assert_eq!(metadata.get_project(tenant, p.id).await.unwrap().unwrap().status, ProjectStatus::Active);
+    // An unknown project is 404 before the slug is looked at.
+    let resp = send(&app, Method::DELETE, &format!("/v1/projects/{}", ProjectId::new()), "org-1", Some(json!({ "confirm": "x" }))).await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn delete_project_publishes_database_and_project_jobs() {
+    let jobs = FakeJobs::default();
+    let (app, metadata, tenant) = projects_app(jobs.clone()).await;
+    let p = metadata.create_project(tenant, "Shop").await.unwrap();
+    let ready = project_database(tenant, p.id, DatabaseStatus::Ready);
+    let failed = project_database(tenant, p.id, DatabaseStatus::Failed);
+    let other = project_database(tenant, ProjectId::new(), DatabaseStatus::Ready);
+    let expected: HashSet<DatabaseId> = [ready.database_id, failed.database_id].into();
+    for db in [ready, failed, other] {
+        metadata.insert_database(db);
+    }
+    let resp = send(&app, Method::DELETE, &format!("/v1/projects/{}", p.id), "org-1", Some(json!({ "confirm": "shop" }))).await;
+    assert_eq!(resp.status(), 202);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "deleting");
+    assert_eq!(body["id"], json!(p.id));
+    let deleted: HashSet<DatabaseId> = jobs.deleted.lock().unwrap().iter().copied().collect();
+    assert_eq!(deleted, expected);
+    assert_eq!(*jobs.project_deletes.lock().unwrap(), vec![p.id]);
+    // The project stays visible, as deleting.
+    let body: Value = send(&app, Method::GET, &format!("/v1/projects/{}", p.id), "org-1", None).await.json().await.unwrap();
+    assert_eq!(body["status"], "deleting");
+}
+
+#[tokio::test]
+async fn delete_project_refusals_map_to_codes() {
+    let jobs = FakeJobs::default();
+    let (app, metadata, tenant) = projects_app(jobs.clone()).await;
+    let delete = |p: ProjectRecord| {
+        let app = &app;
+        async move {
+            let resp = send(app, Method::DELETE, &format!("/v1/projects/{}", p.id), "org-1", Some(json!({ "confirm": p.slug }))).await;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap();
+            (status.as_u16(), body)
+        }
+    };
+
+    let pending = metadata.create_project(tenant, "Pending").await.unwrap();
+    metadata.insert_database(project_database(tenant, pending.id, DatabaseStatus::Provisioning));
+    let (status, body) = delete(pending).await;
+    assert_eq!((status, code_of(&body)), (409, "database_not_ready"), "{body}");
+
+    let protected = metadata.create_project(tenant, "Protected").await.unwrap();
+    let mut db = project_database(tenant, protected.id, DatabaseStatus::Ready);
+    db.main.protected = true;
+    metadata.insert_database(db);
+    let (status, body) = delete(protected).await;
+    assert_eq!((status, code_of(&body)), (409, "branch_protected"), "{body}");
+
+    let busy = metadata.create_project(tenant, "Busy").await.unwrap();
+    let db = project_database(tenant, busy.id, DatabaseStatus::Ready);
+    metadata
+        .begin_enable_app_users(&NewProjectAuth {
+            project_id: busy.id,
+            database_id: db.database_id,
+            pg_database: "web1",
+            schema_name: "public",
+            table_name: "users",
+            email_verification: false,
+            on_delete: OnDelete::Delete,
+        })
+        .await
+        .unwrap();
+    metadata.insert_database(db);
+    let (status, body) = delete(busy).await;
+    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
+
+    let going = metadata.create_project(tenant, "Going").await.unwrap();
+    metadata.begin_project_delete(tenant, going.id).await.unwrap();
+    let (status, body) = delete(going).await;
+    assert_eq!((status, code_of(&body)), (409, "project_deleting"), "{body}");
+
+    let theirs = metadata.create_project(TenantId::new(), "Theirs").await.unwrap();
+    let (status, _) = delete(theirs).await;
+    assert_eq!(status, 404);
+
+    assert!(jobs.deleted.lock().unwrap().is_empty());
+    assert!(jobs.project_deletes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn create_database_in_deleting_project_409() {
+    let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
+    let p = metadata.create_project(tenant, "Going").await.unwrap();
+    metadata.begin_project_delete(tenant, p.id).await.unwrap();
+    let body = json!({ "tenant_id": tenant, "project_id": p.id, "name": "demo" });
+    let resp = post_create(&app, Some(&app.token_for_org("org-1")), body).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "project_deleting");
+}
+
+#[tokio::test]
+async fn me_lists_project_name_and_status() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let mut overview = overview_with_database(tenant);
+    overview.projects.push(ProjectOverview {
+        id: ProjectId::new(),
+        name: "Going".into(),
+        slug: "going".into(),
+        status: ProjectStatus::Deleting,
+        databases: vec![],
+    });
+    metadata.set_overview(overview);
+    let app = spawn_app(metadata, FakeJobs::default()).await;
+    let body: Value = get_me(&app, Some(&app.token_for_org("org-1"))).await.json().await.unwrap();
+    let projects = &body["tenant"]["projects"];
+    assert_eq!((projects[0]["name"].as_str(), projects[0]["status"].as_str()), (Some("Default"), Some("active")));
+    assert_eq!((projects[1]["name"].as_str(), projects[1]["status"].as_str()), (Some("Going"), Some("deleting")));
+}
+
+// ---- App users: settings and user admin ---------------------------------------------
+
+use cheladb_query::app_users::{NewUserRow, PendingInsert, SyncTarget, UserRowError, UsersDb};
+use cheladb_zitadel::client::Zitadel;
+use cheladb_zitadel::mock::{ADMIN_TOKEN, MockZitadel, User as MockUser};
+
+/// What `FakeUsersDb` does when asked to insert or to commit.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum UdbFault {
+    Constraint,
+    EmailTaken,
+    CommitFails,
+}
+
+/// A users-table writer that journals what it was asked, and (with a probe) how many users
+/// Zitadel had at each step.
+#[derive(Clone, Default)]
+struct FakeUsersDb {
+    journal: Arc<Mutex<Vec<String>>>,
+    targets: Arc<Mutex<Vec<SyncTarget>>>,
+    rows: Arc<Mutex<Vec<NewUserRow>>>,
+    fault: Arc<Mutex<Option<UdbFault>>>,
+    probe: Arc<Mutex<Option<Arc<Mutex<cheladb_zitadel::mock::Inner>>>>>,
+}
+
+impl FakeUsersDb {
+    fn zitadel_users(&self) -> usize {
+        self.probe.lock().unwrap().as_ref().map_or(0, |i| i.lock().unwrap().users.len())
+    }
+    fn journal(&self) -> Vec<String> {
+        self.journal.lock().unwrap().clone()
+    }
+}
+
+struct FakePending {
+    db: FakeUsersDb,
+}
+
+#[async_trait::async_trait]
+impl PendingInsert for FakePending {
+    async fn commit(self: Box<Self>) -> Result<(), UserRowError> {
+        let users = self.db.zitadel_users();
+        self.db.journal.lock().unwrap().push(format!("commit:users={users}"));
+        if *self.db.fault.lock().unwrap() == Some(UdbFault::CommitFails) {
+            return Err(UserRowError::Unavailable("commit failed".into()));
+        }
+        Ok(())
+    }
+    async fn rollback(self: Box<Self>) {
+        self.db.journal.lock().unwrap().push("rollback".into());
+    }
+}
+
+#[async_trait::async_trait]
+impl UsersDb for FakeUsersDb {
+    async fn begin_insert(&self, target: &SyncTarget, row: &NewUserRow) -> Result<Box<dyn PendingInsert>, UserRowError> {
+        let users = self.zitadel_users();
+        self.journal.lock().unwrap().push(format!("begin:{}:users={users}", row.email));
+        self.targets.lock().unwrap().push(target.clone());
+        self.rows.lock().unwrap().push(row.clone());
+        match *self.fault.lock().unwrap() {
+            Some(UdbFault::Constraint) => Err(UserRowError::Constraint {
+                message: "null value in column \"nick\"".into(),
+                constraint: Some("users_nick_check".into()),
+            }),
+            Some(UdbFault::EmailTaken) => Err(UserRowError::EmailTaken),
+            _ => Ok(Box::new(FakePending { db: self.clone() })),
+        }
+    }
+}
+
+const AU_ORG: &str = "o1";
+const AU_PASSWORD: &str = "correct-horse-9";
+
+/// A project with a ready database (main branch, Postgres database `web1` served by the data
+/// API), org-1's tenant, and optionally Zitadel's mock behind the orchestrator.
+struct Au {
+    app: TestApp,
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    tenant: TenantId,
+    project: ProjectRecord,
+    db: DatabaseId,
+    main: BranchId,
+    mock: Option<MockZitadel>,
+    udb: FakeUsersDb,
+}
+
+async fn au_env(with_zitadel: bool) -> Au {
+    let metadata = FakeMetadata::default();
+    let jobs = FakeJobs::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let project = metadata.create_project(tenant, "Web").await.unwrap();
+    let db = project_database(tenant, project.id, DatabaseStatus::Ready);
+    let (db_id, main) = (db.database_id, db.main.id);
+    metadata.insert_database(db);
+    metadata.add_branch_db(main, "web1", "owner", DatabaseOrigin::Main);
+    metadata.set_data_api(main, "web1", cheladb_metadata::DataApiState::On);
+    let udb = FakeUsersDb::default();
+    let (mock, zitadel) = if with_zitadel {
+        let mock = MockZitadel::start().await;
+        *udb.probe.lock().unwrap() = Some(mock.inner.clone());
+        let z = Zitadel::new(&mock.base, ADMIN_TOKEN);
+        (Some(mock), Some(z))
+    } else {
+        (None, None)
+    };
+    let app = spawn_app_parts(
+        metadata.clone(),
+        jobs.clone(),
+        "http://127.0.0.1:9",
+        Mode::SelfHosted,
+        10,
+        zitadel,
+        Arc::new(udb.clone()),
+    )
+    .await;
+    Au { app, metadata, jobs, tenant, project, db: db_id, main, mock, udb }
+}
+
+impl Au {
+    fn path(&self, rest: &str) -> String {
+        format!("/v1/projects/{}{rest}", self.project.id)
+    }
+
+    async fn call(&self, method: Method, rest: &str, body: Option<Value>) -> (u16, Value) {
+        let resp = send(&self.app, method, &self.path(rest), "org-1", body).await;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        (status, if text.is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap() })
+    }
+
+    fn set_auth(&self, status: AppUsersStatus) {
+        let now = chrono::Utc::now();
+        self.metadata.project_auths.lock().unwrap().insert(
+            self.project.id,
+            ProjectAuth {
+                project_id: self.project.id,
+                status,
+                error: None,
+                zitadel_org_id: Some(AU_ORG.into()),
+                database_id: self.db,
+                pg_database: "web1".into(),
+                schema_name: "public".into(),
+                table_name: "users".into(),
+                email_verification: false,
+                on_delete: OnDelete::Delete,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+    }
+
+    fn auth(&self) -> ProjectAuth {
+        self.metadata.project_auths.lock().unwrap().get(&self.project.id).cloned().expect("project_auth row")
+    }
+
+    /// The sync role's sealed password on the auth database's main branch.
+    fn seal_sync_role(&self) {
+        let sealed = cheladb_secrets::seal_role_password(&self.app.key, &self.main.to_string(), "cheladb_auth_sync", "sync-pw");
+        self.metadata.branch_syncs.lock().unwrap().insert(
+            self.main,
+            BranchAuthSync { branch_id: self.main, pg_database: "web1".into(), password_sealed: sealed },
+        );
+        *self.app.locator.addr.lock().unwrap() = Some("127.0.0.1:55432".parse().unwrap());
+    }
+
+    fn mock(&self) -> &MockZitadel {
+        self.mock.as_ref().expect("zitadel mock")
+    }
+
+    /// A Zitadel user with a UUID id, in org `org`.
+    fn add_user(&self, org: &str, email: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        self.mock().inner.lock().unwrap().users.push(MockUser {
+            id: id.to_string(),
+            email: email.into(),
+            password: AU_PASSWORD.into(),
+            verified: true,
+            locked: false,
+            org_id: org.into(),
+            username: email.into(),
+            inactive: false,
+            created_at: "2026-10-03T10:00:00Z".into(),
+        });
+        id
+    }
+
+    fn add_session(&self, user: uuid::Uuid, zitadel_session: &str) {
+        let now = chrono::Utc::now();
+        self.metadata.app_sessions.lock().unwrap().push(AppSession {
+            id: uuid::Uuid::new_v4(),
+            project_id: self.project.id,
+            user_id: user,
+            zitadel_session_id: zitadel_session.into(),
+            created_at: now,
+            last_used_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            revoked_at: None,
+        });
+    }
+
+    fn live_sessions(&self, user: uuid::Uuid) -> usize {
+        self.metadata
+            .app_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.user_id == user && s.revoked_at.is_none())
+            .count()
+    }
+
+    fn syncs(&self) -> Vec<AppUsersSyncJob> {
+        self.jobs.app_users_sync_jobs.lock().unwrap().clone()
+    }
+
+    fn jobs_published(&self) -> Vec<AppUsersJob> {
+        self.jobs.app_users_jobs.lock().unwrap().clone()
+    }
+}
+
+fn put_body(au: &Au) -> Value {
+    json!({ "database_id": au.db })
+}
+
+#[tokio::test]
+async fn get_app_users_404_until_enabled_then_the_settings() {
+    let au = au_env(false).await;
+    let (status, body) = au.call(Method::GET, "/app-users", None).await;
+    assert_eq!((status, code_of(&body)), (404, "app_users_disabled"), "{body}");
+    au.set_auth(AppUsersStatus::Enabled);
+    let (status, body) = au.call(Method::GET, "/app-users", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "enabled");
+    assert_eq!(body["database_id"], au.db.to_string());
+    assert_eq!((body["pg_database"].as_str(), body["schema"].as_str(), body["table"].as_str()), (Some("web1"), Some("public"), Some("users")));
+    assert_eq!((body["email_verification"].as_bool(), body["on_delete"].as_str()), (Some(false), Some("delete")));
+    assert_eq!(body["zitadel_org_id"], AU_ORG);
+    assert!(body["error"].is_null());
+}
+
+#[tokio::test]
+async fn app_users_routes_refuse_a_deleting_project_and_another_tenants() {
+    let au = au_env(false).await;
+    let theirs = au.metadata.create_project(TenantId::new(), "Theirs").await.unwrap();
+    let resp = send(&au.app, Method::GET, &format!("/v1/projects/{}/app-users", theirs.id), "org-1", None).await;
+    assert_eq!(resp.status(), 404);
+    au.metadata.begin_project_delete(au.tenant, au.project.id).await.unwrap();
+    for (method, rest) in [(Method::GET, "/app-users"), (Method::DELETE, "/app-users"), (Method::GET, "/users")] {
+        let (status, body) = au.call(method, rest, None).await;
+        assert_eq!((status, code_of(&body)), (409, "project_deleting"), "{rest}: {body}");
+    }
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!((status, code_of(&body)), (409, "project_deleting"), "{body}");
+}
+
+#[tokio::test]
+async fn enable_app_users_202_publishes() {
+    let au = au_env(true).await;
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "enabling");
+    assert_eq!((body["pg_database"].as_str(), body["schema"].as_str(), body["table"].as_str()), (Some("web1"), Some("public"), Some("users")));
+    assert_eq!((body["email_verification"].as_bool(), body["on_delete"].as_str()), (Some(false), Some("delete")));
+    assert_eq!(au.jobs_published(), vec![AppUsersJob::Enable { project_id: au.project.id }]);
+    assert_eq!(*au.jobs.app_users_checks.lock().unwrap(), vec!["web1.public.users".to_string()]);
+    assert_eq!(au.auth().status, AppUsersStatus::Enabling);
+}
+
+#[tokio::test]
+async fn put_while_enabling_republishes() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabling);
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(au.jobs_published(), vec![AppUsersJob::Enable { project_id: au.project.id }]);
+    assert!(au.jobs.app_users_checks.lock().unwrap().is_empty(), "an existing location isn't checked again");
+}
+
+#[tokio::test]
+async fn delete_while_disabling_republishes() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Disabling);
+    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(au.jobs_published(), vec![AppUsersJob::Disable { project_id: au.project.id }]);
+}
+
+#[tokio::test]
+async fn reserved_schema_is_422() {
+    let au = au_env(true).await;
+    for schema in ["cheladb", "information_schema", "pg_x", "pg_catalog"] {
+        let mut body = put_body(&au);
+        body["schema"] = json!(schema);
+        let (status, answer) = au.call(Method::PUT, "/app-users", Some(body)).await;
+        assert_eq!(status, 422, "{schema}: {answer}");
+    }
+    assert!(au.jobs_published().is_empty());
+    assert!(au.metadata.project_auths.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn app_users_enable_refusals() {
+    let au = au_env(true).await;
+    let put = |extra: Value| {
+        let mut body = put_body(&au);
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    };
+    // Identifiers and on_delete.
+    for bad in [json!({"schema": "Bad-Name"}), json!({"table": "1x"}), json!({"table": ""}), json!({"on_delete": "keep"}), json!({"pg_database": ""})] {
+        let (status, body) = au.call(Method::PUT, "/app-users", Some(put(bad.clone()))).await;
+        assert_eq!(status, 422, "{bad}: {body}");
+    }
+    // Another project's database (same tenant) is unknown to this one.
+    let other = au.metadata.create_project(au.tenant, "Other").await.unwrap();
+    let foreign = project_database(au.tenant, other.id, DatabaseStatus::Ready);
+    let foreign_id = foreign.database_id;
+    au.metadata.insert_database(foreign);
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": foreign_id}))).await;
+    assert_eq!((status, code_of(&body)), (404, "not_found"), "{body}");
+    // Another tenant's.
+    let theirs = project_database(TenantId::new(), ProjectId::new(), DatabaseStatus::Ready);
+    let theirs_id = theirs.database_id;
+    au.metadata.insert_database(theirs);
+    let (status, _) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": theirs_id}))).await;
+    assert_eq!(status, 404);
+    // Not ready.
+    let pending = project_database(au.tenant, au.project.id, DatabaseStatus::Provisioning);
+    let pending_id = pending.database_id;
+    au.metadata.insert_database(pending);
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": pending_id}))).await;
+    assert_eq!((status, code_of(&body)), (409, "database_not_ready"), "{body}");
+    // The data API is off on a child branch.
+    let child = au.metadata.add_branch(au.db, "dev", au.main, BranchKind::Normal, BranchStatus::Ready);
+    au.metadata.add_branch_db(child, "web1", "owner", DatabaseOrigin::Main);
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!((status, code_of(&body)), (409, "data_api_not_enabled"), "{body}");
+    au.metadata.set_data_api(child, "web1", cheladb_metadata::DataApiState::On);
+    // The table exists.
+    *au.jobs.app_users_check_reply.lock().unwrap() =
+        Some(AppUsersCheckReply { ok: false, code: Some("app_users_table_exists".into()), error: Some("exists".into()) });
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!((status, code_of(&body)), (409, "app_users_table_exists"), "{body}");
+    // Any other worker failure is a 503.
+    *au.jobs.app_users_check_reply.lock().unwrap() =
+        Some(AppUsersCheckReply { ok: false, code: Some("boom".into()), error: Some("no".into()) });
+    let (status, _) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!(status, 503);
+    assert!(au.jobs_published().is_empty());
+    assert!(au.metadata.project_auths.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn put_again_updates_settings_200() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let mut body = put_body(&au);
+    body["email_verification"] = json!(true);
+    body["on_delete"] = json!("mark");
+    let (status, answer) = au.call(Method::PUT, "/app-users", Some(body)).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!((answer["email_verification"].as_bool(), answer["on_delete"].as_str()), (Some(true), Some("mark")));
+    assert_eq!(answer["status"], "enabled");
+    assert_eq!(au.auth().on_delete, OnDelete::Mark);
+    assert!(au.jobs_published().is_empty());
+}
+
+#[tokio::test]
+async fn put_with_other_location_409_location_fixed() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    for extra in [json!({"schema": "app"}), json!({"table": "people"}), json!({"pg_database": "web2"})] {
+        let mut body = put_body(&au);
+        body[extra.as_object().unwrap().keys().next().unwrap()] = extra.as_object().unwrap().values().next().unwrap().clone();
+        let (status, answer) = au.call(Method::PUT, "/app-users", Some(body)).await;
+        assert_eq!((status, code_of(&answer)), (409, "app_users_location_fixed"), "{extra}: {answer}");
+    }
+    let other = project_database(au.tenant, au.project.id, DatabaseStatus::Ready);
+    let other_id = other.database_id;
+    au.metadata.insert_database(other);
+    let (status, answer) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": other_id}))).await;
+    assert_eq!((status, code_of(&answer)), (409, "app_users_location_fixed"), "{answer}");
+    assert_eq!(au.auth().database_id, au.db);
+}
+
+#[tokio::test]
+async fn retry_after_failed_202() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Failed);
+    au.metadata.project_auths.lock().unwrap().get_mut(&au.project.id).unwrap().error = Some("boom".into());
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "enabling");
+    assert!(body["error"].is_null());
+    assert_eq!(au.jobs_published(), vec![AppUsersJob::Enable { project_id: au.project.id }]);
+}
+
+#[tokio::test]
+async fn disable_refused_while_users_exist() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.add_user(AU_ORG, "a@x.test");
+    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
+    assert_eq!((status, code_of(&body)), (409, "app_users_has_users"), "{body}");
+    assert!(au.jobs_published().is_empty());
+    assert_eq!(au.auth().status, AppUsersStatus::Enabled);
+}
+
+#[tokio::test]
+async fn disable_202_publishes() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.add_user("o2", "elsewhere@x.test");
+    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "disabling");
+    assert_eq!(au.jobs_published(), vec![AppUsersJob::Disable { project_id: au.project.id }]);
+    assert_eq!(au.auth().status, AppUsersStatus::Disabling);
+}
+
+#[tokio::test]
+async fn create_user_inserts_then_creates_then_commits() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "new@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!((body["email"].as_str(), body["email_verified"].as_bool(), body["state"].as_str()), (Some("new@x.test"), Some(true), Some("active")));
+    let id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    // The row went in first (no Zitadel user yet) and committed after Zitadel had the user.
+    assert_eq!(au.udb.journal(), vec!["begin:new@x.test:users=0".to_string(), "commit:users=1".to_string()]);
+    let user = au.mock().user_by_id(&id.to_string()).expect("zitadel user");
+    assert_eq!((user.email.as_str(), user.org_id.as_str(), user.verified), ("new@x.test", AU_ORG, true));
+    let target = au.udb.targets.lock().unwrap()[0].clone();
+    assert_eq!(
+        (target.branch_id, target.host.as_str(), target.port, target.database.as_str(), target.user.as_str(), target.password.as_str()),
+        (au.main.as_uuid(), "127.0.0.1", 55432, "web1", "cheladb_auth_sync", "sync-pw")
+    );
+    assert_eq!((target.schema.as_str(), target.table.as_str()), ("public", "users"));
+    let row = au.udb.rows.lock().unwrap()[0].clone();
+    assert_eq!((row.id, row.email_verified), (id, true));
+    assert!(row.data.is_empty());
+    let syncs = au.syncs();
+    assert_eq!(syncs.len(), 1);
+    assert_eq!((syncs[0].user_id, syncs[0].origin_branch_id, syncs[0].data.is_none()), (id, Some(au.main), true));
+    assert_eq!(syncs[0].project_id, au.project.id);
+}
+
+#[tokio::test]
+async fn create_user_email_verified_false_is_passed_on() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    let (status, body) =
+        au.call(Method::POST, "/users", Some(json!({"email": "u@x.test", "password": AU_PASSWORD, "email_verified": false}))).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["email_verified"], false);
+    assert!(!au.udb.rows.lock().unwrap()[0].email_verified);
+    assert!(!au.mock().user("u@x.test").unwrap().verified);
+}
+
+#[tokio::test]
+async fn create_user_commit_failure_deletes_zitadel_user() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    *au.udb.fault.lock().unwrap() = Some(UdbFault::CommitFails);
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!((status, code_of(&body)), (503, "unavailable"), "{body}");
+    assert!(au.mock().user("n@x.test").is_none());
+    assert!(au.mock().calls().iter().any(|c| c.starts_with("DELETE /v2/users/")), "{:?}", au.mock().calls());
+    assert!(au.syncs().is_empty());
+}
+
+#[tokio::test]
+async fn create_user_constraint_422_never_calls_zitadel() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    *au.udb.fault.lock().unwrap() = Some(UdbFault::Constraint);
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!((status, code_of(&body)), (422, "constraint_violation"), "{body}");
+    assert_eq!(body["error"]["constraint"], "users_nick_check");
+    assert!(au.mock().calls().is_empty(), "{:?}", au.mock().calls());
+    assert!(au.syncs().is_empty());
+}
+
+#[tokio::test]
+async fn create_user_email_taken_and_weak_password() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    *au.udb.fault.lock().unwrap() = Some(UdbFault::EmailTaken);
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
+    *au.udb.fault.lock().unwrap() = None;
+    // The user exists in the org but the table doesn't know it (N2): the org is asked before
+    // Zitadel could make a duplicate, and the row is rolled back.
+    au.add_user(AU_ORG, "dup@x.test");
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "DUP@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
+    assert_eq!(au.udb.journal().last().map(String::as_str), Some("rollback"));
+    assert!(!au.mock().calls().contains(&"POST /v2/users/new".to_string()));
+    // Zitadel's password policy.
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "w@x.test", "password": "short"}))).await;
+    assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
+    assert_eq!(au.udb.journal().last().map(String::as_str), Some("rollback"));
+    assert!(au.syncs().is_empty());
+}
+
+#[tokio::test]
+async fn list_users_pages_and_searches() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    for i in 0..55 {
+        au.add_user(AU_ORG, &format!("user{i:02}@x.test"));
+    }
+    au.add_user("o2", "stranger@x.test");
+    let (status, page) = au.call(Method::GET, "/users", None).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["users"].as_array().unwrap().len(), 50);
+    let token = page["next_page_token"].as_str().expect("next token").to_string();
+    assert_eq!(page["users"][0]["state"], "active");
+    let (status, page2) = au.call(Method::GET, &format!("/users?page_token={token}"), None).await;
+    assert_eq!(status, 200, "{page2}");
+    assert_eq!(page2["users"].as_array().unwrap().len(), 5);
+    assert!(page2["next_page_token"].is_null());
+    let (_, found) = au.call(Method::GET, "/users?search=USER07", None).await;
+    assert_eq!(found["users"].as_array().unwrap().len(), 1);
+    assert_eq!(found["users"][0]["email"], "user07@x.test");
+    let (status, bad) = au.call(Method::GET, "/users?page_token=not-a-token", None).await;
+    assert_eq!(status, 422, "{bad}");
+}
+
+#[tokio::test]
+async fn get_user_and_sessions() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    au.add_session(id, "s1");
+    let (status, body) = au.call(Method::GET, &format!("/users/{id}"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((body["id"].as_str(), body["email"].as_str()), (Some(id.to_string().as_str()), Some("a@x.test")));
+    let (status, sessions) = au.call(Method::GET, &format!("/users/{id}/sessions"), None).await;
+    assert_eq!(status, 200, "{sessions}");
+    assert_eq!(sessions.as_array().unwrap().len(), 1);
+    for key in ["id", "created_at", "last_used_at", "expires_at"] {
+        assert!(sessions[0][key].is_string(), "{key}");
+    }
+    assert!(sessions[0].get("zitadel_session_id").is_none());
+    let (status, _) = au.call(Method::GET, &format!("/users/{}", uuid::Uuid::new_v4()), None).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn update_password_revokes_sessions() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    au.add_session(id, "s1");
+    au.add_session(id, "s2");
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"password": "brand-new-pw-1"}))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(au.mock().user_by_id(&id.to_string()).unwrap().password, "brand-new-pw-1");
+    assert_eq!(au.live_sessions(id), 0);
+    let calls = au.mock().calls();
+    assert!(calls.contains(&"DELETE /v2/sessions/s1".to_string()) && calls.contains(&"DELETE /v2/sessions/s2".to_string()), "{calls:?}");
+    assert_eq!(au.syncs().len(), 1);
+    assert_eq!(au.syncs()[0].user_id, id);
+}
+
+#[tokio::test]
+async fn update_email_and_flag() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "b@x.test"}))).await;
+    assert_eq!(status, 200, "{body}");
+    let user = au.mock().user_by_id(&id.to_string()).unwrap();
+    assert_eq!((user.email.as_str(), user.verified), ("b@x.test", true));
+    // A new address can be set unverified (a code is sent).
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "c@x.test", "email_verified": false}))).await;
+    assert_eq!(status, 200, "{body}");
+    let user = au.mock().user_by_id(&id.to_string()).unwrap();
+    assert_eq!((user.email.as_str(), user.verified), ("c@x.test", false));
+    assert_eq!(body["email_verified"], false);
+    assert_eq!(au.syncs().len(), 2);
+}
+
+/// The Studio drawer's "Email verified" toggle (browser pass: 503). Zitadel v4.19.1 refuses
+/// `POST /v2/users/{id}/email` with the unchanged address (`Errors.User.Email.NotChanged`), so
+/// the flag alone goes through `PATCH /v2/users/{id}`.
+#[tokio::test]
+async fn update_email_verified_alone_marks_the_current_address() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    au.mock().inner.lock().unwrap().users.iter_mut().for_each(|u| u.verified = false);
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email_verified": true}))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((body["email"].as_str(), body["email_verified"].as_bool()), (Some("a@x.test"), Some(true)));
+    assert!(au.mock().user_by_id(&id.to_string()).unwrap().verified);
+    let calls = au.mock().calls();
+    assert!(calls.contains(&format!("PATCH /v2/users/{id}")), "{calls:?}");
+    assert!(!calls.contains(&format!("POST /v2/users/{id}/email")), "{calls:?}");
+    assert_eq!(au.syncs().len(), 1);
+    // Again, and with the same address spelled out: nothing to change, still 200.
+    for patch in [json!({"email_verified": true}), json!({"email": "a@x.test", "email_verified": true})] {
+        let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(patch.clone())).await;
+        assert_eq!(status, 200, "{patch}: {body}");
+        assert_eq!(body["email_verified"], true);
+    }
+    // Zitadel can't take the verification back without a new address: 422, nothing changes.
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email_verified": false}))).await;
+    assert_eq!((status, code_of(&body)), (422, "invalid_request"), "{body}");
+    assert!(au.mock().user_by_id(&id.to_string()).unwrap().verified);
+    // An unverified user asked to stay unverified: nothing to do, 200.
+    let other = au.add_user(AU_ORG, "b@x.test");
+    au.mock().inner.lock().unwrap().users.iter_mut().filter(|u| u.id == other.to_string()).for_each(|u| u.verified = false);
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{other}"), Some(json!({"email_verified": false}))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["email_verified"], false);
+}
+
+/// N2: an address two users of the org already share (made outside Cheladb's checks) is taken.
+#[tokio::test]
+async fn update_to_an_ambiguous_email_is_taken() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    let a = au.add_user(AU_ORG, "a@x.test");
+    au.add_user(AU_ORG, "c@x.test");
+    au.add_user(AU_ORG, "C@x.test");
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{a}"), Some(json!({"email": "c@x.test"}))).await;
+    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "c@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
+}
+
+/// Zitadel's precondition refusals (already in that state) are 409s, never 503.
+#[tokio::test]
+async fn state_changes_already_done_are_409() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    let (status, body) = au.call(Method::POST, &format!("/users/{id}/reactivate"), None).await;
+    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
+    let (status, body) = au.call(Method::POST, &format!("/users/{id}/deactivate"), None).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = au.call(Method::POST, &format!("/users/{id}/deactivate"), None).await;
+    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
+}
+
+#[tokio::test]
+async fn update_email_taken_409() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let a = au.add_user(AU_ORG, "a@x.test");
+    au.add_user(AU_ORG, "b@x.test");
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{a}"), Some(json!({"email": "B@x.test"}))).await;
+    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
+    assert_eq!(au.mock().user_by_id(&a.to_string()).unwrap().email, "a@x.test");
+    assert!(au.syncs().is_empty());
+    // The user's own address isn't "taken".
+    let (status, _) = au.call(Method::PATCH, &format!("/users/{a}"), Some(json!({"email": "a@x.test"}))).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn deactivate_revokes_and_syncs() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    au.add_session(id, "s1");
+    let (status, body) = au.call(Method::POST, &format!("/users/{id}/deactivate"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "inactive");
+    assert!(au.mock().user_by_id(&id.to_string()).unwrap().inactive);
+    assert_eq!(au.live_sessions(id), 0);
+    assert!(au.mock().calls().contains(&"DELETE /v2/sessions/s1".to_string()));
+    assert_eq!(au.syncs().len(), 1);
+    let (status, body) = au.call(Method::POST, &format!("/users/{id}/reactivate"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "active");
+    assert!(!au.mock().user_by_id(&id.to_string()).unwrap().inactive);
+    assert_eq!(au.syncs().len(), 2);
+}
+
+#[tokio::test]
+async fn revoke_sessions_is_204() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    au.add_session(id, "s1");
+    let (status, _) = au.call(Method::DELETE, &format!("/users/{id}/sessions"), None).await;
+    assert_eq!(status, 204);
+    assert_eq!(au.live_sessions(id), 0);
+    assert!(au.mock().calls().contains(&"DELETE /v2/sessions/s1".to_string()));
+}
+
+#[tokio::test]
+async fn delete_user_syncs() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    au.add_session(id, "s1");
+    let (status, _) = au.call(Method::DELETE, &format!("/users/{id}"), None).await;
+    assert_eq!(status, 204);
+    assert!(au.mock().user_by_id(&id.to_string()).is_none());
+    assert_eq!(au.live_sessions(id), 0);
+    assert_eq!(au.syncs().len(), 1);
+    assert_eq!((au.syncs()[0].user_id, au.syncs()[0].data.is_none()), (id, true));
+}
+
+#[tokio::test]
+async fn other_org_user_404() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user("o2", "stranger@x.test");
+    for (method, rest, body) in [
+        (Method::GET, format!("/users/{id}"), None),
+        (Method::PATCH, format!("/users/{id}"), Some(json!({"password": "brand-new-pw-1"}))),
+        (Method::POST, format!("/users/{id}/deactivate"), None),
+        (Method::POST, format!("/users/{id}/reactivate"), None),
+        (Method::GET, format!("/users/{id}/sessions"), None),
+        (Method::DELETE, format!("/users/{id}/sessions"), None),
+        (Method::DELETE, format!("/users/{id}"), None),
+    ] {
+        let (status, answer) = au.call(method.clone(), &rest, body).await;
+        assert_eq!(status, 404, "{method} {rest}: {answer}");
+    }
+    let user = au.mock().user_by_id(&id.to_string()).unwrap();
+    assert_eq!((user.password.as_str(), user.inactive), (AU_PASSWORD, false));
+    assert!(au.syncs().is_empty());
+}
+
+#[tokio::test]
+async fn user_routes_need_enabled_app_users() {
+    let au = au_env(true).await;
+    let (status, body) = au.call(Method::GET, "/users", None).await;
+    assert_eq!((status, code_of(&body)), (409, "app_users_disabled"), "{body}");
+    au.set_auth(AppUsersStatus::Enabling);
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "a@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!((status, code_of(&body)), (409, "app_users_disabled"), "{body}");
+}
+
+#[tokio::test]
+async fn routes_503_without_zitadel() {
+    let au = au_env(false).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = uuid::Uuid::new_v4();
+    for (method, rest, body) in [
+        (Method::GET, "/users".to_string(), None),
+        (Method::POST, "/users".to_string(), Some(json!({"email": "a@x.test", "password": AU_PASSWORD}))),
+        (Method::GET, format!("/users/{id}"), None),
+        (Method::PATCH, format!("/users/{id}"), Some(json!({"email_verified": true}))),
+        (Method::DELETE, format!("/users/{id}"), None),
+        (Method::DELETE, "/app-users".to_string(), None),
+    ] {
+        let (status, answer) = au.call(method.clone(), &rest, body).await;
+        assert_eq!((status, code_of(&answer)), (503, "unavailable"), "{method} {rest}: {answer}");
+    }
+    // Reading the settings needs no Zitadel.
+    let (status, _) = au.call(Method::GET, "/app-users", None).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn data_api_disable_refused_on_auth_database() {
+    let au = au_env(false).await;
+    au.metadata.add_branch_db(au.main, "web2", "owner", DatabaseOrigin::Sql);
+    au.metadata.set_data_api(au.main, "web2", cheladb_metadata::DataApiState::On);
+    au.set_auth(AppUsersStatus::Enabled);
+    au.metadata.project_auths.lock().unwrap().get_mut(&au.project.id).unwrap().pg_database = "web2".into();
+    let base = format!("/v1/databases/{}/branches/{}/pg-databases/web2/data-api", au.db, au.main);
+    for query in ["", "?remove=true"] {
+        let resp = send(&au.app, Method::DELETE, &format!("{base}{query}"), "org-1", None).await;
+        let body = error_of(resp, 409).await;
+        assert_eq!(code_of(&body), "conflict", "{body}");
+        assert_eq!(message_of(&body), "app users use this database: disable app users first");
+    }
+    assert!(au.jobs.data_api_calls.lock().unwrap().is_empty());
+    // Another Postgres database of the same Cheladb database is free to go.
+    au.metadata.add_branch_db(au.main, "web3", "owner", DatabaseOrigin::Sql);
+    let resp = send(&au.app, Method::DELETE, &format!("/v1/databases/{}/branches/{}/pg-databases/web3/data-api", au.db, au.main), "org-1", None).await;
+    assert_eq!(resp.status(), 204);
+}
+
+#[tokio::test]
+async fn list_projects_batches_the_auth_read() {
+    let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
+    let mut ids = vec![];
+    for name in ["A", "B", "C"] {
+        ids.push(metadata.create_project(tenant, name).await.unwrap().id);
+    }
+    metadata.project_auths.lock().unwrap().insert(
+        ids[1],
+        ProjectAuth {
+            project_id: ids[1],
+            status: AppUsersStatus::Enabled,
+            error: None,
+            zitadel_org_id: None,
+            database_id: DatabaseId::new(),
+            pg_database: "web1".into(),
+            schema_name: "public".into(),
+            table_name: "users".into(),
+            email_verification: false,
+            on_delete: OnDelete::Delete,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+    );
+    let body: Value = send(&app, Method::GET, "/v1/projects", "org-1", None).await.json().await.unwrap();
+    let states: Vec<_> = body.as_array().unwrap().iter().map(|p| p["app_users"].as_str()).collect();
+    assert_eq!(states, vec![None, Some("enabled"), None]);
+    assert_eq!(metadata.project_auth_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(metadata.project_auth_batch_reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn disable_retry_while_disabling_skips_the_users_check() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Disabling);
+    // The org still lists a user (or is gone): the retry must not look.
+    au.add_user(AU_ORG, "a@x.test");
+    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(au.jobs_published(), vec![AppUsersJob::Disable { project_id: au.project.id }]);
+    assert!(au.mock().calls().is_empty(), "{:?}", au.mock().calls());
+}
+
+#[tokio::test]
+async fn put_while_disabling_409() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Disabling);
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
+    assert!(au.jobs_published().is_empty());
+    assert_eq!(au.auth().status, AppUsersStatus::Disabling);
+}
+
+#[tokio::test]
+async fn delete_user_succeeds_and_syncs_when_the_revoke_fails() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    *au.metadata.fail_revoke.lock().unwrap() = true;
+    let (status, _) = au.call(Method::DELETE, &format!("/users/{id}"), None).await;
+    assert_eq!(status, 204);
+    assert!(au.mock().user_by_id(&id.to_string()).is_none());
+    assert_eq!(au.syncs().len(), 1);
+}
+
+#[tokio::test]
+async fn update_with_a_weak_password_changes_nothing() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    let (status, body) =
+        au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "new@x.test", "password": "short"}))).await;
+    assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
+    let user = au.mock().user_by_id(&id.to_string()).unwrap();
+    assert_eq!((user.email.as_str(), user.password.as_str()), ("a@x.test", AU_PASSWORD));
+    assert!(au.syncs().is_empty());
 }

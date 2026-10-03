@@ -5,16 +5,37 @@
  * OpenAPI spec version: 1
  */
 import {
-  useMutation
+  useMutation,
+  useQuery
 } from '@tanstack/react-query';
 import type {
+  DataTag,
+  DefinedInitialDataOptions,
+  DefinedUseQueryResult,
   MutationFunction,
   QueryClient,
+  QueryFunction,
+  QueryKey,
+  UndefinedInitialDataOptions,
   UseMutationOptions,
-  UseMutationResult
+  UseMutationResult,
+  UseQueryOptions,
+  UseQueryResult
 } from '@tanstack/react-query';
 
 import type {
+  AppChangePasswordBody,
+  AppEmailBody,
+  AppJwks,
+  AppPasswordResetConfirmBody,
+  AppRefreshBody,
+  AppSession,
+  AppSignInBody,
+  AppSignOutBody,
+  AppSignUpBody,
+  AppSignUpResult,
+  AppUser,
+  AppVerifyEmailBody,
   AuthRequestBody,
   AuthRequestInfo,
   CodeBody,
@@ -36,6 +57,1067 @@ import type { ErrorType } from '../fetch.ts';
 type SecondParameter<T extends (...args: never) => unknown> = Parameters<T>[1];
 
 
+
+const withQueryKey = <T extends object, K>(query: T, queryKey: K): T & { queryKey: K } => {
+  const result = { queryKey } as T & { queryKey: K };
+  for (const key of Object.keys(query)) {
+    // The explicit queryKey always wins, matching the previous
+    // `{ ...query, queryKey }` spread where it was set last.
+    if (key === 'queryKey') continue;
+    Object.defineProperty(result, key, {
+      enumerable: true,
+      configurable: true,
+      get: () => (query as Record<string, unknown>)[key],
+    });
+  }
+  return result;
+};
+
+export const getAppChangeEmailUrl = () => {
+
+
+
+
+  return `/auth/v1/app/change-email`
+}
+
+/**
+ * Changes the signed-in user's email (needs the `Cheladb-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.
+ */
+export const appChangeEmail = async (appEmailBody: AppEmailBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getAppChangeEmailUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appEmailBody)
+  }
+);}
+
+
+
+
+
+export const getAppChangeEmailMutationKey = () => ['appChangeEmail'] as const;
+
+export const getAppChangeEmailMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appChangeEmail>>, TError,AppChangeEmailMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appChangeEmail>>, TError,AppChangeEmailMutationVariables, TContext> => {
+
+const mutationKey = getAppChangeEmailMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appChangeEmail>>, AppChangeEmailMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appChangeEmail(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppChangeEmailMutationResult = NonNullable<Awaited<ReturnType<typeof appChangeEmail>>>
+    export type AppChangeEmailMutationBody = AppEmailBody
+    export type AppChangeEmailMutationError = ErrorType<ErrorEnvelope>
+    export type AppChangeEmailMutationVariables = {data: AppEmailBody}
+
+    export const useAppChangeEmail = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appChangeEmail>>, TError,AppChangeEmailMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appChangeEmail>>,
+        TError,
+        AppChangeEmailMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppChangeEmailMutationOptions(options), queryClient);
+    }
+
+export const getAppChangePasswordUrl = () => {
+
+
+
+
+  return `/auth/v1/app/change-password`
+}
+
+/**
+ * Changes the signed-in user's password (needs the `Cheladb-User` token) and returns a new session; every other session of the user ends.
+ */
+export const appChangePassword = async (appChangePasswordBody: AppChangePasswordBody, options?: Parameters<typeof customFetch>[1]): Promise<AppSession> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<AppSession>(getAppChangePasswordUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appChangePasswordBody)
+  }
+);}
+
+
+
+
+
+export const getAppChangePasswordMutationKey = () => ['appChangePassword'] as const;
+
+export const getAppChangePasswordMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appChangePassword>>, TError,AppChangePasswordMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appChangePassword>>, TError,AppChangePasswordMutationVariables, TContext> => {
+
+const mutationKey = getAppChangePasswordMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appChangePassword>>, AppChangePasswordMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appChangePassword(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppChangePasswordMutationResult = NonNullable<Awaited<ReturnType<typeof appChangePassword>>>
+    export type AppChangePasswordMutationBody = AppChangePasswordBody
+    export type AppChangePasswordMutationError = ErrorType<ErrorEnvelope>
+    export type AppChangePasswordMutationVariables = {data: AppChangePasswordBody}
+
+    export const useAppChangePassword = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appChangePassword>>, TError,AppChangePasswordMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appChangePassword>>,
+        TError,
+        AppChangePasswordMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppChangePasswordMutationOptions(options), queryClient);
+    }
+
+export const getAppJwksUrl = () => {
+
+
+
+
+  return `/auth/v1/app/jwks`
+}
+
+/**
+ * The public keys app access tokens are signed with, so an app's own server can verify them. Needs no key.
+ */
+export const appJwks = async ( options?: Parameters<typeof customFetch>[1]): Promise<AppJwks> => {
+
+  return customFetch<AppJwks>(getAppJwksUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getAppJwksQueryKey = () => {
+    return [
+    `/auth/v1/app/jwks`
+    ] as const;
+    }
+
+
+export const getAppJwksQueryOptions = <TData = Awaited<ReturnType<typeof appJwks>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appJwks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getAppJwksQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof appJwks>>> = ({ signal }) => appJwks({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof appJwks>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type AppJwksQueryResult = NonNullable<Awaited<ReturnType<typeof appJwks>>>
+export type AppJwksQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useAppJwks<TData = Awaited<ReturnType<typeof appJwks>>, TError = ErrorType<ErrorEnvelope>>(
+  options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof appJwks>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof appJwks>>,
+          TError,
+          Awaited<ReturnType<typeof appJwks>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useAppJwks<TData = Awaited<ReturnType<typeof appJwks>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appJwks>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof appJwks>>,
+          TError,
+          Awaited<ReturnType<typeof appJwks>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useAppJwks<TData = Awaited<ReturnType<typeof appJwks>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appJwks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+
+export function useAppJwks<TData = Awaited<ReturnType<typeof appJwks>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appJwks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getAppJwksQueryOptions(options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getAppRequestPasswordResetUrl = () => {
+
+
+
+
+  return `/auth/v1/app/password-reset`
+}
+
+/**
+ * Emails a password-reset code. Answers the same whether or not the account exists.
+ */
+export const appRequestPasswordReset = async (appEmailBody: AppEmailBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getAppRequestPasswordResetUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appEmailBody)
+  }
+);}
+
+
+
+
+
+export const getAppRequestPasswordResetMutationKey = () => ['appRequestPasswordReset'] as const;
+
+export const getAppRequestPasswordResetMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appRequestPasswordReset>>, TError,AppRequestPasswordResetMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appRequestPasswordReset>>, TError,AppRequestPasswordResetMutationVariables, TContext> => {
+
+const mutationKey = getAppRequestPasswordResetMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appRequestPasswordReset>>, AppRequestPasswordResetMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appRequestPasswordReset(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppRequestPasswordResetMutationResult = NonNullable<Awaited<ReturnType<typeof appRequestPasswordReset>>>
+    export type AppRequestPasswordResetMutationBody = AppEmailBody
+    export type AppRequestPasswordResetMutationError = ErrorType<ErrorEnvelope>
+    export type AppRequestPasswordResetMutationVariables = {data: AppEmailBody}
+
+    export const useAppRequestPasswordReset = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appRequestPasswordReset>>, TError,AppRequestPasswordResetMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appRequestPasswordReset>>,
+        TError,
+        AppRequestPasswordResetMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppRequestPasswordResetMutationOptions(options), queryClient);
+    }
+
+export const getAppConfirmPasswordResetUrl = () => {
+
+
+
+
+  return `/auth/v1/app/password-reset/confirm`
+}
+
+/**
+ * Sets a new password with the emailed reset code and ends every session of the user.
+ */
+export const appConfirmPasswordReset = async (appPasswordResetConfirmBody: AppPasswordResetConfirmBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getAppConfirmPasswordResetUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appPasswordResetConfirmBody)
+  }
+);}
+
+
+
+
+
+export const getAppConfirmPasswordResetMutationKey = () => ['appConfirmPasswordReset'] as const;
+
+export const getAppConfirmPasswordResetMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appConfirmPasswordReset>>, TError,AppConfirmPasswordResetMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appConfirmPasswordReset>>, TError,AppConfirmPasswordResetMutationVariables, TContext> => {
+
+const mutationKey = getAppConfirmPasswordResetMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appConfirmPasswordReset>>, AppConfirmPasswordResetMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appConfirmPasswordReset(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppConfirmPasswordResetMutationResult = NonNullable<Awaited<ReturnType<typeof appConfirmPasswordReset>>>
+    export type AppConfirmPasswordResetMutationBody = AppPasswordResetConfirmBody
+    export type AppConfirmPasswordResetMutationError = ErrorType<ErrorEnvelope>
+    export type AppConfirmPasswordResetMutationVariables = {data: AppPasswordResetConfirmBody}
+
+    export const useAppConfirmPasswordReset = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appConfirmPasswordReset>>, TError,AppConfirmPasswordResetMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appConfirmPasswordReset>>,
+        TError,
+        AppConfirmPasswordResetMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppConfirmPasswordResetMutationOptions(options), queryClient);
+    }
+
+export const getAppRefreshUrl = () => {
+
+
+
+
+  return `/auth/v1/app/refresh`
+}
+
+/**
+ * Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later revokes the session).
+ */
+export const appRefresh = async (appRefreshBody: AppRefreshBody, options?: Parameters<typeof customFetch>[1]): Promise<AppSession> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<AppSession>(getAppRefreshUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appRefreshBody)
+  }
+);}
+
+
+
+
+
+export const getAppRefreshMutationKey = () => ['appRefresh'] as const;
+
+export const getAppRefreshMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appRefresh>>, TError,AppRefreshMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appRefresh>>, TError,AppRefreshMutationVariables, TContext> => {
+
+const mutationKey = getAppRefreshMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appRefresh>>, AppRefreshMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appRefresh(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppRefreshMutationResult = NonNullable<Awaited<ReturnType<typeof appRefresh>>>
+    export type AppRefreshMutationBody = AppRefreshBody
+    export type AppRefreshMutationError = ErrorType<ErrorEnvelope>
+    export type AppRefreshMutationVariables = {data: AppRefreshBody}
+
+    export const useAppRefresh = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appRefresh>>, TError,AppRefreshMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appRefresh>>,
+        TError,
+        AppRefreshMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppRefreshMutationOptions(options), queryClient);
+    }
+
+export const getAppResendCodeUrl = () => {
+
+
+
+
+  return `/auth/v1/app/resend-code`
+}
+
+/**
+ * Emails the verification code again. Answers the same whether or not the account exists.
+ */
+export const appResendCode = async (appEmailBody: AppEmailBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getAppResendCodeUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appEmailBody)
+  }
+);}
+
+
+
+
+
+export const getAppResendCodeMutationKey = () => ['appResendCode'] as const;
+
+export const getAppResendCodeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appResendCode>>, TError,AppResendCodeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appResendCode>>, TError,AppResendCodeMutationVariables, TContext> => {
+
+const mutationKey = getAppResendCodeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appResendCode>>, AppResendCodeMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appResendCode(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppResendCodeMutationResult = NonNullable<Awaited<ReturnType<typeof appResendCode>>>
+    export type AppResendCodeMutationBody = AppEmailBody
+    export type AppResendCodeMutationError = ErrorType<ErrorEnvelope>
+    export type AppResendCodeMutationVariables = {data: AppEmailBody}
+
+    export const useAppResendCode = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appResendCode>>, TError,AppResendCodeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appResendCode>>,
+        TError,
+        AppResendCodeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppResendCodeMutationOptions(options), queryClient);
+    }
+
+export const getAppSignInUrl = () => {
+
+
+
+
+  return `/auth/v1/app/sign-in`
+}
+
+/**
+ * Signs an app user in with email and password.
+ */
+export const appSignIn = async (appSignInBody: AppSignInBody, options?: Parameters<typeof customFetch>[1]): Promise<AppSession> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<AppSession>(getAppSignInUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appSignInBody)
+  }
+);}
+
+
+
+
+
+export const getAppSignInMutationKey = () => ['appSignIn'] as const;
+
+export const getAppSignInMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appSignIn>>, TError,AppSignInMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appSignIn>>, TError,AppSignInMutationVariables, TContext> => {
+
+const mutationKey = getAppSignInMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appSignIn>>, AppSignInMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appSignIn(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppSignInMutationResult = NonNullable<Awaited<ReturnType<typeof appSignIn>>>
+    export type AppSignInMutationBody = AppSignInBody
+    export type AppSignInMutationError = ErrorType<ErrorEnvelope>
+    export type AppSignInMutationVariables = {data: AppSignInBody}
+
+    export const useAppSignIn = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appSignIn>>, TError,AppSignInMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appSignIn>>,
+        TError,
+        AppSignInMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppSignInMutationOptions(options), queryClient);
+    }
+
+export const getAppSignOutUrl = () => {
+
+
+
+
+  return `/auth/v1/app/sign-out`
+}
+
+/**
+ * Ends the session of the `Cheladb-User` token, or, without one, the session of the refresh token in the body.
+ */
+export const appSignOut = async (appSignOutBody: AppSignOutBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getAppSignOutUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appSignOutBody)
+  }
+);}
+
+
+
+
+
+export const getAppSignOutMutationKey = () => ['appSignOut'] as const;
+
+export const getAppSignOutMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appSignOut>>, TError,AppSignOutMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appSignOut>>, TError,AppSignOutMutationVariables, TContext> => {
+
+const mutationKey = getAppSignOutMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appSignOut>>, AppSignOutMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appSignOut(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppSignOutMutationResult = NonNullable<Awaited<ReturnType<typeof appSignOut>>>
+    export type AppSignOutMutationBody = AppSignOutBody
+    export type AppSignOutMutationError = ErrorType<ErrorEnvelope>
+    export type AppSignOutMutationVariables = {data: AppSignOutBody}
+
+    export const useAppSignOut = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appSignOut>>, TError,AppSignOutMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appSignOut>>,
+        TError,
+        AppSignOutMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppSignOutMutationOptions(options), queryClient);
+    }
+
+export const getAppSignUpUrl = () => {
+
+
+
+
+  return `/auth/v1/app/sign-up`
+}
+
+/**
+ * Creates an app user and their users-table row. With email verification off, signs them in; with it on, emails a code and returns no tokens.
+ */
+export const appSignUp = async (appSignUpBody: AppSignUpBody, options?: Parameters<typeof customFetch>[1]): Promise<AppSignUpResult> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<AppSignUpResult>(getAppSignUpUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appSignUpBody)
+  }
+);}
+
+
+
+
+
+export const getAppSignUpMutationKey = () => ['appSignUp'] as const;
+
+export const getAppSignUpMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appSignUp>>, TError,AppSignUpMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appSignUp>>, TError,AppSignUpMutationVariables, TContext> => {
+
+const mutationKey = getAppSignUpMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appSignUp>>, AppSignUpMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appSignUp(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppSignUpMutationResult = NonNullable<Awaited<ReturnType<typeof appSignUp>>>
+    export type AppSignUpMutationBody = AppSignUpBody
+    export type AppSignUpMutationError = ErrorType<ErrorEnvelope>
+    export type AppSignUpMutationVariables = {data: AppSignUpBody}
+
+    export const useAppSignUp = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appSignUp>>, TError,AppSignUpMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appSignUp>>,
+        TError,
+        AppSignUpMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppSignUpMutationOptions(options), queryClient);
+    }
+
+export const getAppGetUserUrl = () => {
+
+
+
+
+  return `/auth/v1/app/user`
+}
+
+/**
+ * The signed-in app user (needs the `Cheladb-User` token).
+ */
+export const appGetUser = async ( options?: Parameters<typeof customFetch>[1]): Promise<AppUser> => {
+
+  return customFetch<AppUser>(getAppGetUserUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getAppGetUserQueryKey = () => {
+    return [
+    `/auth/v1/app/user`
+    ] as const;
+    }
+
+
+export const getAppGetUserQueryOptions = <TData = Awaited<ReturnType<typeof appGetUser>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appGetUser>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getAppGetUserQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof appGetUser>>> = ({ signal }) => appGetUser({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof appGetUser>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type AppGetUserQueryResult = NonNullable<Awaited<ReturnType<typeof appGetUser>>>
+export type AppGetUserQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useAppGetUser<TData = Awaited<ReturnType<typeof appGetUser>>, TError = ErrorType<ErrorEnvelope>>(
+  options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof appGetUser>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof appGetUser>>,
+          TError,
+          Awaited<ReturnType<typeof appGetUser>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useAppGetUser<TData = Awaited<ReturnType<typeof appGetUser>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appGetUser>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof appGetUser>>,
+          TError,
+          Awaited<ReturnType<typeof appGetUser>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useAppGetUser<TData = Awaited<ReturnType<typeof appGetUser>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appGetUser>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+
+export function useAppGetUser<TData = Awaited<ReturnType<typeof appGetUser>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof appGetUser>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getAppGetUserQueryOptions(options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getAppVerifyEmailUrl = () => {
+
+
+
+
+  return `/auth/v1/app/verify-email`
+}
+
+/**
+ * Marks the email verified with the emailed code.
+ */
+export const appVerifyEmail = async (appVerifyEmailBody: AppVerifyEmailBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getAppVerifyEmailUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appVerifyEmailBody)
+  }
+);}
+
+
+
+
+
+export const getAppVerifyEmailMutationKey = () => ['appVerifyEmail'] as const;
+
+export const getAppVerifyEmailMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appVerifyEmail>>, TError,AppVerifyEmailMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appVerifyEmail>>, TError,AppVerifyEmailMutationVariables, TContext> => {
+
+const mutationKey = getAppVerifyEmailMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appVerifyEmail>>, AppVerifyEmailMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appVerifyEmail(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppVerifyEmailMutationResult = NonNullable<Awaited<ReturnType<typeof appVerifyEmail>>>
+    export type AppVerifyEmailMutationBody = AppVerifyEmailBody
+    export type AppVerifyEmailMutationError = ErrorType<ErrorEnvelope>
+    export type AppVerifyEmailMutationVariables = {data: AppVerifyEmailBody}
+
+    export const useAppVerifyEmail = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appVerifyEmail>>, TError,AppVerifyEmailMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appVerifyEmail>>,
+        TError,
+        AppVerifyEmailMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppVerifyEmailMutationOptions(options), queryClient);
+    }
 
 export const getGetAuthRequestUrl = () => {
 

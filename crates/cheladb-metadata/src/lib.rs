@@ -8,10 +8,19 @@ use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
 
+mod app_users;
 mod branches;
 mod data_api;
 mod ddl;
 mod neon;
+mod projects;
+pub use app_users::{
+    AppSession, AppUsersStatus, BeginEnable, BranchAuthSync, NewAppSession, NewProjectAuth, OnDelete,
+    ProjectAuth, RefreshNext, RefreshOutcome,
+};
+pub use projects::{
+    BeginProjectDelete, ProjectRecord, ProjectStatus, RenameProject, slug_base, valid_project_name,
+};
 pub use branches::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
     CreateBranchOutcome, DatabaseSettings, LiveBranch, NewBranch, SettingsPatch,
@@ -123,6 +132,9 @@ pub enum MetadataError {
     TenantNotFound(TenantId),
     #[error("project not found: {0}")]
     ProjectNotFound(ProjectId),
+    /// The project is `deleting` or `deleted`: nothing may be added to it.
+    #[error("project {0} is being deleted")]
+    ProjectDeleting(ProjectId),
     #[error("project {project_id} does not belong to tenant {tenant_id}")]
     ProjectTenantMismatch {
         project_id: ProjectId,
@@ -228,7 +240,9 @@ pub struct TenantOverview {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectOverview {
     pub id: ProjectId,
+    pub name: String,
     pub slug: String,
+    pub status: ProjectStatus,
     pub databases: Vec<DatabaseRecord>,
 }
 
@@ -237,17 +251,19 @@ pub struct ProjectOverview {
 pub fn group_overview(
     id: TenantId,
     slug: String,
-    projects: Vec<(ProjectId, String)>,
+    projects: Vec<ProjectRecord>,
     databases: Vec<DatabaseRecord>,
 ) -> TenantOverview {
     let projects = projects
         .into_iter()
-        .map(|(project_id, project_slug)| ProjectOverview {
-            id: project_id,
-            slug: project_slug,
+        .map(|project| ProjectOverview {
+            id: project.id,
+            name: project.name,
+            slug: project.slug,
+            status: project.status,
             databases: databases
                 .iter()
-                .filter(|d| d.project_id == project_id)
+                .filter(|d| d.project_id == project.id)
                 .cloned()
                 .collect(),
         })
@@ -356,6 +372,17 @@ impl MetadataClient {
 
         // The database and its main branch (same id, no parent), together.
         let mut tx = self.pool.begin().await?;
+        // Lock order: the project row first. A project that isn't `active` takes no databases.
+        let project_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM projects WHERE id = $1 FOR SHARE")
+                .bind(project_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?;
+        match project_status.as_deref() {
+            None => return Err(MetadataError::ProjectNotFound(project_id)),
+            Some("active") => {}
+            Some(_) => return Err(MetadataError::ProjectDeleting(project_id)),
+        }
         let result = sqlx::query(
             r#"
             INSERT INTO databases (id, project_id, name, status)
@@ -689,14 +716,15 @@ impl MetadataClient {
             return Ok(None);
         };
         let projects = sqlx::query(
-            "SELECT id, slug FROM projects WHERE tenant_id = $1 ORDER BY slug",
+            "SELECT id, tenant_id, name, slug, status, error, created_at, updated_at
+             FROM projects WHERE tenant_id = $1 AND status <> 'deleted' ORDER BY slug",
         )
         .bind(tenant_id.as_uuid())
         .fetch_all(&self.pool)
         .await?
         .iter()
-        .map(|r| (ProjectId(r.get("id")), r.get::<String, _>("slug")))
-        .collect();
+        .map(projects::project_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
         let databases = sqlx::query(
             r#"
             SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.database_name,
@@ -793,6 +821,19 @@ mod tests {
         }
     }
 
+    fn project(id: ProjectId, slug: &str) -> ProjectRecord {
+        ProjectRecord {
+            id,
+            tenant_id: TenantId(DEMO_TENANT_ID),
+            name: slug.to_uppercase(),
+            slug: slug.into(),
+            status: ProjectStatus::Active,
+            error: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
     #[test]
     fn database_names_are_sanitized_like_before() {
         assert_eq!(postgres_database_name("web-1 prod").unwrap(), "web_1_prod");
@@ -830,7 +871,7 @@ mod tests {
         let overview = group_overview(
             TenantId(DEMO_TENANT_ID),
             "demo".into(),
-            vec![(a, "alpha".into()), (b, "beta".into())],
+            vec![project(a, "alpha"), project(b, "beta")],
             vec![record(b, "b1"), record(a, "a1"), record(b, "b2")],
         );
         assert_eq!(overview.slug, "demo");
@@ -842,6 +883,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(overview.projects[0].slug, "alpha");
+        assert_eq!(overview.projects[0].name, "ALPHA");
+        assert_eq!(overview.projects[0].status, ProjectStatus::Active);
         assert_eq!(names(0), vec!["a1"]);
         assert_eq!(names(1), vec!["b1", "b2"]);
     }
@@ -852,7 +895,7 @@ mod tests {
         let overview = group_overview(
             TenantId(DEMO_TENANT_ID),
             "demo".into(),
-            vec![(a, "alpha".into())],
+            vec![project(a, "alpha")],
             vec![],
         );
         assert_eq!(overview.projects.len(), 1);
@@ -865,7 +908,7 @@ mod tests {
         let overview = group_overview(
             TenantId(DEMO_TENANT_ID),
             "demo".into(),
-            vec![(a, "alpha".into())],
+            vec![project(a, "alpha")],
             vec![record(ProjectId::new(), "stray")],
         );
         assert!(overview.projects[0].databases.is_empty());

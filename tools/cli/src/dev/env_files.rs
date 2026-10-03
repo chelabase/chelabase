@@ -14,6 +14,9 @@ pub struct DemoEnv<'a> {
     pub auth_token_file: &'a str,
     pub auth_cookie_key: &'a str,
     pub compute_jwt_dir: &'a str,
+    pub admin_pat_file: &'a str,
+    pub app_jwt_private_key: &'a str,
+    pub app_jwt_public_key: &'a str,
 }
 
 pub fn render_demo_env(e: &DemoEnv<'_>) -> String {
@@ -23,7 +26,9 @@ CHELADB_ZITADEL_ORG_ID={}\nCHELADB_ZITADEL_PROJECT_ID={}\nCHELADB_ZITADEL_API_CL
 CHELADB_DEMO_USER_ID={}\nCHELADB_DEMO_TENANT_ID={}\nCHELADB_INTERNAL_SIGNING_KEY={}\n\
 CHELADB_INTERNAL_VERIFY_KEY={}\nCHELADB_SECRETS_KEY={}\nCHELADB_AUTH_TOKEN_FILE={}\n\
 CHELADB_AUTH_COOKIE_KEY={}\nCHELADB_COMPUTE_JWT_DIR={}\n\
-CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\nCHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n",
+CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\nCHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n\
+CHELADB_ZITADEL_ADMIN_PAT_FILE={}\nCHELADB_APP_JWT_PRIVATE_KEY={}\nCHELADB_APP_JWT_PUBLIC_KEY={}\n\
+CHELADB_APP_AUTH_INTERNAL_TOKEN=cheladb-dev-app-auth\nCHELADB_APP_SESSIONS_INTERNAL_TOKEN=cheladb-dev-app-sessions\n",
         e.issuer,
         e.issuer,
         e.audiences,
@@ -37,7 +42,10 @@ CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\nCHELADB_REST_INTERNAL_TOKEN=chela
         e.secrets_key,
         e.auth_token_file,
         e.auth_cookie_key,
-        e.compute_jwt_dir
+        e.compute_jwt_dir,
+        e.admin_pat_file,
+        e.app_jwt_private_key,
+        e.app_jwt_public_key
     )
 }
 
@@ -75,6 +83,9 @@ mod tests {
             auth_token_file: "/z/login-client.pat",
             auth_cookie_key: "/u/cookie.key",
             compute_jwt_dir: "/abs/neon",
+            admin_pat_file: "/z/admin.pat",
+            app_jwt_private_key: "/a/k",
+            app_jwt_public_key: "/a/p",
         });
         assert!(text.contains("CHELADB_AUTH_TOKEN_FILE=/z/login-client.pat\n"));
         assert!(text.contains("CHELADB_AUTH_COOKIE_KEY=/u/cookie.key\n"));
@@ -97,6 +108,9 @@ mod tests {
             auth_token_file: "/tok",
             auth_cookie_key: "/cookie",
             compute_jwt_dir: "/abs/neon",
+            admin_pat_file: "/z/admin.pat",
+            app_jwt_private_key: "/a/k",
+            app_jwt_public_key: "/a/p",
         });
         for line in [
             "CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\n",
@@ -150,10 +164,44 @@ mod tests {
             auth_token_file: "/tok",
             auth_cookie_key: "/cookie",
             compute_jwt_dir: "/abs/neon",
+            admin_pat_file: "/z/admin.pat",
+            app_jwt_private_key: "/a/k",
+            app_jwt_public_key: "/a/p",
         });
         assert!(
             text.contains("\nCHELADB_COMPUTE_JWT_DIR=/abs/neon\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn demo_env_has_app_settings() {
+        let text = render_demo_env(&DemoEnv {
+            issuer: "http://localhost:8080",
+            audiences: "p1,c1",
+            org_id: "o",
+            project_id: "p1",
+            api_client_id: "c1",
+            demo_user_id: "u",
+            demo_tenant: "t",
+            signing_key: "/s",
+            verify_key: "/v",
+            secrets_key: "/k",
+            auth_token_file: "/tok",
+            auth_cookie_key: "/cookie",
+            compute_jwt_dir: "/abs/neon",
+            admin_pat_file: "/z/admin.pat",
+            app_jwt_private_key: "/a/app-jwt.key",
+            app_jwt_public_key: "/a/app-jwt.pub",
+        });
+        for line in [
+            "CHELADB_ZITADEL_ADMIN_PAT_FILE=/z/admin.pat\n",
+            "CHELADB_APP_JWT_PRIVATE_KEY=/a/app-jwt.key\n",
+            "CHELADB_APP_JWT_PUBLIC_KEY=/a/app-jwt.pub\n",
+            "CHELADB_APP_AUTH_INTERNAL_TOKEN=cheladb-dev-app-auth\n",
+            "CHELADB_APP_SESSIONS_INTERNAL_TOKEN=cheladb-dev-app-sessions\n",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
     }
 }

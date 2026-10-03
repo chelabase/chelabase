@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use cheladb_neon::ComputeSigner;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct InternalConfig {
@@ -20,7 +21,24 @@ pub struct InternalConfig {
     pub control_plane_uri: String,
     /// `CHELADB_VALKEY_URL`: where the receiver tells the proxies a role's secret changed.
     pub valkey_url: String,
+    /// `CHELADB_APP_AUTH_INTERNAL_TOKEN`: the `auth` service's bearer for the app routes.
+    pub app_auth_token: String,
+    /// `CHELADB_APP_SESSIONS_INTERNAL_TOKEN`: the gateway's bearer, good only for a session's
+    /// liveness.
+    pub app_sessions_token: String,
+    /// `CHELADB_APP_REFRESH_TTL_SECS`: how long a refresh keeps an app session alive.
+    pub app_refresh_ttl: Duration,
+    /// `CHELADB_ZITADEL_ACTIONS_SIGNING_KEY`: checks the Actions webhook's signature; without
+    /// it the webhook answers 503.
+    pub actions_signing_key: Option<String>,
+    /// `CHELADB_ZITADEL_ADMIN_PAT_FILE`: the admin PAT that deletes Zitadel sessions.
+    pub zitadel_admin_pat_file: Option<PathBuf>,
+    /// `CHELADB_ZITADEL_ISSUER`: Zitadel's base URL.
+    pub zitadel_issuer: Option<String>,
 }
+
+/// A session never lasts longer than this after it was created (and so neither can a refresh).
+pub const APP_SESSION_CAP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 impl InternalConfig {
     pub fn from_env() -> Result<Self> {
@@ -50,13 +68,69 @@ impl InternalConfig {
                 "http://host.docker.internal:8083",
             ))?,
             valkey_url: or("CHELADB_VALKEY_URL", "redis://127.0.0.1:6379"),
+            app_auth_token: or("CHELADB_APP_AUTH_INTERNAL_TOKEN", "cheladb-dev-app-auth"),
+            app_sessions_token: or(
+                "CHELADB_APP_SESSIONS_INTERNAL_TOKEN",
+                "cheladb-dev-app-sessions",
+            ),
+            app_refresh_ttl: refresh_ttl(&or("CHELADB_APP_REFRESH_TTL_SECS", "2592000"))?,
+            actions_signing_key: get("CHELADB_ZITADEL_ACTIONS_SIGNING_KEY")
+                .filter(|v| !v.trim().is_empty()),
+            zitadel_admin_pat_file: get("CHELADB_ZITADEL_ADMIN_PAT_FILE")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from),
+            zitadel_issuer: get("CHELADB_ZITADEL_ISSUER")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         })
+    }
+
+    /// The Zitadel admin client (P2), or `None` (with a warning) when the PAT file or the
+    /// issuer is missing: then Zitadel sessions aren't deleted on revoke.
+    pub fn load_zitadel(&self) -> Option<cheladb_zitadel::client::Zitadel> {
+        let (Some(file), Some(issuer)) = (&self.zitadel_admin_pat_file, &self.zitadel_issuer)
+        else {
+            tracing::warn!(
+                "CHELADB_ZITADEL_ADMIN_PAT_FILE or CHELADB_ZITADEL_ISSUER is unset: \
+                 revoked app sessions keep their Zitadel sessions"
+            );
+            return None;
+        };
+        match std::fs::read_to_string(file) {
+            Ok(pat) if !pat.trim().is_empty() => {
+                Some(cheladb_zitadel::client::Zitadel::new(issuer, pat.trim()))
+            }
+            Ok(_) => {
+                tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty");
+                None
+            }
+            Err(err) => {
+                tracing::warn!(file = %file.display(), "reading the Zitadel admin PAT: {err}");
+                None
+            }
+        }
     }
 
     /// The key pair `cheladb dev bootstrap` writes.
     pub fn load_signer(&self) -> Result<ComputeSigner> {
         cheladb_neon::jwt::load_signer(&self.compute_jwt_dir)
     }
+}
+
+/// Whole seconds, at least 1 and at most the session cap.
+fn refresh_ttl(value: &str) -> Result<Duration> {
+    let secs: u64 = value
+        .trim()
+        .parse()
+        .ok()
+        .filter(|s| (1..=APP_SESSION_CAP.as_secs()).contains(s))
+        .ok_or_else(|| {
+            anyhow!(
+                "CHELADB_APP_REFRESH_TTL_SECS={value:?}: expected whole seconds from 1 to {}",
+                APP_SESSION_CAP.as_secs()
+            )
+        })?;
+    Ok(Duration::from_secs(secs))
 }
 
 /// Computes call this address from inside their containers, so it needs a scheme, a host and
@@ -102,6 +176,15 @@ impl std::fmt::Debug for InternalConfig {
                     self.valkey_url.as_str()
                 },
             )
+            .field("app_auth_token", &"<redacted>")
+            .field("app_sessions_token", &"<redacted>")
+            .field("app_refresh_ttl", &self.app_refresh_ttl)
+            .field(
+                "actions_signing_key",
+                &self.actions_signing_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("zitadel_admin_pat_file", &self.zitadel_admin_pat_file)
+            .field("zitadel_issuer", &self.zitadel_issuer)
             .finish()
     }
 }
@@ -183,6 +266,96 @@ mod tests {
         assert!(!shown.contains("cheladb-dev-data-keys"), "{shown}");
         assert!(!shown.contains("cheladb-dev-rest-internal"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
+    #[test]
+    fn app_auth_settings_have_dev_defaults() {
+        let c = InternalConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(c.app_auth_token, "cheladb-dev-app-auth");
+        assert_eq!(c.app_sessions_token, "cheladb-dev-app-sessions");
+        assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(2_592_000));
+        assert_eq!(c.actions_signing_key, None);
+        assert_eq!(c.zitadel_admin_pat_file, None);
+        assert_eq!(c.zitadel_issuer, None);
+    }
+
+    #[test]
+    fn app_auth_settings_are_read() {
+        let c = InternalConfig::from_lookup(|name| match name {
+            "CHELADB_APP_AUTH_INTERNAL_TOKEN" => Some("auth-tok".into()),
+            "CHELADB_APP_SESSIONS_INTERNAL_TOKEN" => Some("gw-tok".into()),
+            "CHELADB_APP_REFRESH_TTL_SECS" => Some("3600".into()),
+            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key".into()),
+            "CHELADB_ZITADEL_ADMIN_PAT_FILE" => Some(".cheladb/zitadel/admin.pat".into()),
+            "CHELADB_ZITADEL_ISSUER" => Some("http://127.0.0.1:8080".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.app_auth_token, "auth-tok");
+        assert_eq!(c.app_sessions_token, "gw-tok");
+        assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(3600));
+        assert_eq!(c.actions_signing_key.as_deref(), Some("sign-key"));
+        assert_eq!(
+            c.zitadel_admin_pat_file,
+            Some(PathBuf::from(".cheladb/zitadel/admin.pat"))
+        );
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://127.0.0.1:8080"));
+        let blank = InternalConfig::from_lookup(|name| {
+            (name == "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY").then(|| "  ".to_string())
+        })
+        .unwrap();
+        assert_eq!(blank.actions_signing_key, None);
+    }
+
+    #[test]
+    fn a_bad_refresh_ttl_names_the_variable() {
+        for bad in ["0", "-1", "soon", "7776001"] {
+            let err = InternalConfig::from_lookup(|name| {
+                (name == "CHELADB_APP_REFRESH_TTL_SECS").then(|| bad.to_string())
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("CHELADB_APP_REFRESH_TTL_SECS"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn debug_hides_the_app_auth_secrets() {
+        let c = InternalConfig::from_lookup(|name| match name {
+            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key-secret".into()),
+            _ => None,
+        })
+        .unwrap();
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("cheladb-dev-app-auth"), "{shown}");
+        assert!(!shown.contains("cheladb-dev-app-sessions"), "{shown}");
+        assert!(!shown.contains("sign-key-secret"), "{shown}");
+    }
+
+    #[test]
+    fn zitadel_needs_the_pat_file_and_the_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let pat = dir.path().join("admin.pat");
+        std::fs::write(&pat, "the-pat\n").unwrap();
+        let base = InternalConfig::from_lookup(|_| None).unwrap();
+        assert!(base.load_zitadel().is_none());
+        let only_file = InternalConfig {
+            zitadel_admin_pat_file: Some(pat.clone()),
+            ..base.clone()
+        };
+        assert!(only_file.load_zitadel().is_none());
+        let missing_file = InternalConfig {
+            zitadel_admin_pat_file: Some(dir.path().join("nope.pat")),
+            zitadel_issuer: Some("http://127.0.0.1:9".into()),
+            ..base.clone()
+        };
+        assert!(missing_file.load_zitadel().is_none());
+        let both = InternalConfig {
+            zitadel_admin_pat_file: Some(pat),
+            zitadel_issuer: Some("http://127.0.0.1:9".into()),
+            ..base
+        };
+        assert!(both.load_zitadel().is_some());
     }
 
     // Review Focus 4: an orchestrator started before bootstrap says what to run.

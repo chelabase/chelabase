@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use cheladb_metadata::{
-    BranchConnectionRow, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus,
+    AppSession, AppUsersStatus, BranchAuthSync, OnDelete, ProjectAuth, ProjectRecord,
+    ProjectStatus, BranchConnectionRow, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus,
     CreateBranchOutcome, DataApiSettings, DataKeyRecord, DatabaseRecord, DatabaseSettings,
     DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState, InsertRoleOutcome, LiveBranch,
     LiveDatabase, MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewBranch, NewDataKey,
@@ -170,6 +171,14 @@ pub struct FakeState {
     /// The next N `create_endpoint_for_branch` calls first flip the parent's `protected`, as
     /// a user toggling Protect between the read and the insert (C8).
     pub protection_flips: u32,
+    /// Projects, their app users settings, the branches' sync passwords and app sessions.
+    pub projects: HashMap<ProjectId, ProjectRecord>,
+    pub project_auth: HashMap<ProjectId, ProjectAuth>,
+    pub auth_sync: HashMap<BranchId, BranchAuthSync>,
+    /// A concurrent bootstrap that wins the next claim: `(pg_database, sealed)` is stored just
+    /// before it.
+    pub auth_sync_racer: Option<(String, String)>,
+    pub app_sessions: Vec<AppSession>,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -448,6 +457,74 @@ impl FakeMetadata {
             },
         );
         CreateBranchOutcome::Created
+    }
+
+    /// An `active` project row.
+    pub fn insert_project(&self) -> ProjectId {
+        let id = ProjectId::new();
+        let now = chrono::Utc::now();
+        self.state().projects.insert(
+            id,
+            ProjectRecord {
+                id,
+                tenant_id: TenantId::new(),
+                name: "app".to_string(),
+                slug: "app".to_string(),
+                status: ProjectStatus::Active,
+                error: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        id
+    }
+
+    /// Moves the database (and its branches' rows) into `project`.
+    pub fn move_to_project(&self, db: DatabaseId, project: ProjectId) {
+        self.state().databases.get_mut(&db).unwrap().project_id = project;
+    }
+
+    /// A `project_auth` row for `project` with the defaults (`public.users` in `app`).
+    pub fn insert_auth(&self, project: ProjectId, db: DatabaseId, status: AppUsersStatus) {
+        let now = chrono::Utc::now();
+        self.state().project_auth.insert(
+            project,
+            ProjectAuth {
+                project_id: project,
+                status,
+                error: None,
+                zitadel_org_id: None,
+                database_id: db,
+                pg_database: "app".to_string(),
+                schema_name: "public".to_string(),
+                table_name: "users".to_string(),
+                email_verification: false,
+                on_delete: OnDelete::Delete,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+    }
+
+    pub fn auth(&self, project: ProjectId) -> Option<ProjectAuth> {
+        self.state().project_auth.get(&project).cloned()
+    }
+
+    /// A live app session of `user`, with Zitadel session `zitadel_session_id`.
+    pub fn add_session(&self, project: ProjectId, user: uuid::Uuid, zitadel_session_id: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        self.state().app_sessions.push(AppSession {
+            id,
+            project_id: project,
+            user_id: user,
+            zitadel_session_id: zitadel_session_id.to_string(),
+            created_at: now,
+            last_used_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            revoked_at: None,
+        });
+        id
     }
 
     pub fn endpoint_ids(&self) -> Vec<String> {
@@ -1621,6 +1698,304 @@ impl WorkerMetadata for FakeMetadata {
             })
         }))
     }
+
+    async fn deleting_projects(&self, older_than: Duration) -> Result<Vec<ProjectId>, MetadataError> {
+        let state = self.read("deleting_projects")?;
+        let cutoff = Utc::now() - older_than;
+        let mut found: Vec<&ProjectRecord> = state
+            .projects
+            .values()
+            .filter(|p| p.status == ProjectStatus::Deleting && p.updated_at < cutoff)
+            .collect();
+        found.sort_by_key(|p| p.updated_at);
+        Ok(found.into_iter().map(|p| p.id).collect())
+    }
+
+    async fn app_users_in_transition(
+        &self,
+        older_than: Duration,
+    ) -> Result<Vec<ProjectAuth>, MetadataError> {
+        let state = self.read("app_users_in_transition")?;
+        let cutoff = Utc::now() - older_than;
+        let mut found: Vec<ProjectAuth> = state
+            .project_auth
+            .values()
+            .filter(|a| {
+                matches!(a.status, AppUsersStatus::Enabling | AppUsersStatus::Disabling)
+                    && a.updated_at < cutoff
+            })
+            .cloned()
+            .collect();
+        found.sort_by_key(|a| a.updated_at);
+        Ok(found)
+    }
+
+    async fn project_by_id(&self, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
+        Ok(self.read("project_by_id")?.projects.get(&id).cloned())
+    }
+
+    async fn project_databases(
+        &self,
+        id: ProjectId,
+    ) -> Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError> {
+        let state = self.read("project_databases")?;
+        let mut found: Vec<&DatabaseRecord> = state
+            .databases
+            .values()
+            .filter(|d| d.project_id == id && d.status != DatabaseStatus::Deleted)
+            .collect();
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(found
+            .into_iter()
+            .map(|d| (d.database_id, d.status, d.error.clone()))
+            .collect())
+    }
+
+    async fn set_project_error(&self, id: ProjectId, error: Option<&str>) -> Result<(), MetadataError> {
+        let mut state = self.write("set_project_error")?;
+        if let Some(p) = state.projects.get_mut(&id) {
+            p.error = error.map(str::to_string);
+            p.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn finish_project_delete(&self, id: ProjectId) -> Result<(), MetadataError> {
+        let mut state = self.write("finish_project_delete")?;
+        let now = Utc::now();
+        for s in state.app_sessions.iter_mut() {
+            if s.project_id == id && s.revoked_at.is_none() {
+                s.revoked_at = Some(now);
+            }
+        }
+        let dbs: HashSet<DatabaseId> = state
+            .databases
+            .values()
+            .filter(|d| d.project_id == id)
+            .map(|d| d.database_id)
+            .collect();
+        let branches: HashSet<BranchId> = state
+            .branches
+            .values()
+            .filter(|b| dbs.contains(&b.database_id))
+            .map(|b| b.id)
+            .collect();
+        state.auth_sync.retain(|b, _| !branches.contains(b));
+        state.project_auth.remove(&id);
+        if let Some(p) = state.projects.get_mut(&id) {
+            p.status = ProjectStatus::Deleted;
+            p.error = None;
+            p.updated_at = now;
+        }
+        Ok(())
+    }
+
+    async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
+        Ok(self.read("project_auth")?.project_auth.get(&project).cloned())
+    }
+
+    async fn app_auth_for_database(
+        &self,
+        db: DatabaseId,
+    ) -> Result<Option<ProjectAuth>, MetadataError> {
+        Ok(self
+            .read("app_auth_for_database")?
+            .project_auth
+            .values()
+            .find(|a| a.database_id == db)
+            .cloned())
+    }
+
+    async fn set_app_users_org(&self, project: ProjectId, org_id: &str) -> Result<(), MetadataError> {
+        let mut state = self.write("set_app_users_org")?;
+        if state
+            .project_auth
+            .values()
+            .any(|a| a.project_id != project && a.zitadel_org_id.as_deref() == Some(org_id))
+        {
+            return Err(MetadataError::Conflict);
+        }
+        if let Some(a) = state.project_auth.get_mut(&project) {
+            a.zitadel_org_id = Some(org_id.to_string());
+            a.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn finish_enable_app_users(
+        &self,
+        project: ProjectId,
+        outcome: Result<(), String>,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("finish_enable_app_users")?;
+        match state.project_auth.get_mut(&project) {
+            Some(a) if a.status == AppUsersStatus::Enabling => {
+                match outcome {
+                    Ok(()) => {
+                        a.status = AppUsersStatus::Enabled;
+                        a.error = None;
+                    }
+                    Err(e) => {
+                        a.status = AppUsersStatus::Failed;
+                        a.error = Some(e);
+                    }
+                }
+                a.updated_at = Utc::now();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
+        self.write("delete_project_auth")?.project_auth.remove(&project);
+        Ok(())
+    }
+
+    async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {
+        let state = self.read("enabled_app_projects")?;
+        let mut found: Vec<ProjectAuth> = state
+            .project_auth
+            .values()
+            .filter(|a| a.status == AppUsersStatus::Enabled)
+            .cloned()
+            .collect();
+        found.sort_by_key(|a| a.created_at);
+        Ok(found)
+    }
+
+    async fn branch_auth_sync(&self, branch: BranchId) -> Result<Option<BranchAuthSync>, MetadataError> {
+        Ok(self.read("branch_auth_sync")?.auth_sync.get(&branch).cloned())
+    }
+
+    async fn set_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        sealed: &str,
+    ) -> Result<(), MetadataError> {
+        self.write("set_branch_auth_sync")?.auth_sync.insert(
+            branch,
+            BranchAuthSync {
+                branch_id: branch,
+                pg_database: pg_database.to_string(),
+                password_sealed: sealed.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn claim_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        sealed: &str,
+    ) -> Result<String, MetadataError> {
+        let mut state = self.write("claim_branch_auth_sync")?;
+        if let Some((db, racer)) = state.auth_sync_racer.take() {
+            state.auth_sync.insert(
+                branch,
+                BranchAuthSync {
+                    branch_id: branch,
+                    pg_database: db,
+                    password_sealed: racer,
+                },
+            );
+        }
+        let row = state.auth_sync.entry(branch).or_insert_with(|| BranchAuthSync {
+            branch_id: branch,
+            pg_database: pg_database.to_string(),
+            password_sealed: sealed.to_string(),
+        });
+        if row.pg_database != pg_database {
+            row.pg_database = pg_database.to_string();
+            row.password_sealed = sealed.to_string();
+        }
+        Ok(row.password_sealed.clone())
+    }
+
+    async fn swap_branch_auth_sync(
+        &self,
+        branch: BranchId,
+        pg_database: &str,
+        expected: &str,
+        sealed: &str,
+    ) -> Result<String, MetadataError> {
+        let mut state = self.write("swap_branch_auth_sync")?;
+        if let Some((db, racer)) = state.auth_sync_racer.take() {
+            state.auth_sync.insert(
+                branch,
+                BranchAuthSync {
+                    branch_id: branch,
+                    pg_database: db,
+                    password_sealed: racer,
+                },
+            );
+        }
+        match state.auth_sync.get_mut(&branch) {
+            Some(row) if row.pg_database == pg_database && row.password_sealed != expected => {
+                Ok(row.password_sealed.clone())
+            }
+            _ => {
+                state.auth_sync.insert(
+                    branch,
+                    BranchAuthSync {
+                        branch_id: branch,
+                        pg_database: pg_database.to_string(),
+                        password_sealed: sealed.to_string(),
+                    },
+                );
+                Ok(sealed.to_string())
+            }
+        }
+    }
+
+    async fn revoke_user_sessions(
+        &self,
+        project: ProjectId,
+        user: uuid::Uuid,
+        keep: Option<uuid::Uuid>,
+        created_before: Option<DateTime<Utc>>,
+    ) -> Result<Vec<AppSession>, MetadataError> {
+        let mut state = self.write("revoke_user_sessions")?;
+        let now = Utc::now();
+        let mut revoked = Vec::new();
+        for s in state.app_sessions.iter_mut() {
+            if s.project_id == project
+                && s.user_id == user
+                && s.revoked_at.is_none()
+                && keep != Some(s.id)
+                && created_before.is_none_or(|t| s.created_at < t)
+            {
+                s.revoked_at = Some(now);
+                revoked.push(s.clone());
+            }
+        }
+        Ok(revoked)
+    }
+
+    async fn revoke_project_sessions(&self, project: ProjectId) -> Result<Vec<AppSession>, MetadataError> {
+        let mut state = self.write("revoke_project_sessions")?;
+        let now = Utc::now();
+        let mut revoked = Vec::new();
+        for s in state.app_sessions.iter_mut() {
+            if s.project_id == project && s.revoked_at.is_none() {
+                s.revoked_at = Some(now);
+                revoked.push(s.clone());
+            }
+        }
+        Ok(revoked)
+    }
+
+    async fn purge_app_sessions(&self, older_than: Duration) -> Result<u64, MetadataError> {
+        let mut state = self.write("purge_app_sessions")?;
+        let cutoff = Utc::now() - older_than;
+        let before = state.app_sessions.len();
+        state
+            .app_sessions
+            .retain(|s| !(s.revoked_at.is_some_and(|r| r < cutoff) || s.expires_at < cutoff));
+        Ok((before - state.app_sessions.len()) as u64)
+    }
 }
 
 /// Oldest first, like the real queries.
@@ -2150,6 +2525,9 @@ pub fn worker() -> (FakeWorker, Journal) {
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
+        zitadel: None,
+        app_users_reconcile_every: Duration::from_secs(300),
+        remove_orphans: true,
     };
     (worker, journal)
 }

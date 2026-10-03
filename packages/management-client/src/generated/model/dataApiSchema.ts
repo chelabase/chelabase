@@ -4,12 +4,14 @@
  * Cheladb Management API
  * OpenAPI spec version: 1
  */
+import type { AppUsersTable } from './appUsersTable.ts';
 import type { DataApiSchemaSchemas } from './dataApiSchemaSchemas.ts';
 
 /**
  * The Data API schema: everything the asking roles can reach.
  */
 export interface DataApiSchema {
+  app_users?: AppUsersTable | null;
   default_schema: string;
   schemas: DataApiSchemaSchemas;
   version: string;

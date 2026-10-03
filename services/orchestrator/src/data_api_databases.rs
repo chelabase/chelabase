@@ -251,7 +251,7 @@ struct RemoveQuery {
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`conflict`: the main database is always served, `remove=true` on a database the data API was never enabled on, or the worker refused (the message says why); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
+        (status = 409, description = "`conflict`: the main database is always served, app users use the database, `remove=true` on a database the data API was never enabled on, or the worker refused (the message says why); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the cluster's own `postgres` database is never served", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 502, description = "`unavailable`: the worker failed to do it", body = ErrorEnvelope),
@@ -290,6 +290,18 @@ where
     let Some(row) = rows.iter().find(|d| d.name == name) else {
         return ApiError::not_found("database not found").into_response();
     };
+    // The project's users table lives there: the data API stays on until app users are off.
+    match state.metadata.app_auth_for_database(branch.database_id).await {
+        Ok(Some(auth)) if auth.pg_database == name => {
+            return conflict(ErrorCode::Conflict, "app users use this database: disable app users first")
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            error!("app auth for database: {err}");
+            return ApiError::internal().into_response();
+        }
+    }
     match row.origin {
         DatabaseOrigin::Main => {
             return conflict(

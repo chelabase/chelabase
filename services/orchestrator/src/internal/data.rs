@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{InternalState, NeonMetadataPort};
 
-/// `{"key_id","branch_id","kind","role","databases"}` (`databases` is null for every served
+/// `{"key_id","branch_id","project_id","kind","role","databases"}` (`databases` is null for every served
 /// database, else the key's allow-list) for the live key with this hash (64 lowercase hex
 /// characters); 404 for anything else. `last_used_at` is stamped after the answer is on its way.
 pub(super) async fn key_lookup<M, L>(
@@ -42,6 +42,7 @@ where
             Json(json!({
                 "key_id": key.key_id,
                 "branch_id": key.branch_id,
+                "project_id": key.project_id,
                 "kind": key.kind,
                 "role": key.role,
                 "databases": key.databases,

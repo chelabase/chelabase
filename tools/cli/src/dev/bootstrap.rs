@@ -2,7 +2,7 @@
 
 use crate::dev::env_files::{DemoEnv, render_demo_env, render_studio_env};
 use crate::dev::zitadel::HttpZitadel;
-use crate::dev::{internal_keys, secrets_key, steps, tenant};
+use crate::dev::{app_keys, internal_keys, secrets_key, steps, tenant};
 use crate::neon::compute_jwt;
 use crate::paths::{
     auth_dir, demo_tenant_id, gateway_dir, issuer, neon_dir, secrets_dir, studio_env_file,
@@ -33,6 +33,7 @@ pub async fn run() -> Result<()> {
     })?;
     let cookie_key = secrets_key::ensure_file(&cookie_dir, "cookie.key")?;
     let compute_jwt = compute_jwt::ensure(&neon_dir())?;
+    let app_jwt = app_keys::ensure(&cookie_dir)?;
 
     let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat", 45, TOKEN_POLL).await?;
     let login_client = zdir.join("login-client.pat");
@@ -49,6 +50,7 @@ pub async fn run() -> Result<()> {
     let demo_user_id = steps::ensure_demo_user(&api, &org_id).await?;
     steps::ensure_demo_key(&api, &demo_user_id, &zdir.join("demo-sa.json")).await?;
     steps::ensure_smtp(&api).await?;
+    steps::ensure_actions_target(&api, &zdir.join("actions.env")).await?;
 
     let demo_tenant = demo_tenant_id();
     tenant::bind_demo_tenant(&org_id, &demo_tenant)?;
@@ -71,6 +73,9 @@ pub async fn run() -> Result<()> {
             auth_token_file: &path(&login_client.canonicalize()?),
             auth_cookie_key: &path(&cookie_key),
             compute_jwt_dir: &path(&compute_jwt.dir),
+            admin_pat_file: &path(&zdir.join("admin.pat").canonicalize()?),
+            app_jwt_private_key: &path(&app_jwt.private),
+            app_jwt_public_key: &path(&app_jwt.public),
         }),
     )
     .with_context(|| format!("write {}", demo_env.display()))?;

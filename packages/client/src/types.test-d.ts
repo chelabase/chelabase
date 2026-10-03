@@ -244,3 +244,38 @@ big.database("analytics");
 expectTypeOf(big.database("analytics", types)).toEqualTypeOf<Client<DatabaseShape, true>>();
 // @ts-expect-error the name is a string
 multi.database(1);
+
+// --- db.auth: signUp's data is typed from `appUsers`, loose without it
+type AppDb = {
+  defaultSchema: "public";
+  appUsers: { schema: "public"; table: "profiles" };
+  schemas: {
+    public: {
+      tables: {
+        profiles: {
+          Row: { id: string; email: string; email_verified: boolean; created_at: string; deleted_at: string | null; nick: string; age: number | null };
+          Insert: { id?: string; email?: string; email_verified?: boolean; created_at?: string; deleted_at?: string | null; nick: string; age?: number | null };
+          Update: { nick?: string };
+        };
+      };
+      functions: {};
+    };
+  };
+};
+const appDb = createClient<AppDb>({ ...opts, types });
+type SignUpArg = Parameters<typeof appDb.auth.signUp>[0];
+expectTypeOf<SignUpArg["data"]>().toEqualTypeOf<{ nick: string; age?: number | null } | undefined>();
+void appDb.auth.signUp({ email: "a@b.co", password: "pw", data: { nick: "x" } });
+// @ts-expect-error unknown column
+void appDb.auth.signUp({ email: "a@b.co", password: "pw", data: { nope: 1 } });
+// @ts-expect-error a managed column is not insertable by the app
+void appDb.auth.signUp({ email: "a@b.co", password: "pw", data: { nick: "x", email: "y" } });
+// @ts-expect-error nick is required
+void appDb.auth.signUp({ email: "a@b.co", password: "pw", data: {} });
+
+const looseDb = createClient({ ...opts });
+expectTypeOf<Parameters<typeof looseDb.auth.signUp>[0]["data"]>().toEqualTypeOf<Record<string, Json> | undefined>();
+void looseDb.auth.signUp({ email: "a@b.co", password: "pw", data: { anything: [1, { b: null }] } });
+// Without `appUsers` in a generated Database the data is the loose record too.
+const plainDb = createClient<Database>({ ...opts, types });
+expectTypeOf<Parameters<typeof plainDb.auth.signUp>[0]["data"]>().toEqualTypeOf<Record<string, Json> | undefined>();

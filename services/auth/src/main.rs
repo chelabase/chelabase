@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use tracing::info;
 use auth::app::{AppState, router};
-use auth::config::Config;
+use auth::app_users::AppUsers;
+use auth::config::{AppConfig, Config};
 use auth::guard::RateLimiter;
 use auth::zitadel::Zitadel;
 
@@ -26,7 +27,15 @@ async fn main() -> anyhow::Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     info!("auth listening on {}", config.listen);
+    let app = match AppConfig::from_env()? {
+        Some(c) => {
+            info!("app users' flows are on (access tokens live {} s)", c.access_ttl.as_secs());
+            Some(AppUsers::from_config(&c, &config.issuer)?)
+        }
+        None => None,
+    };
     let state = Arc::new(AppState {
+        app,
         zitadel: Zitadel::new(&config.issuer, &config.token),
         config,
         limiter: RateLimiter::default(),

@@ -59,7 +59,11 @@ pub const LOCK_TIMEOUT_SECS: u32 = 20;
 /// Removes the data API machinery from a database (`DELETE …/data-api?remove=true`, P7), only
 /// when the `cheladb` schema is the one the bootstrap made (owned by `cheladb_admin`): the
 /// three event triggers, the two functions and the two tables by name, then the schema with
-/// `RESTRICT`, so anything else someone put there makes it fail rather than go with it. A
+/// `RESTRICT`, so anything else someone put there makes it fail rather than go with it. Before
+/// its own functions it drops what app users left (the protect event triggers, the sync
+/// functions, the config table) and the claim helpers, each before the one it calls; a policy
+/// still using a helper makes it fail. `cheladb.users_guard()` is left to `RESTRICT`: a guard
+/// trigger still using it means app users are on, which the caller refuses first. A
 /// `cheladb` schema with another owner is left alone (a warning). The `cheladb_admin` role
 /// stays (it's cluster-wide), and so do the default privileges and grants. The first line is a
 /// comment so the script is told apart from the bootstrap's. It takes [`BOOTSTRAP_LOCK_KEY`]
@@ -75,6 +79,16 @@ DO $$ BEGIN
     DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
     DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
     DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
+    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_drop;
+    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_ddl;
+    DROP FUNCTION IF EXISTS cheladb.users_protect();
+    DROP FUNCTION IF EXISTS cheladb.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
+    DROP FUNCTION IF EXISTS cheladb.app_users_gone(uuid, boolean);
+    DROP FUNCTION IF EXISTS cheladb.app_users_rows();
+    DROP TABLE IF EXISTS cheladb.app_users_table;
+    DROP FUNCTION IF EXISTS cheladb.user_email();
+    DROP FUNCTION IF EXISTS cheladb.user_id();
+    DROP FUNCTION IF EXISTS cheladb.claims();
     DROP FUNCTION IF EXISTS cheladb.bump_schema_version();
     DROP FUNCTION IF EXISTS cheladb.grant_extension_functions();
     DROP TABLE IF EXISTS cheladb.schema_version;
@@ -85,6 +99,24 @@ DO $$ BEGIN
   END IF;
 END $$;
 ";
+
+/// Postgres' refusal to drop something another object still uses (2BP01: a policy or view on
+/// a claim helper, P29), from psql's output: the `ERROR` line and its `DETAIL`, without the
+/// prefixes. `None` for any other failure.
+fn dependency_refusal(output: &str) -> Option<String> {
+    // `run_exec` puts psql's stderr after its own prefix on the first line, so `ERROR:` may
+    // start mid-line.
+    let mut lines = output.lines().map(str::trim);
+    let error = lines
+        .by_ref()
+        .find_map(|l| l.split_once("ERROR:").map(|(_, e)| e))
+        .map(str::trim)
+        .filter(|e| e.contains("because other objects depend on it"))?;
+    match lines.next().and_then(|l| l.strip_prefix("DETAIL:")) {
+        Some(detail) => Some(format!("{error} ({})", detail.trim())),
+        None => Some(error.to_string()),
+    }
+}
 
 /// Where a data API request applies: the branch's endpoint and the database's row.
 struct DataApiTarget {
@@ -129,7 +161,9 @@ pub fn valid_role_name(name: &str) -> bool {
 /// The idempotent script run as cloud_admin in a branch's database after every compute
 /// (re)creation and from reconcile: the `cheladb` machinery schema and its event trigger,
 /// `authenticator` made `LOGIN` with the branch's password, the owner's default privileges in
-/// `public`, and (on the database's first bootstrap only) the same grants on what exists.
+/// `public`, the claim helpers ([`crate::app_users_sql::claim_helpers_body`]), and (on the
+/// database's first bootstrap only) the same grants on what exists. The tamper check allows
+/// what app users adds to `cheladb` (P4).
 ///
 /// The script is one transaction (`BEGIN … COMMIT`) that first takes
 /// [`BOOTSTRAP_LOCK_KEY`] (after `SET LOCAL lock_timeout`, [`LOCK_TIMEOUT_SECS`]), so a reader
@@ -181,6 +215,7 @@ fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str,
     // quoted identifier.
     let schema_literal = quote_literal(&schema_ident);
     let owner = quote_literal(owner_role);
+    let claim_helpers = crate::app_users_sql::claim_helpers_body();
     format!(
         "BEGIN;
 SET search_path = pg_catalog, pg_temp;
@@ -225,10 +260,10 @@ BEGIN
     OR EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ns
       AND (c.relowner OPERATOR(pg_catalog.<>) ALL (trusted) OR c.reloftype OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
         OR c.relkind OPERATOR(pg_catalog.<>) ALL (ARRAY['r', 'i']::pg_catalog.\"char\"[])
-        OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey']::pg_catalog.name[])))
+        OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey', 'app_users_table', 'app_users_table_pkey']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
       AND (p.proowner OPERATOR(pg_catalog.<>) ALL (trusted)
-        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions']::pg_catalog.name[])))
+        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND NOT t.tgisinternal)
     OR EXISTS (SELECT FROM pg_catalog.pg_rewrite w JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class
@@ -276,7 +311,7 @@ REVOKE ALL ON cheladb.schema_version, cheladb.bootstrap FROM PUBLIC;
 GRANT SELECT ON cheladb.schema_version TO authenticator;
 GRANT USAGE ON SCHEMA cheladb TO {owner_role};
 GRANT SELECT ON cheladb.schema_version TO {owner_role};
-CREATE OR REPLACE FUNCTION cheladb.bump_schema_version() RETURNS event_trigger
+{claim_helpers}CREATE OR REPLACE FUNCTION cheladb.bump_schema_version() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
   $f$ BEGIN UPDATE cheladb.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
 ALTER FUNCTION cheladb.bump_schema_version() OWNER TO CURRENT_USER;
@@ -383,7 +418,7 @@ fn role_check_sql(role: &str) -> String {
 }
 
 /// Roles Cheladb owns; never a secret key's.
-const RESERVED_ROLES: [&str; 2] = [AUTHENTICATOR, "cheladb_admin"];
+const RESERVED_ROLES: [&str; 3] = [AUTHENTICATOR, "cheladb_admin", crate::app_users_sql::USERS_SYNC_ROLE];
 
 /// What [`Worker::check_data_role`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -786,8 +821,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .admin_sql(&target.ep, name, REMOVE_DATA_API_SQL)
                 .await
         {
-            warn!(branch_id = %branch, database = name, "removing the data API machinery: {e:#}");
-            return CheckDataRoleReply::failed(format!("removing the data API machinery: {e:#}"));
+            let output = format!("{e:#}");
+            warn!(branch_id = %branch, database = name, "removing the data API machinery: {output}");
+            if let Some(message) = dependency_refusal(&output) {
+                return CheckDataRoleReply::refused(format!(
+                    "removing the data API machinery: {message}"
+                ));
+            }
+            return CheckDataRoleReply::failed(format!(
+                "removing the data API machinery: {output}"
+            ));
         }
         match self.metadata.set_data_api_off(branch, name).await {
             Ok(_) => CheckDataRoleReply::ok(),
@@ -1075,10 +1118,10 @@ BEGIN
     OR EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ns
       AND (c.relowner OPERATOR(pg_catalog.<>) ALL (trusted) OR c.reloftype OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
         OR c.relkind OPERATOR(pg_catalog.<>) ALL (ARRAY['r', 'i']::pg_catalog.\"char\"[])
-        OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey']::pg_catalog.name[])))
+        OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey', 'app_users_table', 'app_users_table_pkey']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
       AND (p.proowner OPERATOR(pg_catalog.<>) ALL (trusted)
-        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions']::pg_catalog.name[])))
+        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND NOT t.tgisinternal)
     OR EXISTS (SELECT FROM pg_catalog.pg_rewrite w JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class
@@ -1126,6 +1169,23 @@ REVOKE ALL ON cheladb.schema_version, cheladb.bootstrap FROM PUBLIC;
 GRANT SELECT ON cheladb.schema_version TO authenticator;
 GRANT USAGE ON SCHEMA cheladb TO postgres;
 GRANT SELECT ON cheladb.schema_version TO postgres;
+GRANT USAGE ON SCHEMA cheladb TO PUBLIC;
+CREATE OR REPLACE FUNCTION cheladb.claims() RETURNS jsonb LANGUAGE sql STABLE PARALLEL SAFE
+BEGIN ATOMIC
+  SELECT COALESCE(NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb, '{}'::jsonb);
+END;
+CREATE OR REPLACE FUNCTION cheladb.user_id() RETURNS uuid LANGUAGE sql STABLE PARALLEL SAFE
+BEGIN ATOMIC
+  SELECT (cheladb.claims() OPERATOR(pg_catalog.->>) 'sub')::uuid;
+END;
+CREATE OR REPLACE FUNCTION cheladb.user_email() RETURNS text LANGUAGE sql STABLE PARALLEL SAFE
+BEGIN ATOMIC
+  SELECT cheladb.claims() OPERATOR(pg_catalog.->>) 'email';
+END;
+ALTER FUNCTION cheladb.claims() OWNER TO CURRENT_USER;
+ALTER FUNCTION cheladb.user_id() OWNER TO CURRENT_USER;
+ALTER FUNCTION cheladb.user_email() OWNER TO CURRENT_USER;
+GRANT EXECUTE ON FUNCTION cheladb.claims(), cheladb.user_id(), cheladb.user_email() TO PUBLIC;
 CREATE OR REPLACE FUNCTION cheladb.bump_schema_version() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
   $f$ BEGIN UPDATE cheladb.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
@@ -2177,6 +2237,52 @@ COMMIT;
         assert_eq!(reply.kind.as_deref(), Some("not_ready"));
     }
 
+    /// A remove that Postgres refuses because something still uses the machinery (a policy on
+    /// `cheladb.user_id()`, P29) is `refused` with Postgres' message, so the API can show it;
+    /// the database stays on.
+    #[tokio::test]
+    async fn remove_blocked_by_a_dependency_is_refused_with_the_message() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        add_row(&w, main.id, "extra", DataApiState::On, "public");
+        let output = "NOTICE:  event trigger \"cheladb_users_protect_drop\" does not exist, skipping\n\
+                      ERROR:  cannot drop function cheladb.user_id() because other objects depend on it\n\
+                      DETAIL:  policy mine_own on table mine depends on function cheladb.user_id()\n\
+                      HINT:  Use DROP ... CASCADE to drop the dependent objects too.";
+        *w.computes.fail_sql_containing.lock().unwrap() = Some(("DROP SCHEMA".into(), output.into()));
+        let reply = w.disable_data_api(&request(main.id, "extra", true)).await;
+        assert_eq!(reply.kind.as_deref(), Some("refused"), "{reply:?}");
+        let message = reply.error.unwrap();
+        assert!(
+            message.contains("cannot drop function cheladb.user_id() because other objects depend on it")
+                && message.contains("policy mine_own on table mine depends on function cheladb.user_id()"),
+            "{message}"
+        );
+        assert!(!message.contains("NOTICE"), "{message}");
+        assert_eq!(row(&w, main.id, "extra").state, DataApiState::On);
+    }
+
+    /// N3: psql's stderr follows `run_exec`'s prefix on the same line when no NOTICE comes
+    /// first, and terse verbosity prints no DETAIL.
+    #[test]
+    fn dependency_refusal_is_found_anywhere_in_a_line() {
+        let message = "cannot drop function cheladb.user_id() because other objects depend on it";
+        assert_eq!(
+            dependency_refusal(&format!("psql in compute ep-1 exited with 3: ERROR:  {message}")),
+            Some(message.to_string())
+        );
+        assert_eq!(
+            dependency_refusal(&format!("psql in compute ep-1 exited with 3: ERROR:  {message}\nDETAIL:  policy p on table t depends on function cheladb.user_id()")),
+            Some(format!("{message} (policy p on table t depends on function cheladb.user_id())"))
+        );
+        assert_eq!(
+            dependency_refusal("psql in compute ep-1 exited with 3: ERROR:  permission denied for schema cheladb"),
+            None
+        );
+        assert_eq!(dependency_refusal("connection refused"), None);
+    }
+
     /// Only what the bootstrap made is dropped, by name, and only from a `cheladb` schema owned
     /// by `cheladb_admin`; `RESTRICT` refuses to take anything else with it. A `cheladb`
     /// schema someone else owns is left alone with a warning. The cluster-wide role stays.
@@ -2194,6 +2300,16 @@ DO $$ BEGIN
     DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
     DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
     DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
+    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_drop;
+    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_ddl;
+    DROP FUNCTION IF EXISTS cheladb.users_protect();
+    DROP FUNCTION IF EXISTS cheladb.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
+    DROP FUNCTION IF EXISTS cheladb.app_users_gone(uuid, boolean);
+    DROP FUNCTION IF EXISTS cheladb.app_users_rows();
+    DROP TABLE IF EXISTS cheladb.app_users_table;
+    DROP FUNCTION IF EXISTS cheladb.user_email();
+    DROP FUNCTION IF EXISTS cheladb.user_id();
+    DROP FUNCTION IF EXISTS cheladb.claims();
     DROP FUNCTION IF EXISTS cheladb.bump_schema_version();
     DROP FUNCTION IF EXISTS cheladb.grant_extension_functions();
     DROP TABLE IF EXISTS cheladb.schema_version;
@@ -2213,6 +2329,81 @@ END $$;
         assert!(REMOVE_DATA_API_SQL.contains(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';")));
         assert!(!REMOVE_DATA_API_SQL.contains("CASCADE"));
         assert!(!REMOVE_DATA_API_SQL.contains("DROP ROLE"), "the cluster-wide role stays");
+    }
+
+    /// P4: what the users bootstrap and the claim helpers add to `cheladb` doesn't make the
+    /// data API bootstrap set the schema aside.
+    #[test]
+    fn tamper_check_allows_app_users_objects() {
+        let sql = data_api_sql("postgres", "pw", "public");
+        let array = |column: &str| {
+            let start = sql.find(&format!("{column} OPERATOR(pg_catalog.<>) ALL (ARRAY[")).unwrap();
+            sql[start..start + sql[start..].find("]::").unwrap()].to_string()
+        };
+        let (relnames, pronames) = (array("c.relname"), array("p.proname"));
+        for name in ["app_users_table", "app_users_table_pkey"] {
+            assert!(relnames.contains(&format!("'{name}'")), "{name}");
+        }
+        for name in [
+            "claims", "user_id", "user_email", "users_guard", "users_protect", "app_users_upsert", "app_users_gone",
+            "app_users_rows",
+        ] {
+            assert!(pronames.contains(&format!("'{name}'")), "{name}");
+        }
+        // The claim helpers come with every bootstrap, right after the owner's grants.
+        let helpers = format!("GRANT SELECT ON cheladb.schema_version TO postgres;\n{}", crate::app_users_sql::claim_helpers_body());
+        assert!(sql.contains(&helpers));
+        assert!(data_api_sql_granting_existing("postgres", "pw", "public").contains(&helpers));
+    }
+
+    /// C1: the claim helpers (and the app users objects) go before `DROP SCHEMA … RESTRICT`,
+    /// each function before the one it calls; `users_guard` is left to `RESTRICT`.
+    #[test]
+    fn remove_data_api_sql_drops_helpers_dependents_first() {
+        let sql = REMOVE_DATA_API_SQL;
+        let at = |s: &str| sql.find(s).unwrap_or_else(|| panic!("{s}"));
+        let schema = at("DROP SCHEMA cheladb RESTRICT;");
+        let (email, id, claims) = (
+            at("DROP FUNCTION IF EXISTS cheladb.user_email();"),
+            at("DROP FUNCTION IF EXISTS cheladb.user_id();"),
+            at("DROP FUNCTION IF EXISTS cheladb.claims();"),
+        );
+        assert!(email < claims && id < claims && claims < schema);
+        let protect = at("DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_drop;");
+        assert!(protect < at("DROP FUNCTION IF EXISTS cheladb.users_protect();"));
+        assert!(at("DROP TABLE IF EXISTS cheladb.app_users_table;") < schema);
+        assert!(at("DROP FUNCTION IF EXISTS cheladb.app_users_rows();") < schema);
+        assert!(!sql.contains("users_guard"), "left to RESTRICT");
+        // Inside the ownership guard.
+        assert!(at("r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN") < protect);
+    }
+
+    #[test]
+    fn reserved_roles_include_the_sync_role() {
+        assert!(RESERVED_ROLES.contains(&crate::app_users_sql::USERS_SYNC_ROLE));
+        assert_eq!(
+            refuse_by_name("cheladb_auth_sync"),
+            Some(RoleCheck::Refused("the role cheladb_auth_sync is reserved".into()))
+        );
+    }
+
+    /// The app users scripts start with their own marker line, so the data API script
+    /// counters (and the journal's first-line entries) never take them for a bootstrap.
+    #[tokio::test]
+    async fn data_api_script_counters_skip_app_users_scripts() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let ep = w.metadata.main(id).endpoint_id.unwrap();
+        w.computes.sql.lock().unwrap().clear();
+        for script in [
+            crate::app_users_sql::users_bootstrap_sql("public", "users", "pw", "postgres"),
+            crate::app_users_sql::USERS_TEARDOWN_SQL.to_string(),
+            crate::app_users_sql::claim_helpers_sql(),
+        ] {
+            w.computes.sql.lock().unwrap().push((ep.clone(), "app".into(), script));
+        }
+        assert!(data_api_scripts(&w, &ep).is_empty());
+        assert!(scripts_in(&w, &ep, "app").is_empty());
     }
 
     #[tokio::test]

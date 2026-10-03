@@ -130,6 +130,40 @@ type and the `types` map; pass both (`createClient<Database>({ url, key, types }
 them (`createClient({ url, key })`), the client accepts any table, column and
 function and types values as `unknown`.
 
+## App users: `db.auth`
+
+With app users enabled on the project, `db.auth` signs your users up and in. Once signed in,
+every request the client sends carries the user's access token (`cheladb-user` header), so
+the data API runs as that user.
+
+```ts
+const db = createClient<Database>({ url, key, types, auth: { storage, autoRefresh: true } });
+
+const { session, verificationRequired } = await db.auth.signUp({ email, password, data: { nick: "ana" } });
+await db.auth.signIn({ email, password });
+const off = db.auth.onChange((event, user) => {}); // "signed_in" | "signed_out" | "refreshed"
+await db.auth.signOut();
+```
+
+Methods: `signUp`, `signIn`, `signOut`, `refresh`, `getUser`, `verifyEmail`, `resendCode`,
+`requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `changePassword`, `onChange`.
+
+- `signUp`'s `data` fills the app's own columns of the users table; with a generated
+  `Database` it is typed from that table's insertable columns (without the managed ones:
+  `id`, `email`, `email_verified`, `created_at`, `deleted_at`). `session` is `null` while
+  email verification is pending (`verificationRequired`).
+- Only the refresh token is stored (key `cheladb.<first 12 chars of the key>.refresh`), in
+  `localStorage` when present, otherwise in memory; pass `auth.storage` (`{ get, set, remove }`,
+  sync or async) for anything else, such as React Native. The access token stays in memory.
+- The access token is refreshed 60 s before it expires (`autoRefresh: false` turns the timer
+  off), by one shared request. A data request answered `401 user_token_expired` refreshes once
+  and retries once. A returning visitor's first request refreshes lazily first.
+- When a refresh is answered `refresh_token_reused`, `refresh_token_invalid` or `user_inactive`,
+  or any request carrying the access token (data or `db.auth`) is answered
+  `401 user_session_revoked`, the client signs out locally (drops the stored refresh token),
+  emits `signed_out` and throws the `DataApiError`.
+- `database()` siblings share the same session.
+
 ## Other databases
 
 A branch can serve more than its main database. `db.database("analytics")` returns a client

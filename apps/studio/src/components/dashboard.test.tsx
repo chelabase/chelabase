@@ -1,11 +1,11 @@
 import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getGetMeQueryKey, type DatabaseStatus, type DatabaseSummary, type Me } from "@cheladb/management-client";
+import { getGetMeQueryKey, type DatabaseSummary, type Me, type ProjectStatusView } from "@cheladb/management-client";
 import { POLL_MS } from "@/lib/query";
 import { createReauthGuard, restartSignInOnce } from "@/lib/reauth";
 import { fakeFetch, jsonResponse, sequence, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
-import { renderWithQuery } from "@/test/render";
+import { renderWithRouter } from "@/test/render-router";
 import { Dashboard, type DashboardProps } from "./dashboard";
 
 const bound: Me = {
@@ -17,6 +17,8 @@ const bound: Me = {
       {
         id: "p1",
         slug: "default",
+        name: "Default",
+        status: "active",
         databases: [{ database_id: "d1", name: "web1", status: "ready", host: "127.0.0.1", port: 49153, branch_count: 1 }],
       },
     ],
@@ -26,8 +28,12 @@ const bound: Me = {
 function withDatabases(databases: DatabaseSummary[]): Me {
   return { ...bound, tenant: { ...bound.tenant!, projects: [{ ...bound.tenant!.projects[0], databases }] } };
 }
-const withStatus = (status: DatabaseStatus) => withDatabases([{ ...bound.tenant!.projects[0].databases[0], status }]);
-const gone = withDatabases([]);
+const withStatus = (status: ProjectStatusView): Me => ({
+  ...bound,
+  tenant: { ...bound.tenant!, projects: [{ ...bound.tenant!.projects[0], status }] },
+});
+const noDatabases = withDatabases([]);
+const noProjects: Me = { ...bound, tenant: { ...bound.tenant!, projects: [] } };
 
 const ok = (me: Me) => () => jsonResponse(me);
 const fail = (status: number, code: string, message: string) => () => jsonResponse({ error: { code, message } }, status);
@@ -42,8 +48,8 @@ function setup(
   routes: Record<string, FakeHandler> = {},
 ) {
   const f = fakeFetch({ "GET /v1/me": me, ...routes });
-  const result = renderWithQuery(
-    <Dashboard apiUrl="http://gw" profile={profile} onSignOut={() => {}} {...props} />,
+  const result = renderWithRouter(
+    <Dashboard profile={profile} onSignOut={() => {}} {...props} />,
     { fetch: f, onUnauthorized },
   );
   return { ...result, fetch: f };
@@ -60,32 +66,29 @@ function memoryStorage() {
 
 afterEach(() => vi.useRealTimers());
 
-const mainBranch = {
-  id: "b-main", name: "main", parent_branch_id: null, kind: "normal", status: "ready", host: "ep-aaaaaaaaaaaa.localtest.me",
-  port: 4432, branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
-};
-/** The branches and Data API views of database d1. */
-const databaseRoutes: Record<string, FakeHandler> = {
-  "GET /v1/databases/d1": () =>
-    jsonResponse({
-      ...bound.tenant!.projects[0].databases[0], tenant_id: "t1", project_id: "p1", error: null, history_window: 86400,
-      max_branches: 5, max_rows: 1000, statement_timeout_ms: 8000, max_connections: 5, default_schema: "public",
-    }),
-  "GET /v1/databases/d1/branches": () => jsonResponse([mainBranch]),
-  "GET /v1/databases/d1/branches/b-main/keys": () => jsonResponse([]),
-  "GET /v1/databases/d1/branches/b-main/data-api/schema": () =>
-    jsonResponse({ version: "1", default_schema: "public", schemas: {} }),
-};
-
 describe("Dashboard", () => {
-  it("shows the tenant, project and its databases", async () => {
+  it("dashboard_lists_projects_and_links", async () => {
     setup(ok(bound));
-    expect(await screen.findByRole("heading", { name: "demo / default" })).toBeInTheDocument();
-    expect(screen.getByText("web1")).toBeInTheDocument();
-    expect(screen.getByText("ready")).toBeInTheDocument();
-    expect(screen.getByText("127.0.0.1:49153")).toBeInTheDocument();
+    const link = await screen.findByRole("link", { name: "Default" });
+    expect(link).toHaveAttribute("href", "/app/projects/p1");
+    expect(screen.getByText("default")).toBeInTheDocument();
+    expect(screen.getByText("active")).toBeInTheDocument();
+    expect(screen.getByText("1 database")).toBeInTheDocument();
     expect(screen.getByText("Ada Lovelace")).toBeInTheDocument();
     expect(screen.getByText("ada@example.com")).toBeInTheDocument();
+    await userEvent.click(link);
+    expect(await screen.findByText("project route p1")).toBeInTheDocument();
+  });
+
+  it("new_project_dialog_creates_and_navigates", async () => {
+    setup(ok(bound), {}, undefined, {
+      "POST /v1/projects": () =>
+        jsonResponse({ id: "p9", slug: "shop", name: "Shop", status: "active", error: null, app_users: null, created_at: "t", updated_at: "t" }, 201),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "New project" }));
+    await userEvent.type(await screen.findByLabelText("Project name"), "Shop");
+    await userEvent.click(screen.getByRole("button", { name: "Create project" }));
+    expect(await screen.findByText("project route p9")).toBeInTheDocument();
   });
 
   it("says when the tenant has no projects", async () => {
@@ -117,7 +120,7 @@ describe("Dashboard", () => {
     expect(guard.shouldRedirect()).toBe(true);
     const onLoaded = vi.fn(() => guard.reset());
     setup(ok(bound), { onLoaded });
-    expect(await screen.findByRole("heading", { name: "demo / default" })).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "Default" })).toBeInTheDocument();
     expect(onLoaded).toHaveBeenCalledTimes(1);
     // Re-armed: a later 401 may restart sign-in again.
     expect(createReauthGuard(storage).shouldRedirect()).toBe(true);
@@ -139,39 +142,36 @@ describe("Dashboard", () => {
     setup(sequence(fail(503, "unavailable", "auth unavailable"), ok(bound)));
     expect(await screen.findByRole("alert")).toHaveTextContent("auth unavailable");
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(await screen.findByRole("heading", { name: "demo / default" })).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "Default" })).toBeInTheDocument();
   });
 
-  it("dashboard_polls_while_provisioning_and_stops_when_ready", async () => {
+  it("dashboard_polls_while_a_project_is_deleting_and_stops_when_it_settles", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    const { fetch } = setup(sequence(ok(withStatus("provisioning")), ok(withStatus("ready"))));
-    expect(await screen.findByText("provisioning")).toBeInTheDocument();
-    expect(meCalls(fetch)).toBe(1);
-
-    await act(() => vi.advanceTimersByTimeAsync(POLL_MS));
-    expect(await screen.findByText("ready")).toBeInTheDocument();
-    expect(meCalls(fetch)).toBe(2);
-
-    await act(() => vi.advanceTimersByTimeAsync(POLL_MS * 5));
-    expect(meCalls(fetch)).toBe(2);
-  });
-
-  it("keeps refreshing while a database is being deleted", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const { fetch } = setup(sequence(ok(withStatus("deleting")), ok(gone)));
+    const { fetch } = setup(sequence(ok(withStatus("deleting")), ok(noProjects)));
     expect(await screen.findByText("deleting")).toBeInTheDocument();
+    expect(meCalls(fetch)).toBe(1);
     await act(() => vi.advanceTimersByTimeAsync(POLL_MS));
-    expect(await screen.findByText("No databases yet.")).toBeInTheDocument();
+    expect(await screen.findByText(/no projects yet/i)).toBeInTheDocument();
     expect(meCalls(fetch)).toBe(2);
-    // The last deleting database is gone: polling stops.
     await act(() => vi.advanceTimersByTimeAsync(POLL_MS * 5));
     expect(meCalls(fetch)).toBe(2);
   });
 
-  it("doesn't poll an empty list", async () => {
+  it("polls while a database is provisioning", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    const { fetch } = setup(ok(gone));
-    expect(await screen.findByText("No databases yet.")).toBeInTheDocument();
+    const provisioning = withDatabases([{ ...bound.tenant!.projects[0].databases[0], status: "provisioning" }]);
+    const { fetch } = setup(sequence(ok(provisioning), ok(bound)));
+    expect(await screen.findByRole("link", { name: "Default" })).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(POLL_MS));
+    expect(meCalls(fetch)).toBe(2);
+    await act(() => vi.advanceTimersByTimeAsync(POLL_MS * 5));
+    expect(meCalls(fetch)).toBe(2);
+  });
+
+  it("doesn't poll a settled list", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { fetch } = setup(ok(noDatabases));
+    expect(await screen.findByText("0 databases")).toBeInTheDocument();
     await act(() => vi.advanceTimersByTimeAsync(POLL_MS * 5));
     expect(meCalls(fetch)).toBe(1);
   });
@@ -179,14 +179,14 @@ describe("Dashboard", () => {
   it("keeps the last good list when a refresh fails, and keeps refreshing", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { fetch } = setup(
-      sequence(ok(withStatus("deleting")), fail(502, "unavailable", "gateway hiccup"), ok(gone)),
+      sequence(ok(withStatus("deleting")), fail(502, "unavailable", "gateway hiccup"), ok(noProjects)),
     );
     expect(await screen.findByText("deleting")).toBeInTheDocument();
     await act(() => vi.advanceTimersByTimeAsync(POLL_MS));
     expect(await screen.findByText("Couldn't refresh (gateway hiccup); retrying…")).toBeInTheDocument();
-    expect(screen.getByText("web1")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Default" })).toBeInTheDocument();
     await act(() => vi.advanceTimersByTimeAsync(POLL_MS));
-    expect(await screen.findByText("No databases yet.")).toBeInTheDocument();
+    expect(await screen.findByText(/no projects yet/i)).toBeInTheDocument();
     expect(meCalls(fetch)).toBeGreaterThanOrEqual(3);
     expect(screen.queryByText(/Couldn't load your workspace/)).toBeNull();
     expect(screen.queryByText(/Couldn't refresh/)).toBeNull();
@@ -199,38 +199,5 @@ describe("Dashboard", () => {
     expect(onSignOut).toHaveBeenCalledTimes(1);
     expect(queryClient.getQueryData(getGetMeQueryKey())).toBeUndefined();
     expect(queryClient.getQueryCache().findAll()).toHaveLength(0);
-  });
-
-  it("expands a database into its branches", async () => {
-    const { fetch } = setup(ok(bound), {}, undefined, databaseRoutes);
-    await userEvent.click(await screen.findByRole("button", { name: "Branches" }));
-    expect(await screen.findByText("0 of 5 branches")).toBeInTheDocument();
-    expect(fetch.calls.map((r) => new URL(r.url).pathname)).toContain("/v1/databases/d1/branches");
-    await userEvent.click(screen.getByRole("button", { name: "Branches" }));
-    expect(screen.queryByText("0 of 5 branches")).toBeNull();
-  });
-
-  it("opens the Data API view of a database, switching with Branches", async () => {
-    setup(ok(bound), {}, undefined, databaseRoutes);
-    await userEvent.click(await screen.findByRole("button", { name: "Data API" }));
-    expect(await screen.findByText("http://gw/data/v1/query")).toBeInTheDocument();
-    expect(screen.queryByText(/of 5 branches/)).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Branches" }));
-    expect(await screen.findByText("0 of 5 branches")).toBeInTheDocument();
-    expect(screen.queryByText("http://gw/data/v1/query")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Branches" }));
-    expect(screen.queryByText("0 of 5 branches")).not.toBeInTheDocument();
-  });
-
-  it("opens the Tables console of a database", async () => {
-    setup(ok(bound), {}, undefined, {
-      ...databaseRoutes,
-      "GET /v1/databases/d1/branches/b-main/databases": () =>
-        jsonResponse([{ name: "app", main: true, data_api: "on", data_api_error: null, default_schema: "public", origin: "owner", owner: "o" }]),
-      "GET /v1/databases/d1/branches/b-main/roles": () => jsonResponse([]),
-    });
-    await userEvent.click(await screen.findByRole("button", { name: "Tables" }));
-    expect(await screen.findByLabelText("View as")).toBeInTheDocument();
-    expect(screen.getByText(/Viewing as owner/)).toBeInTheDocument();
   });
 });

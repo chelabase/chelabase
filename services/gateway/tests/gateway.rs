@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
+const E2E_PROJECT: &str = "33333333-3333-4333-8333-333333333333";
 const STUDIO: &str = "http://localhost:3000";
 
 /// The most recent request the mock upstream received: headers plus `:uri`.
@@ -465,8 +466,18 @@ async fn hostname_upstream_is_resolved() {
 /// Fake orchestrator internal listener: every key is a known public key.
 async fn spawn_internal_listener() -> String {
     let app = Router::new().fallback(|req: Request| async move {
-        let ok = req.headers().get("authorization").and_then(|v| v.to_str().ok())
-            == Some("Bearer e2e-data-keys-token");
+        let bearer = req.headers().get("authorization").and_then(|v| v.to_str().ok());
+        if req.uri().path().starts_with("/internal/app/sessions/") {
+            return if bearer == Some("Bearer e2e-sessions-token") {
+                (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({"live": true, "project_id": E2E_PROJECT})),
+                )
+            } else {
+                (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+            };
+        }
+        let ok = bearer == Some("Bearer e2e-data-keys-token");
         if !ok {
             return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
         }
@@ -475,6 +486,7 @@ async fn spawn_internal_listener() -> String {
             Json(serde_json::json!({
                 "key_id": "11111111-1111-4111-8111-111111111111",
                 "branch_id": "22222222-2222-4222-8222-222222222222",
+                "project_id": E2E_PROJECT,
                 "kind": "public",
                 "role": "anon",
             })),
@@ -552,4 +564,77 @@ async fn proxy_failures_are_json_on_data_routes_too() {
         body,
         serde_json::json!({"error": {"code": "unavailable", "message": "upstream unavailable"}})
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cheladb_user_header_is_stripped_upstream() {
+    use cheladb_auth::app_token::{app_audience, AppClaims, AppTokenSigner, APP_ISSUER};
+    let jwks = MockJwks::start().await;
+    let (rest, seen) = spawn_upstream().await;
+    let internal = spawn_internal_listener().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (private_pem, public_pem) = generate_keypair_pem();
+    let public_path = dir.path().join("app-jwt.pub");
+    std::fs::write(&public_path, &public_pem).unwrap();
+    let signer = AppTokenSigner::from_pem(private_pem.as_bytes(), public_pem.as_bytes()).unwrap();
+    let project: uuid::Uuid = E2E_PROJECT.parse().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = signer
+        .sign(&AppClaims {
+            iss: APP_ISSUER.to_string(),
+            aud: app_audience(project),
+            sub: uuid::Uuid::new_v4(),
+            sid: uuid::Uuid::new_v4(),
+            project,
+            email: "ada@example.com".into(),
+            email_verified: true,
+            role: "authenticated".into(),
+            iat: now,
+            exp: now + 300,
+        })
+        .unwrap();
+    let (base, verify, _gateway) = spawn_gateway_with(
+        &rest,
+        &jwks,
+        &[
+            ("CHELADB_REST_URL", &rest),
+            ("CHELADB_INTERNAL_URL", &internal),
+            ("CHELADB_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+            ("CHELADB_APP_SESSIONS_INTERNAL_TOKEN", "e2e-sessions-token"),
+            ("CHELADB_APP_JWT_PUBLIC_KEY", public_path.to_str().unwrap()),
+        ],
+    )
+    .await;
+    let key = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Public).key;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/data/v1/query"))
+        .header("authorization", format!("Bearer {key}"))
+        .header("cheladb-user", &token)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let saw = seen.lock().unwrap().clone().expect("rest was called");
+    assert!(!saw.contains_key("cheladb-user"), "the user token must not reach rest");
+    assert!(!saw.contains_key("authorization"));
+    let data = verify.verify(&saw[IDENTITY_HEADER], "rest").unwrap().data.unwrap();
+    assert_eq!(data.role, "authenticated");
+
+    // A bad token is refused by the gateway and never reaches the upstream.
+    *seen.lock().unwrap() = None;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/data/v1/query"))
+        .header("authorization", format!("Bearer {key}"))
+        .header("cheladb-user", "garbage")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert!(seen.lock().unwrap().is_none());
 }

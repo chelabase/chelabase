@@ -28,7 +28,16 @@ die() {
 # hex <bytes>: that many random bytes as lowercase hex.
 hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
 # SQL on stdin; values are passed as psql variables (-v name=value, used as :'name').
-metadata_sql() { "${compose[@]}" exec -T metadata-db psql -U cheladb -d cheladb_metadata -v ON_ERROR_STOP=1 -qtA "$@"; }
+# The database is the path of CHELADB_METADATA_DATABASE_URL when set (a branch may run on its own
+# metadata database), else cheladb_metadata.
+metadata_db() {
+  local db="${CHELADB_METADATA_DATABASE_URL:-}"
+  db="${db#*://}"
+  [[ "$db" == */* ]] && db="${db#*/}" || db=""
+  db="${db%%[?#]*}"
+  echo "${db:-cheladb_metadata}"
+}
+metadata_sql() { "${compose[@]}" exec -T metadata-db psql -U cheladb -d "$(metadata_db)" -v ON_ERROR_STOP=1 -qtA "$@"; }
 
 # call <method> <url> [json body]: prints the response body; dies on no answer or non-2xx.
 # Each request is limited to $MAX_TIME seconds (default 60).

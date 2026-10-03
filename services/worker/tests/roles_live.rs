@@ -708,7 +708,23 @@ async fn stop_orchestrator() {
     panic!("the orchestrator still listens 20 s after the kill");
 }
 
-/// Starts the orchestrator as `just dev` does (same environment as this test, plus `env`),
+/// The variables `just dev` sources for its apps beyond `demo.env` (which the test's own
+/// environment already has): `.cheladb/zitadel/actions.env` under `root`, when present.
+/// `KEY=VALUE` lines; blank lines and `#` comments are skipped.
+fn dev_env_files(root: &std::path::Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(root.join(".cheladb/zitadel/actions.env")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+        .collect()
+}
+
+/// Starts the orchestrator as `just dev` does (same environment as this test, plus
+/// [`dev_env_files`], plus `env`),
 /// records it in the dev directory's `pids` in place of the old one, and waits for it to answer.
 async fn start_orchestrator(env: &[(&str, &str)]) {
     use std::os::unix::process::CommandExt;
@@ -723,6 +739,7 @@ async fn start_orchestrator(env: &[(&str, &str)]) {
     let child = std::process::Command::new("cargo")
         .args(["run", "-q", "-p", "orchestrator"])
         .current_dir(&root)
+        .envs(dev_env_files(&root))
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
@@ -764,6 +781,29 @@ where
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
     }
+}
+
+/// The restarted orchestrator gets what `just dev` sources besides the test's own environment
+/// (`actions.env`: without its signing key the Zitadel webhook answers 503 until `just dev`
+/// runs again).
+#[test]
+fn restarted_orchestrator_gets_the_dev_env_files() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".cheladb/zitadel")).unwrap();
+    std::fs::write(
+        root.path().join(".cheladb/zitadel/actions.env"),
+        "# comment\n\nCHELADB_ZITADEL_ACTIONS_SIGNING_KEY=k=1\n",
+    )
+    .unwrap();
+    assert_eq!(
+        dev_env_files(root.path()),
+        vec![(
+            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY".to_string(),
+            "k=1".to_string()
+        )]
+    );
+    let empty = tempfile::tempdir().unwrap();
+    assert!(dev_env_files(empty.path()).is_empty());
 }
 
 // --- SQL-managed roles ----------------------------------------------------------------------

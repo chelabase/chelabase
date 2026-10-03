@@ -334,6 +334,19 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .map(|_| ())
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
+        // A reset or restore brings back the timeline's own `cheladb_auth_sync` password:
+        // the branch's stored one is set again (with the rest of the users machinery).
+        let database = self
+            .metadata
+            .get_branch(branch)
+            .await
+            .map_err(|e| format!("bootstrapping app users: reading the branch: {e}"))?
+            .map(|b| b.database_id);
+        if let Some(database) = database {
+            self.bootstrap_users_for(branch, database, ep)
+                .await
+                .map_err(|e| format!("bootstrapping app users: {e:#}"))?;
+        }
         // Recorded before the resync: the compute now runs these settings whatever the
         // resync does, and a resync that keeps failing gets a plain `Resync` from reconcile,
         // not a re-creation every pass.

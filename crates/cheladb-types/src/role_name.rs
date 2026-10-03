@@ -2,7 +2,7 @@
 
 /// Names a login role can't take: the platform's own roles and Postgres' keywords.
 /// Any name starting with `pg_` (in any case) is reserved too.
-pub const RESERVED_ROLE_NAMES: [&str; 9] = [
+pub const RESERVED_ROLE_NAMES: [&str; 10] = [
     "postgres",
     "anon",
     "authenticated",
@@ -12,6 +12,7 @@ pub const RESERVED_ROLE_NAMES: [&str; 9] = [
     "neon_superuser",
     "public",
     "none",
+    "cheladb_auth_sync",
 ];
 
 /// Why a login role name was refused (422 `invalid_role_name` / `reserved_role_name`).
@@ -102,6 +103,7 @@ mod tests {
                 "{name}"
             );
         }
+        assert!(RESERVED_ROLE_NAMES.contains(&"cheladb_auth_sync"));
         for name in ["pg_x", "PG_x", "Pg_monitor"] {
             assert_eq!(
                 check_login_role_name(name),

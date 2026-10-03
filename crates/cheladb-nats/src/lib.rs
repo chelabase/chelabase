@@ -40,6 +40,21 @@ pub const CONSUMER_BRANCH: &str = "cheladb-worker-branch";
 pub const SUBJECT_DATABASE_SETTINGS: &str = "cheladb.database_settings";
 pub const CONSUMER_DATABASE_SETTINGS: &str = "cheladb-worker-settings";
 
+/// Durable project delete jobs.
+pub const SUBJECT_PROJECT_DELETE: &str = "cheladb.project_delete";
+pub const CONSUMER_PROJECT_DELETE: &str = "cheladb-worker-project-delete";
+
+/// Durable app-users jobs: enable, disable and reconcile a project's user location.
+pub const SUBJECT_APP_USERS: &str = "cheladb.app_users";
+pub const CONSUMER_APP_USERS: &str = "cheladb-worker-app-users";
+
+/// Durable app-users sync jobs: copy one user row into the project's databases.
+pub const SUBJECT_APP_USERS_SYNC: &str = "cheladb.app_users_sync";
+pub const CONSUMER_APP_USERS_SYNC: &str = "cheladb-worker-app-users-sync";
+
+/// Core request/reply (not JetStream): check a table can hold the app-users location.
+pub const SUBJECT_APP_USERS_CHECK: &str = "cheladb.rpc.app_users.check";
+
 /// Core request/reply (not JetStream): reset a database's owner password.
 pub const SUBJECT_RESET_PASSWORD: &str = "cheladb.rpc.reset_password";
 
@@ -55,6 +70,46 @@ pub struct ProvisionDatabaseJob {
     pub project_id: ProjectId,
     pub tenant_id: TenantId,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectDeleteJob {
+    pub project_id: ProjectId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppUsersJob {
+    Enable { project_id: ProjectId },
+    Disable { project_id: ProjectId },
+    Reconcile { project_id: ProjectId },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppUsersSyncJob {
+    pub project_id: ProjectId,
+    pub user_id: Uuid,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    #[serde(default)]
+    pub origin_branch_id: Option<BranchId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppUsersCheckRequest {
+    pub database_id: DatabaseId,
+    pub pg_database: String,
+    pub schema: String,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppUsersCheckReply {
+    pub ok: bool,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +344,9 @@ pub fn control_subjects() -> Vec<String> {
         SUBJECT_DELETE.to_string(),
         SUBJECT_BRANCH.to_string(),
         SUBJECT_DATABASE_SETTINGS.to_string(),
+        SUBJECT_PROJECT_DELETE.to_string(),
+        SUBJECT_APP_USERS.to_string(),
+        SUBJECT_APP_USERS_SYNC.to_string(),
     ]
 }
 
@@ -409,6 +467,81 @@ where
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     run_consumer(js, CONSUMER_DATABASE_SETTINGS, SUBJECT_DATABASE_SETTINGS, handler).await
+}
+
+pub async fn publish_project_delete(
+    js: &async_nats::jetstream::Context,
+    job: &JobEnvelope<ProjectDeleteJob>,
+) -> Result<(), NatsError> {
+    let payload = serde_json::to_vec(job)?;
+    js.publish(SUBJECT_PROJECT_DELETE.to_string(), payload.into())
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?;
+    Ok(())
+}
+
+pub async fn publish_app_users(
+    js: &async_nats::jetstream::Context,
+    job: &JobEnvelope<AppUsersJob>,
+) -> Result<(), NatsError> {
+    let payload = serde_json::to_vec(job)?;
+    js.publish(SUBJECT_APP_USERS.to_string(), payload.into())
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?;
+    Ok(())
+}
+
+pub async fn publish_app_users_sync(
+    js: &async_nats::jetstream::Context,
+    job: &JobEnvelope<AppUsersSyncJob>,
+) -> Result<(), NatsError> {
+    let payload = serde_json::to_vec(job)?;
+    js.publish(SUBJECT_APP_USERS_SYNC.to_string(), payload.into())
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?;
+    Ok(())
+}
+
+/// Run the project delete consumer loop, calling `handler` for each job.
+pub async fn run_project_delete_consumer<F, Fut>(
+    js: async_nats::jetstream::Context,
+    handler: F,
+) -> Result<(), NatsError>
+where
+    F: FnMut(JobEnvelope<ProjectDeleteJob>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    run_consumer(js, CONSUMER_PROJECT_DELETE, SUBJECT_PROJECT_DELETE, handler).await
+}
+
+/// Run the app users consumer loop, calling `handler` for each job.
+pub async fn run_app_users_consumer<F, Fut>(
+    js: async_nats::jetstream::Context,
+    handler: F,
+) -> Result<(), NatsError>
+where
+    F: FnMut(JobEnvelope<AppUsersJob>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    run_consumer(js, CONSUMER_APP_USERS, SUBJECT_APP_USERS, handler).await
+}
+
+/// Run the app users sync consumer loop, calling `handler` for each job.
+pub async fn run_app_users_sync_consumer<F, Fut>(
+    js: async_nats::jetstream::Context,
+    handler: F,
+) -> Result<(), NatsError>
+where
+    F: FnMut(JobEnvelope<AppUsersSyncJob>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    run_consumer(js, CONSUMER_APP_USERS_SYNC, SUBJECT_APP_USERS_SYNC, handler).await
 }
 
 /// Run the delete consumer loop, calling `handler` for each job.
@@ -804,6 +937,9 @@ mod tests {
                 SUBJECT_DELETE.to_string(),
                 SUBJECT_BRANCH.to_string(),
                 SUBJECT_DATABASE_SETTINGS.to_string(),
+                SUBJECT_PROJECT_DELETE.to_string(),
+                SUBJECT_APP_USERS.to_string(),
+                SUBJECT_APP_USERS_SYNC.to_string(),
             ]
         );
         assert!(missing_subjects(&control_subjects()).is_empty());
@@ -825,8 +961,60 @@ mod tests {
         ];
         assert_eq!(
             missing_subjects(&old),
-            vec![SUBJECT_BRANCH.to_string(), SUBJECT_DATABASE_SETTINGS.to_string()]
+            vec![
+                SUBJECT_BRANCH.to_string(),
+                SUBJECT_DATABASE_SETTINGS.to_string(),
+                SUBJECT_PROJECT_DELETE.to_string(),
+                SUBJECT_APP_USERS.to_string(),
+                SUBJECT_APP_USERS_SYNC.to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn control_subjects_include_app_jobs() {
+        let subjects = control_subjects();
+        for s in ["cheladb.project_delete", "cheladb.app_users", "cheladb.app_users_sync"] {
+            assert!(subjects.contains(&s.to_string()), "{s}");
+        }
+        // The check subject is core request/reply, not on the stream.
+        assert_eq!(SUBJECT_APP_USERS_CHECK, "cheladb.rpc.app_users.check");
+        assert!(!subjects.contains(&SUBJECT_APP_USERS_CHECK.to_string()));
+        assert_eq!(CONSUMER_PROJECT_DELETE, "cheladb-worker-project-delete");
+        assert_eq!(CONSUMER_APP_USERS, "cheladb-worker-app-users");
+        assert_eq!(CONSUMER_APP_USERS_SYNC, "cheladb-worker-app-users-sync");
+    }
+
+    #[test]
+    fn app_users_job_round_trips() {
+        let project_id = ProjectId::new();
+        assert_eq!(
+            serde_json::to_value(AppUsersJob::Enable { project_id }).unwrap(),
+            serde_json::json!({ "enable": { "project_id": project_id } })
+        );
+        for job in [
+            AppUsersJob::Enable { project_id },
+            AppUsersJob::Disable { project_id },
+            AppUsersJob::Reconcile { project_id },
+        ] {
+            let back: AppUsersJob =
+                serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+            assert_eq!(back, job);
+        }
+    }
+
+    #[test]
+    fn sync_job_defaults_missing_fields() {
+        let (project_id, user_id) = (ProjectId::new(), Uuid::new_v4());
+        let job: AppUsersSyncJob = serde_json::from_value(
+            serde_json::json!({ "project_id": project_id, "user_id": user_id }),
+        )
+        .unwrap();
+        assert_eq!(job.user_id, user_id);
+        assert!(job.data.is_none());
+        assert!(job.origin_branch_id.is_none());
+        let reply: AppUsersCheckReply = serde_json::from_value(serde_json::json!({ "ok": true })).unwrap();
+        assert!(reply.ok && reply.code.is_none() && reply.error.is_none());
     }
 
     #[test]

@@ -6,10 +6,9 @@ import { useAppSession } from "@/lib/app-session";
 export const Route = createFileRoute("/app/")({ component: DashboardRoute });
 
 function DashboardRoute() {
-  const { apiUrl, profile, onLoaded, onSignOut } = useAppSession();
+  const { profile, onLoaded, onSignOut } = useAppSession();
   return (
     <Dashboard
-      apiUrl={apiUrl}
       profile={profile}
       onLoaded={onLoaded}
       onSignOut={onSignOut}

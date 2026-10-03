@@ -13,6 +13,12 @@ pub struct GatewayConfig {
     pub internal_url: String,
     /// Bearer for that listener (`CHELADB_DATA_KEYS_TOKEN`).
     pub data_keys_token: String,
+    /// App-user token verification key, a PEM file (`CHELADB_APP_JWT_PUBLIC_KEY`); when unset,
+    /// every `Cheladb-User` header is refused.
+    pub app_jwt_public_key: Option<String>,
+    /// Liveness-only bearer for `GET /internal/app/sessions/{id}`
+    /// (`CHELADB_APP_SESSIONS_INTERNAL_TOKEN`).
+    pub app_sessions_token: String,
     /// Upstream read timeout (`CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS`, default 60).
     pub upstream_timeout: Duration,
 }
@@ -27,6 +33,8 @@ impl std::fmt::Debug for GatewayConfig {
             .field("studio_origins", &self.studio_origins)
             .field("internal_url", &self.internal_url)
             .field("data_keys_token", &"<redacted>")
+            .field("app_jwt_public_key", &self.app_jwt_public_key)
+            .field("app_sessions_token", &"<redacted>")
             .field("upstream_timeout", &self.upstream_timeout)
             .finish()
     }
@@ -46,6 +54,13 @@ impl GatewayConfig {
             studio_origins: split_csv(&env_or("CHELADB_STUDIO_ORIGINS", "http://localhost:3000")),
             internal_url: env_or("CHELADB_INTERNAL_URL", "http://127.0.0.1:8083"),
             data_keys_token: env_or("CHELADB_DATA_KEYS_TOKEN", "cheladb-dev-data-keys"),
+            app_jwt_public_key: std::env::var("CHELADB_APP_JWT_PUBLIC_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            app_sessions_token: env_or(
+                "CHELADB_APP_SESSIONS_INTERNAL_TOKEN",
+                "cheladb-dev-app-sessions",
+            ),
             upstream_timeout: parse_timeout_secs(&env_or(
                 "CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS",
                 "60",
@@ -89,10 +104,13 @@ mod tests {
             studio_origins: vec![],
             internal_url: "http://127.0.0.1:3".into(),
             data_keys_token: "super-secret-token".into(),
+            app_jwt_public_key: None,
+            app_sessions_token: "sessions-secret".into(),
             upstream_timeout: std::time::Duration::from_secs(1),
         };
         let shown = format!("{config:?}");
         assert!(!shown.contains("super-secret-token"), "{shown}");
+        assert!(!shown.contains("sessions-secret"), "{shown}");
         assert!(shown.contains("data_keys_token"), "{shown}");
     }
 

@@ -1,0 +1,16 @@
+language: "rust"
+
+tasks:
+  check:
+    command: "cargo"
+    args: ["check", "-p", "cheladb-zitadel"]
+    inputs:
+      - "src/**/*"
+      - "Cargo.toml"
+  build:
+    command: "cargo"
+    args: ["build", "-p", "cheladb-zitadel"]
+    deps: ["check"]
+  test:
+    command: "cargo"
+    args: ["test", "-p", "cheladb-zitadel"]

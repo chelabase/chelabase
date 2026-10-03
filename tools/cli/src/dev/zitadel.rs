@@ -61,7 +61,7 @@ impl ZitadelApi for HttpZitadel {
         let mut request = self
             .http
             .request(method.clone(), format!("{}{path}", self.issuer));
-        if method != Method::GET {
+        if method != Method::GET && method != Method::DELETE {
             request = request.json(&body);
         }
         self.send(request, &what).await

@@ -41,6 +41,10 @@ pub struct DataIdentity {
     /// branch serves. Absent in tokens minted before allow-lists existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub databases: Option<Vec<String>>,
+    /// The project an app-user token belongs to; absent for key-based identities and in
+    /// tokens minted before app users existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 /// The caller, as established by the gateway. For a data key, `sub` is the key id and

@@ -113,6 +113,7 @@ fn console_identity(branch: Uuid, role: &str) -> DataIdentity {
         role: role.to_owned(),
         claims: Value::Object(Default::default()),
         databases: None,
+        project_id: None,
     }
 }
 
@@ -555,6 +556,7 @@ mod tests {
             role: role.into(),
             claims: serde_json::json!({}),
             databases: None,
+            project_id: None,
         }
     }
 

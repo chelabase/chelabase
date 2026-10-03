@@ -6,6 +6,7 @@
 
 use crate::data_keys::{DataKeyResolver, KeyError};
 use crate::registry::SharedRegistry;
+use crate::user_tokens::{UserTokenError, UserTokens};
 use cheladb_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
 use cheladb_auth::{AuthError, JwtVerifier};
 use cheladb_routes::{match_endpoint, Auth, Cors, Endpoint, Match, Scope, Service};
@@ -23,7 +24,9 @@ pub const GATEWAY_HEALTH_PATH: &str = "/_gateway/health";
 const MAX_REQUEST_ID_LEN: usize = 128;
 /// Client headers never forwarded upstream: upstreams only ever see the
 /// gateway-minted identity.
-const STRIPPED_REQUEST_HEADERS: &[&str] = &[IDENTITY_HEADER, "authorization"];
+/// The end-user token header; checked by the gateway, never forwarded.
+pub const USER_TOKEN_HEADER: &str = "cheladb-user";
+const STRIPPED_REQUEST_HEADERS: &[&str] = &[IDENTITY_HEADER, "authorization", USER_TOKEN_HEADER];
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id";
 const CORS_MAX_AGE_SECS: &str = "600";
 
@@ -95,6 +98,7 @@ pub struct Pipeline {
     verifier: JwtVerifier,
     signer: InternalSigner,
     keys: Arc<DataKeyResolver>,
+    users: Arc<UserTokens>,
 }
 
 impl Pipeline {
@@ -104,6 +108,7 @@ impl Pipeline {
         verifier: JwtVerifier,
         signer: InternalSigner,
         keys: Arc<DataKeyResolver>,
+        users: Arc<UserTokens>,
     ) -> Self {
         Self {
             registry,
@@ -111,6 +116,7 @@ impl Pipeline {
             verifier,
             signer,
             keys,
+            users,
         }
     }
 
@@ -176,10 +182,11 @@ impl Pipeline {
 
         let identity = match endpoint.policy.auth {
             Auth::Public => None,
-            Auth::DataKey | Auth::SecretDataKey => {
+            Auth::DataKey | Auth::SecretDataKey | Auth::PublicDataKey => {
                 let secret_only = endpoint.policy.auth == Auth::SecretDataKey;
+                let public_only = endpoint.policy.auth == Auth::PublicDataKey;
                 match self
-                    .authenticate_key(endpoint.service, req, secret_only, request_id)
+                    .authenticate_key(endpoint.service, req, secret_only, public_only, request_id)
                     .await
                 {
                     Ok(token) => Some(token),
@@ -226,7 +233,7 @@ impl Pipeline {
                 headers: vec![
                     ("access-control-allow-origin", "*".to_string()),
                     ("access-control-allow-methods", "GET, POST".to_string()),
-                    ("access-control-allow-headers", "authorization, content-type".to_string()),
+                    ("access-control-allow-headers", "authorization, content-type, cheladb-user".to_string()),
                     ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
                 ],
                 body: None,
@@ -295,13 +302,43 @@ impl Pipeline {
         service: Service,
         req: &RequestParts<'_>,
         secret_only: bool,
+        public_only: bool,
         request_id: &str,
     ) -> Result<String, GatewayResponse> {
         let key = bearer_token(req.headers).ok_or(KeyError::Missing).map_err(key_error)?;
         let resolved = self.keys.resolve(key, req.client_ip).await.map_err(key_error)?;
-        if secret_only && resolved.kind != DataKeyKind::Secret {
-            return Err(key_error(KeyError::Invalid));
+        if let Some(refused) = key_kind_refusal(secret_only, public_only, resolved.kind) {
+            return Err(refused);
         }
+        let (role, claims) = match header_str(req.headers, USER_TOKEN_HEADER) {
+            None if req.headers.contains_key(USER_TOKEN_HEADER) => {
+                return Err(user_token_error(UserTokenError::Invalid));
+            }
+            None => (resolved.role, json!({})),
+            Some(_) if resolved.kind == DataKeyKind::Secret => {
+                return Err(data_error(
+                    400,
+                    "user_token_with_secret_key",
+                    "a user token can't be sent with a secret key",
+                ));
+            }
+            // Never fall back to the key's own role on a bad token.
+            Some(token) => {
+                let claims = self
+                    .users
+                    .check(token, resolved.project_id)
+                    .await
+                    .map_err(user_token_error)?;
+                (
+                    "authenticated".to_string(),
+                    json!({
+                        "sub": claims.sub, "sid": claims.sid, "project": claims.project,
+                        "email": claims.email, "email_verified": claims.email_verified,
+                        "role": "authenticated", "exp": claims.exp,
+                    }),
+                )
+            }
+        };
         let identity = Identity {
             sub: resolved.key_id.to_string(),
             org_id: String::new(),
@@ -311,9 +348,10 @@ impl Pipeline {
                 branch_id: resolved.branch_id,
                 key_id: resolved.key_id,
                 kind: resolved.kind,
-                role: resolved.role,
-                claims: json!({}),
+                role,
+                claims,
                 databases: resolved.databases,
+                project_id: Some(resolved.project_id),
             }),
         };
         self.signer.sign(service.name(), &identity).map_err(|err| {
@@ -400,12 +438,38 @@ fn internal_key_error(request_id: &str) -> GatewayResponse {
     data_error(500, "internal", &format!("internal error (request id {request_id})"))
 }
 
+/// The answer for a resolved key of the wrong kind for the endpoint, if any.
+fn key_kind_refusal(
+    secret_only: bool,
+    public_only: bool,
+    kind: DataKeyKind,
+) -> Option<GatewayResponse> {
+    if secret_only && kind != DataKeyKind::Secret {
+        return Some(key_error(KeyError::Invalid));
+    }
+    if public_only && kind == DataKeyKind::Secret {
+        return Some(data_error(401, "unauthorized", "this endpoint takes a public key"));
+    }
+    None
+}
+
 fn key_error(err: KeyError) -> GatewayResponse {
     match err {
         KeyError::Missing => data_error(401, "unauthorized", "missing API key: send Authorization: Bearer <key>"),
         KeyError::Invalid => data_error(401, "unauthorized", "invalid, revoked or unauthorized API key"),
         KeyError::RateLimited => data_error(429, "rate_limited", "too many unknown-key lookups; slow down"),
         KeyError::Unavailable => data_error(503, "unavailable", "key lookup is unavailable; retry shortly"),
+    }
+}
+
+fn user_token_error(err: UserTokenError) -> GatewayResponse {
+    match err {
+        UserTokenError::Invalid => data_error(401, "user_token_invalid", "the user token is invalid"),
+        UserTokenError::Expired => data_error(401, "user_token_expired", "the user token has expired"),
+        UserTokenError::Revoked => data_error(401, "user_session_revoked", "the user session was revoked"),
+        UserTokenError::Unavailable => {
+            data_error(503, "unavailable", "session check is unavailable; retry shortly")
+        }
     }
 }
 
@@ -431,8 +495,25 @@ mod tests {
     use crate::registry::Registry;
     use cheladb_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
     use cheladb_auth::test_support::{BrokenJwks, MockJwks};
+    use crate::user_tokens::test_support as ut;
+    use cheladb_auth::app_token::AppTokenSigner;
     use cheladb_auth::ZitadelAuthConfig;
     use http::{HeaderName, HeaderValue};
+
+    #[test]
+    fn public_only_endpoint_refuses_secret_key() {
+        let refused = key_kind_refusal(false, true, DataKeyKind::Secret).expect("refused");
+        assert_eq!(refused.status, 401);
+        let body = refused.body.unwrap();
+        assert_eq!(body["error"]["code"], "unauthorized");
+        assert_eq!(body["error"]["message"], "this endpoint takes a public key");
+        assert!(key_kind_refusal(false, true, DataKeyKind::Public).is_none());
+        // The other policies are unchanged.
+        assert!(key_kind_refusal(true, false, DataKeyKind::Public).is_some());
+        assert!(key_kind_refusal(true, false, DataKeyKind::Secret).is_none());
+        assert!(key_kind_refusal(false, false, DataKeyKind::Secret).is_none());
+        assert!(key_kind_refusal(false, false, DataKeyKind::Public).is_none());
+    }
 
     const STUDIO: &str = "http://localhost:3000";
 
@@ -461,6 +542,7 @@ mod tests {
             verifier,
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
             Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
+            Arc::new(UserTokens::new(None, "http://127.0.0.1:1", "unused")),
         );
         (pipeline, InternalVerifier::from_pem(public_pem.as_bytes()).unwrap())
     }
@@ -871,6 +953,7 @@ mod tests {
             JwtVerifier::new(jwks.config(vec![])),
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
             Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
+            Arc::new(UserTokens::new(None, "http://127.0.0.1:1", "unused")),
         );
         let plan = expect_plan(run(&pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", STUDIO)]).await.outcome);
         assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), None);
@@ -886,10 +969,14 @@ mod tests {
         pipeline: Pipeline,
         verify: InternalVerifier,
         mock: dk::Mock,
+        sessions: ut::Mock,
+        app: AppTokenSigner,
     }
 
     async fn data_harness() -> DataHarness {
         let (url, mock) = dk::start().await;
+        let (sessions_url, sessions) = ut::start().await;
+        let (app, app_verifier) = ut::keys();
         let jwks = MockJwks::start().await;
         let (private_pem, public_pem) = generate_keypair_pem();
         let pipeline = Pipeline::new(
@@ -898,11 +985,14 @@ mod tests {
             JwtVerifier::new(jwks.config(vec![])),
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
             Arc::new(DataKeyResolver::new(&url, dk::BEARER)),
+            Arc::new(UserTokens::new(Some(app_verifier), &sessions_url, ut::BEARER)),
         );
         DataHarness {
             pipeline,
             verify: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
             mock,
+            sessions,
+            app,
         }
     }
 
@@ -1061,7 +1151,7 @@ mod tests {
             assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some("GET, POST"));
             assert_eq!(
                 header(&resp.headers, "access-control-allow-headers"),
-                Some("authorization, content-type")
+                Some("authorization, content-type, cheladb-user")
             );
             assert_eq!(header(&resp.headers, "access-control-max-age"), Some("600"));
             assert_eq!(header(&resp.headers, "access-control-allow-credentials"), None);
@@ -1138,5 +1228,243 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_ne!(sent[0].1, "forged-token");
         assert_eq!(Some(sent[0].1.as_str()), plan.identity.as_deref());
+    }
+
+    // ---- app-user tokens (step 6b, Task 10) ----
+
+    use uuid::Uuid as TestUuid;
+
+    /// A public key plus a signed token for its project and a session the mock reports as `session`.
+    struct UserCase {
+        key: String,
+        project: TestUuid,
+        sid: TestUuid,
+    }
+
+    fn user_case(h: &DataHarness, kind: DataKeyKind) -> UserCase {
+        let key = dk::new_key(kind);
+        let resolved = dk::resolved(kind);
+        let project = resolved.project_id;
+        h.mock.set(&key, Answer::Known(resolved));
+        UserCase { key, project, sid: TestUuid::new_v4() }
+    }
+
+    fn user_token(h: &DataHarness, project: TestUuid, sid: TestUuid, exp_in: i64) -> String {
+        h.app.sign(&ut::claims(project, sid, exp_in)).unwrap()
+    }
+
+    async fn user_call(h: &DataHarness, key: &str, token: &str) -> Handled {
+        let bearer = format!("Bearer {key}");
+        run(
+            &h.pipeline,
+            "POST",
+            "/data/v1/query",
+            None,
+            &[("authorization", &bearer), ("cheladb-user", token)],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn identity_carries_project_id() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        let plan = expect_plan(data_call(&h, "POST", "/data/v1/query", Some(&case.key)).await.outcome);
+        let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap();
+        let data = claims.data.unwrap();
+        assert_eq!(data.project_id, Some(case.project));
+        assert_eq!(data.role, "anon");
+        assert_eq!(h.sessions.lookups(), 0, "no user header, no liveness call");
+    }
+
+    #[tokio::test]
+    async fn valid_user_token_mints_authenticated_with_claims() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let plan = expect_plan(user_call(&h, &case.key, &token).await.outcome);
+        let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap();
+        let data = claims.data.unwrap();
+        assert_eq!(data.role, "authenticated");
+        assert_eq!(data.kind, DataKeyKind::Public);
+        assert_eq!(data.project_id, Some(case.project));
+        assert_eq!(data.claims["sid"], case.sid.to_string());
+        assert_eq!(data.claims["project"], case.project.to_string());
+        assert_eq!(data.claims["email"], "ada@example.com");
+        assert_eq!(data.claims["email_verified"], true);
+        assert_eq!(data.claims["role"], "authenticated");
+        assert!(data.claims["sub"].is_string() && data.claims["exp"].is_u64());
+        assert_eq!(h.sessions.bad_bearer.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Review Focus 2: a bad user token is never downgraded to the anon role.
+    #[tokio::test]
+    async fn user_token_never_falls_back_to_anon() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        let revoked_sid = TestUuid::new_v4();
+        h.sessions.set(revoked_sid, ut::Session::Revoked(case.project));
+        let expired_session = TestUuid::new_v4();
+        h.sessions.set(expired_session, ut::Session::Expired(case.project));
+        let cases = [
+            ("garbage", "user_token_invalid"),
+            ("", "user_token_invalid"),
+        ]
+        .map(|(t, c)| (t.to_string(), c))
+        .into_iter()
+        .chain([
+            (user_token(&h, case.project, case.sid, -300), "user_token_expired"),
+            (user_token(&h, case.project, revoked_sid, 300), "user_session_revoked"),
+            (user_token(&h, case.project, expired_session, 300), "user_session_revoked"),
+            (user_token(&h, case.project, TestUuid::new_v4(), 300), "user_session_revoked"),
+        ]);
+        for (token, code) in cases {
+            let handled = user_call(&h, &case.key, &token).await;
+            let resp = expect_response(handled.outcome);
+            assert_eq!((resp.status, error_code(&resp)), (401, Some(code)), "token {token:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_key_with_user_token_400() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Secret);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let resp = expect_response(user_call(&h, &case.key, &token).await.outcome);
+        assert_eq!((resp.status, error_code(&resp)), (400, Some("user_token_with_secret_key")));
+        assert_eq!(h.sessions.lookups(), 0);
+    }
+
+    #[tokio::test]
+    async fn token_for_another_project_is_invalid() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        let other = TestUuid::new_v4();
+        h.sessions.set(case.sid, ut::Session::Live(other));
+        let token = user_token(&h, other, case.sid, 300);
+        let resp = expect_response(user_call(&h, &case.key, &token).await.outcome);
+        assert_eq!((resp.status, error_code(&resp)), (401, Some("user_token_invalid")));
+        assert_eq!(h.sessions.lookups(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_of_another_project_is_revoked() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(TestUuid::new_v4()));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let resp = expect_response(user_call(&h, &case.key, &token).await.outcome);
+        assert_eq!((resp.status, error_code(&resp)), (401, Some("user_session_revoked")));
+    }
+
+    #[tokio::test]
+    async fn session_liveness_is_cached_30s() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        for _ in 0..2 {
+            expect_plan(user_call(&h, &case.key, &token).await.outcome);
+        }
+        assert_eq!(h.sessions.lookups(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoked_session_401() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Revoked(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let resp = expect_response(user_call(&h, &case.key, &token).await.outcome);
+        assert_eq!((resp.status, error_code(&resp)), (401, Some("user_session_revoked")));
+    }
+
+    #[tokio::test]
+    async fn liveness_unavailable_503() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Error);
+        let token = user_token(&h, case.project, case.sid, 300);
+        let resp = expect_response(user_call(&h, &case.key, &token).await.outcome);
+        assert_eq!((resp.status, error_code(&resp)), (503, Some("unavailable")));
+        assert!(header(&resp.headers, "retry-after").is_some());
+        // Not cached: recovers once the listener does.
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        expect_plan(user_call(&h, &case.key, &token).await.outcome);
+    }
+
+    #[tokio::test]
+    async fn cheladb_user_header_is_stripped_upstream() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let plan = expect_plan(user_call(&h, &case.key, &token).await.outcome);
+        let edits = plan.upstream_headers("rid");
+        assert!(edits.remove.contains(&"cheladb-user"));
+        assert!(!edits.set.iter().any(|(n, _)| *n == "cheladb-user"));
+    }
+
+    #[tokio::test]
+    async fn preflight_allows_cheladb_user() {
+        let h = data_harness().await;
+        let resp = expect_response(
+            run(
+                &h.pipeline,
+                "OPTIONS",
+                "/data/v1/query",
+                None,
+                &[("origin", "https://app.example"), ("access-control-request-method", "POST")],
+            )
+            .await
+            .outcome,
+        );
+        assert_eq!(
+            header(&resp.headers, "access-control-allow-headers"),
+            Some("authorization, content-type, cheladb-user")
+        );
+    }
+
+    /// Routes that take only a public key (`Auth::PublicDataKey`, the app auth routes) mint the
+    /// same identity: the project, and `authenticated` once a user token rides along.
+    #[tokio::test]
+    async fn auth_app_routes_carry_the_identity() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let bearer = format!("Bearer {}", case.key);
+
+        let anon = headers(&[("authorization", &bearer)]);
+        let parts = |headers| RequestParts { method: "POST", path: "/", host: None, headers, client_ip: None };
+        let minted = h
+            .pipeline
+            .authenticate_key(Service::Auth, &parts(&anon), false, true, "rid")
+            .await
+            .unwrap();
+        let data = h.verify.verify(&minted, "auth").unwrap().data.unwrap();
+        assert_eq!((data.project_id, data.role.as_str()), (Some(case.project), "anon"));
+
+        let with_user = headers(&[("authorization", &bearer), ("cheladb-user", &token)]);
+        let minted = h
+            .pipeline
+            .authenticate_key(Service::Auth, &parts(&with_user), false, true, "rid")
+            .await
+            .unwrap();
+        let data = h.verify.verify(&minted, "auth").unwrap().data.unwrap();
+        assert_eq!((data.project_id, data.role.as_str()), (Some(case.project), "authenticated"));
+
+        // A secret key is refused on a public-only route before any user token is looked at.
+        let secret = user_case(&h, DataKeyKind::Secret);
+        let bearer = format!("Bearer {}", secret.key);
+        let hs = headers(&[("authorization", &bearer), ("cheladb-user", &token)]);
+        let refused = h
+            .pipeline
+            .authenticate_key(Service::Auth, &parts(&hs), false, true, "rid")
+            .await
+            .unwrap_err();
+        assert_eq!(refused.status, 401);
     }
 }
