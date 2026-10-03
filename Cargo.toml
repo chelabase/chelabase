@@ -83,7 +83,7 @@ getrandom = "0.4.3"
 hex = "0.4.3"
 # Our fork of 0.7.18 (step 6d): simple queries expose command tags, the empty-query marker and
 # column types. Upstream PR pending; return to crates.io once it's released.
-tokio-postgres = { git = "https://github.com/ChelaDB/rust-postgres", rev = "b52c5ababff3dd453cf398d28f0405b91c970a8b", default-features = false, features = ["runtime"] }
+tokio-postgres = { git = "https://github.com/ChelaDB/rust-postgres", rev = "d20c5b3cd15c8fa649757768a788428788844612", default-features = false, features = ["runtime"] }
 pg_query = "6.2.1"
 tokio-util = "0.7.19"
 moka = { version = "0.12.16", features = ["future", "sync"] }

@@ -1,6 +1,6 @@
 # SQL-managed roles through the proxy: research for the 6a re-spec
 
-Date: 2026-10-01. Read-only research. Fork: the ChelaDB-neon checkout at `ab423ee3b` (not built or modified). Cheladb: worktree `.worktrees/login-roles` (6a as built, unmerged).
+Date: 2026-10-01. Read-only research. Fork: the ChelaDB-neon checkout at `27c74fe88` (not built or modified). Cheladb: worktree `.worktrees/login-roles` (6a as built, unmerged).
 
 Goal: a project's existing migrations (`CREATE ROLE x LOGIN PASSWORD '…'`, `ALTER ROLE x PASSWORD`, `ALTER ROLE x RENAME TO y`, `DROP ROLE x`, `GRANT a TO b`, `CREATE DATABASE`) should just work, even though every client connection goes through Neon's proxy, which gets role secrets from Cheladb's control plane rather than from the compute's `pg_authid`.
 
