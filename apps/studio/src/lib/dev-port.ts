@@ -1,5 +1,5 @@
-// Studio's dev server port. A worktree slot N runs it on 3000 + 100N (`just dev` sets
-// CHELADB_STUDIO_PORT); Zitadel has every slot's port registered as a redirect URI.
+// Studio's dev server port: 3000 unless CHELADB_STUDIO_PORT says otherwise. Zitadel's Studio
+// app has http://localhost:3000 registered as its redirect URI.
 export function devPort(env: Record<string, string | undefined>): number {
   const raw = env.CHELADB_STUDIO_PORT;
   if (raw === undefined || raw.trim() === "") return 3000;

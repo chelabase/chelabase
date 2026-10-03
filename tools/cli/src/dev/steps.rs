@@ -75,25 +75,22 @@ pub async fn ensure_api_app(api: &impl ZitadelApi, project_id: &str) -> Result<S
     created_client_id(&created).with_context(|| format!("CreateApplication: {created}"))
 }
 
-/// Worktree slot `slot`'s Studio app (slot 0's is `cheladb-studio`): its client id; its
-/// redirect and login settings are corrected if they drifted.
+/// The Studio app's client id; its redirect and login settings are corrected if they drifted.
 pub async fn ensure_studio_app(
     api: &impl ZitadelApi,
     project_id: &str,
-    slot: u16,
     mode: Mode,
 ) -> Result<String> {
-    let name = studio_app_name(slot);
-    if let Some(app) = existing_app(api, project_id, &name).await? {
-        let drift = studio_app_drift(&app.raw, slot, mode);
+    if let Some(app) = existing_app(api, project_id, STUDIO_APP).await? {
+        let drift = studio_app_drift(&app.raw, mode);
         if !drift.is_empty() {
             api.connect(
                 APPS,
                 "UpdateApplication",
-                studio_app_update(project_id, &app.id, slot, mode),
+                studio_app_update(project_id, &app.id, mode),
             )
             .await?;
-            info!(?drift, "updated the Studio app {name}");
+            info!(?drift, "updated the Studio app {STUDIO_APP}");
         }
         return Ok(app.client_id);
     }
@@ -101,18 +98,17 @@ pub async fn ensure_studio_app(
         .connect(
             APPS,
             "CreateApplication",
-            studio_app_create(project_id, slot, mode),
+            studio_app_create(project_id, mode),
         )
         .await?;
-    info!("created Studio app {name}");
+    info!("created Studio app {STUDIO_APP}");
     created_client_id(&created).with_context(|| format!("CreateApplication: {created}"))
 }
 
-/// W8, self-hosted mode only: every Studio app (any slot's) gets its own login base URI,
-/// bootstrap checks that none is left without one, then switches off the instance's
-/// "login v2 required", which otherwise replaces each app's base URI with the instance's
-/// (slot 0's Studio). Platform mode leaves the instance and the other slots' apps alone.
-pub async fn ensure_studio_logins(
+/// W8, self-hosted mode only, after [`ensure_studio_app`]: checks the Studio app has its own
+/// login base URI, then keeps the instance's "login v2 required" off (it would replace the
+/// app's base URI with the instance's). Platform mode leaves the instance alone.
+pub async fn ensure_studio_login(
     api: &impl ZitadelApi,
     project_id: &str,
     mode: Mode,
@@ -120,33 +116,15 @@ pub async fn ensure_studio_logins(
     if mode == Mode::Platform {
         return Ok(());
     }
+    // Checked against what Zitadel stores, before the instance stops forcing its login.
     let listed = api
         .connect(APPS, "ListApplications", apps_search(project_id))
         .await?;
-    let mut slots: Vec<u16> = listed
-        .get("applications")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|a| a.get("name").and_then(Value::as_str))
-        .filter_map(studio_slot_from_name)
-        .collect();
-    slots.sort_unstable();
-    slots.dedup();
-    for slot in slots {
-        ensure_studio_app(api, project_id, slot, mode).await?;
-    }
-    // Checked against what Zitadel now stores, before the instance stops forcing its login.
-    let listed = api
-        .connect(APPS, "ListApplications", apps_search(project_id))
-        .await?;
-    let missing = studio_apps_without_login(&listed);
-    if !missing.is_empty() {
+    if studio_app_lacks_login(&listed) {
         bail!(
-            "Studio apps without a login v2 base URI: {}. They would fall back to Zitadel's \
-             v1 login; fix them in the console (Login version: v2, base URI \
-             http://localhost:3N00/) or run `just zitadel-reset`, then re-run bootstrap",
-            missing.join(", ")
+            "the Studio app {STUDIO_APP} has no login v2 base URI. It would fall back to \
+             Zitadel's v1 login; fix it in the console (Login version: v2, base URI \
+             {STUDIO_ORIGIN}/) or run `just zitadel-reset`, then re-run bootstrap"
         );
     }
     let features = api
@@ -154,14 +132,14 @@ pub async fn ensure_studio_logins(
         .await?;
     let (required, base_uri) = login_v2_from(&features);
     if required {
-        let base_uri = base_uri.unwrap_or_else(|| format!("{}/", studio_origin(0)));
+        let base_uri = base_uri.unwrap_or_else(|| format!("{STUDIO_ORIGIN}/"));
         api.connect(
             FEATURES,
             "SetInstanceFeatures",
             login_v2_optional(&base_uri),
         )
         .await?;
-        info!("login v2 is no longer required instance-wide: each Studio app uses its own login");
+        info!("login v2 is no longer required instance-wide: the Studio app uses its own login");
     }
     Ok(())
 }
@@ -255,8 +233,7 @@ mod tests {
     use std::sync::Mutex;
 
     /// Answers by call key (`"POST /v2/organizations/_search"` or `"Service/Method"`), records
-    /// calls and their bodies. A key with several answers gives them in order, then repeats
-    /// the last.
+    /// calls and their bodies.
     #[derive(Default)]
     struct Fake {
         answers: Mutex<HashMap<String, Vec<Value>>>,
@@ -269,15 +246,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(key.to_string(), vec![answer]);
-            self
-        }
-        fn then(self, key: &str, answer: Value) -> Self {
-            self.answers
-                .lock()
-                .unwrap()
-                .entry(key.to_string())
-                .or_default()
-                .push(answer);
             self
         }
         fn calls(&self) -> Vec<String> {
@@ -328,11 +296,10 @@ mod tests {
     const GET_FEATURES: &str = "FeatureService/GetInstanceFeatures";
     const SET_FEATURES: &str = "FeatureService/SetInstanceFeatures";
 
-    fn studio(id: &str, slot: u16, mode: Mode) -> Value {
-        let mut config = studio_app_config(slot, mode);
-        config["clientId"] = json!(format!("c-{slot}"));
-        json!({"applicationId": id, "name": crate::dev::requests::studio_app_name(slot),
-               "oidcConfiguration": config})
+    fn studio(id: &str, mode: Mode) -> Value {
+        let mut config = studio_app_config(mode);
+        config["clientId"] = json!("c-spa");
+        json!({"applicationId": id, "name": "cheladb-studio", "oidcConfiguration": config})
     }
 
     fn existing() -> Fake {
@@ -342,8 +309,8 @@ mod tests {
             .with("ApplicationService/ListApplications", json!({"applications": [
                 {"applicationId": "a1", "name": "cheladb-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
                 {"applicationId": "a2", "name": "cheladb-studio", "oidcConfiguration": {
-                    "clientId": "c-spa", "redirectUris": studio_app_config(0, Mode::SelfHosted)["redirectUris"],
-                    "postLogoutRedirectUris": studio_app_config(0, Mode::SelfHosted)["postLogoutRedirectUris"],
+                    "clientId": "c-spa", "redirectUris": studio_app_config(Mode::SelfHosted)["redirectUris"],
+                    "postLogoutRedirectUris": studio_app_config(Mode::SelfHosted)["postLogoutRedirectUris"],
                     "accessTokenType": "OIDC_TOKEN_TYPE_JWT", "developmentMode": true,
                     "loginVersion": {"loginV2": {"baseUri": "http://localhost:3000/"}}}}]}))
             .with("POST /v2/users", json!({"result": [{"userId": "u1"}]}))
@@ -357,7 +324,7 @@ mod tests {
         assert_eq!(ensure_project(&fake, "o1").await.unwrap(), "p1");
         assert_eq!(ensure_api_app(&fake, "p1").await.unwrap(), "c-api");
         assert_eq!(
-            ensure_studio_app(&fake, "p1", 0, Mode::SelfHosted)
+            ensure_studio_app(&fake, "p1", Mode::SelfHosted)
                 .await
                 .unwrap(),
             "c-spa"
@@ -370,33 +337,6 @@ mod tests {
             .filter(|c| !c.contains("_search") && !c.contains("/List") && c != "POST /v2/users")
             .collect();
         assert!(writes.is_empty(), "unexpected writes: {writes:?}");
-    }
-
-    // W7: slot N's Studio gets its own app beside slot 0's.
-    #[tokio::test]
-    async fn a_slot_gets_its_own_studio_app() {
-        let fake = existing().with(
-            "ApplicationService/CreateApplication",
-            json!({"applicationId": "a7", "oidcConfiguration": {"clientId": "c-s1"}}),
-        );
-        assert_eq!(
-            ensure_studio_app(&fake, "p1", 1, Mode::SelfHosted)
-                .await
-                .unwrap(),
-            "c-s1"
-        );
-        assert!(
-            fake.calls()
-                .contains(&"ApplicationService/CreateApplication".to_string()),
-            "{:?}",
-            fake.calls()
-        );
-        assert_eq!(
-            ensure_studio_app(&fake, "p1", 0, Mode::SelfHosted)
-                .await
-                .unwrap(),
-            "c-spa"
-        );
     }
 
     #[tokio::test]
@@ -447,7 +387,7 @@ mod tests {
                 {"applicationId": "a2", "name": "cheladb-studio", "oidcConfiguration": {"clientId": "c-spa", "redirectUris": ["http://old/callback"]}}]}))
             .with("ApplicationService/UpdateApplication", json!({}));
         assert_eq!(
-            ensure_studio_app(&fake, "p1", 0, Mode::SelfHosted)
+            ensure_studio_app(&fake, "p1", Mode::SelfHosted)
                 .await
                 .unwrap(),
             "c-spa"
@@ -465,7 +405,7 @@ mod tests {
             "ApplicationService/ListApplications",
             json!({"applications": [{"applicationId": "a2", "name": "cheladb-studio"}]}),
         );
-        let err = ensure_studio_app(&fake, "p1", 0, Mode::SelfHosted)
+        let err = ensure_studio_app(&fake, "p1", Mode::SelfHosted)
             .await
             .unwrap_err()
             .to_string();
@@ -480,39 +420,24 @@ mod tests {
         );
     }
 
-    // W8: in self-hosted mode a Studio app without a login base URI (slot 0's from before W8)
-    // gets one, apps that have theirs are left alone, then the instance stops forcing its
-    // own login URL (keeping its base URI).
+    // W8: in self-hosted mode, once the Studio app has its own login base URI, the instance
+    // stops forcing its login URL (keeping its base URI).
     #[tokio::test]
-    async fn self_hosted_gives_every_studio_app_its_login_then_stops_forcing_the_instances() {
-        let before = json!({"applications": [
-            {"applicationId": "a1", "name": "cheladb-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
-            studio("a2", 0, Mode::Platform),
-            studio("a3", 2, Mode::SelfHosted)]});
-        let after = json!({"applications": [
-            studio("a2", 0, Mode::SelfHosted),
-            studio("a3", 2, Mode::SelfHosted)]});
+    async fn self_hosted_stops_forcing_the_instances_login() {
         let fake = Fake::default()
-            .with(LIST, before.clone())
-            .then(LIST, before)
-            .then(LIST, after)
-            .with(UPDATE, json!({}))
+            .with(
+                LIST,
+                json!({"applications": [studio("a2", Mode::SelfHosted)]}),
+            )
             .with(
                 GET_FEATURES,
                 json!({"loginV2": {"required": true,
                 "baseUri": "http://localhost:3000/", "source": "SOURCE_INSTANCE"}}),
             )
             .with(SET_FEATURES, json!({}));
-        ensure_studio_logins(&fake, "p1", Mode::SelfHosted)
+        ensure_studio_login(&fake, "p1", Mode::SelfHosted)
             .await
             .unwrap();
-        let updates = fake.bodies(UPDATE);
-        assert_eq!(updates.len(), 1, "{:?}", fake.calls());
-        assert_eq!(updates[0]["applicationId"], "a2");
-        assert_eq!(
-            updates[0]["oidcConfiguration"]["loginVersion"],
-            json!({"loginV2": {"baseUri": "http://localhost:3000/"}})
-        );
         assert_eq!(
             fake.bodies(GET_FEATURES),
             vec![json!({"inheritance": true})]
@@ -521,28 +446,22 @@ mod tests {
             fake.bodies(SET_FEATURES),
             vec![json!({"loginV2": {"required": false, "baseUri": "http://localhost:3000/"}})]
         );
-        // The base URIs are in place before the instance stops forcing its own.
-        let calls = fake.calls();
-        let set = calls.iter().position(|c| c == SET_FEATURES).unwrap();
-        let update = calls.iter().position(|c| c == UPDATE).unwrap();
-        assert!(update < set, "{calls:?}");
     }
 
     // A second run writes nothing.
     #[tokio::test]
-    async fn self_hosted_logins_are_idempotent() {
+    async fn the_self_hosted_login_is_idempotent() {
         let fake = Fake::default()
             .with(
                 LIST,
-                json!({"applications": [
-                studio("a2", 0, Mode::SelfHosted), studio("a3", 1, Mode::SelfHosted)]}),
+                json!({"applications": [studio("a2", Mode::SelfHosted)]}),
             )
             .with(
                 GET_FEATURES,
                 json!({"loginV2": {"baseUri": "http://localhost:3000/",
                 "source": "SOURCE_INSTANCE"}}),
             );
-        ensure_studio_logins(&fake, "p1", Mode::SelfHosted)
+        ensure_studio_login(&fake, "p1", Mode::SelfHosted)
             .await
             .unwrap();
         let calls = fake.calls();
@@ -553,20 +472,20 @@ mod tests {
         );
     }
 
-    // No base URI on the instance either: the instance keeps slot 0's Studio as its default.
+    // No base URI on the instance either: the instance keeps Studio as its default.
     #[tokio::test]
-    async fn required_off_without_a_base_uri_names_slot_0s_studio() {
+    async fn required_off_without_a_base_uri_names_studio() {
         let fake = Fake::default()
             .with(
                 LIST,
-                json!({"applications": [studio("a2", 0, Mode::SelfHosted)]}),
+                json!({"applications": [studio("a2", Mode::SelfHosted)]}),
             )
             .with(
                 GET_FEATURES,
                 json!({"loginV2": {"required": true, "source": "SOURCE_SYSTEM"}}),
             )
             .with(SET_FEATURES, json!({}));
-        ensure_studio_logins(&fake, "p1", Mode::SelfHosted)
+        ensure_studio_login(&fake, "p1", Mode::SelfHosted)
             .await
             .unwrap();
         assert_eq!(
@@ -575,17 +494,16 @@ mod tests {
         );
     }
 
-    // If Zitadel still lists a Studio app without a base URI after the updates, bootstrap stops
-    // before switching the instance off (that app would fall back to the v1 login).
+    // If Zitadel still lists the Studio app without a base URI, bootstrap stops before switching
+    // the instance off (the app would fall back to the v1 login).
     #[tokio::test]
     async fn a_studio_app_left_without_a_login_stops_bootstrap() {
-        let missing = json!({"applications": [studio("a2", 0, Mode::Platform)]});
+        let missing = json!({"applications": [studio("a2", Mode::Platform)]});
         let fake = Fake::default()
             .with(LIST, missing)
-            .with(UPDATE, json!({}))
             .with(GET_FEATURES, json!({"loginV2": {"required": true}}))
             .with(SET_FEATURES, json!({}));
-        let err = ensure_studio_logins(&fake, "p1", Mode::SelfHosted)
+        let err = ensure_studio_login(&fake, "p1", Mode::SelfHosted)
             .await
             .unwrap_err()
             .to_string();
@@ -604,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn platform_mode_leaves_the_logins_alone() {
         let fake = Fake::default();
-        ensure_studio_logins(&fake, "p1", Mode::Platform)
+        ensure_studio_login(&fake, "p1", Mode::Platform)
             .await
             .unwrap();
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());

@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 set -a; source "$ROOT/.cheladb/zitadel/demo.env"; set +a
-# A worktree slot's Studio app (W7; `just` exports it), else slot 0's from Studio's .env.local.
+# Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in Studio's .env.local.
 CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$ROOT/apps/studio/.env.local")}"
 ISS="$CHELADB_ZITADEL_ISSUER"
 GW="${GATEWAY_URL:-http://localhost:8000}"

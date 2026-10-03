@@ -588,20 +588,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-hook-relay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "reqwest",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "cheladb-metadata"
 version = "0.1.0"
 dependencies = [

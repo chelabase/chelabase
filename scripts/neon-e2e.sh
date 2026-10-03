@@ -75,17 +75,17 @@ for i in $(seq 120); do
 done
 pass "database $name ($db_id) is ready"
 
-# The storage controller's attach hook reached this slot: it goes through the hook relay, and
-# only the slot whose metadata names the tenant answers it (the others say 404).
+# The storage controller's attach hook reached the orchestrator's internal listener (:8083/storcon):
+# once it answers, the tenant's compute notification is no longer pending.
 hook_tenant="$(metadata_sql -v id="$db_id" <<<"SELECT neon_tenant_id FROM databases WHERE id = :'id';")"
 [[ "$hook_tenant" =~ ^[0-9a-f]{32}$ ]] || die "no tenant for database $db_id in metadata (got '$hook_tenant')"
 for i in $(seq 20); do
   shards="$(call GET "$STORCON/control/v1/tenant/$hook_tenant" | jq -c '.shards')"
   jq -e 'length > 0 and all(.[]; .is_pending_compute_notification == false)' <<<"$shards" >/dev/null && break
-  [[ $i -lt 20 ]] || die "tenant $hook_tenant's compute notification is still pending after 10 s (hook relay, or this slot's internal listener): $shards"
+  [[ $i -lt 20 ]] || die "tenant $hook_tenant's compute notification is still pending after 10 s (is the orchestrator's internal listener answering /storcon?): $shards"
   sleep 0.5
 done
-pass "the storage controller's hook reached this slot (tenant $hook_tenant)"
+pass "the storage controller's hook reached the orchestrator (tenant $hook_tenant)"
 
 # 2. The owner credentials.
 status="$(api GET "/v1/databases/$db_id/connection")"

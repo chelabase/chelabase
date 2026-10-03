@@ -2444,7 +2444,7 @@ mod tests {
             pos(
                 &journal,
                 &format!(
-                    "compute.sql {} app SET search_path = pg_catalog, pg_temp;",
+                    "compute.sql {} app BEGIN;",
                     s.dev_ep
                 ),
             ),

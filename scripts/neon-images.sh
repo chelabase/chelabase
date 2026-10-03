@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Chooses the Neon images for `just deps-up`. Prints NEON_IMAGE=… and COMPUTE_NODE_IMAGE=…
 # on stdout for the caller to export; messages go to stderr. A local `just neon-build` wins;
-# otherwise the digest-pinned GHCR default from the shared Compose file is pulled.
+# otherwise the digest-pinned GHCR default from the Compose file is pulled.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/infra/compose/shared.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/infra/compose/docker-compose.yml}"
 here="$ROOT/infra/neon"
 # shellcheck source=../infra/neon/lib/tags.sh
 . "$here/lib/tags.sh"

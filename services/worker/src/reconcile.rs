@@ -370,14 +370,6 @@ pub fn should_abort_provision(status: DatabaseStatus) -> bool {
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
 {
-    /// Whether `tenant` is reported for the first time in this process (and remembers it).
-    pub(crate) fn first_report_of_unknown_tenant(&self, tenant: &str) -> bool {
-        self.reported_unknown_tenants
-            .lock()
-            .unwrap()
-            .insert(tenant.to_string())
-    }
-
     /// One reconcile pass. `Err` only when observing fails; each action's error is logged
     /// and the next action still runs.
     ///
@@ -667,13 +659,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 Ok(())
             }
             Action::ReportUnknownTenant(tenant) => {
-                if !self.first_report_of_unknown_tenant(tenant) {
-                    return Ok(());
-                }
                 warn!(
                     tenant_id = %tenant,
-                    "storage-controller tenant has no endpoint row; keeping it (logged once). \
-                     In local dev it may be another worktree slot's. Otherwise restore the \
+                    "storage-controller tenant has no endpoint row; keeping it. Restore the \
                      metadata, or delete the tenant by hand if it's disposable (`just \
                      sweep-dbs` only removes tenants that have an endpoint row)"
                 );
@@ -1421,7 +1409,7 @@ mod tests {
         let (w, journal) = worker();
         let (id, ep) = provision(&w, &journal).await;
         let main = BranchId::from(id);
-        let data_api = format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp;");
+        let data_api = format!("compute.sql {ep} app BEGIN;");
 
         // Nothing missing: no bootstrap.
         w.reconcile_once().await.unwrap();
@@ -1467,7 +1455,7 @@ mod tests {
             .is_some()
         );
         assert_eq!(
-            position(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp;")),
+            position(&journal, &format!("compute.sql {ep} app BEGIN;")),
             None
         );
 
@@ -1480,7 +1468,7 @@ mod tests {
             &journal,
             &format!("compute.sql {ep} app SELECT to_regclass"),
         );
-        assert!(checked < pos(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp;")));
+        assert!(checked < pos(&journal, &format!("compute.sql {ep} app BEGIN;")));
     }
 
     #[tokio::test]
@@ -1730,20 +1718,6 @@ mod tests {
         );
         assert_eq!(w.computes.list().await.unwrap(), Vec::<String>::new());
         assert_eq!(w.storage.tenants.lock().unwrap().len(), 2);
-    }
-
-    // Every worktree slot shares the storage controller, so each worker sees the other slots'
-    // tenants on every pass: each is logged once per process, not every 30 s.
-    #[tokio::test]
-    async fn an_unknown_tenant_is_reported_once() {
-        let (w, _journal) = worker();
-        assert!(w.first_report_of_unknown_tenant("t1"));
-        assert!(!w.first_report_of_unknown_tenant("t1"));
-        assert!(w.first_report_of_unknown_tenant("t2"));
-        w.storage.tenants.lock().unwrap().insert(NeonId::new());
-        w.reconcile_once().await.unwrap();
-        w.reconcile_once().await.unwrap();
-        assert_eq!(w.reported_unknown_tenants.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -2443,7 +2417,7 @@ mod tests {
         w.enabling_seen.lock().unwrap().insert((main, "analytics".to_string()), old);
         w.reconcile_once().await.unwrap();
         assert_eq!(w.metadata.state().db_rows[&main][1].state, cheladb_metadata::DataApiState::On);
-        assert!(position(&journal, &format!("compute.sql {ep} analytics SET search_path")).is_some());
+        assert!(position(&journal, &format!("compute.sql {ep} analytics BEGIN;")).is_some());
     }
 
     #[tokio::test]
@@ -2476,7 +2450,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, _, s)| s.starts_with("SET search_path = pg_catalog, pg_temp;\nDO $$") || s.contains("CREATE SCHEMA IF NOT EXISTS cheladb"))
+            .filter(|(_, _, s)| s.starts_with("BEGIN;\n") || s.contains("CREATE SCHEMA IF NOT EXISTS cheladb"))
             .map(|(_, d, _)| d.clone())
             .collect();
         assert_eq!(healed, ["broken"], "only the broken database is bootstrapped");

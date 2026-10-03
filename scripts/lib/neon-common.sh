@@ -1,6 +1,5 @@
 # Helpers shared by scripts/neon-smoke.sh, neon-e2e.sh and the justfile's sweep-dbs. Sourced, not run.
-# Set LOG_PREFIX (the script's name) before sourcing. metadata_sql runs against the worktree
-# slot's metadata database (CHELADB_METADATA_DB, set by `just`; slot 0's is cheladb_metadata).
+# Set LOG_PREFIX (the script's name) before sourcing.
 
 # delete_tenant <tenant id>: deletes it from the storage controller ($STORCON, default
 # http://127.0.0.1:1234). Deletion is asynchronous (202): polls until the tenant is gone, 60 s at most.
@@ -19,8 +18,7 @@ delete_tenant() {
 }
 
 neon_common_compose="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../infra/compose" && pwd)"
-# The shared tier (metadata Postgres, Neon storage).
-compose=(docker compose -p cheladb -f "$neon_common_compose/shared.yml" --env-file "$neon_common_compose/.env.example")
+compose=(docker compose -f "$neon_common_compose/docker-compose.yml" --env-file "$neon_common_compose/.env.example")
 
 say() { echo "[$LOG_PREFIX] $*"; }
 die() {
@@ -30,7 +28,7 @@ die() {
 # hex <bytes>: that many random bytes as lowercase hex.
 hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
 # SQL on stdin; values are passed as psql variables (-v name=value, used as :'name').
-metadata_sql() { "${compose[@]}" exec -T metadata-db psql -U cheladb -d "${CHELADB_METADATA_DB:-cheladb_metadata}" -v ON_ERROR_STOP=1 -qtA "$@"; }
+metadata_sql() { "${compose[@]}" exec -T metadata-db psql -U cheladb -d cheladb_metadata -v ON_ERROR_STOP=1 -qtA "$@"; }
 
 # call <method> <url> [json body]: prints the response body; dies on no answer or non-2xx.
 # Each request is limited to $MAX_TIME seconds (default 60).

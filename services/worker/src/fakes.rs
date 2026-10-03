@@ -2150,7 +2150,6 @@ pub fn worker() -> (FakeWorker, Journal) {
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
-        reported_unknown_tenants: Mutex::default(),
     };
     (worker, journal)
 }

@@ -23,8 +23,8 @@ export default defineConfig({
     viteReact(),
   ],
   server: {
-    // 3000, or the worktree slot's port (3000 + 100N). Zitadel has exactly these redirect URIs
-    // registered; never drift to another port.
+    // 3000 (or CHELADB_STUDIO_PORT). The Zitadel redirect URI is registered for :3000; never
+    // drift to another port.
     port: devPort(process.env),
     strictPort: true,
   },

@@ -9,9 +9,8 @@ controller, proxy) and a compute image. Both come from our hard fork,
 ## Pull (default)
 
 `just deps-up` pulls `ghcr.io/cheladb/neon-storage` and `ghcr.io/cheladb/neon-compute-v17`
-(the fork's dev images, tagged `<sha12>-dev`), pinned by digest in `infra/compose/shared.yml`
-(the storage pin is repeated in `slot.yml`, for the proxy). The packages are public on ghcr.io, so
-pulling needs no login. (Pushing from a fork checkout needs `docker login ghcr.io` with a
+(the fork's dev images, tagged `<sha12>-dev`), pinned by digest in `infra/compose/docker-compose.yml`.
+The packages are public on ghcr.io, so pulling needs no login. (Pushing from a fork checkout needs `docker login ghcr.io` with a
 token that has `write:packages`.)
 
 The old `ghcr.io/cheladb/neon` and `compute-node-v17` packages hold images built from
@@ -43,12 +42,12 @@ tag is picked up by `just deps-up`.
    them to GHCR and prints the digests. (Publishing is by hand: pushes to `main` publish
    nothing, and cheladb-v1 has no copy of the script.)
 3. Put the full commit sha in `infra/neon/NEON_REF`, and paste the new tags and digests into
-   `infra/compose/shared.yml` (both images) and `infra/compose/slot.yml` (storage).
-4. `just neon-test` (it checks the ref exists on the fork and that both Compose files carry
-   `:<sha12>-dev@sha256:`), then `just stack-test`.
-5. Run the e2e scripts in your slot (`just neon-e2e`, `just branch-e2e`, `just data-e2e`,
-   `just console-e2e`, `just role-e2e` and `just auth-e2e`), then `just stack-migrate` (when no other slot is running)
-   to move the shared tier's storage onto the new pins.
+   `infra/compose/docker-compose.yml` (both images).
+4. `just neon-test` (it checks the ref exists on the fork and that both pins carry
+   `:<sha12>-dev@sha256:`).
+5. Move the stack onto the new pins with `just live just deps-up`, then run the e2e scripts
+   through the queue (`just live just neon-e2e`, and likewise `branch-e2e`, `data-e2e`,
+   `console-e2e`, `role-e2e` and `auth-e2e`).
 
 The compute image runs Postgres 17.11 (the fork's `REL_17_STABLE_cheladb`).
 

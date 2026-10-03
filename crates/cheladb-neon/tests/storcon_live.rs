@@ -41,9 +41,11 @@ async fn round_trip(client: StorconClient, tenant: NeonId) {
     client.create_tenant(&tenant).await.unwrap();
     let described = client.describe_tenant(&tenant).await.unwrap();
     assert!(!described.shards.is_empty());
-    // No worktree slot knows a throwaway tenant, so its compute notification stays pending (the
-    // hook answers 404, which the storage controller expects during a create).
     for shard in &described.shards {
+        assert!(
+            !shard.is_pending_compute_notification,
+            "compute notification pending (is storcon-hook answering?): {shard:?}"
+        );
         assert_eq!(shard.last_error, "", "{shard:?}");
     }
 

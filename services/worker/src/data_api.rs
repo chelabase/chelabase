@@ -38,16 +38,38 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('cheladb.schema_version')
          'cheladb_schema_version_drop', 'cheladb_extension_functions']::pg_catalog.name[]) \
          AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3";
 
+/// The key of the transaction-scoped advisory lock the bootstrap takes first, so two
+/// bootstraps of one database serialize (advisory locks are per database). The bytes of
+/// "cheladb" followed by 0x01 (the bootstrap); other Cheladb advisory locks must use
+/// another key.
+pub const BOOTSTRAP_LOCK_KEY: i64 = 0x6368_656c_6164_6201;
+
+/// How long either script waits for a lock (the advisory lock above, or a table lock such as
+/// `ALTER TABLE … OWNER` on `cheladb.schema_version`) before it fails, in seconds. It sits
+/// under the 30 s `ADMIN_SQL_TIMEOUT` of `admin_sql`: when the caller gives up, dropping its
+/// future doesn't kill psql, so a script still queued behind a stuck lock would run later with
+/// stale content (an old `authenticator` password). Failing first, with the transaction
+/// rolled back, leaves 10 s of the budget for the script's own work and never leaves an
+/// AccessExclusive lock waiting or held for long. `lock_timeout` bounds every lock wait,
+/// advisory locks included (they go through the same lock manager as table locks).
+/// [`REMOVE_DATA_API_SQL`] is a `const` and can't format this in, so its text repeats the
+/// value; a test keeps the two in step.
+pub const LOCK_TIMEOUT_SECS: u32 = 20;
+
 /// Removes the data API machinery from a database (`DELETE …/data-api?remove=true`, P7), only
 /// when the `cheladb` schema is the one the bootstrap made (owned by `cheladb_admin`): the
 /// three event triggers, the two functions and the two tables by name, then the schema with
 /// `RESTRICT`, so anything else someone put there makes it fail rather than go with it. A
 /// `cheladb` schema with another owner is left alone (a warning). The `cheladb_admin` role
 /// stays (it's cluster-wide), and so do the default privileges and grants. The first line is a
-/// comment so the script is told apart from the bootstrap's.
+/// comment so the script is told apart from the bootstrap's. It takes [`BOOTSTRAP_LOCK_KEY`]
+/// first (bootstrap and remove lock the same objects in opposite orders, so without it they
+/// could deadlock), bounded by [`LOCK_TIMEOUT_SECS`]; the key's value is repeated here.
 pub const REMOVE_DATA_API_SQL: &str = "-- remove the data API machinery
 SET search_path = pg_catalog, pg_temp;
 DO $$ BEGIN
+  SET LOCAL lock_timeout = '20s';
+  PERFORM pg_catalog.pg_advisory_xact_lock(7163086723497615873);
   IF EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
       WHERE n.nspname OPERATOR(pg_catalog.=) 'cheladb' AND r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN
     DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
@@ -109,6 +131,14 @@ pub fn valid_role_name(name: &str) -> bool {
 /// `authenticator` made `LOGIN` with the branch's password, the owner's default privileges in
 /// `public`, and (on the database's first bootstrap only) the same grants on what exists.
 ///
+/// The script is one transaction (`BEGIN … COMMIT`) that first takes
+/// [`BOOTSTRAP_LOCK_KEY`] (after `SET LOCAL lock_timeout`, [`LOCK_TIMEOUT_SECS`]), so a reader
+/// never sees the event triggers dropped and not yet recreated, and concurrent bootstraps
+/// serialize. A failure (psql runs with `ON_ERROR_STOP`; the closed connection aborts the open
+/// transaction) rolls back every change in it, but not `pg_terminate_backend`: backends the
+/// script already terminated stay terminated. Nothing in
+/// it may be a statement Postgres refuses inside a transaction block.
+///
 /// The event-trigger functions are owned by the superuser running the script (Neon refuses
 /// to let a superuser run a function a non-superuser owns, and the triggers fire for
 /// cloud_admin's DDL too), `SECURITY DEFINER` with every name schema-qualified. The owner's
@@ -152,7 +182,10 @@ fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str,
     let schema_literal = quote_literal(&schema_ident);
     let owner = quote_literal(owner_role);
     format!(
-        "SET search_path = pg_catalog, pg_temp;
+        "BEGIN;
+SET search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
+SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN CREATE ROLE cheladb_admin NOLOGIN; END IF;
 END $$;
@@ -302,6 +335,7 @@ DO $$ DECLARE r record; BEGIN
 END $$;
 SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace({schema_literal}) IS NULL;
 SELECT pg_catalog.current_setting('cheladb.quarantined', true);
+COMMIT;
 "
     )
 }
@@ -943,9 +977,8 @@ mod tests {
         FakeWorker, Journal, entries, position, ready_branch, ready_database, worker,
     };
 
-    /// The data API script's first line, as the fake backend journals it.
-    /// The data API script's first line (the role check puts its SELECT on the same line).
-    const DATA_API: &str = "SET search_path = pg_catalog, pg_temp;";
+    /// The data API script's first line, as the fake backend journals it (the transaction's `BEGIN;`).
+    const DATA_API: &str = "BEGIN;";
 
     fn pos(journal: &Journal, prefix: &str) -> usize {
         position(journal, prefix)
@@ -999,7 +1032,10 @@ mod tests {
 
     #[test]
     fn data_api_sql_is_exact() {
-        let expected = "SET search_path = pg_catalog, pg_temp;
+        let expected = "BEGIN;
+SET search_path = pg_catalog, pg_temp;
+SET LOCAL lock_timeout = '20s';
+SELECT pg_catalog.pg_advisory_xact_lock(7163086723497615873);
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN CREATE ROLE cheladb_admin NOLOGIN; END IF;
 END $$;
@@ -1150,10 +1186,41 @@ DO $$ DECLARE r record; BEGIN
 END $$;
 SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace('\"public\"') IS NULL;
 SELECT pg_catalog.current_setting('cheladb.quarantined', true);
+COMMIT;
 ";
         assert_eq!(data_api_sql("postgres", "s3cretPassw0rd", "public"), expected);
         // A quoted literal, quotes doubled.
         assert!(data_api_sql("postgres", "it's", "public").contains("PASSWORD 'it''s';\n"));
+    }
+
+    /// The whole script is one transaction under a transaction-scoped advisory lock: a reader
+    /// (a health check, another bootstrap) never sees the event triggers dropped but not yet
+    /// recreated, a failure rolls everything back (psql runs with ON_ERROR_STOP and the
+    /// connection closing aborts the open transaction), and concurrent bootstraps serialize.
+    #[test]
+    fn the_bootstrap_script_runs_in_one_transaction_under_an_advisory_lock() {
+        for sql in [
+            data_api_sql("postgres", "pw", "public"),
+            data_api_sql_granting_existing("postgres", "pw", "public"),
+        ] {
+            assert!(sql.starts_with("BEGIN;\nSET search_path = pg_catalog, pg_temp;\n"), "{sql}");
+            assert!(sql.ends_with("COMMIT;\n"), "{sql}");
+            let lock = format!("SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});\n");
+            let lock_at = sql.find(&lock).expect("the advisory lock");
+            let timeout_at = sql.find("SET LOCAL lock_timeout = '20s';\n").expect("the lock timeout");
+            assert!(sql.find("BEGIN;").unwrap() < timeout_at && timeout_at < lock_at, "lock_timeout before the lock");
+            assert_eq!(sql.matches("pg_advisory").count(), 1);
+            let first_change = sql.find("CREATE ROLE cheladb_admin").unwrap();
+            assert!(lock_at < first_change, "the lock comes before anything changes");
+            // Exactly one transaction, and nothing in it that can't run inside one.
+            assert_eq!(sql.matches("BEGIN;").count(), 1);
+            assert_eq!(sql.matches("COMMIT;").count(), 1);
+            let drop = sql.find("DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;\n").unwrap();
+            assert!(sql.find("BEGIN;").unwrap() < lock_at && lock_at < drop && drop < sql.rfind("COMMIT;").unwrap());
+            for forbidden in ["CREATE DATABASE", "DROP DATABASE", "VACUUM", "CONCURRENTLY", "ROLLBACK"] {
+                assert!(!sql.contains(forbidden), "{forbidden}");
+            }
+        }
     }
 
     /// The script runs as a superuser on a database its owner controls: nothing it calls
@@ -1162,7 +1229,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
     #[test]
     fn the_script_pins_the_search_path_and_vets_cheladb_first() {
         let sql = data_api_sql("postgres", "pw", "public");
-        assert!(sql.starts_with("SET search_path = pg_catalog, pg_temp;\n"), "{sql}");
+        assert!(sql.starts_with("BEGIN;\nSET search_path = pg_catalog, pg_temp;\n"), "{sql}");
         let rename = sql.find("ALTER SCHEMA cheladb RENAME TO %I").expect("the rename aside");
         let create = sql.find("CREATE SCHEMA IF NOT EXISTS cheladb").unwrap();
         assert!(rename < create);
@@ -1172,7 +1239,7 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
         }
         assert_eq!(sql.matches("SET search_path = pg_catalog, pg_temp AS").count(), 2);
         assert!(!sql.contains(" format("), "every function qualified");
-        assert!(sql.ends_with("SELECT pg_catalog.current_setting('cheladb.quarantined', true);\n"));
+        assert!(sql.ends_with("SELECT pg_catalog.current_setting('cheladb.quarantined', true);\nCOMMIT;\n"));
     }
 
     /// `cheladb_admin` owns the schema: an owner who made it first (with a login, a
@@ -2120,6 +2187,8 @@ SELECT pg_catalog.current_setting('cheladb.quarantined', true);
             "-- remove the data API machinery
 SET search_path = pg_catalog, pg_temp;
 DO $$ BEGIN
+  SET LOCAL lock_timeout = '20s';
+  PERFORM pg_catalog.pg_advisory_xact_lock(7163086723497615873);
   IF EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
       WHERE n.nspname OPERATOR(pg_catalog.=) 'cheladb' AND r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN
     DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
@@ -2136,6 +2205,12 @@ DO $$ BEGIN
 END $$;
 "
         );
+        let timeout_at = REMOVE_DATA_API_SQL.find("SET LOCAL lock_timeout = '20s';").unwrap();
+        let lock_at = REMOVE_DATA_API_SQL.find("pg_advisory_xact_lock").unwrap();
+        let first_drop = REMOVE_DATA_API_SQL.find("DROP ").unwrap();
+        assert!(timeout_at < lock_at && lock_at < first_drop, "timeout, then lock, then the drops");
+        assert!(REMOVE_DATA_API_SQL.contains(&format!("pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});")));
+        assert!(REMOVE_DATA_API_SQL.contains(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';")));
         assert!(!REMOVE_DATA_API_SQL.contains("CASCADE"));
         assert!(!REMOVE_DATA_API_SQL.contains("DROP ROLE"), "the cluster-wide role stays");
     }

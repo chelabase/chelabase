@@ -45,13 +45,12 @@ mod roles;
 pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, RestReply};
 pub use openapi::openapi;
 
-/// Port the Neon proxy serves the Postgres protocol on (slot 0's; `CHELADB_PROXY_PG_PORT`).
+/// Port the Neon proxy serves the Postgres protocol on (default of `CHELADB_PROXY_PG_PORT`).
 pub const PROXY_PG_PORT: u16 = 4432;
-/// Port the Neon proxy serves SQL-over-HTTP on (slot 0's; `CHELADB_PROXY_HTTP_PORT`).
+/// Port the Neon proxy serves SQL-over-HTTP on (default of `CHELADB_PROXY_HTTP_PORT`).
 pub const PROXY_HTTP_PORT: u16 = 4444;
 
-/// Where clients reach the Neon proxy: `<ep>.<domain>` on these ports. In local dev each
-/// worktree slot's proxy publishes its own ports (4432/4444 + 100 × slot).
+/// Where clients reach the Neon proxy: `<ep>.<domain>` on these ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyAddress {
     pub domain: String,
@@ -1899,16 +1898,15 @@ mod proxy_address_tests {
     }
 
     #[test]
-    fn the_proxy_defaults_to_slot_0s_ports() {
+    fn the_proxy_defaults_to_4432_and_4444() {
         let p = ProxyAddress::from_lookup(lookup(&[])).unwrap();
         assert_eq!(p, ProxyAddress::local("localtest.me"));
         assert_eq!((p.pg_port, p.http_port), (4432, 4444));
         assert_eq!(p.domain, "localtest.me");
     }
 
-    // A worktree slot's proxy publishes 4432 + 100N and 4444 + 100N (`just` sets both).
     #[test]
-    fn the_proxy_ports_follow_the_slot() {
+    fn the_proxy_ports_and_domain_come_from_the_environment() {
         let p = ProxyAddress::from_lookup(lookup(&[
             ("CHELADB_PROXY_PG_PORT", "4532"),
             ("CHELADB_PROXY_HTTP_PORT", "4544"),

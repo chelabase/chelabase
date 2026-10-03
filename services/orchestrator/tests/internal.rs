@@ -1053,26 +1053,29 @@ async fn an_unparseable_hook_body_is_retried_never_a_4xx() {
     }
 }
 
-// The storage controller is shared by every worktree slot; the hook relay offers each hook to
-// the slots in order and keeps the first answer that isn't 404. A slot that doesn't know the
-// tenant must say so, or every hook would stop at slot 0.
+// A tenant no endpoint row names (a throwaway one from neon-smoke, or one already torn down) is
+// answered at once: there is nothing to reconfigure, and another tenant's computes are left alone.
 #[tokio::test]
-async fn hook_for_an_unknown_tenant_is_404() {
+async fn hook_for_an_unknown_tenant_reconfigures_nothing() {
     let neon = FakeNeon::default();
     neon.add(
         "ep-other",
         "0000000000000000000000000000ffff",
         "0000000000000000000000000000eeee",
     );
-    let app = spawn_internal(neon, FakeLocator::default(), &storcon(true).await).await;
+    let (addr, seen) = compute(200).await;
+    let locator = FakeLocator::default();
+    locator.running("ep-other", "172.20.0.9", Some(addr));
+    let app = spawn_internal(neon, locator, &storcon(true).await).await;
     assert_eq!(
         app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await,
-        404
+        200
     );
     let body = json!({ "tenant_id": TENANT, "timeline_id": TIMELINE, "generation": 3,
                        "safekeepers": [{ "id": 1, "hostname": "sk1" }] })
     .to_string();
-    assert_eq!(app.put(SAFEKEEPERS, Some(STORCON_TOKEN), &body).await, 404);
+    assert_eq!(app.put(SAFEKEEPERS, Some(STORCON_TOKEN), &body).await, 200);
+    assert!(seen.0.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

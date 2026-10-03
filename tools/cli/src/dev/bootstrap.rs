@@ -16,18 +16,6 @@ use tracing::info;
 
 const GATEWAY_URL: &str = "http://localhost:8000";
 
-/// Where slot `slot`'s Studio finds its app's client id (`just` exports it for slots 1-9; slot
-/// 0's is in apps/studio/.env.local, as before slots).
-fn slot_studio_env_file(zitadel_dir: &Path, slot: u16) -> std::path::PathBuf {
-    zitadel_dir.join(format!("studio-s{slot}.env"))
-}
-
-fn render_slot_studio_env(client_id: &str) -> String {
-    format!(
-        "# Written by `cheladb dev bootstrap`: this slot's Studio app.\nVITE_ZITADEL_CLIENT_ID={client_id}\n"
-    )
-}
-
 pub async fn run() -> Result<()> {
     let iss = issuer();
     let zdir = zitadel_dir();
@@ -55,17 +43,9 @@ pub async fn run() -> Result<()> {
     let org_id = wait_ready(|| steps::ensure_org(&api)).await?;
     let project_id = steps::ensure_project(&api, &org_id).await?;
     let api_client_id = steps::ensure_api_app(&api, &project_id).await?;
-    let studio_client_id = steps::ensure_studio_app(&api, &project_id, 0, mode).await?;
-    // A worktree slot's Studio has its own app (W7).
-    let slot = crate::paths::slot()?;
-    if slot > 0 {
-        let client_id = steps::ensure_studio_app(&api, &project_id, slot, mode).await?;
-        let file = slot_studio_env_file(&zdir, slot);
-        fs::write(&file, render_slot_studio_env(&client_id))
-            .with_context(|| format!("write {}", file.display()))?;
-    }
-    // W8: self-hosted mode only, each slot's sign-in goes to its own Studio.
-    steps::ensure_studio_logins(&api, &project_id, mode).await?;
+    let studio_client_id = steps::ensure_studio_app(&api, &project_id, mode).await?;
+    // W8: self-hosted mode only, sign-ins go to Studio's own login.
+    steps::ensure_studio_login(&api, &project_id, mode).await?;
     let demo_user_id = steps::ensure_demo_user(&api, &org_id).await?;
     steps::ensure_demo_key(&api, &demo_user_id, &zdir.join("demo-sa.json")).await?;
     steps::ensure_smtp(&api).await?;
@@ -145,6 +125,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev::requests::STUDIO_ORIGIN;
 
     fn host(url: &str) -> &str {
         let rest = url.split_once("://").unwrap().1;
@@ -186,24 +167,8 @@ mod tests {
 
     // auth's SameSite=Strict cookies are dropped on cross-site fetches: Studio and the
     // gateway must be the same site (localhost vs 127.0.0.1 are different sites).
-    // W7: slot N's Studio reads its own app's client id from this file (`just` exports it).
-    #[test]
-    fn a_slots_studio_env_names_its_client() {
-        assert_eq!(
-            render_slot_studio_env("c-s1"),
-            "# Written by `cheladb dev bootstrap`: this slot's Studio app.\nVITE_ZITADEL_CLIENT_ID=c-s1\n"
-        );
-        assert_eq!(
-            slot_studio_env_file(std::path::Path::new("/z"), 4),
-            std::path::Path::new("/z/studio-s4.env")
-        );
-    }
-
     #[test]
     fn studio_and_the_gateway_are_the_same_site() {
-        assert_eq!(
-            host(&crate::dev::requests::studio_origin(0)),
-            host(GATEWAY_URL)
-        );
+        assert_eq!(host(STUDIO_ORIGIN), host(GATEWAY_URL));
     }
 }

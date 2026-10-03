@@ -8,6 +8,8 @@
 
 ## Status
 
+- **Reverted 2026-10-03:** replaced by one dev stack per machine and `just live` queue (branch `live-queue`, plan `docs/superpowers/plans/2026-10-03-live-queue.md`).
+
 - **Handoff:**
   - 6c (`data-api-databases`) must merge `main` and run `just stack-claim` before any `deps-up`, `dev`, `deps-down` or `sweep-dbs`.
   - 6c's merge will conflict in about 13 shared files (`live_db.rs`, `reconcile.rs`, `backend.rs`, `worker/config.rs`, the orchestrator's `lib.rs`/`main.rs`, and others); its new `rest_live`/`live_db` code must keep S8's per-run scoping.

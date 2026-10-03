@@ -1,9 +1,5 @@
-# Cheladb local control-plane dependencies: the shared tier.
-# Rust apps and Studio run on the host against these services. Every worktree slot (see
-# scripts/lib/slots.sh and `just stack`) shares this tier; each also runs its own app tier
-# from slot.yml (NATS, Valkey, the proxy). Bind mounts go through CHELADB_SHARED_DIR (the
-# main checkout's .cheladb, set by `just`), so `up` names the same paths from every worktree
-# and never recreates a container another slot uses.
+# Cheladb local control-plane dependencies.
+# Rust apps and Studio run on the host against these services.
 
 name: cheladb
 
@@ -38,6 +34,36 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  nats:
+    image: nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
+    restart: unless-stopped
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Valkey (BSD-3-Clause, speaks the Redis protocol). Neon's proxy uses it for query cancel and
+  # for the cache-clearing messages the control plane publishes on a password change. Local dev:
+  # no auth, loopback only. Platform mode needs auth and TLS.
+  valkey:
+    image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes: ["valkey_data:/data"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
   zitadel-db:
     image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
@@ -92,7 +118,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ${CHELADB_SHARED_DIR:-../../.cheladb}/zitadel:/zitadel-bootstrap
+      - ../../.cheladb/zitadel:/zitadel-bootstrap
 
   # Local mail catcher: Zitadel's signup verification codes land here (UI :8025).
   mailpit:
@@ -208,15 +234,16 @@ services:
       # network; only the API below is published, on loopback.
       - --dev
       - --listen=0.0.0.0:1234
-      # Attachment changes (every tenant create, too) are pushed to the hook relay, which
-      # forwards each to the slot's internal listener (on the host) that knows the tenant; a
-      # tenant's reconcile waits until it answers. The token is local dev only.
-      - --control-plane-url=http://hook-relay:8099/storcon
+      # Attachment changes (every tenant create, too) are pushed to the orchestrator's
+      # internal listener on the host; a tenant's reconcile waits until it answers. The
+      # token is local dev only.
+      - --control-plane-url=http://host.docker.internal:8083/storcon
       - --control-plane-jwt-token=${CHELADB_STORCON_HOOK_TOKEN:-cheladb-dev-storcon-hook}
       - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
     ports:
       # The control plane runs on the host.
       - "127.0.0.1:1234:1234"
+    extra_hosts: ["host.docker.internal:host-gateway"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1234/ready"]
       interval: 2s
@@ -287,8 +314,8 @@ services:
         condition: service_healthy
 
   # Writes the proxy's TLS certificate once: a local CA and a *.localtest.me certificate signed
-  # by it. Every slot's proxy (slot.yml) mounts this volume; clients verify against the CA,
-  # which `just deps-up` copies to .cheladb/neon/proxy-ca.crt.
+  # by it. Clients verify against the CA; `just deps-up` copies it to
+  # .cheladb/neon/proxy-ca.crt.
   proxy-tls:
     image: *neon-image
     restart: "no"
@@ -315,21 +342,48 @@ services:
     volumes: ["neon_proxy_tls:/tls"]
     network_mode: none
 
-  # Forwards the storage controller's hooks to the worktree slot that knows the tenant: it tries
-  # each registered slot's internal listener (8083 + 100 × slot, on the host) in slot order,
-  # and returns the first answer that isn't 404. Reached by service name only: never published.
-  # Image: `just hook-relay-build` (deps-up builds it when missing).
-  hook-relay:
-    image: ${CHELADB_HOOK_RELAY_IMAGE:-cheladb/hook-relay:dev}
-    pull_policy: never
+  # Neon's proxy. Clients connect to <endpoint-id>.localtest.me (which resolves to 127.0.0.1):
+  # Postgres wire on 4432; WebSocket and SQL over HTTP on 4444. It asks the orchestrator's
+  # internal listener for role secrets and compute addresses, and reaches computes on this
+  # network. Role secrets are cached for at most a minute, and dropped at once when the
+  # control plane publishes /password_updated to Valkey.
+  proxy:
+    image: *neon-image
     restart: unless-stopped
-    command: ["--listen", "0.0.0.0:8099", "--slots-dir", "/slots"]
-    volumes:
-      - ${CHELADB_SHARED_DIR:-../../.cheladb}/slots:/slots:ro
+    command:
+      - proxy
+      - --auth-backend=control-plane
+      - --auth-endpoint=http://host.docker.internal:8083/proxy/api/v1
+      - --proxy=0.0.0.0:4432
+      - --wss=0.0.0.0:4444
+      # The proxy takes the endpoint domain from the certificate's CN.
+      - --tls-cert=/tls/tls.crt
+      - --tls-key=/tls/tls.key
+      - --project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m
+      - --redis-auth-type=plain
+      - --redis-plain=redis://valkey:6379
+    environment:
+      NEON_PROXY_TO_CONTROLPLANE_TOKEN: ${CHELADB_PROXY_API_TOKEN:-cheladb-dev-proxy-api}
+    ports:
+      - "127.0.0.1:4432:4432"
+      - "127.0.0.1:4444:4444"
     extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["neon_proxy_tls:/tls:ro"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/4432"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      proxy-tls:
+        condition: service_completed_successfully
+      # The proxy exits if it can't reach Redis at startup.
+      valkey:
+        condition: service_healthy
 
 volumes:
   metadata_pg_data:
+  nats_data:
+  valkey_data:
   zitadel_pg_data:
   neon_seaweedfs_data:
   neon_pageserver_data:

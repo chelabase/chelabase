@@ -43,10 +43,12 @@ pnpm install
 | `just sweep-dbs` | Dev reset: remove every worker-provisioned container and data volume (+ all metadata rows if deps up) |
 | `just check` | Rust + TS typechecks |
 | `just test` | Rust tests with nextest, then doctests |
-| `just sweep-builds` | Delete build artifacts older than 14 days (`days=N` to change) from both target dirs |
-| `just wt-add <branch> [base] [auto\|none]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/`, with its own slot (`none`: without one) |
-| `just stack` / `stack-claim` / `stack-free <N>` / `stack-migrate` | List the slots and the shared tier; give this worktree a slot; wipe a stale slot; apply the shared tier's configuration (see "Running several worktrees") |
-| `just hook-relay-build` / `stack-test` | Build the hook relay image; offline checks for slots and Compose |
+| `just sweep-builds` | Delete build artifacts older than 14 days (`days=N` to change) from the main and all worktrees' `target/` dirs |
+| `just wt-add <branch> [base]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/` with its own build dir |
+| `just live <recipe or command>` | Queue your command on the machine's one stack; run when it's your turn |
+| `just live-status` | See who holds the stack and who waits in the queue |
+| `just live-test` | Run the queue's offline tests (empty worktree, two concurrent runs, stale holder) |
+| `just stack-reset-slots` | Remove old slot data (for the second computer, one time after merge) |
 | `just orchestrator` / `worker` / `gateway` / `rest` / `auth` / `studio` | Foreground one process |
 | `just cleanup` | Fresh start: stops dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps (keeps keys and the seeded tenant). Asks first |
 | `just auth-e2e` | Live sign-up, sign-in, reset and logout through the gateway (needs `just dev`) |
@@ -70,9 +72,11 @@ If bootstrap fails with missing `admin.pat` (old Zitadel volume before FirstInst
 just zitadel-reset && just zitadel-bootstrap
 ```
 
+`zitadel-bootstrap` binds the demo tenant to the Zitadel org only when the metadata database is up, so run `just deps-up` first, or rerun the bootstrap afterwards (`just dev` also rebinds). A Zitadel reset leaves no human account: sign up on :3000 ("Create account").
+
 ### Builds and worktrees
 
-`just test` runs the Rust tests with [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`) and then the doctests. Dev builds carry line tables only (no full debug info), which keeps test binaries small. `just sweep-builds` (needs `cargo install cargo-sweep --locked`) drops build artifacts older than 14 days from `target/` and `.worktrees/target`; `just cleanup` runs it too. `just wt-add <branch>` makes a worktree in `.worktrees/<branch>` with `.cheladb` and `apps/studio/.env.local` linked from the main checkout and dependencies installed; `just wt-remove <branch>` removes it and keeps the branch. All worktrees share one Cargo target dir, `.worktrees/target` (set in `.worktrees/.cargo/config.toml`), so dependencies build once. The main checkout stays on `main`.
+`just test` runs the Rust tests with [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`) and then the doctests. Dev builds carry line tables only (no full debug info), which keeps test binaries small. `just sweep-builds` drops build artifacts older than 14 days from the main `target/` and every worktree's; `just cleanup` runs it too. `just wt-add <branch>` makes a worktree in `.worktrees/<branch>` with its own `target/` directory (cargo's default), `.cheladb` and `apps/studio/.env.local` linked from the main checkout, and dependencies installed; `just wt-remove <branch>` removes it and keeps the branch. The main checkout stays on `main`. With sccache configured in `~/.cargo/config.toml`, compilation is shared across the machine.
 
 Logs for detached processes: `.cheladb/dev/*.log`. IAM artifacts: `.cheladb/zitadel/` (gitignored). Zitadel PATs are opaque — demo calls use **JWT profile** access tokens from `cheladb dev token`.
 
@@ -252,45 +256,77 @@ Generated files are never edited by hand. Errors from these clients are thrown a
 
 Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.cheladb/zitadel/demo.env` after bootstrap.
 
-## Running several worktrees
+## Worktrees and the live queue
 
-Several worktrees can run their own development stacks side by side on the same machine, each with their own app tier. The heavy tier (Postgres server, Neon storage, Zitadel, hook relay) is shared. A quick reference:
+Each machine has one development stack. Parallel worktrees work without slots: they build into their own `target/` directories and run tests through `just live`, a FIFO queue that takes turns on the shared stack.
 
-| What | Main checkout (slot 0) | Slot N worktree |
-|---|---|---|
-| Metadata database | `cheladb_metadata` | `cheladb_metadata_s<N>` |
-| Dev directory | `.cheladb/dev` | `.cheladb/dev/s<N>` |
-| Compose project | `cheladb-s0` | `cheladb-s<N>` |
-| NATS, Valkey, proxy ports | 4222, 6379, 4432/4444 | 4222+100N, 6379+100N, 4432+100N / 4444+100N |
-| Gateway, internal, auth, rest ports | 8000, 8083, 8084, 8085 | 8000+100N, 8083+100N, 8084+100N, 8085+100N |
-| Studio port | 3000 | 3000+100N |
+### Machine setup (one time)
 
-**Get started:**
+Install sccache (build cache) and cargo-sweep (cleanup), then configure the cache:
 
-1. **Moving to slots:**
-   - **An old single stack is running** (for example on the second computer): `just dev-down`, `git pull`, then `just stack-migrate` (builds the hook relay, pulls the new image pins, removes the old NATS, Valkey and proxy containers and recreates the shared tier), then `just deps-up` and `just dev`.
-   - **A fresh machine:** `just dev`.
-   - **A worktree made before slots:** merge `main` into its branch, run `just dev-down` if its apps run as slot 0, then `just stack-claim` (gives it a slot and writes its `.env.local`).
-   - **After a hook relay code change:** `just hook-relay-build`, then `just stack-migrate` (which rebuilds the relay itself and recreates the shared tier; it refuses while other slots run).
-2. `just wt-add my-feature` creates a worktree in `.worktrees/my-feature` with its own slot (lowest free from 1–9), metadata database, and `.env.local`. It writes an entry to `.cheladb/slots/N.env`. `just wt-add my-feature main none` creates the worktree without a slot (no registry entry, no `.env.local`; for worktrees that run no stack, such as implementer worktrees); `just stack-claim` gives it one later. When all nine slots are taken, `wt-add` fails and suggests the `none` form or `just stack-free`.
-3. `just dev` (in the new worktree) starts that slot's dev apps and its metadata database. Run `just neon-e2e` to test it.
-4. Multiple slots can run live tests and e2e scripts at the same time. Studio sign-in for each slot is separate; open `http://localhost:3N00` (e.g., `3100` for slot 1). Each slot has its own Zitadel app (`cheladb-studio` for slot 0, `cheladb-studio-s<N>` for slot N) whose login URL is that slot's Studio. To make that work, `just zitadel-bootstrap` (run by `just dev`) switches off the Zitadel instance's "login v2 required" in self-hosted mode, since that setting sends every app to slot 0's login. It also checks that every Studio app names its own login URL, because an app without one would fall back to Zitadel's old v1 login. Platform mode leaves the instance setting alone.
-5. `just wt-remove my-feature` stops that slot's apps, removes its Compose project, drops its metadata database, frees the registry entry, and removes the worktree.
-6. `just stack` lists all running slot projects and the shared tier. `just stack-free <N>` wipes a stale slot N and frees it if nothing is using it. `just stack-claim` gives the current worktree a slot. `just stack-migrate` applies the shared tier's current configuration (see step 1). `just hook-relay-build` builds the hook relay image. `just stack-test` runs the offline slot checks.
+```bash
+cargo install sccache --locked              # latest: 0.18.0
+cargo install cargo-sweep --locked          # latest: 0.8.0
+```
 
-**Prerequisites on a second computer:**
+Add this to `~/.cargo/config.toml` (create it if it doesn't exist):
 
-- `cargo` (to build the hook relay) and `jq` (to parse the metadata)
-- The host's glibc must be version ≤ 2.43, or the hook relay Dockerfile must be bumped (edit `FROM ubuntu:…` to a newer LTS base with a matching or newer glibc)
-- **Pre-slot branches** (created before this chore): their `just deps-up` does not error. It silently recreates the shared storage on older image pins (a pageserver downgrade), points the storage controller back at host port 8083 (bypassing the hook relay), and clashes with the `cheladb-s0` ports. Their `deps-down` stops the whole shared tier, their worker removes other slots' computes, and their orchestrator answers 200 for tenants it does not know. Rule: merge `main` and run `just stack-claim` before any `deps-up`, `dev`, `deps-down` or `sweep-dbs` on a pre-slot branch.
+```toml
+[build]
+rustc-wrapper = "sccache"
+```
 
-**Important during development:**
+This is per-machine, not per-repo. Worktrees share sccache across the machine; `just sweep-builds` removes artifacts older than 14 days (`days=N` to change) from the main `target/` and every worktree's.
 
-- Don't run `just deps-down` or `just cleanup` while other slot projects are running; they stop the shared tier that those slots depend on.
-- Each slot's dev services (gateway, orchestrator, worker, auth, rest) run independently; a slot 1 worker doesn't affect slot 0.
-- The hook relay routes storage-controller hooks (paths under `/storcon/`; anything else is 404) to the slot that owns each tenant.
-- Slots on `localhost` share their session cookies (cookies ignore ports), so signing in on one slot's Studio replaces the other's session: keep one signed-in Studio at a time.
-- Two worktrees building at once can overwrite each other's binaries in the shared target dir; set `CARGO_TARGET_DIR` per worktree for concurrent live runs of different branches.
+### Creating worktrees
+
+```bash
+just wt-add my-feature          # creates .worktrees/my-feature with its own build dir
+just wt-add my-feature main     # same thing (base branch is main)
+just wt-add my-branch other     # branches from other instead
+```
+
+Each worktree:
+- has its own `target/` directory (cargo's default; no shared `.cargo/config.toml`)
+- symlinks `.cheladb` and `apps/studio/.env.local` from the main checkout
+- can build in parallel with others (with sccache sharing compilation)
+- shares the one stack: Compose is machine-wide, and `just dev`'s apps run from whichever worktree last took the stack (`just live` moves them)
+
+Run tests through the queue:
+
+```bash
+just live just neon-e2e        # queues the e2e test; runs when its turn comes
+just live cargo nextest run    # queues a cargo command
+just live-status               # see who holds the stack and who waits
+just wt-remove my-feature      # removes the worktree and its target/, and keeps the branch
+```
+
+The queue ensures only one test run at a time; others wait. Press Ctrl-C to cancel your run.
+
+### Running the stack and tests
+
+```bash
+just dev                      # start the stack: Compose up + bootstrap + background apps
+just dev-down                 # stop the background apps (Compose stays up)
+just stop                     # dev-down then deps-down (full shutdown)
+just live just neon-e2e       # queue a test run
+just live just data-e2e       # queue another; it waits
+just live -- deps-up          # apply new image pins (through the queue)
+just stack-reset-slots        # for the second computer (one time, after git pull)
+```
+
+### Second computer setup
+
+When moving to this machine or syncing after a merge:
+
+```bash
+git pull                      # get the latest code
+just stack-reset-slots        # remove old slot data, stop slot dev apps, run deps-up (interactive)
+```
+
+`stack-reset-slots` already runs `just deps-up`, so don't repeat it. Also set up the machine once: sccache and cargo-sweep (`cargo install cargo-sweep --locked`; `just sweep-builds` and `just cleanup` skip the sweep without it). The reset now stops the dev apps a slot left running (each `.cheladb/dev/s<N>/pids` process group) before it deletes the slot files.
+
+`just stack-reset-slots` is idempotent and prints what it removes before asking.
 
 ## Data API
 
@@ -543,7 +579,7 @@ A non-2xx response without this error body (a proxy error page) gets its code fr
 6. An owner password set in SQL answers 409 `owner_password_unknown`; after a reset the owner console works at once.
 7. Main can't be switched off; disabling `analytics` answers 409 `data_api_disabled` in the console and 404 to the key at once; `?remove=true` drops the `cheladb` schema; the database is deleted.
 
-`rest_live` (`cargo test -p rest --test rest_live -- --ignored --test-threads=1`, with the slot's env loaded as `just` does) covers two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
+`rest_live` (`cargo test -p rest --test rest_live -- --ignored --test-threads=1`, with `.cheladb/zitadel/demo.env` loaded as `just` does) covers two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
 
 ### Known limits
 

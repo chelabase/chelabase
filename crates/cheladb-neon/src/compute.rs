@@ -17,8 +17,6 @@ pub const COMPUTE_CTL_PORT: u16 = 3080;
 pub const COMPUTE_TOKEN_ENV: &str = "NEON_CONTROL_PLANE_TOKEN";
 /// Container label naming the endpoint a compute belongs to.
 pub const ENDPOINT_LABEL: &str = "cheladb.dev/endpoint-id";
-/// Container label naming the worktree slot (0 = the main checkout) whose worker owns it.
-pub const SLOT_LABEL: &str = "cheladb.dev/slot";
 
 const NAME_PREFIX: &str = "cheladb-compute-";
 

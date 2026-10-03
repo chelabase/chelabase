@@ -1,6 +1,6 @@
 // Reads the e2e table back through Neon's proxy with @neondatabase/serverless: once over
 // WebSocket (Pool) and once over SQL over HTTP (neon()). The proxy's serverless side listens
-// on the slot's CHELADB_PROXY_HTTP_PORT (4444 in slot 0), not 443, so both URLs point there.
+// on CHELADB_PROXY_HTTP_PORT (4444 by default), not 443, so both URLs point there.
 // Env: DATABASE_URL, EXPECT (the row count), NODE_EXTRA_CA_CERTS (the proxy's CA),
 // CHELADB_PROXY_HTTP_PORT (default 4444).
 import { Pool, neon, neonConfig } from "@neondatabase/serverless";

@@ -1,7 +1,6 @@
 language: "bash"
 
-# The lifecycle lives in the justfile: it loads the worktree's slot first (ports, project, and
-# CHELADB_SHARED_DIR so the shared tier's mounts name the same paths from every worktree).
+# The lifecycle lives in the justfile (it refuses while another worktree holds the stack: just live).
 tasks:
   up:
     command: "just"

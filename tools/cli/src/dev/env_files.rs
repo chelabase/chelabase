@@ -104,8 +104,7 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line} in {text}");
         }
-        // demo.env is shared by every worktree slot: no ports in it. The apps default to slot
-        // 0's, and `just` sets each slot's (scripts/lib/slots.sh).
+        // No ports in demo.env: the apps default to the dev stack's.
         for key in [
             "CHELADB_REST_URL=",
             "CHELADB_REST_INTERNAL_URL=",

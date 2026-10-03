@@ -38,7 +38,6 @@ fn backend(network: &str, control_plane_uri: &str) -> DockerBackend {
         image: compute_image(),
         network: network.to_string(),
         control_plane_uri: control_plane_uri.to_string(),
-        slot: 0,
     })
     .unwrap()
 }

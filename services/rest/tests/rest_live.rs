@@ -294,7 +294,7 @@ impl Live {
     }
 
     /// What the enable route and the worker's job do: `enabling`, the bootstrap, `on`. Then
-    /// rest is told (the orchestrator would call the slot's own rest, not this one).
+    /// rest is told (the orchestrator would call the dev stack's rest, not this test's).
     async fn enable(&self, branch: BranchId, name: &str) {
         let start = self
             .metadata

@@ -57,12 +57,12 @@ call POST "$STORCON/v1/tenant" \
   "{\"new_tenant_id\":\"$tenant\",\"placement_policy\":{\"Attached\":0}}" >/dev/null
 say "created tenant $tenant"
 
-# Creating a tenant attaches it, so the storage controller notifies the control-plane hook
-# (the hook relay). No worktree slot knows a throwaway tenant, so every slot answers 404 and the
-# notification stays pending: the storage controller expects that during a create and retries
-# later. Whether the hook reaches a slot is checked by neon-e2e, through a real database.
-call GET "$STORCON/control/v1/tenant/$tenant" >/dev/null
-say "read the tenant back"
+# Creating a tenant attaches it, so the storage controller notifies the control-plane hook.
+# The orchestrator's internal listener answers the hook; without it the notification stays pending.
+shard="$(call GET "$STORCON/control/v1/tenant/$tenant" | jq -c '.shards[0]')"
+jq -e '.is_pending_compute_notification == false' <<<"$shard" >/dev/null ||
+  die "tenant $tenant's compute notification is still pending (is the orchestrator running? just dev): $shard"
+say "the control-plane hook was notified"
 
 call POST "$STORCON/v1/tenant/$tenant/timeline" \
   "{\"new_timeline_id\":\"$timeline\",\"pg_version\":17}" >/dev/null

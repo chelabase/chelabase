@@ -28,9 +28,6 @@ pub struct WorkerConfig {
     pub control_plane_uri: String,
     pub valkey_url: String,
     pub compute_image: String,
-    /// `CHELADB_SLOT`: the worktree slot (0-9, 0 = the main checkout). The computes this
-    /// worker starts carry it as a label, and it only lists (and reconciles) its own.
-    pub slot: u16,
     pub mode: cheladb_types::mode::Mode,
     pub owner_superuser_requested: bool,
     /// `CHELADB_BRANCH_ROLE_CAP`, `CHELADB_BRANCH_DATABASE_CAP` and
@@ -68,14 +65,6 @@ impl WorkerConfig {
             Some("true" | "1" | "yes")
         );
         let roles = RoleSettings::from_lookup(mode, &get).map_err(|e| anyhow!(e))?;
-        let slot = match non_blank(&get, "CHELADB_SLOT") {
-            None => 0,
-            Some(v) => v
-                .parse::<u16>()
-                .ok()
-                .filter(|n| *n <= 9)
-                .ok_or_else(|| anyhow!("CHELADB_SLOT={v:?} is not a slot number (0-9)"))?,
-        };
         let config = Self {
             storcon_url: or_default("CHELADB_STORCON_URL", "http://127.0.0.1:1234"),
             compute_jwt_dir: PathBuf::from(or_default("CHELADB_COMPUTE_JWT_DIR", ".cheladb/neon")),
@@ -86,7 +75,6 @@ impl WorkerConfig {
             ),
             valkey_url: or_default("CHELADB_VALKEY_URL", "redis://127.0.0.1:6379"),
             compute_image,
-            slot,
             mode,
             owner_superuser_requested,
             roles,
@@ -142,7 +130,6 @@ pub fn build(
             image: config.compute_image.clone(),
             network: config.compute_network.clone(),
             control_plane_uri: config.control_plane_uri.clone(),
-            slot: config.slot,
         })?,
         cache: ProxyCache::new(&config.valkey_url)?,
         pusher: HttpPusher { http, signer },
@@ -155,7 +142,6 @@ pub fn build(
         claim_refresh: Duration::from_secs(60),
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
-        reported_unknown_tenants: Default::default(),
     })
 }
 
@@ -189,21 +175,6 @@ mod tests {
         assert_eq!(c.mode, Mode::SelfHosted);
         assert!(!c.owner_superuser_requested);
         assert!(!c.owner_superuser());
-    }
-
-    // `just dev` sets CHELADB_SLOT from the worktree's slot; computes carry it as a label.
-    #[test]
-    fn the_slot_comes_from_cheladb_slot() {
-        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
-        assert_eq!(c.slot, 0);
-        let c = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELADB_SLOT", "3")])).unwrap();
-        assert_eq!(c.slot, 3);
-        for bad in ["x", "-1", "10"] {
-            let err = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELADB_SLOT", bad)]))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("CHELADB_SLOT"), "{bad}: {err}");
-        }
     }
 
     #[test]

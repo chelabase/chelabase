@@ -1,6 +1,6 @@
 //! Binds the demo tenant to the local Zitadel org (`tenants.zitadel_org_id`).
 
-use crate::paths::{compose_env, compose_file, metadata_db};
+use crate::paths::{compose_env, compose_file};
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 use tracing::{info, warn};
@@ -8,7 +8,6 @@ use tracing::{info, warn};
 pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
     let compose = compose_file();
     let env_file = compose_env();
-    let db = metadata_db();
 
     let ready = Command::new("docker")
         .args([
@@ -24,7 +23,7 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
             "-U",
             "cheladb",
             "-d",
-            &db,
+            "cheladb_metadata",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -51,7 +50,7 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
             "-U",
             "cheladb",
             "-d",
-            &db,
+            "cheladb_metadata",
             "-tAc",
             "SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='zitadel_org_id'",
         ])
@@ -81,7 +80,7 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
             "-U",
             "cheladb",
             "-d",
-            &db,
+            "cheladb_metadata",
             "-v",
             "ON_ERROR_STOP=1",
             "-c",

@@ -16,7 +16,7 @@
 //!
 //! Each test provisions its own database and deletes it afterwards, pass or fail. A few tests
 //! restart `just dev`'s orchestrator with extra settings (or stop it) and put it back as it was
-//! afterwards, pass or fail; they need the `pids` file from `just dev` in `CHELADB_DEV_DIR` (default `.cheladb/dev`).
+//! afterwards, pass or fail; they need `.cheladb/dev/pids` from `just dev`.
 
 use std::future::Future;
 use std::process::Stdio;
@@ -663,34 +663,13 @@ async fn wait_for_data_status(key: &str, table: &str, status: u16, within: Durat
 
 // --- `just dev`'s orchestrator, restarted with other settings -------------------------------
 
-/// The dev directory `just dev` writes its pids and logs to: `CHELADB_DEV_DIR` (relative paths
-/// from the workspace root), `.cheladb/dev` by default.
+/// The dev directory `just dev` writes its pids and logs to.
 fn dev_dir() -> std::path::PathBuf {
-    resolve_dev_dir(
-        &workspace_root(),
-        std::env::var("CHELADB_DEV_DIR").ok().as_deref(),
-    )
-}
-
-fn resolve_dev_dir(root: &std::path::Path, env: Option<&str>) -> std::path::PathBuf {
-    match env.filter(|v| !v.is_empty()) {
-        Some(dir) => root.join(dir), // an absolute `dir` replaces the root
-        None => root.join(".cheladb/dev"),
-    }
+    workspace_root().join(".cheladb/dev")
 }
 
 fn pids_file() -> std::path::PathBuf {
     dev_dir().join("pids")
-}
-
-#[test]
-fn dev_dir_resolves_against_the_root_with_the_old_default() {
-    use std::path::Path;
-    let root = Path::new("/w");
-    assert_eq!(resolve_dev_dir(root, None), Path::new("/w/.cheladb/dev"));
-    assert_eq!(resolve_dev_dir(root, Some("")), Path::new("/w/.cheladb/dev"));
-    assert_eq!(resolve_dev_dir(root, Some(".cheladb/dev-1")), Path::new("/w/.cheladb/dev-1"));
-    assert_eq!(resolve_dev_dir(root, Some("/abs/dev")), Path::new("/abs/dev"));
 }
 
 async fn port_open(port: u16) -> bool {

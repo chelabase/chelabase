@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::compute::{
     COMPUTE_CTL_PORT, COMPUTE_TOKEN_ENV, ComputeLocator, DockerLocator, ENDPOINT_LABEL,
-    POSTGRES_PORT, SLOT_LABEL, compute_ctl_args, container_name,
+    POSTGRES_PORT, compute_ctl_args, container_name,
 };
 
 const ADMIN_SQL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,8 +41,6 @@ pub struct ComputeSettings {
     pub image: String,
     pub network: String,
     pub control_plane_uri: String,
-    /// The worktree slot (0 = the main checkout) whose worker owns these computes.
-    pub slot: u16,
 }
 
 /// Lifecycle of computes plus admin SQL inside them.
@@ -57,7 +55,7 @@ pub trait ComputeBackend: ComputeLocator {
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = anyhow::Result<Option<ComputeStatus>>> + Send;
-    /// Endpoint ids of every container carrying ENDPOINT_LABEL in this slot, running or not.
+    /// Endpoint ids of every container carrying ENDPOINT_LABEL, running or not.
     fn list(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
     /// Runs `sql` (stdin) with psql as cloud_admin inside the compute; returns stdout.
     fn admin_sql(
@@ -87,13 +85,7 @@ pub fn create_body(
         entrypoint: Some(vec!["/usr/local/bin/compute_ctl".to_string()]),
         cmd: Some(compute_ctl_args(endpoint_id, &settings.control_plane_uri)),
         env: Some(vec![format!("{COMPUTE_TOKEN_ENV}={compute_token}")]),
-        labels: Some(
-            [
-                (ENDPOINT_LABEL.to_string(), endpoint_id.to_string()),
-                (SLOT_LABEL.to_string(), settings.slot.to_string()),
-            ]
-            .into(),
-        ),
+        labels: Some([(ENDPOINT_LABEL.to_string(), endpoint_id.to_string())].into()),
         exposed_ports: Some(ports.to_vec()),
         host_config: Some(HostConfig {
             network_mode: Some(settings.network.clone()),
@@ -108,15 +100,6 @@ pub fn create_body(
             ..Default::default()
         }),
         ..Default::default()
-    }
-}
-
-/// Whether a compute with these labels is `slot`'s. Computes created before slots existed carry
-/// no slot label: they are slot 0's.
-pub fn in_slot(labels: &std::collections::HashMap<String, String>, slot: u16) -> bool {
-    match labels.get(SLOT_LABEL) {
-        Some(label) => label.parse::<u16>().ok() == Some(slot),
-        None => slot == 0,
     }
 }
 
@@ -349,12 +332,9 @@ impl ComputeBackend for DockerBackend {
             }))
             .await
             .context("listing compute containers")?;
-        // Only this slot's: another worktree's worker owns the rest.
         Ok(containers
             .into_iter()
-            .filter_map(|c| c.labels)
-            .filter(|labels| in_slot(labels, self.settings.slot))
-            .filter_map(|mut labels| labels.remove(ENDPOINT_LABEL))
+            .filter_map(|c| c.labels?.remove(ENDPOINT_LABEL))
             .collect())
     }
 
@@ -598,43 +578,13 @@ pub mod fake {
 mod tests {
     use super::fake::{FakeBackend, Journal};
     use super::*;
-    use std::collections::HashMap;
 
     fn settings() -> ComputeSettings {
         ComputeSettings {
             image: "neon/compute-node-v17:test".to_string(),
             network: "cheladb_default".to_string(),
             control_plane_uri: "http://host.docker.internal:8083".to_string(),
-            slot: 3,
         }
-    }
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn create_body_labels_the_slot() {
-        let body = create_body("ep-abc123", "t", &settings());
-        assert_eq!(
-            body.labels.unwrap().get("cheladb.dev/slot"),
-            Some(&"3".to_string())
-        );
-    }
-
-    // Each worktree slot's worker removes computes it has no row for: it must only see its own.
-    #[test]
-    fn a_compute_belongs_to_the_slot_on_its_label() {
-        let ep = ("cheladb.dev/endpoint-id", "ep-1");
-        assert!(in_slot(&labels(&[ep, ("cheladb.dev/slot", "3")]), 3));
-        assert!(!in_slot(&labels(&[ep, ("cheladb.dev/slot", "3")]), 0));
-        assert!(!in_slot(&labels(&[ep, ("cheladb.dev/slot", "0")]), 3));
-        // Computes created before slots existed have no label: they are slot 0's.
-        assert!(in_slot(&labels(&[ep]), 0));
-        assert!(!in_slot(&labels(&[ep]), 3));
     }
 
     #[test]
