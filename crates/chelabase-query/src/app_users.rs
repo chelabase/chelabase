@@ -11,9 +11,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
-use sqlx::{PgPool, Postgres, Transaction};
+use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
+use tokio_postgres::{NoTls, TransactionStatus};
+use tokio_postgres::types::Type;
 use uuid::Uuid;
+
+use crate::error::DbFields;
 
 /// The role the sync connects as.
 pub const SYNC_ROLE: &str = "chelabase_auth_sync";
@@ -102,7 +105,8 @@ pub trait UsersDb: Send + Sync {
 #[async_trait::async_trait]
 pub trait PendingInsert: Send {
     async fn commit(self: Box<Self>) -> Result<(), UserRowError>;
-    /// Best effort: dropping the transaction rolls back anyway.
+    /// Best effort: when the `ROLLBACK` fails, the connection is closed instead (which ends
+    /// the transaction).
     async fn rollback(self: Box<Self>);
 }
 
@@ -139,26 +143,35 @@ pub fn insert_sql(schema: &str, table: &str, data_columns: &[String]) -> String 
     )
 }
 
-fn map_error(e: sqlx::Error) -> UserRowError {
-    if let sqlx::Error::Database(db) = &e {
-        let code = db.code().map(|c| c.into_owned()).unwrap_or_default();
-        let constraint = db.constraint().map(str::to_owned);
-        if code == UNIQUE_VIOLATION && constraint.as_deref() == Some(EMAIL_KEY) {
-            return UserRowError::EmailTaken;
-        }
-        if code.starts_with("23") || code.starts_with("22") || code == "42501" {
-            return UserRowError::Constraint {
-                message: db.message().to_owned(),
-                constraint,
-            };
-        }
+/// The row error a Postgres error maps to, or `None` when it isn't one the caller can act on.
+fn map_db(db: &dyn DbFields) -> Option<UserRowError> {
+    let code = db.code();
+    let constraint = db.constraint().map(str::to_owned);
+    if code == UNIQUE_VIOLATION && constraint.as_deref() == Some(EMAIL_KEY) {
+        return Some(UserRowError::EmailTaken);
     }
-    UserRowError::Unavailable(e.to_string())
+    if code.starts_with("23") || code.starts_with("22") || code == "42501" {
+        return Some(UserRowError::Constraint {
+            message: db.message().to_owned(),
+            constraint,
+        });
+    }
+    None
 }
 
-/// Postgres-backed [`UsersDb`], with a small pool per branch endpoint and credentials.
+fn map_error(e: &tokio_postgres::Error) -> UserRowError {
+    e.as_db_error()
+        .and_then(|db| map_db(db))
+        .unwrap_or_else(|| UserRowError::Unavailable(e.to_string()))
+}
+
+/// Longest wait for a connection (waiting for a free one, or connecting).
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Postgres-backed [`UsersDb`], with a small pool per branch endpoint and credentials. An
+/// idle pool is dropped by the cache's time-to-idle (two connections don't need a reaper).
 pub struct PgUsersDb {
-    pools: moka::future::Cache<(Uuid, [u8; 32]), PgPool>,
+    pools: moka::future::Cache<(Uuid, [u8; 32]), Pool>,
 }
 
 impl Default for PgUsersDb {
@@ -178,7 +191,7 @@ impl PgUsersDb {
     }
 
     /// The branch's pool; a changed password, address or database makes a new one.
-    async fn pool(&self, t: &SyncTarget) -> PgPool {
+    async fn pool(&self, t: &SyncTarget) -> Pool {
         let mut h = Sha256::new();
         h.update(t.password.as_bytes());
         h.update(format!("{}:{}", t.host, t.port).as_bytes());
@@ -186,34 +199,82 @@ impl PgUsersDb {
         let key = (t.branch_id, <[u8; 32]>::from(h.finalize()));
         self.pools
             .get_with(key, async {
-                let options = PgConnectOptions::new()
+                let mut config = tokio_postgres::Config::new();
+                config
                     .host(&t.host)
                     .port(t.port)
-                    .username(&t.user)
+                    .user(&t.user)
                     .password(&t.password)
-                    .database(&t.database)
-                    .ssl_mode(PgSslMode::Prefer)
+                    .dbname(&t.database)
                     .application_name("chelabase-auth");
-                PgPoolOptions::new()
-                    .max_connections(2)
-                    .min_connections(0)
-                    .idle_timeout(Duration::from_secs(60))
-                    .connect_lazy_with(options)
+                let manager = Manager::from_config(
+                    config,
+                    NoTls,
+                    ManagerConfig {
+                        recycling_method: RecyclingMethod::Fast,
+                    },
+                );
+                Pool::builder(manager)
+                    .max_size(2)
+                    .runtime(Runtime::Tokio1)
+                    .wait_timeout(Some(ACQUIRE_TIMEOUT))
+                    .create_timeout(Some(ACQUIRE_TIMEOUT))
+                    .build()
+                    .expect("a pool with a runtime set always builds")
             })
             .await
     }
 }
 
-struct PendingTx(Transaction<'static, Postgres>);
+/// A pooled connection inside an open transaction. It goes back to the pool only once its
+/// `COMMIT` or `ROLLBACK` succeeded; dropped before that (a cancelled sync, an error, a
+/// panic) it's taken out of the pool and closed, which ends the transaction (and frees the
+/// email's unique-index lock) at once rather than when the connection is next used.
+struct PendingTx {
+    object: Option<Object>,
+    finished: bool,
+}
+
+impl PendingTx {
+    fn new(object: Object) -> Self {
+        PendingTx {
+            object: Some(object),
+            finished: false,
+        }
+    }
+
+    fn conn(&self) -> &Object {
+        self.object
+            .as_ref()
+            .expect("a pending insert holds its connection until dropped")
+    }
+
+    /// Ends the transaction with `sql`; the connection is kept only when that worked.
+    async fn end(&mut self, sql: &str) -> Result<(), tokio_postgres::Error> {
+        self.conn().batch_execute(sql).await?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingTx {
+    fn drop(&mut self) {
+        if let Some(object) = self.object.take()
+            && !self.finished
+        {
+            drop(Object::take(object));
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl PendingInsert for PendingTx {
-    async fn commit(self: Box<Self>) -> Result<(), UserRowError> {
-        self.0.commit().await.map_err(map_error)
+    async fn commit(mut self: Box<Self>) -> Result<(), UserRowError> {
+        self.end("COMMIT").await.map_err(|e| map_error(&e))
     }
 
-    async fn rollback(self: Box<Self>) {
-        let _ = self.0.rollback().await;
+    async fn rollback(mut self: Box<Self>) {
+        let _ = self.end("ROLLBACK").await;
     }
 }
 
@@ -225,53 +286,170 @@ impl UsersDb for PgUsersDb {
         row: &NewUserRow,
     ) -> Result<Box<dyn PendingInsert>, UserRowError> {
         let pool = self.pool(target).await;
-        let mut tx = pool
-            .begin()
+        let conn = pool
+            .get()
             .await
             .map_err(|e| UserRowError::Unavailable(e.to_string()))?;
-        sqlx::query("SET LOCAL statement_timeout = '10s'")
-            .execute(&mut *tx)
+        // Held from here: a failure or a cancel before the end discards the connection.
+        let tx = PendingTx::new(conn);
+        tx.conn()
+            .batch_execute(&begin_sql(tx.conn().transaction_status()))
             .await
-            .map_err(map_error)?;
+            .map_err(|e| map_error(&e))?;
 
         let rel = format!("{}.{}", quote(&target.schema), quote(&target.table));
-        let insertable: Vec<String> = sqlx::query_scalar(INSERTABLE_COLUMNS_SQL)
-            .bind(&rel)
-            .bind(MANAGED_COLUMNS.as_slice())
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(map_error)?;
+        let insertable = match insertable_columns(tx.conn(), &rel).await {
+            Ok(columns) => columns,
+            Err(e) => {
+                Box::new(tx).rollback().await;
+                return Err(map_error(&e));
+            }
+        };
 
         // `Map` iterates in key order (no `preserve_order`), so the first unknown is the
         // alphabetically first.
         let mut keys: Vec<String> = row.data.keys().cloned().collect();
         keys.sort();
         if let Some(bad) = keys.iter().find(|k| !insertable.contains(k)) {
-            let _ = tx.rollback().await;
+            Box::new(tx).rollback().await;
             return Err(UserRowError::UnknownColumn(bad.clone()));
         }
 
-        let sql = insert_sql(&target.schema, &target.table, &keys);
-        let q = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(row.id)
-            .bind(&row.email)
-            .bind(row.email_verified);
-        let q = if keys.is_empty() {
-            q
-        } else {
-            q.bind(serde_json::Value::Object(row.data.clone()).to_string())
-        };
-        if let Err(e) = q.execute(&mut *tx).await {
-            let _ = tx.rollback().await;
-            return Err(map_error(e));
+        if let Err(e) = insert_row(tx.conn(), target, &keys, row).await {
+            Box::new(tx).rollback().await;
+            return Err(map_error(&e));
         }
-        Ok(Box::new(PendingTx(tx)))
+        Ok(Box::new(tx))
     }
+}
+
+/// Opens the transaction and caps its statements. The leading `ROLLBACK` ends whatever a
+/// connection dropped mid-transaction left open; it's sent unless the connection is idle
+/// (Postgres logs a warning when there is nothing to end).
+fn begin_sql(status: TransactionStatus) -> String {
+    let begin = "BEGIN; SET LOCAL statement_timeout = '10s'";
+    if status == TransactionStatus::Idle {
+        begin.to_owned()
+    } else {
+        format!("ROLLBACK; {begin}")
+    }
+}
+
+/// The columns of `rel` (a quoted `schema.table`) that app user data may name.
+async fn insertable_columns(
+    conn: &Object,
+    rel: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    // `$1` is text (cast to `regclass` in the SQL), `$2` is `text[]` (cast to `name[]`).
+    let stmt = conn
+        .prepare_typed_cached(INSERTABLE_COLUMNS_SQL, &[Type::TEXT, Type::TEXT_ARRAY])
+        .await?;
+    let managed: &[&str] = &MANAGED_COLUMNS;
+    let rows = conn.query(&stmt, &[&rel, &managed]).await?;
+    rows.iter().map(|r| r.try_get(0)).collect()
+}
+
+/// The insert of `row`, with `keys` (its sorted data keys) as the table's own columns.
+async fn insert_row(
+    conn: &Object,
+    target: &SyncTarget,
+    keys: &[String],
+    row: &NewUserRow,
+) -> Result<(), tokio_postgres::Error> {
+    let sql = insert_sql(&target.schema, &target.table, keys);
+    if keys.is_empty() {
+        let stmt = conn
+            .prepare_typed(&sql, &[Type::UUID, Type::TEXT, Type::BOOL])
+            .await?;
+        conn.execute(&stmt, &[&row.id, &row.email, &row.email_verified])
+            .await?;
+    } else {
+        let stmt = conn
+            .prepare_typed(&sql, &[Type::UUID, Type::TEXT, Type::BOOL, Type::TEXT])
+            .await?;
+        let json = serde_json::Value::Object(row.data.clone()).to_string();
+        conn.execute(&stmt, &[&row.id, &row.email, &row.email_verified, &json])
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fake {
+        code: &'static str,
+        constraint: Option<&'static str>,
+    }
+
+    impl DbFields for Fake {
+        fn code(&self) -> &str {
+            self.code
+        }
+        fn message(&self) -> &str {
+            "boom"
+        }
+        fn detail(&self) -> Option<&str> {
+            None
+        }
+        fn hint(&self) -> Option<&str> {
+            None
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.constraint
+        }
+    }
+
+    #[test]
+    fn the_app_users_begin_rolls_back_only_when_not_idle() {
+        use tokio_postgres::TransactionStatus;
+        assert_eq!(
+            begin_sql(TransactionStatus::Idle),
+            "BEGIN; SET LOCAL statement_timeout = '10s'"
+        );
+        for status in [
+            TransactionStatus::InTransaction,
+            TransactionStatus::Failed,
+            TransactionStatus::Unknown,
+        ] {
+            assert_eq!(
+                begin_sql(status),
+                "ROLLBACK; BEGIN; SET LOCAL statement_timeout = '10s'",
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_email_index_violation_is_email_taken() {
+        let f = Fake { code: "23505", constraint: Some("chelabase_users_email_key") };
+        assert_eq!(map_db(&f), Some(UserRowError::EmailTaken));
+        // Another unique index is a plain constraint failure.
+        let f = Fake { code: "23505", constraint: Some("users_nick_key") };
+        assert_eq!(
+            map_db(&f),
+            Some(UserRowError::Constraint {
+                message: "boom".into(),
+                constraint: Some("users_nick_key".into())
+            })
+        );
+    }
+
+    #[test]
+    fn data_errors_and_privilege_errors_are_constraints_and_the_rest_is_unmapped() {
+        for code in ["22P02", "23502", "23514", "42501"] {
+            let f = Fake { code, constraint: None };
+            assert_eq!(
+                map_db(&f),
+                Some(UserRowError::Constraint { message: "boom".into(), constraint: None }),
+                "{code}"
+            );
+        }
+        for code in ["57014", "08006", "42P01"] {
+            assert_eq!(map_db(&Fake { code, constraint: None }), None, "{code}");
+        }
+    }
 
     #[test]
     fn insert_sql_lists_columns_in_order() {
@@ -291,6 +469,28 @@ mod tests {
             "INSERT INTO \"s\".\"t\" (id, email, email_verified, created_at) \
              VALUES ($1, $2, $3, pg_catalog.now())"
         );
+    }
+
+    /// A pending insert goes back to the pool only once committed or rolled back; dropped
+    /// before that (a cancelled sync), its connection is taken out of the pool and closed,
+    /// ending the transaction and its lock on the email.
+    #[tokio::test]
+    async fn a_pending_insert_dropped_unfinished_is_discarded() {
+        let pool = crate::fake_pg::pool(2).await;
+        drop(PendingTx::new(pool.get().await.unwrap()));
+        assert_eq!(pool.status().size, 0, "dropped: taken");
+
+        let tx: Box<dyn PendingInsert> = Box::new(PendingTx::new(pool.get().await.unwrap()));
+        tx.commit().await.unwrap();
+        assert_eq!(pool.status().size, 1, "committed: kept");
+        let tx: Box<dyn PendingInsert> = Box::new(PendingTx::new(pool.get().await.unwrap()));
+        tx.rollback().await;
+        assert_eq!(pool.status().size, 1, "rolled back: kept");
+
+        // The commit's future dropped before it ran (the caller cancelled).
+        let tx: Box<dyn PendingInsert> = Box::new(PendingTx::new(pool.get().await.unwrap()));
+        drop(tx.commit());
+        assert_eq!(pool.status().size, 0, "cancelled commit: taken");
     }
 
     #[test]

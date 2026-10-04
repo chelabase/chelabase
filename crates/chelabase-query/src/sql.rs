@@ -69,6 +69,62 @@ pub enum FnLookupError {
 pub struct Plan {
     pub sql: String,
     pub binds: Vec<Bind>,
+    /// The same statement with its result passed through `chelabase.cap_response`, whose
+    /// budget is one more `int8` parameter, `$(binds.len() + 1)`. Built from the
+    /// planner's parts at plan time (a write's CTE stays top level), never by parsing
+    /// `sql`.
+    pub capped_sql: String,
+}
+
+/// The type a statement's parameter is prepared with (the driver would otherwise infer
+/// one, and `CAST($n AS bigint)` would infer `int8` where we bind text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamType {
+    Text,
+    Jsonb,
+    Int8,
+}
+
+impl Plan {
+    /// The types of `sql`'s parameters, one per bind.
+    pub fn param_types(&self) -> Vec<ParamType> {
+        self.binds
+            .iter()
+            .map(|b| match b {
+                Bind::Text(_) => ParamType::Text,
+                Bind::Json(_) => ParamType::Jsonb,
+                Bind::Limit { .. } | Bind::Offset { .. } => ParamType::Int8,
+            })
+            .collect()
+    }
+
+    /// The types of `capped_sql`'s parameters: [`Plan::param_types`] plus the budget
+    /// (`int8`) at the end.
+    pub fn capped_param_types(&self) -> Vec<ParamType> {
+        let mut types = self.param_types();
+        types.push(ParamType::Int8);
+        types
+    }
+}
+
+/// What the planner built for one operation: the statement, and for a write its parts
+/// (the CTE body, the tail select) so the capped form can keep the CTE at top level.
+struct Built {
+    sql: String,
+    write: Option<WriteParts>,
+}
+
+struct WriteParts {
+    /// The DML inside `WITH r AS (...)`, with its `RETURNING` if any.
+    dml: String,
+    /// The select list and `FROM` of the result (reads `r`).
+    tail: String,
+}
+
+impl From<String> for Built {
+    fn from(sql: String) -> Self {
+        Built { sql, write: None }
+    }
 }
 
 /// How to fill one parameter. Plans hold no values, so one plan serves every tree with
@@ -137,10 +193,21 @@ pub fn plan(op: &Op, catalog: &impl Catalog, default_schema: &str) -> Result<Vec
             default_schema,
             binds: Vec::new(),
         };
-        let sql = p.op(op)?;
+        let built = p.op(op)?;
+        let budget = p.binds.len() + 1;
+        let capped_sql = match &built.write {
+            Some(WriteParts { dml, tail }) => format!(
+                "WITH r AS ({dml}), q(r) AS (SELECT {tail}) SELECT chelabase.cap_response(q.r, ${budget}) FROM q"
+            ),
+            None => format!(
+                "SELECT chelabase.cap_response(q.r, ${budget}) FROM ({}) AS q(r)",
+                built.sql
+            ),
+        };
         Ok(Plan {
-            sql,
+            sql: built.sql,
             binds: p.binds,
+            capped_sql,
         })
     };
     match op {
@@ -270,9 +337,9 @@ impl<'c, C: Catalog> Planner<'c, C> {
             })
     }
 
-    fn op(&mut self, op: &Op) -> Result<String, PlanError> {
+    fn op(&mut self, op: &Op) -> Result<Built, PlanError> {
         match op {
-            Op::Select(s) => self.select(s),
+            Op::Select(s) => self.select(s).map(Built::from),
             Op::Insert(i) => {
                 let table = self.table(&i.into)?;
                 let keys = i.values[0]
@@ -351,7 +418,7 @@ impl<'c, C: Catalog> Planner<'c, C> {
                     quote_ident(&f.name),
                     args.join(", ")
                 );
-                Ok(if f.returns_set {
+                Ok(Built::from(if f.returns_set {
                     // `x.f` is the result column whatever the row type holds: a scalar
                     // stays a scalar, and a row type's own column `f` can't shadow it.
                     format!(
@@ -362,7 +429,7 @@ impl<'c, C: Catalog> Planner<'c, C> {
                     format!("SELECT NULLIF({call}::text, '')")
                 } else {
                     format!("SELECT to_json({call})::text")
-                })
+                }))
             }
             Op::Batch(_) => Err(invalid("batches don't nest")),
         }
@@ -462,9 +529,17 @@ impl<'c, C: Catalog> Planner<'c, C> {
         table: &TableInfo,
         stmt: String,
         returning: Option<&Returning>,
-    ) -> Result<String, PlanError> {
+    ) -> Result<Built, PlanError> {
         let cols = match returning {
-            None => return Ok(format!("WITH r AS ({stmt}) SELECT '[]'::text")),
+            None => {
+                return Ok(Built {
+                    sql: format!("WITH r AS ({stmt}) SELECT '[]'::text"),
+                    write: Some(WriteParts {
+                        dml: stmt,
+                        tail: "'[]'::text".to_owned(),
+                    }),
+                });
+            }
             Some(Returning::All) => all_columns(table),
             Some(Returning::Columns(cols)) => {
                 let mut seen = HashSet::new();
@@ -480,9 +555,13 @@ impl<'c, C: Catalog> Planner<'c, C> {
             }
         };
         let limit = self.bind(Bind::Limit { op: self.index });
-        Ok(format!(
-            "WITH r AS ({stmt} RETURNING {cols}) SELECT coalesce(json_agg(t.*), '[]')::text FROM (SELECT * FROM r LIMIT {limit}) t"
-        ))
+        let tail =
+            format!("coalesce(json_agg(t.*), '[]')::text FROM (SELECT * FROM r LIMIT {limit}) t");
+        let dml = format!("{stmt} RETURNING {cols}");
+        Ok(Built {
+            sql: format!("WITH r AS ({dml}) SELECT {tail}"),
+            write: Some(WriteParts { dml, tail }),
+        })
     }
 
     fn where_clause(

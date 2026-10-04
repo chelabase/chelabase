@@ -7,6 +7,7 @@ members = [
     "services/auth",
     "services/rest",
     "tools/cli",
+    "tools/bench-data-api",
     "crates/chelabase-types",
     "crates/chelabase-metadata",
     "crates/chelabase-nats",
@@ -81,9 +82,11 @@ aes-gcm = "0.11.1"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
 getrandom = "0.4.3"
 hex = "0.4.3"
-# Our fork of 0.7.18 (step 6d): simple queries expose command tags, the empty-query marker and
-# column types. Upstream PR pending; return to crates.io once it's released.
-tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "d20c5b3cd15c8fa649757768a788428788844612", default-features = false, features = ["runtime"] }
+# Our fork of 0.7.18, branch chelabase/transaction-status (step 6e, on top of step 6d's
+# simple-query tags): simple queries expose command tags, the empty-query marker and column
+# types, and `Client::transaction_status` tells whether a transaction may be open. Upstream
+# PRs pending; return to crates.io once they're released.
+tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "60016594a76606abf661581a48b4d1d42ed29d2d", default-features = false, features = ["runtime"] }
 pg_query = "6.2.1"
 tokio-util = "0.7.19"
 moka = { version = "0.12.16", features = ["future", "sync"] }
@@ -93,6 +96,7 @@ redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"]
 sha2 = "0.11.0"
 subtle = "2.6.1"
 stringprep = "0.1.5"
+deadpool-postgres = { version = "0.14.2", default-features = false, features = ["rt_tokio_1"] }
 
 [profile.dev]
 # File:line in backtraces without full debug info: smaller test binaries, faster links.
@@ -110,3 +114,8 @@ opt-level = 3
 
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
+
+# deadpool-postgres depends on crates.io tokio-postgres; route it to our fork so the bench
+# harness has one tokio-postgres (the fork, chelabase/transaction-status) in the build.
+[patch.crates-io]
+tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "60016594a76606abf661581a48b4d1d42ed29d2d" }

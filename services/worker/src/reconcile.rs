@@ -551,7 +551,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             };
             let main_database = self.database_of(ep).await.ok();
             for database in served {
-                match self.data_api_healthy_in(ep, &database.name).await {
+                match self
+                    .data_api_healthy_in(ep, &database.name, &database.default_schema)
+                    .await
+                {
                     Ok(true) => {}
                     // Main's goes through the whole branch bootstrap: it also re-grants the
                     // secret keys' roles and ensures the public key.
@@ -2472,6 +2475,19 @@ mod tests {
 
         let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SELECT to_regclass")).is_some();
         assert!(checked("app") && checked("healthy") && checked("broken") && !checked("off"));
+        // Each database is checked against its own default schema.
+        let check_in = |db: &str| {
+            w.computes
+                .sql
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, d, s)| d == db && s.contains(check))
+                .map(|(_, _, s)| s.clone())
+                .unwrap()
+        };
+        assert!(check_in("healthy").contains("to_regnamespace('\"reporting\"')"));
+        assert!(check_in("app").contains("to_regnamespace('\"public\"')"));
         let healed: Vec<String> = w
             .computes
             .sql

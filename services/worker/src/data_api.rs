@@ -22,9 +22,11 @@ use crate::{OWNER_ROLE, Worker, credentials};
 const AUTHENTICATOR: &str = "authenticator";
 /// Whether a branch's data API machinery is intact (psql prints `t` or `f`): the `chelabase`
 /// schema, `authenticator` able to log in with `USAGE` on it and `SELECT` on
-/// `schema_version`, and the three event triggers present and enabled. Anything else is
+/// `schema_version`, the three event triggers present and enabled, and the guard functions
+/// `assert_schema_version(uuid)` and `cap_response(text,bigint)`. Anything else is
 /// what the bootstrap repairs. Operators are schema-qualified (it runs as the superuser in
-/// a database the owner controls).
+/// a database the owner controls). Reconcile runs it through [`schema_check_sql`], which
+/// adds the database's default schema.
 pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version') IS NOT NULL \
      AND EXISTS (SELECT FROM pg_catalog.pg_roles r \
        JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) 'chelabase' \
@@ -36,7 +38,26 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version
      AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger \
        WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', \
          'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) \
-         AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3";
+         AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3 \
+     AND pg_catalog.to_regprocedure('chelabase.assert_schema_version(uuid)') IS NOT NULL \
+     AND pg_catalog.to_regprocedure('chelabase.cap_response(text,bigint)') IS NOT NULL";
+
+/// [`SCHEMA_CHECK_SQL`] for a database whose default schema is `schema`: also
+/// `authenticator`'s `USAGE` on it. The data API prepares its statements as `authenticator`
+/// (NOINHERIT) before it switches role, and Postgres checks `USAGE` on every schema a
+/// statement names while parsing it, so without it every pipelined request falls back to
+/// the sequential path. A default schema that doesn't exist passes: the bootstrap skips it
+/// too. The literal is the quoted identifier (`to_regnamespace` parses identifier syntax).
+pub fn schema_check_sql(schema: &str) -> String {
+    let schema_literal = quote_literal(&quote_ident(schema));
+    format!(
+        "{SCHEMA_CHECK_SQL} \
+     AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n \
+       JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) 'authenticator' \
+       WHERE n.oid OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace({schema_literal})::pg_catalog.oid \
+         AND NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE'))"
+    )
+}
 
 /// The key of the transaction-scoped advisory lock the bootstrap takes first, so two
 /// bootstraps of one database serialize (advisory locks are per database). The bytes of
@@ -90,6 +111,8 @@ DO $$ BEGIN
     DROP FUNCTION IF EXISTS chelabase.user_id();
     DROP FUNCTION IF EXISTS chelabase.claims();
     DROP FUNCTION IF EXISTS chelabase.bump_schema_version();
+    DROP FUNCTION IF EXISTS chelabase.assert_schema_version(uuid);
+    DROP FUNCTION IF EXISTS chelabase.cap_response(text, bigint);
     DROP FUNCTION IF EXISTS chelabase.grant_extension_functions();
     DROP TABLE IF EXISTS chelabase.schema_version;
     DROP TABLE IF EXISTS chelabase.bootstrap;
@@ -161,7 +184,8 @@ pub fn valid_role_name(name: &str) -> bool {
 /// The idempotent script run as cloud_admin in a branch's database after every compute
 /// (re)creation and from reconcile: the `chelabase` machinery schema and its event trigger,
 /// `authenticator` made `LOGIN` with the branch's password, the owner's default privileges in
-/// `public`, the claim helpers ([`crate::app_users_sql::claim_helpers_body`]), and (on the
+/// the default schema and `USAGE` on it for `anon`, `authenticated` and `authenticator` (the
+/// data API parses its statements as `authenticator`), the claim helpers ([`crate::app_users_sql::claim_helpers_body`]), and (on the
 /// database's first bootstrap only) the same grants on what exists. The tamper check allows
 /// what app users adds to `chelabase` (P4).
 ///
@@ -263,7 +287,7 @@ BEGIN
         OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey', 'app_users_table', 'app_users_table_pkey']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
       AND (p.proowner OPERATOR(pg_catalog.<>) ALL (trusted)
-        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows']::pg_catalog.name[])))
+        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows', 'assert_schema_version', 'cap_response']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND NOT t.tgisinternal)
     OR EXISTS (SELECT FROM pg_catalog.pg_rewrite w JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class
@@ -316,6 +340,30 @@ GRANT SELECT ON chelabase.schema_version TO {owner_role};
   $f$ BEGIN UPDATE chelabase.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
 ALTER FUNCTION chelabase.bump_schema_version() OWNER TO CURRENT_USER;
 REVOKE ALL ON FUNCTION chelabase.bump_schema_version() FROM PUBLIC;
+CREATE OR REPLACE FUNCTION chelabase.assert_schema_version(expected uuid) RETURNS uuid
+  LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS
+  $f$ DECLARE v uuid; BEGIN
+    SELECT version INTO v FROM chelabase.schema_version;
+    IF v IS DISTINCT FROM expected THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB001', MESSAGE = 'chelabase: stale schema version';
+    END IF;
+    RETURN v; END $f$;
+CREATE OR REPLACE FUNCTION chelabase.cap_response(result text, budget bigint) RETURNS text
+  LANGUAGE plpgsql VOLATILE SET search_path = '' AS
+  $f$ DECLARE n bigint := coalesce(pg_catalog.octet_length(result), 0); total bigint; BEGIN
+    IF n OPERATOR(pg_catalog.>) budget THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB002', MESSAGE = 'chelabase: response too large';
+    END IF;
+    total := coalesce(nullif(pg_catalog.current_setting('chelabase.response_bytes', true), '')::bigint, 0) OPERATOR(pg_catalog.+) n;
+    IF total OPERATOR(pg_catalog.>) budget THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB002', MESSAGE = 'chelabase: response too large';
+    END IF;
+    PERFORM pg_catalog.set_config('chelabase.response_bytes', total::text, true);
+    RETURN result; END $f$;
+ALTER FUNCTION chelabase.assert_schema_version(uuid) OWNER TO CURRENT_USER;
+ALTER FUNCTION chelabase.cap_response(text, bigint) OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION chelabase.assert_schema_version(uuid), chelabase.cap_response(text, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION chelabase.assert_schema_version(uuid), chelabase.cap_response(text, bigint) TO PUBLIC;
 CREATE OR REPLACE FUNCTION chelabase.grant_extension_functions() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
   $f$ DECLARE f pg_catalog.regprocedure; BEGIN
@@ -350,7 +398,7 @@ DO $$ BEGIN
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT EXECUTE ON FUNCTIONS TO authenticated;
-    GRANT USAGE ON SCHEMA {schema_ident} TO anon, authenticated;
+    GRANT USAGE ON SCHEMA {schema_ident} TO anon, authenticated, authenticator;
   END IF;
 END $$;
 DO $$ DECLARE r record; BEGIN
@@ -719,16 +767,28 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Whether `ep`'s main database has its data API machinery intact ([`SCHEMA_CHECK_SQL`]).
-    pub async fn data_api_healthy(&self, ep: &str) -> anyhow::Result<bool> {
+    pub async fn data_api_healthy(&self, branch: BranchId, ep: &str) -> anyhow::Result<bool> {
         let database_name = self.database_of(ep).await?;
-        self.data_api_healthy_in(ep, &database_name).await
+        let schema = self
+            .served_or_main(branch, ep)
+            .await?
+            .into_iter()
+            .find(|d| d.name == database_name)
+            .map_or_else(|| "public".to_owned(), |d| d.default_schema);
+        self.data_api_healthy_in(ep, &database_name, &schema).await
     }
 
-    /// [`Self::data_api_healthy`] for any database of `ep`.
-    pub async fn data_api_healthy_in(&self, ep: &str, database: &str) -> anyhow::Result<bool> {
+    /// [`Self::data_api_healthy`] for any database of `ep`, whose default schema is `schema`
+    /// ([`schema_check_sql`]).
+    pub async fn data_api_healthy_in(
+        &self,
+        ep: &str,
+        database: &str,
+        schema: &str,
+    ) -> anyhow::Result<bool> {
         let out = self
             .computes
-            .admin_sql(ep, database, SCHEMA_CHECK_SQL)
+            .admin_sql(ep, database, &schema_check_sql(schema))
             .await?;
         match out.trim() {
             "t" => Ok(true),
@@ -1163,7 +1223,7 @@ BEGIN
         OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey', 'app_users_table', 'app_users_table_pkey']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
       AND (p.proowner OPERATOR(pg_catalog.<>) ALL (trusted)
-        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows']::pg_catalog.name[])))
+        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows', 'assert_schema_version', 'cap_response']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND NOT t.tgisinternal)
     OR EXISTS (SELECT FROM pg_catalog.pg_rewrite w JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class
@@ -1233,6 +1293,30 @@ CREATE OR REPLACE FUNCTION chelabase.bump_schema_version() RETURNS event_trigger
   $f$ BEGIN UPDATE chelabase.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
 ALTER FUNCTION chelabase.bump_schema_version() OWNER TO CURRENT_USER;
 REVOKE ALL ON FUNCTION chelabase.bump_schema_version() FROM PUBLIC;
+CREATE OR REPLACE FUNCTION chelabase.assert_schema_version(expected uuid) RETURNS uuid
+  LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS
+  $f$ DECLARE v uuid; BEGIN
+    SELECT version INTO v FROM chelabase.schema_version;
+    IF v IS DISTINCT FROM expected THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB001', MESSAGE = 'chelabase: stale schema version';
+    END IF;
+    RETURN v; END $f$;
+CREATE OR REPLACE FUNCTION chelabase.cap_response(result text, budget bigint) RETURNS text
+  LANGUAGE plpgsql VOLATILE SET search_path = '' AS
+  $f$ DECLARE n bigint := coalesce(pg_catalog.octet_length(result), 0); total bigint; BEGIN
+    IF n OPERATOR(pg_catalog.>) budget THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB002', MESSAGE = 'chelabase: response too large';
+    END IF;
+    total := coalesce(nullif(pg_catalog.current_setting('chelabase.response_bytes', true), '')::bigint, 0) OPERATOR(pg_catalog.+) n;
+    IF total OPERATOR(pg_catalog.>) budget THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB002', MESSAGE = 'chelabase: response too large';
+    END IF;
+    PERFORM pg_catalog.set_config('chelabase.response_bytes', total::text, true);
+    RETURN result; END $f$;
+ALTER FUNCTION chelabase.assert_schema_version(uuid) OWNER TO CURRENT_USER;
+ALTER FUNCTION chelabase.cap_response(text, bigint) OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION chelabase.assert_schema_version(uuid), chelabase.cap_response(text, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION chelabase.assert_schema_version(uuid), chelabase.cap_response(text, bigint) TO PUBLIC;
 CREATE OR REPLACE FUNCTION chelabase.grant_extension_functions() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
   $f$ DECLARE f pg_catalog.regprocedure; BEGIN
@@ -1267,7 +1351,7 @@ DO $$ BEGIN
     ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
     ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
     ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT EXECUTE ON FUNCTIONS TO authenticated;
-    GRANT USAGE ON SCHEMA \"public\" TO anon, authenticated;
+    GRANT USAGE ON SCHEMA \"public\" TO anon, authenticated, authenticator;
   END IF;
 END $$;
 DO $$ DECLARE r record; BEGIN
@@ -1457,6 +1541,34 @@ COMMIT;
         }
     }
 
+    /// P5: the two guard functions the data API pipeline calls are owned by the bootstrap
+    /// user and callable by every role (`cap_response` runs after the switch to a key's role,
+    /// `assert_schema_version` as `authenticator`); the default `PUBLIC` grant is revoked
+    /// first so the grant is explicit.
+    #[test]
+    fn guard_functions_are_granted_to_public_and_owned_by_the_bootstrap_user() {
+        let sql = data_api_sql("postgres", "pw", "public");
+        let both = "chelabase.assert_schema_version(uuid), chelabase.cap_response(text, bigint)";
+        for function in ["chelabase.assert_schema_version(uuid)", "chelabase.cap_response(text, bigint)"] {
+            assert!(sql.contains(&format!("ALTER FUNCTION {function} OWNER TO CURRENT_USER;\n")), "{function}");
+            assert!(!sql.contains(&format!("ALTER FUNCTION {function} OWNER TO chelabase_admin")), "{function}");
+        }
+        let revoke = sql.find(&format!("REVOKE ALL ON FUNCTION {both} FROM PUBLIC;\n")).expect("revoke");
+        let grant = sql.find(&format!("GRANT EXECUTE ON FUNCTION {both} TO PUBLIC;\n")).expect("grant");
+        assert!(revoke < grant);
+        assert!(sql.contains("SECURITY DEFINER SET search_path = '' AS"));
+    }
+
+    /// COALESCE, NULLIF, GREATEST and LEAST are SQL syntax, not catalog functions:
+    /// `pg_catalog.nullif(...)` fails at run time (plpgsql parses bodies lazily).
+    #[test]
+    fn script_does_not_qualify_syntax_constructs() {
+        let sql = data_api_sql("postgres", "pw", "public");
+        for construct in ["nullif", "coalesce", "greatest", "least"] {
+            assert!(!sql.contains(&format!("pg_catalog.{construct}")), "pg_catalog.{construct}");
+        }
+    }
+
     #[tokio::test]
     async fn bootstrap_generates_and_seals_a_password_once() {
         let (w, journal) = worker();
@@ -1568,9 +1680,30 @@ COMMIT;
             "chelabase_schema_version_ddl",
             "chelabase_schema_version_drop",
             "chelabase_extension_functions",
+            "to_regprocedure('chelabase.assert_schema_version(uuid)')",
+            "to_regprocedure('chelabase.cap_response(text,bigint)')",
         ] {
             assert!(SCHEMA_CHECK_SQL.contains(part), "{part}: {SCHEMA_CHECK_SQL}");
         }
+    }
+
+    /// The check of a database also asks for `authenticator`'s `USAGE` on its default schema
+    /// (the pipeline parses its statements as `authenticator`), the schema quoted as the
+    /// bootstrap quotes it; a default schema that doesn't exist passes (the bootstrap skips
+    /// it too, so it can't repair it).
+    #[test]
+    fn the_health_check_asks_for_authenticator_usage_on_the_default_schema() {
+        let sql = schema_check_sql("my\"schema");
+        assert!(sql.starts_with(SCHEMA_CHECK_SQL), "{sql}");
+        let rest = &sql[SCHEMA_CHECK_SQL.len()..];
+        for part in [
+            "pg_catalog.to_regnamespace('\"my\"\"schema\"')",
+            "r.rolname OPERATOR(pg_catalog.=) 'authenticator'",
+            "NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE')",
+        ] {
+            assert!(rest.contains(part), "{part}: {rest}");
+        }
+        assert!(schema_check_sql("public").contains("to_regnamespace('\"public\"')"));
     }
 
     #[tokio::test]
@@ -2445,6 +2578,8 @@ DO $$ BEGIN
     DROP FUNCTION IF EXISTS chelabase.user_id();
     DROP FUNCTION IF EXISTS chelabase.claims();
     DROP FUNCTION IF EXISTS chelabase.bump_schema_version();
+    DROP FUNCTION IF EXISTS chelabase.assert_schema_version(uuid);
+    DROP FUNCTION IF EXISTS chelabase.cap_response(text, bigint);
     DROP FUNCTION IF EXISTS chelabase.grant_extension_functions();
     DROP TABLE IF EXISTS chelabase.schema_version;
     DROP TABLE IF EXISTS chelabase.bootstrap;
@@ -2480,7 +2615,7 @@ END $$;
         }
         for name in [
             "claims", "user_id", "user_email", "users_guard", "users_protect", "app_users_upsert", "app_users_gone",
-            "app_users_rows",
+            "app_users_rows", "assert_schema_version", "cap_response",
         ] {
             assert!(pronames.contains(&format!("'{name}'")), "{name}");
         }
@@ -2507,6 +2642,8 @@ END $$;
         assert!(protect < at("DROP FUNCTION IF EXISTS chelabase.users_protect();"));
         assert!(at("DROP TABLE IF EXISTS chelabase.app_users_table;") < schema);
         assert!(at("DROP FUNCTION IF EXISTS chelabase.app_users_rows();") < schema);
+        assert!(at("DROP FUNCTION IF EXISTS chelabase.assert_schema_version(uuid);") < schema);
+        assert!(at("DROP FUNCTION IF EXISTS chelabase.cap_response(text, bigint);") < schema);
         assert!(!sql.contains("users_guard"), "left to RESTRICT");
         // Inside the ownership guard.
         assert!(at("r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN") < protect);
@@ -2649,7 +2786,7 @@ END $$;
         // The schema is quoted wherever the script names it.
         let sql = data_api_sql("postgres", "pw", "my\"schema");
         assert!(sql.contains("IN SCHEMA \"my\"\"schema\" GRANT SELECT ON TABLES TO anon;"));
-        assert!(sql.contains("GRANT USAGE ON SCHEMA \"my\"\"schema\" TO anon, authenticated;"));
+        assert!(sql.contains("GRANT USAGE ON SCHEMA \"my\"\"schema\" TO anon, authenticated, authenticator;"));
         // `regnamespace` and `to_regnamespace` parse identifier syntax: the literal is the quoted
         // identifier, so a name with a quote or capitals means the schema it names.
         assert!(sql.contains("'\"my\"\"schema\"'::pg_catalog.regnamespace"));
@@ -2703,7 +2840,11 @@ END $$;
         // Every statement that names the schema sits inside a guard, so a schema that's gone
         // (a restore to before it existed, a DROP SCHEMA) doesn't fail the bootstrap.
         let first = sql.find(&format!("  IF {guard} THEN\n    ALTER DEFAULT PRIVILEGES")).expect("guarded defaults");
-        let usage = sql.find("GRANT USAGE ON SCHEMA \"reporting\" TO anon, authenticated;").unwrap();
+        let usage = sql.find("GRANT USAGE ON SCHEMA \"reporting\" TO anon, authenticated, authenticator;").unwrap();
+        // The asked-for rebootstrap grants it too (it's what a branch bootstrapped before
+        // authenticator needed it gets on its next run).
+        let existing = data_api_sql_granting_existing("postgres", "pw", "reporting");
+        assert!(existing.contains("GRANT USAGE ON SCHEMA \"reporting\" TO anon, authenticated, authenticator;"));
         let end = first + sql[first..].find("  END IF;").unwrap();
         assert!(first < usage && usage < end);
         for statement in sql.match_indices("IN SCHEMA \"reporting\"").map(|(i, _)| i) {

@@ -55,6 +55,8 @@ struct Live {
     signer: InternalSigner,
     http: reqwest::Client,
     key: SecretKey,
+    /// The served rest's state (its engine's counters).
+    state: Arc<AppState<InternalSource>>,
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -135,6 +137,15 @@ where
     F: FnOnce(Arc<Live>) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    live_capped(name, rest::exec::DEFAULT_MAX_RESPONSE_BYTES, body).await;
+}
+
+/// [`live`] with rest's responses capped at `max_response_bytes`.
+async fn live_capped<F, Fut>(name: &str, max_response_bytes: usize, body: F)
+where
+    F: FnOnce(Arc<Live>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let (worker, metadata) = setup().await;
     let db = DatabaseId::new();
     let db_name = format!("rest-{name}-{}", &db.to_string()[..6]);
@@ -165,7 +176,8 @@ where
                 &internal_token,
             ),
             200,
-        ),
+        )
+        .with_max_response_bytes(max_response_bytes),
         verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
         internal_token: internal_token.clone(),
     });
@@ -175,7 +187,8 @@ where
         db,
         database_name: record.database_name.clone().expect("database name"),
         rest: serve(router(state.clone())).await,
-        internal: serve(internal_router(state)).await,
+        internal: serve(internal_router(state.clone())).await,
+        state,
         internal_token,
         signer: InternalSigner::from_pem(private.as_bytes()).unwrap(),
         http: reqwest::Client::new(),
@@ -1603,26 +1616,292 @@ async fn the_health_check_sees_what_the_bootstrap_repairs() {
     live("health", |l| async move {
         let main = l.branch(l.main_id()).await;
         let ep = main.endpoint_id.clone().expect("endpoint");
-        assert!(l.worker.data_api_healthy(&ep).await.unwrap());
+        assert!(l.worker.data_api_healthy(l.main_id(), &ep).await.unwrap());
         for breakage in [
             "ALTER EVENT TRIGGER chelabase_schema_version_ddl DISABLE;",
             "ALTER EVENT TRIGGER chelabase_extension_functions DISABLE;",
             "ALTER ROLE authenticator NOLOGIN;",
             "REVOKE USAGE ON SCHEMA chelabase FROM PUBLIC, authenticator;",
             "REVOKE SELECT ON chelabase.schema_version FROM authenticator;",
+            // The default schema's USAGE (the data API parses as authenticator).
+            "REVOKE USAGE ON SCHEMA public FROM PUBLIC, authenticator;",
             "DROP EVENT TRIGGER chelabase_schema_version_drop;",
+            "DROP FUNCTION chelabase.assert_schema_version(uuid);",
+            "DROP FUNCTION chelabase.cap_response(text, bigint);",
         ] {
             l.sql_on(l.main_id(), breakage).await;
-            assert!(!l.worker.data_api_healthy(&ep).await.unwrap(), "{breakage}");
+            assert!(!l.worker.data_api_healthy(l.main_id(), &ep).await.unwrap(), "{breakage}");
             l.worker
                 .bootstrap_data_api(&main, &l.database_name)
                 .await
                 .expect("bootstrap");
             assert!(
-                l.worker.data_api_healthy(&ep).await.unwrap(),
+                l.worker.data_api_healthy(l.main_id(), &ep).await.unwrap(),
                 "after {breakage}"
             );
         }
+    })
+    .await;
+}
+
+/// A schema change between two pipelined requests: the next one's asserted version is stale,
+/// so it's planned again and runs sequentially, and its write commits once (the stale
+/// pipeline's transaction aborted at the preamble, before the plan ran).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn stale_version_replans_and_commits_once() {
+    live("stale", |l| async move {
+        l.owner("CREATE TABLE t (v text);").await;
+        let insert = |v: &str| json!({"v":1,"op":"insert","into":"t","values":[{"v":v}],"returning":["v"]});
+        // The first request reads the version (sequential), the second is pipelined.
+        assert_eq!(l.auth(insert("a")).await.ok(), &json!([{"v":"a"}]));
+        assert_eq!(l.auth(insert("b")).await.ok(), &json!([{"v":"b"}]));
+        // The version changes under the cached one.
+        l.owner("CREATE TABLE other (x int);").await;
+        assert_eq!(l.auth(insert("c")).await.ok(), &json!([{"v":"c"}]));
+        let all = json!({"v":1,"op":"select","from":"t","orderBy":[{"col":"v"}]});
+        assert_eq!(
+            l.auth(all.clone()).await.ok(),
+            &json!([{"v":"a"},{"v":"b"},{"v":"c"}])
+        );
+        // The new version is the cached one now: the next requests pipeline again.
+        assert_eq!(l.auth(insert("d")).await.ok(), &json!([{"v":"d"}]));
+        assert_eq!(
+            l.auth(json!({"v":1,"op":"select","from":"other"})).await.ok(),
+            &json!([])
+        );
+        assert_eq!(l.auth(all).await.ok().as_array().map(Vec::len), Some(4));
+    })
+    .await;
+}
+
+/// A pipelined batch whose third write fails: every step after it is aborted, `COMMIT`
+/// rolls back, and none of the batch's rows stay.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn mid_batch_failure_leaves_no_rows() {
+    live("midbatch", |l| async move {
+        l.owner(
+            "CREATE TABLE u (id int PRIMARY KEY);
+             CREATE FUNCTION refuse() RETURNS void LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''no''; END';",
+        )
+        .await;
+        let select = json!({"v":1,"op":"select","from":"u","orderBy":[{"col":"id"}]});
+        // Warm: the next requests are pipelined.
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        let insert = |id: i32| json!({"op":"insert","into":"u","values":[{"id":id}]});
+        let failed = l
+            .auth(json!({"v":1,"op":"batch","ops":[insert(1), insert(2), insert(1), insert(3)]}))
+            .await;
+        assert_eq!(failed.error(409, "conflict")["sqlstate"], "23505");
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        // A function raising half-way: the same.
+        let raised = l
+            .auth(json!({"v":1,"op":"batch","ops":[
+                insert(1), {"op":"call","fn":"refuse"}, insert(2)]}))
+            .await;
+        assert_eq!(raised.error(400, "raised")["message"], "no");
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        // And the connection serves the next batch.
+        let ok = l
+            .auth(json!({"v":1,"op":"batch","ops":[insert(1), insert(2)]}))
+            .await;
+        assert_eq!(ok.ok(), &json!([[], []]));
+        assert_eq!(l.auth(select).await.ok(), &json!([{"id":1},{"id":2}]));
+    })
+    .await;
+}
+
+/// A write whose `returning` is over the response cap is the 413, and the row isn't kept:
+/// the cap is checked in SQL, before `COMMIT`.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn oversized_write_response_leaves_no_row() {
+    live_capped("oversized", 200, |l| async move {
+        l.owner("CREATE TABLE w (v text);").await;
+        let select = json!({"v":1,"op":"select","from":"w","select":["v"]});
+        // Warm (sequential), then pipelined.
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        let long = "x".repeat(300);
+        let too_big = l
+            .auth(json!({"v":1,"op":"insert","into":"w","values":[{"v":long}],"returning":["v"]}))
+            .await;
+        assert_eq!(
+            too_big.error(413, "too_large")["message"],
+            "the response is over 200 bytes; ask for fewer rows (limit) or fewer columns"
+        );
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        // Without `returning` the response is small: the row is kept.
+        let quiet = l
+            .auth(json!({"v":1,"op":"insert","into":"w","values":[{"v":"short"}]}))
+            .await;
+        assert_eq!(quiet.ok(), &json!([]));
+        assert_eq!(l.auth(select).await.ok(), &json!([{"v":"short"}]));
+    })
+    .await;
+}
+
+/// An RPC can set the server-side response counter (`chelabase.response_bytes`) to anything,
+/// but it can't make the response pass the budget: a single result over it is refused in
+/// SQL whatever the counter says, and Rust counts the results again.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn forged_response_counter_cannot_return_more_than_the_budget() {
+    live_capped("forged", 200, |l| async move {
+        l.owner(
+            "CREATE TABLE big (v text); INSERT INTO big VALUES (repeat('x', 300));
+             CREATE TABLE half (v text); INSERT INTO half VALUES (repeat('y', 120));
+             CREATE FUNCTION forge() RETURNS void LANGUAGE plpgsql AS \
+               'BEGIN PERFORM set_config(''chelabase.response_bytes'', ''-1000000000'', true); END';",
+        )
+        .await;
+        let half = json!({"op":"select","from":"half"});
+        // Warm (sequential), then pipelined.
+        for _ in 0..2 {
+            assert_eq!(
+                l.auth(json!({"v":1,"op":"select","from":"half","limit":0})).await.ok(),
+                &json!([])
+            );
+        }
+        let message = "the response is over 200 bytes; ask for fewer rows (limit) or fewer columns";
+        // Unforged, two results that are together over the budget: the SQL counter refuses.
+        let over = l
+            .auth(json!({"v":1,"op":"batch","ops":[half, half]}))
+            .await;
+        assert_eq!(over.error(413, "too_large")["message"], message);
+        // Forged, one result over the budget on its own: still refused in SQL.
+        let one = l
+            .auth(json!({"v":1,"op":"batch","ops":[
+                {"op":"call","fn":"forge"}, {"op":"select","from":"big"}]}))
+            .await;
+        assert_eq!(one.error(413, "too_large")["message"], message);
+        // Forged, each result under the budget but together over it: Rust's count refuses.
+        let together = l
+            .auth(json!({"v":1,"op":"batch","ops":[{"op":"call","fn":"forge"}, half, half]}))
+            .await;
+        assert_eq!(together.error(413, "too_large")["message"], message);
+        // Each alone fits.
+        let fits = l.auth(json!({"v":1,"op":"select","from":"half"})).await;
+        assert_eq!(fits.ok().as_array().map(Vec::len), Some(1));
+    })
+    .await;
+}
+
+/// An RPC that changes the session (`set_config(…, false)`, a `SET ROLE`) leaves nothing for
+/// the next request on the same connection: the pipeline resets the session after `COMMIT`,
+/// before the next request prepares its statements on it.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn session_state_set_by_an_rpc_does_not_reach_the_next_request() {
+    live("session", |l| async move {
+        l.metadata
+            .update_database_settings(
+                l.db,
+                &chelabase_metadata::SettingsPatch {
+                    max_connections: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        l.owner(
+            "CREATE TABLE t (id int PRIMARY KEY);
+             INSERT INTO t VALUES (1);
+             CREATE SCHEMA elsewhere;
+             GRANT USAGE ON SCHEMA elsewhere TO anon, authenticated;
+             CREATE FUNCTION wander() RETURNS void LANGUAGE plpgsql AS \
+               'BEGIN PERFORM set_config(''search_path'', ''elsewhere'', false); \
+                PERFORM set_config(''default_transaction_read_only'', ''on'', false); \
+                PERFORM set_config(''app.marker'', ''left over'', false); \
+                EXECUTE ''SET ROLE anon''; END';
+             CREATE FUNCTION whoami() RETURNS text LANGUAGE sql STABLE AS \
+               'SELECT current_user::text || '' | '' || current_setting(''search_path'') \
+                  || '' | '' || current_setting(''transaction_read_only'') \
+                  || '' | '' || coalesce(current_setting(''app.marker'', true), '''')';",
+        )
+        .await;
+        let whoami = json!({"v":1,"op":"call","fn":"whoami"});
+        // Sequential first, then pipelined.
+        let before = l.auth(whoami.clone()).await.ok().clone();
+        assert_eq!(l.auth(whoami.clone()).await.ok(), &before);
+        assert!(
+            before.as_str().is_some_and(|s| s.starts_with("authenticated | ")
+                && s.contains(" | off | ")),
+            "{before}"
+        );
+        let wandered = l.auth(json!({"v":1,"op":"call","fn":"wander"})).await;
+        assert_eq!(wandered.text, "null", "{wandered:?}");
+        assert_eq!(l.auth(whoami.clone()).await.ok(), &before);
+        let read = l.auth(json!({"v":1,"op":"select","from":"t"})).await;
+        assert_eq!(read.ok(), &json!([{"id":1}]));
+        let written = l
+            .auth(json!({"v":1,"op":"insert","into":"t","values":[{"id":2}]}))
+            .await;
+        assert_eq!(written.ok(), &json!([]));
+        // The same in a batch. Inside the request the RPC's `SET ROLE anon` holds for the
+        // operations after it (as Postgres runs them; anon may read `t`, not run `whoami`).
+        let batch = l
+            .auth(json!({"v":1,"op":"batch","ops":[{"op":"call","fn":"wander"}, {"op":"select","from":"t","orderBy":[{"col":"id"}]}]}))
+            .await;
+        assert_eq!(batch.ok(), &json!([null, [{"id":1},{"id":2}]]));
+        assert_eq!(l.auth(whoami).await.ok(), &before);
+    })
+    .await;
+}
+
+/// A database whose guard functions are gone (a database not bootstrapped since they were
+/// added): the pipeline finds them missing and every request runs sequentially, with the same
+/// answers, until the bootstrap puts them back.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn a_database_without_the_guard_functions_runs_sequentially() {
+    live("noguard", |l| async move {
+        l.owner("CREATE TABLE t (id int PRIMARY KEY, v text);").await;
+        let select = json!({"v":1,"op":"select","from":"t","orderBy":[{"col":"id"}]});
+        // Warm (sequential), then pipelined: the guard functions' statements are prepared.
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        assert_eq!(l.auth(select.clone()).await.ok(), &json!([]));
+        l.sql_on(
+            l.main_id(),
+            "DROP FUNCTION chelabase.assert_schema_version(uuid); \
+             DROP FUNCTION chelabase.cap_response(text, bigint);",
+        )
+        .await;
+        let main = l.branch(l.main_id()).await;
+        let ep = main.endpoint_id.clone().expect("endpoint");
+        assert!(!l.worker.data_api_healthy(l.main_id(), &ep).await.unwrap());
+
+        let inserted = l
+            .auth(json!({"v":1,"op":"insert","into":"t","values":[{"id":1,"v":"a"}],"returning":["id","v"]}))
+            .await;
+        assert_eq!(inserted.ok(), &json!([{"id":1,"v":"a"}]));
+        let insert = |id: i32| json!({"op":"insert","into":"t","values":[{"id":id}]});
+        let batch = l
+            .auth(json!({"v":1,"op":"batch","ops":[insert(2), {"op":"select","from":"t","select":["id"],"orderBy":[{"col":"id"}]}]}))
+            .await;
+        assert_eq!(batch.ok(), &json!([[], [{"id":1},{"id":2}]]));
+        let failed = l
+            .auth(json!({"v":1,"op":"batch","ops":[insert(3), insert(1)]}))
+            .await;
+        assert_eq!(failed.error(409, "conflict")["sqlstate"], "23505");
+        assert_eq!(
+            l.auth(select.clone()).await.ok(),
+            &json!([{"id":1,"v":"a"},{"id":2,"v":null}])
+        );
+        l.anon(json!({"v":1,"op":"insert","into":"t","values":[{"id":9}]}))
+            .await
+            .error(403, "permission_denied");
+
+        l.worker
+            .bootstrap_data_api(&main, &l.database_name)
+            .await
+            .expect("bootstrap");
+        assert!(l.worker.data_api_healthy(l.main_id(), &ep).await.unwrap());
+        assert_eq!(
+            l.auth(select).await.ok().as_array().map(Vec::len),
+            Some(2)
+        );
     })
     .await;
 }
@@ -1779,6 +2058,65 @@ async fn two_databases_serve_separately_with_their_own_schema() {
         assert_eq!(schema.json["databases"], json!([main_name, "analytics"]));
         let schema = l.schema_of("authenticated", None).await;
         assert!(schema.ok()["schemas"]["stats"].is_null(), "{schema:?}");
+    })
+    .await;
+}
+
+/// A database whose default schema isn't `public`: the pipeline prepares its statements as
+/// `authenticator` (before the role switch), which the bootstrap grants `USAGE` on the
+/// schema, so its requests run pipelined instead of failing to prepare and falling back every
+/// time. A branch bootstrapped without that grant fails the health check, and the bootstrap
+/// puts it back.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn a_non_public_default_schema_runs_pipelined() {
+    live("nonpublic", |l| async move {
+        l.create_database("analytics").await;
+        l.owner_in(
+            "analytics",
+            "CREATE SCHEMA stats; CREATE TABLE stats.t (v text); \
+             INSERT INTO stats.t VALUES ('analytics');",
+        )
+        .await;
+        assert!(
+            l.metadata
+                .set_database_default_schema(l.main_id(), "analytics", "stats")
+                .await
+                .unwrap()
+        );
+        l.enable(l.main_id(), "analytics").await;
+        let ep = l.branch(l.main_id()).await.endpoint_id.expect("endpoint");
+        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
+
+        let read = select_t(Some("analytics"));
+        let write = json!({"v":1,"database":"analytics","op":"insert","into":"t",
+            "values":[{"v":"more"}],"returning":["v"]});
+        // Warm each role (sequential: the version, the schema and the role's view), then
+        // every request is one pipeline.
+        assert_eq!(l.anon(read.clone()).await.ok(), &json!([{"v":"analytics"}]));
+        assert_eq!(l.auth(read.clone()).await.ok(), &json!([{"v":"analytics"}]));
+        let before = l.state.engine.pipelined_runs();
+        for _ in 0..3 {
+            assert_eq!(l.anon(read.clone()).await.ok(), &json!([{"v":"analytics"}]));
+        }
+        assert_eq!(l.auth(write).await.ok(), &json!([{"v":"more"}]));
+        assert_eq!(l.state.engine.pipelined_runs() - before, 4);
+
+        // A database bootstrapped before authenticator got the grant: the check notices,
+        // and the bootstrap repairs it.
+        l.sql_in(
+            l.main_id(),
+            "analytics",
+            "REVOKE USAGE ON SCHEMA stats FROM authenticator;",
+        )
+        .await;
+        assert!(!l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
+        let main = l.branch(l.main_id()).await;
+        l.worker
+            .bootstrap_data_api(&main, &l.database_name)
+            .await
+            .expect("bootstrap");
+        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
     })
     .await;
 }
@@ -1963,7 +2301,7 @@ async fn disable_answers_unknown_database_at_once() {
 
         // The machinery stays: re-enabling is the bootstrap again, and serves at once.
         let ep = l.branch(main).await.endpoint_id.expect("endpoint");
-        assert!(l.worker.data_api_healthy_in(&ep, "analytics").await.unwrap());
+        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "public").await.unwrap());
         l.enable(main, "analytics").await;
         assert_eq!(l.anon(query.clone()).await.ok(), &json!([{"v":"analytics"}]));
 
@@ -2047,7 +2385,7 @@ async fn child_branch_serves_the_parent_second_database() {
         assert_eq!(row.data_api, DataApiState::On);
         assert_eq!(row.default_schema, "stats");
         let ep = dev.endpoint_id.clone().expect("endpoint");
-        assert!(l.worker.data_api_healthy_in(&ep, "analytics").await.unwrap());
+        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
 
         let on_dev = |body: Value| l.query_on(dev_id, DataKeyKind::Secret, "authenticated", body);
         assert_eq!(

@@ -1,24 +1,33 @@
 //! Where each branch's database is, and a pool of connections to it.
 //!
 //! Connection info comes from the orchestrator's internal listener and is cached 60 s (or
-//! until [`Pools::invalidate`]). Each served database of a branch gets its own sqlx pool
-//! (dropped after 5 minutes unused); every pool of a branch waits on one set of branch
-//! slots (`max_connections`), and one global semaphore caps connections across every
-//! branch. Open connections, idle ones included, stay within `max_connections` per branch
-//! too: before a pool may open one, idle connections of the branch's other pools are closed,
-//! least recently used first ([`idle_to_close`]). A connection that fails to open (the compute moved after a reset or a restore,
-//! or its password changed) drops the cached info, fetches it again and retries once;
-//! nothing is retried once a statement was sent.
+//! until [`Pools::invalidate`]). Each served database of a branch gets its own
+//! deadpool-postgres pool (dropped after 5 minutes unused); every pool of a branch waits on
+//! one set of branch slots (`max_connections`), and one global semaphore caps connections
+//! across every branch. Open connections, idle ones included, stay within `max_connections`
+//! per branch too: before a pool may open one, idle connections of the branch's other pools
+//! are closed, least recently used pool first and oldest connection first
+//! ([`idle_to_close`], [`oldest_first`]). A reaper closes connections idle past
+//! [`CONNECTION_IDLE`]. A connection that fails to open (the compute moved after a reset or
+//! a restore, or its password changed) drops the cached info, fetches it again and retries
+//! once; nothing is retried once a statement was sent.
+//!
+//! Nothing runs when a connection goes back to its pool: every request starts with
+//! `BEGIN; RESET_SQL` (with a `ROLLBACK` first when the connection may be inside a
+//! transaction: [`chelabase_query::engine::begin_sql`]) and ends with
+//! `RESET_SQL` after its `COMMIT`; a request that doesn't finish closes its connection
+//! ([`chelabase_query::Lease`]).
 
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use deadpool_postgres::{
+    Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
+};
 use serde::Deserialize;
-use sqlx::pool::PoolConnection;
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
-use sqlx::{Executor, Postgres};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
@@ -29,21 +38,25 @@ pub const INFO_TTL: Duration = Duration::from_secs(60);
 pub const INFO_REFRESH_AFTER: Duration = Duration::from_secs(2);
 /// A branch's pool is dropped after this long unused.
 pub const POOL_IDLE: Duration = Duration::from_secs(5 * 60);
-/// Idle connections inside a pool are closed after this long.
+/// Idle connections inside a pool are closed after this long (deadpool counts it from when
+/// the connection was last handed out).
 pub const CONNECTION_IDLE: Duration = Duration::from_secs(60);
+/// How often the reaper looks for connections idle past [`CONNECTION_IDLE`].
+pub const REAP_EVERY: Duration = Duration::from_secs(10);
+/// The longest opening one connection may take.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest a request waits for a connection (or a global permit).
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest a request waits for a connection in all (slots, first try and retry).
 pub const ACQUIRE_DEADLINE: Duration = Duration::from_secs(6);
 /// The first try for a connection, before the branch's info is fetched again.
 pub const FIRST_ATTEMPT: Duration = Duration::from_secs(1);
-/// Prepared statements kept per connection (the SQL text is the key).
-pub const STATEMENT_CACHE: usize = 500;
 /// Most databases with a live pool.
 const MAX_POOLS: u64 = 10_000;
-/// Run on every connection handed back to its pool: a function the request called may have
-/// changed the session (`SET ROLE`, `set_config(…, false)`), and the next request must start
-/// as `authenticator` with the connection's defaults. Prepared statements survive it.
+/// Sent at the front of every request (`[ROLLBACK;] BEGIN; RESET_SQL`) and after its end: a
+/// function an earlier request called may have changed the session (`SET ROLE`, `set_config(…, false)`), and
+/// each request must start as `authenticator` with the connection's defaults. Prepared
+/// statements survive it.
 pub const RESET_SQL: &str = "SET ROLE NONE; RESET ALL";
 
 /// The branch's data API settings (project-wide), as the internal listener sends them.
@@ -252,12 +265,18 @@ pub enum AcquireError {
     #[error("the database isn't served")]
     NotServed,
     #[error(transparent)]
-    Db(sqlx::Error),
+    Db(DbAcquireError),
 }
 
-/// A connection, holding its branch and global slots until it's dropped.
+/// The pool's own failure to hand out a connection.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct DbAcquireError(pub PoolError);
+
+/// A connection, holding its branch and global slots until it's dropped. Lease the client
+/// (`chelabase_query::Lease::new(conn.client)`) for a request.
 pub struct Conn {
-    pub conn: PoolConnection<Postgres>,
+    pub client: Object,
     pub info: Arc<ConnInfo>,
     _permits: Permits,
 }
@@ -271,19 +290,150 @@ pub struct Permits {
 /// One served database's pool.
 struct DbPool {
     info: Arc<ConnInfo>,
-    pool: PgPool,
+    /// What its connections open with (the manager doesn't show it).
+    #[cfg(test)]
+    config: tokio_postgres::Config,
+    pool: Pool,
     /// When a request last took a connection from it.
     last_used: std::sync::Mutex<tokio::time::Instant>,
+    /// Connections being opened ([`Opening`]): deadpool counts one in its size only once
+    /// it's open.
+    opening: AtomicUsize,
 }
 
 impl DbPool {
+    fn new(info: Arc<ConnInfo>, config: tokio_postgres::Config, max_size: usize) -> Self {
+        DbPool {
+            info,
+            #[cfg(test)]
+            config: config.clone(),
+            pool: build_pool(config, max_size),
+            last_used: std::sync::Mutex::new(tokio::time::Instant::now()),
+            opening: AtomicUsize::new(0),
+        }
+    }
+
     fn load(&self) -> PoolLoad {
+        // `opening` first: a connection that finishes opening between the two reads is then
+        // counted twice at worst, never missed.
+        let opening = self.opening.load(Ordering::SeqCst);
+        let status = self.pool.status();
+        let size = status.size + opening;
         PoolLoad {
-            size: self.pool.size(),
-            idle: self.pool.num_idle(),
+            size: u32::try_from(size).unwrap_or(u32::MAX),
+            idle: status.available,
             last_used: *self.last_used.lock().expect("last_used"),
         }
     }
+}
+
+/// A connection being opened in a pool, counted in [`DbPool::opening`] until it's dropped
+/// (opened, failed or cancelled).
+struct Opening<'a>(&'a AtomicUsize);
+
+impl<'a> Opening<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Opening(count)
+    }
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How a pool for `database` of `info` connects.
+fn pg_config(info: &ConnInfo, database: &str) -> tokio_postgres::Config {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(&info.host)
+        .port(info.port)
+        .user(&info.user)
+        .password(&info.password)
+        .dbname(database)
+        .application_name("chelabase-rest")
+        .connect_timeout(CONNECT_TIMEOUT);
+    config
+}
+
+/// A pool of up to `max_size` connections opened with `config`: no TLS (the compute is on
+/// the private network), `Fast` recycling (only a closed connection is dropped), a wait
+/// for a free connection capped at [`ACQUIRE_TIMEOUT`]. Each connection's statement cache
+/// is bounded by the lease that prepares through it
+/// ([`chelabase_query::pipeline::STATEMENT_CACHE_CAP`]).
+fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Pool {
+    let manager = Manager::from_config(
+        config,
+        tokio_postgres::NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        },
+    );
+    Pool::builder(manager)
+        .max_size(max_size)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(ACQUIRE_TIMEOUT))
+        .build()
+        .expect("a pool with a runtime")
+}
+
+/// Which `n` of a pool's idle connections to close: the longest unused first. `idle` is each
+/// connection's key and how long since it was last handed out.
+fn oldest_first<K: Copy>(idle: &[(K, Duration)], n: usize) -> Vec<K> {
+    let mut order: Vec<&(K, Duration)> = idle.iter().collect();
+    order.sort_by_key(|(_, unused)| std::cmp::Reverse(*unused));
+    order.into_iter().take(n).map(|(k, _)| *k).collect()
+}
+
+/// Closes `n` of `pool`'s idle connections, the longest unused first ([`oldest_first`]).
+/// Connections in use are never touched; fewer close when fewer are idle.
+fn close_oldest_idle(pool: &Pool, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut idle = Vec::new();
+    pool.retain(|_, m| {
+        idle.push((m.created, m.last_used()));
+        true
+    });
+    let mut close = oldest_first(&idle, n);
+    // Connections are told apart by when they were created; one taken in between stays.
+    let _closed = pool.retain(|_, m| match close.iter().position(|c| *c == m.created) {
+        Some(i) => {
+            close.swap_remove(i);
+            false
+        }
+        None => true,
+    });
+}
+
+/// Closes every idle connection of `pool` unused for `idle` or longer.
+fn reap(pool: &Pool, idle: Duration) {
+    // The removed connections close as they drop.
+    let _closed = pool.retain(|_, m| m.last_used() < idle);
+}
+
+type PoolCache = moka::future::Cache<(Uuid, String), Arc<DbPool>>;
+
+/// Every `every`, [`reap`]s each cached pool with `idle`; ends once the cache is gone.
+fn spawn_reaper(
+    pools: Weak<PoolCache>,
+    every: Duration,
+    idle: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let Some(pools) = pools.upgrade() else {
+                return;
+            };
+            for (_, p) in pools.iter() {
+                reap(&p.pool, idle);
+            }
+        }
+    })
 }
 
 /// A branch's slots, shared by all its databases' pools: `max_connections` of them, and the
@@ -350,8 +500,10 @@ impl BranchSlots {
 /// A pool's connections as the bound sees them.
 #[derive(Debug, Clone, Copy)]
 struct PoolLoad {
-    /// Open connections, idle and in use.
+    /// Open connections, idle and in use, plus those being opened ([`Opening`]).
     size: u32,
+    /// deadpool's `available`: open connections minus the requests holding or waiting for
+    /// one, so it under-reports idle connections while requests wait.
     idle: usize,
     last_used: tokio::time::Instant,
 }
@@ -387,40 +539,52 @@ pub struct Pools<S> {
     source: S,
     /// Each branch's info and when it was fetched.
     infos: moka::future::Cache<Uuid, (Arc<ConnInfo>, tokio::time::Instant)>,
-    pools: moka::future::Cache<(Uuid, String), Arc<DbPool>>,
+    /// Shared with the reaper, which holds it weakly.
+    pools: Arc<PoolCache>,
     slots: moka::future::Cache<Uuid, Arc<BranchSlots>>,
     permits: Arc<Semaphore>,
 }
 
 /// Failing to open a connection, before any statement: worth a fresh look at where the
 /// compute is. `at_size`: the pool already holds all its connections.
-fn is_connect_error(e: &sqlx::Error, at_size: bool) -> bool {
+fn is_connect_error(e: &PoolError, at_size: bool) -> bool {
     match e {
-        sqlx::Error::Io(_) | sqlx::Error::Tls(_) => true,
-        // sqlx retries a refused connection until it times out; a pool whose connections
-        // are all open timed out waiting for one to come back.
-        sqlx::Error::PoolTimedOut => !at_size,
+        // A pool whose connections are all open timed out waiting for one to come back.
+        PoolError::Timeout(TimeoutType::Wait) => !at_size,
+        PoolError::Timeout(TimeoutType::Create) => true,
+        // Refused, closed, or any failure before Postgres answered; of Postgres's answers,
+        // refused credentials, a connection exception or a server shutting down or starting.
+        PoolError::Backend(e) => match e.as_db_error() {
+            _ if e.is_closed() => true,
+            None => true,
+            Some(db) => {
+                let code = db.code().code();
+                code.starts_with("28") || code.starts_with("08") || code.starts_with("57P")
+            }
+        },
         // An invalidate closed the pool under the request: the next try builds a new one.
-        sqlx::Error::PoolClosed => true,
-        sqlx::Error::Database(db) => db
-            .code()
-            .is_some_and(|c| c.starts_with("28") || c.starts_with("08") || c.starts_with("57P")),
+        PoolError::Closed => true,
         _ => false,
     }
 }
 
 impl<S: ConnSource> Pools<S> {
+    /// Starts the reaper too, so it must be called inside a Tokio runtime.
     pub fn new(source: S, max_connections: usize) -> Self {
+        let pools = Arc::new(
+            moka::future::Cache::builder()
+                .max_capacity(MAX_POOLS)
+                .time_to_idle(POOL_IDLE)
+                .build(),
+        );
+        spawn_reaper(Arc::downgrade(&pools), REAP_EVERY, CONNECTION_IDLE);
         Pools {
             source,
             infos: moka::future::Cache::builder()
                 .max_capacity(MAX_POOLS)
                 .time_to_live(INFO_TTL)
                 .build(),
-            pools: moka::future::Cache::builder()
-                .max_capacity(MAX_POOLS)
-                .time_to_idle(POOL_IDLE)
-                .build(),
+            pools,
             slots: moka::future::Cache::builder()
                 .max_capacity(MAX_POOLS)
                 .time_to_idle(POOL_IDLE)
@@ -456,7 +620,7 @@ impl<S: ConnSource> Pools<S> {
     }
 
     /// Forgets what's held for `branch` at once (a database disabled, a setting changed): its
-    /// info and its pools (closed once their connections come back). Its slots stay, so
+    /// info and its pools (closed at once; connections in use close as they come back). Its slots stay, so
     /// connections still held count against the branch; the next info resizes them.
     pub async fn invalidate(&self, branch: Uuid) {
         self.infos.invalidate(&branch).await;
@@ -468,7 +632,7 @@ impl<S: ConnSource> Pools<S> {
             .collect();
         for key in keys {
             if let Some(p) = self.pools.remove(&*key).await {
-                tokio::spawn(async move { p.pool.close().await });
+                p.pool.close();
             }
         }
     }
@@ -483,33 +647,12 @@ impl<S: ConnSource> Pools<S> {
         {
             return p;
         }
-        let options = PgConnectOptions::new()
-            .host(&info.host)
-            .port(info.port)
-            .username(&info.user)
-            .password(&info.password)
-            .database(database)
-            .ssl_mode(PgSslMode::Prefer)
-            .application_name("chelabase-rest")
-            .statement_cache_capacity(STATEMENT_CACHE);
-        let pool = PgPoolOptions::new()
-            .max_connections(info.settings.max_connections.max(1))
-            .min_connections(0)
-            .idle_timeout(CONNECTION_IDLE)
-            .acquire_timeout(ACQUIRE_TIMEOUT)
-            .after_release(|conn, _| {
-                Box::pin(async move {
-                    // An error closes the connection instead.
-                    conn.execute(sqlx::raw_sql(RESET_SQL)).await?;
-                    Ok(true)
-                })
-            })
-            .connect_lazy_with(options);
-        let p = Arc::new(DbPool {
-            info: info.clone(),
-            pool,
-            last_used: std::sync::Mutex::new(tokio::time::Instant::now()),
-        });
+        let config = pg_config(info, database);
+        let p = Arc::new(DbPool::new(
+            info.clone(),
+            config,
+            info.settings.max_connections.max(1) as usize,
+        ));
         self.pools.insert(key, p.clone()).await;
         p
     }
@@ -532,18 +675,18 @@ impl<S: ConnSource> Pools<S> {
     }
 
     /// Closes idle connections of the branch's other pools until `target` may open one
-    /// within `max_connections` ([`idle_to_close`]).
-    async fn make_room(&self, slots: &BranchSlots, target: &Arc<DbPool>, max: u32) {
+    /// within `max_connections` ([`idle_to_close`]). `own_open`: the caller's [`Opening`] is
+    /// already in `target`'s load (`idle_to_close` adds the one to open itself).
+    fn make_room(&self, slots: &BranchSlots, target: &Arc<DbPool>, max: u32, own_open: bool) {
         let others = slots.others(target);
         let loads: Vec<PoolLoad> = others.iter().map(|p| p.load()).collect();
-        for (i, n) in idle_to_close(&target.load(), &loads, max) {
-            for _ in 0..n {
-                // Only an idle connection is taken; none left means another request did it.
-                let Some(conn) = others[i].pool.try_acquire() else {
-                    break;
-                };
-                let _ = conn.close().await;
-            }
+        let mut load = target.load();
+        if own_open {
+            load.size = load.size.saturating_sub(1);
+        }
+        for (i, n) in idle_to_close(&load, &loads, max) {
+            // Only idle connections close; fewer left means another request took them.
+            close_oldest_idle(&others[i].pool, n);
         }
     }
 
@@ -591,23 +734,32 @@ impl<S: ConnSource> Pools<S> {
             slots.register(&pool);
             let permits = self.permits(&slots.slots).await?;
             *pool.last_used.lock().expect("last_used") = tokio::time::Instant::now();
-            self.make_room(&slots, &pool, info.settings.max_connections.max(1))
-                .await;
-            // sqlx keeps retrying a refused connection until its acquire timeout; a
-            // compute that moved refuses, so the first attempt gets less time before the
-            // info is fetched again.
+            // No idle connection to reuse: one may be opened, so it counts against the
+            // branch before room is made (another request's `make_room` sees it) until the
+            // attempt ends, however it ends.
+            let opening = (pool.pool.status().available == 0).then(|| Opening::new(&pool.opening));
+            self.make_room(
+                &slots,
+                &pool,
+                info.settings.max_connections.max(1),
+                opening.is_some(),
+            );
+            // A compute that moved may not answer at all (a dropped SYN), so the first
+            // attempt gets less time before the info is fetched again; running out of it
+            // counts as a wait for the pool.
             let attempt = if retried {
-                pool.pool.acquire().await
+                pool.pool.get().await
             } else {
                 let first = FIRST_ATTEMPT.min(deadline - tokio::time::Instant::now());
-                tokio::time::timeout(first, pool.pool.acquire())
+                tokio::time::timeout(first, pool.pool.get())
                     .await
-                    .unwrap_or(Err(sqlx::Error::PoolTimedOut))
+                    .unwrap_or(Err(PoolError::Timeout(TimeoutType::Wait)))
             };
+            drop(opening);
             match attempt {
-                Ok(conn) => {
+                Ok(client) => {
                     return Ok(Conn {
-                        conn,
+                        client,
                         info,
                         _permits: permits,
                     });
@@ -618,14 +770,15 @@ impl<S: ConnSource> Pools<S> {
                     self.infos.invalidate(&branch).await;
                     retried = true;
                 }
-                Err(e) => return Err(AcquireError::Db(e)),
+                Err(e) => return Err(AcquireError::Db(DbAcquireError(e))),
             }
         }
     }
 }
 
 fn pool_at_size(p: &DbPool) -> bool {
-    p.pool.size() >= p.pool.options().get_max_connections()
+    let status = p.pool.status();
+    status.size >= status.max_size
 }
 
 #[cfg(test)]
@@ -686,6 +839,121 @@ pub(crate) mod test_support {
         async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
             Ok(two_databases())
         }
+    }
+
+    /// How [`fake_pg`] answers a startup message.
+    #[derive(Debug, Clone, Copy)]
+    pub enum Answer {
+        /// `AuthenticationOk`, `ReadyForQuery`, then it holds the socket until the client
+        /// closes it.
+        Ready,
+        /// `AuthenticationOk`, `ReadyForQuery`, then it closes the socket.
+        ReadyThenClose,
+        /// A FATAL `ErrorResponse` with this SQLSTATE and message, then it closes.
+        Error(&'static str, &'static str),
+    }
+
+    /// A Postgres stand-in on 127.0.0.1 answering every startup with one [`Answer`].
+    pub struct FakePg {
+        pub port: u16,
+        /// Sockets it answered [`Answer::Ready`] on that the client hasn't closed yet.
+        pub open: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn error_response(code: &str, message: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (field, value) in [(b'S', "FATAL"), (b'V', "FATAL"), (b'C', code), (b'M', message)] {
+            body.push(field);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut out = vec![b'E'];
+        out.extend_from_slice(&i32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    pub async fn fake_pg(answer: Answer) -> FakePg {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = open.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let open = count.clone();
+                tokio::spawn(async move {
+                    let Ok(len) = socket.read_i32().await else {
+                        return;
+                    };
+                    let mut startup = vec![0; usize::try_from(len).unwrap_or(4) - 4];
+                    if socket.read_exact(&mut startup).await.is_err() {
+                        return;
+                    }
+                    const READY: [u8; 15] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'];
+                    match answer {
+                        Answer::Ready => {
+                            open.fetch_add(1, Ordering::SeqCst);
+                            if socket.write_all(&READY).await.is_ok() {
+                                let mut buf = [0; 1024];
+                                while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
+                            }
+                            open.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        Answer::ReadyThenClose => {
+                            let _ = socket.write_all(&READY).await;
+                        }
+                        Answer::Error(code, message) => {
+                            let _ = socket.write_all(&error_response(code, message)).await;
+                        }
+                    }
+                });
+            }
+        });
+        FakePg { port, open }
+    }
+
+    pub fn fake_config(port: u16) -> tokio_postgres::Config {
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(port).user("x").dbname("x");
+        config
+    }
+
+    /// What connecting to a [`fake_pg`] answering `answer` fails with.
+    pub async fn connect_error(answer: Answer) -> tokio_postgres::Error {
+        let fake = fake_pg(answer).await;
+        fake_config(fake.port)
+            .connect(tokio_postgres::NoTls)
+            .await
+            .map(|_| ())
+            .unwrap_err()
+    }
+
+    /// A refused connection (nothing listens on the port).
+    pub async fn refused_error() -> tokio_postgres::Error {
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        fake_config(port)
+            .connect(tokio_postgres::NoTls)
+            .await
+            .map(|_| ())
+            .unwrap_err()
+    }
+
+    /// A statement on a connection the server closed.
+    pub async fn closed_error() -> tokio_postgres::Error {
+        let fake = fake_pg(Answer::ReadyThenClose).await;
+        let (client, connection) = fake_config(fake.port)
+            .connect(tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        // The connection ends when it reads the server's end of the stream.
+        let _ = connection.await;
+        client.batch_execute("SELECT 1").await.unwrap_err()
     }
 }
 
@@ -832,11 +1100,8 @@ mod tests {
         let main = pools.pool(branch, "main", &info).await;
         let analytics = pools.pool(branch, "analytics", &info).await;
         assert!(!Arc::ptr_eq(&main, &analytics));
-        assert_eq!(main.pool.connect_options().get_database(), Some("main"));
-        assert_eq!(
-            analytics.pool.connect_options().get_database(),
-            Some("analytics")
-        );
+        assert_eq!(main.config.get_dbname(), Some("main"));
+        assert_eq!(analytics.config.get_dbname(), Some("analytics"));
         assert!(Arc::ptr_eq(&main, &pools.pool(branch, "main", &info).await));
 
         let slots = pools.slots(branch, &info).await;
@@ -916,6 +1181,7 @@ mod tests {
     #[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the dev metadata Postgres (just deps-up)"]
     async fn open_connections_stay_within_the_branch_cap_live() {
         use sqlx::Executor;
+        use sqlx::postgres::PgPool;
         let url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
             "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
         });
@@ -971,7 +1237,7 @@ mod tests {
             async move {
                 for _ in 0..200 {
                     if let Some(p) = pools.pools.get(&(branch, db.clone())).await
-                        && p.pool.num_idle() == idle
+                        && p.pool.status().available == idle
                     {
                         return;
                     }
@@ -998,7 +1264,11 @@ mod tests {
         }
         assert!(seen <= 2, "{seen} connections open for a branch capped at 2");
         let a_pool = pools.pools.get(&(branch, a.clone())).await.unwrap();
-        assert_eq!(a_pool.pool.size() + 1, 2, "one of a's idle connections was closed");
+        assert_eq!(
+            a_pool.pool.status().size + 1,
+            2,
+            "one of a's idle connections was closed"
+        );
         drop(c3);
         pools.invalidate(branch).await;
         for db in [&a, &b] {
@@ -1060,15 +1330,191 @@ mod tests {
         assert!(matches!(e, AcquireError::NotServed), "{e:?}");
     }
 
-    #[test]
-    fn a_busy_pool_timing_out_is_not_a_moved_compute() {
-        assert!(!is_connect_error(&sqlx::Error::PoolTimedOut, true));
-        assert!(is_connect_error(&sqlx::Error::PoolTimedOut, false));
-        let io = || sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
-        assert!(is_connect_error(&io(), true));
-        assert!(is_connect_error(&io(), false));
-        assert!(!is_connect_error(&sqlx::Error::RowNotFound, false));
-        // A pool closed under the request (an invalidate): a new one is built.
-        assert!(is_connect_error(&sqlx::Error::PoolClosed, true));
+    #[tokio::test]
+    async fn a_busy_pool_timing_out_is_not_a_moved_compute() {
+        use super::test_support::{Answer, closed_error, connect_error, refused_error};
+        let backend = |e| PoolError::Backend(e);
+        // (error, retried when the pool is at its size, retried below it)
+        let table: Vec<(&str, PoolError, bool, bool)> = vec![
+            // A pool whose connections are all open timed out waiting for one to come back.
+            ("wait", PoolError::Timeout(TimeoutType::Wait), false, true),
+            ("create", PoolError::Timeout(TimeoutType::Create), true, true),
+            ("recycle", PoolError::Timeout(TimeoutType::Recycle), false, false),
+            ("refused", backend(refused_error().await), true, true),
+            ("closed", backend(closed_error().await), true, true),
+            (
+                "password",
+                backend(connect_error(Answer::Error("28P01", "password failed")).await),
+                true,
+                true,
+            ),
+            (
+                "connection",
+                backend(connect_error(Answer::Error("08006", "gone")).await),
+                true,
+                true,
+            ),
+            (
+                "starting up",
+                backend(connect_error(Answer::Error("57P03", "starting")).await),
+                true,
+                true,
+            ),
+            (
+                "no database",
+                backend(connect_error(Answer::Error("3D000", "no such database")).await),
+                false,
+                false,
+            ),
+            // A pool closed under the request (an invalidate): a new one is built.
+            ("pool closed", PoolError::Closed, true, true),
+            ("no runtime", PoolError::NoRuntimeSpecified, false, false),
+        ];
+        for (name, e, at_size, below) in &table {
+            assert_eq!(is_connect_error(e, true), *at_size, "{name} at size: {e:?}");
+            assert_eq!(is_connect_error(e, false), *below, "{name} below size: {e:?}");
+        }
+    }
+
+    /// Within a pool, the connections unused longest close first, never more than idle.
+    #[tokio::test]
+    async fn make_room_closes_the_oldest_idle_first() {
+        let s = Duration::from_secs;
+        let idle = [(0, s(5)), (1, s(50)), (2, s(1)), (3, s(20))];
+        assert_eq!(oldest_first(&idle, 1), vec![1]);
+        assert_eq!(oldest_first(&idle, 2), vec![1, 3]);
+        assert_eq!(oldest_first(&idle, 9), vec![1, 3, 0, 2]);
+        assert!(oldest_first(&idle, 0).is_empty());
+
+        // On a pool: three idle connections, handed out at different times.
+        let fake = super::test_support::fake_pg(super::test_support::Answer::Ready).await;
+        let pool = build_pool(super::test_support::fake_config(fake.port), 3);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(pool.get().await.unwrap());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let created: Vec<_> = held.iter().map(|c| Object::metrics(c).created).collect();
+        // One in use is never closed.
+        let in_use = held.pop().unwrap();
+        drop(held);
+        close_oldest_idle(&pool, 1);
+        let mut left = Vec::new();
+        pool.retain(|_, m| {
+            left.push(m.created);
+            true
+        });
+        assert_eq!(left, vec![created[1]], "the oldest went first");
+        close_oldest_idle(&pool, 5);
+        assert_eq!(pool.status().size, 1, "only the one in use is left");
+        drop(in_use);
+        for _ in 0..100 {
+            if fake.open.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fake.open.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// deadpool counts a connection in its size only once it's open: a connection another
+    /// database of the branch is still opening counts too, so the cap holds while two
+    /// requests open connections at once.
+    #[tokio::test(start_paused = true)]
+    async fn pending_opens_count_against_the_branch_cap() {
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let info = Arc::new(super::test_support::two_databases());
+        let analytics = DbPool::new(info.clone(), pg_config(&info, "analytics"), 2);
+        assert_eq!(analytics.load().size, 0);
+        let opening = Opening::new(&analytics.opening);
+        assert_eq!(analytics.load().size, 1, "an open in flight counts");
+        // `main` keeps one idle connection; the target opens one; the branch's cap is 2.
+        let main = load(1, 1, 50);
+        assert_eq!(
+            idle_to_close(&load(0, 0, 0), &[main, analytics.load()], 2),
+            vec![(0, 1)]
+        );
+        drop(opening);
+        assert!(idle_to_close(&load(0, 0, 0), &[main, analytics.load()], 2).is_empty());
+    }
+
+    /// An [`Opening`] counts from when it's made until it's dropped, a cancelled request's
+    /// included.
+    #[tokio::test]
+    async fn an_opening_is_counted_until_it_ends() {
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let _a = Opening::new(&count);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            let _b = Opening::new(&count);
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // Cancelled while it waits.
+        let c = count.clone();
+        let task = tokio::spawn(async move {
+            let _opening = Opening::new(&c);
+            std::future::pending::<()>().await;
+        });
+        for _ in 0..100 {
+            if count.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    /// The reaper closes connections idle past the limit, keeps the others, and ends once its
+    /// pools are gone.
+    #[tokio::test]
+    async fn reaper_closes_connections_idle_past_the_limit() {
+        use std::sync::atomic::Ordering;
+        let fake = super::test_support::fake_pg(super::test_support::Answer::Ready).await;
+        let mut info = super::test_support::two_databases();
+        info.port = fake.port;
+        let pools = Arc::new(moka::future::Cache::builder().build());
+        let pool = Arc::new(DbPool::new(
+            Arc::new(info.clone()),
+            pg_config(&info, "main"),
+            2,
+        ));
+        pools.insert((Uuid::nil(), "main".to_owned()), pool.clone()).await;
+        let (a, b) = (pool.pool.get().await.unwrap(), pool.pool.get().await.unwrap());
+        drop(a);
+        let reaper = spawn_reaper(
+            Arc::downgrade(&pools),
+            Duration::from_millis(20),
+            Duration::from_millis(400),
+        );
+        // Not idle long enough yet.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(pool.pool.status().size, 2);
+        // Past the limit: the idle one closes, the one in use stays.
+        let mut size = 2;
+        for _ in 0..200 {
+            size = pool.pool.status().size;
+            if size == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(size, 1, "the idle connection was closed");
+        for _ in 0..100 {
+            if fake.open.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fake.open.load(Ordering::SeqCst), 1, "its socket too");
+        drop(b);
+        drop(pools);
+        tokio::time::timeout(Duration::from_secs(2), reaper)
+            .await
+            .expect("the reaper ends with its pools")
+            .unwrap();
     }
 }

@@ -2,7 +2,7 @@ mod common;
 
 use common::{FakeCatalog, MAX_ROWS, one, op, plans};
 use chelabase_query::query::{Path, Slot, resolve};
-use chelabase_query::sql::{Bind, BindValue, PlanError, plan, resolve_bind};
+use chelabase_query::sql::{Bind, BindValue, ParamType, PlanError, plan, resolve_bind};
 use serde_json::json;
 
 fn at(slot: Slot) -> Path {
@@ -656,5 +656,111 @@ fn big_numbers_reach_the_binds_with_their_digits() {
     assert_eq!(
         text(&call, Bind::Text(at(Slot::Arg("tag".into())))),
         FRACTION
+    );
+}
+
+// ---- capped_sql and param_types ----
+
+#[test]
+fn capped_select_wraps_in_a_subquery() {
+    let p = one(r#"{"v":1,"op":"select","from":"Order","select":["id"]}"#);
+    assert_eq!(
+        p.capped_sql,
+        r#"SELECT chelabase.cap_response(q.r, $3) FROM (SELECT coalesce(json_agg(t.*), '[]')::text FROM (SELECT "id" FROM "public"."Order" LIMIT $1 OFFSET $2) t) AS q(r)"#
+    );
+}
+
+#[test]
+fn capped_write_keeps_the_cte_top_level() {
+    let p = one(r#"{"v":1,"op":"insert","into":"billing.invoices","values":[{"amount":1}]}"#);
+    assert_eq!(
+        p.capped_sql,
+        r#"WITH r AS (INSERT INTO "billing"."invoices" ("amount") SELECT "amount" FROM jsonb_populate_recordset(NULL::"billing"."invoices", $1)), q(r) AS (SELECT '[]'::text) SELECT chelabase.cap_response(q.r, $2) FROM q"#
+    );
+
+    let p = one(
+        r#"{"v":1,"op":"insert","into":"Order","values":[{"total":"1.50","select":"x"}],"returning":["id"]}"#,
+    );
+    assert_eq!(
+        p.capped_sql,
+        r#"WITH r AS (INSERT INTO "public"."Order" ("select", "total") SELECT "select", "total" FROM jsonb_populate_recordset(NULL::"public"."Order", $1) RETURNING "id"), q(r) AS (SELECT coalesce(json_agg(t.*), '[]')::text FROM (SELECT * FROM r LIMIT $2) t) SELECT chelabase.cap_response(q.r, $3) FROM q"#
+    );
+
+    let p = one(
+        r#"{"v":1,"op":"update","table":"Order","set":{"mood":"happy","select":"z"},
+            "where":{"col":"id","eq":7},"returning":"*"}"#,
+    );
+    assert_eq!(
+        p.capped_sql,
+        r#"WITH r AS (UPDATE "public"."Order" SET ("select", "mood") = (SELECT "select", "mood" FROM jsonb_populate_record(NULL::"public"."Order", $1)) WHERE "id" = CAST($2 AS bigint) RETURNING "id", "select", "total", "mood", "tags", "meta", "made"), q(r) AS (SELECT coalesce(json_agg(t.*), '[]')::text FROM (SELECT * FROM r LIMIT $3) t) SELECT chelabase.cap_response(q.r, $4) FROM q"#
+    );
+
+    let p = one(r#"{"v":1,"op":"delete","from":"billing.invoices","all":true}"#);
+    assert_eq!(
+        p.capped_sql,
+        r#"WITH r AS (DELETE FROM "billing"."invoices"), q(r) AS (SELECT '[]'::text) SELECT chelabase.cap_response(q.r, $1) FROM q"#
+    );
+
+    let p = one(
+        r#"{"v":1,"op":"delete","from":"billing.invoices","where":{"not":{"col":"paid","is":null}},"returning":["id","amount"]}"#,
+    );
+    assert_eq!(
+        p.capped_sql,
+        r#"WITH r AS (DELETE FROM "billing"."invoices" WHERE NOT ("paid" IS NULL) RETURNING "id", "amount"), q(r) AS (SELECT coalesce(json_agg(t.*), '[]')::text FROM (SELECT * FROM r LIMIT $1) t) SELECT chelabase.cap_response(q.r, $2) FROM q"#
+    );
+}
+
+#[test]
+fn capped_call_wraps() {
+    let p = one(r#"{"v":1,"op":"call","fn":"public.add_points","args":{"user_id":"u"}}"#);
+    assert_eq!(
+        p.capped_sql,
+        r#"SELECT chelabase.cap_response(q.r, $2) FROM (SELECT to_json("public"."add_points"("user_id" => CAST($1 AS uuid)))::text) AS q(r)"#
+    );
+
+    let p = one(r#"{"v":1,"op":"call","fn":"pairs"}"#);
+    assert_eq!(
+        p.capped_sql,
+        r#"SELECT chelabase.cap_response(q.r, $1) FROM (SELECT coalesce(json_agg(x.f), '[]')::text FROM (SELECT "public"."pairs"() AS f) x) AS q(r)"#
+    );
+}
+
+#[test]
+fn capped_param_is_last() {
+    for json in [
+        r#"{"v":1,"op":"select","from":"Order"}"#,
+        r#"{"v":1,"op":"delete","from":"billing.invoices","all":true}"#,
+        r#"{"v":1,"op":"call","fn":"touch"}"#,
+        r#"{"v":1,"op":"call","fn":"recent_orders","args":{"n":3}}"#,
+    ] {
+        let p = one(json);
+        let budget = format!("q.r, ${})", p.binds.len() + 1);
+        assert!(p.capped_sql.contains(&budget), "{json}: {}", p.capped_sql);
+        assert_eq!(p.capped_param_types().last(), Some(&ParamType::Int8));
+        assert_eq!(p.capped_param_types().len(), p.binds.len() + 1);
+    }
+    // `sql` is unchanged and has no budget parameter
+    let p = one(r#"{"v":1,"op":"call","fn":"touch"}"#);
+    assert_eq!(p.sql, r#"SELECT NULLIF("public"."touch"()::text, '')"#);
+}
+
+#[test]
+fn param_types_follow_binds() {
+    let p = one(r#"{"v":1,"op":"select","from":"Order","where":{"and":[{"col":"total","gte":100},{"col":"mood","in":["happy"]}]}}"#);
+    assert_eq!(
+        p.param_types(),
+        vec![
+            ParamType::Text,
+            ParamType::Jsonb,
+            ParamType::Int8,
+            ParamType::Int8
+        ]
+    );
+    let p = one(r#"{"v":1,"op":"insert","into":"Order","values":[{"total":"1"}],"returning":"*"}"#);
+    assert_eq!(p.param_types(), vec![ParamType::Jsonb, ParamType::Int8]);
+    // the capped statement has one more int8 (the budget)
+    assert_eq!(
+        p.capped_param_types(),
+        vec![ParamType::Jsonb, ParamType::Int8, ParamType::Int8]
     );
 }

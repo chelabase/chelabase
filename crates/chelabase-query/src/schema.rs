@@ -22,7 +22,8 @@ use chelabase_types::data_api_schema::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::PgConnection;
+use tokio_postgres::Client;
+use tokio_postgres::types::Type;
 
 use crate::query::Name;
 use crate::sql::{Catalog, ColumnInfo, FnLookupError, FunctionInfo, TableInfo, quote_ident};
@@ -55,7 +56,7 @@ pub fn is_reserved(schema: &str) -> bool {
         || schema.starts_with("pg_toast_temp_")
 }
 
-/// `$1` = [`RESERVED_SCHEMAS`]. One row, one `text` column: the JSON [`Raw`] reads (oids
+/// `$1` = [`RESERVED_SCHEMAS`] (`text[]`). One row, one `text` column: the JSON [`Raw`] reads (oids
 /// as `int8`, since `to_json` writes an `oid` as a string).
 pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
   'namespaces', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(n.oid::int8, n.nspname)), '[]')
@@ -89,7 +90,7 @@ pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
     WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_'))
 )::text";
 
-/// `$1` = the role, `$2` = [`RESERVED_SCHEMAS`]. One row, one `text` column: the JSON
+/// `$1` = the role (`text`), `$2` = [`RESERVED_SCHEMAS`] (`text[]`). One row, one `text` column: the JSON
 /// [`Visibility`] reads.
 pub const VISIBILITY_SQL: &str = "SELECT pg_catalog.json_build_object(
   'schemas', (SELECT coalesce(pg_catalog.json_agg(n.oid::int8), '[]') FROM pg_catalog.pg_namespace n
@@ -113,7 +114,7 @@ pub const VISIBILITY_SQL: &str = "SELECT pg_catalog.json_build_object(
 #[derive(Debug, thiserror::Error)]
 pub enum IntrospectError {
     #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    Db(#[from] tokio_postgres::Error),
     #[error("reading the catalog's JSON: {0}")]
     Decode(#[from] serde_json::Error),
 }
@@ -758,18 +759,16 @@ impl Catalog for RoleView {
 }
 
 /// Reads the catalog at `version` (inside the request's transaction).
-pub async fn introspect(
-    conn: &mut PgConnection,
-    version: String,
-) -> Result<Schema, IntrospectError> {
-    let json: String = sqlx::query_scalar(INTROSPECT_SQL)
-        .bind(RESERVED_SCHEMAS)
-        .fetch_one(&mut *conn)
-        .await?;
+pub async fn introspect(client: &Client, version: String) -> Result<Schema, IntrospectError> {
+    let json: String = client
+        .query_typed_one(INTROSPECT_SQL, &[(&RESERVED_SCHEMAS, Type::TEXT_ARRAY)])
+        .await?
+        .try_get(0)?;
     let mut raw: Raw = serde_json::from_str(&json)?;
-    raw.app_users = sqlx::query_as(APP_USERS_TABLE_SQL)
-        .fetch_optional(&mut *conn)
-        .await?;
+    raw.app_users = match client.query_typed_opt(APP_USERS_TABLE_SQL, &[]).await? {
+        Some(row) => Some((row.try_get(0)?, row.try_get(1)?)),
+        None => None,
+    };
     Ok(Schema::build(version, raw))
 }
 
@@ -789,28 +788,27 @@ pub const APP_USERS_TABLE_SQL: &str = "SELECT n.nspname::text, c.relname::text \
      ORDER BY c.oid LIMIT 1";
 
 /// What `role` can reach (inside the request's transaction).
-pub async fn visibility(
-    conn: &mut PgConnection,
-    role: &str,
-) -> Result<Visibility, IntrospectError> {
-    let json: String = sqlx::query_scalar(VISIBILITY_SQL)
-        .bind(role)
-        .bind(RESERVED_SCHEMAS)
-        .fetch_one(&mut *conn)
-        .await?;
+pub async fn visibility(client: &Client, role: &str) -> Result<Visibility, IntrospectError> {
+    let json: String = client
+        .query_typed_one(
+            VISIBILITY_SQL,
+            &[(&role, Type::TEXT), (&RESERVED_SCHEMAS, Type::TEXT_ARRAY)],
+        )
+        .await?
+        .try_get(0)?;
     Ok(Visibility::from_json(&json)?)
 }
 
 /// The view for `role` at `schema`'s version, computed once and cached with the schema.
 pub async fn role_view(
-    conn: &mut PgConnection,
+    client: &Client,
     schema: &Schema,
     role: &str,
 ) -> Result<Arc<RoleView>, IntrospectError> {
     if let Some(view) = schema.cached_view(role) {
         return Ok(view);
     }
-    let visibility = visibility(conn, role).await?;
+    let visibility = visibility(client, role).await?;
     Ok(schema.insert_view(role, visibility))
 }
 

@@ -5,10 +5,10 @@
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use deadpool_postgres::PoolError;
 use serde_json::{Map, Value, json};
-use sqlx::error::DatabaseError;
 
-pub use chelabase_query::error::{SCHEMA_MISSING, UNREACHABLE, classify};
+pub use chelabase_query::error::{DbFields, SCHEMA_MISSING, UNREACHABLE, classify};
 use chelabase_query::error::QueryFailure;
 use chelabase_query::query::QueryError;
 use chelabase_query::sql::PlanError;
@@ -99,13 +99,23 @@ impl ApiError {
     }
 
     /// A database error raised while a statement ran: the spec's table, or a 500.
-    pub fn from_database(err: &dyn DatabaseError, request_id: &str) -> Self {
-        QueryFailure::from_database(err, request_id).into()
+    pub fn from_db(err: &dyn DbFields, request_id: &str) -> Self {
+        QueryFailure::from_db(err, request_id).into()
     }
 
     /// An error from running a statement (after a connection was acquired).
-    pub fn from_sqlx(err: sqlx::Error, request_id: &str) -> Self {
-        QueryFailure::from_sqlx(err, request_id).into()
+    pub fn from_pg(err: &tokio_postgres::Error, request_id: &str) -> Self {
+        QueryFailure::from_pg(err, request_id).into()
+    }
+
+    /// The pool's failure to hand out a connection: waiting too long, or a pool closed under
+    /// the request, is [`Self::unreachable`] (as sqlx's `PoolTimedOut` and `PoolClosed`
+    /// were); a failure to connect goes through [`Self::from_pg`].
+    pub fn from_pool(err: &PoolError, request_id: &str) -> Self {
+        match err {
+            PoolError::Backend(e) => Self::from_pg(e, request_id),
+            other => Self::unreachable(request_id, other),
+        }
     }
 }
 
@@ -181,4 +191,33 @@ mod tests {
         );
     }
 
+    /// A pool that times out or is closed answers like sqlx's `PoolTimedOut`/`PoolClosed`
+    /// did (503, the fixed body); a failure to connect is mapped like any driver error.
+    #[tokio::test]
+    async fn pool_errors_map_like_the_old_sqlx_ones() {
+        use crate::conn::test_support::{Answer, connect_error, refused_error};
+        use deadpool_postgres::TimeoutType;
+        let unreachable = |e: &ApiError| {
+            e.status == StatusCode::SERVICE_UNAVAILABLE
+                && e.code == "unavailable"
+                && e.message == UNREACHABLE
+                && (e.detail.is_none() && e.hint.is_none() && e.sqlstate.is_none())
+        };
+        for e in [
+            PoolError::Timeout(TimeoutType::Wait),
+            PoolError::Timeout(TimeoutType::Create),
+            PoolError::Timeout(TimeoutType::Recycle),
+            PoolError::Closed,
+            PoolError::Backend(refused_error().await),
+            PoolError::Backend(connect_error(Answer::Error("28P01", "10.1.2.3 refused")).await),
+        ] {
+            let mapped = ApiError::from_pool(&e, "rid-1");
+            assert!(unreachable(&mapped), "{e:?}: {mapped:?}");
+        }
+        // Postgres's own error, through `from_pg`: an unmapped SQLSTATE is a 500.
+        let e = PoolError::Backend(connect_error(Answer::Error("XX000", "secret")).await);
+        let mapped = ApiError::from_pool(&e, "rid-1");
+        assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message.contains("secret"), "{}", mapped.message);
+    }
 }

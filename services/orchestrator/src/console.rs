@@ -30,7 +30,7 @@ use axum::{
 };
 use chelabase_metadata::{BranchDatabase, BranchKind, BranchStatus, DataApiState, DatabaseOrigin};
 use chelabase_neon::ComputeLocator;
-use chelabase_query::{Op, QueryCache, QueryFailure, RunAs, RunSettings};
+use chelabase_query::{Lease, Op, QueryCache, QueryFailure, RunAs, RunSettings};
 use chelabase_secrets::{Purpose, open_credential};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::data_api_schema::DataApiSchema;
@@ -38,7 +38,8 @@ use chelabase_types::{ApiPath, BranchId};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
+use tokio_postgres::NoTls;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -62,11 +63,22 @@ pub const ROLE_CHECK_TTL: Duration = Duration::from_secs(300);
 pub const APPLICATION_NAME: &str = "chelabase-console";
 /// Seconds a 503 asks the client to wait (the data API's value).
 const RETRY_AFTER_SECS: u32 = 2;
-/// Run on every owner connection handed back to its pool: the next request starts as the
-/// owner with the connection's defaults, holding no advisory lock and no temporary table (a
-/// function the owner called may have left any of them). An error closes the connection.
+/// Run on an owner connection before and after every request (`RunSettings::reset_sql`): the
+/// next request starts as the owner with the connection's defaults, holding no advisory lock
+/// and no temporary table (a function the owner called may have left any of them). A reset
+/// that fails discards the connection.
 pub const OWNER_RESET_SQL: &str =
     "SET ROLE NONE; RESET ALL; SELECT pg_advisory_unlock_all(); DISCARD TEMP";
+/// An owner pool's manager settings: `Fast` recycling (only a closed connection is dropped).
+/// Every request resets the session itself, before and after its work
+/// ([`OWNER_RESET_SQL`] as `RunSettings::reset_sql`), so a reset on checkout would only add
+/// a round trip.
+fn owner_manager_config() -> ManagerConfig {
+    ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    }
+}
+
 /// Longest wait for rest's schema of a role.
 const SCHEMA_TIMEOUT: Duration = Duration::from_secs(15);
 /// The owner password isn't known to Chelabase.
@@ -114,7 +126,7 @@ impl OwnerPoolKey {
 /// The console's state: the owner pools, the owner's schema and shape caches, and the roles
 /// the worker accepted.
 pub struct Console {
-    pub(crate) pools: moka::future::Cache<OwnerPoolKey, PgPool>,
+    pub(crate) pools: moka::future::Cache<OwnerPoolKey, Pool>,
     pub(crate) cache: QueryCache,
     checked_roles: moka::sync::Cache<(BranchId, String), ()>,
 }
@@ -125,11 +137,11 @@ impl Default for Console {
             pools: moka::future::Cache::builder()
                 .max_capacity(10_000)
                 .time_to_idle(OWNER_POOL_IDLE)
-                .eviction_listener(|_, pool: PgPool, _| {
-                    // Close its connections now rather than when the last clone drops.
-                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                        rt.spawn(async move { pool.close().await });
-                    }
+                .eviction_listener(|_, pool: Pool, _| {
+                    // Close its connections now rather than when the last clone drops. An
+                    // idle pool is only ever evicted by this cache's time-to-idle, which is
+                    // all the idle reaping two connections need.
+                    pool.close();
                 })
                 .build(),
             cache: QueryCache::default(),
@@ -142,22 +154,21 @@ impl Default for Console {
 }
 
 impl Console {
-    /// The owner pool for `key`, made with `options` on a miss. It connects lazily.
-    async fn owner_pool(&self, key: OwnerPoolKey, options: PgConnectOptions) -> PgPool {
+    /// The owner pool for `key`, made with `config` on a miss. It connects lazily
+    /// ([`owner_manager_config`]; each request resets the session itself). Each
+    /// connection's statement cache is bounded by the [`Lease`] that prepares through it
+    /// ([`chelabase_query::pipeline::STATEMENT_CACHE_CAP`]).
+    async fn owner_pool(&self, key: OwnerPoolKey, config: tokio_postgres::Config) -> Pool {
         self.pools
             .get_with(key, async move {
-                PgPoolOptions::new()
-                    .max_connections(OWNER_POOL_CONNECTIONS)
-                    .min_connections(0)
-                    .idle_timeout(OWNER_POOL_IDLE)
-                    .acquire_timeout(OWNER_ACQUIRE_TIMEOUT)
-                    .after_release(|conn, _| {
-                        Box::pin(async move {
-                            sqlx::Executor::execute(conn, sqlx::raw_sql(OWNER_RESET_SQL)).await?;
-                            Ok(true)
-                        })
-                    })
-                    .connect_lazy_with(options)
+                let manager = Manager::from_config(config, NoTls, owner_manager_config());
+                Pool::builder(manager)
+                    .max_size(OWNER_POOL_CONNECTIONS as usize)
+                    .runtime(Runtime::Tokio1)
+                    .wait_timeout(Some(OWNER_ACQUIRE_TIMEOUT))
+                    .create_timeout(Some(OWNER_ACQUIRE_TIMEOUT))
+                    .build()
+                    .expect("a pool with a runtime set always builds")
             })
             .await
     }
@@ -487,30 +498,43 @@ async fn owner_pool_for<M, J>(
     branch: &chelabase_metadata::BranchRecord,
     row: &BranchDatabase,
     owner: &str,
-) -> Result<PgPool, ApiError>
+) -> Result<Pool, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
     let target = owner_target(state, branch, owner).await?;
-    let options = PgConnectOptions::new()
-        .host(&target.addr.ip().to_string())
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(target.addr.ip().to_string())
         .port(target.addr.port())
-        .username(&target.user)
+        .user(&target.user)
         .password(&target.password)
-        .database(&row.name)
-        .ssl_mode(PgSslMode::Prefer)
+        .dbname(&row.name)
         .application_name(APPLICATION_NAME);
     Ok(state
         .console
         .owner_pool(
             OwnerPoolKey::new(branch.id, &row.name, &target.sealed, target.addr),
-            options,
+            config,
         )
         .await)
 }
 
-/// Runs `op` as the database's owner on the owner pool, in one transaction.
+/// A pooled connection failure as the data API answers it: a pool that timed out or was
+/// closed under the request is a 503 (`Retry-After`), like any moment the database is out of
+/// reach; a driver error from connecting or recycling goes through [`QueryFailure::from_pg`].
+fn pool_failure(err: PoolError, request_id: &str) -> QueryFailure {
+    match err {
+        PoolError::Backend(e) => QueryFailure::from_pg(&e, request_id),
+        PoolError::Timeout(_) | PoolError::Closed => QueryFailure::unreachable(request_id, err),
+        other => QueryFailure::internal(request_id, other),
+    }
+}
+
+/// Runs `op` as the database's owner on the owner pool, in one transaction, on a leased
+/// connection ([`chelabase_query::Lease`]: closed rather than pooled when the call doesn't
+/// finish or its session can't be reset).
 async fn run_as_owner<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
@@ -532,28 +556,25 @@ where
         max_rows: i64::from(record.max_rows),
         statement_timeout_ms: i64::from(record.statement_timeout_ms),
         default_schema: row.default_schema.clone(),
+        reset_sql: OWNER_RESET_SQL,
     };
     let rid = principal.request_id.as_str();
     let result: Result<String, QueryFailure> = async {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| QueryFailure::from_sqlx(e, rid))?;
+        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid))?);
         let out = chelabase_query::run(
-            &mut tx,
+            &lease,
             &state.console.cache,
             (branch.id.as_uuid(), &row.name),
-            RunAs::Owner,
+            // The owner pool logs in as `owner` (`owner_pool_for`).
+            RunAs::Owner { user: owner },
             &settings,
             chelabase_query::engine::DEFAULT_MAX_RESPONSE_BYTES,
             op,
             rid,
         )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|e| QueryFailure::from_sqlx(e, rid))?;
-        Ok(out)
+        .await;
+        lease.done();
+        out
     }
     .await;
     match result {
@@ -658,7 +679,7 @@ where
 }
 
 /// Everything the owner reaches in `row`'s database, read on the owner pool through the
-/// console's schema cache.
+/// console's schema cache, on a leased connection (see [`run_as_owner`]).
 async fn owner_schema<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
@@ -679,25 +700,23 @@ where
         max_rows: i64::from(record.max_rows),
         statement_timeout_ms: i64::from(record.statement_timeout_ms),
         default_schema: row.default_schema.clone(),
+        reset_sql: OWNER_RESET_SQL,
     };
     let rid = principal.request_id.as_str();
     let result: Result<Value, QueryFailure> = async {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| QueryFailure::from_sqlx(e, rid))?;
-        let (schema, view) = chelabase_query::schema_for(
-            &mut tx,
+        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid))?);
+        let read = chelabase_query::schema_for(
+            &lease,
             &state.console.cache,
             (branch.id.as_uuid(), &row.name),
-            RunAs::Owner,
+            // The owner pool logs in as `owner` (`owner_pool_for`).
+            RunAs::Owner { user: owner },
             &settings,
             rid,
         )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|e| QueryFailure::from_sqlx(e, rid))?;
+        .await;
+        lease.done();
+        let (schema, view) = read?;
         Ok(schema.to_json(&row.default_schema, &[(owner, &view.visibility)], true))
     }
     .await;
@@ -947,11 +966,31 @@ mod tests {
         );
     }
 
+    /// The reset runs inside each request (before and after it, `RunSettings::reset_sql`),
+    /// so the pool's recycling only drops closed connections: no extra round trip per
+    /// checkout.
+    #[test]
+    fn owner_pools_recycle_fast() {
+        assert!(matches!(
+            owner_manager_config().recycling_method,
+            RecyclingMethod::Fast
+        ));
+    }
+
     /// An owner pool closed under the request (evicted while the request held it) answers
     /// 503 with `Retry-After`, like any moment the database is out of reach.
     #[test]
     fn a_closed_owner_pool_is_503_with_retry_after() {
-        let response = data_api_failure(QueryFailure::from_sqlx(sqlx::Error::PoolClosed, "rid"));
+        let response = data_api_failure(pool_failure(PoolError::Closed, "rid"));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "2");
+    }
+
+    /// Waiting too long for an owner connection is the same 503.
+    #[test]
+    fn an_owner_pool_timeout_is_503_with_retry_after() {
+        let failure = pool_failure(PoolError::Timeout(deadpool_postgres::TimeoutType::Wait), "rid");
+        let response = data_api_failure(failure);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "2");
     }

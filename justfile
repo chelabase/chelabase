@@ -592,6 +592,10 @@ app-users-e2e: _live-check
 data-e2e: _live-check
     scripts/data-e2e.sh
 
+# Data API round-trip benchmark (step 6e): four execution variants under netem RTTs; results in docs/benchmarks (needs just dev)
+bench-data-api *args: _live-check
+    scripts/bench-data-api.sh {{args}}
+
 # Live data API across databases and Studio's console: a second database, a key allowed only on it, console CRUD as owner, anon under RLS and other roles, disable (needs just dev)
 console-e2e: _live-check
     scripts/console-e2e.sh
