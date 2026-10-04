@@ -7,33 +7,33 @@ members = [
     "services/auth",
     "services/rest",
     "tools/cli",
-    "crates/cheladb-types",
-    "crates/cheladb-metadata",
-    "crates/cheladb-nats",
-    "crates/cheladb-auth",
-    "crates/cheladb-routes",
-    "crates/cheladb-secrets",
-    "crates/cheladb-neon",
-    "crates/cheladb-query",
-    "crates/cheladb-zitadel",
+    "crates/chelabase-types",
+    "crates/chelabase-metadata",
+    "crates/chelabase-nats",
+    "crates/chelabase-auth",
+    "crates/chelabase-routes",
+    "crates/chelabase-secrets",
+    "crates/chelabase-neon",
+    "crates/chelabase-query",
+    "crates/chelabase-zitadel",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/chelabase/cheladb"
+repository = "https://github.com/chelabase/chelabase"
 
 [workspace.dependencies]
-cheladb-types = { path = "crates/cheladb-types" }
-cheladb-metadata = { path = "crates/cheladb-metadata" }
-cheladb-nats = { path = "crates/cheladb-nats" }
-cheladb-auth = { path = "crates/cheladb-auth" }
-cheladb-routes = { path = "crates/cheladb-routes" }
-cheladb-secrets = { path = "crates/cheladb-secrets" }
-cheladb-neon = { path = "crates/cheladb-neon" }
-cheladb-query = { path = "crates/cheladb-query" }
-cheladb-zitadel = { path = "crates/cheladb-zitadel" }
+chelabase-types = { path = "crates/chelabase-types" }
+chelabase-metadata = { path = "crates/chelabase-metadata" }
+chelabase-nats = { path = "crates/chelabase-nats" }
+chelabase-auth = { path = "crates/chelabase-auth" }
+chelabase-routes = { path = "crates/chelabase-routes" }
+chelabase-secrets = { path = "crates/chelabase-secrets" }
+chelabase-neon = { path = "crates/chelabase-neon" }
+chelabase-query = { path = "crates/chelabase-query" }
+chelabase-zitadel = { path = "crates/chelabase-zitadel" }
 
 axum = "0.8.9"
 utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }

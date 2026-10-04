@@ -1,9 +1,0 @@
-language: "rust"
-
-tasks:
-  check:
-    command: "cargo"
-    args: ["check", "-p", "cheladb-metadata"]
-  build:
-    command: "cargo"
-    args: ["build", "-p", "cheladb-metadata"]

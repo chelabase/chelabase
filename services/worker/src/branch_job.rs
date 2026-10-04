@@ -1,14 +1,14 @@
 //! Dispatch of a `BranchJob` (the branch consumer's payload) to the handlers.
 
-use cheladb_nats::BranchJob;
-use cheladb_neon::{ComputeBackend, StorconError};
+use chelabase_nats::BranchJob;
+use chelabase_neon::{ComputeBackend, StorconError};
 
 use crate::Worker;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 
 /// How many deliveries of a branch job a transient storage-controller failure (a 5xx, no
 /// answer, or a timeout) is retried over before the branch fails with it. Spaced by
-/// [`cheladb_nats::BRANCH_REDELIVERY_DELAY`], they span about 2 minutes: long enough for a
+/// [`chelabase_nats::BRANCH_REDELIVERY_DELAY`], they span about 2 minutes: long enough for a
 /// storage-controller restart. A refusal (4xx) fails at once.
 pub const BRANCH_JOB_ATTEMPTS: u64 = 5;
 
@@ -94,9 +94,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::BranchStatus;
-    use cheladb_nats::PointInTime;
-    use cheladb_types::BranchId;
+    use chelabase_metadata::BranchStatus;
+    use chelabase_nats::PointInTime;
+    use chelabase_types::BranchId;
 
     use super::*;
     use std::time::Duration;
@@ -113,7 +113,7 @@ mod tests {
         // A storage-controller restart can take a minute or two; the deliveries (spaced by the
         // branch consumer's nak delay) must outlast it.
         let gaps = u32::try_from(BRANCH_JOB_ATTEMPTS - 1).unwrap();
-        let window = cheladb_nats::BRANCH_REDELIVERY_DELAY * gaps;
+        let window = chelabase_nats::BRANCH_REDELIVERY_DELAY * gaps;
         assert!(window >= Duration::from_secs(120), "{window:?}");
     }
 

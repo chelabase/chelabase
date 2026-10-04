@@ -12,16 +12,16 @@ use axum::{
     http::{StatusCode, header, header::CACHE_CONTROL},
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchKind, BranchRecord, BranchStatus, DataKeyRecord, MetadataError, NewDataKey, RoleLevel,
 };
-use cheladb_secrets::{Purpose, open_credential, seal_credential};
-use cheladb_types::api_error::{ApiError, ErrorCode};
-use cheladb_types::{ApiPath, BranchId};
-use cheladb_types::data_key::{self, DataKeyKind};
+use chelabase_secrets::{Purpose, open_credential, seal_credential};
+use chelabase_types::api_error::{ApiError, ErrorCode};
+use chelabase_types::{ApiPath, BranchId};
+use chelabase_types::data_key::{self, DataKeyKind};
 use chrono::{DateTime, Utc};
-use cheladb_types::api_error::ErrorEnvelope;
-use cheladb_types::data_api_schema::DataApiSchema;
+use chelabase_types::api_error::ErrorEnvelope;
+use chelabase_types::data_api_schema::DataApiSchema;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -96,7 +96,7 @@ pub(crate) fn no_store(mut response: Response) -> Response {
 /// The branch's key row for the response, opening the public key's sealed value.
 fn summary(
     record: DataKeyRecord,
-    secrets: &cheladb_secrets::SecretKey,
+    secrets: &chelabase_secrets::SecretKey,
     role_blocked: bool,
 ) -> Result<DataKey, ()> {
     let key = match (record.kind, record.sealed.as_deref()) {
@@ -122,7 +122,7 @@ fn summary(
 
 /// Builds the row and the plaintext of a new key. Public keys are sealed for display.
 fn new_key(
-    secrets: &cheladb_secrets::SecretKey,
+    secrets: &chelabase_secrets::SecretKey,
     branch: BranchId,
     kind: DataKeyKind,
     role: &str,
@@ -178,7 +178,7 @@ fn created(key: &NewDataKey, plaintext: String) -> Response {
         (status = 200, description = "The branch's live keys, newest first; only the public key carries its full value", body = Vec<DataKey>),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -264,7 +264,7 @@ struct CreateKeyRequest {
         (status = 201, description = "The new key; its value is shown only here", body = CreatedDataKey),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -365,7 +365,7 @@ where
         (status = 201, description = "The replacement key (same kind, role and name); the old one stops working", body = CreatedDataKey),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`public_key_exists`: the branch already has a public key", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -457,7 +457,7 @@ where
         (status = 200, description = "The key after the change; only the public key carries its full value", body = DataKey),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: `databases` is missing or isn't null or a list of 1 to 20 distinct names of the branch's databases", body = ErrorEnvelope),
@@ -535,7 +535,7 @@ where
         (status = 204, description = "The key is revoked"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`public_key_not_revocable`: a public key can only be rotated", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -625,7 +625,7 @@ struct SchemaQuery {
         (status = 200, description = "The schemas, tables, functions and enums the data API exposes, with each table's role privileges", body = DataApiSchema),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the named Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`branch_not_ready`: the branch isn't ready; `data_api_disabled`: the named Postgres database isn't served by the data API", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -659,7 +659,7 @@ where
         match state.metadata.branch_databases(branch.id).await {
             Ok(rows) => match rows.into_iter().find(|d| &d.name == name) {
                 None => return crate::console::database_not_found().into_response(),
-                Some(row) if row.data_api != cheladb_metadata::DataApiState::On => {
+                Some(row) if row.data_api != chelabase_metadata::DataApiState::On => {
                     return crate::console::data_api_disabled(name).into_response();
                 }
                 Some(_) => {}
@@ -708,7 +708,7 @@ where
                 // It stopped being served (or went) since the check above.
                 return match state.metadata.branch_databases(branch.id).await {
                     Ok(rows) => match rows.into_iter().find(|d| &d.name == name) {
-                        Some(row) if row.data_api != cheladb_metadata::DataApiState::On => {
+                        Some(row) if row.data_api != chelabase_metadata::DataApiState::On => {
                             crate::console::data_api_disabled(name)
                         }
                         _ => crate::console::database_not_found(),

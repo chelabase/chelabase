@@ -59,7 +59,7 @@ describe("customFetch", () => {
     }) as typeof fetch);
     const e = await customFetch("/v1/x", { method: "GET" }).catch((x) => x);
     expect(e).toBeInstanceOf(ApiError);
-    expect(e).toMatchObject({ status: 0, code: "network", message: "Can't reach Cheladb; check your connection" });
+    expect(e).toMatchObject({ status: 0, code: "network", message: "Can't reach Chelabase; check your connection" });
   });
 
   it("401_calls_on_unauthorized_and_sets_sign_in_restarted", async () => {
@@ -93,7 +93,7 @@ describe("edge cases", () => {
     setup((async () => res("<html>ok</html>", 200, "text/html")) as typeof fetch);
     const e = await customFetch("/v1/x", { method: "GET" }).catch((x) => x);
     expect(e).toBeInstanceOf(ApiError);
-    expect(e).toMatchObject({ status: 200, code: "internal", message: "Unexpected response from Cheladb" });
+    expect(e).toMatchObject({ status: 200, code: "internal", message: "Unexpected response from Chelabase" });
   });
 
   it("flat_string_error_body_falls_back", async () => {

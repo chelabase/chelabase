@@ -257,12 +257,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "cheladb-auth",
- "cheladb-query",
- "cheladb-routes",
- "cheladb-secrets",
- "cheladb-types",
- "cheladb-zitadel",
+ "chelabase-auth",
+ "chelabase-query",
+ "chelabase-routes",
+ "chelabase-secrets",
+ "chelabase-types",
+ "chelabase-zitadel",
  "chrono",
  "dotenvy",
  "hex",
@@ -582,16 +582,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb"
+name = "chelabase"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
- "cheladb-auth",
- "cheladb-neon",
- "cheladb-secrets",
- "cheladb-types",
+ "chelabase-auth",
+ "chelabase-neon",
+ "chelabase-secrets",
+ "chelabase-types",
  "chrono",
  "clap",
  "jsonwebtoken",
@@ -605,13 +605,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-auth"
+name = "chelabase-auth"
 version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
- "cheladb-auth",
- "cheladb-types",
+ "chelabase-auth",
+ "chelabase-types",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
@@ -629,11 +629,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-metadata"
+name = "chelabase-metadata"
 version = "0.1.0"
 dependencies = [
- "cheladb-secrets",
- "cheladb-types",
+ "chelabase-secrets",
+ "chelabase-types",
  "chrono",
  "serde",
  "sqlx",
@@ -645,11 +645,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-nats"
+name = "chelabase-nats"
 version = "0.1.0"
 dependencies = [
  "async-nats",
- "cheladb-types",
+ "chelabase-types",
  "chrono",
  "futures-util",
  "serde",
@@ -661,14 +661,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-neon"
+name = "chelabase-neon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
  "bollard",
- "cheladb-metadata",
+ "chelabase-metadata",
  "chrono",
  "ed25519-dalek",
  "futures-util",
@@ -692,11 +692,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-query"
+name = "chelabase-query"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "cheladb-types",
+ "chelabase-types",
  "http",
  "moka",
  "serde",
@@ -710,11 +710,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-routes"
+name = "chelabase-routes"
 version = "0.1.0"
 
 [[package]]
-name = "cheladb-secrets"
+name = "chelabase-secrets"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -724,7 +724,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-types"
+name = "chelabase-types"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -739,11 +739,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "cheladb-zitadel"
+name = "chelabase-zitadel"
 version = "0.1.0"
 dependencies = [
  "axum",
- "cheladb-zitadel",
+ "chelabase-zitadel",
  "chrono",
  "hex",
  "hmac",
@@ -1475,9 +1475,9 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
- "cheladb-auth",
- "cheladb-routes",
- "cheladb-types",
+ "chelabase-auth",
+ "chelabase-routes",
+ "chelabase-types",
  "chrono",
  "dotenvy",
  "hex",
@@ -2458,15 +2458,15 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
- "cheladb-auth",
- "cheladb-metadata",
- "cheladb-nats",
- "cheladb-neon",
- "cheladb-query",
- "cheladb-routes",
- "cheladb-secrets",
- "cheladb-types",
- "cheladb-zitadel",
+ "chelabase-auth",
+ "chelabase-metadata",
+ "chelabase-nats",
+ "chelabase-neon",
+ "chelabase-query",
+ "chelabase-routes",
+ "chelabase-secrets",
+ "chelabase-types",
+ "chelabase-zitadel",
  "chrono",
  "dotenvy",
  "futures-util",
@@ -3271,13 +3271,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "cheladb-auth",
- "cheladb-metadata",
- "cheladb-nats",
- "cheladb-neon",
- "cheladb-query",
- "cheladb-secrets",
- "cheladb-types",
+ "chelabase-auth",
+ "chelabase-metadata",
+ "chelabase-nats",
+ "chelabase-neon",
+ "chelabase-query",
+ "chelabase-secrets",
+ "chelabase-types",
  "chrono",
  "dotenvy",
  "moka",
@@ -5036,13 +5036,13 @@ dependencies = [
  "async-nats",
  "axum",
  "base64 0.23.1",
- "cheladb-auth",
- "cheladb-metadata",
- "cheladb-nats",
- "cheladb-neon",
- "cheladb-secrets",
- "cheladb-types",
- "cheladb-zitadel",
+ "chelabase-auth",
+ "chelabase-metadata",
+ "chelabase-nats",
+ "chelabase-neon",
+ "chelabase-secrets",
+ "chelabase-types",
+ "chelabase-zitadel",
  "chrono",
  "dotenvy",
  "futures-util",

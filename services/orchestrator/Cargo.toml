@@ -3,7 +3,7 @@ name = "orchestrator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cheladb control-plane orchestrator API"
+description = "Chelabase control-plane orchestrator API"
 
 [lib]
 name = "orchestrator"
@@ -14,15 +14,15 @@ name = "orchestrator"
 path = "src/main.rs"
 
 [dependencies]
-cheladb-auth = { workspace = true }
-cheladb-metadata = { workspace = true, features = ["openapi"] }
-cheladb-nats = { workspace = true }
-cheladb-query = { workspace = true }
-cheladb-routes = { workspace = true }
-cheladb-secrets = { workspace = true }
-cheladb-zitadel = { workspace = true }
+chelabase-auth = { workspace = true }
+chelabase-metadata = { workspace = true, features = ["openapi"] }
+chelabase-nats = { workspace = true }
+chelabase-query = { workspace = true }
+chelabase-routes = { workspace = true }
+chelabase-secrets = { workspace = true }
+chelabase-zitadel = { workspace = true }
 async-nats = { workspace = true }
-cheladb-types = { workspace = true, features = ["axum", "openapi"] }
+chelabase-types = { workspace = true, features = ["axum", "openapi"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
@@ -35,7 +35,7 @@ dotenvy = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
-cheladb-neon = { workspace = true, features = ["metadata"] }
+chelabase-neon = { workspace = true, features = ["metadata"] }
 getrandom = { workspace = true }
 hex = { workspace = true }
 moka = { workspace = true }
@@ -55,8 +55,8 @@ utoipa-axum = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-cheladb-zitadel = { workspace = true, features = ["mock"] }
-cheladb-auth = { workspace = true, features = ["test-support"] }
+chelabase-zitadel = { workspace = true, features = ["mock"] }
+chelabase-auth = { workspace = true, features = ["test-support"] }
 hmac = { workspace = true }
 jsonwebtoken = { workspace = true }
 tempfile = { workspace = true }

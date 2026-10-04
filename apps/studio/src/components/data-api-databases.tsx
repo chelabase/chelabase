@@ -8,7 +8,7 @@ import {
   updateKey,
   updatePgDatabase,
   type BranchDatabaseView,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 
@@ -171,8 +171,8 @@ function DatabaseControls({
         <div className="space-y-2 rounded-lg border p-3">
           <p>
             {confirm === "disable"
-              ? `Disable the data API for ${name}? Requests for it stop at once. Its grants and the cheladb schema stay.`
-              : `Remove the data API machinery from ${name}? This disables it and drops the cheladb schema and its event trigger. Grants made to anon and authenticated stay.`}
+              ? `Disable the data API for ${name}? Requests for it stop at once. Its grants and the chelabase schema stay.`
+              : `Remove the data API machinery from ${name}? This disables it and drops the chelabase schema and its event trigger. Grants made to anon and authenticated stay.`}
           </p>
           <div className="flex gap-2">
             <Button

@@ -1,7 +1,7 @@
 import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Branch, BranchStatus, Database, DatabaseSummary } from "@cheladb/management-client";
+import type { Branch, BranchStatus, Database, DatabaseSummary } from "@chelabase/management-client";
 import { POLL_MS } from "@/lib/query";
 import { fakeFetch, jsonResponse, sequence, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";

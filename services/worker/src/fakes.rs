@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppSession, AppUsersStatus, BranchAuthSync, OnDelete, ProjectAuth, ProjectRecord,
     ProjectStatus, BranchConnectionRow, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus,
     CreateBranchOutcome, DataApiSettings, DataKeyRecord, DatabaseRecord, DatabaseSettings,
@@ -15,18 +15,18 @@ use cheladb_metadata::{
     NewEndpoint, ObservedDatabase, ResyncApplied, ResyncWrite, RoleCopy, RoleLevel, RoleOrigin,
     SealedChange,
 };
-use cheladb_neon::backend::fake::FakeBackend;
-pub use cheladb_neon::backend::fake::Journal;
-use cheladb_neon::spec::Placement;
-use cheladb_neon::storcon::{LsnAtTime, LsnKind};
-use cheladb_neon::{Lsn, NeonId, StorconError};
-use cheladb_secrets::SecretKey;
-use cheladb_types::data_key::DataKeyKind;
-use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
+use chelabase_neon::backend::fake::FakeBackend;
+pub use chelabase_neon::backend::fake::Journal;
+use chelabase_neon::spec::Placement;
+use chelabase_neon::storcon::{LsnAtTime, LsnKind};
+use chelabase_neon::{Lsn, NeonId, StorconError};
+use chelabase_secrets::SecretKey;
+use chelabase_types::data_key::DataKeyKind;
+use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use chrono::{DateTime, Utc};
 use futures_util::future::BoxFuture;
 
-use cheladb_metadata::{BranchDatabase, DataApiState, DatabaseOrigin, ServedDatabase};
+use chelabase_metadata::{BranchDatabase, DataApiState, DatabaseOrigin, ServedDatabase};
 
 use crate::Worker;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
@@ -1691,7 +1691,7 @@ impl WorkerMetadata for FakeMetadata {
                     statement_timeout_ms: db.statement_timeout_ms,
                     max_connections: db.max_connections,
                 },
-                databases: vec![cheladb_metadata::ServedDatabase {
+                databases: vec![chelabase_metadata::ServedDatabase {
                     name: db.database_name.clone().unwrap_or_else(|| "db".into()),
                     default_schema: "public".into(),
                 }],
@@ -2110,7 +2110,7 @@ impl FakeStorage {
             && *left > 0
         {
             *left -= 1;
-            // What `check` in cheladb-neon makes of a 5xx.
+            // What `check` in chelabase-neon makes of a 5xx.
             return Err(StorconError::Other(anyhow::anyhow!(
                 "storage controller returned 503 Service Unavailable: {UNAVAILABLE_CAUSE}"
             )));
@@ -2513,7 +2513,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         },
         key: SecretKey::generate(),
         owner_superuser: false,
-        roles: cheladb_types::role_settings::RoleSettings {
+        roles: chelabase_types::role_settings::RoleSettings {
             role_cap: 10,
             database_cap: 20,
             strength: false,

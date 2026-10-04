@@ -1,4 +1,4 @@
-// A hand-written `Database` and `types` in the shape `cheladb gen types` emits; shared by
+// A hand-written `Database` and `types` in the shape `chelabase gen types` emits; shared by
 // the tests. Not exported from the package.
 import type { Int8, Json, TypeMap } from "./index.ts";
 

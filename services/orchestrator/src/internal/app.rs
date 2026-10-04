@@ -16,15 +16,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppSession, BranchKind, BranchStatus, NewAppSession, ProjectStatus, RefreshNext, RefreshOutcome,
 };
-use cheladb_nats::{AppUsersSyncJob, JobEnvelope};
-use cheladb_neon::ComputeLocator;
-use cheladb_secrets::{open, open_role_password, seal};
-use cheladb_types::api_error::{ApiError, ErrorCode};
-use cheladb_types::{BranchId, ProjectId};
-use cheladb_zitadel::actions::{
+use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
+use chelabase_neon::ComputeLocator;
+use chelabase_secrets::{open, open_role_password, seal};
+use chelabase_types::api_error::{ApiError, ErrorCode};
+use chelabase_types::{BranchId, ProjectId};
+use chelabase_zitadel::actions::{
     ActionEvent, SIGNATURE_HEADER, UserEventKind, user_event_kind, verify_signature,
 };
 use chrono::{DateTime, Utc};
@@ -38,7 +38,7 @@ use super::config::APP_SESSION_CAP;
 use super::{BoxFuture, InternalState, NeonMetadataPort, require_any_bearer, require_bearer};
 
 /// The role the `auth` service writes the users table as (P7).
-const SYNC_ROLE: &str = "cheladb_auth_sync";
+const SYNC_ROLE: &str = "chelabase_auth_sync";
 /// How long the previous refresh token still gets the new one.
 const REFRESH_GRACE: Duration = Duration::from_secs(10);
 /// Zitadel's events are small; this is generous.
@@ -58,7 +58,7 @@ impl AppJobPort for crate::NatsPorts {
         job: JobEnvelope<AppUsersSyncJob>,
     ) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            cheladb_nats::publish_app_users_sync(&self.js, &job)
+            chelabase_nats::publish_app_users_sync(&self.js, &job)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -253,7 +253,7 @@ async fn sync_target<M, L>(
     state: &InternalState<M, L>,
     branch: BranchId,
     endpoint: Option<&str>,
-    auth: &cheladb_metadata::ProjectAuth,
+    auth: &chelabase_metadata::ProjectAuth,
 ) -> Result<serde_json::Value, String>
 where
     M: NeonMetadataPort,
@@ -556,7 +556,7 @@ where
         Err(e) => return internal("Zitadel event", e),
     };
     let Ok(user) = Uuid::parse_str(&event.aggregate_id) else {
-        // P15: users Cheladb didn't create.
+        // P15: users Chelabase didn't create.
         warn!(user = %event.aggregate_id, "ignoring a Zitadel event for a user id that isn't a uuid");
         return StatusCode::OK.into_response();
     };

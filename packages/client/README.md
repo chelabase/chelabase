@@ -1,11 +1,11 @@
-# @cheladb/client
+# @chelabase/client
 
-A typed client for the Cheladb data API (`POST /data/v1/query`). No runtime
+A typed client for the Chelabase data API (`POST /data/v1/query`). No runtime
 dependencies: it's built on `fetch`, so it runs in browsers, Node and edge runtimes.
 
 ```ts
-import { createClient } from "@cheladb/client";
-import { type Database, types } from "./db"; // written by `cheladb gen types`
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db"; // written by `chelabase gen types`
 
 const db = createClient<Database>({ url: "http://localhost:8000", key: PUBLIC_KEY, types });
 
@@ -125,7 +125,7 @@ is also refused; floats printed with an exponent (`1e300`) are not.
 
 ## Types
 
-`cheladb gen types --url <gateway> --key <secret key> --out db.ts` writes the `Database`
+`chelabase gen types --url <gateway> --key <secret key> --out db.ts` writes the `Database`
 type and the `types` map; pass both (`createClient<Database>({ url, key, types })`). Without
 them (`createClient({ url, key })`), the client accepts any table, column and
 function and types values as `unknown`.
@@ -133,7 +133,7 @@ function and types values as `unknown`.
 ## App users: `db.auth`
 
 With app users enabled on the project, `db.auth` signs your users up and in. Once signed in,
-every request the client sends carries the user's access token (`cheladb-user` header), so
+every request the client sends carries the user's access token (`chelabase-user` header), so
 the data API runs as that user.
 
 ```ts
@@ -152,7 +152,7 @@ Methods: `signUp`, `signIn`, `signOut`, `refresh`, `getUser`, `verifyEmail`, `re
   `Database` it is typed from that table's insertable columns (without the managed ones:
   `id`, `email`, `email_verified`, `created_at`, `deleted_at`). `session` is `null` while
   email verification is pending (`verificationRequired`).
-- Only the refresh token is stored (key `cheladb.<first 12 chars of the key>.refresh`), in
+- Only the refresh token is stored (key `chelabase.<first 12 chars of the key>.refresh`), in
   `localStorage` when present, otherwise in memory; pass `auth.storage` (`{ get, set, remove }`,
   sync or async) for anything else, such as React Native. The access token stays in memory.
 - The access token is refreshed 60 s before it expires (`autoRefresh: false` turns the timer
@@ -171,7 +171,7 @@ bound to that database: every request it sends carries the top-level `database` 
 batch carries it once; an operation inside a batch never names one). It keeps the bigint mode,
 and in that mode `db.database(name, types)` needs the `types` (they decode int8), which the type system enforces.
 
-`cheladb gen types --database analytics` writes that database as `Database`.
+`chelabase gen types --database analytics` writes that database as `Database`.
 `--all-databases` writes every database the key reaches: `Databases` (a key per database),
 `Database` (= `Databases["main"]`) and a `types` map keyed alike:
 

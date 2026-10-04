@@ -3,7 +3,7 @@ name = "rest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cheladb data API engine: JSON query language to SQL over a branch's compute"
+description = "Chelabase data API engine: JSON query language to SQL over a branch's compute"
 
 [lib]
 name = "rest"
@@ -16,9 +16,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
-cheladb-auth = { workspace = true }
-cheladb-query = { workspace = true }
-cheladb-types = { workspace = true }
+chelabase-auth = { workspace = true }
+chelabase-query = { workspace = true }
+chelabase-types = { workspace = true }
 dotenvy = { workspace = true }
 moka = { workspace = true }
 reqwest = { workspace = true }
@@ -36,10 +36,10 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-cheladb-auth = { workspace = true, features = ["keygen"] }
-cheladb-metadata = { workspace = true }
-cheladb-nats = { workspace = true }
-cheladb-neon = { workspace = true }
-cheladb-secrets = { workspace = true }
+chelabase-auth = { workspace = true, features = ["keygen"] }
+chelabase-metadata = { workspace = true }
+chelabase-nats = { workspace = true }
+chelabase-neon = { workspace = true }
+chelabase-secrets = { workspace = true }
 chrono = { workspace = true }
 worker = { path = "../worker" }

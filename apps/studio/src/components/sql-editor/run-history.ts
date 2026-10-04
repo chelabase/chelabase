@@ -17,10 +17,10 @@ export type HistoryEntry = {
 export const HISTORY_MAX = 100;
 export const DEFAULT_TIMEOUT_MS = 60_000;
 export const TIMEOUTS_MS = [60_000, 300_000, 900_000] as const;
-const TIMEOUT_KEY = "cheladb.sql.timeout";
+const TIMEOUT_KEY = "chelabase.sql.timeout";
 
-const historyKey = (sub: string, databaseId: string) => `cheladb.sql.history.${sub}.${databaseId}`;
-const bufferKey = (sub: string, databaseId: string) => `cheladb.sql.buffer.${sub}.${databaseId}`;
+const historyKey = (sub: string, databaseId: string) => `chelabase.sql.history.${sub}.${databaseId}`;
+const bufferKey = (sub: string, databaseId: string) => `chelabase.sql.buffer.${sub}.${databaseId}`;
 
 function read(key: string): string | null {
   try {

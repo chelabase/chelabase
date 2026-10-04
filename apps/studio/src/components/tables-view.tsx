@@ -10,7 +10,7 @@ import {
   useListRoles,
   type ColumnDesc,
   type TableDesc,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import {
   buildFilterTree,

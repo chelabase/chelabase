@@ -11,7 +11,7 @@ use std::pin::pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use cheladb_types::role_name::quote_ident;
+use chelabase_types::role_name::quote_ident;
 use futures_util::{Stream, StreamExt, stream};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};

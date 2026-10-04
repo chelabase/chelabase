@@ -19,9 +19,9 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{BranchDatabase, BranchKind, BranchRecord, BranchStatus, DatabaseRecord};
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::{ApiPath, BranchId};
+use chelabase_metadata::{BranchDatabase, BranchKind, BranchRecord, BranchStatus, DatabaseRecord};
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::{ApiPath, BranchId};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -58,8 +58,8 @@ const RESERVED_ROLES: [&str; 5] = [
     "cloud_admin",
     "neon_superuser",
     "authenticator",
-    "cheladb_admin",
-    "cheladb_auth_sync",
+    "chelabase_admin",
+    "chelabase_auth_sync",
 ];
 
 pub(crate) fn routes<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>
@@ -266,7 +266,7 @@ fn connect_failure(branch: BranchId, err: ConnectError) -> ApiError {
         ConnectError::Rejected { code, message } => {
             warn!(branch_id = %branch, code = %code, "SQL editor connect refused: {message}");
             match code.as_str() {
-                // The sealed password is the one Cheladb set: it was changed in SQL.
+                // The sealed password is the one Chelabase set: it was changed in SQL.
                 "28P01" => conflict(ErrorCode::OwnerPasswordUnknown, OWNER_PASSWORD_UNKNOWN),
                 "3D000" => database_not_found(),
                 "57P03" => unavailable("the branch's compute is starting up; try again"),
@@ -449,7 +449,7 @@ impl Drop for Audit {
         (status = 200, description = "The run's events as NDJSON, ending with `done`", content_type = "application/x-ndjson", body = String),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker couldn't let the owner use `anon` or `authenticated` (the message says why)", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker couldn't let the owner use `anon` or `authenticated` (the message says why)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch, the Postgres database or the role doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`sql_confirm_required`: the guard held statements back; `error.statements` lists them (`index`, `kind`: pg_query's node name or `unparsed`, `text_preview`: the first 200 characters, `reason`: `risky` or `protected`); send again with `confirm: true` to run them. `run_id_in_use`: you have a run with this id in flight; `owner_password_unknown`: the owner's password was set in SQL (reset it); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the body isn't the run's shape, `sql` isn't 1 byte to 1 MiB or holds a NUL byte, `timeout_ms` isn't 100 to 900000, `role` is empty, or `role` is a system role", body = ErrorEnvelope),
@@ -598,7 +598,7 @@ fn reserve_refusal(err: ReserveError) -> Response {
         (status = 202, description = "The cancel was sent", body = Object),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist, or you have no run with this id in flight", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -637,7 +637,7 @@ where
         (status = 200, description = "postgres-language-server's schema JSON (at most 8 MiB)", body = Object),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`owner_password_unknown`: the owner's password was set in SQL (reset it); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the query string is malformed; `schema_too_large`: the schema is over 8 MiB (use keyword completion)", body = ErrorEnvelope),

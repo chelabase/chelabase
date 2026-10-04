@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use cheladb_types::mode::Mode;
+use chelabase_types::mode::Mode;
 use serde_json::{Value, json};
 
 pub const KEY_EXPIRY: &str = "2099-01-01T00:00:00Z";
@@ -122,8 +122,8 @@ pub fn login_v2_optional(base_uri: &str) -> Value {
     json!({"loginV2": {"required": false, "baseUri": base_uri}})
 }
 
-pub const STUDIO_APP: &str = "cheladb-studio";
-pub const API_APP: &str = "cheladb-orchestrator";
+pub const STUDIO_APP: &str = "chelabase-studio";
+pub const API_APP: &str = "chelabase-orchestrator";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
@@ -193,7 +193,7 @@ pub fn machine_user_search(username: &str) -> Value {
 
 pub fn machine_user_create(org_id: &str, username: &str) -> Value {
     json!({"organizationId": org_id, "username": username,
-           "machine": {"name": "Cheladb Demo", "accessTokenType": "ACCESS_TOKEN_TYPE_JWT"}})
+           "machine": {"name": "Chelabase Demo", "accessTokenType": "ACCESS_TOKEN_TYPE_JWT"}})
 }
 
 /// From a `ListUsers` result or a `CreateUser` response.
@@ -223,8 +223,8 @@ pub fn key_file_from(created: &Value) -> Result<String> {
 
 /// Zitadel needs SMTP credentials even though Mailpit accepts any.
 pub fn smtp_payload(host: &str) -> Value {
-    json!({"senderAddress": "noreply@localhost", "senderName": "Cheladb (local)", "tls": false,
-           "host": host, "user": "cheladb", "password": "cheladb", "description": "cheladb local mailpit"})
+    json!({"senderAddress": "noreply@localhost", "senderName": "Chelabase (local)", "tls": false,
+           "host": host, "user": "chelabase", "password": "chelabase", "description": "chelabase local mailpit"})
 }
 
 /// `(id, active)` of the SMTP configuration for `host`, from `/admin/v1/smtp/_search`.
@@ -297,12 +297,12 @@ mod tests {
     #[test]
     fn projects_are_found_by_exact_name() {
         assert_eq!(
-            project_search("cheladb"),
-            json!({"filters": [{"projectNameFilter": {"projectName": "cheladb", "method": "TEXT_FILTER_METHOD_EQUALS"}}]})
+            project_search("chelabase"),
+            json!({"filters": [{"projectNameFilter": {"projectName": "chelabase", "method": "TEXT_FILTER_METHOD_EQUALS"}}]})
         );
         assert_eq!(
-            project_create("o1", "cheladb"),
-            json!({"organizationId": "o1", "name": "cheladb"})
+            project_create("o1", "chelabase"),
+            json!({"organizationId": "o1", "name": "chelabase"})
         );
         assert_eq!(
             project_id_from(&json!({"projects": [{"projectId": "p1"}]})).as_deref(),
@@ -317,12 +317,12 @@ mod tests {
     #[test]
     fn apps_are_found_by_name_with_their_client_id() {
         let listed = json!({"applications": [
-            {"applicationId": "a1", "name": "cheladb-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
-            {"applicationId": "a2", "name": "cheladb-studio", "oidcConfiguration": {"clientId": "c-spa", "redirectUris": ["x"]}}
+            {"applicationId": "a1", "name": "chelabase-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
+            {"applicationId": "a2", "name": "chelabase-studio", "oidcConfiguration": {"clientId": "c-spa", "redirectUris": ["x"]}}
         ]});
-        let api = find_app(&listed, "cheladb-orchestrator").unwrap();
+        let api = find_app(&listed, "chelabase-orchestrator").unwrap();
         assert_eq!((api.id.as_str(), api.client_id.as_str()), ("a1", "c-api"));
-        let spa = find_app(&listed, "cheladb-studio").unwrap();
+        let spa = find_app(&listed, "chelabase-studio").unwrap();
         assert_eq!(spa.client_id, "c-spa");
         assert!(find_app(&listed, "other").is_none());
     }
@@ -343,7 +343,7 @@ mod tests {
         assert!(c.get("loginVersion").is_none(), "{c}");
         let create = studio_app_create("p1", Mode::Platform);
         assert_eq!(create["oidcConfiguration"], c);
-        assert_eq!(create["name"], "cheladb-studio");
+        assert_eq!(create["name"], "chelabase-studio");
         for mode in [Mode::SelfHosted, Mode::Platform] {
             let update = studio_app_update("p1", "a2", mode);
             assert_eq!(update["applicationId"], "a2");
@@ -401,8 +401,8 @@ mod tests {
         let login = |uri: &str| json!({"loginV2": {"baseUri": uri}});
         let listed = |config: Value| {
             json!({"applications": [
-                {"applicationId": "a1", "name": "cheladb-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
-                {"applicationId": "a2", "name": "cheladb-studio", "oidcConfiguration": config}
+                {"applicationId": "a1", "name": "chelabase-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
+                {"applicationId": "a2", "name": "chelabase-studio", "oidcConfiguration": config}
             ]})
         };
         assert!(studio_app_lacks_login(&listed(json!({"clientId": "c0"}))));
@@ -451,11 +451,11 @@ mod tests {
     #[test]
     fn the_demo_machine_user_and_its_key() {
         assert_eq!(
-            machine_user_search("cheladb-demo"),
-            json!({"queries": [{"userNameQuery": {"userName": "cheladb-demo", "method": "TEXT_QUERY_METHOD_EQUALS"}}]})
+            machine_user_search("chelabase-demo"),
+            json!({"queries": [{"userNameQuery": {"userName": "chelabase-demo", "method": "TEXT_QUERY_METHOD_EQUALS"}}]})
         );
-        let create = machine_user_create("o1", "cheladb-demo");
-        assert_eq!(create["username"], "cheladb-demo");
+        let create = machine_user_create("o1", "chelabase-demo");
+        assert_eq!(create["username"], "chelabase-demo");
         assert_eq!(
             create["machine"]["accessTokenType"],
             "ACCESS_TOKEN_TYPE_JWT"
@@ -489,6 +489,6 @@ mod tests {
             Some(("s2".to_string(), false))
         );
         assert_eq!(smtp_payload("mailpit:1025")["host"], "mailpit:1025");
-        assert_eq!(smtp_payload("mailpit:1025")["password"], "cheladb");
+        assert_eq!(smtp_payload("mailpit:1025")["password"], "chelabase");
     }
 }

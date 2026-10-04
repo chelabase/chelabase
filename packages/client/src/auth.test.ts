@@ -5,7 +5,7 @@ import type { Recorded } from "./test-fetch.ts";
 
 const url = "http://localhost:8000";
 const key = "chk_pub_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
-const STORE_KEY = "cheladb.chk_pub_0123.refresh";
+const STORE_KEY = "chelabase.chk_pub_0123.refresh";
 
 const user = { id: "u1", email: "a@b.co", email_verified: true, created_at: "2026-10-03T00:00:00Z" };
 
@@ -81,11 +81,11 @@ describe("auth", () => {
     expect(m.get(STORE_KEY)).toBe("rt1");
     expect([...m.values()]).not.toContain(sess.access_token);
     const signIn = fetch.to("/auth/v1/app/sign-in")[0]!;
-    expect(hdr(signIn, "cheladb-user")).toBeNull();
+    expect(hdr(signIn, "chelabase-user")).toBeNull();
     expect(JSON.parse(signIn.init.body as string)).toEqual({ email: "a@b.co", password: "pw" });
     await db.from("t").select("id");
     const q = fetch.to("/data/v1/query")[0]!;
-    expect(hdr(q, "cheladb-user")).toBe(sess.access_token);
+    expect(hdr(q, "chelabase-user")).toBe(sess.access_token);
     expect(hdr(q, "authorization")).toBe(`Bearer ${key}`);
   });
 
@@ -96,7 +96,7 @@ describe("auth", () => {
     const r = await db.auth.signUp({ email: "a@b.co", password: "pw", data: { nick: "x" } });
     expect(r).toEqual({ user, session: sess, verificationRequired: false });
     const c = fetch.calls[0]!;
-    expect(hdr(c, "cheladb-user")).toBeNull();
+    expect(hdr(c, "chelabase-user")).toBeNull();
     expect(JSON.parse(c.init.body as string)).toEqual({ email: "a@b.co", password: "pw", data: { nick: "x" } });
   });
 
@@ -122,7 +122,7 @@ describe("auth", () => {
     expect(a).toEqual(b);
     expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
     expect(JSON.parse(fetch.calls[0]!.init.body as string)).toEqual({ refresh_token: "rt1" });
-    expect(hdr(fetch.calls[0]!, "cheladb-user")).toBeNull();
+    expect(hdr(fetch.calls[0]!, "chelabase-user")).toBeNull();
     expect(m.get(STORE_KEY)).toBe("rt2");
   });
 
@@ -141,7 +141,7 @@ describe("auth", () => {
     expect(fetch.calls).toHaveLength(0);
     await db.from("t").select("id");
     expect(fetch.calls.map((c) => new URL(c.url).pathname)).toEqual(["/auth/v1/app/refresh", "/data/v1/query"]);
-    expect(hdr(fetch.calls[1]!, "cheladb-user")).toBe(sess.access_token);
+    expect(hdr(fetch.calls[1]!, "chelabase-user")).toBe(sess.access_token);
   });
 
   test("expired_access_refreshes_once_and_retries", async () => {
@@ -151,7 +151,7 @@ describe("auth", () => {
       "/auth/v1/app/sign-in": () => ({ body: s1 }),
       "/auth/v1/app/refresh": () => ({ body: s2 }),
       "/data/v1/query": (c) =>
-        hdr(c, "cheladb-user") === s1.access_token ? err(401, "user_token_expired") : { body: [{ id: 1 }] },
+        hdr(c, "chelabase-user") === s1.access_token ? err(401, "user_token_expired") : { body: [{ id: 1 }] },
     });
     const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s, autoRefresh: false } });
     await db.auth.signIn({ email: "a@b.co", password: "pw" });
@@ -159,7 +159,7 @@ describe("auth", () => {
     expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
     const q = fetch.to("/data/v1/query");
     expect(q).toHaveLength(2);
-    expect(hdr(q[1]!, "cheladb-user")).toBe(s2.access_token);
+    expect(hdr(q[1]!, "chelabase-user")).toBe(s2.access_token);
   });
 
   test("expired_twice_throws_after_one_retry", async () => {
@@ -199,7 +199,7 @@ describe("auth", () => {
     const s1 = session(1);
     const fetch = router({
       "/auth/v1/app/sign-in": () => ({ body: s1 }),
-      "/data/v1/query": (c) => (hdr(c, "cheladb-user") === null ? { body: [] } : err(401, "user_session_revoked")),
+      "/data/v1/query": (c) => (hdr(c, "chelabase-user") === null ? { body: [] } : err(401, "user_session_revoked")),
     });
     const { s, m } = memoryStorage();
     const db = createClient({ url, key, fetch, auth: { storage: s, autoRefresh: false } });
@@ -215,7 +215,7 @@ describe("auth", () => {
     expect(await db.from("t").select("id")).toEqual([]);
     const q = fetch.to("/data/v1/query");
     expect(q).toHaveLength(2);
-    expect(hdr(q[1]!, "cheladb-user")).toBeNull();
+    expect(hdr(q[1]!, "chelabase-user")).toBeNull();
   });
 
   test("user_call_session_revoked_signs_out_locally", async () => {
@@ -264,7 +264,7 @@ describe("auth", () => {
     expect(m.size).toBe(0);
     expect(events).toEqual(["signed_in", "signed_out"]);
     await db.from("t").select("id");
-    expect(hdr(fetch.to("/data/v1/query")[0]!, "cheladb-user")).toBeNull();
+    expect(hdr(fetch.to("/data/v1/query")[0]!, "chelabase-user")).toBeNull();
   });
 
   test("auto_refresh_60s_before_exp", async () => {
@@ -355,11 +355,11 @@ describe("auth", () => {
     const got = await db.auth.changePassword({ currentPassword: "pw", password: "pw2" });
     expect(got).toEqual(s2);
     const c = fetch.to("/auth/v1/app/change-password")[0]!;
-    expect(hdr(c, "cheladb-user")).toBe(s1.access_token);
+    expect(hdr(c, "chelabase-user")).toBe(s1.access_token);
     expect(JSON.parse(c.init.body as string)).toEqual({ current_password: "pw", password: "pw2" });
     expect(m.get(STORE_KEY)).toBe("rt2");
     await db.from("t").select("id");
-    expect(hdr(fetch.to("/data/v1/query")[0]!, "cheladb-user")).toBe(s2.access_token);
+    expect(hdr(fetch.to("/data/v1/query")[0]!, "chelabase-user")).toBe(s2.access_token);
   });
 
   test("user_scoped_calls_send_header_and_public_calls_do_not", async () => {
@@ -381,13 +381,13 @@ describe("auth", () => {
     await db.auth.resendCode({ email: "a@b.co" });
     await db.auth.requestPasswordReset({ email: "a@b.co" });
     await db.auth.confirmPasswordReset({ email: "a@b.co", code: "1", password: "x" });
-    for (const c of fetch.calls.slice(1)) expect(hdr(c, "cheladb-user")).toBeNull();
+    for (const c of fetch.calls.slice(1)) expect(hdr(c, "chelabase-user")).toBeNull();
     expect(await db.auth.getUser()).toEqual(user);
     expect(fetch.to("/auth/v1/app/user")[0]!.init.method).toBe("GET");
     await db.auth.changeEmail({ email: "n@b.co" });
     await db.auth.signOut();
     for (const p of ["user", "change-email", "sign-out"]) {
-      expect(hdr(fetch.to(`/auth/v1/app/${p}`)[0]!, "cheladb-user")).toBe(s1.access_token);
+      expect(hdr(fetch.to(`/auth/v1/app/${p}`)[0]!, "chelabase-user")).toBe(s1.access_token);
     }
   });
 
@@ -424,7 +424,7 @@ describe("auth", () => {
     const db = createClient({ url, key, fetch, auth: { storage: s, autoRefresh: false } });
     await db.auth.signOut();
     expect(JSON.parse(fetch.calls[0]!.init.body as string)).toEqual({ refresh_token: "rt9" });
-    expect(hdr(fetch.calls[0]!, "cheladb-user")).toBeNull();
+    expect(hdr(fetch.calls[0]!, "chelabase-user")).toBeNull();
     expect(m.size).toBe(0);
   });
 });

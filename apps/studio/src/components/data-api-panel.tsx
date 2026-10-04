@@ -8,7 +8,7 @@ import {
   useListKeys,
   type Branch,
   type BranchDatabaseView,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { pollWhile } from "@/lib/query";

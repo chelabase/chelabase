@@ -3,12 +3,14 @@
 **Date:** 2026-09-28
 **Status:** Direction agreed in conversation. Each step still gets its own spec, plan and approval before any build.
 
+> Names before 2026-10-04 use Cheladb (`cheladb`, `CHELADB_*`, `.cheladb/`); see `docs/superpowers/specs/2026-10-04-product-rename-design.md`.
+
 ## Where we are
 
 On `main`:
 - **HTTP gateway** (Pingora, `services/gateway`).
 - **Studio sign-in** through our own pages and `auth` on Zitadel v4.19.1, with a landing page and create-database.
-- **Repo layout** (merged): `apps/studio` only; backends under `services/` (gateway, orchestrator, worker, auth); CLI at `tools/cli`; `cheladb dev bootstrap` / `dev token`.
+- **Repo layout** (merged): `apps/studio` only; backends under `services/` (gateway, orchestrator, worker, auth); CLI at `tools/cli`; `chelabase dev bootstrap` / `dev token`.
 - **Database lifecycle** on Neon (step 4): one tenant, timeline and compute container per database, reached through Neon's proxy:
   - owner role `postgres` plus the data API roles `anon`, `authenticated` and `authenticator`
   - encrypted, re-revealable credentials
@@ -16,13 +18,29 @@ On `main`:
   - delete by tombstone
   - reconcile over endpoints, computes and tenants
 - **Neon storage stack** (step 1, done): starts with `just deps-up` and backs every database since step 4.
-- **`crates/cheladb-neon`** (step 2, done): the storage-controller client, compute spec, SCRAM, LSNs, compute JWTs and Neon ids. The worker and the orchestrator use it.
+- **`crates/chelabase-neon`** (step 2, done): the storage-controller client, compute spec, SCRAM, LSNs, compute JWTs and Neon ids. The worker and the orchestrator use it.
 - **Internal control-plane listener and Neon's proxy** (step 3, done): the orchestrator's internal listener on `127.0.0.1:8083` (proxy API, compute specs, storage-controller hooks), Neon's proxy on `4432` (Postgres) and `4444` (WebSocket and SQL over HTTP), and Valkey for the proxy's cache and query cancel. Merged into local `main` on 2026-09-29, not pushed.
 - **Provisioning on Neon** (step 4, done): merged into local `main` on 2026-09-30, not pushed.
 
 Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 
 ## Resume here (handoff, 2026-09-29)
+
+> **Product rename Cheladb → Chelabase (2026-10-04): spec and plan approved; T1–T8 done; the end-of-step review's fix batch applied; waiting on the user's demo.env live run and merge (see the plan's Status).** Branch `product-rename` (`.worktrees/product-rename`). Spec with decisions D1–D8 and rulings R1–R4: `docs/superpowers/specs/2026-10-04-product-rename-design.md`. Plan and Status (rulings P1–P5, models, waves): `docs/superpowers/plans/2026-10-04-product-rename.md`. **Next:** see the plan's Status "Current" line; `continue step product-rename` resumes from it.
+>
+> **Second computer, after the product rename merges (runbook, 2026-10-04):** do these in order, in the main checkout unless noted.
+>
+> 1. **Stop the old stack BEFORE pulling, with the old code** (after the pull `just dev-down` reads `.chelabase/dev/pids`, so the old host apps would keep their ports). Check `just live-status` shows no holder. If `just stack-reset-slots` hasn't run on this machine yet, run it first (it ends with `just deps-up`, and after the pull it looks for the wrong names). Then `just dev-down` (it reads `.cheladb/dev/pids`), `docker compose -p cheladb stop`, and stop the computes labelled `cheladb.dev/endpoint-id` (`docker ps -q --filter label=cheladb.dev/endpoint-id | xargs -r docker stop`).
+> 2. `git fetch && git pull` on `main`.
+> 3. Copy the key files from `.cheladb/` to `.chelabase/`, unchanged and never regenerated: `mkdir -p -m 700 .chelabase/secrets .chelabase/gateway .chelabase/auth .chelabase/neon`, then `cp -p` each of `secrets/secrets.key`, `gateway/internal-signing.pem`, `gateway/internal-verify.pem`, `auth/app-jwt.key`, `auth/app-jwt.pub`, `auth/cookie.key`, `neon/compute-jwt.pem` and `neon/compute-jwt.pub` (8 files; `compute_jwt::ensure` needs the pair) to the same subpath under `.chelabase/`. Don't copy `zitadel/`, `dev/` or `live/`; bootstrap and the live queue recreate them.
+> 3a. Re-point each existing worktree (`.worktrees/*`), which still has a `.cheladb` symlink: `rm <wt>/.cheladb` (a symlink), then `ln -s <main>/.chelabase <wt>/.chelabase`; or remove and re-add the worktrees with `just wt-remove` / `just wt-add`. Otherwise code run from a worktree makes a fresh, divergent key set there.
+> 4. Rewrite any ignored env file (`apps/studio/.env.local`, `infra/compose/.env`): `perl -pi -e '<MAP>' <file>`, where `<MAP>` is the `MAP` string in `scripts/rename-chelabase.sh` (keep-list masks first, then `ChelaDB`, `CHELADB`, `Cheladb`, `cheladb` to their `Chelabase` forms).
+> 5. Fork clones: rename the folders (`ChelaDB-neon` → `chelabase-neon`, `ChelaDB-postgres` → `chelabase-postgres`). In the neon clone, fix the v17 submodule's single-branch fetch refspec to the renamed branch: `git -C vendor/postgres-v17 config remote.origin.fetch '+refs/heads/REL_17_STABLE_chelabase:refs/remotes/origin/REL_17_STABLE_chelabase'`. Then in each clone: `git fetch --prune`, `git submodule sync --recursive` (it matters in the neon clone), check out the renamed branches (`chelabase/simple-query-tags-v2` and `REL_*_STABLE_chelabase`), and rename or delete the stale local `REL_*_STABLE_cheladb` branches.
+> 6. `just live just deps-up`, then `just live just dev` (dev bootstraps Zitadel on fresh volumes; don't run `just zitadel-bootstrap` first, its PATs only appear after deps-up), then one e2e run (for example `just live just neon-e2e`).
+> 7. Make sure `.claude/settings.json` (`worktree.bgIsolation: "none"`) is present after the pull. It is committed on `main` separately by the user.
+> 8. Only after a passing run, remove the old stack: `docker compose -p cheladb down -v` (this also removes the `cheladb_default` network).
+
+> **Org renamed (2026-10-04):** the GitHub org `ChelaDB` is now **`chelabase`** (repos `chelabase/chelabase`, `chelabase/neon`, `chelabase/postgres`, `chelabase/rust-postgres`, plus the archived `cheladb-v1` and `-pre-replay` repos); GHCR images moved to `ghcr.io/chelabase/...` (same digests); the user claimed an empty placeholder org `ChelaDB`, so old `github.com/ChelaDB/...` URLs no longer resolve. All references switched (`d6172fb`; fork PRs `chelabase/neon#1`, `chelabase/postgres#1`); verified: cargo build, neon-test 125, deps-up from `ghcr.io/chelabase`, neon-e2e. **Second computer:** set `origin` to `https://github.com/chelabase/<repo>.git` in this repo and the fork clones, pull, and `git submodule sync --recursive` in the neon clone. **Next:** the product rename (Cheladb → Chelabase) with the local folder move.
 
 > **Repo moved (2026-10-03):** `chelabase/cheladb-v1` was replayed into **`chelabase/chelabase`** (private) with every commit attributed to `<maintainer>` (noreply email), the old identity scrubbed from all files, original dates kept, and commit SHAs mentioned in docs remapped (verified independently: 1007 commits, 0 leftover old SHAs). Only `main` was carried over (every branch was merged). `cheladb-v1` is archived (read-only); its SHAs differ from this repo's. **Second computer:** switch before committing anything (`git remote set-url origin https://github.com/chelabase/chelabase.git && git fetch --prune && git reset --hard origin/main`, then delete the old local branches), or clone fresh. **Planned next (user, 2026-10-03):** the product rename Cheladb → Chelabase as forward commits only (history keeps the old name), with a full wipe of dev data; then optionally renaming the GitHub org `ChelaDB` → `chelabase` (repos redirect; GHCR images move to `ghcr.io/chelabase` and need re-pinning; claim the old org name right after). Naming decisions still open: casing, CLI name, env prefix, org name. **Order (user, 2026-10-03):** 1. replay the public forks (`postgres`, then `neon` with submodule pins remapped, then `rust-postgres`) for the same attribution fix, then re-tag the images and update `NEON_REF`/pins in `chelabase` (dry run done and verified independently; user's decisions 2026-10-04: the 36 PR merge commits' personal email also becomes the noreply address; old `neon`/`postgres` repos are renamed `<repo>-pre-replay`, made private and archived, and new public repos get the rewritten history; `rust-postgres`'s rewritten commit goes to a new branch `cheladb/simple-query-tags-v2` (old branch deleted after the repin passes; `b52c5ab` stays fetchable by SHA in the fork network; no Support request); new `NEON_REF` `8ae1b8f227e9…`, image tag `8ae1b8f227e9-dev`, Cargo rev `d20c5b3…`. **Done 2026-10-04:** forks pushed (new public `chelabase/neon` `main` `8ae1b8f227e9`, `chelabase/postgres` `REL_17_STABLE_cheladb` `d0a909f41b16`; old repos private and archived as `-pre-replay`; `rust-postgres` branch `cheladb/simple-query-tags-v2` `d20c5b3`), images re-tagged `:8ae1b8f227e9-dev` (same digests), the five GHCR packages re-linked to the new `chelabase/neon` by the user, and `chelabase` repinned on branch `fork-replay-pins` (gates passed). Left: after that branch merges, delete `chelabase/rust-postgres` `cheladb/simple-query-tags`; reset the local fork clones on both computers. Then order item 2 (org rename).); 2. org rename; 3. product rename across `chelabase` and the forks. **Local folder (user, 2026-10-03):** after the rename merges, move this machine to `<repo root>`: fresh clone, copy the ignored state (`.cheladb/` with secrets and key pairs, never regenerated; `apps/studio/.env.local`; local `.claude/` settings), copy `<claude project dir>/` (memory and transcripts) to `<project>/`, rebuild `node_modules`/`target`; keep the old folder until `just dev` and an e2e pass work from the new one. Pooling decision: see "Before platform mode".
 
@@ -81,12 +99,12 @@ Decisions made while brainstorming step 4 (details in its spec):
 **Findings from step 3 (Tasks 8-10):**
 - **No extra proxy flags were needed.** `@neondatabase/serverless` 1.1.0 works with `wsProxy = <ep>.localtest.me:4444/v2` and `fetchEndpoint = https://<ep>.localtest.me:4444/sql`, the proxy CA through `NODE_EXTRA_CA_CERTS`, and Node 24's built-in `WebSocket`.
 - **`localtest.me` also resolves to `::1`.** The proxy publishes on 127.0.0.1 only, so psql is refused before it falls back; use `hostaddr=127.0.0.1` (the hostname still drives SNI and certificate checks).
-- **`host.docker.internal` differs by host.** Docker Desktop (WSL2) reaches the host's 127.0.0.1. On native Linux Docker it is the bridge gateway, so set `CHELADB_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`).
+- **`host.docker.internal` differs by host.** Docker Desktop (WSL2) reaches the host's 127.0.0.1. On native Linux Docker it is the bridge gateway, so set `CHELABASE_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`).
 - **Refusals:** a wrong password gets `password authentication failed for user 'postgres'` on 4432 and HTTP 400 with the same message on `/sql`; an unknown endpoint answers the same way. Tests assert the message, since a downed proxy would also "not return 200".
 - **Cache-TTL timing in `just neon-e2e`.** The check that the proxy still serves the cached secret must run within the 1-minute TTL of the first connect, so the script builds `cheladb` and computes the new verifier before creating the compute. A full run takes about 10 s after the build.
 
 **Findings to carry forward (environment and tooling):**
-- **Setting up a new computer (done on the second one, 2026-10-01):** `proto install` (just, node, pnpm, moon); `proto pin --to global node 24.21.0`, `pnpm 12.6.0` and `moon 2.5.5` (so tools also resolve outside the repo; keep them equal to `.prototools`); rustup stable (added to `~/.bashrc` with `. "$HOME/.cargo/env"`); cargo-nextest (prebuilt from get.nexte.st); `sudo apt-get install -y cmake jq postgresql-client clang protobuf-compiler` (clang and protoc for pg_query, step 6d); Docker Desktop's WSL integration plus the `docker` group; (the Neon images on ghcr.io are public, so no login is needed); then `just wt-add <branch>`, `just deps-up`, `just zitadel-bootstrap` (fresh `.cheladb` keys on each machine) and `just dev`.
+- **Setting up a new computer (done on the second one, 2026-10-01):** `proto install` (just, node, pnpm, moon); `proto pin --to global node 24.21.0`, `pnpm 12.6.0` and `moon 2.5.5` (so tools also resolve outside the repo; keep them equal to `.prototools`); rustup stable (added to `~/.bashrc` with `. "$HOME/.cargo/env"`); cargo-nextest (prebuilt from get.nexte.st); `sudo apt-get install -y cmake jq postgresql-client clang protobuf-compiler` (clang and protoc for pg_query, step 6d); Docker Desktop's WSL integration plus the `docker` group; (the Neon images on ghcr.io are public, so no login is needed); then `just wt-add <branch>`, `just deps-up`, `just zitadel-bootstrap` (fresh `.chelabase` keys on each machine) and `just dev`.
 - **Ephemeral ports run out on this machine.** WSL's `net.ipv4.ip_local_port_range` is `44620 48715`, about 4,000 ports. Many test and e2e runs in a row leave around 10,000 sockets in TIME-WAIT, and then `bind("127.0.0.1:0")` fails in the gateway and `auth` tests. It looks like flakiness but isn't. To fix it:
   - wait a minute or two; or
   - widen the range: `sudo sysctl -w net.ipv4.ip_local_port_range="32768 60999"`. This is the user's machine, so it hasn't been changed.
@@ -98,7 +116,7 @@ Decisions made while brainstorming step 4 (details in its spec):
   ```
 
   It needs the browser build that matches `@playwright/mcp`, installed with `pnpm dlx @playwright/mcp@latest install-browser chrome-for-testing`. Its output goes to `.playwright-mcp/`, which is git-ignored. The browser also needs a few system libraries: `sudo apt-get install -y libnss3 libnspr4 libasound2t64` (`libasound2` on older Ubuntu); check with `ldd ~/.cache/ms-playwright/*/chrome-linux64/chrome | grep 'not found'`. Use pnpm, never npx.
-- **Starting apps outside `just dev`:** anything started by hand isn't in `.cheladb/dev/pids`, so `just stop` doesn't kill it, and the next `just dev` fails with "Address already in use". `just cleanup` also stops anything on the dev ports.
+- **Starting apps outside `just dev`:** anything started by hand isn't in `.chelabase/dev/pids`, so `just stop` doesn't kill it, and the next `just dev` fails with "Address already in use". `just cleanup` also stops anything on the dev ports.
 - **Studio and the gateway must be the same site** (`localhost`, not `127.0.0.1`). Otherwise browsers drop `auth`'s `SameSite=Strict` cookies. Bootstrap writes `VITE_API_URL=http://localhost:8000`, and a test pins this.
 - **TanStack Router JSON-parses search params by default.** Studio replaces the parser (`src/lib/search.ts`) so that all-digit Zitadel ids and codes stay strings.
 - **Zitadel v4 behaviours:**
@@ -118,7 +136,7 @@ Decisions made while brainstorming step 4 (details in its spec):
 | compute image (Postgres 17 + neon extension) and `compute_ctl` | **Adopt unchanged** | Plain Postgres can't read from the pageserver. `compute_ctl` starts Postgres from a JSON spec served by the control plane. |
 | **proxy** (Postgres wire) | **Adopt instead of writing our own pgproxy** | It already does SCRAM, routing by SNI (`<endpoint>.<domain>`), caching of wake results, retries while a compute boots, and rate limits. Its dependency on the control plane is only three calls. |
 | Control plane | **Build it ourselves** | Neon's is closed source. |
-| NeonVM, autoscaler-agent, vm-monitor | **Drop** | They're tied to Kubernetes and KVM. We replace them with our own **Docker-native compute runtime**, where Cheladb can actually be better than Neon. |
+| NeonVM, autoscaler-agent, vm-monitor | **Drop** | They're tied to Kubernetes and KVM. We replace them with our own **Docker-native compute runtime**, where Chelabase can actually be better than Neon. |
 | Neon's Data API | **Not available; build our own** | See the data API section below. |
 
 ### What Neon's proxy needs from us
@@ -131,7 +149,7 @@ Decisions made while brainstorming step 4 (details in its spec):
 | `GET wake_compute?endpointish=` | `address` (host:port of the compute), `server_name` |
 | `GET /endpoints/{id}/jwks` | JWKS; only needed for the proxy's JWT path |
 
-- The proxy's **serverless side is on, in password mode** (`--wss`: WebSocket and SQL-over-HTTP), so Neon's serverless driver (`@neondatabase/serverless`) works against Cheladb. It needs nothing beyond the two calls above. (Changed 2026-09-28 during step 3; the first draft kept it off. We'll be patching Neon anyway, so splitting HTTP between Pingora and the proxy is acceptable.)
+- The proxy's **serverless side is on, in password mode** (`--wss`: WebSocket and SQL-over-HTTP), so Neon's serverless driver (`@neondatabase/serverless`) works against Chelabase. It needs nothing beyond the two calls above. (Changed 2026-09-28 during step 3; the first draft kept it off. We'll be patching Neon anyway, so splitting HTTP between Pingora and the proxy is acceptable.)
 - The proxy's **JWT mode** (`--is-auth-broker`) stays off until step 6. At the pinned ref it replaces password auth on HTTP rather than adding to it, and it needs the `/jwks` call, `local_proxy` on the compute and `pg_session_jwt`. It depends on the data API's end-user identity decision.
 - The proxy's **REST broker** (`--is-rest-broker`) stays off for good: its engine is closed (see the data API section).
 - That gives these front doors:
@@ -150,7 +168,7 @@ We build them from source at a pinned commit, with pulling as a shortcut:
 - Port a trimmed `infra/neon/` from the old repo: `NEON_REF` plus a build script for the `neon` and `compute-node` images only, with no NeonVM.
 - `just neon-build` shallow-clones upstream at `NEON_REF` and builds. The first build needs about 40 GB of free disk and about 40 minutes.
 - `just deps-up` uses local images when they exist, and otherwise pulls the matching `ghcr.io/chelabase/{neon-storage,neon-compute-v17}` `-dev` images pinned by digest.
-- ~~We don't vendor or fork the Neon source.~~ Superseded: the fork is `chelabase/neon` (spec `docs/superpowers/specs/2026-10-01-neon-fork-design.md`, plan `docs/superpowers/plans/2026-10-01-neon-fork.md`, repos `chelabase/neon` and `chelabase/postgres`); cheladb-v1 only pins its commit and its images.
+- ~~We don't vendor or fork the Neon source.~~ Superseded: the fork is `chelabase/neon` (spec `docs/superpowers/specs/2026-10-01-neon-fork-design.md`, plan `docs/superpowers/plans/2026-10-01-neon-fork.md`, repos `chelabase/neon` and `chelabase/postgres`); chelabase only pins its commit and its images.
 
 ### Reuse the old repo (`<repo root>`)
 
@@ -192,7 +210,7 @@ It's your own public Apache-2.0 code, and it already implements a working Neon c
 
 - **Our model:** tenant → project → database, where one database is one container.
 - **Neon's model:** tenant → timeline (branch) → endpoint (compute) → roles and databases.
-- **The mapping:** one Cheladb database becomes one Neon tenant, with a `main` branch, one endpoint and the `postgres` owner role. A branch is a later addition: another timeline under the same database.
+- **The mapping:** one Chelabase database becomes one Neon tenant, with a `main` branch, one endpoint and the `postgres` owner role. A branch is a later addition: another timeline under the same database.
 
 ### What changes in the scaffold when provisioning moves to Neon
 
@@ -219,7 +237,7 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
 
 **Where it doesn't help:**
 - **NATS** stays the job queue and request/reply bus; Valkey doesn't replace it.
-- **The JWKS cache in `cheladb-auth`** is per process with a 10-minute TTL, and should stay that way; sharing it gains nothing.
+- **The JWKS cache in `chelabase-auth`** is per process with a 10-minute TTL, and should stay that way; sharing it gains nothing.
 
 ### Platform mode: notes for later
 
@@ -229,7 +247,7 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
 - **Parked (user, 2026-10-02): fork multixact redo.** The pageserver's Rust `MultixactOffsetCreate` redo (`pageserver/src/walredo/apply_neon.rs` in chelabase/neon) doesn't mirror upstream's 'Set next multixid's offset' change (17.x, 16.12, 15.16, 14.21). `TrimMultiXact()` covers normal starts; after a crash with an assigned-but-unlogged multixid, readers get `MultiXact %u has invalid next offset`. The fix must also handle the next entry on the next SLRU page. Do it before platform mode.
 - (The event-trigger escalation fix, fork Task 11a, is merged and shipped in the fork images; no longer a blocker.)
 
-- **Connection pooling for direct connections (user, 2026-10-03): PgBouncer as a sidecar in each compute pod, for now.** Today only the data API (`rest`'s per-branch sqlx pools) and the proxy's HTTP/WebSocket path pool; plain Postgres connections through the proxy (:4432) reach the compute 1:1. The compute image already ships PgBouncer (1.24.1 in the fork's `compute-node.Dockerfile`; 1.26.0 is current) and `compute_ctl` already applies `pgbouncer_settings` (`tune_pgbouncer`, k8s branch). Work left: start PgBouncer in the pod, send `pgbouncer_settings` in our spec (`crates/cheladb-neon/src/spec.rs`), route pooled hostnames through the proxy to :6432, and choose its auth (auth_query or SCRAM pass-through; identical verifiers, see `docs/superpowers/specs/2026-10-01-sql-roles-research.md`). Rejected for now: a shared pooler tier (PgDog: AGPL v3 would put a copyleft component in the self-hosted install, and it is still 0.x; Supavisor: a BEAM runtime and Supabase's design); PgCat is unmaintained. Revisit PgDog (as an optional component) only for sharding or replica routing. **Self-hosted mode (user, 2026-10-03): the same sidecar design.** The worker's Docker backend (`crates/cheladb-neon/src/compute.rs`, bollard) starts a PgBouncer container per compute sharing the compute's network namespace (`NetworkMode: container:<compute>`, Docker's pod-sidecar equivalent), so both modes share one design and one proxy routing rule. Off by default in self-hosted (dev) mode, with an opt-in switch.
+- **Connection pooling for direct connections (user, 2026-10-03): PgBouncer as a sidecar in each compute pod, for now.** Today only the data API (`rest`'s per-branch sqlx pools) and the proxy's HTTP/WebSocket path pool; plain Postgres connections through the proxy (:4432) reach the compute 1:1. The compute image already ships PgBouncer (1.24.1 in the fork's `compute-node.Dockerfile`; 1.26.0 is current) and `compute_ctl` already applies `pgbouncer_settings` (`tune_pgbouncer`, k8s branch). Work left: start PgBouncer in the pod, send `pgbouncer_settings` in our spec (`crates/chelabase-neon/src/spec.rs`), route pooled hostnames through the proxy to :6432, and choose its auth (auth_query or SCRAM pass-through; identical verifiers, see `docs/superpowers/specs/2026-10-01-sql-roles-research.md`). Rejected for now: a shared pooler tier (PgDog: AGPL v3 would put a copyleft component in the self-hosted install, and it is still 0.x; Supavisor: a BEAM runtime and Supabase's design); PgCat is unmaintained. Revisit PgDog (as an optional component) only for sharding or replica routing. **Self-hosted mode (user, 2026-10-03): the same sidecar design.** The worker's Docker backend (`crates/chelabase-neon/src/compute.rs`, bollard) starts a PgBouncer container per compute sharing the compute's network namespace (`NetworkMode: container:<compute>`, Docker's pod-sidecar equivalent), so both modes share one design and one proxy routing rule. Off by default in self-hosted (dev) mode, with an opt-in switch.
 
 - **API reference UI (user, 2026-10-01):** self-hosted mode serves Swagger UI with its assets embedded (`utoipa-swagger-ui`, `vendored`; works offline), at `/v1/docs` behind the gateway and on Studio's API page (the API-client chore, branch `api-client`). When platform mode is built, consider offering **Scalar** (`utoipa-scalar`, or `@scalar/api-reference-react` in Studio) as the reference UI there: platform mode is always online, so Scalar loading its JavaScript from a CDN no longer matters, and it gives a more modern reference with code samples. A decision for that step, not made yet.
 
@@ -240,7 +258,7 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
    - Add the storage services to Compose.
    - First check: is there about 40 GB free for a source build, and can we pull the `ghcr.io/chelabase/*` images as a fallback?
    - Done when the storage stack comes up healthy next to the existing services.
-2. **`crates/cheladb-neon`.** ✅ Done 2026-09-28; see "Progress".
+2. **`crates/chelabase-neon`.** ✅ Done 2026-09-28; see "Progress".
    - A straight port with its tests: storcon client, compute-spec builder, `scram`, `lsn`, compute JWKS.
 3. **Internal control-plane listener and Neon's proxy.** ✅ Done 2026-09-29: the orchestrator's internal listener, Valkey and Neon's proxy, verified end to end by `just neon-e2e`. Spec: `docs/superpowers/specs/2026-09-28-neon-control-plane-listener-design.md`.
    - A second listener in the orchestrator (`127.0.0.1:8083`). Endpoints: `proxy_api`, `compute_spec`, storage-controller hooks with a full reconfigure.
@@ -262,17 +280,17 @@ Step 3 adds Valkey 9.1.2 (BSD-3-Clause, protocol-compatible with Redis) for Neon
    - **An extension policy:** record which extensions are supported and upgraded, so users don't depend on whatever the image happens to contain.
    - Step 6 doesn't need either extension, so 4a can also run after step 5 if that suits better.
 5. **Branching.** ✅ Done 2026-10-01, merged into local `main` (see "Progress"). Create a branch from `main`, optionally at a point in time. Each branch gets its own endpoint and appears in Studio.
-6. **Data API (`cheladb-rest`).** ✅ Merged 2026-10-01. Deferred to platform mode (from its end-of-step review): a CancelRequest when a request is dropped, a per-database share of rest's global connection permits, a SCRAM verifier instead of a plaintext authenticator password, a guard on dev tokens bound off loopback, the orchestrator's `AuthMethod` check, a global miss-limiter cap, and 42501/23503 messages that can name hidden tables. Our own design, not a PostgREST or Supabase clone; see below.
-   - **Split 2026-10-01:** step 6 is the engine, SDK and type generation, with per-branch public/secret keys; spec `docs/superpowers/specs/2026-10-01-data-api-design.md` (branch `data-api`). Also decided then: the key names the branch; the gateway checks keys; a direct connection as `authenticator`; a schema version uuid; one reserved `cheladb` schema for machinery only, with exposure by `USAGE` privileges and no exposed-schemas list; RLS off by default with a Studio warning; `anon` read-only and `authenticated` CRUD by default.
-6b. **App users** (after step 6): the "App users" section below (an org per project, the app-owned users table, sync, `db.auth`). It plugs a user's JWT into the gateway's data-key step; the claim helpers go in the `cheladb` schema. Needs projects in Studio first. Its own spec, plan and approval.
-6a. **Login roles: revision 2** (after step 6). Projects run their existing migrations unchanged. `CREATE ROLE`, `ALTER ROLE … PASSWORD/RENAME`, `DROP ROLE`, `GRANT` and `CREATE DATABASE` work through the proxy. Roles and databases are managed from SQL, synced to the control plane through Neon's DDL forwarding plus a resync, and managed through the platform API. A protected-branch flag: children of a protected branch get fresh generated passwords for every copied login role. The owner `postgres` gets its own password on every branch; other roles keep the parent's password unless the parent is protected. `CHELADB_BRANCH_ROLE_CAP` (default 50, range 0–500) and `CHELADB_BRANCH_DATABASE_CAP` (default 20, range 1–1000) per branch. Spec: `docs/superpowers/specs/2026-10-01-login-roles-design.md`. Plan (revision 2 on top of revision 1): `docs/superpowers/plans/2026-10-02-login-roles-v2.md` on branch `login-roles` (Status is the source of truth). Running: Wave 1 (Tasks 1–7), Wave 2 (Tasks 4–6, 8–10). Task 10 (docs) complete.
+6. **Data API (`chelabase-rest`).** ✅ Merged 2026-10-01. Deferred to platform mode (from its end-of-step review): a CancelRequest when a request is dropped, a per-database share of rest's global connection permits, a SCRAM verifier instead of a plaintext authenticator password, a guard on dev tokens bound off loopback, the orchestrator's `AuthMethod` check, a global miss-limiter cap, and 42501/23503 messages that can name hidden tables. Our own design, not a PostgREST or Supabase clone; see below.
+   - **Split 2026-10-01:** step 6 is the engine, SDK and type generation, with per-branch public/secret keys; spec `docs/superpowers/specs/2026-10-01-data-api-design.md` (branch `data-api`). Also decided then: the key names the branch; the gateway checks keys; a direct connection as `authenticator`; a schema version uuid; one reserved `chelabase` schema for machinery only, with exposure by `USAGE` privileges and no exposed-schemas list; RLS off by default with a Studio warning; `anon` read-only and `authenticated` CRUD by default.
+6b. **App users** (after step 6): the "App users" section below (an org per project, the app-owned users table, sync, `db.auth`). It plugs a user's JWT into the gateway's data-key step; the claim helpers go in the `chelabase` schema. Needs projects in Studio first. Its own spec, plan and approval.
+6a. **Login roles: revision 2** (after step 6). Projects run their existing migrations unchanged. `CREATE ROLE`, `ALTER ROLE … PASSWORD/RENAME`, `DROP ROLE`, `GRANT` and `CREATE DATABASE` work through the proxy. Roles and databases are managed from SQL, synced to the control plane through Neon's DDL forwarding plus a resync, and managed through the platform API. A protected-branch flag: children of a protected branch get fresh generated passwords for every copied login role. The owner `postgres` gets its own password on every branch; other roles keep the parent's password unless the parent is protected. `CHELABASE_BRANCH_ROLE_CAP` (default 50, range 0–500) and `CHELABASE_BRANCH_DATABASE_CAP` (default 20, range 1–1000) per branch. Spec: `docs/superpowers/specs/2026-10-01-login-roles-design.md`. Plan (revision 2 on top of revision 1): `docs/superpowers/plans/2026-10-02-login-roles-v2.md` on branch `login-roles` (Status is the source of truth). Running: Wave 1 (Tasks 1–7), Wave 2 (Tasks 4–6, 8–10). Task 10 (docs) complete.
 6c. **Data API across databases and schemas** (after 6a, before 6b): the data API works on any of a branch's Postgres databases and schemas, with database and schema switching in Studio. Needs its own spec, plan and approval.
 6d. **SQL editor in Studio** (added 2026-10-02, after 6c): raw SQL runs unchanged (never translated into the data API's grammar) on its own platform route, `POST …/branches/{branch_id}/sql` with a chosen database. It runs as the owner by default, or as a chosen role through `SET LOCAL ROLE` in a transaction. It runs in the orchestrator on 6c's owner pool, so rest keeps only the `authenticator` password, and it returns result sets, row counts, notices and Postgres errors with their position. Needs its own spec, plan and approval. **Spec written 2026-10-03** (`docs/superpowers/specs/2026-10-03-sql-editor-design.md`, branch `sql-editor`); it supersedes this paragraph where they differ (session `SET ROLE` and a fresh tokio-postgres connection per run instead of 6c's pool, streamed NDJSON, a guard, saved queries, pgls completion).
 
-6e. **Data API on tokio-postgres** (chore, user's decision 2026-10-03 during 6d): benchmark today's sqlx path (`BEGIN`, preamble, query, `COMMIT` as four sequential round trips) against a pipelined tokio-postgres one: latency with `tc netem` delay on the compute network, and throughput under concurrent load on one machine. rest and `cheladb-query` switch only if it wins; metadata stays on sqlx.
+6e. **Data API on tokio-postgres** (chore, user's decision 2026-10-03 during 6d): benchmark today's sqlx path (`BEGIN`, preamble, query, `COMMIT` as four sequential round trips) against a pipelined tokio-postgres one: latency with `tc netem` delay on the compute network, and throughput under concurrent load on one machine. rest and `chelabase-query` switch only if it wins; metadata stays on sqlx.
 
 **Notes for steps 6a and 6c:**
-- A per-project database cap on Postgres databases may be added in a later step, beyond the per-branch `CHELADB_BRANCH_DATABASE_CAP`.
+- A per-project database cap on Postgres databases may be added in a later step, beyond the per-branch `CHELABASE_BRANCH_DATABASE_CAP`.
 - The documentation site must highlight the branch password rule (owner gets its own password per branch, other roles keep the parent's unless the parent is protected) so users understand the behavior.
 
 7. **Compute runtime work.** This is where we improve on NeonVM:
@@ -297,22 +315,22 @@ Steps 5, 6 and 7 are independent once step 4 lands, so they can be reordered. Br
 - **Repos:** `chelabase/neon` and `chelabase/postgres`, **public**, detached (not in GitHub's fork network) with full mirrored history. Base: `fa504217`, which is still upstream `main`'s HEAD.
 - **First spec's scope:** items 1–3 below plus the cloud-feature decisions. Postgres 18 gets its own spec afterwards.
 - **CI:** our own workflows on GitHub's free 4-vCPU runners (upstream's need Neon's self-hosted runners and cloud accounts, so they're removed). PRs run lint, clippy, Rust tests and a sharded v17 release-build regression run. A nightly run covers the full v14–v17 matrix and a debug build.
-- **Minors (revised 2026-10-01):** `neondatabase/postgres`'s branches are at 17.8 / 16.12 / 15.16 / 14.21, but they also carry hundreds of commits (475 on v17) that need `neon`-extension changes which were never published. For example, `neon_storage_token` and `get_pin_limit_hook` don't exist in our `pgxn/neon`. So **we don't bump to those heads.** We create our own `REL_1x_STABLE_cheladb` branches from the pinned submodule commits (17.5 / 16.9 / 15.13 / 14.18), merge `postgres/postgres`'s minor tags up to 17.11 / 16.15 / 15.19 / 14.24 (using Neon's own "Update Postgres …" merges as conflict references), and cherry-pick only Neon's self-contained correctness fixes, each listed with a reason. The `_neon` branches stay in the mirror as read-only references.
+- **Minors (revised 2026-10-01):** `neondatabase/postgres`'s branches are at 17.8 / 16.12 / 15.16 / 14.21, but they also carry hundreds of commits (475 on v17) that need `neon`-extension changes which were never published. For example, `neon_storage_token` and `get_pin_limit_hook` don't exist in our `pgxn/neon`. So **we don't bump to those heads.** We create our own `REL_1x_STABLE_chelabase` branches from the pinned submodule commits (17.5 / 16.9 / 15.13 / 14.18), merge `postgres/postgres`'s minor tags up to 17.11 / 16.15 / 15.19 / 14.24 (using Neon's own "Update Postgres …" merges as conflict references), and cherry-pick only Neon's self-contained correctness fixes, each listed with a reason. The `_neon` branches stay in the mirror as read-only references.
 - **v14** reaches end of life in November 2026. It gets its final minor (14.25), then freezes: it stays in the platform images and the nightly CI, but can't be chosen for new databases.
 - **Release watch:** a daily workflow in `chelabase/postgres` opens one de-duplicated issue per new upstream minor.
-- **Images:** the fork's CI publishes to public GHCR and cheladb-v1 pins them by digest. Dev images are a v17-only storage image and a v17 compute with upstream's `minimal` extension set (pgrag, timescaledb, pg_cron, pg_partman). Platform images carry all majors and all extensions. `just neon-build` stays as an offline fallback.
-- **Cloud features:** the auth broker, `local_proxy` and `pg_session_jwt` stay in source, off by default (`pg_session_jwt` ships in the platform images). Feature flags become **push-only**: a fork patch lets `POST /v1/feature_flag_spec` work without a PostHog config, and the cheladb-v1 worker pushes the spec (a later step). This step removes `vm_monitor` and the VM specs and adds the flag patch. The console redirect through Studio and the worker's flag push go to later steps.
-- **Order:** safety net first. (1) Repos, plus CI green on unchanged code with a baseline of flaky tests; (2) submodule bump, then the minors; (3) image build args and GHCR publishing; (4) the drops and the flag patch; (5) repoint cheladb-v1 and run its full verification.
+- **Images:** the fork's CI publishes to public GHCR and chelabase pins them by digest. Dev images are a v17-only storage image and a v17 compute with upstream's `minimal` extension set (pgrag, timescaledb, pg_cron, pg_partman). Platform images carry all majors and all extensions. `just neon-build` stays as an offline fallback.
+- **Cloud features:** the auth broker, `local_proxy` and `pg_session_jwt` stay in source, off by default (`pg_session_jwt` ships in the platform images). Feature flags become **push-only**: a fork patch lets `POST /v1/feature_flag_spec` work without a PostHog config, and the chelabase worker pushes the spec (a later step). This step removes `vm_monitor` and the VM specs and adds the flag patch. The console redirect through Studio and the worker's flag push go to later steps.
+- **Order:** safety net first. (1) Repos, plus CI green on unchanged code with a baseline of flaky tests; (2) submodule bump, then the minors; (3) image build args and GHCR publishing; (4) the drops and the flag patch; (5) repoint chelabase and run its full verification.
 
 **Security finding for the fork (2026-10-01, from step 6 Task 6; a platform-mode blocker).** A database owner (a `neon_superuser` member) can become real superuser:
 - the owner runs `CREATE EVENT TRIGGER` (Neon allows it, through `switch_to_superuser` and then `alter_event_trigger_owner` back to the owner), with a plain function that does `ALTER ROLE <owner> SUPERUSER` when `current_user <> session_user`;
 - the owner then runs `CREATE EXTENSION pgcrypto`, a trusted extension. Its install script runs as the bootstrap superuser while the session user is still the owner, so the owner's trigger fires with a superuser `current_user`.
 
-The cause is `neon_fmgr_hook` in `pgxn/neon/neon_ddl_handler.c`, which skips non-superuser-owned event-trigger functions only when `GetSessionUserId()` is a superuser. Reproduced live on `compute-node-v17:0.1.0` with every `cheladb` event trigger disabled, so it's independent of the data API. The fix: also skip (or refuse) when the current user (`GetUserId()`) is a superuser and the function isn't superuser-owned, with a regression test (owner event trigger + `CREATE EXTENSION` of a trusted extension, and the owner stays non-superuser). The step 6 live test `owner_event_triggers_never_run_as_superuser` (`services/rest/tests/rest_live.rs`) covers only our `GRANT`, and its doc comment points here. The user handed this to the hard-fork session, which recorded it (`neon-fork` `79f091c`); **the user approved it as fork Task 11a (2026-10-01).**
+The cause is `neon_fmgr_hook` in `pgxn/neon/neon_ddl_handler.c`, which skips non-superuser-owned event-trigger functions only when `GetSessionUserId()` is a superuser. Reproduced live on `compute-node-v17:0.1.0` with every `chelabase` event trigger disabled, so it's independent of the data API. The fix: also skip (or refuse) when the current user (`GetUserId()`) is a superuser and the function isn't superuser-owned, with a regression test (owner event trigger + `CREATE EXTENSION` of a trusted extension, and the owner stays non-superuser). The step 6 live test `owner_event_triggers_never_run_as_superuser` (`services/rest/tests/rest_live.rs`) covers only our `GRANT`, and its doc comment points here. The user handed this to the hard-fork session, which recorded it (`neon-fork` `79f091c`); **the user approved it as fork Task 11a (2026-10-01).**
 
 The work, in order:
 1. **The fork and CI:** Neon's Rust tests and Python regression suite (`test_runner/`) running in our CI before any real change. They're the only safety net for touching storage code.
-2. **Postgres minor releases (security).** Done for now in the fork: `REL_17_STABLE_cheladb`, `REL_16_STABLE_cheladb`, `REL_15_STABLE_cheladb` and `REL_14_STABLE_cheladb` are at 17.11 / 16.15 / 15.19 / 14.24, and the compute ships 17.11. Keep merging the minors every quarter. Decide who watches Postgres security releases before the alpha.
+2. **Postgres minor releases (security).** Done for now in the fork: `REL_17_STABLE_chelabase`, `REL_16_STABLE_chelabase`, `REL_15_STABLE_chelabase` and `REL_14_STABLE_chelabase` are at 17.11 / 16.15 / 15.19 / 14.24, and the compute ships 17.11. Keep merging the minors every quarter. Decide who watches Postgres security releases before the alpha.
 3. **Images:** the slim dev variant; the platform images trimmed only of what the cloud-feature discussion drops.
 4. **Postgres 18, then 19.** State as of 2026-09-30:
    - Neon's public `main` vendors only v14–v17, and `libs/postgres_ffi` has constants only up to v17.
@@ -385,7 +403,7 @@ To confirm in the spec: TLS on the safekeepers' WAL service port, and whether `T
 
 **Dependency follow-up:** ✅ Done 2026-09-28 by the dependency refresh (see "Progress"). Every crate uses workspace pins at the latest releases.
 
-**Before step 3: Zitadel v4 (done 2026-09-28, branch `zitadel-v4`).** Zitadel v2 stopped getting releases after v2.71.19 (2025-11-12); v4 is current. Moving touches Studio's hosted login, the generated client in `packages/zitadel` and `cheladb auth bootstrap`, so it gets its own spec and branch, done between the dependency refresh and step 3. Spec: `docs/superpowers/specs/2026-09-28-zitadel-v4-and-own-login-design.md`. It also replaces Zitadel's hosted login with our own: pages in Studio and a small Rust service, `ui-auth`.
+**Before step 3: Zitadel v4 (done 2026-09-28, branch `zitadel-v4`).** Zitadel v2 stopped getting releases after v2.71.19 (2025-11-12); v4 is current. Moving touches Studio's hosted login, the generated client in `packages/zitadel` and `chelabase auth bootstrap`, so it gets its own spec and branch, done between the dependency refresh and step 3. Spec: `docs/superpowers/specs/2026-09-28-zitadel-v4-and-own-login-design.md`. It also replaces Zitadel's hosted login with our own: pages in Studio and a small Rust service, `ui-auth`.
 
 **Security follow-ups found during the refresh:**
 - ✅ Every published port is bound to `127.0.0.1` (metadata-db, zitadel-db, NATS, Zitadel and Mailpit were on all interfaces); `just neon-test` checks it.
@@ -543,14 +561,14 @@ Branch `zitadel-v4`. Plan: `docs/superpowers/plans/2026-09-28-zitadel-v4-and-own
   - Zitadel escapes `_` and `%` in email queries (checked live), so ui-auth needs no escaping.
 - **Studio's sign-out ends the Zitadel session itself:** `end_session` with `id_token_hint` returns straight to Studio. Zitadel only goes through our `/logout` page when it has no hint.
 
-## The data API (`cheladb-rest`)
+## The data API (`chelabase-rest`)
 
 ### Where it stands
 
 Nothing exists anywhere yet:
 - **Neon's Data API is closed.** It's a Rust rewrite of PostgREST inside their proxy (`proxy/src/serverless/rest.rs`, feature `rest_broker`). Its query engine, `subzero-core`, is a **stub** in the public repo; the real crate isn't public or on crates.io.
   - Rechecked 2026-09-28: `neondatabase/subzero` (the commented-out git dependency in `proxy/Cargo.toml`) and `subzerocloud/subzero` both 404. The parser, SQL generator, schema introspection and error mapping all come from that crate; rest.rs is only the glue around it.
-  - So patching Neon doesn't make its REST broker usable: we'd still write the whole engine, against an unpublished API. We build `cheladb-rest` and use rest.rs as a reference for the glue (the `set_config` order, the config cache, Postgres error → HTTP status).
+  - So patching Neon doesn't make its REST broker usable: we'd still write the whole engine, against an unpublished API. We build `chelabase-rest` and use rest.rs as a reference for the glue (the `set_config` order, the config cache, Postgres error → HTTP status).
 - **The old repo deferred it.**
 - **The scaffold has nothing either.**
 
@@ -576,7 +594,7 @@ Settings, read from the database and cached: `db_schemas`, `db_anon_role`, `db_m
 Our own design, aimed at speed, security and developer experience. It deliberately doesn't mirror PostgREST or Supabase: no URL grammar, no postgrest-js compatibility.
 
 **Service**
-- `cheladb-rest`: one multi-tenant Rust service for every database, behind the Pingora gateway.
+- `chelabase-rest`: one multi-tenant Rust service for every database, behind the Pingora gateway.
 - It asks our control plane for each compute's address.
 - One sqlx `PgPool` per database: capped, closed when idle, dropped when the compute stops (step 7).
 
@@ -603,7 +621,7 @@ Our own design, aimed at speed, security and developer experience. It deliberate
 - It's cached per database, schema version and shape hash. Repeat queries skip generation, and prepared statements get reused instead of churning sqlx's statement cache.
 
 **Developer experience**
-- `cheladb gen types` introspects the database and writes TypeScript types. The SDK (`@cheladb/client`) is fully typed: column names, filter value types and result shapes. It builds the same JSON tree the server parses.
+- `chelabase gen types` introspects the database and writes TypeScript types. The SDK (`@chelabase/client`) is fully typed: column names, filter value types and result shapes. It builds the same JSON tree the server parses.
 - Batches: several operations in one request, run atomically in one transaction.
 - **Relations (second pass):** `select` can take related tables through foreign keys, each generated as a nested `json_agg` subquery, so one round trip returns nested JSON.
 
@@ -616,8 +634,8 @@ Our own design, aimed at speed, security and developer experience. It deliberate
 
 This settles the former open decisions 1 (end-user identity) and 2 (how claims reach SQL).
 
-**Identity: one Zitadel organization per Cheladb project**
-- Platform users (people using Studio) stay in the Cheladb organization.
+**Identity: one Zitadel organization per Chelabase project**
+- Platform users (people using Studio) stay in the Chelabase organization.
 - Each project gets its own organization and app registration for its app users, so users of different projects never mix.
 - The SDK's `db.auth.signUp()`, `signIn()` and the rest call our auth service. That's `auth` made project-aware, reusing its password rules, response padding, rate limits and email codes.
 - The data API verifies each token and checks that its organization and audience match the database's project.
@@ -629,7 +647,7 @@ This settles the former open decisions 1 (end-user identity) and 2 (how claims r
 - Developers add their own columns with normal migrations. It's an ordinary table: foreign keys, joins, indexes, row-level security, and the typed SDK sees every column.
 - **Column-level privileges:** only our sync role writes the managed columns; app roles can write every other column. "Users edit their own profile" is one row-level-security policy.
 - **An event trigger** blocks dropping or renaming a managed column, with a clear error. Computes run with a superuser we control.
-- A helper, e.g. `cheladb_auth.user_id()`, reads the current user's id from the claims for row-level-security policies. The names are ours, not copied from anywhere.
+- A helper, e.g. `chelabase_auth.user_id()`, reads the current user's id from the claims for row-level-security policies. The names are ours, not copied from anywhere.
 
 **Atomic sign-up with the app's own columns**
 - `db.auth.signUp({ email, password, data: { display_name: "Ada" } })`: `data` maps to the app's columns, and the typed SDK knows which ones exist.
@@ -694,11 +712,11 @@ Relations and upsert come in a second pass.
 - **Worktrees (decided 2026-09-29):**
   - The main checkout stays on `main` and only coordinates.
   - Each branch lives in `.worktrees/<branch>` (`just wt-add`), and subagents work there with absolute paths and `git -C`.
-  - Each worktree has its own `target/` (sccache is a machine setting), and `.cheladb` is symlinked from the main checkout.
+  - Each worktree has its own `target/` (sccache is a machine setting), and `.chelabase` is symlinked from the main checkout.
   - Never use the harness's `isolation: "worktree"`.
 - **TDD is strict:** implementers show the failing test run (RED) before writing code, and a report without it goes back.
-- Feature branches only. Merge only when the user says. Push to the remote (`chelabase/cheladb-v1`) only when asked.
+- Feature branches only. Merge only when the user says. Push to the remote (`chelabase/chelabase`) only when asked.
 - Commit as `git commit`, with `Co-Authored-By` and `Claude-Session` trailers (see `CLAUDE.md`).
 - Never run `cargo fmt` across the workspace.
-- Never overwrite `.cheladb/secrets/secrets.key` or the gateway key pair.
+- Never overwrite `.chelabase/secrets/secrets.key` or the gateway key pair.
 - The skip-email-verification switch and Mailpit's insecure SMTP auth are for local dev only.

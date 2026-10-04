@@ -25,10 +25,10 @@ pub const MAX_RESPONSE_BYTES: usize = 10 * 1_048_576;
 pub const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
 pub const RUNS_PER_USER: usize = 4;
 pub const RUNS_PER_TARGET: usize = 4;
-pub const APPLICATION_NAME: &str = "cheladb-sql-editor";
+pub const APPLICATION_NAME: &str = "chelabase-sql-editor";
 pub const PGLS_VERSION: &str = "0.26.0";
 pub const MAX_SCHEMA_BYTES: usize = 8 * 1_048_576;
-pub use cheladb_metadata::SAVED_QUERY_CAP;
+pub use chelabase_metadata::SAVED_QUERY_CAP;
 pub const DATA_ROLE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Why a script can't be run or saved, or `None`: 1 byte to 1 MiB, and no NUL byte (the
@@ -46,7 +46,7 @@ pub(crate) fn invalid_sql(sql: &str) -> Option<&'static str> {
 /// The editor's state on `AppState`.
 pub struct SqlEditor {
     pub(crate) runs: registry::RunRegistry,
-    pub(crate) granted: moka::sync::Cache<(cheladb_types::BranchId, String), ()>,
+    pub(crate) granted: moka::sync::Cache<(chelabase_types::BranchId, String), ()>,
 }
 
 impl SqlEditor {

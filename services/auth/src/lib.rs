@@ -4,4 +4,4 @@ pub mod config;
 pub mod cookie;
 pub mod guard;
 pub mod openapi;
-pub use cheladb_zitadel::client as zitadel;
+pub use chelabase_zitadel::client as zitadel;

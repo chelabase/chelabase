@@ -9,7 +9,7 @@ function Landing() {
   if (auth.isAuthenticated) return <Navigate to="/app" replace />;
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background p-8 text-foreground">
-      <h1 className="text-3xl font-semibold tracking-tight">Cheladb Studio</h1>
+      <h1 className="text-3xl font-semibold tracking-tight">Chelabase Studio</h1>
       <p className="max-w-md text-center text-muted-foreground">Postgres databases for your projects.</p>
       <div className="flex gap-3">
         <Button disabled={auth.isLoading} onClick={() => void auth.signinRedirect()}>

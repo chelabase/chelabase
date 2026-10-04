@@ -1,14 +1,14 @@
 //! Creating a branch: an endpoint row, a timeline branched from the parent's, a compute, and
 //! the data API roles and bootstrap inside it.
 
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchKind, BranchRecord, BranchStatus, MetadataError, NewEndpoint, NewRoleCopy, RoleLevel,
     RoleOrigin,
 };
-use cheladb_nats::PointInTime;
-use cheladb_neon::{ComputeBackend, Lsn, NeonId};
-use cheladb_secrets::{Purpose, open_role_password, seal_credential, seal_role_password};
-use cheladb_types::{BranchId, DatabaseId, ProjectId};
+use chelabase_nats::PointInTime;
+use chelabase_neon::{ComputeBackend, Lsn, NeonId};
+use chelabase_secrets::{Purpose, open_role_password, seal_credential, seal_role_password};
+use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -270,7 +270,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .filter_map(|c| Some((c.name.clone(), c.verifier.clone()?)))
                 .collect(),
         };
-        let verifier = cheladb_neon::scram::verifier(&rec.password);
+        let verifier = chelabase_neon::scram::verifier(&rec.password);
         let token_hash = sha256_hex(&rec.compute_token);
         let role_copies: Vec<NewRoleCopy<'_>> = copies
             .iter()
@@ -367,7 +367,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 };
                 if protected && copy.verifier.is_some() {
                     let password = credentials::generate_password();
-                    copy.verifier = Some(cheladb_neon::scram::verifier(&password));
+                    copy.verifier = Some(chelabase_neon::scram::verifier(&password));
                     copy.sealed = Some(seal(&copy.name, &password));
                     copy.fresh = true;
                 } else if let Some(sealed) = r.password_enc {
@@ -616,11 +616,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::{BranchStatus, DatabaseStatus};
-    use cheladb_neon::storcon::{LsnAtTime, LsnKind};
-    use cheladb_neon::{Lsn, NeonId};
-    use cheladb_secrets::{Purpose, open_credential};
-    use cheladb_types::DatabaseId;
+    use chelabase_metadata::{BranchStatus, DatabaseStatus};
+    use chelabase_neon::storcon::{LsnAtTime, LsnKind};
+    use chelabase_neon::{Lsn, NeonId};
+    use chelabase_secrets::{Purpose, open_credential};
+    use chelabase_types::DatabaseId;
 
     use super::*;
     use crate::fakes::{
@@ -691,7 +691,7 @@ mod tests {
         let salt = base64::engine::general_purpose::STANDARD
             .decode(salt)
             .unwrap();
-        cheladb_neon::scram::verifier_with_salt(password, &salt, iterations.parse().unwrap())
+        chelabase_neon::scram::verifier_with_salt(password, &salt, iterations.parse().unwrap())
             == verifier
     }
 
@@ -1422,7 +1422,7 @@ mod tests {
         let main = BranchId::from(s.db);
         assert_eq!(w.create_role(main, "app", false).await, RoleOutcome::Ok);
         assert_eq!(w.create_role(main, "admin", true).await, RoleOutcome::Ok);
-        let sql_verifier = cheladb_neon::scram::verifier("sql-password");
+        let sql_verifier = chelabase_neon::scram::verifier("sql-password");
         sql_row(
             w,
             main,
@@ -1446,7 +1446,7 @@ mod tests {
     }
 
     fn open(w: &FakeWorker, branch: BranchId, name: &str, sealed: &str) -> Option<String> {
-        cheladb_secrets::open_role_password(&w.key, &branch.to_string(), name, sealed).ok()
+        chelabase_secrets::open_role_password(&w.key, &branch.to_string(), name, sealed).ok()
     }
 
     #[tokio::test]
@@ -1567,8 +1567,8 @@ mod tests {
             .map(|n| (*n, row(&w, &s.main_ep, n).unwrap().verifier.unwrap()))
             .collect();
         let old = |name: &str| parent.iter().find(|(n, _)| *n == name).unwrap().1.clone();
-        let late = cheladb_neon::scram::verifier("late-password");
-        let group = cheladb_neon::scram::verifier("group-password");
+        let late = chelabase_neon::scram::verifier("late-password");
+        let group = chelabase_neon::scram::verifier("group-password");
         // The child's catalog at the branch point: `admin` is missing; `late` and `grp` aren't
         // among the parent's copies.
         w.computes.answers.lock().unwrap().clear();
@@ -1652,7 +1652,7 @@ mod tests {
         let (w, journal) = worker();
         let s = setup(&w, &journal).await;
         protect(&w, BranchId::from(s.db));
-        let late = cheladb_neon::scram::verifier("late-password");
+        let late = chelabase_neon::scram::verifier("late-password");
         w.computes
             .answer(CATALOG_READ, &r_line("late", &late, false));
 
@@ -1673,7 +1673,7 @@ mod tests {
         let s = setup(&w, &journal).await;
         let main = BranchId::from(s.db);
         protect(&w, main);
-        let verifier = cheladb_neon::scram::verifier("sql-password");
+        let verifier = chelabase_neon::scram::verifier("sql-password");
         sql_row(&w, main, &s.main_ep, NAME, Some(&verifier), None);
         w.computes
             .answer(CATALOG_READ, &r_line(NAME, &verifier, false));

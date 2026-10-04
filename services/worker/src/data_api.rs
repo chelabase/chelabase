@@ -1,17 +1,17 @@
-//! The data API's bootstrap inside a branch's database (the `cheladb` machinery schema, the
+//! The data API's bootstrap inside a branch's database (the `chelabase` machinery schema, the
 //! `authenticator` login, default privileges and the branch's public key), and the check a
 //! secret key's role must pass.
 
 use anyhow::{Context, bail};
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchDatabase, BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseOrigin,
     MetadataError, NewDataKey, ServedDatabase,
 };
-use cheladb_nats::{CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, GrantDataRoleRequest};
-use cheladb_neon::ComputeBackend;
-use cheladb_secrets::{Purpose, open_credential, seal_credential};
-use cheladb_types::BranchId;
-use cheladb_types::data_key::{self, DataKeyKind};
+use chelabase_nats::{CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, GrantDataRoleRequest};
+use chelabase_neon::ComputeBackend;
+use chelabase_secrets::{Purpose, open_credential, seal_credential};
+use chelabase_types::BranchId;
+use chelabase_types::data_key::{self, DataKeyKind};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -20,32 +20,32 @@ use crate::{OWNER_ROLE, Worker, credentials};
 
 /// The login role the data API connects as; never a secret key's role.
 const AUTHENTICATOR: &str = "authenticator";
-/// Whether a branch's data API machinery is intact (psql prints `t` or `f`): the `cheladb`
+/// Whether a branch's data API machinery is intact (psql prints `t` or `f`): the `chelabase`
 /// schema, `authenticator` able to log in with `USAGE` on it and `SELECT` on
 /// `schema_version`, and the three event triggers present and enabled. Anything else is
 /// what the bootstrap repairs. Operators are schema-qualified (it runs as the superuser in
 /// a database the owner controls).
-pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('cheladb.schema_version') IS NOT NULL \
+pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version') IS NOT NULL \
      AND EXISTS (SELECT FROM pg_catalog.pg_roles r \
-       JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) 'cheladb' \
+       JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) 'chelabase' \
        JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid \
          AND c.relname OPERATOR(pg_catalog.=) 'schema_version' \
        WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin \
          AND pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE') \
          AND pg_catalog.has_table_privilege(r.oid, c.oid, 'SELECT')) \
      AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger \
-       WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['cheladb_schema_version_ddl', \
-         'cheladb_schema_version_drop', 'cheladb_extension_functions']::pg_catalog.name[]) \
+       WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', \
+         'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) \
          AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3";
 
 /// The key of the transaction-scoped advisory lock the bootstrap takes first, so two
 /// bootstraps of one database serialize (advisory locks are per database). The bytes of
-/// "cheladb" followed by 0x01 (the bootstrap); other Cheladb advisory locks must use
+/// "chelabase" followed by 0x01 (the bootstrap); other Chelabase advisory locks must use
 /// another key.
 pub const BOOTSTRAP_LOCK_KEY: i64 = 0x6368_656c_6164_6201;
 
 /// How long either script waits for a lock (the advisory lock above, or a table lock such as
-/// `ALTER TABLE … OWNER` on `cheladb.schema_version`) before it fails, in seconds. It sits
+/// `ALTER TABLE … OWNER` on `chelabase.schema_version`) before it fails, in seconds. It sits
 /// under the 30 s `ADMIN_SQL_TIMEOUT` of `admin_sql`: when the caller gives up, dropping its
 /// future doesn't kill psql, so a script still queued behind a stuck lock would run later with
 /// stale content (an old `authenticator` password). Failing first, with the transaction
@@ -57,14 +57,14 @@ pub const BOOTSTRAP_LOCK_KEY: i64 = 0x6368_656c_6164_6201;
 pub const LOCK_TIMEOUT_SECS: u32 = 20;
 
 /// Removes the data API machinery from a database (`DELETE …/data-api?remove=true`, P7), only
-/// when the `cheladb` schema is the one the bootstrap made (owned by `cheladb_admin`): the
+/// when the `chelabase` schema is the one the bootstrap made (owned by `chelabase_admin`): the
 /// three event triggers, the two functions and the two tables by name, then the schema with
 /// `RESTRICT`, so anything else someone put there makes it fail rather than go with it. Before
 /// its own functions it drops what app users left (the protect event triggers, the sync
 /// functions, the config table) and the claim helpers, each before the one it calls; a policy
-/// still using a helper makes it fail. `cheladb.users_guard()` is left to `RESTRICT`: a guard
+/// still using a helper makes it fail. `chelabase.users_guard()` is left to `RESTRICT`: a guard
 /// trigger still using it means app users are on, which the caller refuses first. A
-/// `cheladb` schema with another owner is left alone (a warning). The `cheladb_admin` role
+/// `chelabase` schema with another owner is left alone (a warning). The `chelabase_admin` role
 /// stays (it's cluster-wide), and so do the default privileges and grants. The first line is a
 /// comment so the script is told apart from the bootstrap's. It takes [`BOOTSTRAP_LOCK_KEY`]
 /// first (bootstrap and remove lock the same objects in opposite orders, so without it they
@@ -75,27 +75,27 @@ DO $$ BEGIN
   SET LOCAL lock_timeout = '20s';
   PERFORM pg_catalog.pg_advisory_xact_lock(7163086723497615873);
   IF EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
-      WHERE n.nspname OPERATOR(pg_catalog.=) 'cheladb' AND r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
-    DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
-    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_drop;
-    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_ddl;
-    DROP FUNCTION IF EXISTS cheladb.users_protect();
-    DROP FUNCTION IF EXISTS cheladb.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
-    DROP FUNCTION IF EXISTS cheladb.app_users_gone(uuid, boolean);
-    DROP FUNCTION IF EXISTS cheladb.app_users_rows();
-    DROP TABLE IF EXISTS cheladb.app_users_table;
-    DROP FUNCTION IF EXISTS cheladb.user_email();
-    DROP FUNCTION IF EXISTS cheladb.user_id();
-    DROP FUNCTION IF EXISTS cheladb.claims();
-    DROP FUNCTION IF EXISTS cheladb.bump_schema_version();
-    DROP FUNCTION IF EXISTS cheladb.grant_extension_functions();
-    DROP TABLE IF EXISTS cheladb.schema_version;
-    DROP TABLE IF EXISTS cheladb.bootstrap;
-    DROP SCHEMA cheladb RESTRICT;
-  ELSIF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'cheladb') THEN
-    RAISE WARNING 'cheladb: the cheladb schema is not owned by cheladb_admin; nothing was removed';
+      WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase' AND r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
+    DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
+    DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
+    DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;
+    DROP FUNCTION IF EXISTS chelabase.users_protect();
+    DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
+    DROP FUNCTION IF EXISTS chelabase.app_users_gone(uuid, boolean);
+    DROP FUNCTION IF EXISTS chelabase.app_users_rows();
+    DROP TABLE IF EXISTS chelabase.app_users_table;
+    DROP FUNCTION IF EXISTS chelabase.user_email();
+    DROP FUNCTION IF EXISTS chelabase.user_id();
+    DROP FUNCTION IF EXISTS chelabase.claims();
+    DROP FUNCTION IF EXISTS chelabase.bump_schema_version();
+    DROP FUNCTION IF EXISTS chelabase.grant_extension_functions();
+    DROP TABLE IF EXISTS chelabase.schema_version;
+    DROP TABLE IF EXISTS chelabase.bootstrap;
+    DROP SCHEMA chelabase RESTRICT;
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'chelabase') THEN
+    RAISE WARNING 'chelabase: the chelabase schema is not owned by chelabase_admin; nothing was removed';
   END IF;
 END $$;
 ";
@@ -159,11 +159,11 @@ pub fn valid_role_name(name: &str) -> bool {
 }
 
 /// The idempotent script run as cloud_admin in a branch's database after every compute
-/// (re)creation and from reconcile: the `cheladb` machinery schema and its event trigger,
+/// (re)creation and from reconcile: the `chelabase` machinery schema and its event trigger,
 /// `authenticator` made `LOGIN` with the branch's password, the owner's default privileges in
 /// `public`, the claim helpers ([`crate::app_users_sql::claim_helpers_body`]), and (on the
 /// database's first bootstrap only) the same grants on what exists. The tamper check allows
-/// what app users adds to `cheladb` (P4).
+/// what app users adds to `chelabase` (P4).
 ///
 /// The script is one transaction (`BEGIN … COMMIT`) that first takes
 /// [`BOOTSTRAP_LOCK_KEY`] (after `SET LOCAL lock_timeout`, [`LOCK_TIMEOUT_SECS`]), so a reader
@@ -191,7 +191,7 @@ pub fn data_api_sql(owner_role: &str, authenticator_password: &str, schema: &str
 }
 
 /// [`data_api_sql`] for a rebootstrap that was asked to grant the schema's existing objects
-/// (`grant_existing`): the first-grants statements run whether or not `cheladb.bootstrap`
+/// (`grant_existing`): the first-grants statements run whether or not `chelabase.bootstrap`
 /// has its row (still only when the schema exists). Grants only: no `REVOKE`, so a role never
 /// loses a privilege to it.
 pub fn data_api_sql_granting_existing(owner_role: &str, authenticator_password: &str, schema: &str) -> String {
@@ -204,7 +204,7 @@ fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str,
         ("", " ON CONFLICT DO NOTHING", "")
     } else {
         (
-            " AND NOT EXISTS (SELECT FROM cheladb.bootstrap)",
+            " AND NOT EXISTS (SELECT FROM chelabase.bootstrap)",
             "",
             "      EXECUTE pg_catalog.format('REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC', r.f);\n",
         )
@@ -222,12 +222,12 @@ SET search_path = pg_catalog, pg_temp;
 SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
 SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN CREATE ROLE cheladb_admin NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN CREATE ROLE chelabase_admin NOLOGIN; END IF;
 END $$;
 DO $$ DECLARE
-  admin pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'cheladb_admin');
+  admin pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_admin');
   trusted pg_catalog.oid[] := ARRAY[admin, (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) CURRENT_USER)];
-  ns pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'cheladb');
+  ns pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'chelabase');
   members pg_catalog.oid[] := ARRAY(SELECT member FROM pg_catalog.pg_auth_members WHERE roleid OPERATOR(pg_catalog.=) admin);
   joined boolean := pg_catalog.cardinality(members) OPERATOR(pg_catalog.>) 0;
   tampered boolean := EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) admin
@@ -237,20 +237,20 @@ DO $$ DECLARE
   m record;
   aside pg_catalog.text;
 BEGIN
-  ALTER ROLE cheladb_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;
+  ALTER ROLE chelabase_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;
   FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
     WHERE s.setrole OPERATOR(pg_catalog.=) admin
   LOOP
-    EXECUTE pg_catalog.format('ALTER ROLE cheladb_admin IN DATABASE %I RESET ALL', m.datname);
+    EXECUTE pg_catalog.format('ALTER ROLE chelabase_admin IN DATABASE %I RESET ALL', m.datname);
   END LOOP;
-  ALTER ROLE cheladb_admin RESET ALL;
+  ALTER ROLE chelabase_admin RESET ALL;
   FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.member JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
     WHERE a.roleid OPERATOR(pg_catalog.=) admin
   LOOP
-    EXECUTE pg_catalog.format('REVOKE cheladb_admin FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
+    EXECUTE pg_catalog.format('REVOKE chelabase_admin FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
   END LOOP;
-  PERFORM pg_catalog.set_config('cheladb.former_members', pg_catalog.array_to_string(members, ','), false);
+  PERFORM pg_catalog.set_config('chelabase.former_members', pg_catalog.array_to_string(members, ','), false);
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
     WHERE (a.usesysid OPERATOR(pg_catalog.=) admin OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
@@ -284,39 +284,39 @@ BEGIN
         OR EXISTS (SELECT FROM pg_catalog.pg_opclass o WHERE o.oid OPERATOR(pg_catalog.=) ANY (i.indclass)
           AND o.opcnamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace))))
   THEN
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
-    DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
-    aside := pg_catalog.format('cheladb_quarantine_%s', pg_catalog.floor(pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000000)::pg_catalog.int8);
-    EXECUTE pg_catalog.format('ALTER SCHEMA cheladb RENAME TO %I', aside);
-    PERFORM pg_catalog.set_config('cheladb.quarantined', aside, false);
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
+    DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
+    aside := pg_catalog.format('chelabase_quarantine_%s', pg_catalog.floor(pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000000)::pg_catalog.int8);
+    EXECUTE pg_catalog.format('ALTER SCHEMA chelabase RENAME TO %I', aside);
+    PERFORM pg_catalog.set_config('chelabase.quarantined', aside, false);
   END IF;
 END $$;
 DO $$ BEGIN
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
-    WHERE (r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin' OR a.usesysid OPERATOR(pg_catalog.=) ANY
-        (pg_catalog.string_to_array(pg_catalog.current_setting('cheladb.former_members', true), ',')::pg_catalog.oid[]))
+    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin' OR a.usesysid OPERATOR(pg_catalog.=) ANY
+        (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
       AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
 END $$;
-CREATE SCHEMA IF NOT EXISTS cheladb AUTHORIZATION cheladb_admin;
-REVOKE ALL ON SCHEMA cheladb FROM PUBLIC;
-GRANT USAGE ON SCHEMA cheladb TO authenticator;
-CREATE TABLE IF NOT EXISTS cheladb.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
-INSERT INTO cheladb.schema_version (version) VALUES (pg_catalog.gen_random_uuid()) ON CONFLICT DO NOTHING;
-CREATE TABLE IF NOT EXISTS cheladb.bootstrap (one boolean PRIMARY KEY DEFAULT true CHECK (one), existing_granted boolean NOT NULL);
-ALTER TABLE cheladb.schema_version OWNER TO cheladb_admin;
-ALTER TABLE cheladb.bootstrap OWNER TO cheladb_admin;
-REVOKE ALL ON cheladb.schema_version, cheladb.bootstrap FROM PUBLIC;
-GRANT SELECT ON cheladb.schema_version TO authenticator;
-GRANT USAGE ON SCHEMA cheladb TO {owner_role};
-GRANT SELECT ON cheladb.schema_version TO {owner_role};
-{claim_helpers}CREATE OR REPLACE FUNCTION cheladb.bump_schema_version() RETURNS event_trigger
+CREATE SCHEMA IF NOT EXISTS chelabase AUTHORIZATION chelabase_admin;
+REVOKE ALL ON SCHEMA chelabase FROM PUBLIC;
+GRANT USAGE ON SCHEMA chelabase TO authenticator;
+CREATE TABLE IF NOT EXISTS chelabase.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
+INSERT INTO chelabase.schema_version (version) VALUES (pg_catalog.gen_random_uuid()) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS chelabase.bootstrap (one boolean PRIMARY KEY DEFAULT true CHECK (one), existing_granted boolean NOT NULL);
+ALTER TABLE chelabase.schema_version OWNER TO chelabase_admin;
+ALTER TABLE chelabase.bootstrap OWNER TO chelabase_admin;
+REVOKE ALL ON chelabase.schema_version, chelabase.bootstrap FROM PUBLIC;
+GRANT SELECT ON chelabase.schema_version TO authenticator;
+GRANT USAGE ON SCHEMA chelabase TO {owner_role};
+GRANT SELECT ON chelabase.schema_version TO {owner_role};
+{claim_helpers}CREATE OR REPLACE FUNCTION chelabase.bump_schema_version() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
-  $f$ BEGIN UPDATE cheladb.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
-ALTER FUNCTION cheladb.bump_schema_version() OWNER TO CURRENT_USER;
-REVOKE ALL ON FUNCTION cheladb.bump_schema_version() FROM PUBLIC;
-CREATE OR REPLACE FUNCTION cheladb.grant_extension_functions() RETURNS event_trigger
+  $f$ BEGIN UPDATE chelabase.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
+ALTER FUNCTION chelabase.bump_schema_version() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION chelabase.bump_schema_version() FROM PUBLIC;
+CREATE OR REPLACE FUNCTION chelabase.grant_extension_functions() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
   $f$ DECLARE f pg_catalog.regprocedure; BEGIN
     FOR f IN SELECT d.objid::pg_catalog.regprocedure FROM pg_catalog.pg_event_trigger_ddl_commands() c
@@ -328,20 +328,20 @@ CREATE OR REPLACE FUNCTION cheladb.grant_extension_functions() RETURNS event_tri
       BEGIN
         EXECUTE pg_catalog.format('GRANT EXECUTE ON ROUTINE %s TO PUBLIC', f);
       EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'cheladb: EXECUTE on % was not granted to PUBLIC: %', f, SQLERRM;
+        RAISE WARNING 'chelabase: EXECUTE on % was not granted to PUBLIC: %', f, SQLERRM;
       END;
     END LOOP;
   EXCEPTION WHEN OTHERS THEN
-    RAISE WARNING 'cheladb: extension functions were not granted to PUBLIC: %', SQLERRM;
+    RAISE WARNING 'chelabase: extension functions were not granted to PUBLIC: %', SQLERRM;
   END $f$;
-ALTER FUNCTION cheladb.grant_extension_functions() OWNER TO CURRENT_USER;
-REVOKE ALL ON FUNCTION cheladb.grant_extension_functions() FROM PUBLIC;
-DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
-DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
-DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
-CREATE EVENT TRIGGER cheladb_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION cheladb.bump_schema_version();
-CREATE EVENT TRIGGER cheladb_schema_version_drop ON sql_drop EXECUTE FUNCTION cheladb.bump_schema_version();
-CREATE EVENT TRIGGER cheladb_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION cheladb.grant_extension_functions();
+ALTER FUNCTION chelabase.grant_extension_functions() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION chelabase.grant_extension_functions() FROM PUBLIC;
+DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
+DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
+DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION chelabase.bump_schema_version();
+CREATE EVENT TRIGGER chelabase_schema_version_drop ON sql_drop EXECUTE FUNCTION chelabase.bump_schema_version();
+CREATE EVENT TRIGGER chelabase_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION chelabase.grant_extension_functions();
 ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD {password};
 ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 DO $$ BEGIN
@@ -365,11 +365,11 @@ DO $$ DECLARE r record; BEGIN
     LOOP
 {revoke_public}      EXECUTE pg_catalog.format('GRANT EXECUTE ON ROUTINE %s TO authenticated', r.f);
     END LOOP;
-    INSERT INTO cheladb.bootstrap (existing_granted) VALUES (true){record_grant};
+    INSERT INTO chelabase.bootstrap (existing_granted) VALUES (true){record_grant};
   END IF;
 END $$;
-SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace({schema_literal}) IS NULL;
-SELECT pg_catalog.current_setting('cheladb.quarantined', true);
+SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace({schema_literal}) IS NULL;
+SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
 "
     )
@@ -380,7 +380,7 @@ pub const ENABLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 
 /// Whether the script skipped the default schema's statements (the schema doesn't exist).
 pub(crate) fn missing_schema(output: &str) -> bool {
-    output.lines().any(|l| l.trim() == "cheladb_missing_schema")
+    output.lines().any(|l| l.trim() == "chelabase_missing_schema")
 }
 
 /// The schema the bootstrap renamed aside, from its output (the script's last line).
@@ -389,12 +389,12 @@ pub fn quarantined(output: &str) -> Option<&str> {
         .lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
-        .filter(|l| l.starts_with("cheladb_quarantine_"))
+        .filter(|l| l.starts_with("chelabase_quarantine_"))
 }
 
 /// Roles a secret key's role must not be a member of, at any depth (besides superusers):
-/// they reach the compute itself or Cheladb's own machinery.
-const SYSTEM_ROLES: &str = "'cheladb_admin', 'pg_execute_server_program', \
+/// they reach the compute itself or Chelabase's own machinery.
+const SYSTEM_ROLES: &str = "'chelabase_admin', 'pg_execute_server_program', \
      'pg_read_server_files', 'pg_write_server_files'";
 
 /// One row for an existing role: `superuser`, `neon_superuser` (a member, at any depth),
@@ -417,8 +417,8 @@ fn role_check_sql(role: &str) -> String {
     )
 }
 
-/// Roles Cheladb owns; never a secret key's.
-const RESERVED_ROLES: [&str; 3] = [AUTHENTICATOR, "cheladb_admin", crate::app_users_sql::USERS_SYNC_ROLE];
+/// Roles Chelabase owns; never a secret key's.
+const RESERVED_ROLES: [&str; 3] = [AUTHENTICATOR, "chelabase_admin", crate::app_users_sql::USERS_SYNC_ROLE];
 
 /// What [`Worker::check_data_role`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,7 +548,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             warn!(branch_id = %branch, %ep, database = %database_name, schema, "the default schema doesn't exist; its default privileges and grants were skipped (the machinery is installed)");
         }
         if let Some(aside) = quarantined(&output) {
-            warn!(branch_id = %branch, %ep, database = %database_name, "a cheladb schema Cheladb didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
+            warn!(branch_id = %branch, %ep, database = %database_name, "a chelabase schema Chelabase didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
         }
         Ok(())
     }
@@ -1053,9 +1053,9 @@ fn refuse_by_name(role: &str) -> Option<RoleCheck> {
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::{BranchStatus, DatabaseStatus, NewDataKey};
-    use cheladb_secrets::{Purpose, open_credential};
-    use cheladb_types::data_key::{self, DataKeyKind};
+    use chelabase_metadata::{BranchStatus, DatabaseStatus, NewDataKey};
+    use chelabase_secrets::{Purpose, open_credential};
+    use chelabase_types::data_key::{self, DataKeyKind};
 
     use super::*;
     use crate::fakes::{
@@ -1122,12 +1122,12 @@ SET search_path = pg_catalog, pg_temp;
 SET LOCAL lock_timeout = '20s';
 SELECT pg_catalog.pg_advisory_xact_lock(7163086723497615873);
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN CREATE ROLE cheladb_admin NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN CREATE ROLE chelabase_admin NOLOGIN; END IF;
 END $$;
 DO $$ DECLARE
-  admin pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'cheladb_admin');
+  admin pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_admin');
   trusted pg_catalog.oid[] := ARRAY[admin, (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) CURRENT_USER)];
-  ns pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'cheladb');
+  ns pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'chelabase');
   members pg_catalog.oid[] := ARRAY(SELECT member FROM pg_catalog.pg_auth_members WHERE roleid OPERATOR(pg_catalog.=) admin);
   joined boolean := pg_catalog.cardinality(members) OPERATOR(pg_catalog.>) 0;
   tampered boolean := EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) admin
@@ -1137,20 +1137,20 @@ DO $$ DECLARE
   m record;
   aside pg_catalog.text;
 BEGIN
-  ALTER ROLE cheladb_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;
+  ALTER ROLE chelabase_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;
   FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
     WHERE s.setrole OPERATOR(pg_catalog.=) admin
   LOOP
-    EXECUTE pg_catalog.format('ALTER ROLE cheladb_admin IN DATABASE %I RESET ALL', m.datname);
+    EXECUTE pg_catalog.format('ALTER ROLE chelabase_admin IN DATABASE %I RESET ALL', m.datname);
   END LOOP;
-  ALTER ROLE cheladb_admin RESET ALL;
+  ALTER ROLE chelabase_admin RESET ALL;
   FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.member JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
     WHERE a.roleid OPERATOR(pg_catalog.=) admin
   LOOP
-    EXECUTE pg_catalog.format('REVOKE cheladb_admin FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
+    EXECUTE pg_catalog.format('REVOKE chelabase_admin FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
   END LOOP;
-  PERFORM pg_catalog.set_config('cheladb.former_members', pg_catalog.array_to_string(members, ','), false);
+  PERFORM pg_catalog.set_config('chelabase.former_members', pg_catalog.array_to_string(members, ','), false);
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
     WHERE (a.usesysid OPERATOR(pg_catalog.=) admin OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
@@ -1184,56 +1184,56 @@ BEGIN
         OR EXISTS (SELECT FROM pg_catalog.pg_opclass o WHERE o.oid OPERATOR(pg_catalog.=) ANY (i.indclass)
           AND o.opcnamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace))))
   THEN
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
-    DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
-    aside := pg_catalog.format('cheladb_quarantine_%s', pg_catalog.floor(pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000000)::pg_catalog.int8);
-    EXECUTE pg_catalog.format('ALTER SCHEMA cheladb RENAME TO %I', aside);
-    PERFORM pg_catalog.set_config('cheladb.quarantined', aside, false);
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
+    DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
+    aside := pg_catalog.format('chelabase_quarantine_%s', pg_catalog.floor(pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000000)::pg_catalog.int8);
+    EXECUTE pg_catalog.format('ALTER SCHEMA chelabase RENAME TO %I', aside);
+    PERFORM pg_catalog.set_config('chelabase.quarantined', aside, false);
   END IF;
 END $$;
 DO $$ BEGIN
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
-    WHERE (r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin' OR a.usesysid OPERATOR(pg_catalog.=) ANY
-        (pg_catalog.string_to_array(pg_catalog.current_setting('cheladb.former_members', true), ',')::pg_catalog.oid[]))
+    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin' OR a.usesysid OPERATOR(pg_catalog.=) ANY
+        (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
       AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
 END $$;
-CREATE SCHEMA IF NOT EXISTS cheladb AUTHORIZATION cheladb_admin;
-REVOKE ALL ON SCHEMA cheladb FROM PUBLIC;
-GRANT USAGE ON SCHEMA cheladb TO authenticator;
-CREATE TABLE IF NOT EXISTS cheladb.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
-INSERT INTO cheladb.schema_version (version) VALUES (pg_catalog.gen_random_uuid()) ON CONFLICT DO NOTHING;
-CREATE TABLE IF NOT EXISTS cheladb.bootstrap (one boolean PRIMARY KEY DEFAULT true CHECK (one), existing_granted boolean NOT NULL);
-ALTER TABLE cheladb.schema_version OWNER TO cheladb_admin;
-ALTER TABLE cheladb.bootstrap OWNER TO cheladb_admin;
-REVOKE ALL ON cheladb.schema_version, cheladb.bootstrap FROM PUBLIC;
-GRANT SELECT ON cheladb.schema_version TO authenticator;
-GRANT USAGE ON SCHEMA cheladb TO postgres;
-GRANT SELECT ON cheladb.schema_version TO postgres;
-GRANT USAGE ON SCHEMA cheladb TO PUBLIC;
-CREATE OR REPLACE FUNCTION cheladb.claims() RETURNS jsonb LANGUAGE sql STABLE PARALLEL SAFE
+CREATE SCHEMA IF NOT EXISTS chelabase AUTHORIZATION chelabase_admin;
+REVOKE ALL ON SCHEMA chelabase FROM PUBLIC;
+GRANT USAGE ON SCHEMA chelabase TO authenticator;
+CREATE TABLE IF NOT EXISTS chelabase.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
+INSERT INTO chelabase.schema_version (version) VALUES (pg_catalog.gen_random_uuid()) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS chelabase.bootstrap (one boolean PRIMARY KEY DEFAULT true CHECK (one), existing_granted boolean NOT NULL);
+ALTER TABLE chelabase.schema_version OWNER TO chelabase_admin;
+ALTER TABLE chelabase.bootstrap OWNER TO chelabase_admin;
+REVOKE ALL ON chelabase.schema_version, chelabase.bootstrap FROM PUBLIC;
+GRANT SELECT ON chelabase.schema_version TO authenticator;
+GRANT USAGE ON SCHEMA chelabase TO postgres;
+GRANT SELECT ON chelabase.schema_version TO postgres;
+GRANT USAGE ON SCHEMA chelabase TO PUBLIC;
+CREATE OR REPLACE FUNCTION chelabase.claims() RETURNS jsonb LANGUAGE sql STABLE PARALLEL SAFE
 BEGIN ATOMIC
   SELECT COALESCE(NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb, '{}'::jsonb);
 END;
-CREATE OR REPLACE FUNCTION cheladb.user_id() RETURNS uuid LANGUAGE sql STABLE PARALLEL SAFE
+CREATE OR REPLACE FUNCTION chelabase.user_id() RETURNS uuid LANGUAGE sql STABLE PARALLEL SAFE
 BEGIN ATOMIC
-  SELECT (cheladb.claims() OPERATOR(pg_catalog.->>) 'sub')::uuid;
+  SELECT (chelabase.claims() OPERATOR(pg_catalog.->>) 'sub')::uuid;
 END;
-CREATE OR REPLACE FUNCTION cheladb.user_email() RETURNS text LANGUAGE sql STABLE PARALLEL SAFE
+CREATE OR REPLACE FUNCTION chelabase.user_email() RETURNS text LANGUAGE sql STABLE PARALLEL SAFE
 BEGIN ATOMIC
-  SELECT cheladb.claims() OPERATOR(pg_catalog.->>) 'email';
+  SELECT chelabase.claims() OPERATOR(pg_catalog.->>) 'email';
 END;
-ALTER FUNCTION cheladb.claims() OWNER TO CURRENT_USER;
-ALTER FUNCTION cheladb.user_id() OWNER TO CURRENT_USER;
-ALTER FUNCTION cheladb.user_email() OWNER TO CURRENT_USER;
-GRANT EXECUTE ON FUNCTION cheladb.claims(), cheladb.user_id(), cheladb.user_email() TO PUBLIC;
-CREATE OR REPLACE FUNCTION cheladb.bump_schema_version() RETURNS event_trigger
+ALTER FUNCTION chelabase.claims() OWNER TO CURRENT_USER;
+ALTER FUNCTION chelabase.user_id() OWNER TO CURRENT_USER;
+ALTER FUNCTION chelabase.user_email() OWNER TO CURRENT_USER;
+GRANT EXECUTE ON FUNCTION chelabase.claims(), chelabase.user_id(), chelabase.user_email() TO PUBLIC;
+CREATE OR REPLACE FUNCTION chelabase.bump_schema_version() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
-  $f$ BEGIN UPDATE cheladb.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
-ALTER FUNCTION cheladb.bump_schema_version() OWNER TO CURRENT_USER;
-REVOKE ALL ON FUNCTION cheladb.bump_schema_version() FROM PUBLIC;
-CREATE OR REPLACE FUNCTION cheladb.grant_extension_functions() RETURNS event_trigger
+  $f$ BEGIN UPDATE chelabase.schema_version SET version = pg_catalog.gen_random_uuid(); END $f$;
+ALTER FUNCTION chelabase.bump_schema_version() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION chelabase.bump_schema_version() FROM PUBLIC;
+CREATE OR REPLACE FUNCTION chelabase.grant_extension_functions() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
   $f$ DECLARE f pg_catalog.regprocedure; BEGIN
     FOR f IN SELECT d.objid::pg_catalog.regprocedure FROM pg_catalog.pg_event_trigger_ddl_commands() c
@@ -1245,20 +1245,20 @@ CREATE OR REPLACE FUNCTION cheladb.grant_extension_functions() RETURNS event_tri
       BEGIN
         EXECUTE pg_catalog.format('GRANT EXECUTE ON ROUTINE %s TO PUBLIC', f);
       EXCEPTION WHEN OTHERS THEN
-        RAISE WARNING 'cheladb: EXECUTE on % was not granted to PUBLIC: %', f, SQLERRM;
+        RAISE WARNING 'chelabase: EXECUTE on % was not granted to PUBLIC: %', f, SQLERRM;
       END;
     END LOOP;
   EXCEPTION WHEN OTHERS THEN
-    RAISE WARNING 'cheladb: extension functions were not granted to PUBLIC: %', SQLERRM;
+    RAISE WARNING 'chelabase: extension functions were not granted to PUBLIC: %', SQLERRM;
   END $f$;
-ALTER FUNCTION cheladb.grant_extension_functions() OWNER TO CURRENT_USER;
-REVOKE ALL ON FUNCTION cheladb.grant_extension_functions() FROM PUBLIC;
-DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
-DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
-DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
-CREATE EVENT TRIGGER cheladb_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION cheladb.bump_schema_version();
-CREATE EVENT TRIGGER cheladb_schema_version_drop ON sql_drop EXECUTE FUNCTION cheladb.bump_schema_version();
-CREATE EVENT TRIGGER cheladb_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION cheladb.grant_extension_functions();
+ALTER FUNCTION chelabase.grant_extension_functions() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION chelabase.grant_extension_functions() FROM PUBLIC;
+DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
+DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
+DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION chelabase.bump_schema_version();
+CREATE EVENT TRIGGER chelabase_schema_version_drop ON sql_drop EXECUTE FUNCTION chelabase.bump_schema_version();
+CREATE EVENT TRIGGER chelabase_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION chelabase.grant_extension_functions();
 ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD 's3cretPassw0rd';
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 DO $$ BEGIN
@@ -1271,7 +1271,7 @@ DO $$ BEGIN
   END IF;
 END $$;
 DO $$ DECLARE r record; BEGIN
-  IF pg_catalog.to_regnamespace('\"public\"') IS NOT NULL AND NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN
+  IF pg_catalog.to_regnamespace('\"public\"') IS NOT NULL AND NOT EXISTS (SELECT FROM chelabase.bootstrap) THEN
     GRANT SELECT ON ALL TABLES IN SCHEMA \"public\" TO anon;
     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"public\" TO authenticated;
     GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"public\" TO authenticated;
@@ -1283,11 +1283,11 @@ DO $$ DECLARE r record; BEGIN
       EXECUTE pg_catalog.format('REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC', r.f);
       EXECUTE pg_catalog.format('GRANT EXECUTE ON ROUTINE %s TO authenticated', r.f);
     END LOOP;
-    INSERT INTO cheladb.bootstrap (existing_granted) VALUES (true);
+    INSERT INTO chelabase.bootstrap (existing_granted) VALUES (true);
   END IF;
 END $$;
-SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace('\"public\"') IS NULL;
-SELECT pg_catalog.current_setting('cheladb.quarantined', true);
+SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace('\"public\"') IS NULL;
+SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
 ";
         assert_eq!(data_api_sql("postgres", "s3cretPassw0rd", "public"), expected);
@@ -1312,12 +1312,12 @@ COMMIT;
             let timeout_at = sql.find("SET LOCAL lock_timeout = '20s';\n").expect("the lock timeout");
             assert!(sql.find("BEGIN;").unwrap() < timeout_at && timeout_at < lock_at, "lock_timeout before the lock");
             assert_eq!(sql.matches("pg_advisory").count(), 1);
-            let first_change = sql.find("CREATE ROLE cheladb_admin").unwrap();
+            let first_change = sql.find("CREATE ROLE chelabase_admin").unwrap();
             assert!(lock_at < first_change, "the lock comes before anything changes");
             // Exactly one transaction, and nothing in it that can't run inside one.
             assert_eq!(sql.matches("BEGIN;").count(), 1);
             assert_eq!(sql.matches("COMMIT;").count(), 1);
-            let drop = sql.find("DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;\n").unwrap();
+            let drop = sql.find("DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;\n").unwrap();
             assert!(sql.find("BEGIN;").unwrap() < lock_at && lock_at < drop && drop < sql.rfind("COMMIT;").unwrap());
             for forbidden in ["CREATE DATABASE", "DROP DATABASE", "VACUUM", "CONCURRENTLY", "ROLLBACK"] {
                 assert!(!sql.contains(forbidden), "{forbidden}");
@@ -1326,41 +1326,41 @@ COMMIT;
     }
 
     /// The script runs as a superuser on a database its owner controls: nothing it calls
-    /// may resolve through the owner's schemas, and a `cheladb` schema it didn't make (or
+    /// may resolve through the owner's schemas, and a `chelabase` schema it didn't make (or
     /// one tampered with) is renamed aside before anything touches it.
     #[test]
-    fn the_script_pins_the_search_path_and_vets_cheladb_first() {
+    fn the_script_pins_the_search_path_and_vets_chelabase_first() {
         let sql = data_api_sql("postgres", "pw", "public");
         assert!(sql.starts_with("BEGIN;\nSET search_path = pg_catalog, pg_temp;\n"), "{sql}");
-        let rename = sql.find("ALTER SCHEMA cheladb RENAME TO %I").expect("the rename aside");
-        let create = sql.find("CREATE SCHEMA IF NOT EXISTS cheladb").unwrap();
+        let rename = sql.find("ALTER SCHEMA chelabase RENAME TO %I").expect("the rename aside");
+        let create = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap();
         assert!(rename < create);
-        assert!(sql.contains("REVOKE cheladb_admin FROM %I GRANTED BY %I CASCADE"));
+        assert!(sql.contains("REVOKE chelabase_admin FROM %I GRANTED BY %I CASCADE"));
         for check in ["pg_trigger", "pg_rewrite", "pg_policy", "pg_attrdef", "pg_opclass", "relowner", "proowner"] {
             assert!(sql.contains(check), "{check}");
         }
         assert_eq!(sql.matches("SET search_path = pg_catalog, pg_temp AS").count(), 2);
         assert!(!sql.contains(" format("), "every function qualified");
-        assert!(sql.ends_with("SELECT pg_catalog.current_setting('cheladb.quarantined', true);\nCOMMIT;\n"));
+        assert!(sql.ends_with("SELECT pg_catalog.current_setting('chelabase.quarantined', true);\nCOMMIT;\n"));
     }
 
-    /// `cheladb_admin` owns the schema: an owner who made it first (with a login, a
+    /// `chelabase_admin` owns the schema: an owner who made it first (with a login, a
     /// password or settings) could log in as it, so it's stripped every run, its sessions
     /// (and those of anyone who held it) are ended, and a tampered role means the schema
     /// is set aside.
     #[test]
-    fn cheladb_admin_is_locked_down_before_the_schema_is_trusted() {
+    fn chelabase_admin_is_locked_down_before_the_schema_is_trusted() {
         let sql = data_api_sql("postgres", "pw", "public");
         let locked = sql
-            .find("ALTER ROLE cheladb_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;")
+            .find("ALTER ROLE chelabase_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;")
             .expect("the role is locked down");
-        assert!(sql.contains("ALTER ROLE cheladb_admin RESET ALL;"));
-        assert!(sql.contains("ALTER ROLE cheladb_admin IN DATABASE %I RESET ALL"));
+        assert!(sql.contains("ALTER ROLE chelabase_admin RESET ALL;"));
+        assert!(sql.contains("ALTER ROLE chelabase_admin IN DATABASE %I RESET ALL"));
         let ended = sql.find("pg_catalog.pg_terminate_backend(a.pid)").expect("sessions ended");
         assert!(sql.contains("a.rolcanlogin OR a.rolsuper"), "a tampered role is detected");
         assert!(sql.contains("a.rolpassword IS NOT NULL"));
         assert!(sql.contains("IF ns IS NOT NULL AND (joined OR tampered"));
-        let create = sql.find("CREATE SCHEMA IF NOT EXISTS cheladb").unwrap();
+        let create = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap();
         assert!(locked < create && ended < create);
     }
 
@@ -1370,8 +1370,8 @@ COMMIT;
     #[test]
     fn grant_extension_functions_runs_as_the_invoker_and_never_fails() {
         let sql = data_api_sql("postgres", "pw", "public");
-        let start = sql.find("CREATE OR REPLACE FUNCTION cheladb.grant_extension_functions()").unwrap();
-        let end = sql[start..].find("ALTER FUNCTION cheladb.grant_extension_functions()").unwrap();
+        let start = sql.find("CREATE OR REPLACE FUNCTION chelabase.grant_extension_functions()").unwrap();
+        let end = sql[start..].find("ALTER FUNCTION chelabase.grant_extension_functions()").unwrap();
         let body = &sql[start..start + end];
         assert!(body.contains("SECURITY INVOKER"), "{body}");
         assert!(!body.contains("SECURITY DEFINER"), "{body}");
@@ -1394,15 +1394,15 @@ COMMIT;
     }
 
     /// A session of a former member that started before the REVOKE committed could still
-    /// SET ROLE cheladb_admin: sessions are ended again once it has.
+    /// SET ROLE chelabase_admin: sessions are ended again once it has.
     #[test]
     fn former_members_sessions_are_ended_again_after_the_revoke_commits() {
         let sql = data_api_sql("postgres", "pw", "public");
-        let vet_end = sql.find("PERFORM pg_catalog.set_config('cheladb.quarantined', aside, false);").unwrap();
+        let vet_end = sql.find("PERFORM pg_catalog.set_config('chelabase.quarantined', aside, false);").unwrap();
         let again = sql
-            .find("current_setting('cheladb.former_members', true)")
+            .find("current_setting('chelabase.former_members', true)")
             .expect("a second termination");
-        let create = sql.find("CREATE SCHEMA IF NOT EXISTS cheladb").unwrap();
+        let create = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap();
         assert!(vet_end < again && again < create);
         assert_eq!(sql.matches("pg_catalog.pg_terminate_backend(a.pid)").count(), 2);
     }
@@ -1410,8 +1410,8 @@ COMMIT;
     #[test]
     fn quarantined_schema_is_read_from_the_output() {
         assert_eq!(
-            quarantined("cheladb_quarantine_1700000000\n"),
-            Some("cheladb_quarantine_1700000000")
+            quarantined("chelabase_quarantine_1700000000\n"),
+            Some("chelabase_quarantine_1700000000")
         );
         assert_eq!(quarantined("\n"), None);
         assert_eq!(quarantined(""), None);
@@ -1424,8 +1424,8 @@ COMMIT;
         let id = ready_database(&w).await;
         let main = w.metadata.main(id);
         w.computes.answers.lock().unwrap().push((
-            "cheladb.quarantined".into(),
-            "cheladb_quarantine_1700000000\n".into(),
+            "chelabase.quarantined".into(),
+            "chelabase_quarantine_1700000000\n".into(),
         ));
         w.bootstrap_data_api(&main, "app").await.unwrap();
     }
@@ -1438,21 +1438,21 @@ COMMIT;
     /// Neon refuses to let a superuser run a function a non-superuser owns, and the event
     /// triggers fire for cloud_admin's own DDL: every trigger function must be owned by the
     /// superuser that runs the bootstrap (an earlier bootstrap's owner is replaced), never by
-    /// cheladb_admin.
+    /// chelabase_admin.
     #[test]
     fn event_trigger_functions_are_owned_by_the_bootstrap_superuser() {
         let sql = data_api_sql("postgres", "pw", "public");
         for function in [
-            "cheladb.bump_schema_version()",
-            "cheladb.grant_extension_functions()",
+            "chelabase.bump_schema_version()",
+            "chelabase.grant_extension_functions()",
         ] {
             assert!(
                 sql.contains(&format!("ALTER FUNCTION {function} OWNER TO CURRENT_USER;\n")),
                 "{function} is handed to the bootstrap's superuser"
             );
             assert!(
-                !sql.contains(&format!("ALTER FUNCTION {function} OWNER TO cheladb_admin")),
-                "{function} must not be owned by cheladb_admin"
+                !sql.contains(&format!("ALTER FUNCTION {function} OWNER TO chelabase_admin")),
+                "{function} must not be owned by chelabase_admin"
             );
         }
     }
@@ -1558,16 +1558,16 @@ COMMIT;
     #[test]
     fn the_health_check_covers_the_login_grants_and_triggers() {
         for part in [
-            "to_regclass('cheladb.schema_version')",
+            "to_regclass('chelabase.schema_version')",
             "rolcanlogin",
             "has_schema_privilege",
             "'USAGE'",
             "has_table_privilege",
             "'SELECT'",
             "evtenabled",
-            "cheladb_schema_version_ddl",
-            "cheladb_schema_version_drop",
-            "cheladb_extension_functions",
+            "chelabase_schema_version_ddl",
+            "chelabase_schema_version_drop",
+            "chelabase_extension_functions",
         ] {
             assert!(SCHEMA_CHECK_SQL.contains(part), "{part}: {SCHEMA_CHECK_SQL}");
         }
@@ -1699,7 +1699,7 @@ COMMIT;
         const PREFIX: &str = "bootstrapping the data API: ";
         let fail = |w: &FakeWorker| {
             *w.computes.fail_sql_containing.lock().unwrap() =
-                Some(("cheladb_admin".into(), "permission denied".into()));
+                Some(("chelabase_admin".into(), "permission denied".into()));
         };
 
         // Provision.
@@ -1906,7 +1906,7 @@ COMMIT;
         for system in [
             "s.rolsuper",
             "'neon_superuser'",
-            "'cheladb_admin'",
+            "'chelabase_admin'",
             "'pg_execute_server_program'",
             "'pg_read_server_files'",
             "'pg_write_server_files'",
@@ -1956,7 +1956,7 @@ COMMIT;
         let main = BranchId::from(id);
         for (role, message) in [
             ("authenticator", "the role authenticator is reserved"),
-            ("cheladb_admin", "the role cheladb_admin is reserved"),
+            ("chelabase_admin", "the role chelabase_admin is reserved"),
             (
                 "pg_execute_server_program",
                 "the role pg_execute_server_program is a built-in role",
@@ -2067,7 +2067,7 @@ COMMIT;
 
     #[tokio::test]
     async fn check_data_role_rpc_replies() {
-        use cheladb_nats::{CheckDataRoleReply, CheckDataRoleRequest};
+        use chelabase_nats::{CheckDataRoleReply, CheckDataRoleRequest};
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
         let main = BranchId::from(id);
@@ -2204,8 +2204,8 @@ COMMIT;
 
     // --- Databases beyond main (6c) -----------------------------------------------------
 
-    use cheladb_metadata::DataApiState;
-    use cheladb_nats::DataApiDatabaseRequest;
+    use chelabase_metadata::DataApiState;
+    use chelabase_nats::DataApiDatabaseRequest;
 
     use crate::fakes::FakeDbRow;
 
@@ -2308,7 +2308,7 @@ COMMIT;
         let main = w.metadata.main(id);
         add_row(&w, main.id, "analytics", DataApiState::Enabling, "nosuch");
         *w.computes.fail_sql_containing.lock().unwrap() =
-            Some(("cheladb_admin".into(), "schema \"nosuch\" does not exist".into()));
+            Some(("chelabase_admin".into(), "schema \"nosuch\" does not exist".into()));
 
         w.enable_data_api(&request(main.id, "analytics", false)).await;
 
@@ -2372,7 +2372,7 @@ COMMIT;
     }
 
     /// A remove that Postgres refuses because something still uses the machinery (a policy on
-    /// `cheladb.user_id()`, P29) is `refused` with Postgres' message, so the API can show it;
+    /// `chelabase.user_id()`, P29) is `refused` with Postgres' message, so the API can show it;
     /// the database stays on.
     #[tokio::test]
     async fn remove_blocked_by_a_dependency_is_refused_with_the_message() {
@@ -2380,17 +2380,17 @@ COMMIT;
         let id = ready_database(&w).await;
         let main = w.metadata.main(id);
         add_row(&w, main.id, "extra", DataApiState::On, "public");
-        let output = "NOTICE:  event trigger \"cheladb_users_protect_drop\" does not exist, skipping\n\
-                      ERROR:  cannot drop function cheladb.user_id() because other objects depend on it\n\
-                      DETAIL:  policy mine_own on table mine depends on function cheladb.user_id()\n\
+        let output = "NOTICE:  event trigger \"chelabase_users_protect_drop\" does not exist, skipping\n\
+                      ERROR:  cannot drop function chelabase.user_id() because other objects depend on it\n\
+                      DETAIL:  policy mine_own on table mine depends on function chelabase.user_id()\n\
                       HINT:  Use DROP ... CASCADE to drop the dependent objects too.";
         *w.computes.fail_sql_containing.lock().unwrap() = Some(("DROP SCHEMA".into(), output.into()));
         let reply = w.disable_data_api(&request(main.id, "extra", true)).await;
         assert_eq!(reply.kind.as_deref(), Some("refused"), "{reply:?}");
         let message = reply.error.unwrap();
         assert!(
-            message.contains("cannot drop function cheladb.user_id() because other objects depend on it")
-                && message.contains("policy mine_own on table mine depends on function cheladb.user_id()"),
+            message.contains("cannot drop function chelabase.user_id() because other objects depend on it")
+                && message.contains("policy mine_own on table mine depends on function chelabase.user_id()"),
             "{message}"
         );
         assert!(!message.contains("NOTICE"), "{message}");
@@ -2401,24 +2401,24 @@ COMMIT;
     /// first, and terse verbosity prints no DETAIL.
     #[test]
     fn dependency_refusal_is_found_anywhere_in_a_line() {
-        let message = "cannot drop function cheladb.user_id() because other objects depend on it";
+        let message = "cannot drop function chelabase.user_id() because other objects depend on it";
         assert_eq!(
             dependency_refusal(&format!("psql in compute ep-1 exited with 3: ERROR:  {message}")),
             Some(message.to_string())
         );
         assert_eq!(
-            dependency_refusal(&format!("psql in compute ep-1 exited with 3: ERROR:  {message}\nDETAIL:  policy p on table t depends on function cheladb.user_id()")),
-            Some(format!("{message} (policy p on table t depends on function cheladb.user_id())"))
+            dependency_refusal(&format!("psql in compute ep-1 exited with 3: ERROR:  {message}\nDETAIL:  policy p on table t depends on function chelabase.user_id()")),
+            Some(format!("{message} (policy p on table t depends on function chelabase.user_id())"))
         );
         assert_eq!(
-            dependency_refusal("psql in compute ep-1 exited with 3: ERROR:  permission denied for schema cheladb"),
+            dependency_refusal("psql in compute ep-1 exited with 3: ERROR:  permission denied for schema chelabase"),
             None
         );
         assert_eq!(dependency_refusal("connection refused"), None);
     }
 
-    /// Only what the bootstrap made is dropped, by name, and only from a `cheladb` schema owned
-    /// by `cheladb_admin`; `RESTRICT` refuses to take anything else with it. A `cheladb`
+    /// Only what the bootstrap made is dropped, by name, and only from a `chelabase` schema owned
+    /// by `chelabase_admin`; `RESTRICT` refuses to take anything else with it. A `chelabase`
     /// schema someone else owns is left alone with a warning. The cluster-wide role stays.
     #[test]
     fn remove_sql_drops_only_the_machinery_of_our_schema() {
@@ -2430,27 +2430,27 @@ DO $$ BEGIN
   SET LOCAL lock_timeout = '20s';
   PERFORM pg_catalog.pg_advisory_xact_lock(7163086723497615873);
   IF EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
-      WHERE n.nspname OPERATOR(pg_catalog.=) 'cheladb' AND r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_ddl;
-    DROP EVENT TRIGGER IF EXISTS cheladb_schema_version_drop;
-    DROP EVENT TRIGGER IF EXISTS cheladb_extension_functions;
-    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_drop;
-    DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_ddl;
-    DROP FUNCTION IF EXISTS cheladb.users_protect();
-    DROP FUNCTION IF EXISTS cheladb.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
-    DROP FUNCTION IF EXISTS cheladb.app_users_gone(uuid, boolean);
-    DROP FUNCTION IF EXISTS cheladb.app_users_rows();
-    DROP TABLE IF EXISTS cheladb.app_users_table;
-    DROP FUNCTION IF EXISTS cheladb.user_email();
-    DROP FUNCTION IF EXISTS cheladb.user_id();
-    DROP FUNCTION IF EXISTS cheladb.claims();
-    DROP FUNCTION IF EXISTS cheladb.bump_schema_version();
-    DROP FUNCTION IF EXISTS cheladb.grant_extension_functions();
-    DROP TABLE IF EXISTS cheladb.schema_version;
-    DROP TABLE IF EXISTS cheladb.bootstrap;
-    DROP SCHEMA cheladb RESTRICT;
-  ELSIF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'cheladb') THEN
-    RAISE WARNING 'cheladb: the cheladb schema is not owned by cheladb_admin; nothing was removed';
+      WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase' AND r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
+    DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
+    DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
+    DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
+    DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;
+    DROP FUNCTION IF EXISTS chelabase.users_protect();
+    DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
+    DROP FUNCTION IF EXISTS chelabase.app_users_gone(uuid, boolean);
+    DROP FUNCTION IF EXISTS chelabase.app_users_rows();
+    DROP TABLE IF EXISTS chelabase.app_users_table;
+    DROP FUNCTION IF EXISTS chelabase.user_email();
+    DROP FUNCTION IF EXISTS chelabase.user_id();
+    DROP FUNCTION IF EXISTS chelabase.claims();
+    DROP FUNCTION IF EXISTS chelabase.bump_schema_version();
+    DROP FUNCTION IF EXISTS chelabase.grant_extension_functions();
+    DROP TABLE IF EXISTS chelabase.schema_version;
+    DROP TABLE IF EXISTS chelabase.bootstrap;
+    DROP SCHEMA chelabase RESTRICT;
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname OPERATOR(pg_catalog.=) 'chelabase') THEN
+    RAISE WARNING 'chelabase: the chelabase schema is not owned by chelabase_admin; nothing was removed';
   END IF;
 END $$;
 "
@@ -2465,7 +2465,7 @@ END $$;
         assert!(!REMOVE_DATA_API_SQL.contains("DROP ROLE"), "the cluster-wide role stays");
     }
 
-    /// P4: what the users bootstrap and the claim helpers add to `cheladb` doesn't make the
+    /// P4: what the users bootstrap and the claim helpers add to `chelabase` doesn't make the
     /// data API bootstrap set the schema aside.
     #[test]
     fn tamper_check_allows_app_users_objects() {
@@ -2485,7 +2485,7 @@ END $$;
             assert!(pronames.contains(&format!("'{name}'")), "{name}");
         }
         // The claim helpers come with every bootstrap, right after the owner's grants.
-        let helpers = format!("GRANT SELECT ON cheladb.schema_version TO postgres;\n{}", crate::app_users_sql::claim_helpers_body());
+        let helpers = format!("GRANT SELECT ON chelabase.schema_version TO postgres;\n{}", crate::app_users_sql::claim_helpers_body());
         assert!(sql.contains(&helpers));
         assert!(data_api_sql_granting_existing("postgres", "pw", "public").contains(&helpers));
     }
@@ -2496,28 +2496,28 @@ END $$;
     fn remove_data_api_sql_drops_helpers_dependents_first() {
         let sql = REMOVE_DATA_API_SQL;
         let at = |s: &str| sql.find(s).unwrap_or_else(|| panic!("{s}"));
-        let schema = at("DROP SCHEMA cheladb RESTRICT;");
+        let schema = at("DROP SCHEMA chelabase RESTRICT;");
         let (email, id, claims) = (
-            at("DROP FUNCTION IF EXISTS cheladb.user_email();"),
-            at("DROP FUNCTION IF EXISTS cheladb.user_id();"),
-            at("DROP FUNCTION IF EXISTS cheladb.claims();"),
+            at("DROP FUNCTION IF EXISTS chelabase.user_email();"),
+            at("DROP FUNCTION IF EXISTS chelabase.user_id();"),
+            at("DROP FUNCTION IF EXISTS chelabase.claims();"),
         );
         assert!(email < claims && id < claims && claims < schema);
-        let protect = at("DROP EVENT TRIGGER IF EXISTS cheladb_users_protect_drop;");
-        assert!(protect < at("DROP FUNCTION IF EXISTS cheladb.users_protect();"));
-        assert!(at("DROP TABLE IF EXISTS cheladb.app_users_table;") < schema);
-        assert!(at("DROP FUNCTION IF EXISTS cheladb.app_users_rows();") < schema);
+        let protect = at("DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;");
+        assert!(protect < at("DROP FUNCTION IF EXISTS chelabase.users_protect();"));
+        assert!(at("DROP TABLE IF EXISTS chelabase.app_users_table;") < schema);
+        assert!(at("DROP FUNCTION IF EXISTS chelabase.app_users_rows();") < schema);
         assert!(!sql.contains("users_guard"), "left to RESTRICT");
         // Inside the ownership guard.
-        assert!(at("r.rolname OPERATOR(pg_catalog.=) 'cheladb_admin') THEN") < protect);
+        assert!(at("r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN") < protect);
     }
 
     #[test]
     fn reserved_roles_include_the_sync_role() {
         assert!(RESERVED_ROLES.contains(&crate::app_users_sql::USERS_SYNC_ROLE));
         assert_eq!(
-            refuse_by_name("cheladb_auth_sync"),
-            Some(RoleCheck::Refused("the role cheladb_auth_sync is reserved".into()))
+            refuse_by_name("chelabase_auth_sync"),
+            Some(RoleCheck::Refused("the role chelabase_auth_sync is reserved".into()))
         );
     }
 
@@ -2556,7 +2556,7 @@ END $$;
         assert_eq!(scripts_in(&w, &ep, "analytics"), [data_api_sql("postgres", &password, "reporting")]);
         let reply = w.rebootstrap_data_api(&request(main.id, "off", false)).await;
         assert_eq!(reply.kind.as_deref(), Some("refused"));
-        *w.computes.fail_sql_containing.lock().unwrap() = Some(("cheladb_admin".into(), "boom".into()));
+        *w.computes.fail_sql_containing.lock().unwrap() = Some(("chelabase_admin".into(), "boom".into()));
         let reply = w.rebootstrap_data_api(&request(main.id, "analytics", false)).await;
         assert_eq!(reply.kind.as_deref(), Some("failed"));
     }
@@ -2570,7 +2570,7 @@ END $$;
         add_row(&w, main.id, "analytics", DataApiState::On, "reporting");
         let password = authenticator_password(&w, &main);
 
-        // Without the flag: the first-grants statements stay behind `cheladb.bootstrap`.
+        // Without the flag: the first-grants statements stay behind `chelabase.bootstrap`.
         assert_eq!(w.rebootstrap_data_api(&request(main.id, "analytics", false)).await, CheckDataRoleReply::ok());
         // With it: the same script, but the first-grants run whether or not a first grant ran.
         let mut asked = request(main.id, "analytics", false);
@@ -2583,12 +2583,12 @@ END $$;
         assert_eq!(scripts[1], data_api_sql_granting_existing("postgres", &password, "reporting"));
         let grants = "GRANT SELECT ON ALL TABLES IN SCHEMA \"reporting\" TO anon;";
         assert!(scripts[0].contains(grants) && scripts[1].contains(grants));
-        let guard = "IF pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL AND NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN";
+        let guard = "IF pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL AND NOT EXISTS (SELECT FROM chelabase.bootstrap) THEN";
         assert!(scripts[0].contains(guard) && !scripts[1].contains(guard));
         // Still guarded by the schema's existence, never revoking anything from a role, and
         // an existing bootstrap row isn't an error.
         assert!(scripts[1].contains("IF pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL THEN\n    GRANT SELECT ON ALL TABLES"));
-        assert!(scripts[1].contains("INSERT INTO cheladb.bootstrap (existing_granted) VALUES (true) ON CONFLICT DO NOTHING;"));
+        assert!(scripts[1].contains("INSERT INTO chelabase.bootstrap (existing_granted) VALUES (true) ON CONFLICT DO NOTHING;"));
         assert_eq!(scripts[1].matches("GRANT SELECT ON ALL TABLES").count(), 1);
         // Grants only (U2): the first-grants block of the granting variant has no REVOKE and
         // still carries the same GRANTs; the first enable's block keeps its revoke.
@@ -2642,9 +2642,9 @@ END $$;
     #[test]
     fn bootstrap_grants_the_owner_the_version_table() {
         let sql = data_api_sql("postgres", "pw", "public");
-        let version = sql.find("GRANT SELECT ON cheladb.schema_version TO postgres;\n").expect("P5 table grant");
-        let usage = sql.find("GRANT USAGE ON SCHEMA cheladb TO postgres;\n").expect("P5 schema grant");
-        let created = sql.find("CREATE TABLE IF NOT EXISTS cheladb.schema_version").unwrap();
+        let version = sql.find("GRANT SELECT ON chelabase.schema_version TO postgres;\n").expect("P5 table grant");
+        let usage = sql.find("GRANT USAGE ON SCHEMA chelabase TO postgres;\n").expect("P5 schema grant");
+        let created = sql.find("CREATE TABLE IF NOT EXISTS chelabase.schema_version").unwrap();
         assert!(created < usage && usage < version);
         // The schema is quoted wherever the script names it.
         let sql = data_api_sql("postgres", "pw", "my\"schema");
@@ -2709,18 +2709,18 @@ END $$;
         for statement in sql.match_indices("IN SCHEMA \"reporting\"").map(|(i, _)| i) {
             assert!(statement > first, "{statement}");
         }
-        assert!(sql.contains(&format!("  IF {guard} AND NOT EXISTS (SELECT FROM cheladb.bootstrap) THEN")));
+        assert!(sql.contains(&format!("  IF {guard} AND NOT EXISTS (SELECT FROM chelabase.bootstrap) THEN")));
         // The schema-free default privilege stays outside the guard.
         let revoke = sql.find("REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;").unwrap();
         assert!(revoke < first);
         // The machinery itself is not guarded, and the marker comes before the last line.
-        assert!(sql.find("CREATE SCHEMA IF NOT EXISTS cheladb").unwrap() < first);
-        let marker = sql.find("SELECT 'cheladb_missing_schema' WHERE pg_catalog.to_regnamespace('\"reporting\"') IS NULL;\n").unwrap();
-        assert!(marker < sql.find("current_setting('cheladb.quarantined'").unwrap());
-        assert!(super::missing_schema("cheladb_missing_schema\n\n"));
-        assert!(super::missing_schema("cheladb_missing_schema\ncheladb_quarantine_1\n"));
+        assert!(sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap() < first);
+        let marker = sql.find("SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace('\"reporting\"') IS NULL;\n").unwrap();
+        assert!(marker < sql.find("current_setting('chelabase.quarantined'").unwrap());
+        assert!(super::missing_schema("chelabase_missing_schema\n\n"));
+        assert!(super::missing_schema("chelabase_missing_schema\nchelabase_quarantine_1\n"));
         assert!(!super::missing_schema("\n"));
-        assert_eq!(quarantined("cheladb_missing_schema\ncheladb_quarantine_1\n"), Some("cheladb_quarantine_1"));
+        assert_eq!(quarantined("chelabase_missing_schema\nchelabase_quarantine_1\n"), Some("chelabase_quarantine_1"));
     }
 
     #[tokio::test]
@@ -2730,7 +2730,7 @@ END $$;
         let main = w.metadata.main(id);
         w.metadata.state().db_rows.get_mut(&main.id).unwrap()[0].schema = "gone".to_string();
         // The script reports that it skipped the schema's statements.
-        w.computes.answer("cheladb.quarantined", "cheladb_missing_schema\n");
+        w.computes.answer("chelabase.quarantined", "chelabase_missing_schema\n");
 
         let dev = ready_branch(&w, id, "dev", main.id).await;
 

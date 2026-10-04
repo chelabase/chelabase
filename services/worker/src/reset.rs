@@ -4,13 +4,13 @@
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use cheladb_metadata::BranchStatus;
-use cheladb_nats::RESET_NOT_APPLIED;
-use cheladb_neon::ComputeBackend;
-use cheladb_secrets::{Purpose, seal_credential};
-use cheladb_types::BranchId;
+use chelabase_metadata::BranchStatus;
+use chelabase_nats::RESET_NOT_APPLIED;
+use chelabase_neon::ComputeBackend;
+use chelabase_secrets::{Purpose, seal_credential};
+use chelabase_types::BranchId;
 #[cfg(test)]
-use cheladb_types::DatabaseId;
+use chelabase_types::DatabaseId;
 use tracing::{info, warn};
 
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
@@ -41,7 +41,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
         // Step 1: the sealed password, the verifier and the flag, in one transaction.
         let password = credentials::generate_password();
-        let verifier = cheladb_neon::scram::verifier(&password);
+        let verifier = chelabase_neon::scram::verifier(&password);
         let sealed = seal_credential(&self.key, &main.id.to_string(), Purpose::Owner, &password);
         let replaced = self
             .metadata
@@ -121,13 +121,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .neon_databases(endpoint_id)
                 .await
                 .context("loading the databases")?;
-            let config = cheladb_neon::spec::stored_endpoint_config(
+            let config = chelabase_neon::spec::stored_endpoint_config(
                 &self.storage,
                 &endpoint,
                 roles,
                 databases,
                 self.pusher.jwks(),
-                Some(cheladb_neon::spec::ddl_url(
+                Some(chelabase_neon::spec::ddl_url(
                     &self.control_plane_uri,
                     endpoint_id,
                 )),
@@ -178,8 +178,8 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use cheladb_metadata::DatabaseStatus;
-    use cheladb_secrets::open_credential;
+    use chelabase_metadata::DatabaseStatus;
+    use chelabase_secrets::open_credential;
     use tokio::sync::oneshot;
 
     use super::*;
@@ -231,7 +231,7 @@ mod tests {
         let (iterations, salt) = params.split_once(':').unwrap();
         let salt = STANDARD.decode(salt).unwrap();
         assert_eq!(
-            cheladb_neon::scram::verifier_with_salt(&password, &salt, iterations.parse().unwrap()),
+            chelabase_neon::scram::verifier_with_salt(&password, &salt, iterations.parse().unwrap()),
             verifier
         );
     }
@@ -359,7 +359,7 @@ mod tests {
             store_verifier(
                 &state,
                 &hook_ep,
-                &cheladb_neon::scram::verifier("the-newer-password"),
+                &chelabase_neon::scram::verifier("the-newer-password"),
             );
             Box::pin(async {})
         }));
@@ -391,8 +391,8 @@ mod tests {
         let (w, journal) = worker();
         let (id, ep) = ready(&w, &journal).await;
         let (va, vb) = (
-            cheladb_neon::scram::verifier("password-a"),
-            cheladb_neon::scram::verifier("password-b"),
+            chelabase_neon::scram::verifier("password-a"),
+            chelabase_neon::scram::verifier("password-b"),
         );
         // Reset A committed; reconcile's apply_pending (below, `a`) reads A and pushes it.
         store_verifier(&w.metadata.state, &ep, &va);
@@ -469,9 +469,9 @@ mod tests {
             .get_mut(&ep)
             .unwrap()
             .roles
-            .push(cheladb_metadata::NeonRole {
+            .push(chelabase_metadata::NeonRole {
                 name: "app".into(),
-                scram_verifier: cheladb_neon::scram::verifier("x"),
+                scram_verifier: chelabase_neon::scram::verifier("x"),
             });
 
         let _lock = w.metadata.lock_endpoint(&ep).await.unwrap();

@@ -73,7 +73,7 @@ const runs = (f: FakeFetch) => f.calls.filter((r) => r.method === "POST" && r.ur
 const runBodies = (f: FakeFetch) => Promise.all(runs(f).map((r) => r.clone().json() as Promise<any>));
 const schemaCalls = (f: FakeFetch) => f.calls.filter((r) => r.url.includes("/sql/schema"));
 const textOf = (el: Element) => el.textContent ?? "";
-const historyOf = () => JSON.parse(localStorage.getItem("cheladb.sql.history.u1.d1") ?? "[]") as Array<Record<string, unknown>>;
+const historyOf = () => JSON.parse(localStorage.getItem("chelabase.sql.history.u1.d1") ?? "[]") as Array<Record<string, unknown>>;
 /** A run response whose events the test pushes. */
 function openRun() {
   let ctl!: ReadableStreamDefaultController<Uint8Array>;
@@ -118,7 +118,7 @@ describe("SqlEditor", () => {
     expect(body.run_id).toMatch(/^[0-9a-f-]{36}$/);
     expect(runs(f)[0].headers.get("Authorization")).toBe("Bearer test-token");
     // the run lands in the history
-    const hist = JSON.parse(localStorage.getItem("cheladb.sql.history.u1.d1")!);
+    const hist = JSON.parse(localStorage.getItem("chelabase.sql.history.u1.d1")!);
     expect(hist[0]).toMatchObject({ sql: "select 1; select 2", branchId: "b1", outcome: "ok", durationMs: 12 });
   });
 
@@ -226,7 +226,7 @@ describe("SqlEditor", () => {
     const { unmount } = setup();
     await setDoc("select 42");
     unmount();
-    expect(localStorage.getItem("cheladb.sql.buffer.u1.d1")).toBe("select 42");
+    expect(localStorage.getItem("chelabase.sql.buffer.u1.d1")).toBe("select 42");
   });
 
   it("error_position_is_underlined", async () => {

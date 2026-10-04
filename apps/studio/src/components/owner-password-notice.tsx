@@ -8,13 +8,13 @@ export interface OwnerPasswordNoticeProps {
   onRetry: () => void;
 }
 
-/** Shown when a request needs the owner's password and Cheladb doesn't know it (it was set in SQL). */
+/** Shown when a request needs the owner's password and Chelabase doesn't know it (it was set in SQL). */
 export function OwnerPasswordNotice({ databaseId, branchId, onRetry }: OwnerPasswordNoticeProps) {
   const [showRoles, setShowRoles] = useState(false);
   return (
     <div className="space-y-2 rounded-lg border p-3 text-sm">
       <p>
-        The owner password isn&apos;t known to Cheladb (it was set in SQL), so the console can&apos;t connect as the
+        The owner password isn&apos;t known to Chelabase (it was set in SQL), so the console can&apos;t connect as the
         owner. Reset it to continue.
       </p>
       <div className="flex gap-2">

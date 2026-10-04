@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Branch } from "@cheladb/management-client";
+import type { Branch } from "@chelabase/management-client";
 import {
   actionReasons,
   buildTree,

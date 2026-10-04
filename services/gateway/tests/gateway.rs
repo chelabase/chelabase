@@ -5,8 +5,8 @@
 
 use axum::extract::Request;
 use axum::{Json, Router};
-use cheladb_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
-use cheladb_auth::test_support::MockJwks;
+use chelabase_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
+use chelabase_auth::test_support::MockJwks;
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -99,14 +99,14 @@ async fn spawn_gateway_with(
     command.envs(extra_env.iter().copied());
     let child = command
         .current_dir(workdir.path())
-        .env("CHELADB_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
-        .env("CHELADB_ORCHESTRATOR_URL", upstream_url)
-        .env("CHELADB_API_HOSTS", "")
-        .env("CHELADB_STUDIO_ORIGINS", STUDIO)
-        .env("CHELADB_ZITADEL_ISSUER", jwks.issuer())
-        .env("CHELADB_ZITADEL_JWKS_URL", jwks.jwks_url())
-        .env("CHELADB_ZITADEL_AUDIENCES", "")
-        .env("CHELADB_INTERNAL_SIGNING_KEY", &signing_key)
+        .env("CHELABASE_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
+        .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
+        .env("CHELABASE_API_HOSTS", "")
+        .env("CHELABASE_STUDIO_ORIGINS", STUDIO)
+        .env("CHELABASE_ZITADEL_ISSUER", jwks.issuer())
+        .env("CHELABASE_ZITADEL_JWKS_URL", jwks.jwks_url())
+        .env("CHELABASE_ZITADEL_AUDIENCES", "")
+        .env("CHELABASE_INTERNAL_SIGNING_KEY", &signing_key)
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -430,7 +430,7 @@ async fn upstream_that_never_answers_is_504_json() {
     let (base, _verify, _gateway) = spawn_gateway_with(
         &upstream,
         &jwks,
-        &[("CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS", "1")],
+        &[("CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS", "1")],
     )
     .await;
 
@@ -507,13 +507,13 @@ async fn client_authorization_header_is_not_forwarded_to_rest() {
         &rest,
         &jwks,
         &[
-            ("CHELADB_REST_URL", &rest),
-            ("CHELADB_INTERNAL_URL", &internal),
-            ("CHELADB_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+            ("CHELABASE_REST_URL", &rest),
+            ("CHELABASE_INTERNAL_URL", &internal),
+            ("CHELABASE_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
         ],
     )
     .await;
-    let key = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Public).key;
+    let key = chelabase_types::data_key::generate(chelabase_types::data_key::DataKeyKind::Public).key;
 
     let resp = reqwest::Client::new()
         .post(format!("{base}/data/v1/query"))
@@ -543,13 +543,13 @@ async fn proxy_failures_are_json_on_data_routes_too() {
         &dead_rest,
         &jwks,
         &[
-            ("CHELADB_REST_URL", &dead_rest),
-            ("CHELADB_INTERNAL_URL", &internal),
-            ("CHELADB_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+            ("CHELABASE_REST_URL", &dead_rest),
+            ("CHELABASE_INTERNAL_URL", &internal),
+            ("CHELABASE_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
         ],
     )
     .await;
-    let key = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Public).key;
+    let key = chelabase_types::data_key::generate(chelabase_types::data_key::DataKeyKind::Public).key;
 
     let resp = reqwest::Client::new()
         .post(format!("{base}/data/v1/query"))
@@ -567,8 +567,8 @@ async fn proxy_failures_are_json_on_data_routes_too() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cheladb_user_header_is_stripped_upstream() {
-    use cheladb_auth::app_token::{app_audience, AppClaims, AppTokenSigner, APP_ISSUER};
+async fn chelabase_user_header_is_stripped_upstream() {
+    use chelabase_auth::app_token::{app_audience, AppClaims, AppTokenSigner, APP_ISSUER};
     let jwks = MockJwks::start().await;
     let (rest, seen) = spawn_upstream().await;
     let internal = spawn_internal_listener().await;
@@ -600,27 +600,27 @@ async fn cheladb_user_header_is_stripped_upstream() {
         &rest,
         &jwks,
         &[
-            ("CHELADB_REST_URL", &rest),
-            ("CHELADB_INTERNAL_URL", &internal),
-            ("CHELADB_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
-            ("CHELADB_APP_SESSIONS_INTERNAL_TOKEN", "e2e-sessions-token"),
-            ("CHELADB_APP_JWT_PUBLIC_KEY", public_path.to_str().unwrap()),
+            ("CHELABASE_REST_URL", &rest),
+            ("CHELABASE_INTERNAL_URL", &internal),
+            ("CHELABASE_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+            ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "e2e-sessions-token"),
+            ("CHELABASE_APP_JWT_PUBLIC_KEY", public_path.to_str().unwrap()),
         ],
     )
     .await;
-    let key = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Public).key;
+    let key = chelabase_types::data_key::generate(chelabase_types::data_key::DataKeyKind::Public).key;
 
     let resp = reqwest::Client::new()
         .post(format!("{base}/data/v1/query"))
         .header("authorization", format!("Bearer {key}"))
-        .header("cheladb-user", &token)
+        .header("chelabase-user", &token)
         .body("{}")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let saw = seen.lock().unwrap().clone().expect("rest was called");
-    assert!(!saw.contains_key("cheladb-user"), "the user token must not reach rest");
+    assert!(!saw.contains_key("chelabase-user"), "the user token must not reach rest");
     assert!(!saw.contains_key("authorization"));
     let data = verify.verify(&saw[IDENTITY_HEADER], "rest").unwrap().data.unwrap();
     assert_eq!(data.role, "authenticated");
@@ -630,7 +630,7 @@ async fn cheladb_user_header_is_stripped_upstream() {
     let resp = reqwest::Client::new()
         .post(format!("{base}/data/v1/query"))
         .header("authorization", format!("Bearer {key}"))
-        .header("cheladb-user", "garbage")
+        .header("chelabase-user", "garbage")
         .body("{}")
         .send()
         .await

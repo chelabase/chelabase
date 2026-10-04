@@ -1,4 +1,4 @@
-# Cheladb
+# Chelabase
 
 Local-only DBaaS control-plane monorepo.
 
@@ -9,7 +9,7 @@ Apache-2.0. Tooling: [proto](https://moonrepo.dev/proto) + [moon](https://moonre
 ```
 apps/studio          the only user-facing app
 services/            gateway, orchestrator, worker, rest, auth (was ui-auth)
-tools/cli            the `cheladb` binary (binary and package name unchanged)
+tools/cli            the `chelabase` binary
 crates/, packages/   shared Rust and TypeScript libraries, unchanged
 infra/compose/       metadata Postgres, NATS JetStream, Zitadel
 ```
@@ -34,7 +34,7 @@ pnpm install
 | `just` | List recipes |
 | `just deps-up` / `up` | Compose up `-d` |
 | `just deps-down` / `down` | Compose down **only** |
-| `just zitadel-bootstrap` | `cargo run -p cheladb -- dev bootstrap` |
+| `just zitadel-bootstrap` | `cargo run -p chelabase -- dev bootstrap` |
 | `just auth-token` | Mint demo JWT access token (stdout) |
 | `just zitadel-reset` | Wipe **only** Zitadel volume so FirstInstance rewrites `admin.pat` |
 | `just dev` | Compose up + bootstrap + **detached** apps; prints seed IDs |
@@ -60,9 +60,9 @@ pnpm install
 
 ```bash
 just dev                 # deps + IAM bootstrap + background processes
-just create-db-demo      # → 202 + database_id (mints JWT via cheladb CLI)
+just create-db-demo      # → 202 + database_id (mints JWT via chelabase CLI)
 # poll (with minted token):
-#   TOKEN=$(cargo run -q -p cheladb -- dev token)
+#   TOKEN=$(cargo run -q -p chelabase -- dev token)
 #   curl -sS -H "Authorization: Bearer $TOKEN" \
 #     http://127.0.0.1:8000/v1/databases/<database_id>
 just stop
@@ -78,9 +78,9 @@ just zitadel-reset && just zitadel-bootstrap
 
 ### Builds and worktrees
 
-`just test` runs the Rust tests with [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`) and then the doctests. Dev builds carry line tables only (no full debug info), which keeps test binaries small. `just sweep-builds` drops build artifacts older than 14 days from the main `target/` and every worktree's; `just cleanup` runs it too. `just wt-add <branch>` makes a worktree in `.worktrees/<branch>` with its own `target/` directory (cargo's default), `.cheladb` and `apps/studio/.env.local` linked from the main checkout, and dependencies installed; `just wt-remove <branch>` removes it and keeps the branch. The main checkout stays on `main`. With sccache configured in `~/.cargo/config.toml`, compilation is shared across the machine.
+`just test` runs the Rust tests with [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`) and then the doctests. Dev builds carry line tables only (no full debug info), which keeps test binaries small. `just sweep-builds` drops build artifacts older than 14 days from the main `target/` and every worktree's; `just cleanup` runs it too. `just wt-add <branch>` makes a worktree in `.worktrees/<branch>` with its own `target/` directory (cargo's default), `.chelabase` and `apps/studio/.env.local` linked from the main checkout, and dependencies installed; `just wt-remove <branch>` removes it and keeps the branch. The main checkout stays on `main`. With sccache configured in `~/.cargo/config.toml`, compilation is shared across the machine.
 
-Logs for detached processes: `.cheladb/dev/*.log`. IAM artifacts: `.cheladb/zitadel/` (gitignored). Zitadel PATs are opaque — demo calls use **JWT profile** access tokens from `cheladb dev token`.
+Logs for detached processes: `.chelabase/dev/*.log`. IAM artifacts: `.chelabase/zitadel/` (gitignored). Zitadel PATs are opaque — demo calls use **JWT profile** access tokens from `chelabase dev token`.
 
 ## Seed tenant / project (local demo)
 
@@ -93,13 +93,13 @@ Bootstrap sets `tenants.zitadel_org_id` for the demo tenant from the local Zitad
 
 ## Auth
 
-- All API traffic goes through the gateway on `:8000`. Endpoints and their policy are declared once in `crates/cheladb-routes`.
-- Management API endpoints (`/v1/*`) require `Authorization: Bearer <Zitadel JWT>`. The gateway verifies it via JWKS, then forwards a 60-second EdDSA **internal identity token** (`x-cheladb-identity`) signed for the target service. It never forwards `Authorization` or a client-supplied identity header.
-- The orchestrator trusts only the internal token (`CHELADB_INTERNAL_VERIFY_KEY`) and maps its `org_id` to a tenant (soft-bind via `tenants.zitadel_org_id`). Calling `:8081` directly returns `401`.
-- `cheladb dev bootstrap` creates the gateway keypair in `.cheladb/gateway/` (once; never overwritten) and writes both key paths into `.cheladb/zitadel/demo.env`.
+- All API traffic goes through the gateway on `:8000`. Endpoints and their policy are declared once in `crates/chelabase-routes`.
+- Management API endpoints (`/v1/*`) require `Authorization: Bearer <Zitadel JWT>`. The gateway verifies it via JWKS, then forwards a 60-second EdDSA **internal identity token** (`x-chelabase-identity`) signed for the target service. It never forwards `Authorization` or a client-supplied identity header.
+- The orchestrator trusts only the internal token (`CHELABASE_INTERNAL_VERIFY_KEY`) and maps its `org_id` to a tenant (soft-bind via `tenants.zitadel_org_id`). Calling `:8081` directly returns `401`.
+- `chelabase dev bootstrap` creates the gateway keypair in `.chelabase/gateway/` (once; never overwritten) and writes both key paths into `.chelabase/zitadel/demo.env`.
 - `GET /health` is public; `GET /_gateway/health` is the gateway's own liveness check.
 - Forwarding headers: the gateway appends the client IP to `X-Forwarded-For` (never trust it for authorization) and sets `X-Forwarded-Proto: http` only when a TLS-terminating proxy in front hasn't already set it.
-- Gateway env: `CHELADB_GATEWAY_ADDR` (default `127.0.0.1:8000`), `CHELADB_ORCHESTRATOR_URL` (default `http://127.0.0.1:8081`), `CHELADB_API_HOSTS` (comma-separated hostnames that serve the management, login and data APIs; empty = any host), `CHELADB_STUDIO_ORIGINS` (default `http://localhost:3000`), `CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS` (default `60`).
+- Gateway env: `CHELABASE_GATEWAY_ADDR` (default `127.0.0.1:8000`), `CHELABASE_ORCHESTRATOR_URL` (default `http://127.0.0.1:8081`), `CHELABASE_API_HOSTS` (comma-separated hostnames that serve the management, login and data APIs; empty = any host), `CHELABASE_STUDIO_ORIGINS` (default `http://localhost:3000`), `CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS` (default `60`).
 
 Design notes:
 
@@ -120,8 +120,8 @@ Studio uses TanStack Query for all data fetching. Lists poll every 2 seconds whi
 
 How it's wired:
 
-- `cheladb dev bootstrap` (idempotent) registers the `cheladb-studio` OIDC app (PKCE, JWT access tokens; drifted redirect settings are corrected in place), points Zitadel's SMTP at Mailpit, creates `.cheladb/auth/cookie.key`, and writes `apps/studio/.env.local` (gitignored). It needs `.cheladb/zitadel/login-client.pat`, which Zitadel writes only on a fresh instance (`just zitadel-reset`).
-- `CHELADB_MODE` is `self-hosted` (the default, the dev mode) or `platform` (the hosted cloud, not built yet). Email verification follows it: off in self-hosted mode (sign-ups are created with the email already verified), required in platform mode. `CHELADB_REQUIRE_EMAIL_VERIFICATION=true` or `=false` overrides it; codes land in Mailpit.
+- `chelabase dev bootstrap` (idempotent) registers the `chelabase-studio` OIDC app (PKCE, JWT access tokens; drifted redirect settings are corrected in place), points Zitadel's SMTP at Mailpit, creates `.chelabase/auth/cookie.key`, and writes `apps/studio/.env.local` (gitignored). It needs `.chelabase/zitadel/login-client.pat`, which Zitadel writes only on a fresh instance (`just zitadel-reset`).
+- `CHELABASE_MODE` is `self-hosted` (the default, the dev mode) or `platform` (the hosted cloud, not built yet). Email verification follows it: off in self-hosted mode (sign-ups are created with the email already verified), required in platform mode. `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true` or `=false` overrides it; codes land in Mailpit.
 - Everyone who signs up joins the same organization, tenant and project (a shared team workspace, by design for self-hosting). Per-signup isolation is the "one org per signup" option in the spec.
 - Open Studio at `http://localhost:3000`; visits to `127.0.0.1:3000` are redirected there, since the Zitadel redirect URI and gateway CORS are registered for `localhost`.
 - New signups join the bootstrapped org, which is bound to the demo tenant. That pin is one scope in `apps/studio/src/lib/auth.ts`. Moving to one organization per signup is sketched in the [Studio auth spec](docs/superpowers/specs/2026-09-27-studio-auth-design.md).
@@ -132,16 +132,16 @@ How it's wired:
 1. `just dev` (needs Docker; the worker starts each database's compute container)
 2. `just create-db-demo demo1` (positional; `name=demo1` would become the literal name)
 3. Poll `GET http://127.0.0.1:8000/v1/databases/<id>` with a minted Bearer token until `status` is `ready`
-4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.cheladb/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). `CHELADB_PROXY_CA_FILE` (default `.cheladb/neon/proxy-ca.crt`) only sets the path reported in `ca_file`; it doesn't change which CA the proxy uses.
+4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.chelabase/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). `CHELABASE_PROXY_CA_FILE` (default `.chelabase/neon/proxy-ca.crt`) only sets the path reported in `ca_file`; it doesn't change which CA the proxy uses.
 5. `DELETE http://127.0.0.1:8000/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset.
 
 ## Database lifecycle
 
-Each database gets a Neon tenant and timeline on the storage controller, plus one compute container (`cheladb-compute-<ep>`). The `postgres` role is a member of `neon_superuser`, and a real superuser only when `CHELADB_DB_OWNER_SUPERUSER` is on and `CHELADB_MODE` is self-hosted. Clients connect through Neon's proxy: Postgres wire at `<ep>.localtest.me:4432`; SQL over HTTP and WebSocket at `https://<ep>.localtest.me:4444/sql`. Use `sslrootcert=.cheladb/neon/proxy-ca.crt`; if `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`.
+Each database gets a Neon tenant and timeline on the storage controller, plus one compute container (`chelabase-compute-<ep>`). The `postgres` role is a member of `neon_superuser`, and a real superuser only when `CHELABASE_DB_OWNER_SUPERUSER` is on and `CHELABASE_MODE` is self-hosted. Clients connect through Neon's proxy: Postgres wire at `<ep>.localtest.me:4432`; SQL over HTTP and WebSocket at `https://<ep>.localtest.me:4444/sql`. Use `sslrootcert=.chelabase/neon/proxy-ca.crt`; if `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`.
 
 The data API roles `anon` (NOLOGIN), `authenticated` (NOLOGIN) and `authenticator` (LOGIN NOINHERIT, with its own encrypted password per branch) are created in every database. The `cheladb_platform` role is gone.
 
-- **Connection details** (`GET /v1/databases/{id}/connection`, Studio → *Connection details*) can be revealed any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key at `CHELADB_SECRETS_KEY` (`.cheladb/secrets/secrets.key`, created by bootstrap). Keep that file: without it stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist (after `just sweep-dbs` a new key is simply adopted). Databases from before Neon provisioning became `deleted` tombstones when its migration ran; recreate them.
+- **Connection details** (`GET /v1/databases/{id}/connection`, Studio → *Connection details*) can be revealed any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key at `CHELABASE_SECRETS_KEY` (`.chelabase/secrets/secrets.key`, created by bootstrap). Keep that file: without it stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist (after `just sweep-dbs` a new key is simply adopted). Databases from before Neon provisioning became `deleted` tombstones when its migration ran; recreate them.
 - **Reset password** (`POST …/reset-password`) sets a new owner password. Existing sessions keep working until they reconnect. If the worker isn't running you get `503`. A `503` saying the password "was changed but not yet applied" means the new password is stored (reveal shows it; Studio shows it with the error) and the worker's reconcile applies it.
 - **Delete** (`DELETE /v1/databases/{id}`, Studio asks you to type the name) removes the compute and the tenant, with all its data. The row stays as a `deleted` tombstone (hidden from the API) and the name can be reused.
 - **Reconcile**: every 30 s the worker:
@@ -149,14 +149,14 @@ The data API roles `anon` (NOLOGIN), `authenticated` (NOLOGIN) and `authenticato
   - retries deletes stuck for more than a minute;
   - starts a new compute for a ready database whose container is gone (an exited container is left to Docker's restart policy);
   - applies a password reset that was stored but not applied;
-  - removes compute containers that have no endpoint row (unless `CHELADB_WORKER_REMOVE_ORPHANS=false`, for a worker on its own metadata database that shares the machine's Docker with another stack: it then logs them and keeps them);
+  - removes compute containers that have no endpoint row (unless `CHELABASE_WORKER_REMOVE_ORPHANS=false`, for a worker on its own metadata database that shares the machine's Docker with another stack: it then logs them and keeps them);
   - retries the teardown of an endpoint whose database is failed or deleted.
 
   A storage-controller tenant with no endpoint row, or an endpoint row with no database, is only reported in the worker log, never removed: it may hold the only copy of someone's data. In local dev, `just sweep-dbs` removes every database, endpoint and endpoint tenant; delete an unknown tenant by hand.
-- `CHELADB_DB_OWNER_SUPERUSER=true` makes the `postgres` role of *new* databases a real superuser (self-hosted only; ignored in platform mode). Users can then alter `cloud_admin` or `neon_superuser` and break the compute's reconfigure and the worker's admin SQL for that database.
+- `CHELABASE_DB_OWNER_SUPERUSER=true` makes the `postgres` role of *new* databases a real superuser (self-hosted only; ignored in platform mode). Users can then alter `cloud_admin` or `neon_superuser` and break the compute's reconfigure and the worker's admin SQL for that database.
 - Connections go through Neon's proxy (above), never straight to a compute.
 - **Upgrading from before this feature is one-way.** The migration drops the old plaintext `admin_password` column, so older binaries can't run against the upgraded metadata database (and sqlx refuses to start with a migration it doesn't know). Existing databases keep running; recreate them to get revealable credentials.
-- Metadata tests that need a real database are opt-in: `cargo test -p cheladb-metadata -- --ignored --test-threads=1` (with `just deps-up`).
+- Metadata tests that need a real database are opt-in: `cargo test -p chelabase-metadata -- --ignored --test-threads=1` (with `just deps-up`).
 
 ## Projects
 
@@ -180,7 +180,7 @@ Every database can have branches: copies of another branch's data, each with its
 
 ## Roles and migrations
 
-Projects run their own migrations and setup scripts through Cheladb's proxy. `CREATE ROLE … LOGIN PASSWORD`, `ALTER ROLE … PASSWORD`, `ALTER ROLE … RENAME`, `DROP ROLE`, `GRANT role TO role`, and `CREATE DATABASE` all work when run as the owner `postgres`.
+Projects run their own migrations and setup scripts through Chelabase's proxy. `CREATE ROLE … LOGIN PASSWORD`, `ALTER ROLE … PASSWORD`, `ALTER ROLE … RENAME`, `DROP ROLE`, `GRANT role TO role`, and `CREATE DATABASE` all work when run as the owner `postgres`.
 
 **What works in SQL:**
 - `CREATE ROLE <name> LOGIN PASSWORD <secret>`: the role can log in through the proxy. The password may be plain or a pre-hashed SCRAM verifier (see the password rules); an MD5 one is refused.
@@ -188,14 +188,14 @@ Projects run their own migrations and setup scripts through Cheladb's proxy. `CR
 - `ALTER ROLE <name> RENAME TO <new>`: the role's login works under its new name. A rename with `PASSWORD NULL` in the same transaction needs a compute image with fork task F3 (not pinned yet). With the current image the copy keeps its old password under the new name until the next periodic resync removes it; run `ALTER ROLE <new> PASSWORD NULL` in its own transaction to remove it at once.
 - `DROP ROLE <name>`: removed from the proxy's cache. Deleting a role while a live secret data key uses it is refused.
 - `GRANT <role> TO <app>`: role inheritance is active; `SET ROLE app` and `INHERIT` work after creation.
-- `CREATE DATABASE <name>`: tracked and shown in Studio. The cap per branch is `CHELADB_BRANCH_DATABASE_CAP` (default 20, range 1–1000).
+- `CREATE DATABASE <name>`: tracked and shown in Studio. The cap per branch is `CHELABASE_BRANCH_DATABASE_CAP` (default 20, range 1–1000).
 - Roles made in SQL before this version can log in after the first resync once the database is running.
 - `ALTER TABLE … OWNER TO <role>` also needs `GRANT CREATE ON SCHEMA public TO <role>` (Postgres 15 and later); the owner can `SET ROLE` to the role right after `CREATE ROLE`.
 - Replaying a `pg_dumpall` globals file: its `ALTER ROLE … WITH NOSUPERUSER …` lines are refused for the owner, which isn't a superuser (`Only roles with the SUPERUSER attribute may change the SUPERUSER attribute`). Remove `NOSUPERUSER` from those lines; the SCRAM password literals are accepted as they are.
 
 **Password rules:**
-- `CHELADB_PASSWORD_STRENGTH` (self-hosted mode: `off` by default, opt-in `on`; platform mode: forced `on`): when on, at least 12 characters and an estimated 60 bits of entropy (character classes × length).
-- **MD5 passwords are refused** (`MD5 passwords can't be used through Cheladb; set a plain password`). A role that already has an MD5 password (from an older dump, say) is listed as unusable through the proxy until its password is reset.
+- `CHELABASE_PASSWORD_STRENGTH` (self-hosted mode: `off` by default, opt-in `on`; platform mode: forced `on`): when on, at least 12 characters and an estimated 60 bits of entropy (character classes × length).
+- **MD5 passwords are refused** (`MD5 passwords can't be used through Chelabase; set a plain password`). A role that already has an MD5 password (from an older dump, say) is listed as unusable through the proxy until its password is reset.
 - A pre-hashed SCRAM password is **accepted in self-hosted mode** (strength rules don't apply to pre-hashed ones), and **refused in platform mode**.
 - **Unreadable password:** `unreadable` means a rename or a branch copy couldn't reseal the stored password, so it was dropped; reset the password. (A wrong secrets key instead gives a 500 `credentials_unavailable` when the password is revealed.) Studio shows "Stored password can't be read; reset it."
 - `PASSWORD NULL` removes a role's login copy; a group role with no password has no proxy copy.
@@ -215,33 +215,33 @@ Projects run their own migrations and setup scripts through Cheladb's proxy. `CR
 - Restore is allowed. The owner and the roles made in Studio or through the API keep their current passwords; roles made in SQL are as they were at the restore point, passwords included (a role made after it is gone).
 
 **Role caps and metadata:**
-- Login roles per branch: `CHELADB_BRANCH_ROLE_CAP` (default 50, range 0–500). Group roles without a password don't count.
+- Login roles per branch: `CHELABASE_BRANCH_ROLE_CAP` (default 50, range 0–500). Group roles without a password don't count.
 - The system `postgres` database is listed in Studio and the connection picker, and isn't counted in the database cap.
 - Dropping the branch's main database is refused (`the branch's main database "<name>" can't be dropped`, also with `IF EXISTS` or `WITH (FORCE)`); renaming it is refused.
 - The owner can `SET ROLE` to any role it creates (those with `createrole_self_grant = 'set, inherit'`).
 - An owner-level role made in Studio or through the API gets the owner's attributes (`CREATEROLE`, `CREATEDB`, `BYPASSRLS`, `REPLICATION`) and `neon_superuser`. If any of them is taken away in SQL, the next resync gives it back.
 
 **Control plane down:**
-- When Cheladb can't reach the control plane, the DDL fails after about 5 seconds with `role and database changes are unavailable right now; try again` (SQLSTATE 55000). The change doesn't take effect; retry the statement.
-- Cheladb's other refusals reach the client as their own one-line message (for example `the branch owner's password can't be removed; reset it instead`).
+- When Chelabase can't reach the control plane, the DDL fails after about 5 seconds with `role and database changes are unavailable right now; try again` (SQLSTATE 55000). The change doesn't take effect; retry the statement.
+- Chelabase's other refusals reach the client as their own one-line message (for example `the branch owner's password can't be removed; reset it instead`).
 
 ## Management API
 
-OpenAPI documents are generated from the Rust route handlers in `crates/cheladb-routes` using utoipa 6 and utoipa-axum. Two documents are maintained: `openapi/management.json` (the Management API, the orchestrator's `/v1`, meant to go public later) and `openapi/login.json` (the auth `/auth/v1` login API for Studio only). The route tests fail when the documents are stale or when a route isn't documented.
+OpenAPI documents are generated from the Rust route handlers in `crates/chelabase-routes` using utoipa 6 and utoipa-axum. Two documents are maintained: `openapi/management.json` (the Management API, the orchestrator's `/v1`, meant to go public later) and `openapi/login.json` (the auth `/auth/v1` login API for Studio only). The route tests fail when the documents are stale or when a route isn't documented.
 
 After changing any management or login route, its request/response structs, or error codes, run `just api-gen`. This command:
-- Rewrites both OpenAPI documents with `CHELADB_BLESS=1` on the document tests
+- Rewrites both OpenAPI documents with `CHELABASE_BLESS=1` on the document tests
 - Runs orval 8 to regenerate the TypeScript clients
 - Syncs the Scalar API reference UI bundle with `just scalar-sync`
 - Commit the result; `just check` will fail if the documents, generated code or Scalar bundle are out of date.
 
 **Generated clients.** Two packages are generated from the documents using orval 8:
-- `packages/management-client`: `@cheladb/management-client` (private for now) with TanStack Query hooks (`useGetDatabase`, `useCreateBranch`), plain functions (`getDatabase(id)`), and query key helpers (`getGetDatabaseQueryKey(id)`). Configure it once with `configureManagementClient({ baseUrl, getToken, onUnauthorized })`.
+- `packages/management-client`: `@chelabase/management-client` (private for now) with TanStack Query hooks (`useGetDatabase`, `useCreateBranch`), plain functions (`getDatabase(id)`), and query key helpers (`getGetDatabaseQueryKey(id)`). Configure it once with `configureManagementClient({ baseUrl, getToken, onUnauthorized })`.
 - `apps/studio/src/lib/login-client`: Studio's internal login client, generated the same way.
 
 Generated files are never edited by hand. Errors from these clients are thrown as `ApiError { status, code, message, extra }`, so clients can switch on the stable `code` field rather than the message.
 
-**Error shape.** All management, login and gateway errors use one shape: `{"error": {"code": "<code>", "message": "<sentence>", ...}}`. The `code` is stable snake_case (e.g. `not_found`, `branch_not_ready`, `has_children`, `name_taken`, `tenant_not_bound`, `invalid_request`, `too_large`, `rate_limited`, `unavailable`, `worker_unavailable`, `not_applied`, `sign_in_expired`, `invalid_credentials`). The full list is in the `ErrorCode` enum (`crates/cheladb-types/src/api_error.rs`) and the OpenAPI documents. Another tenant's database answers 404 `not_found`, exactly like a missing one. The data API keeps its own codes and extra fields (`detail`, `hint`, `sqlstate`).
+**Error shape.** All management, login and gateway errors use one shape: `{"error": {"code": "<code>", "message": "<sentence>", ...}}`. The `code` is stable snake_case (e.g. `not_found`, `branch_not_ready`, `has_children`, `name_taken`, `tenant_not_bound`, `invalid_request`, `too_large`, `rate_limited`, `unavailable`, `worker_unavailable`, `not_applied`, `sign_in_expired`, `invalid_credentials`). The full list is in the `ErrorCode` enum (`crates/chelabase-types/src/api_error.rs`) and the OpenAPI documents. Another tenant's database answers 404 `not_found`, exactly like a missing one. The data API keeps its own codes and extra fields (`detail`, `hint`, `sqlstate`).
 
 **API reference.** Scalar provides a self-hosted API reference UI at `GET /v1/docs` behind the gateway (public; the orchestrator serves the page plus `/v1/docs/scalar.js`, the embedded bundle) and queries `GET /v1/openapi.json`. Studio has an **API** page (`/app/api`, linked next to Sign out) rendering the same document with "Try it out" sending the signed-in user's token automatically. Scalar is configured to never contact scalar.com: telemetry off, default fonts off, no request proxy (`proxyUrl: ""`), external URLs empty, agent/MCP off, developer tools never. Scalar is versioned via pnpm pinning: root `@scalar/api-reference` (exact) and Studio `@scalar/api-reference-react` (exact). To update: bump both with pnpm (minimum release age applies), run `just scalar-sync` to copy `dist/browser/standalone.js` into `services/orchestrator/assets/scalar/` with a `VERSION` file, then commit. The orchestrator embeds Scalar at compile time, so Rust builds need no Node.
 
@@ -264,7 +264,7 @@ Generated files are never edited by hand. Errors from these clients are thrown a
 | Neon proxy | 4432, 4444 | Postgres wire; WebSocket and SQL over HTTP |
 | Valkey | 6379 | Proxy cache invalidation and query cancel |
 
-Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.cheladb/zitadel/demo.env` after bootstrap.
+Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer values from `.chelabase/zitadel/demo.env` after bootstrap.
 
 ## Worktrees and the live queue
 
@@ -298,7 +298,7 @@ just wt-add my-branch other     # branches from other instead
 
 Each worktree:
 - has its own `target/` directory (cargo's default; no shared `.cargo/config.toml`)
-- symlinks `.cheladb` and `apps/studio/.env.local` from the main checkout
+- symlinks `.chelabase` and `apps/studio/.env.local` from the main checkout
 - can build in parallel with others (with sccache sharing compilation)
 - shares the one stack: Compose is machine-wide, and `just dev`'s apps run from whichever worktree last took the stack (`just live` moves them)
 
@@ -334,7 +334,7 @@ git pull                      # get the latest code
 just stack-reset-slots        # remove old slot data, stop slot dev apps, run deps-up (interactive)
 ```
 
-`stack-reset-slots` already runs `just deps-up`, so don't repeat it. Also set up the machine once: sccache and cargo-sweep (`cargo install cargo-sweep --locked`; `just sweep-builds` and `just cleanup` skip the sweep without it). The reset now stops the dev apps a slot left running (each `.cheladb/dev/s<N>/pids` process group) before it deletes the slot files.
+`stack-reset-slots` already runs `just deps-up`, so don't repeat it. Also set up the machine once: sccache and cargo-sweep (`cargo install cargo-sweep --locked`; `just sweep-builds` and `just cleanup` skip the sweep without it). The reset now stops the dev apps a slot left running (each `.chelabase/dev/s<N>/pids` process group) before it deletes the slot files.
 
 `just stack-reset-slots` is idempotent and prints what it removes before asking.
 
@@ -355,7 +355,7 @@ POST /data/v1/query, Authorization: Bearer <key>  →  gateway
   ↓ pool for the branch and that database (sqlx, as `authenticator`)
   ↓ BEGIN
   ↓ one round trip: set_config for role, request.jwt.claims, statement_timeout and
-  ↓   transaction_timeout; read cheladb.schema_version
+  ↓   transaction_timeout; read chelabase.schema_version
   ↓ [introspect if the schema version is new]
   ↓ parse query → shape cache → generate SQL → execute
   ↓ COMMIT
@@ -365,9 +365,9 @@ POST /data/v1/query, Authorization: Bearer <key>  →  gateway
 Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key (cached 30 s) and mints an internal token that `rest` verifies; the token carries the key's database allow-list, and `rest` enforces it (the gateway never reads bodies). Unknown keys are also cached 30 s, and cache misses (lookups reaching the internal listener) are limited to 20 per second per client IP; over the limit gets 429.
 
 `rest` listens on `127.0.0.1:8085` (internal listener on `:8086`). Its env:
-- `CHELADB_REST_ADDR` and `CHELADB_REST_INTERNAL_ADDR` (the defaults above);
-- `CHELADB_REST_MAX_CONNECTIONS` (default 200): permits shared by every pool, on top of each branch's own `max_connections` setting (one budget for all of the branch's database pools);
-- `CHELADB_REST_MAX_RESPONSE_BYTES` (default 16 MiB): the largest response. Each operation's result is counted as it arrives; the first one past the cap rolls the request back and answers 413 `too_large`.
+- `CHELABASE_REST_ADDR` and `CHELABASE_REST_INTERNAL_ADDR` (the defaults above);
+- `CHELABASE_REST_MAX_CONNECTIONS` (default 200): permits shared by every pool, on top of each branch's own `max_connections` setting (one budget for all of the branch's database pools);
+- `CHELABASE_REST_MAX_RESPONSE_BYTES` (default 16 MiB): the largest response. Each operation's result is counted as it arrives; the first one past the cap rolls the request back and answers 413 `too_large`.
 
 The gateway answers its own 404 and 405 under `/data/` with the data API's error body (code `invalid_query`).
 
@@ -375,13 +375,13 @@ The gateway answers its own 404 and 405 under `/data/` with the data API's error
 
 Each branch has exactly one live **public key** (role `anon`, safe for browsers) and zero or more **secret keys** (chosen role, server only). Both start with a prefix (`chk_pub_` or `chk_sec_`) and are 51 characters total.
 
-- **What is stored:** the SHA-256 of every key and its first 12 characters (shown in lists). A secret key is returned once and Cheladb keeps no copy (Studio shows it in a copy-once box). The public key is also stored encrypted, so Studio can show it again.
+- **What is stored:** the SHA-256 of every key and its first 12 characters (shown in lists). A secret key is returned once and Chelabase keeps no copy (Studio shows it in a copy-once box). The public key is also stored encrypted, so Studio can show it again.
 - **Public key:** created when the branch first becomes ready. It can't be revoked (409: rotate it instead). Rotating creates a new key with the same role and name and revokes the old one in one transaction; the old key keeps working until the gateway's 30-second cache expires.
 - **Secret key:** choose a role when creating one (`POST /v1/databases/{id}/branches/{bid}/keys`; the default is `authenticated`). The role is checked and granted to `authenticator` at creation; a refused role is a 422 saying why. A role is refused when it:
   - isn't a valid role name (a letter or `_`, then letters, digits, `_` or `$`; at most 63 characters);
-  - is `authenticator` or `cheladb_admin`, or any `pg_*` role;
+  - is `authenticator` or `chelabase_admin`, or any `pg_*` role;
   - doesn't exist in the branch's database;
-  - is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `cheladb_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`;
+  - is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`;
   - is owner-level: it has `CREATEROLE`, `CREATEDB`, `BYPASSRLS` or `REPLICATION` (`the role <name> is owner-level (owner-level roles can't back a secret key; use a plain role)`).
 - **Rotating a secret key** keeps its role and doesn't run the check or the grant again. A reset or restore rewinds the grant, so the worker's bootstrap grants each live secret key's role again (a role that's gone or now refused is skipped with a warning, and its key stops working).
 - **Revocation:** effective within 30 seconds (the gateway cache).
@@ -392,11 +392,11 @@ Each branch has exactly one live **public key** (role `anon`, safe for browsers)
 
 A branch's data API serves its main database, and any other Postgres database of the branch you enable. A database made in SQL (`CREATE DATABASE analytics`) is listed with the branch's databases, not served.
 
-- **Enable:** `POST /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api` answers 202; the worker runs the data API bootstrap in that database (the `cheladb` schema, its event triggers, the default privileges and, the first time, the grants on existing objects, all in that database's `default_schema`). The database's `data_api` reads `enabling`, then `on`, or `error` with `data_api_error` (`GET …/branches/{branch_id}/databases` lists each database's state). Studio's Data API view has the same controls, per database.
-- **Disable:** `DELETE …/pg-databases/{name}/data-api` stops serving at once (the orchestrator tells `rest` to drop the branch's pools and caches; if that call fails, the 60-second connection-info cache bounds the delay). The machinery stays, so enabling again is quick. `?remove=true` also drops the `cheladb` schema and its event triggers; grants already made to `anon` and `authenticated` stay. The main database can't be switched off (409).
+- **Enable:** `POST /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api` answers 202; the worker runs the data API bootstrap in that database (the `chelabase` schema, its event triggers, the default privileges and, the first time, the grants on existing objects, all in that database's `default_schema`). The database's `data_api` reads `enabling`, then `on`, or `error` with `data_api_error` (`GET …/branches/{branch_id}/databases` lists each database's state). Studio's Data API view has the same controls, per database.
+- **Disable:** `DELETE …/pg-databases/{name}/data-api` stops serving at once (the orchestrator tells `rest` to drop the branch's pools and caches; if that call fails, the 60-second connection-info cache bounds the delay). The machinery stays, so enabling again is quick. `?remove=true` also drops the `chelabase` schema and its event triggers; grants already made to `anon` and `authenticated` stay. The main database can't be switched off (409).
 - **The system `postgres` database** can't be enabled (422): `cloud_admin` owns it, so the owner couldn't manage its grants.
 - **Default schema, per database:** `PATCH …/pg-databases/{name}` with `{ "default_schema": "app" }` (the name check is `^[a-z_][a-z0-9_]{0,62}$`). For a served database the bootstrap runs again, so the default privileges cover the new schema; objects already in it are granted only with `"grant_existing": true` (grants only, never revokes). Studio shows the same opt-in as the checkbox "Also grant existing objects in <schema>" next to Save default schema; it clears after a save.
-- **Cap:** at most `CHELADB_BRANCH_DATA_API_DATABASE_CAP` served databases per branch (orchestrator env; default 10, 1–100, main included; each costs `rest` a pool). Over it, enable answers 409 "this branch already serves <n> databases (the cap is <n>)".
+- **Cap:** at most `CHELABASE_BRANCH_DATA_API_DATABASE_CAP` served databases per branch (orchestrator env; default 10, 1–100, main included; each costs `rest` a pool). Over it, enable answers 409 "this branch already serves <n> databases (the cap is <n>)".
 - **Changes made in SQL:** a rename keeps the database's state and default schema, and every key list naming it follows. A drop removes it from every key list; a key whose list would be left empty is revoked (an empty list can't mean "every database"). The resync paths can revoke keys too: a rename seen only by the resync (not by a tracked `ALTER DATABASE … RENAME`) looks like a drop plus a create, and a reset or restore that rewinds a database's creation re-inserts its row. In both cases a key that listed only that database is revoked, and the database comes back with the data API off.
 - **Branches, reset and restore:** a child branch serves what its parent serves (states and default schemas are copied after its first sync), and the bootstrap runs in every served database wherever it runs for main: after each compute (re)creation and from the worker's reconcile.
 
@@ -413,14 +413,14 @@ A request names its database with the top-level `"database"` field (see "Query l
 
 Studio's Tables view browses and edits rows in any served database and schema (`POST /v1/databases/{id}/branches/{branch_id}/console/query` with `{ "role": null | "<role>", "database": null | "<name>", "tree": <a data API request> }`). Every operation is allowed, batches included, in one transaction with the data API's `max_rows` and statement timeout. The answer is the data API's.
 
-- **As the owner** (`role: null`, Studio's default): the orchestrator runs the request itself, on a small pool per branch and database (at most 2 connections, closed after 60 seconds idle) with the owner password it holds. Row-level security doesn't apply to the owner. `rest` never sees the owner's password. When the owner's password was set in SQL, Cheladb doesn't know it: 409 `owner_password_unknown` until a reset (`POST …/branches/{branch_id}/reset-password`), which works at once.
+- **As the owner** (`role: null`, Studio's default): the orchestrator runs the request itself, on a small pool per branch and database (at most 2 connections, closed after 60 seconds idle) with the owner password it holds. Row-level security doesn't apply to the owner. `rest` never sees the owner's password. When the owner's password was set in SQL, Chelabase doesn't know it: 409 `owner_password_unknown` until a reset (`POST …/branches/{branch_id}/reset-password`), which works at once.
 - **As another role** (`anon`, `authenticated`, a plain role you made): the worker checks the role the first time (remembered five minutes) and grants it to `authenticator`; `rest` then runs the request as that role. An owner-level role, or one that doesn't exist, is refused (403 `role_refused`, saying why). A role dropped after its check answers 503 `unavailable` for up to 30 seconds, then 404 `unknown_role`.
 - **Errors:** a database that isn't served is 409 `data_api_disabled` (Studio offers Enable); one that doesn't exist is 404 `not_found`; everything else is the data API's code.
 - **Audit:** every write is logged at `info` (platform user, branch, database, role, operation kind), never the values.
 
 ### Schema model
 
-The `cheladb` schema holds machinery only, reserved and never exposed. Other reserved schemas: `pg_catalog`, `information_schema`, `pg_toast`, `neon`, `neon_migration` and temp schemas. An object is reachable when the key's role has `USAGE` on its schema and any privilege on the object: any column-level `SELECT`, `INSERT` or `UPDATE`, or table-level `DELETE`, for tables, views, materialized views and foreign tables, and `EXECUTE` for functions. Anything else answers like a name that doesn't exist (`unknown_table`, `unknown_column`, `unknown_function`).
+The `chelabase` schema holds machinery only, reserved and never exposed. Other reserved schemas: `pg_catalog`, `information_schema`, `pg_toast`, `neon`, `neon_migration` and temp schemas. An object is reachable when the key's role has `USAGE` on its schema and any privilege on the object: any column-level `SELECT`, `INSERT` or `UPDATE`, or table-level `DELETE`, for tables, views, materialized views and foreign tables, and `EXECUTE` for functions. Anything else answers like a name that doesn't exist (`unknown_table`, `unknown_column`, `unknown_function`).
 
 **Default privileges.** The worker's bootstrap runs on every compute (re)creation and from reconcile, and is idempotent. It sets, for objects the owner role (`postgres`) creates:
 - `anon`: `SELECT` on tables and views in `public`, and `USAGE` on the `public` schema.
@@ -490,11 +490,11 @@ One request is one operation: a JSON tree. `"v": 1` is required at the top, and 
 
 ### SDK and type generation
 
-`@cheladb/client` is a typed TypeScript SDK:
+`@chelabase/client` is a typed TypeScript SDK:
 
 ```ts
-import { createClient } from "@cheladb/client";
-import { type Database, types } from "./db"; // from `cheladb gen types`
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db"; // from `chelabase gen types`
 
 const db = createClient<Database>({ url: "http://localhost:8000", key, types });
 await db.from("orders").select("id", "total").where({ status: "paid" }).limit(10);
@@ -512,7 +512,7 @@ An `update` or `delete` needs `.where()` or `.all()` before it compiles.
 
 **A typed client requires `types`.** `createClient<Database>({ url, key })` without `types` is a compile error: without the map the client can't tell an `int8` or a `numeric` from any other number. The untyped `createClient({ url, key })` needs no `types`.
 
-**Type generation:** `cheladb gen types --url <gateway-url> --key <secret-key> --out db.ts` writes a typed `Database` type and a `types` constant. Pass the key through the environment variable `CHELADB_DATA_KEY` instead of a flag, so it stays out of the process list.
+**Type generation:** `chelabase gen types --url <gateway-url> --key <secret-key> --out db.ts` writes a typed `Database` type and a `types` constant. Pass the key through the environment variable `CHELABASE_DATA_KEY` instead of a flag, so it stays out of the process list.
 
 **Big numbers:** `int8` and `numeric` columns are read exactly from JSON source text. The default type is `number` for `int8` (throws `UnsafeIntegerError` outside the safe range ±2^53) and `string` for `numeric`. Use `bigint: true` together with `types` to get `bigint` for all `int8` columns:
 
@@ -520,7 +520,7 @@ An `update` or `delete` needs `.where()` or `.all()` before it compiles.
 const db = createClient<Database>({ url, key, types, bigint: true });
 ```
 
-**Other databases:** `db.database("analytics")` returns a client bound to that database (every request carries the top-level `database`). `cheladb gen types --database analytics` generates that database's types; `--all-databases` generates every database the key reaches (`Databases`, one key per database, and a `types` map keyed alike; main is always under the key `main`, whatever its real name). The key must reach main, since the list of databases comes from main's schema response.
+**Other databases:** `db.database("analytics")` returns a client bound to that database (every request carries the top-level `database`). `chelabase gen types --database analytics` generates that database's types; `--all-databases` generates every database the key reaches (`Databases`, one key per database, and a `types` map keyed alike; main is always under the key `main`, whatever its real name). The key must reach main, since the list of databases comes from main's schema response.
 
 See `packages/client/README.md` for details and runtime requirements.
 
@@ -552,7 +552,7 @@ The response is `{"error": {"code", "message", "detail"?, "hint"?, "sqlstate"?}}
 | 404 | `unknown_role` | Studio's console only: the chosen role doesn't exist (any more). |
 | 409 | `conflict` | Unique (23505), foreign key (23503) or exclusion (23P01) violation. |
 | 409 | `retry` | Serialization failure or deadlock (40001, 40P01). Safe to retry. |
-| 413 | `too_large` | Request body over 1 MiB, or a response over `CHELADB_REST_MAX_RESPONSE_BYTES`. |
+| 413 | `too_large` | Request body over 1 MiB, or a response over `CHELABASE_REST_MAX_RESPONSE_BYTES`. |
 | 429 | `rate_limited` | Cache misses over 20 per second from this IP address. |
 | 500 | `internal` | Unexpected server error. The message includes a request id; check the logs. |
 | 503 | `unavailable` | See below. |
@@ -574,7 +574,7 @@ A non-2xx response without this error body (a proxy error page) gets its code fr
 `just data-e2e` (needs `just deps-up` and `just dev`) runs a live story through the gateway and the proxy:
 1. Provision a database, list its public key, create a secret key (role `authenticated`) and a table.
 2. Through the SDK: the secret key inserts, the public key reads, the public key's insert is refused (403), and a batch rolls back on error.
-3. Generate types with `cheladb gen types` and typecheck a sample: a valid call compiles, a wrong column doesn't.
+3. Generate types with `chelabase gen types` and typecheck a sample: a valid call compiles, a wrong column doesn't.
 4. Add a row-level security policy: it hides a row from the public key (`anon`) but not from the secret key's role.
 5. Revoke the secret key and check it gets 401 within 35 seconds.
 
@@ -587,9 +587,9 @@ A non-2xx response without this error body (a proxy error page) gets its code fr
 4. As `anon` under row-level security policies: it reads, inserts, updates and deletes only the rows the policies allow.
 5. A plain role reads under its policy; an owner-level role and an unknown role are refused (403); a role dropped after its check answers 404 `unknown_role` once `rest`'s 30-second check cache expires.
 6. An owner password set in SQL answers 409 `owner_password_unknown`; after a reset the owner console works at once.
-7. Main can't be switched off; disabling `analytics` answers 409 `data_api_disabled` in the console and 404 to the key at once; `?remove=true` drops the `cheladb` schema; the database is deleted.
+7. Main can't be switched off; disabling `analytics` answers 409 `data_api_disabled` in the console and 404 to the key at once; `?remove=true` drops the `chelabase` schema; the database is deleted.
 
-`rest_live` (`cargo test -p rest --test rest_live -- --ignored --test-threads=1`, with `.cheladb/zitadel/demo.env` loaded as `just` does) covers two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
+`rest_live` (`cargo test -p rest --test rest_live -- --ignored --test-threads=1`, with `.chelabase/zitadel/demo.env` loaded as `just` does) covers two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
 
 ### Known limits
 
@@ -602,7 +602,7 @@ A non-2xx response without this error body (a proxy error page) gets its code fr
 
 ## App users
 
-Apps sign their own end users up and in through `db.auth`, and the data API runs their requests as `authenticated` with the user's claims. Zitadel holds the identities (one organization per project, its id the project's id); Cheladb issues the tokens; each user also has a row in a users table the app owns.
+Apps sign their own end users up and in through `db.auth`, and the data API runs their requests as `authenticated` with the user's claims. Zitadel holds the identities (one organization per project, its id the project's id); Chelabase issues the tokens; each user also has a row in a users table the app owns.
 
 ### Enabling
 
@@ -611,7 +611,7 @@ Apps sign their own end users up and in through `db.auth`, and the data API runs
 - the data API on in that Postgres database on **every** live branch (409 `data_api_not_enabled`);
 - no table at `schema.table` (default `public.users`) on any branch (409 `app_users_table_exists`).
 
-The worker creates the Zitadel org, runs the users bootstrap on every branch of the auth database, and installs the claim helpers in every other database the data API serves in the project. New branches of the auth database get the bootstrap (with their own `cheladb_auth_sync` password) and the users' rows. While app users are on, the auth database's data API can't be switched off or removed (409).
+The worker creates the Zitadel org, runs the users bootstrap on every branch of the auth database, and installs the claim helpers in every other database the data API serves in the project. New branches of the auth database get the bootstrap (with their own `chelabase_auth_sync` password) and the users' rows. While app users are on, the auth database's data API can't be switched off or removed (409).
 
 `DELETE /v1/projects/{id}/app-users` disables them: refused with 409 `app_users_has_users` while the org has users; otherwise the worker removes the guard machinery and the sync role from every branch, revokes the sessions and deletes the org. The table stays as an ordinary table, **with RLS still on and no policies** (the two built-in policies go, since they call the helpers): add your own or switch RLS off.
 
@@ -620,24 +620,24 @@ Defaults in self-hosted mode: `email_verification` off (no code is sent and new 
 ### The users table
 
 - Managed columns: `id uuid` (primary key, the Zitadel user id), `email`, `email_verified`, `created_at`, `deleted_at`. Every other column is yours: add columns, constraints, indexes and foreign keys with ordinary migrations (the table is owned by `postgres`).
-- **Rows are Cheladb's.** A guard trigger refuses INSERT, DELETE and TRUNCATE, and any change to a managed column, by any role but `cheladb_auth_sync` (42501, "rows of public.users are created and deleted by Cheladb app users", "column email is managed by Cheladb app users"). Your own columns can be updated, by the owner or by users through their policy.
+- **Rows are Chelabase's.** A guard trigger refuses INSERT, DELETE and TRUNCATE, and any change to a managed column, by any role but `chelabase_auth_sync` (42501, "rows of public.users are created and deleted by Chelabase app users", "column email is managed by Chelabase app users"). Your own columns can be updated, by the owner or by users through their policy.
 - **Its shape is protected.** Event triggers refuse dropping or renaming the table, moving it to another schema, dropping, renaming or retyping a managed column, and dropping, renaming or disabling the guard triggers. A superuser can still get around them (with `event_triggers = off`); the users bootstrap, which runs again when the branch's compute is re-created, reset or restored, puts back a dropped table and the triggers.
-- **It starts locked down:** no privileges for `anon`, RLS on, and two own-row policies for `authenticated`: `cheladb_users_select_own` (`USING (id = cheladb.user_id())`) and `cheladb_users_update_own`. They aren't protected; change or drop them like any policy.
+- **It starts locked down:** no privileges for `anon`, RLS on, and two own-row policies for `authenticated`: `chelabase_users_select_own` (`USING (id = chelabase.user_id())`) and `chelabase_users_update_own`. They aren't protected; change or drop them like any policy.
 - **Sign-up data is opt-in per column.** `signUp`'s `data` reaches a column only when `authenticated` may insert into it: `GRANT INSERT (display_name) ON users TO authenticated`. Any other key is 422 `unknown_column`; `REVOKE INSERT (col) ON users FROM authenticated` takes a column out again. The values go through your types and constraints: a failure is 422 `constraint_violation` with Postgres' message, and no Zitadel user is created.
-- **Defaults and triggers run as `cheladb_auth_sync`.** Rows are written by the sync role, so a column default or a `BEFORE INSERT` trigger of yours on the users table runs with its privileges: grant it what they touch (for example `GRANT INSERT ON profiles TO cheladb_auth_sync`), or make the trigger function `SECURITY DEFINER`.
+- **Defaults and triggers run as `chelabase_auth_sync`.** Rows are written by the sync role, so a column default or a `BEFORE INSERT` trigger of yours on the users table runs with its privileges: grant it what they touch (for example `GRANT INSERT ON profiles TO chelabase_auth_sync`), or make the trigger function `SECURITY DEFINER`.
 - `on_delete`: a user deleted in Zitadel deletes the row (`delete`; your foreign keys cascade as you defined them) or sets `deleted_at` (`mark`). The unique email index skips marked rows, so the address can sign up again.
-- `cheladb gen types` marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
+- `chelabase gen types` marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
 
 ### Claim helpers
 
-In schema `cheladb` of every database the data API serves (`STABLE`, executable by every role, so a policy written without `TO` works for custom data API roles and the console too; they only read the request's claims): `cheladb.claims()` (the request's claims as `jsonb`, `{}` without a user), `cheladb.user_id()` (`uuid`, null without a user) and `cheladb.user_email()`. Use them in policies and defaults:
+In schema `chelabase` of every database the data API serves (`STABLE`, executable by every role, so a policy written without `TO` works for custom data API roles and the console too; they only read the request's claims): `chelabase.claims()` (the request's claims as `jsonb`, `{}` without a user), `chelabase.user_id()` (`uuid`, null without a user) and `chelabase.user_email()`. Use them in policies and defaults:
 
 ```sql
 CREATE TABLE notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  owner uuid NOT NULL DEFAULT cheladb.user_id(), body text NOT NULL);
+  owner uuid NOT NULL DEFAULT chelabase.user_id(), body text NOT NULL);
 ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
 CREATE POLICY notes_own ON notes FOR ALL TO authenticated
-  USING (owner = cheladb.user_id()) WITH CHECK (owner = cheladb.user_id());
+  USING (owner = chelabase.user_id()) WITH CHECK (owner = chelabase.user_id());
 ```
 
 Removing the data API (`DELETE …/data-api?remove=true`) drops the helpers too; while a policy or view still uses one, it's refused (409) with Postgres' dependency message: drop those first.
@@ -651,36 +651,36 @@ const mine = await db.from("users").select("id", "display_name"); // only the si
 ```
 
 - The flows live under `/auth/v1/app/` and take a **public** key: `sign-up`, `sign-in`, `refresh`, `sign-out`, `user`, `verify-email`, `resend-code`, `password-reset`, `password-reset/confirm`, `change-email`, `change-password`, and `GET jwks` (public: your own servers can verify tokens with it). They're padded and rate-limited like the platform's sign-in.
-- **Access token:** an EdDSA JWT (`iss = cheladb-auth`, `aud = cheladb-project:<project id>`, `sub`, `sid`, `email`, `email_verified`, `role = authenticated`), valid `CHELADB_APP_ACCESS_TTL_SECS` (default 900). Requests send it as `Cheladb-User: <token>` beside `Authorization: Bearer <public key>`. The gateway checks it and that its session is still live (cached 30 s, so a revocation lands within 30 s), and never falls back to `anon`: an invalid, expired or revoked token is 401 `user_token_invalid`, `user_token_expired` or `user_session_revoked`; a secret key with the header is 400.
-- **Refresh token:** `<session id>.<secret>`, kept by the SDK in its storage (`localStorage` in browsers, memory otherwise, or your `{get, set, remove}`), with a sliding expiry of `CHELADB_APP_REFRESH_TTL_SECS` (default 30 days) and a 90-day cap. Every refresh rotates it. Within 10 s of a rotation the previous token gets the same new pair back (two tabs refreshing at once); after that, presenting it revokes the session (401 `refresh_token_reused`). The SDK refreshes 60 s before expiry and once after a 401 `user_token_expired`, and signs out locally (emitting `signed_out`) on `refresh_token_reused`, `refresh_token_invalid` or `user_inactive` from a refresh, or `user_session_revoked` from any request.
+- **Access token:** an EdDSA JWT (`iss = chelabase-auth`, `aud = chelabase-project:<project id>`, `sub`, `sid`, `email`, `email_verified`, `role = authenticated`), valid `CHELABASE_APP_ACCESS_TTL_SECS` (default 900). Requests send it as `Chelabase-User: <token>` beside `Authorization: Bearer <public key>`. The gateway checks it and that its session is still live (cached 30 s, so a revocation lands within 30 s), and never falls back to `anon`: an invalid, expired or revoked token is 401 `user_token_invalid`, `user_token_expired` or `user_session_revoked`; a secret key with the header is 400.
+- **Refresh token:** `<session id>.<secret>`, kept by the SDK in its storage (`localStorage` in browsers, memory otherwise, or your `{get, set, remove}`), with a sliding expiry of `CHELABASE_APP_REFRESH_TTL_SECS` (default 30 days) and a 90-day cap. Every refresh rotates it. Within 10 s of a rotation the previous token gets the same new pair back (two tabs refreshing at once); after that, presenting it revokes the session (401 `refresh_token_reused`). The SDK refreshes 60 s before expiry and once after a 401 `user_token_expired`, and signs out locally (emitting `signed_out`) on `refresh_token_reused`, `refresh_token_invalid` or `user_inactive` from a refresh, or `user_session_revoked` from any request.
 - Passwords follow the platform's rules. A password change revokes the user's other sessions (the caller gets a fresh pair); a reset revokes them all.
 - Platform admin: `GET/POST /v1/projects/{id}/users`, `GET/PATCH/DELETE …/users/{user_id}`, `POST …/deactivate` and `…/reactivate` (deactivating revokes the sessions), `GET/DELETE …/sessions` (sign out everywhere). Studio's **Users** tab has all of it.
 
 ### Sync, webhooks and reconcile
 
 Zitadel is the source of truth; three paths copy users into the table on every live branch of the auth database:
-- **write-through** from Cheladb's own flows (sign-up, the platform admin);
-- **webhooks:** `cheladb dev bootstrap` creates one instance-wide Zitadel Actions v2 target pointing at the orchestrator's internal listener (`POST /internal/zitadel/events`), with an execution on user events, and writes its signing key to `.cheladb/zitadel/actions.env` (sourced by `just`). The orchestrator checks the signature and ignores other orgs. Compose relaxes Zitadel's `ZITADEL_HTTPCLIENT_DENYLIST` so it may call the host (self-hosted dev only);
-- **reconcile:** every `CHELADB_APP_USERS_RECONCILE_SECS` (default 300) per enabled project, and right after a branch of the auth database is created, the worker compares the org's users with each branch's rows and syncs every difference. It also reruns enables, disables and project deletes stuck for 5 minutes and purges old sessions.
+- **write-through** from Chelabase's own flows (sign-up, the platform admin);
+- **webhooks:** `chelabase dev bootstrap` creates one instance-wide Zitadel Actions v2 target pointing at the orchestrator's internal listener (`POST /internal/zitadel/events`), with an execution on user events, and writes its signing key to `.chelabase/zitadel/actions.env` (sourced by `just`). The orchestrator checks the signature and ignores other orgs. Compose relaxes Zitadel's `ZITADEL_HTTPCLIENT_DENYLIST` so it may call the host (self-hosted dev only);
+- **reconcile:** every `CHELABASE_APP_USERS_RECONCILE_SECS` (default 300) per enabled project, and right after a branch of the auth database is created, the worker compares the org's users with each branch's rows and syncs every difference. It also reruns enables, disables and project deletes stuck for 5 minutes and purges old sessions.
 
 ### Settings
 
 | Variable | Default | Read by |
 |---|---|---|
-| `CHELADB_ZITADEL_ADMIN_PAT_FILE` | from `demo.env` (`.cheladb/zitadel/admin.pat`) | orchestrator, worker, auth (org and user admin; without it app-user routes answer 503 and jobs wait) |
-| `CHELADB_APP_JWT_PRIVATE_KEY` / `CHELADB_APP_JWT_PUBLIC_KEY` | from `demo.env` (`.cheladb/auth/app-jwt.{key,pub}`, made once by bootstrap, never overwritten) | auth signs, the gateway verifies |
-| `CHELADB_APP_AUTH_INTERNAL_TOKEN` | `cheladb-dev-app-auth` | auth → orchestrator internal app routes |
-| `CHELADB_APP_SESSIONS_INTERNAL_TOKEN` | `cheladb-dev-app-sessions` | gateway → session liveness |
-| `CHELADB_ZITADEL_ACTIONS_SIGNING_KEY` | from `.cheladb/zitadel/actions.env` | orchestrator (webhook signatures) |
-| `CHELADB_APP_ACCESS_TTL_SECS` | `900` (60–86400) | auth |
-| `CHELADB_APP_REFRESH_TTL_SECS` | `2592000` (30 days; at most 90 days) | orchestrator |
-| `CHELADB_APP_USERS_RECONCILE_SECS` | `300` (30–86400) | worker |
-| `CHELADB_INTERNAL_URL` | `http://127.0.0.1:8083` | auth (the orchestrator's internal listener) |
-| `CHELADB_WORKER_REMOVE_ORPHANS` | `true` | worker (see Database lifecycle → Reconcile) |
+| `CHELABASE_ZITADEL_ADMIN_PAT_FILE` | from `demo.env` (`.chelabase/zitadel/admin.pat`) | orchestrator, worker, auth (org and user admin; without it app-user routes answer 503 and jobs wait) |
+| `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | from `demo.env` (`.chelabase/auth/app-jwt.{key,pub}`, made once by bootstrap, never overwritten) | auth signs, the gateway verifies |
+| `CHELABASE_APP_AUTH_INTERNAL_TOKEN` | `chelabase-dev-app-auth` | auth → orchestrator internal app routes |
+| `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | gateway → session liveness |
+| `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY` | from `.chelabase/zitadel/actions.env` | orchestrator (webhook signatures) |
+| `CHELABASE_APP_ACCESS_TTL_SECS` | `900` (60–86400) | auth |
+| `CHELABASE_APP_REFRESH_TTL_SECS` | `2592000` (30 days; at most 90 days) | orchestrator |
+| `CHELABASE_APP_USERS_RECONCILE_SECS` | `300` (30–86400) | worker |
+| `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | auth (the orchestrator's internal listener) |
+| `CHELABASE_WORKER_REMOVE_ORPHANS` | `true` | worker (see Database lifecycle → Reconcile) |
 
 ### Testing
 
-- `just app-users-e2e` (needs `just dev`): a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `cheladb.user_id()` policy; a new branch gets the rows; an email changed in Zitadel reaches the row through the webhook; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its Zitadel org. `KEEP=1` leaves everything in place.
+- `just app-users-e2e` (needs `just dev`): a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `chelabase.user_id()` policy; a new branch gets the rows; an email changed in Zitadel reaches the row through the webhook; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its Zitadel org. `KEEP=1` leaves everything in place.
 - `app_users_live` (`cargo test -p worker --test app_users_live -- --ignored --test-threads=1`, with `demo.env` and `scripts/neon-images.sh` sourced as the file's header shows): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real Zitadel.
 
 ## SQL editor
@@ -746,9 +746,9 @@ The storage stack starts with `just deps-up` and backs every database.
 - **`just neon-e2e`** goes through the gateway API to create a test database, then proves that it answers through the proxy over Postgres wire, SQL over HTTP and the serverless driver; that a wrong password is refused; that query cancel works; and that a changed password works at once.
 - **Valkey** (`127.0.0.1:6379`, base profile):
   - it's what makes query cancel work through the proxy;
-  - the proxy caches role secrets for at most a minute, so a password change must publish `/password_updated` (`cheladb neon password-updated`) after reconfiguring the compute;
+  - the proxy caches role secrets for at most a minute, so a password change must publish `/password_updated` (`chelabase neon password-updated`) after reconfiguring the compute;
   - the roadmap's "Valkey: where else it helps" lists later uses.
-- **Native Linux Docker.** `host.docker.internal` resolves to the bridge gateway, which can't reach a listener on `127.0.0.1`. There, set `CHELADB_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`). Only the host part may change: the port stays 8083, because Compose and the compute use it. The scripts derive their internal URL from the same variable. Docker Desktop (WSL2) works as is.
+- **Native Linux Docker.** `host.docker.internal` resolves to the bridge gateway, which can't reach a listener on `127.0.0.1`. There, set `CHELABASE_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`). Only the host part may change: the port stays 8083, because Compose and the compute use it. The scripts derive their internal URL from the same variable. Docker Desktop (WSL2) works as is.
 - **`just neon-smoke`** now needs the orchestrator running (`just dev`).
 
 ## Still out of scope

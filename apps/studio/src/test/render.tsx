@@ -1,4 +1,4 @@
-import { configureManagementClient } from "@cheladb/management-client";
+import { configureManagementClient } from "@chelabase/management-client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render } from "@testing-library/react";
 import type { ReactElement, ReactNode } from "react";

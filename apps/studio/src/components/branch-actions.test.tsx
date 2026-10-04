@@ -3,7 +3,7 @@ import { renderWithQuery } from "@/test/render";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { getGetDatabaseQueryKey, getListBranchesQueryKey, type Branch as BranchSummary } from "@cheladb/management-client";
+import { getGetDatabaseQueryKey, getListBranchesQueryKey, type Branch as BranchSummary } from "@chelabase/management-client";
 import { BranchActions } from "./branch-actions";
 
 const mk = (over: Partial<BranchSummary> & { name: string; id: string }): BranchSummary => ({

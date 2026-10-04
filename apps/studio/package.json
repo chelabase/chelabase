@@ -1,5 +1,5 @@
 {
-  "name": "@cheladb/studio",
+  "name": "@chelabase/studio",
   "private": true,
   "type": "module",
   "imports": {
@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
-    "@cheladb/management-client": "workspace:*",
+    "@chelabase/management-client": "workspace:*",
     "@codemirror/autocomplete": "6.20.3",
     "@codemirror/commands": "6.11.1",
     "@codemirror/lang-sql": "6.10.0",

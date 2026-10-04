@@ -1,4 +1,4 @@
-import { ApiError } from "@cheladb/management-client";
+import { ApiError } from "@chelabase/management-client";
 import { QueryClient } from "@tanstack/react-query";
 
 export const POLL_MS = 2000;

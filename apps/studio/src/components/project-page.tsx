@@ -7,7 +7,7 @@ import {
   type DatabaseSummary,
   type Me,
   type ProjectInfo,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";

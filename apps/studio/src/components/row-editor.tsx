@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import type { ColumnDesc } from "@cheladb/management-client";
+import type { ColumnDesc } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { inputKind, parseValue } from "@/lib/console";
 

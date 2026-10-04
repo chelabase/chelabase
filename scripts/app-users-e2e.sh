@@ -5,7 +5,7 @@
 # 2. SDK sign-up: a NOT NULL app column refuses a sign-up without it (422 constraint_violation),
 #    and sign-up `data` fills it once the column is granted for INSERT to authenticated;
 # 3. the built-in own-row policy: each user reads only their row, the public key alone reads
-#    nothing; a developer policy USING (owner = cheladb.user_id()) works the same way;
+#    nothing; a developer policy USING (owner = chelabase.user_id()) works the same way;
 # 4. a new branch gets the users' rows (within 60 s);
 # 5. an email changed in Zitadel (admin API) reaches the row through the webhook (within 30 s);
 # 6. refresh rotation; the old refresh token reused after the 10 s grace is 401
@@ -22,7 +22,7 @@ LOG_PREFIX=app-users-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
-PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
+PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 tmp="$(mktemp -d)"
 project_id=""
@@ -45,17 +45,17 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p cheladb || die "cargo build -p cheladb"
-[[ -f .cheladb/zitadel/demo.env ]] || die ".cheladb/zitadel/demo.env is missing (run just dev)"
+cargo build -q -p chelabase || die "cargo build -p chelabase"
+[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
 set -a
 # shellcheck disable=SC1091
-source .cheladb/zitadel/demo.env
+source .chelabase/zitadel/demo.env
 set +a
-ca="$root/.cheladb/neon/proxy-ca.crt"
+ca="$root/.chelabase/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
-[[ -n "${CHELADB_ZITADEL_ADMIN_PAT_FILE:-}" && -s "${CHELADB_ZITADEL_ADMIN_PAT_FILE}" ]] ||
-  die "CHELADB_ZITADEL_ADMIN_PAT_FILE is unset or empty (run just dev: its bootstrap writes demo.env)"
-ZITADEL="${CHELADB_ZITADEL_ISSUER:-http://localhost:8080}"
+[[ -n "${CHELABASE_ZITADEL_ADMIN_PAT_FILE:-}" && -s "${CHELABASE_ZITADEL_ADMIN_PAT_FILE}" ]] ||
+  die "CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset or empty (run just dev: its bootstrap writes demo.env)"
+ZITADEL="${CHELABASE_ZITADEL_ISSUER:-http://localhost:8080}"
 command -v pnpm >/dev/null || die "pnpm is missing"
 trap cleanup EXIT
 
@@ -69,7 +69,7 @@ ok() {
 # zitadel <method> <path> [body]: Zitadel's API with the admin PAT; the status (body in
 # $tmp/zbody). The PAT goes through a header file, never argv.
 zitadel() {
-  printf 'Authorization: Bearer %s\n' "$(tr -d '\n' <"$CHELADB_ZITADEL_ADMIN_PAT_FILE")" >"$tmp/zauth"
+  printf 'Authorization: Bearer %s\n' "$(tr -d '\n' <"$CHELABASE_ZITADEL_ADMIN_PAT_FILE")" >"$tmp/zauth"
   local args=(-sS --max-time 30 -o "$tmp/zbody" -w '%{http_code}' -X "$1" "$ZITADEL$2" -H @"$tmp/zauth")
   if [[ -n "${3:-}" ]]; then args+=(-H 'content-type: application/json' -d "$3"); fi
   curl "${args[@]}" || true
@@ -198,18 +198,18 @@ pass "signed up A ($user_a) and B with display_name"
 
 # 2b. Generated types mark the users table (a secret key's role reads the schema).
 ok POST "/v1/databases/$db_id/branches/$db_id/keys" 201 '{"name":"app-users-e2e"}'
-CHELADB_DATA_KEY="$(jq -r '.key' "$tmp/body")" cargo run -q -p cheladb -- gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
-  die "cheladb gen types"
+CHELABASE_DATA_KEY="$(jq -r '.key' "$tmp/body")" cargo run -q -p chelabase -- gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
+  die "chelabase gen types"
 grep -q 'appUsers: { schema: "public"; table: "users" }' "$tmp/db.ts" ||
   die "the generated types don't mark the users table: $(grep -n appUsers "$tmp/db.ts" || echo none)"
-pass "cheladb gen types marks public.users as the app users table"
+pass "chelabase gen types marks public.users as the app users table"
 
 # 3. Row-level security: the built-in policy, and a developer's on another table.
 psql_on "$db_id" -c "CREATE TABLE notes (id bigint generated always as identity primary key,
-    owner uuid NOT NULL DEFAULT cheladb.user_id(), body text NOT NULL);
+    owner uuid NOT NULL DEFAULT chelabase.user_id(), body text NOT NULL);
   ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
   CREATE POLICY notes_own ON notes FOR ALL TO authenticated
-    USING (owner = cheladb.user_id()) WITH CHECK (owner = cheladb.user_id());" >/dev/null
+    USING (owner = chelabase.user_id()) WITH CHECK (owner = chelabase.user_id());" >/dev/null
 sdk rls
 pass "own-row policies: A and B each see only their rows, the public key alone reads nothing"
 

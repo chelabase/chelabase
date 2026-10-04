@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DataApiSchema, Privilege as Priv, TableDesc as DataApiTable } from "@cheladb/management-client";
+import type { DataApiSchema, Privilege as Priv, TableDesc as DataApiTable } from "@chelabase/management-client";
 import { RlsWarning } from "./rls-warning";
 
 type Privs = { anon?: Priv[]; authenticated?: Priv[] };

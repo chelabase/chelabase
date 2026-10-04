@@ -4,7 +4,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppSession, BranchAuthSync, ProjectAuth, ProjectRecord,
     BranchConnectionRow, BranchDatabase, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
     DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState,
@@ -12,11 +12,11 @@ use cheladb_metadata::{
     NeonEndpoint, NeonRole, NewDataKey, NewEndpoint, ResyncApplied, ResyncWrite, RoleCopy,
     ServedDatabase,
 };
-use cheladb_neon::proxy_cache::ProxyCache;
-use cheladb_neon::spec::Placement;
-use cheladb_neon::storcon::LsnAtTime;
-use cheladb_neon::{ComputeSigner, Lsn, NeonId, StorconClient, StorconError};
-use cheladb_types::{BranchId, DatabaseId, ProjectId};
+use chelabase_neon::proxy_cache::ProxyCache;
+use chelabase_neon::spec::Placement;
+use chelabase_neon::storcon::LsnAtTime;
+use chelabase_neon::{ComputeSigner, Lsn, NeonId, StorconClient, StorconError};
+use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
@@ -110,7 +110,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         applied_version: i64,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
-    // Login roles (see `cheladb_metadata::neon`).
+    // Login roles (see `chelabase_metadata::neon`).
 
     /// API create: `CapReached` at `cap` copies, `Exists` when the name is taken; the row is
     /// `pending`. Bumps the version. An unknown endpoint is a database error.
@@ -194,7 +194,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
     ) -> impl Future<Output = Result<Vec<EndpointState>, MetadataError>> + Send;
 
-    // Branches (see `cheladb_metadata::branches` for each one's guards).
+    // Branches (see `chelabase_metadata::branches` for each one's guards).
 
     /// Guarded: `from` must match, and never out of deleting/deleted. True when changed.
     fn set_branch_status(
@@ -285,7 +285,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
     ) -> impl Future<Output = Result<Vec<LiveBranch>, MetadataError>> + Send;
 
-    // The data API (see `cheladb_metadata::data_api`).
+    // The data API (see `chelabase_metadata::data_api`).
 
     /// A second live public key on the branch is [`MetadataError::Conflict`].
     fn insert_data_key(
@@ -350,7 +350,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<BranchConnectionRow>, MetadataError>> + Send;
 
-    // Projects and app users (see `cheladb_metadata::projects` and `::app_users`).
+    // Projects and app users (see `chelabase_metadata::projects` and `::app_users`).
 
     /// Projects `deleting` and untouched for `older_than`.
     fn deleting_projects(
@@ -414,7 +414,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<BranchAuthSync>, MetadataError>> + Send;
-    /// Upserts the branch's `cheladb_auth_sync` password (sealed) and its Postgres database.
+    /// Upserts the branch's `chelabase_auth_sync` password (sealed) and its Postgres database.
     fn set_branch_auth_sync(
         &self,
         branch: BranchId,
@@ -1211,7 +1211,7 @@ impl SpecPusher for HttpPusher {
         endpoint_id: &str,
         config: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        cheladb_neon::reconfigure::push(&self.http, control_addr, &self.signer, endpoint_id, config)
+        chelabase_neon::reconfigure::push(&self.http, control_addr, &self.signer, endpoint_id, config)
             .await
     }
 }

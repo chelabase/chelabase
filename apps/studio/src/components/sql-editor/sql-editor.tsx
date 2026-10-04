@@ -8,7 +8,7 @@ import {
   useListBranches,
   useListRoles,
   type SavedQuery,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { errorText } from "@/lib/errors";
 import type { PglsClient } from "@/lib/pgls/client";
 import { sqlExtensions } from "@/lib/pgls/codemirror";

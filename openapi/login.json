@@ -1,7 +1,7 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Cheladb login API",
+    "title": "Chelabase login API",
     "license": {
       "name": "Apache-2.0"
     },
@@ -13,7 +13,7 @@
         "tags": [
           "app-users"
         ],
-        "description": "Changes the signed-in user's email (needs the `Cheladb-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.",
+        "description": "Changes the signed-in user's email (needs the `Chelabase-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.",
         "operationId": "appChangeEmail",
         "requestBody": {
           "content": {
@@ -117,7 +117,7 @@
         "tags": [
           "app-users"
         ],
-        "description": "Changes the signed-in user's password (needs the `Cheladb-User` token) and returns a new session; every other session of the user ends.",
+        "description": "Changes the signed-in user's password (needs the `Chelabase-User` token) and returns a new session; every other session of the user ends.",
         "operationId": "appChangePassword",
         "requestBody": {
           "content": {
@@ -813,7 +813,7 @@
         "tags": [
           "app-users"
         ],
-        "description": "Ends the session of the `Cheladb-User` token, or, without one, the session of the refresh token in the body.",
+        "description": "Ends the session of the `Chelabase-User` token, or, without one, the session of the refresh token in the body.",
         "operationId": "appSignOut",
         "requestBody": {
           "content": {
@@ -1008,7 +1008,7 @@
         "tags": [
           "app-users"
         ],
-        "description": "The signed-in app user (needs the `Cheladb-User` token).",
+        "description": "The signed-in app user (needs the `Chelabase-User` token).",
         "operationId": "appGetUser",
         "responses": {
           "200": {
@@ -2025,7 +2025,7 @@
         "properties": {
           "access_token": {
             "type": "string",
-            "description": "Send it as the `Cheladb-User` header."
+            "description": "Send it as the `Chelabase-User` header."
           },
           "expires_in": {
             "type": "integer",
@@ -2068,7 +2068,7 @@
               "string",
               "null"
             ],
-            "description": "Needed only without a `Cheladb-User` token."
+            "description": "Needed only without a `Chelabase-User` token."
           }
         }
       },

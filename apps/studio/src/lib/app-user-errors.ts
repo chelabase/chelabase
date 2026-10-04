@@ -1,4 +1,4 @@
-import { ApiError } from "@cheladb/management-client";
+import { ApiError } from "@chelabase/management-client";
 import { errorText } from "@/lib/errors";
 
 /** Plain texts for the error codes app-user screens can meet. */
@@ -9,7 +9,7 @@ const TEXTS: Record<string, string> = {
   app_users_location_fixed: "The database, schema and table can't change once app users are enabled. Disable them first.",
   email_taken: "That email is already in use",
   weak_password: "That password is too weak. Use a longer one.",
-  unavailable: "User administration isn't configured on this Cheladb (the Zitadel admin credentials are missing)",
+  unavailable: "User administration isn't configured on this Chelabase (the Zitadel admin credentials are missing)",
 };
 
 export function appUserErrorText(err: unknown): string {

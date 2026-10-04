@@ -12,7 +12,7 @@
 #   doesn't exist (refused) and as one dropped after its check (unknown_role);
 # - an owner password set in SQL answers 409 owner_password_unknown until a reset;
 # - main can't be switched off; disable answers 409 data_api_disabled in the console and 404
-#   to the key at once; remove machinery drops the cheladb schema; delete.
+#   to the key at once; remove machinery drops the chelabase schema; delete.
 # KEEP=1 leaves the database in place.
 set -euo pipefail
 
@@ -22,7 +22,7 @@ LOG_PREFIX=console-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
-PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
+PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 DB2=analytics
@@ -46,13 +46,13 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p cheladb || die "cargo build -p cheladb"
-[[ -f .cheladb/zitadel/demo.env ]] || die ".cheladb/zitadel/demo.env is missing (run just dev)"
+cargo build -q -p chelabase || die "cargo build -p chelabase"
+[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
 set -a
 # shellcheck disable=SC1091
-source .cheladb/zitadel/demo.env
+source .chelabase/zitadel/demo.env
 set +a
-ca="$root/.cheladb/neon/proxy-ca.crt"
+ca="$root/.chelabase/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
 trap cleanup EXIT
 
@@ -302,12 +302,12 @@ console_err null "\"$DB2\"" '{"v":1,"op":"select","from":"items"}' 409 data_api_
 code="$(data "$KEY" "$in_db2")"
 [[ "$code" == 404 && "$(jq -r '.error.code' "$tmp/data")" == unknown_database ]] ||
   die "the key in $DB2 after the disable: $code $(cat "$tmp/data")"
-[[ "$(psql_in "$DB2" -c "SELECT count(*) FROM pg_namespace WHERE nspname = 'cheladb'")" == 1 ]] ||
+[[ "$(psql_in "$DB2" -c "SELECT count(*) FROM pg_namespace WHERE nspname = 'chelabase'")" == 1 ]] ||
   die "disable dropped the machinery"
 ok DELETE "$branch/pg-databases/$DB2/data-api?remove=true" 204
-[[ "$(psql_in "$DB2" -c "SELECT count(*) FROM pg_namespace WHERE nspname = 'cheladb'")" == 0 ]] ||
-  die "remove left the cheladb schema"
-pass "main can't be switched off; disabled $DB2 is 409 in the console and 404 to the key at once; remove dropped cheladb"
+[[ "$(psql_in "$DB2" -c "SELECT count(*) FROM pg_namespace WHERE nspname = 'chelabase'")" == 0 ]] ||
+  die "remove left the chelabase schema"
+pass "main can't be switched off; disabled $DB2 is 409 in the console and 404 to the key at once; remove dropped chelabase"
 
 # 9. Delete.
 if [[ "${KEEP:-}" != 1 ]]; then

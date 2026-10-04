@@ -1,8 +1,0 @@
-[package]
-name = "cheladb-routes"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Cheladb public endpoint declarations shared by the gateway and services"
-
-[dependencies]

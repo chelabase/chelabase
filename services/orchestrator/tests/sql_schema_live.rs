@@ -3,7 +3,7 @@
 use orchestrator::sql_editor::{MAX_SCHEMA_BYTES, schema};
 use tokio_postgres::NoTls;
 
-const BASE: &str = "postgres://cheladb:cheladb@127.0.0.1:5433";
+const BASE: &str = "postgres://chelabase:chelabase@127.0.0.1:5433";
 
 async fn connect(db: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(&format!("{BASE}/{db}"), NoTls)
@@ -20,7 +20,7 @@ async fn introspection_runs_and_fits() {
     getrandom::fill(&mut buf).unwrap();
     let database = format!("t5_schema_{:08x}", u32::from_le_bytes(buf));
 
-    let admin = connect("cheladb_metadata").await;
+    let admin = connect("chelabase_metadata").await;
     admin
         .batch_execute(&format!("CREATE DATABASE {database}"))
         .await

@@ -1,5 +1,5 @@
 -- A realistic migration that manages its own roles, as a team would write it for any Postgres.
--- scripts/role-e2e.sh runs it with psql as the branch owner, through Cheladb's proxy.
+-- scripts/role-e2e.sh runs it with psql as the branch owner, through Chelabase's proxy.
 -- psql runs each statement on its own (CREATE DATABASE can't run inside a transaction).
 
 -- A group role that holds the app's privileges; it never logs in.

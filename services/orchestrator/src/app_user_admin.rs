@@ -11,13 +11,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use cheladb_metadata::{AppUsersStatus, ProjectRecord};
-use cheladb_nats::{AppUsersSyncJob, JobEnvelope};
-use cheladb_query::app_users::{NewUserRow, SYNC_ROLE, SyncTarget, UserRowError};
-use cheladb_secrets::open_role_password;
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::{ApiJson, ApiPath, BranchId};
-use cheladb_zitadel::client::{EmailMatch, NewUser, UserState, ZError, ZUser, Zitadel};
+use chelabase_metadata::{AppUsersStatus, ProjectRecord};
+use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
+use chelabase_query::app_users::{NewUserRow, SYNC_ROLE, SyncTarget, UserRowError};
+use chelabase_secrets::open_role_password;
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::{ApiJson, ApiPath, BranchId};
+use chelabase_zitadel::client::{EmailMatch, NewUser, UserState, ZError, ZUser, Zitadel};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
@@ -135,7 +135,7 @@ pub(crate) fn zitadel_unavailable() -> ApiError {
 }
 
 /// A Zitadel failure the route didn't map itself. Only an unreachable Zitadel, or one
-/// refusing Cheladb's own credential, is `503`: a precondition refusal (the user is already in
+/// refusing Chelabase's own credential, is `503`: a precondition refusal (the user is already in
 /// that state, an unchanged value) is `409 conflict`, a refused value `422`, an unknown user
 /// `404`. Zitadel's message is an error id, logged and never shown.
 pub(crate) fn zitadel_failed(what: &str, err: &ZError) -> ApiError {
@@ -145,7 +145,7 @@ pub(crate) fn zitadel_failed(what: &str, err: &ZError) -> ApiError {
             match *status {
                 404 => ApiError::not_found("user not found"),
                 401 | 403 => {
-                    error!("zitadel refused Cheladb's credential: {what}: {err}");
+                    error!("zitadel refused Chelabase's credential: {what}: {err}");
                     ApiError::new(503, ErrorCode::Unavailable, "the user service can't be reached; try again")
                 }
                 409 => conflict(ErrorCode::Conflict, "the user service refused the change: it conflicts with the user's current state"),
@@ -170,7 +170,7 @@ mod tests {
         ZError::Rejected { status, message: message.into() }
     }
 
-    /// Only an unreachable Zitadel (or one refusing Cheladb's own credential) is `503`.
+    /// Only an unreachable Zitadel (or one refusing Chelabase's own credential) is `503`.
     #[test]
     fn zitadel_refusals_map_by_kind() {
         let cases = [
@@ -338,7 +338,7 @@ fn row_error(err: UserRowError) -> ApiError {
         (status = 200, description = "A page of users", body = AppUserPage),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the query is malformed", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: `page_token` isn't one this API issued", body = ErrorEnvelope),
@@ -401,7 +401,7 @@ where
         (status = 201, description = "The new user", body = AppUser),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled; `email_taken`: another user has this email; `branch_not_ready`: the auth database's main branch has no compute", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -453,7 +453,7 @@ where
             ApiError::new(
                 500,
                 ErrorCode::CredentialsUnavailable,
-                "stored credentials can't be decrypted with the current secrets key; restore the original CHELADB_SECRETS_KEY file",
+                "stored credentials can't be decrypted with the current secrets key; restore the original CHELABASE_SECRETS_KEY file",
             )
         })?;
     let addr = match state.locator.postgres_addr(endpoint).await {
@@ -561,7 +561,7 @@ where
         (status = 200, description = "The user", body = AppUser),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project or user (another project's user answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -602,7 +602,7 @@ where
         (status = 200, description = "The user after the change", body = AppUser),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project or user", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled; `email_taken`: another user has this email; `conflict`: the user service refused the change in the user's current state", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -710,7 +710,7 @@ async fn fresh_user(z: &Zitadel, user_id: &str) -> Result<AppUser, ApiError> {
         (status = 200, description = "The user, `inactive`", body = AppUser),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project or user", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled; `conflict`: the user is already inactive", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -743,7 +743,7 @@ where
         (status = 200, description = "The user, `active`", body = AppUser),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project or user", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled; `conflict`: the user is already active", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -809,7 +809,7 @@ where
         (status = 200, description = "The user's sessions that aren't revoked, oldest first", body = Vec<AppUserSession>),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project or user", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -862,7 +862,7 @@ where
         (status = 204, description = "The user's sessions are revoked"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project or user", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -903,7 +903,7 @@ where
         (status = 204, description = "The user is deleted"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project or user", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),

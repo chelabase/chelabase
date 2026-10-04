@@ -9,17 +9,17 @@ pub struct GatewayConfig {
     pub upstreams: Upstreams,
     pub api_hosts: Vec<String>,
     pub studio_origins: Vec<String>,
-    /// Orchestrator's internal listener (`CHELADB_INTERNAL_URL`), for key lookups.
+    /// Orchestrator's internal listener (`CHELABASE_INTERNAL_URL`), for key lookups.
     pub internal_url: String,
-    /// Bearer for that listener (`CHELADB_DATA_KEYS_TOKEN`).
+    /// Bearer for that listener (`CHELABASE_DATA_KEYS_TOKEN`).
     pub data_keys_token: String,
-    /// App-user token verification key, a PEM file (`CHELADB_APP_JWT_PUBLIC_KEY`); when unset,
-    /// every `Cheladb-User` header is refused.
+    /// App-user token verification key, a PEM file (`CHELABASE_APP_JWT_PUBLIC_KEY`); when unset,
+    /// every `Chelabase-User` header is refused.
     pub app_jwt_public_key: Option<String>,
     /// Liveness-only bearer for `GET /internal/app/sessions/{id}`
-    /// (`CHELADB_APP_SESSIONS_INTERNAL_TOKEN`).
+    /// (`CHELABASE_APP_SESSIONS_INTERNAL_TOKEN`).
     pub app_sessions_token: String,
-    /// Upstream read timeout (`CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS`, default 60).
+    /// Upstream read timeout (`CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS`, default 60).
     pub upstream_timeout: Duration,
 }
 
@@ -43,26 +43,26 @@ impl std::fmt::Debug for GatewayConfig {
 impl GatewayConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
-            listen: env_or("CHELADB_GATEWAY_ADDR", "127.0.0.1:8000"),
+            listen: env_or("CHELABASE_GATEWAY_ADDR", "127.0.0.1:8000"),
             upstreams: Upstreams::new(
-                &env_or("CHELADB_ORCHESTRATOR_URL", "http://127.0.0.1:8081"),
-                &env_or("CHELADB_AUTH_URL", "http://127.0.0.1:8084"),
+                &env_or("CHELABASE_ORCHESTRATOR_URL", "http://127.0.0.1:8081"),
+                &env_or("CHELABASE_AUTH_URL", "http://127.0.0.1:8084"),
             )
-            .and_then(|u| u.with_rest(&env_or("CHELADB_REST_URL", "http://127.0.0.1:8085")))
+            .and_then(|u| u.with_rest(&env_or("CHELABASE_REST_URL", "http://127.0.0.1:8085")))
             .map_err(anyhow::Error::msg)?,
-            api_hosts: split_csv(&env_or("CHELADB_API_HOSTS", "")),
-            studio_origins: split_csv(&env_or("CHELADB_STUDIO_ORIGINS", "http://localhost:3000")),
-            internal_url: env_or("CHELADB_INTERNAL_URL", "http://127.0.0.1:8083"),
-            data_keys_token: env_or("CHELADB_DATA_KEYS_TOKEN", "cheladb-dev-data-keys"),
-            app_jwt_public_key: std::env::var("CHELADB_APP_JWT_PUBLIC_KEY")
+            api_hosts: split_csv(&env_or("CHELABASE_API_HOSTS", "")),
+            studio_origins: split_csv(&env_or("CHELABASE_STUDIO_ORIGINS", "http://localhost:3000")),
+            internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
+            data_keys_token: env_or("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
+            app_jwt_public_key: std::env::var("CHELABASE_APP_JWT_PUBLIC_KEY")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             app_sessions_token: env_or(
-                "CHELADB_APP_SESSIONS_INTERNAL_TOKEN",
-                "cheladb-dev-app-sessions",
+                "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN",
+                "chelabase-dev-app-sessions",
             ),
             upstream_timeout: parse_timeout_secs(&env_or(
-                "CHELADB_GATEWAY_UPSTREAM_TIMEOUT_SECS",
+                "CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS",
                 "60",
             ))
             .map_err(anyhow::Error::msg)?,

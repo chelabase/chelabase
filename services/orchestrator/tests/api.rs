@@ -1,23 +1,23 @@
 use axum::Router;
-use cheladb_auth::internal::{
+use chelabase_auth::internal::{
     generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier, IDENTITY_HEADER,
 };
-use cheladb_metadata::{
+use chelabase_metadata::{
     BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseOrigin, DataKeyRecord, DatabaseRecord,
     DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, ProjectStatus, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
     TenantOverview,
     AppSession, AppUsersStatus, BeginEnable, BeginProjectDelete, BranchAuthSync, NewProjectAuth, OnDelete, ProjectAuth,
     ProjectRecord, RenameProject, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
 };
-use cheladb_nats::{
+use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
     ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RESET_NOT_APPLIED,
 };
-use cheladb_routes::{Service, ENDPOINTS};
-use cheladb_types::mode::Mode;
-use cheladb_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use cheladb_secrets::{open_credential, seal_credential, Purpose, SecretKey};
-use cheladb_types::data_key::{self, DataKeyKind};
+use chelabase_routes::{Service, ENDPOINTS};
+use chelabase_types::mode::Mode;
+use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
+use chelabase_secrets::{open_credential, seal_credential, Purpose, SecretKey};
+use chelabase_types::data_key::{self, DataKeyKind};
 use orchestrator::{
     build_router, AppState, Console, JobPort, MetadataPort, PostgresAddr, ProxyAddress, ResetError,
     RestInternal,
@@ -218,7 +218,7 @@ impl FakeMetadata {
             name: name.into(),
             owner: owner.into(),
             origin,
-            data_api: cheladb_metadata::DataApiState::Off,
+            data_api: chelabase_metadata::DataApiState::Off,
             data_api_error: None,
             default_schema: "public".into(),
             data_api_bootstrapped: origin == DatabaseOrigin::Main,
@@ -700,8 +700,8 @@ impl MetadataPort for FakeMetadata {
         branch: BranchId,
         name: &str,
         cap: u32,
-    ) -> Result<cheladb_metadata::EnableStart, MetadataError> {
-        use cheladb_metadata::{DataApiState, EnableStart};
+    ) -> Result<chelabase_metadata::EnableStart, MetadataError> {
+        use chelabase_metadata::{DataApiState, EnableStart};
         let mut all = self.branch_dbs.lock().unwrap();
         let rows = all.entry(branch).or_default();
         let Some(i) = rows.iter().position(|d| d.name == name) else {
@@ -806,7 +806,7 @@ impl MetadataPort for FakeMetadata {
             .filter(|p| p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
             .map(|p| p.slug.clone())
             .collect();
-        let base = cheladb_metadata::slug_base(name);
+        let base = chelabase_metadata::slug_base(name);
         let mut slug = base.clone();
         let mut n = 2;
         while taken.contains(&slug) {
@@ -1503,7 +1503,7 @@ async fn spawn_app_full(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, 
         mode,
         cap,
         None,
-        Arc::new(cheladb_query::app_users::PgUsersDb::new()),
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
     )
     .await
 }
@@ -1514,8 +1514,8 @@ async fn spawn_app_parts(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<cheladb_zitadel::client::Zitadel>,
-    users_db: Arc<dyn cheladb_query::app_users::UsersDb>,
+    zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
 ) -> TestApp {
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
@@ -1532,7 +1532,7 @@ async fn spawn_app_parts(
             http: reqwest::Client::new(),
         },
         mode,
-        proxy_ca_file: ".cheladb/neon/proxy-ca.crt".into(),
+        proxy_ca_file: ".chelabase/neon/proxy-ca.crt".into(),
         data_api_database_cap: cap,
         locator: Arc::new(locator.clone()),
         console: Console::default(),
@@ -1602,7 +1602,7 @@ async fn docs_page_configures_scalar_offline() {
     assert_eq!(resp.status(), 200);
     assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
     let html = resp.text().await.unwrap();
-    assert!(html.contains("Cheladb Management API"), "{html}");
+    assert!(html.contains("Chelabase Management API"), "{html}");
     // The script URL carries the first 12 hex of the bundle's sha256 (from VERSION), so a
     // Scalar upgrade is never served stale from the day-long cache.
     let version = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/scalar/VERSION")).unwrap();
@@ -2130,7 +2130,7 @@ async fn reveal_in_mode(mode: Mode) -> serde_json::Value {
 #[tokio::test]
 async fn reveal_carries_the_ca_file_in_self_hosted_mode() {
     let body = reveal_in_mode(Mode::SelfHosted).await;
-    assert_eq!(body["ca_file"], ".cheladb/neon/proxy-ca.crt");
+    assert_eq!(body["ca_file"], ".chelabase/neon/proxy-ca.crt");
     assert!(body["uri"].as_str().unwrap().ends_with("?sslmode=verify-full"));
 }
 
@@ -2536,7 +2536,7 @@ async fn delete_other_tenant_is_404() {
     assert!(jobs.deleted.lock().unwrap().is_empty());
 }
 
-/// Every endpoint `cheladb-routes` assigns to the orchestrator must be routed
+/// Every endpoint `chelabase-routes` assigns to the orchestrator must be routed
 /// by the orchestrator's own router. A 401 still proves the route exists; only
 /// 404 (unknown path) and 405 (wrong method) mean drift.
 #[tokio::test]
@@ -2555,7 +2555,7 @@ async fn every_declared_orchestrator_endpoint_is_routed() {
         let status = client.request(method, &url).send().await.unwrap().status();
         assert!(
             status != 404 && status != 405,
-            "{} {} is declared in cheladb-routes but the orchestrator answered {status}",
+            "{} {} is declared in chelabase-routes but the orchestrator answered {status}",
             ep.method.as_str(),
             ep.path
         );
@@ -3856,7 +3856,7 @@ async fn data_api_schema_forwards_the_database() {
     let (t, seen) = branching_with_schema_rest().await;
     let main = t.seeded();
     t.metadata.add_branch_db(main, "my db&x", "etl", DatabaseOrigin::Sql);
-    t.metadata.set_data_api(main, "my db&x", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "my db&x", chelabase_metadata::DataApiState::On);
     let path = format!("{}/data-api/schema", t.branch(main));
     // No parameter: main, as today.
     assert_eq!(t.send(Method::GET, &path, None).await.status(), 200);
@@ -3886,7 +3886,7 @@ async fn data_api_schema_unknown_or_disabled_database() {
     // Rest saying `unknown_database` for a database metadata lists as on (it vanished
     // meanwhile): answered by what metadata says, here still not found.
     t.metadata.add_branch_db(main, "gone", "etl", DatabaseOrigin::Sql);
-    t.metadata.set_data_api(main, "gone", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "gone", chelabase_metadata::DataApiState::On);
     let err = error_of(t.send(Method::GET, &format!("{path}?database=gone"), None).await, 404).await;
     assert_eq!(code_of(&err), "not_found");
     assert_eq!(seen.lock().unwrap().len(), 1);
@@ -4352,7 +4352,7 @@ async fn role_reply_codes_map_to_statuses() {
     t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
     let key = uuid::Uuid::new_v4();
     let in_use = RoleReply {
-        keys: vec![cheladb_nats::KeyRef { id: key, name: "ci".into() }],
+        keys: vec![chelabase_nats::KeyRef { id: key, name: "ci".into() }],
         ..role_reply("role_in_use")
     };
     let table: Vec<(RoleReply, u16, &str)> = vec![
@@ -4491,7 +4491,7 @@ async fn connection_by_role_and_database() {
     let ep = t.metadata.branch(dev).endpoint_id.unwrap();
     t.metadata.role_passwords.lock().unwrap().insert(
         (ep.clone(), "app".into()),
-        cheladb_secrets::seal_role_password(&t.app.key, &dev.to_string(), "app", "app-pw"),
+        chelabase_secrets::seal_role_password(&t.app.key, &dev.to_string(), "app", "app-pw"),
     );
     t.metadata.add_role(&ep, "postgres", RoleOrigin::Owner, true, false);
     t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
@@ -4773,7 +4773,7 @@ async fn connection_role_sealed_for_another_branch_is_500_credentials_unavailabl
     t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
     t.metadata.role_passwords.lock().unwrap().insert(
         (ep, "app".into()),
-        cheladb_secrets::seal_role_password(&t.app.key, &BranchId::new().to_string(), "app", "x"),
+        chelabase_secrets::seal_role_password(&t.app.key, &BranchId::new().to_string(), "app", "x"),
     );
     let err = error_of(t.send(Method::GET, &format!("{}/connection?role=app", t.branch(dev)), None).await, 500).await;
     assert_eq!(code_of(&err), "credentials_unavailable");
@@ -4859,7 +4859,7 @@ impl Branching {
     fn seeded(&self) -> BranchId {
         let main = self.main();
         self.metadata.add_branch_db(main, "web1", "postgres", DatabaseOrigin::Main);
-        self.metadata.set_data_api(main, "web1", cheladb_metadata::DataApiState::On);
+        self.metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::On);
         self.metadata.add_branch_db(main, "analytics", "etl", DatabaseOrigin::Sql);
         self.metadata.add_branch_db(main, "scratch", "etl", DatabaseOrigin::Sql);
         self.metadata.add_branch_db(main, "postgres", "cloud_admin", DatabaseOrigin::System);
@@ -4872,12 +4872,12 @@ impl Branching {
 }
 
 impl FakeMetadata {
-    fn set_data_api(&self, branch: BranchId, name: &str, state: cheladb_metadata::DataApiState) {
+    fn set_data_api(&self, branch: BranchId, name: &str, state: chelabase_metadata::DataApiState) {
         let mut all = self.branch_dbs.lock().unwrap();
         let row = all.get_mut(&branch).unwrap().iter_mut().find(|d| d.name == name).unwrap();
         row.data_api = state;
         // As the store does: any state but off means an enable began.
-        row.data_api_bootstrapped |= state != cheladb_metadata::DataApiState::Off;
+        row.data_api_bootstrapped |= state != chelabase_metadata::DataApiState::Off;
     }
 
     fn pg_database(&self, branch: BranchId, name: &str) -> BranchDatabase {
@@ -4909,7 +4909,7 @@ async fn enable_answers_202_and_publishes() {
     assert_eq!(body["data_api"], "enabling");
     assert!(body["data_api_error"].is_null());
     assert_eq!(t.data_api_calls(), vec!["enable:analytics"]);
-    assert_eq!(t.metadata.pg_database(main, "analytics").data_api, cheladb_metadata::DataApiState::Enabling);
+    assert_eq!(t.metadata.pg_database(main, "analytics").data_api, chelabase_metadata::DataApiState::Enabling);
 
     // Pressing it again while it is enabling starts the job again (a retry).
     assert_eq!(t.send(Method::POST, &format!("{}/data-api", t.pg(main, "analytics")), None).await.status(), 202);
@@ -4924,7 +4924,7 @@ async fn enable_answers_202_and_publishes() {
     // A lost publish is healed by reconcile (the row stays `enabling`): still 202.
     *t.jobs.fail_enable_publish.lock().unwrap() = true;
     assert_eq!(t.send(Method::POST, &format!("{}/data-api", t.pg(main, "scratch")), None).await.status(), 202);
-    assert_eq!(t.metadata.pg_database(main, "scratch").data_api, cheladb_metadata::DataApiState::Enabling);
+    assert_eq!(t.metadata.pg_database(main, "scratch").data_api, chelabase_metadata::DataApiState::Enabling);
 }
 
 #[tokio::test]
@@ -4945,7 +4945,7 @@ async fn enable_refusals() {
     assert_eq!(code_of(&err), "conflict");
     assert_eq!(message_of(&err), "this branch already serves 2 databases (the cap is 2)");
     assert_eq!(t.data_api_calls(), vec!["enable:analytics"]);
-    assert_eq!(t.metadata.pg_database(main, "scratch").data_api, cheladb_metadata::DataApiState::Off);
+    assert_eq!(t.metadata.pg_database(main, "scratch").data_api, chelabase_metadata::DataApiState::Off);
     // A branch that isn't ready, and a backup.
     let pending = t.add("wip", main, BranchKind::Normal, BranchStatus::Pending);
     let err = error_of(t.send(Method::POST, &format!("{}/data-api", t.pg(pending, "x")), None).await, 409).await;
@@ -4963,7 +4963,7 @@ async fn disable_main_is_refused() {
     let err = error_of(t.send(Method::DELETE, &format!("{}/data-api", t.pg(main, "web1")), None).await, 409).await;
     assert_eq!(code_of(&err), "conflict");
     assert!(t.data_api_calls().is_empty());
-    assert_eq!(t.metadata.pg_database(main, "web1").data_api, cheladb_metadata::DataApiState::On);
+    assert_eq!(t.metadata.pg_database(main, "web1").data_api, chelabase_metadata::DataApiState::On);
     assert!(seen.lock().unwrap().is_empty());
     // Unknown: 404; the system database was never served: 422.
     assert_eq!(t.send(Method::DELETE, &format!("{}/data-api", t.pg(main, "nope")), None).await.status(), 404);
@@ -4975,7 +4975,7 @@ async fn disable_main_is_refused() {
 async fn disable_runs_the_job_then_invalidates_rest() {
     let (t, seen) = branching_with_rest(10).await;
     let main = t.seeded();
-    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "analytics", chelabase_metadata::DataApiState::On);
     let path = format!("{}/data-api", t.pg(main, "analytics"));
     assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
     assert_eq!(t.send(Method::DELETE, &format!("{path}?remove=true"), None).await.status(), 204);
@@ -5006,7 +5006,7 @@ async fn disable_runs_the_job_then_invalidates_rest() {
     assert_eq!(message_of(&err), "database is in use");
 }
 
-/// `remove` on a database no enable ever began on is refused: whatever `cheladb` schema it
+/// `remove` on a database no enable ever began on is refused: whatever `chelabase` schema it
 /// holds isn't the data API's. Disabling it (already off) without `remove` still answers 204.
 #[tokio::test]
 async fn remove_on_a_database_never_enabled_is_refused() {
@@ -5023,8 +5023,8 @@ async fn remove_on_a_database_never_enabled_is_refused() {
     assert!(seen.lock().unwrap().is_empty());
     assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
     // Off after an enable began: the machinery may be there, so it can be removed.
-    t.metadata.set_data_api(main, "scratch", cheladb_metadata::DataApiState::On);
-    t.metadata.set_data_api(main, "scratch", cheladb_metadata::DataApiState::Off);
+    t.metadata.set_data_api(main, "scratch", chelabase_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "scratch", chelabase_metadata::DataApiState::Off);
     assert_eq!(t.send(Method::DELETE, &format!("{path}?remove=true"), None).await.status(), 204);
     assert_eq!(t.data_api_calls(), vec!["disable:scratch:false", "disable:scratch:true"]);
 }
@@ -5033,7 +5033,7 @@ async fn remove_on_a_database_never_enabled_is_refused() {
 async fn disable_survives_rest_being_down() {
     let t = branching().await; // rest points at a closed port
     let main = t.seeded();
-    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "analytics", chelabase_metadata::DataApiState::On);
     let path = format!("{}/data-api", t.pg(main, "analytics"));
     assert_eq!(t.send(Method::DELETE, &path, None).await.status(), 204);
 }
@@ -5258,7 +5258,7 @@ fn the_database_cap_is_read_from_the_environment() {
     assert_eq!(data_api_database_cap(Some(" 100 ")), Ok(100));
     for bad in ["0", "101", "-1", "ten", "1.5"] {
         let err = data_api_database_cap(Some(bad)).unwrap_err();
-        assert!(err.contains("CHELADB_BRANCH_DATA_API_DATABASE_CAP"), "{bad}: {err}");
+        assert!(err.contains("CHELABASE_BRANCH_DATA_API_DATABASE_CAP"), "{bad}: {err}");
     }
 }
 
@@ -5389,7 +5389,7 @@ async fn other_roles_check_once_then_forward_to_rest() {
         assert_eq!(body, json!({ "role": "editor", "database": "web1", "tree": select_notes() }));
     }
     // Another role is checked on its own; the owner is never forwarded.
-    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "analytics", chelabase_metadata::DataApiState::On);
     let resp = t.console(main, json!({ "role": "viewer", "database": "analytics", "tree": select_notes() })).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(t.role_checks().len(), 2);
@@ -5454,9 +5454,9 @@ async fn a_disabled_database_is_409() {
     let (t, calls) = console_app(rest_ok(json!([]))).await;
     let main = t.main();
     for state in [
-        cheladb_metadata::DataApiState::Off,
-        cheladb_metadata::DataApiState::Enabling,
-        cheladb_metadata::DataApiState::Error,
+        chelabase_metadata::DataApiState::Off,
+        chelabase_metadata::DataApiState::Enabling,
+        chelabase_metadata::DataApiState::Error,
     ] {
         t.metadata.set_data_api(main, "analytics", state);
         for role in [Value::Null, json!("editor")] {
@@ -5484,14 +5484,14 @@ async fn rest_unknown_database_maps_to_the_rows_state() {
         if request["database"] == "analytics"
             && let Some((metadata, branch)) = slot.lock().unwrap().clone()
         {
-            metadata.set_data_api(branch, "analytics", cheladb_metadata::DataApiState::Off);
+            metadata.set_data_api(branch, "analytics", chelabase_metadata::DataApiState::Off);
         }
         (404, vec![], json!({ "error": { "code": "unknown_database", "message": "the database doesn't exist or isn't served by this key" } }))
     });
     let (t, _) = console_app(answer).await;
     let main = t.main();
     *metadata_slot.lock().unwrap() = Some((t.metadata.clone(), main));
-    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "analytics", chelabase_metadata::DataApiState::On);
     let resp = t.console(main, json!({ "role": "editor", "database": "analytics", "tree": select_notes() })).await;
     assert_eq!(code_of(&error_of(resp, 409).await), "data_api_disabled");
     // Still on in metadata: a plain 404.
@@ -5573,7 +5573,7 @@ async fn console_schema_as_a_role_checks_then_forwards_role_and_database() {
     let schema = json!({ "version": "v1", "default_schema": "reporting", "schemas": {} });
     let (t, calls) = console_app(rest_ok(schema.clone())).await;
     let main = t.main();
-    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "analytics", chelabase_metadata::DataApiState::On);
     let resp = t.console_schema(main, "?role=editor&database=analytics").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["content-type"], "application/json");
@@ -5671,7 +5671,7 @@ async fn the_owner_password_never_goes_to_rest() {
     let (t, calls) = console_app(rest_ok(json!([]))).await;
     let main = t.main();
     let sealed = t.metadata.branch(main).owner_password_enc.unwrap();
-    t.metadata.set_data_api(main, "analytics", cheladb_metadata::DataApiState::On);
+    t.metadata.set_data_api(main, "analytics", chelabase_metadata::DataApiState::On);
     // The owner path, with and without a compute: never forwarded.
     for database in [Value::Null, json!("analytics")] {
         let resp = t.console(main, json!({ "role": null, "database": database, "tree": select_notes() })).await;
@@ -5773,8 +5773,8 @@ struct ScratchCompute {
 impl ScratchCompute {
     async fn new() -> Self {
         use sqlx::Executor;
-        let url = std::env::var("CHELADB_METADATA_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into());
+        let url = std::env::var("CHELABASE_METADATA_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into());
         let admin = sqlx::PgPool::connect(&url).await.expect("the metadata Postgres (just deps-up)");
         let suffix = format!("{:08x}", rand_u32());
         let database = format!("t6_console_{suffix}");
@@ -5789,11 +5789,11 @@ impl ScratchCompute {
         let scratch = sqlx::PgPool::connect_with(opts.database(&database)).await.unwrap();
         scratch
             .execute(sqlx::AssertSqlSafe(format!(
-                "CREATE SCHEMA cheladb; \
-                 CREATE TABLE cheladb.schema_version (version bigint NOT NULL); \
-                 INSERT INTO cheladb.schema_version VALUES (1); \
-                 GRANT USAGE ON SCHEMA cheladb TO {owner}; \
-                 GRANT SELECT ON cheladb.schema_version TO {owner}; \
+                "CREATE SCHEMA chelabase; \
+                 CREATE TABLE chelabase.schema_version (version bigint NOT NULL); \
+                 INSERT INTO chelabase.schema_version VALUES (1); \
+                 GRANT USAGE ON SCHEMA chelabase TO {owner}; \
+                 GRANT SELECT ON chelabase.schema_version TO {owner}; \
                  CREATE TABLE public.notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, body text NOT NULL); \
                  ALTER TABLE public.notes OWNER TO {owner};"
             )))
@@ -5904,7 +5904,7 @@ async fn owner_console_runs_through_the_owner_pool() {
     assert!(body["error"]["code"].is_string(), "{body}");
     // The owner pool holds at most 2 connections, under its own application name.
     let (n,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = 'cheladb-console'",
+        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = 'chelabase-console'",
     )
     .bind(&scratch.owner)
     .fetch_one(&scratch.admin)
@@ -5930,7 +5930,7 @@ async fn owner_password_unknown_then_works_after_reset() {
     let scratch = ScratchCompute::new().await;
     let t = owner_console_app(&scratch).await;
     let main = t.main();
-    // Set in SQL: Cheladb doesn't know it.
+    // Set in SQL: Chelabase doesn't know it.
     t.seal_owner_password(None);
     let resp = t.console(main, json!({ "role": null, "tree": select_notes() })).await;
     assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
@@ -6240,9 +6240,9 @@ async fn me_lists_project_name_and_status() {
 
 // ---- App users: settings and user admin ---------------------------------------------
 
-use cheladb_query::app_users::{NewUserRow, PendingInsert, SyncTarget, UserRowError, UsersDb};
-use cheladb_zitadel::client::Zitadel;
-use cheladb_zitadel::mock::{ADMIN_TOKEN, MockZitadel, User as MockUser};
+use chelabase_query::app_users::{NewUserRow, PendingInsert, SyncTarget, UserRowError, UsersDb};
+use chelabase_zitadel::client::Zitadel;
+use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel, User as MockUser};
 
 /// What `FakeUsersDb` does when asked to insert or to commit.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -6260,7 +6260,7 @@ struct FakeUsersDb {
     targets: Arc<Mutex<Vec<SyncTarget>>>,
     rows: Arc<Mutex<Vec<NewUserRow>>>,
     fault: Arc<Mutex<Option<UdbFault>>>,
-    probe: Arc<Mutex<Option<Arc<Mutex<cheladb_zitadel::mock::Inner>>>>>,
+    probe: Arc<Mutex<Option<Arc<Mutex<chelabase_zitadel::mock::Inner>>>>>,
 }
 
 impl FakeUsersDb {
@@ -6336,7 +6336,7 @@ async fn au_env(with_zitadel: bool) -> Au {
     let (db_id, main) = (db.database_id, db.main.id);
     metadata.insert_database(db);
     metadata.add_branch_db(main, "web1", "owner", DatabaseOrigin::Main);
-    metadata.set_data_api(main, "web1", cheladb_metadata::DataApiState::On);
+    metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::On);
     let udb = FakeUsersDb::default();
     let (mock, zitadel) = if with_zitadel {
         let mock = MockZitadel::start().await;
@@ -6398,7 +6398,7 @@ impl Au {
 
     /// The sync role's sealed password on the auth database's main branch.
     fn seal_sync_role(&self) {
-        let sealed = cheladb_secrets::seal_role_password(&self.app.key, &self.main.to_string(), "cheladb_auth_sync", "sync-pw");
+        let sealed = chelabase_secrets::seal_role_password(&self.app.key, &self.main.to_string(), "chelabase_auth_sync", "sync-pw");
         self.metadata.branch_syncs.lock().unwrap().insert(
             self.main,
             BranchAuthSync { branch_id: self.main, pg_database: "web1".into(), password_sealed: sealed },
@@ -6530,7 +6530,7 @@ async fn delete_while_disabling_republishes() {
 #[tokio::test]
 async fn reserved_schema_is_422() {
     let au = au_env(true).await;
-    for schema in ["cheladb", "information_schema", "pg_x", "pg_catalog"] {
+    for schema in ["chelabase", "information_schema", "pg_x", "pg_catalog"] {
         let mut body = put_body(&au);
         body["schema"] = json!(schema);
         let (status, answer) = au.call(Method::PUT, "/app-users", Some(body)).await;
@@ -6579,7 +6579,7 @@ async fn app_users_enable_refusals() {
     au.metadata.add_branch_db(child, "web1", "owner", DatabaseOrigin::Main);
     let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
     assert_eq!((status, code_of(&body)), (409, "data_api_not_enabled"), "{body}");
-    au.metadata.set_data_api(child, "web1", cheladb_metadata::DataApiState::On);
+    au.metadata.set_data_api(child, "web1", chelabase_metadata::DataApiState::On);
     // The table exists.
     *au.jobs.app_users_check_reply.lock().unwrap() =
         Some(AppUsersCheckReply { ok: false, code: Some("app_users_table_exists".into()), error: Some("exists".into()) });
@@ -6678,7 +6678,7 @@ async fn create_user_inserts_then_creates_then_commits() {
     let target = au.udb.targets.lock().unwrap()[0].clone();
     assert_eq!(
         (target.branch_id, target.host.as_str(), target.port, target.database.as_str(), target.user.as_str(), target.password.as_str()),
-        (au.main.as_uuid(), "127.0.0.1", 55432, "web1", "cheladb_auth_sync", "sync-pw")
+        (au.main.as_uuid(), "127.0.0.1", 55432, "web1", "chelabase_auth_sync", "sync-pw")
     );
     assert_eq!((target.schema.as_str(), target.table.as_str()), ("public", "users"));
     let row = au.udb.rows.lock().unwrap()[0].clone();
@@ -6866,7 +6866,7 @@ async fn update_email_verified_alone_marks_the_current_address() {
     assert_eq!(body["email_verified"], false);
 }
 
-/// N2: an address two users of the org already share (made outside Cheladb's checks) is taken.
+/// N2: an address two users of the org already share (made outside Chelabase's checks) is taken.
 #[tokio::test]
 async fn update_to_an_ambiguous_email_is_taken() {
     let au = au_env(true).await;
@@ -7013,7 +7013,7 @@ async fn routes_503_without_zitadel() {
 async fn data_api_disable_refused_on_auth_database() {
     let au = au_env(false).await;
     au.metadata.add_branch_db(au.main, "web2", "owner", DatabaseOrigin::Sql);
-    au.metadata.set_data_api(au.main, "web2", cheladb_metadata::DataApiState::On);
+    au.metadata.set_data_api(au.main, "web2", chelabase_metadata::DataApiState::On);
     au.set_auth(AppUsersStatus::Enabled);
     au.metadata.project_auths.lock().unwrap().get_mut(&au.project.id).unwrap().pg_database = "web2".into();
     let base = format!("/v1/databases/{}/branches/{}/pg-databases/web2/data-api", au.db, au.main);
@@ -7024,7 +7024,7 @@ async fn data_api_disable_refused_on_auth_database() {
         assert_eq!(message_of(&body), "app users use this database: disable app users first");
     }
     assert!(au.jobs.data_api_calls.lock().unwrap().is_empty());
-    // Another Postgres database of the same Cheladb database is free to go.
+    // Another Postgres database of the same Chelabase database is free to go.
     au.metadata.add_branch_db(au.main, "web3", "owner", DatabaseOrigin::Sql);
     let resp = send(&au.app, Method::DELETE, &format!("/v1/databases/{}/branches/{}/pg-databases/web3/data-api", au.db, au.main), "org-1", None).await;
     assert_eq!(resp.status(), 204);
@@ -7478,7 +7478,7 @@ async fn run_reserved_role_is_422() {
     let ep = t.metadata.branch(main).endpoint_id.unwrap();
     // Even when listed (a resync might show one), a reserved name is refused.
     t.metadata.add_role(&ep, "cloud_admin", RoleOrigin::Sql, true, false);
-    for role in ["cloud_admin", "neon_superuser", "authenticator", "cheladb_admin", "pg_read_all_data", "PG_monitor"] {
+    for role in ["cloud_admin", "neon_superuser", "authenticator", "chelabase_admin", "pg_read_all_data", "PG_monitor"] {
         let resp = t.run_sql(main, with(run_body("select 1"), "role", json!(role))).await;
         assert_eq!(code_of(&error_of(resp, 422).await), "invalid_request", "{role}");
     }
@@ -7761,7 +7761,7 @@ async fn read_events(mut resp: reqwest::Response) -> Vec<Value> {
 /// Owner sessions of the SQL editor on the scratch compute.
 async fn editor_sessions(scratch: &ScratchCompute) -> i64 {
     let (n,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = 'cheladb-sql-editor'",
+        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = 'chelabase-sql-editor'",
     )
     .bind(&scratch.owner)
     .fetch_one(&scratch.admin)

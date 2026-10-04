@@ -1,7 +1,7 @@
 //! Studio's console: one data API request on a branch, as the database's owner or as a named
 //! role.
 //!
-//! - **The owner** (`role: null`) runs here, through `cheladb-query`, on a small pool per
+//! - **The owner** (`role: null`) runs here, through `chelabase-query`, on a small pool per
 //!   (branch, database) that connects to the compute's published Postgres port with the
 //!   owner password the orchestrator already holds sealed. The pool's key carries a
 //!   fingerprint of the sealed password and the compute's address (P4): a reset, a password
@@ -28,13 +28,13 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{BranchDatabase, BranchKind, BranchStatus, DataApiState, DatabaseOrigin};
-use cheladb_neon::ComputeLocator;
-use cheladb_query::{Op, QueryCache, QueryFailure, RunAs, RunSettings};
-use cheladb_secrets::{Purpose, open_credential};
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::data_api_schema::DataApiSchema;
-use cheladb_types::{ApiPath, BranchId};
+use chelabase_metadata::{BranchDatabase, BranchKind, BranchStatus, DataApiState, DatabaseOrigin};
+use chelabase_neon::ComputeLocator;
+use chelabase_query::{Op, QueryCache, QueryFailure, RunAs, RunSettings};
+use chelabase_secrets::{Purpose, open_credential};
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::data_api_schema::DataApiSchema;
+use chelabase_types::{ApiPath, BranchId};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -59,7 +59,7 @@ const OWNER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a role the worker accepted is remembered.
 pub const ROLE_CHECK_TTL: Duration = Duration::from_secs(300);
 /// The owner's connections, as `pg_stat_activity` shows them.
-pub const APPLICATION_NAME: &str = "cheladb-console";
+pub const APPLICATION_NAME: &str = "chelabase-console";
 /// Seconds a 503 asks the client to wait (the data API's value).
 const RETRY_AFTER_SECS: u32 = 2;
 /// Run on every owner connection handed back to its pool: the next request starts as the
@@ -69,7 +69,7 @@ pub const OWNER_RESET_SQL: &str =
     "SET ROLE NONE; RESET ALL; SELECT pg_advisory_unlock_all(); DISCARD TEMP";
 /// Longest wait for rest's schema of a role.
 const SCHEMA_TIMEOUT: Duration = Duration::from_secs(15);
-/// The owner password isn't known to Cheladb.
+/// The owner password isn't known to Chelabase.
 pub const OWNER_PASSWORD_UNKNOWN: &str = "reset the owner's password to view as owner";
 
 /// A future the [`PostgresAddr`] port returns.
@@ -284,7 +284,7 @@ where
         (status = 200, description = "The data API's answer: the rows, the written rows or count, a call's result, or a batch's results in order", body = serde_json::Value),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON; the data API's `invalid_query` or `invalid_value`: the tree is malformed, the request and its tree name different databases, or Postgres refused a value", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `permission_denied` or `role_not_allowed`", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `permission_denied` or `role_not_allowed`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; the data API's `unknown_table` or `unknown_function`, or `unknown_role` when the role was dropped after the check (a passed check is remembered five minutes)", body = ErrorEnvelope),
         (status = 409, description = "`data_api_disabled`: the Postgres database isn't served by the data API (enable it first); `owner_password_unknown`: the owner's password was set in SQL (reset it to view as owner); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; the data API's `conflict` or `retry`", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit, or the answer is over the data API's response cap", body = ErrorEnvelope),
@@ -351,7 +351,7 @@ where
             data_api_failure(QueryFailure::invalid_query(format!("the tree: {e}")))
         }));
     let parsed = or_answer!(
-        cheladb_query::parse(&tree).map_err(|e| data_api_failure(QueryFailure::from(e)))
+        chelabase_query::parse(&tree).map_err(|e| data_api_failure(QueryFailure::from(e)))
     );
     let name = match (request.database.as_deref(), parsed.database.as_deref()) {
         (Some(a), Some(b)) if a != b => {
@@ -418,19 +418,19 @@ pub(crate) struct OwnerTarget {
 }
 
 /// The owner's address and credentials on `branch`: 409 `owner_password_unknown` when
-/// Cheladb doesn't know the owner password, 409 `branch_not_ready`, 500
+/// Chelabase doesn't know the owner password, 409 `branch_not_ready`, 500
 /// `credentials_unavailable` when the sealed password can't be opened, 503 when the compute
 /// can't be found.
 pub(crate) async fn owner_target<M, J>(
     state: &AppState<M, J>,
-    branch: &cheladb_metadata::BranchRecord,
+    branch: &chelabase_metadata::BranchRecord,
     owner: &str,
 ) -> Result<OwnerTarget, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    // A password set in SQL leaves nothing sealed: Cheladb doesn't know it.
+    // A password set in SQL leaves nothing sealed: Chelabase doesn't know it.
     let Some(sealed) = branch
         .owner_password_enc
         .as_deref()
@@ -457,7 +457,7 @@ where
                 500,
                 ErrorCode::CredentialsUnavailable,
                 "stored credentials can't be decrypted with the current secrets key; \
-                 restore the original CHELADB_SECRETS_KEY file",
+                 restore the original CHELABASE_SECRETS_KEY file",
             ));
         }
     };
@@ -484,7 +484,7 @@ where
 /// The owner pool of `row`'s database on `branch`; errors as [`owner_target`].
 async fn owner_pool_for<M, J>(
     state: &AppState<M, J>,
-    branch: &cheladb_metadata::BranchRecord,
+    branch: &chelabase_metadata::BranchRecord,
     row: &BranchDatabase,
     owner: &str,
 ) -> Result<PgPool, ApiError>
@@ -514,8 +514,8 @@ where
 async fn run_as_owner<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
-    record: &cheladb_metadata::DatabaseRecord,
-    branch: &cheladb_metadata::BranchRecord,
+    record: &chelabase_metadata::DatabaseRecord,
+    branch: &chelabase_metadata::BranchRecord,
     row: &BranchDatabase,
     owner: &str,
     op: &Op,
@@ -539,13 +539,13 @@ where
             .begin()
             .await
             .map_err(|e| QueryFailure::from_sqlx(e, rid))?;
-        let out = cheladb_query::run(
+        let out = chelabase_query::run(
             &mut tx,
             &state.console.cache,
             (branch.id.as_uuid(), &row.name),
             RunAs::Owner,
             &settings,
-            cheladb_query::engine::DEFAULT_MAX_RESPONSE_BYTES,
+            chelabase_query::engine::DEFAULT_MAX_RESPONSE_BYTES,
             op,
             rid,
         )
@@ -589,7 +589,7 @@ pub struct ConsoleSchemaQuery {
         (status = 200, description = "The schemas, tables, functions and enums the owner (or the role) reaches; each table's `privileges` has one entry, for that role", body = DataApiSchema),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `role_not_allowed`", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `role_not_allowed`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; the data API's `unknown_role` when the role was dropped after the check (a passed check is remembered five minutes)", body = ErrorEnvelope),
         (status = 409, description = "`data_api_disabled`: the Postgres database isn't served by the data API; `owner_password_unknown`: the owner's password was set in SQL (reset it to view as owner); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the query string is malformed, `role` is empty, or `role` names the owner (omit it)", body = ErrorEnvelope),
@@ -662,8 +662,8 @@ where
 async fn owner_schema<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
-    record: &cheladb_metadata::DatabaseRecord,
-    branch: &cheladb_metadata::BranchRecord,
+    record: &chelabase_metadata::DatabaseRecord,
+    branch: &chelabase_metadata::BranchRecord,
     row: &BranchDatabase,
     owner: &str,
 ) -> Response
@@ -686,7 +686,7 @@ where
             .begin()
             .await
             .map_err(|e| QueryFailure::from_sqlx(e, rid))?;
-        let (schema, view) = cheladb_query::schema_for(
+        let (schema, view) = chelabase_query::schema_for(
             &mut tx,
             &state.console.cache,
             (branch.id.as_uuid(), &row.name),
@@ -907,7 +907,7 @@ mod tests {
     use super::*;
 
     fn op(tree: Value) -> Op {
-        cheladb_query::parse(tree.to_string().as_bytes())
+        chelabase_query::parse(tree.to_string().as_bytes())
             .unwrap()
             .op
     }

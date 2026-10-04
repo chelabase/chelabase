@@ -6,7 +6,7 @@
 #
 #   neon_tag      first 12 chars of NEON_REF
 #   neon_dev_tag  neon_tag plus -dev: the tag of the dev variant's images
-#                 (cheladb/neon-storage and cheladb/neon-compute-v17 locally)
+#                 (chelabase/neon-storage and chelabase/neon-compute-v17 locally)
 
 neon_ref="$(tr -d '[:space:]' <"$here/NEON_REF")"
 neon_tag="${neon_ref:0:12}"

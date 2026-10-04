@@ -5,15 +5,15 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use cheladb_metadata::{
+use chelabase_metadata::{
     CopyUpsert, ObservedDatabase, ResyncApplied, ResyncWrite, RoleCopy, RoleLevel, RoleOrigin,
     SealedChange,
 };
-use cheladb_neon::ComputeBackend;
-use cheladb_secrets::seal_role_password;
-use cheladb_types::BranchId;
-use cheladb_types::role_name::{quote_ident, quote_literal};
-use cheladb_types::role_password::{PasswordKind, hash_kind};
+use chelabase_neon::ComputeBackend;
+use chelabase_secrets::seal_role_password;
+use chelabase_types::BranchId;
+use chelabase_types::role_name::{quote_ident, quote_literal};
+use chelabase_types::role_password::{PasswordKind, hash_kind};
 use tracing::{error, info, warn};
 
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
@@ -83,7 +83,7 @@ FROM pg_authid a
 WHERE a.oid >= 16384
   AND a.rolname <> $OWNER
   AND a.rolname NOT IN ('cloud_admin', 'neon_superuser', 'anon', 'authenticated',
-                        'authenticator', 'cheladb_admin', 'cheladb_auth_sync')
+                        'authenticator', 'chelabase_admin', 'chelabase_auth_sync')
   AND a.rolname !~ '^pg_'
 UNION ALL
 SELECT 'd',
@@ -442,7 +442,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 let script = fresh.assign(OWNER_ROLE, &mut observed, |name| {
                     let password = credentials::generate_password();
                     (
-                        cheladb_neon::scram::verifier(&password),
+                        chelabase_neon::scram::verifier(&password),
                         seal_role_password(&self.key, &aad, name, &password),
                     )
                 });
@@ -800,14 +800,14 @@ mod tests {
         ));
     }
 
-    /// I1: the app users sync login is Cheladb's, like `authenticator`: the catalog read
+    /// I1: the app users sync login is Chelabase's, like `authenticator`: the catalog read
     /// leaves it out, so it never becomes a `neon_roles` row.
     #[test]
     fn resync_ignores_the_sync_role() {
         let sql = resync_sql("postgres");
         let start = sql.find("AND a.rolname NOT IN (").unwrap();
         let list = &sql[start..start + sql[start..].find(')').unwrap()];
-        for role in ["authenticator", "cheladb_admin", crate::app_users_sql::USERS_SYNC_ROLE] {
+        for role in ["authenticator", "chelabase_admin", crate::app_users_sql::USERS_SYNC_ROLE] {
             assert!(list.contains(&format!("'{role}'")), "{role} in {list}");
         }
     }

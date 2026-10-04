@@ -3,10 +3,10 @@
 
 use std::path::PathBuf;
 
-use cheladb_metadata::{MetadataClient, MetadataConfig};
-use cheladb_neon::{ComputeBackend, NeonId};
-use cheladb_secrets::SecretKey;
-use cheladb_types::DatabaseId;
+use chelabase_metadata::{MetadataClient, MetadataConfig};
+use chelabase_neon::{ComputeBackend, NeonId};
+use chelabase_secrets::SecretKey;
+use chelabase_types::DatabaseId;
 use worker::config::{RealWorker, WorkerConfig, build};
 
 pub fn workspace_root() -> PathBuf {
@@ -15,19 +15,19 @@ pub fn workspace_root() -> PathBuf {
 
 pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
     let mut config =
-        WorkerConfig::from_env().expect("worker config (is CHELADB_COMPUTE_IMAGE set?)");
+        WorkerConfig::from_env().expect("worker config (is CHELABASE_COMPUTE_IMAGE set?)");
     if config.compute_jwt_dir.is_relative() {
         config.compute_jwt_dir = workspace_root().join(&config.compute_jwt_dir);
     }
     let metadata = MetadataClient::connect(&MetadataConfig {
-        database_url: std::env::var("CHELADB_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into()
+        database_url: std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
         }),
     })
     .await
     .expect("metadata database");
     let key =
-        SecretKey::from_env().expect("CHELADB_SECRETS_KEY (source .cheladb/zitadel/demo.env)");
+        SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (source .chelabase/zitadel/demo.env)");
     let worker = build(&config, metadata.clone(), key).expect("worker");
     (worker, metadata, config)
 }

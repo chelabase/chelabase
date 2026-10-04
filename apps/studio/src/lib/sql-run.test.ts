@@ -1,4 +1,4 @@
-import { configureManagementClient } from "@cheladb/management-client";
+import { configureManagementClient } from "@chelabase/management-client";
 import { describe, expect, it } from "vitest";
 import { fakeFetch } from "../test/fake-fetch";
 import { changesSchema, errorOffset, initialRunState, readNdjson, runReducer, startRun, type RunEvent } from "./sql-run";

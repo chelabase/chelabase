@@ -10,10 +10,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseOrigin, EnableStart};
-use cheladb_nats::CheckDataRoleReply;
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::{ApiPath, BranchId};
+use chelabase_metadata::{BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseOrigin, EnableStart};
+use chelabase_nats::CheckDataRoleReply;
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::{ApiPath, BranchId};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
@@ -152,7 +152,7 @@ where
     operation_id = "enableDataApi",
     tag = "data-api",
     summary = "Serve a Postgres database through the data API",
-    description = "Marks the database `enabling` and asks the worker to bootstrap it; the answer is 202 at once. Poll the branch's databases for `data_api`: `on`, or `error` with the reason. Pressing it again retries a failed or stuck enable. A database already `on` answers 200 and nothing runs. The branch serves at most `CHELADB_BRANCH_DATA_API_DATABASE_CAP` databases (default 10, main included).",
+    description = "Marks the database `enabling` and asks the worker to bootstrap it; the answer is 202 at once. Poll the branch's databases for `data_api`: `on`, or `error` with the reason. Pressing it again retries a failed or stuck enable. A database already `on` answers 200 and nothing runs. The branch serves at most `CHELABASE_BRANCH_DATA_API_DATABASE_CAP` databases (default 10, main included).",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -163,7 +163,7 @@ where
         (status = 202, description = "The database is `enabling`", body = BranchDatabaseView),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `conflict`: the branch already serves as many databases as the cap allows", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the cluster's own `postgres` database is never served", body = ErrorEnvelope),
@@ -238,18 +238,18 @@ struct RemoveQuery {
     operation_id = "disableDataApi",
     tag = "data-api",
     summary = "Stop serving a Postgres database",
-    description = "Stops serving the database at once. The `cheladb` schema and the grants stay, so enabling again is instant; `remove=true` also drops the `cheladb` schema and its event trigger (grants to `anon` and `authenticated` stay). Answers 204 after the worker has done it. The branch's main database can't be disabled.",
+    description = "Stops serving the database at once. The `chelabase` schema and the grants stay, so enabling again is instant; `remove=true` also drops the `chelabase` schema and its event trigger (grants to `anon` and `authenticated` stay). Answers 204 after the worker has done it. The branch's main database can't be disabled.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
         ("name" = String, Path, description = "The Postgres database's name"),
-        ("remove" = Option<bool>, Query, description = "Also drop the `cheladb` machinery in the database"),
+        ("remove" = Option<bool>, Query, description = "Also drop the `chelabase` machinery in the database"),
     ),
     responses(
         (status = 204, description = "The database is no longer served"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the query is malformed", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: the main database is always served, app users use the database, `remove=true` on a database the data API was never enabled on, or the worker refused (the message says why); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the cluster's own `postgres` database is never served", body = ErrorEnvelope),
@@ -315,7 +315,7 @@ where
         }
         _ => {}
     }
-    // No enable ever began here: a `cheladb` schema in it isn't the data API's.
+    // No enable ever began here: a `chelabase` schema in it isn't the data API's.
     if remove && row.data_api == DataApiState::Off && !row.data_api_bootstrapped {
         return conflict(
             ErrorCode::Conflict,
@@ -369,7 +369,7 @@ struct UpdatePgDatabaseRequest {
         (status = 200, description = "The database after the change", body = BranchDatabaseView),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `conflict`: the worker refused the bootstrap; `data_api_disabled`: `grant_existing` with an unchanged schema on a database the data API does not serve", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),

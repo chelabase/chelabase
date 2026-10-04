@@ -5,11 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::Context;
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchKind, BranchStatus, DatabaseStatus, EndpointState, LiveBranch, LiveDatabase,
 };
-use cheladb_neon::{ComputeBackend, NeonId, StorconError};
-use cheladb_types::{BranchId, DatabaseId};
+use chelabase_neon::{ComputeBackend, NeonId, StorconError};
+use chelabase_types::{BranchId, DatabaseId};
 use reqwest::StatusCode;
 use tracing::{info, warn};
 
@@ -18,7 +18,7 @@ use crate::{COMPUTE_SETTINGS_VERSION, Worker};
 
 pub const STALE_PROVISION_SECS: i64 = 600;
 pub const STALE_DELETE_SECS: i64 = 60;
-/// How many ready branches each pass checks for the `cheladb` schema (one `admin_sql` each)
+/// How many ready branches each pass checks for the `chelabase` schema (one `admin_sql` each)
 /// and resyncs the login roles of.
 pub const SCHEMA_CHECKS_PER_PASS: usize = 20;
 /// How long a database row may stay `enabling` before reconcile runs its enable bootstrap again
@@ -45,9 +45,9 @@ pub struct Snapshot {
     /// couldn't be read), which counts as drift.
     pub pitr: HashMap<String, Duration>,
     /// Branches whose data API needs its bootstrap: no public key or authenticator password
-    /// (from the metadata), or no `cheladb.schema_version` (from this pass's checks).
+    /// (from the metadata), or no `chelabase.schema_version` (from this pass's checks).
     pub needs_data_api: HashSet<BranchId>,
-    /// `(branch, database)` pairs whose `cheladb` machinery failed this pass's check: only that
+    /// `(branch, database)` pairs whose `chelabase` machinery failed this pass's check: only that
     /// database is bootstrapped (the branch as a whole is in `needs_data_api`).
     pub needs_data_api_databases: HashSet<(BranchId, String)>,
     /// `(branch, database)` rows that have been `enabling` for [`ENABLING_RETRY_SECS`]: their
@@ -79,7 +79,7 @@ pub enum Action {
     /// A reset stored a new password but didn't apply it: reset steps 2–4.
     ApplyPending(String),
     /// A ready `normal` branch with its compute lacks its public key, its authenticator
-    /// password or the `cheladb` schema: run the data API bootstrap.
+    /// password or the `chelabase` schema: run the data API bootstrap.
     /// `database` is `None` for the whole branch (every served database, the keys and the
     /// password), or one database whose machinery is broken.
     BootstrapDataApi {
@@ -334,7 +334,7 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
 }
 
 /// The next `n` of `candidates` (sorted by id) after `after`, wrapping around: reconcile's
-/// `cheladb` schema check covers every ready branch in turn, a few per pass.
+/// `chelabase` schema check covers every ready branch in turn, a few per pass.
 pub fn schema_check_batch(
     candidates: &[BranchId],
     after: Option<BranchId>,
@@ -356,7 +356,7 @@ pub fn schema_check_batch(
 struct RoundRobin {
     /// Branches whose data API machinery is broken.
     missing_data_api: Vec<BranchId>,
-    /// `(branch, database)`: one served database whose `cheladb` machinery is broken.
+    /// `(branch, database)`: one served database whose `chelabase` machinery is broken.
     missing_databases: HashSet<(BranchId, String)>,
     /// Every branch of the batch: its login roles are resynced.
     resync: HashSet<BranchId>,
@@ -613,7 +613,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 self.reconcile_data_api(*branch_id, database.as_deref()).await
             }
             Action::RetryEnableDataApi(branch_id, name) => {
-                let request = cheladb_nats::DataApiDatabaseRequest {
+                let request = chelabase_nats::DataApiDatabaseRequest {
                     branch_id: *branch_id,
                     name: name.clone(),
                     remove: false,
@@ -634,7 +634,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Action::RemoveCompute(ep) if !self.remove_orphans => {
                 info!(
                     endpoint_id = %ep,
-                    "compute has no endpoint row; keeping it (CHELADB_WORKER_REMOVE_ORPHANS is off)"
+                    "compute has no endpoint row; keeping it (CHELABASE_WORKER_REMOVE_ORPHANS is off)"
                 );
                 Ok(())
             }
@@ -748,7 +748,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::BranchKind;
+    use chelabase_metadata::BranchKind;
 
     use super::*;
     use crate::fakes::{
@@ -1447,8 +1447,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_bootstraps_when_cheladb_is_missing() {
-        let check = "to_regclass('cheladb.schema_version')";
+    async fn reconcile_bootstraps_when_chelabase_is_missing() {
+        let check = "to_regclass('chelabase.schema_version')";
         // Present: checked, nothing else.
         let (w, journal) = worker();
         let (_id, ep) = provision(&w, &journal).await;
@@ -1489,7 +1489,7 @@ mod tests {
             crate::roles::RoleOutcome::Ok
         );
         w.computes
-            .answer("to_regclass('cheladb.schema_version')", "t\n");
+            .answer("to_regclass('chelabase.schema_version')", "t\n");
         journal.lock().unwrap().clear();
         w.computes.sql.lock().unwrap().clear();
 
@@ -1538,7 +1538,7 @@ mod tests {
         let (w, journal) = worker();
         let (_id, ep) = provision(&w, &journal).await;
         w.computes
-            .answer("to_regclass('cheladb.schema_version')", "t\n");
+            .answer("to_regclass('chelabase.schema_version')", "t\n");
         w.metadata
             .state()
             .endpoints
@@ -1578,7 +1578,7 @@ mod tests {
         let (w, journal) = worker();
         let (_id, ep) = provision(&w, &journal).await;
         w.computes
-            .answer("to_regclass('cheladb.schema_version')", "t\n");
+            .answer("to_regclass('chelabase.schema_version')", "t\n");
         w.metadata
             .state()
             .endpoints
@@ -2424,10 +2424,10 @@ mod tests {
         let main = BranchId::from(id);
         w.metadata.state().db_rows.get_mut(&main).unwrap().push(crate::fakes::FakeDbRow::new(
             "analytics",
-            cheladb_metadata::DataApiState::Enabling,
+            chelabase_metadata::DataApiState::Enabling,
             "reporting",
         ));
-        w.computes.answer("to_regclass('cheladb.schema_version')", "t\n");
+        w.computes.answer("to_regclass('chelabase.schema_version')", "t\n");
         // The resync in the same passes sees both databases.
         let d = |name: &str| format!("d|{}||{}|f||\n", hex::encode(name), hex::encode("postgres"));
         w.computes.answer("FROM pg_authid", &[d("app"), d("analytics")].concat());
@@ -2436,7 +2436,7 @@ mod tests {
         w.reconcile_once().await.unwrap();
         assert_eq!(
             w.metadata.state().db_rows[&main][1].state,
-            cheladb_metadata::DataApiState::Enabling
+            chelabase_metadata::DataApiState::Enabling
         );
         // Seen over a minute ago: the bootstrap runs there and the row is `on`.
         let old = std::time::Instant::now()
@@ -2444,13 +2444,13 @@ mod tests {
             .unwrap();
         w.enabling_seen.lock().unwrap().insert((main, "analytics".to_string()), old);
         w.reconcile_once().await.unwrap();
-        assert_eq!(w.metadata.state().db_rows[&main][1].state, cheladb_metadata::DataApiState::On);
+        assert_eq!(w.metadata.state().db_rows[&main][1].state, chelabase_metadata::DataApiState::On);
         assert!(position(&journal, &format!("compute.sql {ep} analytics BEGIN;")).is_some());
     }
 
     #[tokio::test]
     async fn reconcile_checks_and_heals_each_served_database() {
-        use cheladb_metadata::DataApiState::{Off, On};
+        use chelabase_metadata::DataApiState::{Off, On};
         let (w, journal) = worker();
         let (id, ep) = provision(&w, &journal).await;
         let main = BranchId::from(id);
@@ -2462,7 +2462,7 @@ mod tests {
                 .unwrap()
                 .push(crate::fakes::FakeDbRow::new(name, state, "reporting"));
         }
-        let check = "to_regclass('cheladb.schema_version')";
+        let check = "to_regclass('chelabase.schema_version')";
         w.computes.answer_in("app", check, "t\n");
         w.computes.answer_in("healthy", check, "t\n");
         w.computes.answer_in("broken", check, "f\n");
@@ -2478,7 +2478,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, _, s)| s.starts_with("BEGIN;\n") || s.contains("CREATE SCHEMA IF NOT EXISTS cheladb"))
+            .filter(|(_, _, s)| s.starts_with("BEGIN;\n") || s.contains("CREATE SCHEMA IF NOT EXISTS chelabase"))
             .map(|(_, d, _)| d.clone())
             .collect();
         assert_eq!(healed, ["broken"], "only the broken database is bootstrapped");
@@ -2497,11 +2497,11 @@ mod tests {
         let (w, journal) = worker();
         let (id, ep) = provision(&w, &journal).await;
         let main = BranchId::from(id);
-        let generated = cheladb_types::data_key::generate(cheladb_types::data_key::DataKeyKind::Secret);
-        w.metadata.state().data_keys.push(cheladb_metadata::NewDataKey {
+        let generated = chelabase_types::data_key::generate(chelabase_types::data_key::DataKeyKind::Secret);
+        w.metadata.state().data_keys.push(chelabase_metadata::NewDataKey {
             id: uuid::Uuid::new_v4(),
             branch_id: main,
-            kind: cheladb_types::data_key::DataKeyKind::Secret,
+            kind: chelabase_types::data_key::DataKeyKind::Secret,
             role: "reporting".to_string(),
             name: "reporting key".to_string(),
             prefix: generated.prefix,
@@ -2510,7 +2510,7 @@ mod tests {
             databases: None,
         });
         w.computes.answer("pg_has_role", "ok\n");
-        w.computes.answer_in("app", "to_regclass('cheladb.schema_version')", "f\n");
+        w.computes.answer_in("app", "to_regclass('chelabase.schema_version')", "f\n");
         w.computes.sql.lock().unwrap().clear();
 
         w.reconcile_once().await.unwrap();

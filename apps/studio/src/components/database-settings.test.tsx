@@ -1,7 +1,7 @@
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { getGetDatabaseQueryKey } from "@cheladb/management-client";
+import { getGetDatabaseQueryKey } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { DatabaseSettings } from "./database-settings";

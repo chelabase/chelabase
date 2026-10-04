@@ -36,7 +36,7 @@ pub fn ensure_file(dir: &Path, file_name: &str) -> Result<PathBuf> {
         .open(&path)
         .with_context(|| format!("create {}", path.display()))?;
     file.write_all(
-        cheladb_secrets::SecretKey::generate()
+        chelabase_secrets::SecretKey::generate()
             .to_base64()
             .as_bytes(),
     )
@@ -48,7 +48,7 @@ pub fn ensure_file(dir: &Path, file_name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_secrets::{open, seal, SecretKey};
+    use chelabase_secrets::{open, seal, SecretKey};
 
     #[test]
     fn creates_a_loadable_key() {
@@ -75,7 +75,7 @@ mod tests {
         let before = std::fs::read(&first).unwrap();
         ensure_file(dir.path(), "cookie.key").unwrap();
         assert_eq!(std::fs::read(&first).unwrap(), before);
-        assert!(cheladb_secrets::SecretKey::from_file(&first).is_ok());
+        assert!(chelabase_secrets::SecretKey::from_file(&first).is_ok());
     }
 
     #[cfg(unix)]

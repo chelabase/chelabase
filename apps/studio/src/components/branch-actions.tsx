@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useDeleteBranch, useResetBranchToParent, useRestoreBranch, useUpdateBranch, type Branch } from "@cheladb/management-client";
+import { useDeleteBranch, useResetBranchToParent, useRestoreBranch, useUpdateBranch, type Branch } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import {
   actionReasons,

@@ -1,7 +1,7 @@
 //! Settings for the internal listener, all with local-dev defaults.
 
 use anyhow::{Context, Result, anyhow};
-use cheladb_neon::ComputeSigner;
+use chelabase_neon::ComputeSigner;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,24 +16,24 @@ pub struct InternalConfig {
     pub storcon_url: String,
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
-    /// `CHELADB_CONTROL_PLANE_URI`: how computes reach this listener; the DDL receiver's URL
+    /// `CHELABASE_CONTROL_PLANE_URI`: how computes reach this listener; the DDL receiver's URL
     /// (`neon.console_url`) is built from it.
     pub control_plane_uri: String,
-    /// `CHELADB_VALKEY_URL`: where the receiver tells the proxies a role's secret changed.
+    /// `CHELABASE_VALKEY_URL`: where the receiver tells the proxies a role's secret changed.
     pub valkey_url: String,
-    /// `CHELADB_APP_AUTH_INTERNAL_TOKEN`: the `auth` service's bearer for the app routes.
+    /// `CHELABASE_APP_AUTH_INTERNAL_TOKEN`: the `auth` service's bearer for the app routes.
     pub app_auth_token: String,
-    /// `CHELADB_APP_SESSIONS_INTERNAL_TOKEN`: the gateway's bearer, good only for a session's
+    /// `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN`: the gateway's bearer, good only for a session's
     /// liveness.
     pub app_sessions_token: String,
-    /// `CHELADB_APP_REFRESH_TTL_SECS`: how long a refresh keeps an app session alive.
+    /// `CHELABASE_APP_REFRESH_TTL_SECS`: how long a refresh keeps an app session alive.
     pub app_refresh_ttl: Duration,
-    /// `CHELADB_ZITADEL_ACTIONS_SIGNING_KEY`: checks the Actions webhook's signature; without
+    /// `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY`: checks the Actions webhook's signature; without
     /// it the webhook answers 503.
     pub actions_signing_key: Option<String>,
-    /// `CHELADB_ZITADEL_ADMIN_PAT_FILE`: the admin PAT that deletes Zitadel sessions.
+    /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT that deletes Zitadel sessions.
     pub zitadel_admin_pat_file: Option<PathBuf>,
-    /// `CHELADB_ZITADEL_ISSUER`: Zitadel's base URL.
+    /// `CHELABASE_ZITADEL_ISSUER`: Zitadel's base URL.
     pub zitadel_issuer: Option<String>,
 }
 
@@ -53,33 +53,33 @@ impl InternalConfig {
                 .unwrap_or_else(|| default.to_string())
         };
         Ok(Self {
-            addr: or("CHELADB_INTERNAL_ADDR", "127.0.0.1:8083")
+            addr: or("CHELABASE_INTERNAL_ADDR", "127.0.0.1:8083")
                 .parse()
-                .context("CHELADB_INTERNAL_ADDR is not a socket address")?,
-            proxy_token: or("CHELADB_PROXY_API_TOKEN", "cheladb-dev-proxy-api"),
-            storcon_token: or("CHELADB_STORCON_HOOK_TOKEN", "cheladb-dev-storcon-hook"),
-            data_keys_token: or("CHELADB_DATA_KEYS_TOKEN", "cheladb-dev-data-keys"),
-            rest_token: or("CHELADB_REST_INTERNAL_TOKEN", "cheladb-dev-rest-internal"),
-            storcon_url: or("CHELADB_STORCON_URL", "http://127.0.0.1:1234"),
-            compute_jwt_dir: PathBuf::from(or("CHELADB_COMPUTE_JWT_DIR", ".cheladb/neon")),
-            compute_network: or("CHELADB_COMPUTE_NETWORK", "cheladb_default"),
+                .context("CHELABASE_INTERNAL_ADDR is not a socket address")?,
+            proxy_token: or("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
+            storcon_token: or("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
+            data_keys_token: or("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
+            rest_token: or("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
+            storcon_url: or("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
+            compute_jwt_dir: PathBuf::from(or("CHELABASE_COMPUTE_JWT_DIR", ".chelabase/neon")),
+            compute_network: or("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
             control_plane_uri: check_control_plane_uri(or(
-                "CHELADB_CONTROL_PLANE_URI",
+                "CHELABASE_CONTROL_PLANE_URI",
                 "http://host.docker.internal:8083",
             ))?,
-            valkey_url: or("CHELADB_VALKEY_URL", "redis://127.0.0.1:6379"),
-            app_auth_token: or("CHELADB_APP_AUTH_INTERNAL_TOKEN", "cheladb-dev-app-auth"),
+            valkey_url: or("CHELABASE_VALKEY_URL", "redis://127.0.0.1:6379"),
+            app_auth_token: or("CHELABASE_APP_AUTH_INTERNAL_TOKEN", "chelabase-dev-app-auth"),
             app_sessions_token: or(
-                "CHELADB_APP_SESSIONS_INTERNAL_TOKEN",
-                "cheladb-dev-app-sessions",
+                "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN",
+                "chelabase-dev-app-sessions",
             ),
-            app_refresh_ttl: refresh_ttl(&or("CHELADB_APP_REFRESH_TTL_SECS", "2592000"))?,
-            actions_signing_key: get("CHELADB_ZITADEL_ACTIONS_SIGNING_KEY")
+            app_refresh_ttl: refresh_ttl(&or("CHELABASE_APP_REFRESH_TTL_SECS", "2592000"))?,
+            actions_signing_key: get("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY")
                 .filter(|v| !v.trim().is_empty()),
-            zitadel_admin_pat_file: get("CHELADB_ZITADEL_ADMIN_PAT_FILE")
+            zitadel_admin_pat_file: get("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),
-            zitadel_issuer: get("CHELADB_ZITADEL_ISSUER")
+            zitadel_issuer: get("CHELABASE_ZITADEL_ISSUER")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
         })
@@ -87,18 +87,18 @@ impl InternalConfig {
 
     /// The Zitadel admin client (P2), or `None` (with a warning) when the PAT file or the
     /// issuer is missing: then Zitadel sessions aren't deleted on revoke.
-    pub fn load_zitadel(&self) -> Option<cheladb_zitadel::client::Zitadel> {
+    pub fn load_zitadel(&self) -> Option<chelabase_zitadel::client::Zitadel> {
         let (Some(file), Some(issuer)) = (&self.zitadel_admin_pat_file, &self.zitadel_issuer)
         else {
             tracing::warn!(
-                "CHELADB_ZITADEL_ADMIN_PAT_FILE or CHELADB_ZITADEL_ISSUER is unset: \
+                "CHELABASE_ZITADEL_ADMIN_PAT_FILE or CHELABASE_ZITADEL_ISSUER is unset: \
                  revoked app sessions keep their Zitadel sessions"
             );
             return None;
         };
         match std::fs::read_to_string(file) {
             Ok(pat) if !pat.trim().is_empty() => {
-                Some(cheladb_zitadel::client::Zitadel::new(issuer, pat.trim()))
+                Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim()))
             }
             Ok(_) => {
                 tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty");
@@ -111,9 +111,9 @@ impl InternalConfig {
         }
     }
 
-    /// The key pair `cheladb dev bootstrap` writes.
+    /// The key pair `chelabase dev bootstrap` writes.
     pub fn load_signer(&self) -> Result<ComputeSigner> {
-        cheladb_neon::jwt::load_signer(&self.compute_jwt_dir)
+        chelabase_neon::jwt::load_signer(&self.compute_jwt_dir)
     }
 }
 
@@ -126,7 +126,7 @@ fn refresh_ttl(value: &str) -> Result<Duration> {
         .filter(|s| (1..=APP_SESSION_CAP.as_secs()).contains(s))
         .ok_or_else(|| {
             anyhow!(
-                "CHELADB_APP_REFRESH_TTL_SECS={value:?}: expected whole seconds from 1 to {}",
+                "CHELABASE_APP_REFRESH_TTL_SECS={value:?}: expected whole seconds from 1 to {}",
                 APP_SESSION_CAP.as_secs()
             )
         })?;
@@ -138,7 +138,7 @@ fn refresh_ttl(value: &str) -> Result<Duration> {
 fn check_control_plane_uri(uri: String) -> Result<String> {
     let bad = |why: &str| {
         anyhow!(
-            "CHELADB_CONTROL_PLANE_URI={uri:?}: {why} (for example http://host.docker.internal:8083)"
+            "CHELABASE_CONTROL_PLANE_URI={uri:?}: {why} (for example http://host.docker.internal:8083)"
         )
     };
     let url = reqwest::Url::parse(&uri).map_err(|e| bad(&format!("not a URL ({e})")))?;
@@ -192,41 +192,41 @@ impl std::fmt::Debug for InternalConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
+    use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
 
     #[test]
     fn defaults_are_for_local_dev() {
         let c = InternalConfig::from_lookup(|_| None).unwrap();
         assert_eq!(c.addr, "127.0.0.1:8083".parse().unwrap());
-        assert_eq!(c.proxy_token, "cheladb-dev-proxy-api");
-        assert_eq!(c.storcon_token, "cheladb-dev-storcon-hook");
-        assert_eq!(c.data_keys_token, "cheladb-dev-data-keys");
-        assert_eq!(c.rest_token, "cheladb-dev-rest-internal");
+        assert_eq!(c.proxy_token, "chelabase-dev-proxy-api");
+        assert_eq!(c.storcon_token, "chelabase-dev-storcon-hook");
+        assert_eq!(c.data_keys_token, "chelabase-dev-data-keys");
+        assert_eq!(c.rest_token, "chelabase-dev-rest-internal");
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
-        assert_eq!(c.compute_jwt_dir, PathBuf::from(".cheladb/neon"));
-        assert_eq!(c.compute_network, "cheladb_default");
+        assert_eq!(c.compute_jwt_dir, PathBuf::from(".chelabase/neon"));
+        assert_eq!(c.compute_network, "chelabase_default");
     }
 
     #[test]
     fn set_values_win_and_blank_ones_do_not() {
         let c = InternalConfig::from_lookup(|name| match name {
-            "CHELADB_INTERNAL_ADDR" => Some("127.0.0.1:9083".into()),
-            "CHELADB_PROXY_API_TOKEN" => Some("  ".into()),
+            "CHELABASE_INTERNAL_ADDR" => Some("127.0.0.1:9083".into()),
+            "CHELABASE_PROXY_API_TOKEN" => Some("  ".into()),
             _ => None,
         })
         .unwrap();
         assert_eq!(c.addr.port(), 9083);
-        assert_eq!(c.proxy_token, "cheladb-dev-proxy-api");
+        assert_eq!(c.proxy_token, "chelabase-dev-proxy-api");
     }
 
     #[test]
     fn a_bad_address_names_the_variable() {
         let err = InternalConfig::from_lookup(|name| {
-            (name == "CHELADB_INTERNAL_ADDR").then(|| "nope".to_string())
+            (name == "CHELABASE_INTERNAL_ADDR").then(|| "nope".to_string())
         })
         .unwrap_err()
         .to_string();
-        assert!(err.contains("CHELADB_INTERNAL_ADDR"), "{err}");
+        assert!(err.contains("CHELABASE_INTERNAL_ADDR"), "{err}");
     }
 
     #[test]
@@ -235,25 +235,25 @@ mod tests {
         assert_eq!(d.control_plane_uri, "http://host.docker.internal:8083");
         assert_eq!(d.valkey_url, "redis://127.0.0.1:6379");
         let c = InternalConfig::from_lookup(|name| match name {
-            "CHELADB_CONTROL_PLANE_URI" => Some("http://172.17.0.1:9083".into()),
-            "CHELADB_VALKEY_URL" => Some("redis://valkey:6379".into()),
+            "CHELABASE_CONTROL_PLANE_URI" => Some("http://172.17.0.1:9083".into()),
+            "CHELABASE_VALKEY_URL" => Some("redis://valkey:6379".into()),
             _ => None,
         })
         .unwrap();
         assert_eq!(c.control_plane_uri, "http://172.17.0.1:9083");
         assert_eq!(c.valkey_url, "redis://valkey:6379");
         let blank = InternalConfig::from_lookup(|name| {
-            (name == "CHELADB_VALKEY_URL").then(|| " ".to_string())
+            (name == "CHELABASE_VALKEY_URL").then(|| " ".to_string())
         })
         .unwrap();
         assert_eq!(blank.valkey_url, "redis://127.0.0.1:6379");
         for bad in ["host.docker.internal:8083", "http://h", "ftp://h:1"] {
             let err = InternalConfig::from_lookup(|name| {
-                (name == "CHELADB_CONTROL_PLANE_URI").then(|| bad.to_string())
+                (name == "CHELABASE_CONTROL_PLANE_URI").then(|| bad.to_string())
             })
             .unwrap_err()
             .to_string();
-            assert!(err.contains("CHELADB_CONTROL_PLANE_URI"), "{bad}: {err}");
+            assert!(err.contains("CHELABASE_CONTROL_PLANE_URI"), "{bad}: {err}");
         }
     }
 
@@ -261,18 +261,18 @@ mod tests {
     fn debug_hides_the_tokens() {
         let c = InternalConfig::from_lookup(|_| None).unwrap();
         let shown = format!("{c:?}");
-        assert!(!shown.contains("cheladb-dev-proxy-api"), "{shown}");
-        assert!(!shown.contains("cheladb-dev-storcon-hook"), "{shown}");
-        assert!(!shown.contains("cheladb-dev-data-keys"), "{shown}");
-        assert!(!shown.contains("cheladb-dev-rest-internal"), "{shown}");
+        assert!(!shown.contains("chelabase-dev-proxy-api"), "{shown}");
+        assert!(!shown.contains("chelabase-dev-storcon-hook"), "{shown}");
+        assert!(!shown.contains("chelabase-dev-data-keys"), "{shown}");
+        assert!(!shown.contains("chelabase-dev-rest-internal"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
     }
 
     #[test]
     fn app_auth_settings_have_dev_defaults() {
         let c = InternalConfig::from_lookup(|_| None).unwrap();
-        assert_eq!(c.app_auth_token, "cheladb-dev-app-auth");
-        assert_eq!(c.app_sessions_token, "cheladb-dev-app-sessions");
+        assert_eq!(c.app_auth_token, "chelabase-dev-app-auth");
+        assert_eq!(c.app_sessions_token, "chelabase-dev-app-sessions");
         assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(2_592_000));
         assert_eq!(c.actions_signing_key, None);
         assert_eq!(c.zitadel_admin_pat_file, None);
@@ -282,12 +282,12 @@ mod tests {
     #[test]
     fn app_auth_settings_are_read() {
         let c = InternalConfig::from_lookup(|name| match name {
-            "CHELADB_APP_AUTH_INTERNAL_TOKEN" => Some("auth-tok".into()),
-            "CHELADB_APP_SESSIONS_INTERNAL_TOKEN" => Some("gw-tok".into()),
-            "CHELADB_APP_REFRESH_TTL_SECS" => Some("3600".into()),
-            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key".into()),
-            "CHELADB_ZITADEL_ADMIN_PAT_FILE" => Some(".cheladb/zitadel/admin.pat".into()),
-            "CHELADB_ZITADEL_ISSUER" => Some("http://127.0.0.1:8080".into()),
+            "CHELABASE_APP_AUTH_INTERNAL_TOKEN" => Some("auth-tok".into()),
+            "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN" => Some("gw-tok".into()),
+            "CHELABASE_APP_REFRESH_TTL_SECS" => Some("3600".into()),
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key".into()),
+            "CHELABASE_ZITADEL_ADMIN_PAT_FILE" => Some(".chelabase/zitadel/admin.pat".into()),
+            "CHELABASE_ZITADEL_ISSUER" => Some("http://127.0.0.1:8080".into()),
             _ => None,
         })
         .unwrap();
@@ -297,11 +297,11 @@ mod tests {
         assert_eq!(c.actions_signing_key.as_deref(), Some("sign-key"));
         assert_eq!(
             c.zitadel_admin_pat_file,
-            Some(PathBuf::from(".cheladb/zitadel/admin.pat"))
+            Some(PathBuf::from(".chelabase/zitadel/admin.pat"))
         );
         assert_eq!(c.zitadel_issuer.as_deref(), Some("http://127.0.0.1:8080"));
         let blank = InternalConfig::from_lookup(|name| {
-            (name == "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY").then(|| "  ".to_string())
+            (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY").then(|| "  ".to_string())
         })
         .unwrap();
         assert_eq!(blank.actions_signing_key, None);
@@ -311,24 +311,24 @@ mod tests {
     fn a_bad_refresh_ttl_names_the_variable() {
         for bad in ["0", "-1", "soon", "7776001"] {
             let err = InternalConfig::from_lookup(|name| {
-                (name == "CHELADB_APP_REFRESH_TTL_SECS").then(|| bad.to_string())
+                (name == "CHELABASE_APP_REFRESH_TTL_SECS").then(|| bad.to_string())
             })
             .unwrap_err()
             .to_string();
-            assert!(err.contains("CHELADB_APP_REFRESH_TTL_SECS"), "{bad}: {err}");
+            assert!(err.contains("CHELABASE_APP_REFRESH_TTL_SECS"), "{bad}: {err}");
         }
     }
 
     #[test]
     fn debug_hides_the_app_auth_secrets() {
         let c = InternalConfig::from_lookup(|name| match name {
-            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key-secret".into()),
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key-secret".into()),
             _ => None,
         })
         .unwrap();
         let shown = format!("{c:?}");
-        assert!(!shown.contains("cheladb-dev-app-auth"), "{shown}");
-        assert!(!shown.contains("cheladb-dev-app-sessions"), "{shown}");
+        assert!(!shown.contains("chelabase-dev-app-auth"), "{shown}");
+        assert!(!shown.contains("chelabase-dev-app-sessions"), "{shown}");
         assert!(!shown.contains("sign-key-secret"), "{shown}");
     }
 
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn keys_from_the_bootstrap_load() {
         let dir = tempfile::tempdir().unwrap();
-        let (pem, x) = cheladb_neon::jwt::generate_keypair();
+        let (pem, x) = chelabase_neon::jwt::generate_keypair();
         std::fs::write(dir.path().join(PRIVATE_KEY_FILE), pem).unwrap();
         std::fs::write(dir.path().join(PUBLIC_KEY_FILE), format!("{x}\n")).unwrap();
         let c = InternalConfig {

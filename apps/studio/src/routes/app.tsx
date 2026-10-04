@@ -1,4 +1,4 @@
-import { configureManagementClient } from "@cheladb/management-client";
+import { configureManagementClient } from "@chelabase/management-client";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Outlet, createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";

@@ -490,7 +490,7 @@ impl<S: ConnSource> Pools<S> {
             .password(&info.password)
             .database(database)
             .ssl_mode(PgSslMode::Prefer)
-            .application_name("cheladb-rest")
+            .application_name("chelabase-rest")
             .statement_cache_capacity(STATEMENT_CACHE);
         let pool = PgPoolOptions::new()
             .max_connections(info.settings.max_connections.max(1))
@@ -913,11 +913,11 @@ mod tests {
     /// Two connections left idle in one, then one taken in the other: the branch never has
     /// more than 2 open.
     #[tokio::test]
-    #[ignore = "needs a Postgres: CHELADB_METADATA_DATABASE_URL or the dev metadata Postgres (just deps-up)"]
+    #[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the dev metadata Postgres (just deps-up)"]
     async fn open_connections_stay_within_the_branch_cap_live() {
         use sqlx::Executor;
-        let url = std::env::var("CHELADB_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into()
+        let url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
         });
         let parsed = reqwest::Url::parse(&url).unwrap();
         let admin = PgPool::connect(&url).await.unwrap();
@@ -958,7 +958,7 @@ mod tests {
         let branch = Uuid::new_v4();
         let open = || async {
             let (n,): (i64,) = sqlx::query_as(
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = ANY($1) AND application_name = 'cheladb-rest'",
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = ANY($1) AND application_name = 'chelabase-rest'",
             )
             .bind(vec![a.clone(), b.clone()])
             .fetch_one(&admin)

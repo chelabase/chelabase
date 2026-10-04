@@ -5,20 +5,20 @@ use anyhow::{Context, Result, bail};
 use std::process::Command;
 use tracing::{info, warn};
 
-/// The metadata database's name: the path of `CHELADB_METADATA_DATABASE_URL` when it has one
-/// (a branch may run on its own metadata database), else `cheladb_metadata`.
+/// The metadata database's name: the path of `CHELABASE_METADATA_DATABASE_URL` when it has one
+/// (a branch may run on its own metadata database), else `chelabase_metadata`.
 fn metadata_db_name(url: Option<&str>) -> String {
     url.and_then(|u| u.trim().split_once("://"))
         .and_then(|(_, rest)| rest.split_once('/'))
         .map(|(_, path)| path.split(['?', '#']).next().unwrap_or("").to_string())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "cheladb_metadata".to_string())
+        .unwrap_or_else(|| "chelabase_metadata".to_string())
 }
 
 pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
     let compose = compose_file();
     let env_file = compose_env();
-    let url = std::env::var("CHELADB_METADATA_DATABASE_URL").ok();
+    let url = std::env::var("CHELABASE_METADATA_DATABASE_URL").ok();
     let database = metadata_db_name(url.as_deref());
 
     let ready = Command::new("docker")
@@ -33,7 +33,7 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
             "metadata-db",
             "pg_isready",
             "-U",
-            "cheladb",
+            "chelabase",
             "-d",
             &database,
         ])
@@ -60,7 +60,7 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
             "metadata-db",
             "psql",
             "-U",
-            "cheladb",
+            "chelabase",
             "-d",
             &database,
             "-tAc",
@@ -90,7 +90,7 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
             "metadata-db",
             "psql",
             "-U",
-            "cheladb",
+            "chelabase",
             "-d",
             &database,
             "-v",
@@ -115,17 +115,17 @@ mod tests {
 
     #[test]
     fn metadata_db_name_follows_the_url() {
-        assert_eq!(metadata_db_name(None), "cheladb_metadata");
-        assert_eq!(metadata_db_name(Some("  ")), "cheladb_metadata");
+        assert_eq!(metadata_db_name(None), "chelabase_metadata");
+        assert_eq!(metadata_db_name(Some("  ")), "chelabase_metadata");
         assert_eq!(
-            metadata_db_name(Some("postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata_6b")),
-            "cheladb_metadata_6b"
+            metadata_db_name(Some("postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata_6b")),
+            "chelabase_metadata_6b"
         );
         assert_eq!(
             metadata_db_name(Some("postgres://u:p@h:5433/other?sslmode=disable")),
             "other"
         );
-        assert_eq!(metadata_db_name(Some("postgres://u:p@h:5433/")), "cheladb_metadata");
-        assert_eq!(metadata_db_name(Some("not a url")), "cheladb_metadata");
+        assert_eq!(metadata_db_name(Some("postgres://u:p@h:5433/")), "chelabase_metadata");
+        assert_eq!(metadata_db_name(Some("not a url")), "chelabase_metadata");
     }
 }

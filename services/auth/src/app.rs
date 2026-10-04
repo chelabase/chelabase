@@ -3,14 +3,14 @@
 use crate::config::Config;
 use crate::cookie::*;
 use crate::guard::{RateLimiter, client_ip, email_tag, pad};
-use cheladb_zitadel::rules::{normalize_email, strong_password};
+use chelabase_zitadel::rules::{normalize_email, strong_password};
 use crate::zitadel::{NewUser, Session, ZError, Zitadel};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::api_extract::ApiJson;
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::api_extract::ApiJson;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;

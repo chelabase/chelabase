@@ -1,10 +1,10 @@
 //! Resolving a branch point (a time, an LSN, or now) to an LSN on a source timeline.
 
-use cheladb_metadata::BranchKind;
-use cheladb_nats::PointInTime;
-use cheladb_neon::storcon::LsnKind;
-use cheladb_neon::{ComputeBackend, Lsn, NeonId};
-use cheladb_types::BranchId;
+use chelabase_metadata::BranchKind;
+use chelabase_nats::PointInTime;
+use chelabase_neon::storcon::LsnKind;
+use chelabase_neon::{ComputeBackend, Lsn, NeonId};
+use chelabase_types::BranchId;
 use chrono::{DateTime, SecondsFormat, Utc};
 use tracing::warn;
 

@@ -1,11 +1,11 @@
 //! The branching story against the real Neon stack: create at a time, reset to parent,
 //! restore, a point outside the history window, and delete everything.
 //!
-//! Same setup as `neon_live` (`just deps-up`, `just dev`, `CHELADB_COMPUTE_IMAGE`):
+//! Same setup as `neon_live` (`just deps-up`, `just dev`, `CHELABASE_COMPUTE_IMAGE`):
 //!
 //! ```text
-//! set -a; . .cheladb/zitadel/demo.env; eval "$(scripts/neon-images.sh)"
-//! CHELADB_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
+//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
+//! CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
 //!   cargo test -p worker --test branch_live -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
@@ -15,13 +15,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchDeleteOutcome, BranchRecord, BranchStatus, DEMO_PROJECT_ID, DEMO_TENANT_ID,
     DatabaseStatus, MetadataClient, NewBranch,
 };
-use cheladb_nats::{BranchJob, PointInTime};
-use cheladb_neon::{ComputeBackend, NeonId, StorconClient, StorconError};
-use cheladb_types::{BranchId, DatabaseId};
+use chelabase_nats::{BranchJob, PointInTime};
+use chelabase_neon::{ComputeBackend, NeonId, StorconClient, StorconError};
+use chelabase_types::{BranchId, DatabaseId};
 use worker::config::{RealWorker, WorkerConfig};
 
 mod common;
@@ -93,7 +93,7 @@ impl Story<'_> {
             })
             .await
             .unwrap();
-        assert_eq!(outcome, cheladb_metadata::CreateBranchOutcome::Created);
+        assert_eq!(outcome, chelabase_metadata::CreateBranchOutcome::Created);
         let started = Instant::now();
         self.worker
             .handle_branch_job(BranchJob::Create { branch_id: id, at })
@@ -129,7 +129,7 @@ impl Story<'_> {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn branching_story() {
     let (worker, metadata, config) = setup().await;
     let worker = Arc::new(worker);
@@ -263,7 +263,7 @@ async fn story(
         metadata
             .update_database_settings(
                 id,
-                &cheladb_metadata::SettingsPatch {
+                &chelabase_metadata::SettingsPatch {
                     history_window: Some(Duration::from_secs(3600)),
                     ..Default::default()
                 },

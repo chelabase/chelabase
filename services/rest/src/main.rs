@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use cheladb_auth::internal::InternalVerifier;
+use chelabase_auth::internal::InternalVerifier;
 use rest::app::{AppState, Config, internal_router, router};
 use rest::conn::InternalSource;
 use rest::exec::Engine;

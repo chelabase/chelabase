@@ -1,4 +1,4 @@
-const KEY = "cheladb.reauth-attempted";
+const KEY = "chelabase.reauth-attempted";
 
 type FlagStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 

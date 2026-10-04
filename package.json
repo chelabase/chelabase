@@ -1,10 +1,10 @@
 {
-  "name": "cheladb",
+  "name": "chelabase",
   "private": true,
   "packageManager": "pnpm@12.6.0",
   "scripts": {
-    "studio:dev": "pnpm --filter @cheladb/studio dev",
-    "studio:build": "pnpm --filter @cheladb/studio build"
+    "studio:dev": "pnpm --filter @chelabase/studio dev",
+    "studio:build": "pnpm --filter @chelabase/studio build"
   },
   "devDependencies": {
     "@scalar/api-reference": "1.72.2"

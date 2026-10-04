@@ -1,4 +1,4 @@
-//! Cheladb HTTP API gateway.
+//! Chelabase HTTP API gateway.
 //!
 //! `proxy` (and `main.rs`) adapt the Pingora engine; every other module is
 //! engine-independent so it can be unit tested and survive an engine swap.

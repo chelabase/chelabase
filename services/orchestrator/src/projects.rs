@@ -10,12 +10,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppUsersStatus, BeginProjectDelete, ProjectRecord, ProjectStatus, RenameProject, valid_project_name,
 };
-use cheladb_nats::{DeleteDatabaseJob, JobEnvelope, ProjectDeleteJob};
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::{ApiJson, ApiPath, ProjectId};
+use chelabase_nats::{DeleteDatabaseJob, JobEnvelope, ProjectDeleteJob};
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::{ApiJson, ApiPath, ProjectId};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use utoipa::ToSchema;
@@ -174,7 +174,7 @@ where
     responses(
         (status = 200, description = "The tenant's projects, oldest first", body = Vec<ProjectInfo>),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -220,7 +220,7 @@ where
         (status = 201, description = "The new project", body = ProjectInfo),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the name is missing or isn't 1 to 64 characters", body = ErrorEnvelope),
@@ -263,7 +263,7 @@ where
         (status = 200, description = "The project", body = ProjectInfo),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -300,7 +300,7 @@ where
         (status = 200, description = "The renamed project", body = ProjectInfo),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -353,7 +353,7 @@ Returns 202 at once; the project shows as `deleting` until the background work i
         (status = 202, description = "Accepted; the project is `deleting`", body = ProjectInfo),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`: already being deleted; `database_not_ready`: a database is still being created; `branch_protected`: a branch is protected; `conflict`: app users are being enabled or disabled", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),

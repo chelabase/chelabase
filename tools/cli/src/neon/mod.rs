@@ -1,4 +1,4 @@
-//! `cheladb neon …`: helpers for the Neon compute path (roadmap step 3).
+//! `chelabase neon …`: helpers for the Neon compute path (roadmap step 3).
 
 pub mod compute_jwt;
 
@@ -18,10 +18,10 @@ pub fn password_from(mut input: impl Read) -> Result<String> {
     Ok(password.to_string())
 }
 
-/// `cheladb neon verifier`: prints the SCRAM verifier for the password on stdin.
+/// `chelabase neon verifier`: prints the SCRAM verifier for the password on stdin.
 pub fn verifier() -> Result<()> {
     let password = password_from(std::io::stdin().lock())?;
-    println!("{}", cheladb_neon::scram::verifier(&password));
+    println!("{}", chelabase_neon::scram::verifier(&password));
     Ok(())
 }
 
@@ -35,20 +35,20 @@ pub fn receivers_line(receivers: u64) -> Result<String> {
     Ok(receivers.to_string())
 }
 
-/// `cheladb neon password-updated`: tells the proxies to drop a role's cached secret.
+/// `chelabase neon password-updated`: tells the proxies to drop a role's cached secret.
 pub async fn password_updated(endpoint: &str, role: &str) -> Result<()> {
     let url =
-        std::env::var("CHELADB_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let receivers = cheladb_neon::proxy_cache::ProxyCache::new(&url)?
+        std::env::var("CHELABASE_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let receivers = chelabase_neon::proxy_cache::ProxyCache::new(&url)?
         .password_updated(endpoint, role)
         .await?;
     println!("{}", receivers_line(receivers)?);
     Ok(())
 }
 
-/// `cheladb neon compute-args`: compute_ctl's arguments, one per line.
+/// `chelabase neon compute-args`: compute_ctl's arguments, one per line.
 pub fn compute_args(endpoint: &str, control_plane_uri: &str) {
-    for arg in cheladb_neon::compute::compute_ctl_args(endpoint, control_plane_uri) {
+    for arg in chelabase_neon::compute::compute_ctl_args(endpoint, control_plane_uri) {
         println!("{arg}");
     }
 }

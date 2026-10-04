@@ -1,7 +1,7 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Cheladb Management API",
+    "title": "Chelabase Management API",
     "license": {
       "name": "Apache-2.0"
     },
@@ -58,7 +58,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `forbidden`: `tenant_id` isn't the caller's tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: `tenant_id` isn't the caller's tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -196,7 +196,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -282,7 +282,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -389,7 +389,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -511,7 +511,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -608,7 +608,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -746,7 +746,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -863,7 +863,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1010,7 +1010,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1137,7 +1137,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `permission_denied` or `role_not_allowed`",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `permission_denied` or `role_not_allowed`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1314,7 +1314,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `role_not_allowed`",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `role_not_allowed`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1461,7 +1461,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1603,7 +1603,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1714,7 +1714,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1820,7 +1820,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1971,7 +1971,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2098,7 +2098,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2226,7 +2226,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2354,7 +2354,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2457,7 +2457,7 @@
           "data-api"
         ],
         "summary": "Serve a Postgres database through the data API",
-        "description": "Marks the database `enabling` and asks the worker to bootstrap it; the answer is 202 at once. Poll the branch's databases for `data_api`: `on`, or `error` with the reason. Pressing it again retries a failed or stuck enable. A database already `on` answers 200 and nothing runs. The branch serves at most `CHELADB_BRANCH_DATA_API_DATABASE_CAP` databases (default 10, main included).",
+        "description": "Marks the database `enabling` and asks the worker to bootstrap it; the answer is 202 at once. Poll the branch's databases for `data_api`: `on`, or `error` with the reason. Pressing it again retries a failed or stuck enable. A database already `on` answers 200 and nothing runs. The branch serves at most `CHELABASE_BRANCH_DATA_API_DATABASE_CAP` databases (default 10, main included).",
         "operationId": "enableDataApi",
         "parameters": [
           {
@@ -2532,7 +2532,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2593,7 +2593,7 @@
           "data-api"
         ],
         "summary": "Stop serving a Postgres database",
-        "description": "Stops serving the database at once. The `cheladb` schema and the grants stay, so enabling again is instant; `remove=true` also drops the `cheladb` schema and its event trigger (grants to `anon` and `authenticated` stay). Answers 204 after the worker has done it. The branch's main database can't be disabled.",
+        "description": "Stops serving the database at once. The `chelabase` schema and the grants stay, so enabling again is instant; `remove=true` also drops the `chelabase` schema and its event trigger (grants to `anon` and `authenticated` stay). Answers 204 after the worker has done it. The branch's main database can't be disabled.",
         "operationId": "disableDataApi",
         "parameters": [
           {
@@ -2628,7 +2628,7 @@
           {
             "name": "remove",
             "in": "query",
-            "description": "Also drop the `cheladb` machinery in the database",
+            "description": "Also drop the `chelabase` machinery in the database",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -2660,7 +2660,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2801,7 +2801,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2929,7 +2929,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3057,7 +3057,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3199,7 +3199,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3316,7 +3316,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3457,7 +3457,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3598,7 +3598,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3747,7 +3747,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `role_refused`: the worker couldn't let the owner use `anon` or `authenticated` (the message says why)",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker couldn't let the owner use `anon` or `authenticated` (the message says why)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3906,7 +3906,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4024,7 +4024,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4163,7 +4163,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4254,7 +4254,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4376,7 +4376,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4473,7 +4473,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4602,7 +4602,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4691,7 +4691,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4798,7 +4798,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4943,7 +4943,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5018,7 +5018,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5126,7 +5126,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5223,7 +5223,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5360,7 +5360,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5488,7 +5488,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5605,7 +5605,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5655,7 +5655,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: a field is missing or invalid, the schema is reserved (`cheladb`, `information_schema`, `pg_*`, Neon's), or `on_delete` isn't `delete` or `mark`",
+            "description": "`invalid_request`: a field is missing or invalid, the schema is reserved (`chelabase`, `information_schema`, `pg_*`, Neon's), or `on_delete` isn't `delete` or `mark`",
             "content": {
               "application/json": {
                 "schema": {
@@ -5742,7 +5742,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5869,7 +5869,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5996,7 +5996,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6144,7 +6144,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6254,7 +6254,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6381,7 +6381,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6530,7 +6530,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6648,7 +6648,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6769,7 +6769,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6878,7 +6878,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7043,7 +7043,7 @@
         "properties": {
           "database_id": {
             "$ref": "#/components/schemas/DatabaseId",
-            "description": "The Cheladb database whose Postgres database holds the users table."
+            "description": "The Chelabase database whose Postgres database holds the users table."
           },
           "email_verification": {
             "type": "boolean"
@@ -7091,7 +7091,7 @@
       },
       "AppUsersTable": {
         "type": "object",
-        "description": "The branch's app users table: where `cheladb.app_users_table` points.",
+        "description": "The branch's app users table: where `chelabase.app_users_table` points.",
         "required": [
           "schema",
           "table"
@@ -7417,7 +7417,7 @@
           },
           "password_state": {
             "$ref": "#/components/schemas/PasswordState",
-            "description": "`generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is\nstored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy\ncan't use; set a new password. `unreadable`: the stored password could not be opened\n(a rename or branch copy dropped it); reset it."
+            "description": "`generated`: made by Chelabase, shown here. `set_in_sql`: set in SQL, only its hash is\nstored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Chelabase's proxy\ncan't use; set a new password. `unreadable`: the stored password could not be opened\n(a rename or branch copy dropped it); reset it."
           },
           "port": {
             "type": "integer",
@@ -8131,7 +8131,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/Tenant",
-                "description": "`None` when the caller's org isn't bound to a Cheladb tenant yet."
+                "description": "`None` when the caller's org isn't bound to a Chelabase tenant yet."
               },
               {
                 "type": "null"
@@ -8331,7 +8331,7 @@
         "properties": {
           "database_id": {
             "$ref": "#/components/schemas/DatabaseId",
-            "description": "The Cheladb database (of this project) that holds the users table."
+            "description": "The Chelabase database (of this project) that holds the users table."
           },
           "email_verification": {
             "type": [

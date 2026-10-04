@@ -1,4 +1,4 @@
-//! SQL editor saved queries: each user's own, per Cheladb database.
+//! SQL editor saved queries: each user's own, per Chelabase database.
 
 use std::sync::Arc;
 
@@ -8,9 +8,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite};
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::{ApiJson, ApiPath};
+use chelabase_metadata::{SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite};
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::{ApiJson, ApiPath};
 use serde::Deserialize;
 use tracing::error;
 use utoipa::ToSchema;
@@ -132,7 +132,7 @@ fn stale(current: SavedQuery) -> ApiError {
         (status = 200, description = "The caller's saved queries", body = Vec<SavedQuerySummary>),
         (status = 400, description = "`invalid_request`: the path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or is another tenant's", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -164,7 +164,7 @@ where
         (status = 201, description = "The saved query", body = SavedQuery),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or is another tenant's", body = ErrorEnvelope),
         (status = 409, description = "`saved_query_name_taken`: the caller has a query with that name (ignoring case); `saved_query_cap`: the caller already keeps 500", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -226,7 +226,7 @@ where
         (status = 200, description = "The saved query", body = SavedQuery),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the saved query doesn't exist, or isn't the caller's", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -266,7 +266,7 @@ where
         (status = 200, description = "The updated saved query", body = SavedQuery),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the saved query doesn't exist, or isn't the caller's", body = ErrorEnvelope),
         (status = 409, description = "`saved_query_conflict`: `version` is stale (the response carries the row as `error.current`); `saved_query_name_taken`: another query of the caller's has that name", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -325,7 +325,7 @@ where
         (status = 204, description = "The saved query is deleted"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the saved query doesn't exist, or isn't the caller's", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),

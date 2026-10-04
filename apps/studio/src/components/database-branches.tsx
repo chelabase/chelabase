@@ -1,4 +1,4 @@
-import { useGetDatabase, useListBranches, type Branch, type DatabaseSettings as Settings, type DatabaseSummary } from "@cheladb/management-client";
+import { useGetDatabase, useListBranches, type Branch, type DatabaseSettings as Settings, type DatabaseSummary } from "@chelabase/management-client";
 import { isTransitional } from "@/lib/branches";
 import { errorText } from "@/lib/errors";
 import { pollWhile } from "@/lib/query";

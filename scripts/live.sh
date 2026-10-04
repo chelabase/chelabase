@@ -3,7 +3,7 @@
 #   live.sh run <cmd...>   wait for our turn, hold the stack, run the command
 #   live.sh status         who holds the stack and who waits
 #   live.sh check          exit 0 if we may use the stack, else print the holder and exit 3
-# State lives in $CHELADB_LIVE_DIR (default: <main checkout>/.cheladb/live):
+# State lives in $CHELABASE_LIVE_DIR (default: <main checkout>/.chelabase/live):
 #   lock (flock), holder (key=value), queue/<epoch-ns>-<pid> (key=value tickets).
 set -u
 
@@ -12,10 +12,10 @@ main_checkout() {
   common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
   dirname "$common"
 }
-if [ -n "${CHELADB_LIVE_DIR:-}" ]; then
-  LIVE_DIR="$CHELADB_LIVE_DIR"
+if [ -n "${CHELABASE_LIVE_DIR:-}" ]; then
+  LIVE_DIR="$CHELABASE_LIVE_DIR"
 else
-  LIVE_DIR="$(main_checkout)/.cheladb/live" || { echo "live.sh: not in a git checkout" >&2; exit 2; }
+  LIVE_DIR="$(main_checkout)/.chelabase/live" || { echo "live.sh: not in a git checkout" >&2; exit 2; }
 fi
 QUEUE="$LIVE_DIR/queue"
 LOCK="$LIVE_DIR/lock"
@@ -77,7 +77,7 @@ cmd_status() {
 }
 
 cmd_check() {
-  [ "${CHELADB_LIVE_HOLDER:-}" = 1 ] && return 0
+  [ "${CHELABASE_LIVE_HOLDER:-}" = 1 ] && return 0
   lock_held || return 0
   if [ -s "$HOLDER" ] && [ "$(field worktree "$HOLDER")" = "$(this_worktree)" ]; then return 0; fi
   echo "The dev stack is $(describe_holder)." >&2
@@ -219,10 +219,10 @@ cmd_run() {
   tty_detect
   local rc=0
   if [ -n "${LIVE_SWAP_DEV:-}" ]; then
-    run_child 0 env -u CHELADB_LIVE_HOLDER bash -c "$LIVE_SWAP_DEV"; rc=$?
+    run_child 0 env -u CHELABASE_LIVE_HOLDER bash -c "$LIVE_SWAP_DEV"; rc=$?
     [ "$rc" -eq 0 ] || { echo "live: LIVE_SWAP_DEV failed ($rc)" >&2; return "$rc"; }
   fi
-  export CHELADB_LIVE_HOLDER=1
+  export CHELABASE_LIVE_HOLDER=1
   run_child 1 "$@"
 }
 

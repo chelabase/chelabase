@@ -1,6 +1,6 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { Branch as BranchSummary } from "@cheladb/management-client";
+import type { Branch as BranchSummary } from "@chelabase/management-client";
 // The actions in each row (DatabaseActions, the branch mutations) need a QueryClient.
 import { renderWithQuery } from "@/test/render";
 import { BranchTree } from "./branch-tree";

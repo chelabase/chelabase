@@ -1,4 +1,4 @@
-import { ApiError } from "@cheladb/management-client";
+import { ApiError } from "@chelabase/management-client";
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { useGetAuthRequest, useSignIn } from "@/lib/login-client/generated/endpoints";
@@ -115,7 +115,7 @@ export function SignInForm({ authRequest = "", go, toVerify, toRegister, notice 
   }
 
   return (
-    <LoginLayout title="Sign in to Cheladb">
+    <LoginLayout title="Sign in to Chelabase">
       {notice && <p role="status" className="text-sm">{notice}</p>}
       <form onSubmit={submit} className="space-y-4">
         <Field label="Email" type="email" value={email} onChange={setEmail} autoComplete="username" />

@@ -1,4 +1,4 @@
-// The type layer: the `Database` shape `cheladb gen types` emits, the runtime type map,
+// The type layer: the `Database` shape `chelabase gen types` emits, the runtime type map,
 // and the typed builder interfaces. No runtime code lives here.
 
 /** A JSON value (`json` and `jsonb` columns). */
@@ -8,7 +8,7 @@ export type Json = string | number | boolean | null | Json[] | { [k: string]: Js
  * An `int8` column, argument or return in a generated `Database`. The client resolves it:
  * `number` by default, `bigint` with `createClient({ bigint: true })`. Never both.
  */
-export type Int8 = { readonly __cheladb: "int8" };
+export type Int8 = { readonly __chelabase: "int8" };
 
 /** The Postgres types whose JSON numbers the client reads from their exact source text. */
 export type PgExact = "int8" | "numeric";
@@ -36,10 +36,10 @@ export interface TypeMap {
   >;
 }
 
-/** The `Database` shape that `cheladb gen types` emits. */
+/** The `Database` shape that `chelabase gen types` emits. */
 export interface DatabaseShape {
   defaultSchema: string;
-  /** Where the project's app users table lives; `cheladb gen types` writes it when app users are enabled. */
+  /** Where the project's app users table lives; `chelabase gen types` writes it when app users are enabled. */
   appUsers?: { schema: string; table: string };
   schemas: Record<
     string,

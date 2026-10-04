@@ -11,8 +11,8 @@ use axum::Router;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use cheladb_routes::orchestrator as routes;
-use cheladb_types::api_error::ApiError;
+use chelabase_routes::orchestrator as routes;
+use chelabase_types::api_error::ApiError;
 
 /// The document, built once.
 static DOCUMENT: LazyLock<String> =
@@ -37,7 +37,7 @@ const PAGE: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cheladb Management API</title>
+<title>Chelabase Management API</title>
 </head>
 <body>
 <div id="app"></div>

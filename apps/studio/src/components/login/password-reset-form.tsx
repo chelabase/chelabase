@@ -35,9 +35,9 @@ export function PasswordResetForm({ userId = "", code = "" }: { userId?: string;
     return (
       <LoginLayout title="Reset your password">
         <p className="text-sm">
-          {confirming ? "Your password is set. Sign in from Cheladb Studio." : "If an account exists for that email, we've sent a reset link."}
+          {confirming ? "Your password is set. Sign in from Chelabase Studio." : "If an account exists for that email, we've sent a reset link."}
         </p>
-        <a href="/" className="text-sm underline">Back to Cheladb Studio</a>
+        <a href="/" className="text-sm underline">Back to Chelabase Studio</a>
       </LoginLayout>
     );
   }

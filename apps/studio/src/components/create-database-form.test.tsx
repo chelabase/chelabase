@@ -1,7 +1,7 @@
 import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getGetDatabaseQueryKey, getGetMeQueryKey, type Database, type DatabaseStatus } from "@cheladb/management-client";
+import { getGetDatabaseQueryKey, getGetMeQueryKey, type Database, type DatabaseStatus } from "@chelabase/management-client";
 import { POLL_MS } from "@/lib/query";
 import { fakeFetch, jsonResponse, sequence, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";

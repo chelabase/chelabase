@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCreateAppUser } from "@cheladb/management-client";
+import { useCreateAppUser } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/dialog";
 import { appUserErrorText } from "@/lib/app-user-errors";

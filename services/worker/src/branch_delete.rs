@@ -1,8 +1,8 @@
 //! Deleting a branch: its backups' and its own timelines, compute and endpoint row.
 
-use cheladb_metadata::{BranchRecord, BranchStatus};
-use cheladb_neon::{ComputeBackend, NeonId};
-use cheladb_types::{BranchId, DatabaseId};
+use chelabase_metadata::{BranchRecord, BranchStatus};
+use chelabase_neon::{ComputeBackend, NeonId};
+use chelabase_types::{BranchId, DatabaseId};
 use tracing::{info, warn};
 
 use crate::Worker;
@@ -156,9 +156,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::{BranchDeleteOutcome, BranchStatus};
-    use cheladb_neon::NeonId;
-    use cheladb_types::DatabaseId;
+    use chelabase_metadata::{BranchDeleteOutcome, BranchStatus};
+    use chelabase_neon::NeonId;
+    use chelabase_types::DatabaseId;
 
     use super::*;
     use crate::fakes::{

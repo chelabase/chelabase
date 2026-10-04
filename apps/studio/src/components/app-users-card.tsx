@@ -12,7 +12,7 @@ import {
   type AppUsersSettings,
   type DatabaseSummary,
   type ProjectInfo,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { appUserErrorText } from "@/lib/app-user-errors";
 import { POLL_MS, pollWhile } from "@/lib/query";
@@ -207,7 +207,7 @@ function EnableForm({
   return (
     <form onSubmit={submit} className="space-y-3">
       <p className="text-sm text-muted-foreground">
-        Give this project sign-in for its own users. Cheladb creates the users table and keeps it in step with the
+        Give this project sign-in for its own users. Chelabase creates the users table and keeps it in step with the
         project's identity provider. RLS is on with own-row policies by default. Sign-up data needs a grant per column:{" "}
         <code>GRANT INSERT (col) ON &lt;table&gt; TO authenticated</code>.
       </p>

@@ -3,14 +3,14 @@
 use crate::dev::requests::*;
 use crate::dev::zitadel::ZitadelApi;
 use anyhow::{Context, Result, bail};
-use cheladb_types::mode::Mode;
+use chelabase_types::mode::Mode;
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::path::Path;
 use tracing::info;
 
-const PROJECT: &str = "cheladb";
-const DEMO_USER: &str = "cheladb-demo";
+const PROJECT: &str = "chelabase";
+const DEMO_USER: &str = "chelabase-demo";
 const MAILPIT: &str = "mailpit:1025";
 const PROJECTS: &str = "zitadel.project.v2.ProjectService";
 const APPS: &str = "zitadel.application.v2.ApplicationService";
@@ -213,9 +213,9 @@ pub async fn ensure_smtp(api: &impl ZitadelApi) -> Result<()> {
     Ok(())
 }
 
-const ACTIONS_TARGET: &str = "cheladb-app-users";
+const ACTIONS_TARGET: &str = "chelabase-app-users";
 const ACTIONS_ENDPOINT: &str = "http://host.docker.internal:8083/internal/zitadel/events";
-const ACTIONS_KEY_VAR: &str = "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY";
+const ACTIONS_KEY_VAR: &str = "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY";
 
 /// The Actions target that posts user events to auth's internal listener, and the execution
 /// that routes the `user` event group to it. Zitadel shows a target's signing key only when it
@@ -275,7 +275,7 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::dev::requests::studio_app_config;
-    use cheladb_types::mode::Mode;
+    use chelabase_types::mode::Mode;
     use reqwest::Method;
     use serde_json::{Value, json};
     use std::collections::HashMap;
@@ -348,7 +348,7 @@ mod tests {
     fn studio(id: &str, mode: Mode) -> Value {
         let mut config = studio_app_config(mode);
         config["clientId"] = json!("c-spa");
-        json!({"applicationId": id, "name": "cheladb-studio", "oidcConfiguration": config})
+        json!({"applicationId": id, "name": "chelabase-studio", "oidcConfiguration": config})
     }
 
     fn existing() -> Fake {
@@ -356,8 +356,8 @@ mod tests {
             .with("POST /v2/organizations/_search", json!({"result": [{"id": "o1"}]}))
             .with("ProjectService/ListProjects", json!({"projects": [{"projectId": "p1"}]}))
             .with("ApplicationService/ListApplications", json!({"applications": [
-                {"applicationId": "a1", "name": "cheladb-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
-                {"applicationId": "a2", "name": "cheladb-studio", "oidcConfiguration": {
+                {"applicationId": "a1", "name": "chelabase-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
+                {"applicationId": "a2", "name": "chelabase-studio", "oidcConfiguration": {
                     "clientId": "c-spa", "redirectUris": studio_app_config(Mode::SelfHosted)["redirectUris"],
                     "postLogoutRedirectUris": studio_app_config(Mode::SelfHosted)["postLogoutRedirectUris"],
                     "accessTokenType": "OIDC_TOKEN_TYPE_JWT", "developmentMode": true,
@@ -433,7 +433,7 @@ mod tests {
     async fn a_drifted_studio_app_is_updated_in_place() {
         let fake = existing()
             .with("ApplicationService/ListApplications", json!({"applications": [
-                {"applicationId": "a2", "name": "cheladb-studio", "oidcConfiguration": {"clientId": "c-spa", "redirectUris": ["http://old/callback"]}}]}))
+                {"applicationId": "a2", "name": "chelabase-studio", "oidcConfiguration": {"clientId": "c-spa", "redirectUris": ["http://old/callback"]}}]}))
             .with("ApplicationService/UpdateApplication", json!({}));
         assert_eq!(
             ensure_studio_app(&fake, "p1", Mode::SelfHosted)
@@ -452,14 +452,14 @@ mod tests {
     async fn a_named_app_without_a_client_id_is_an_error_not_a_duplicate() {
         let fake = Fake::default().with(
             "ApplicationService/ListApplications",
-            json!({"applications": [{"applicationId": "a2", "name": "cheladb-studio"}]}),
+            json!({"applications": [{"applicationId": "a2", "name": "chelabase-studio"}]}),
         );
         let err = ensure_studio_app(&fake, "p1", Mode::SelfHosted)
             .await
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("cheladb-studio") && err.contains("a2"),
+            err.contains("chelabase-studio") && err.contains("a2"),
             "{err}"
         );
         assert!(
@@ -557,7 +557,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("cheladb-studio") && err.contains("v1 login"),
+            err.contains("chelabase-studio") && err.contains("v1 login"),
             "{err}"
         );
         assert!(
@@ -611,7 +611,7 @@ mod tests {
     const EXECUTIONS: &str = "PUT /v2/actions/executions";
 
     fn target_listing(ids: &[&str]) -> Value {
-        json!({"targets": ids.iter().map(|id| json!({"id": id, "name": "cheladb-app-users"})).collect::<Vec<_>>()})
+        json!({"targets": ids.iter().map(|id| json!({"id": id, "name": "chelabase-app-users"})).collect::<Vec<_>>()})
     }
 
     fn actions_fake(existing: &[&str]) -> Fake {
@@ -636,7 +636,7 @@ mod tests {
             vec![TARGETS_SEARCH, TARGETS_CREATE, EXECUTIONS]
         );
         let body = &fake.bodies(TARGETS_CREATE)[0];
-        assert_eq!(body["name"], "cheladb-app-users");
+        assert_eq!(body["name"], "chelabase-app-users");
         assert_eq!(body["restAsync"], json!({}));
         assert_eq!(
             body["endpoint"],
@@ -649,7 +649,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
         );
         #[cfg(unix)]
         {
@@ -663,7 +663,7 @@ mod tests {
     async fn actions_target_reused_when_key_file_exists() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("actions.env");
-        std::fs::write(&file, "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=old\n").unwrap();
+        std::fs::write(&file, "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n").unwrap();
         let fake = actions_fake(&["t-old"]);
         ensure_actions_target(&fake, &file).await.unwrap();
         // Kept: no delete, no create; the execution is still PUT (idempotent) with the old id.
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-old"]));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=old\n"
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n"
         );
     }
 
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-new"]));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            "CHELADB_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
         );
     }
 }

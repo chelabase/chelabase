@@ -1,6 +1,6 @@
 //! Where each service lives (`host:port`, plain HTTP).
 
-use cheladb_routes::Service;
+use chelabase_routes::Service;
 
 const DEFAULT_REST: &str = "127.0.0.1:8085";
 

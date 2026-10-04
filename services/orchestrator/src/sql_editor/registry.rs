@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cheladb_types::BranchId;
+use chelabase_types::BranchId;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -111,7 +111,7 @@ impl Drop for RunGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_types::BranchId;
+    use chelabase_types::BranchId;
     use uuid::Uuid;
 
     #[test]

@@ -1,0 +1,9 @@
+language: "rust"
+
+tasks:
+  check:
+    command: "cargo"
+    args: ["check", "-p", "chelabase-auth"]
+  build:
+    command: "cargo"
+    args: ["build", "-p", "chelabase-auth"]

@@ -1,9 +1,9 @@
 # Neon images
 
-Cheladb runs Neon's storage stack (pageserver, safekeepers, storage broker, storage
+Chelabase runs Neon's storage stack (pageserver, safekeepers, storage broker, storage
 controller, proxy) and a compute image. Both come from our hard fork,
 [chelabase/neon](https://github.com/chelabase/neon), at the commit in `NEON_REF`
-(`8ae1b8f227e974a4c5e15dd0831925291aed2438`). Design: `docs/superpowers/specs/` and
+(`956332507a7be94a00db47f0813412e1fa6d5b0d`). Design: `docs/superpowers/specs/` and
 `docs/superpowers/plans/2026-10-01-neon-fork.md`.
 
 ## Pull (default)
@@ -19,7 +19,7 @@ upstream Neon; they stay for old pins and are no longer used.
 ## Build from source
 
 `just neon-build` shallow-clones the fork at `NEON_REF` into `infra/neon/.cache/` and builds
-`cheladb/neon-storage:<tag>` and `cheladb/neon-compute-v17:<tag>`; `<tag>` is the first 12
+`chelabase/neon-storage:<tag>` and `chelabase/neon-compute-v17:<tag>`; `<tag>` is the first 12
 chars of `NEON_REF`, plus `-dev` for the dev variant. The first build needs about 40 GB of
 free disk and about 40 minutes. When those local images exist, `just deps-up` uses them
 instead of pulling. Reclaim the build cache afterwards with
@@ -51,12 +51,14 @@ landed in chelabase/neon-pre-replay#25 (https://github.com/chelabase/neon-pre-re
 
 ## Bump `NEON_REF`
 
-> **Tag names after the 2026-10-04 history replay:** images published before that date carry pre-replay fork SHAs in their tags (e.g. `39b641053212-dev`), and those tags are kept as they are. The current `8ae1b8f227e9-dev` images are re-tags of the `2d2a6acd7be2-dev` builds (same digests), so their binaries may still report the old `GIT_VERSION`. The next real bump publishes images built from a post-replay commit.
+> **Tag names after the 2026-10-04 history replay:** images published before that date carry pre-replay fork SHAs in their tags (e.g. `39b641053212-dev`), and those tags are kept as they are. The earlier `8ae1b8f227e9-dev` images are re-tags of the `2d2a6acd7be2-dev` builds (same digests), so their binaries may still report the old `GIT_VERSION`. The next real bump publishes images built from a post-replay commit.
+>
+> The `956332507a7b-dev` tags are re-tags of the same digests (made with `docker buildx imagetools create --prefer-index=false`).
 
 1. Merge the change in `chelabase/neon` (`main`).
 2. In a fork checkout, run `.github/scripts/publish-dev.sh`. It builds the dev images, pushes
    them to GHCR and prints the digests. (Publishing is by hand: pushes to `main` publish
-   nothing, and cheladb-v1 has no copy of the script.)
+   nothing, and chelabase has no copy of the script.)
 3. Put the full commit sha in `infra/neon/NEON_REF`, and paste the new tags and digests into
    `infra/compose/docker-compose.yml` (both images).
 4. `just neon-test` (it checks the ref exists on the fork and that both pins carry
@@ -65,14 +67,14 @@ landed in chelabase/neon-pre-replay#25 (https://github.com/chelabase/neon-pre-re
    through the queue (`just live just neon-e2e`, and likewise `branch-e2e`, `data-e2e`,
    `console-e2e`, `role-e2e`, `auth-e2e` and `storage-leak-e2e`).
 
-The compute image runs Postgres 17.11 (the fork's `REL_17_STABLE_cheladb`).
+The compute image runs Postgres 17.11 (the fork's `REL_17_STABLE_chelabase`).
 
 ## Minors and upstream
 
 Upstream Neon releases and the Postgres minors flow into the fork through its minor watcher
 and the process in
 [`FORK.md`](https://github.com/chelabase/neon/blob/main/FORK.md). The fork carries our
-patches; cheladb-v1 only moves `NEON_REF` forward as above.
+patches; chelabase only moves `NEON_REF` forward as above.
 
 ## Recipes
 

@@ -41,11 +41,11 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p cheladb || die "cargo build -p cheladb"
-[[ -f .cheladb/zitadel/demo.env ]] || die ".cheladb/zitadel/demo.env is missing (run just dev)"
+cargo build -q -p chelabase || die "cargo build -p chelabase"
+[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
 set -a
 # shellcheck disable=SC1091
-source .cheladb/zitadel/demo.env
+source .chelabase/zitadel/demo.env
 set +a
 trap cleanup EXIT
 
@@ -74,7 +74,7 @@ wait_db() {
 # the status is printed. The token goes through stdin (-H @-), never argv.
 stream() {
   local out="$1" max="$2" body="$3" token
-  token="$(cargo run -q -p cheladb -- dev token)" || die "cheladb dev token"
+  token="$(cargo run -q -p chelabase -- dev token)" || die "chelabase dev token"
   printf 'Authorization: Bearer %s\n' "$token" |
     curl -sSN --max-time "$max" -o "$out" -w '%{http_code}' -H @- -H 'content-type: application/json' \
       -X POST -d "$body" "$GATEWAY$branch/sql" || true

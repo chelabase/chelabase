@@ -1,4 +1,4 @@
-# Cheladb local lifecycle — https://github.com/casey/just
+# Chelabase local lifecycle — https://github.com/casey/just
 # Run `just` to list recipes.
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
@@ -6,9 +6,9 @@ set dotenv-load := false
 
 compose_file := "infra/compose/docker-compose.yml"
 compose_env := "infra/compose/.env.example"
-dev_dir := ".cheladb/dev"
+dev_dir := ".chelabase/dev"
 
-# Seed IDs from crates/cheladb-metadata migrations (demo / default).
+# Seed IDs from crates/chelabase-metadata migrations (demo / default).
 demo_tenant_id := "00000000-0000-4000-8000-000000000001"
 demo_project_id := "00000000-0000-4000-8000-000000000002"
 
@@ -25,15 +25,15 @@ default:
 # recipes below that touch the stack refuse while another worktree holds it.
 
 # Refuse when another worktree holds the stack (it prints the holder); skipped inside just live.
-# With the lock free but `just dev` running from another worktree (.cheladb/dev/worktree), a plain
+# With the lock free but `just dev` running from another worktree (.chelabase/dev/worktree), a plain
 # recipe would hit that worktree's apps: warn on stderr (not an error). `just live` moves dev first.
-# CHELADB_LIVE_SCRIPT replaces scripts/live.sh (tests only).
+# CHELABASE_LIVE_SCRIPT replaces scripts/live.sh (tests only).
 [private]
 _live-check:
     #!/usr/bin/env bash
     set -uo pipefail
-    [[ -z "${CHELADB_LIVE_HOLDER:-}" ]] || exit 0
-    "${CHELADB_LIVE_SCRIPT:-scripts/live.sh}" check || { status=$?; echo "wait in line instead: just live <recipe>" >&2; exit "$status"; }
+    [[ -z "${CHELABASE_LIVE_HOLDER:-}" ]] || exit 0
+    "${CHELABASE_LIVE_SCRIPT:-scripts/live.sh}" check || { status=$?; echo "wait in line instead: just live <recipe>" >&2; exit "$status"; }
     owner="$(cat "{{dev_dir}}/worktree" 2>/dev/null || true)"
     if [[ -n "$owner" && "$owner" != "{{justfile_directory()}}" ]]; then
       echo "warning: just dev runs from $owner, not this worktree: this recipe tests that worktree's apps. Run it as: just live <recipe>" >&2
@@ -56,18 +56,22 @@ live *args:
       set -- "{{just_executable()}}" "$@"
     fi
     export LIVE_SWAP_DEV='"{{just_executable()}}" --justfile "{{justfile()}}" --working-directory "{{justfile_directory()}}" _live-swap-dev'
-    exec "${CHELADB_LIVE_SCRIPT:-scripts/live.sh}" run "$@"
+    exec "${CHELABASE_LIVE_SCRIPT:-scripts/live.sh}" run "$@"
 
 # Who holds the stack, and who waits for it (and for how long)
 live-status:
-    "${CHELADB_LIVE_SCRIPT:-scripts/live.sh}" status
+    "${CHELABASE_LIVE_SCRIPT:-scripts/live.sh}" status
 
 # Offline checks for the live queue (scripts/live.sh)
 live-test:
     scripts/tests/live.sh
 
+# Offline tests for the old-name -> Chelabase rename script (scripts/rename-chelabase.sh)
+rename-test:
+    scripts/tests/rename-chelabase.sh
+
 # The dev swap `just live` runs while holding the stack: when `just dev` runs from another
-# worktree (.cheladb/dev/worktree), stop it (the pids file is shared) and start it here, then
+# worktree (.chelabase/dev/worktree), stop it (the pids file is shared) and start it here, then
 # wait for the gateway. Nothing to do when it runs here, or not at all.
 [private]
 _live-swap-dev:
@@ -87,7 +91,7 @@ _live-swap-dev:
       echo "[live] just dev runs from ${owner:-another worktree}: moving it to $here"
     fi
     "{{just_executable()}}" dev-down
-    CHELADB_LIVE_HOLDER=1 "{{just_executable()}}" dev
+    CHELABASE_LIVE_HOLDER=1 "{{just_executable()}}" dev
     wait_for() { # wait_for <name> <url> <log>: up to 3 min
       for _ in $(seq 180); do
         if curl -fsS -o /dev/null "$2" 2>/dev/null; then return 0; fi
@@ -111,8 +115,8 @@ stack-reset-slots *args: _live-check
 deps-up: _live-check
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p .cheladb/zitadel
-    chmod 777 .cheladb/zitadel 2>/dev/null || true
+    mkdir -p .chelabase/zitadel
+    chmod 777 .chelabase/zitadel 2>/dev/null || true
     images="$(scripts/neon-images.sh)"
     # shellcheck disable=SC2086
     export $images
@@ -131,13 +135,13 @@ deps-up: _live-check
     done
     # The proxy's CA, for clients that verify its certificate.
     # `compose cp` writes progress to stderr: show it only if the copy fails.
-    mkdir -p .cheladb/neon
-    cp_err="$("${compose[@]}" cp proxy:/tls/ca.crt .cheladb/neon/proxy-ca.crt 2>&1 >/dev/null)" ||
+    mkdir -p .chelabase/neon
+    cp_err="$("${compose[@]}" cp proxy:/tls/ca.crt .chelabase/neon/proxy-ca.crt 2>&1 >/dev/null)" ||
       { echo "copying the proxy's CA certificate failed: $cp_err" >&2; exit 1; }
 
 # Stop control-plane infrastructure containers, the Neon storage stack and any compute containers
 deps-down: _live-check
-    docker ps -aq --filter name=^cheladb-compute- | xargs -r docker rm -f
+    docker ps -aq --filter name=^chelabase-compute- | xargs -r docker rm -f
     docker compose -f {{compose_file}} --env-file {{compose_env}} down
 
 # Show Compose service status
@@ -152,7 +156,7 @@ down: deps-down
 
 # Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind)
 zitadel-bootstrap: _live-check
-    cargo run -q -p cheladb -- dev bootstrap
+    cargo run -q -p chelabase -- dev bootstrap
 
 # Wipe Zitadel volume only so FirstInstance rewrites admin.pat
 zitadel-reset: _live-check
@@ -160,23 +164,23 @@ zitadel-reset: _live-check
 
 # Mint a short-lived demo access token (stdout)
 auth-token:
-    @cargo run -q -p cheladb -- dev token
+    @cargo run -q -p chelabase -- dev token
 
 # --- Individual processes (foreground) ---
 
 orchestrator:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -f .cheladb/zitadel/demo.env ]]; then
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/demo.env
+      source .chelabase/zitadel/demo.env
       set +a
     fi
-    if [[ -f .cheladb/zitadel/actions.env ]]; then
+    if [[ -f .chelabase/zitadel/actions.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/actions.env
+      source .chelabase/zitadel/actions.env
       set +a
     fi
     cargo run -p orchestrator
@@ -184,23 +188,23 @@ orchestrator:
 worker:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -f .cheladb/zitadel/demo.env ]]; then
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/demo.env
+      source .chelabase/zitadel/demo.env
       set +a
     fi
     eval "$(scripts/neon-images.sh)"
-    export CHELADB_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
+    export CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
     cargo run -p worker
 
 gateway:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -f .cheladb/zitadel/demo.env ]]; then
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/demo.env
+      source .chelabase/zitadel/demo.env
       set +a
     fi
     cargo run -p gateway
@@ -208,10 +212,10 @@ gateway:
 rest:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -f .cheladb/zitadel/demo.env ]]; then
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/demo.env
+      source .chelabase/zitadel/demo.env
       set +a
     fi
     cargo run -p rest
@@ -219,16 +223,16 @@ rest:
 auth:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -f .cheladb/zitadel/demo.env ]]; then
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/demo.env
+      source .chelabase/zitadel/demo.env
       set +a
     fi
     cargo run -p auth
 
 studio:
-    pnpm --filter @cheladb/studio dev
+    pnpm --filter @chelabase/studio dev
 
 # --- Detached full stack ---
 
@@ -241,74 +245,74 @@ dev: _live-check deps-up
       echo "dev already running from $(cat "{{dev_dir}}/worktree" 2>/dev/null || echo 'an unknown worktree') ({{dev_dir}}/pids exists). Run: just dev-down"
       exit 1
     fi
-    # Which worktree runs the apps (the dev dir is shared through the .cheladb symlink): just live
+    # Which worktree runs the apps (the dev dir is shared through the .chelabase symlink): just live
     # moves them when another worktree takes the stack.
     echo "{{justfile_directory()}}" >"{{dev_dir}}/worktree"
 
     echo "waiting for metadata postgres…"
     for i in $(seq 1 30); do
-      if docker compose -f "{{compose_file}}" exec -T metadata-db pg_isready -U cheladb -d cheladb_metadata >/dev/null 2>&1; then
+      if docker compose -f "{{compose_file}}" exec -T metadata-db pg_isready -U chelabase -d chelabase_metadata >/dev/null 2>&1; then
         break
       fi
       sleep 1
     done
 
-    # A metadata database other than cheladb_metadata (CHELADB_METADATA_DATABASE_URL) is created
+    # A metadata database other than chelabase_metadata (CHELABASE_METADATA_DATABASE_URL) is created
     # when missing; the orchestrator migrates it below.
-    metadata_db="${CHELADB_METADATA_DATABASE_URL:-}"
+    metadata_db="${CHELABASE_METADATA_DATABASE_URL:-}"
     metadata_db="${metadata_db##*/}"
     metadata_db="${metadata_db%%\?*}"
-    if [[ -n "$metadata_db" && "$metadata_db" != cheladb_metadata ]]; then
-      psql_meta=(docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db psql -U cheladb -d cheladb_metadata -qtA)
+    if [[ -n "$metadata_db" && "$metadata_db" != chelabase_metadata ]]; then
+      psql_meta=(docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db psql -U chelabase -d chelabase_metadata -qtA)
       if [[ "$("${psql_meta[@]}" -c "SELECT 1 FROM pg_database WHERE datname = '$metadata_db'")" != 1 ]]; then
         echo "creating metadata database $metadata_db"
-        "${psql_meta[@]}" -c "CREATE DATABASE \"$metadata_db\" OWNER cheladb"
+        "${psql_meta[@]}" -c "CREATE DATABASE \"$metadata_db\" OWNER chelabase"
       fi
     fi
 
     echo "bootstrapping Zitadel IAM…"
-    if ! cargo run -q -p cheladb -- dev bootstrap; then
+    if ! cargo run -q -p chelabase -- dev bootstrap; then
       echo ""
       echo "Zitadel bootstrap failed (often missing admin.pat on an old volume)."
       echo "Run: just zitadel-reset && just zitadel-bootstrap"
       exit 1
     fi
 
-    export CHELADB_METADATA_DATABASE_URL="${CHELADB_METADATA_DATABASE_URL:-postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata}"
-    export CHELADB_NATS_URL="${CHELADB_NATS_URL:-nats://127.0.0.1:4222}"
-    if [[ -f .cheladb/zitadel/demo.env ]]; then
+    export CHELABASE_METADATA_DATABASE_URL="${CHELABASE_METADATA_DATABASE_URL:-postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata}"
+    export CHELABASE_NATS_URL="${CHELABASE_NATS_URL:-nats://127.0.0.1:4222}"
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/demo.env
+      source .chelabase/zitadel/demo.env
       set +a
     fi
-    if [[ -f .cheladb/zitadel/actions.env ]]; then
+    if [[ -f .chelabase/zitadel/actions.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/actions.env
+      source .chelabase/zitadel/actions.env
       set +a
     fi
 
     # The worker starts computes from this image (a local neon-build if present).
     eval "$(scripts/neon-images.sh)"
-    export CHELADB_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
+    export CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
 
-    cargo build -p orchestrator -p worker -p gateway -p rest -p auth -p cheladb
+    cargo build -p orchestrator -p worker -p gateway -p rest -p auth -p chelabase
 
     # Start orchestrator first so migrations add tenants.zitadel_org_id, then re-bind.
     nohup setsid cargo run -p orchestrator >"{{dev_dir}}/orchestrator.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     sleep 3
-    cargo run -q -p cheladb -- dev bootstrap >/dev/null || true
+    cargo run -q -p chelabase -- dev bootstrap >/dev/null || true
 
     nohup setsid cargo run -p worker >"{{dev_dir}}/worker.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid cargo run -p gateway >"{{dev_dir}}/gateway.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid cargo run -p rest >"{{dev_dir}}/rest.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
     nohup setsid cargo run -p auth >"{{dev_dir}}/auth.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
-    nohup setsid pnpm --filter @cheladb/studio dev >"{{dev_dir}}/studio.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
+    nohup setsid pnpm --filter @chelabase/studio dev >"{{dev_dir}}/studio.log" 2>&1 & echo $! >>"{{dev_dir}}/pids"
 
     sleep 2
     echo ""
-    echo "=== Cheladb dev stack (detached) ==="
+    echo "=== Chelabase dev stack (detached) ==="
     echo "Seed tenant_id:  {{demo_tenant_id}}"
     echo "Seed project_id: {{demo_project_id}}"
     echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
@@ -320,7 +324,7 @@ dev: _live-check deps-up
     echo "Studio:          http://localhost:3000  (sign in / create account)"
     echo "Mailpit (email): http://localhost:8025  (signup verification codes)"
     echo "Zitadel console: http://localhost:8080/ui/console"
-    echo "Demo IAM:        .cheladb/zitadel/ (cargo run -p cheladb -- dev token)"
+    echo "Demo IAM:        .chelabase/zitadel/ (cargo run -p chelabase -- dev token)"
     echo "Logs:            {{dev_dir}}/*.log"
     echo ""
     echo "Create a DB:"
@@ -385,7 +389,7 @@ _cleanup:
     "$just" sweep-dbs
     "$just" zitadel-reset
     curl -fsS -X DELETE http://localhost:8025/api/v1/messages >/dev/null && echo "emptied Mailpit"
-    for _ in $(seq 60); do [[ -s .cheladb/zitadel/login-client.pat ]] && break; sleep 1; done
+    for _ in $(seq 60); do [[ -s .chelabase/zitadel/login-client.pat ]] && break; sleep 1; done
     "$just" zitadel-bootstrap
     echo ""
     echo "Sweeping old build artifacts..."
@@ -399,38 +403,38 @@ _cleanup:
 create-db-demo name="demo1":
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -f .cheladb/zitadel/demo.env ]]; then
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
-      source .cheladb/zitadel/demo.env
+      source .chelabase/zitadel/demo.env
       set +a
     fi
-    TOKEN="$(cargo run -q -p cheladb -- dev token)"
+    TOKEN="$(cargo run -q -p chelabase -- dev token)"
     curl -sS -X POST "http://127.0.0.1:8000/v1/databases" \
       -H "content-type: application/json" \
       -H "Authorization: Bearer ${TOKEN}" \
       -d "{\"tenant_id\":\"{{demo_tenant_id}}\",\"project_id\":\"{{demo_project_id}}\",\"name\":\"{{name}}\"}"
     echo
 
-# Remove worker-provisioned containers (label cheladb.managed=true) and Neon computes (label
-# cheladb.dev/endpoint-id), delete their storage-controller tenants, and clear the `databases`,
+# Remove worker-provisioned containers (label chelabase.managed=true) and Neon computes (label
+# chelabase.dev/endpoint-id), delete their storage-controller tenants, and clear the `databases`,
 # `branches` and `neon_endpoints` rows. Does not touch Compose deps.
 sweep-dbs: _live-check
     #!/usr/bin/env bash
     set -euo pipefail
-    ids="$(docker ps -aq --filter 'label=cheladb.managed=true' 2>/dev/null || true)"
+    ids="$(docker ps -aq --filter 'label=chelabase.managed=true' 2>/dev/null || true)"
     if [[ -z "${ids}" ]]; then
       echo "no managed tenant containers to remove"
     else
       echo "removing managed tenant containers:"
-      docker ps -a --filter 'label=cheladb.managed=true' --format '  {{ "{{.Names}}" }}\t{{ "{{.Status}}" }}'
+      docker ps -a --filter 'label=chelabase.managed=true' --format '  {{ "{{.Names}}" }}\t{{ "{{.Status}}" }}'
       docker stop ${ids} >/dev/null
       # -v also drops anonymous volumes of databases created before named volumes.
       docker rm -f -v ${ids} >/dev/null
       echo "removed $(echo "${ids}" | wc -w | tr -d ' ') container(s)"
     fi
 
-    volumes="$(docker volume ls -q --filter 'label=cheladb.managed=true' 2>/dev/null || true)"
+    volumes="$(docker volume ls -q --filter 'label=chelabase.managed=true' 2>/dev/null || true)"
     if [[ -z "${volumes}" ]]; then
       echo "no managed data volumes to remove"
     else
@@ -438,18 +442,18 @@ sweep-dbs: _live-check
       echo "removed $(echo "${volumes}" | wc -w | tr -d ' ') data volume(s)"
     fi
 
-    ids="$(docker ps -aq --filter 'label=cheladb.dev/endpoint-id' 2>/dev/null || true)"
+    ids="$(docker ps -aq --filter 'label=chelabase.dev/endpoint-id' 2>/dev/null || true)"
     if [[ -z "${ids}" ]]; then
       echo "no Neon compute containers to remove"
     else
       echo "removing Neon compute containers:"
-      docker ps -a --filter 'label=cheladb.dev/endpoint-id' --format '  {{ "{{.Names}}" }}\t{{ "{{.Status}}" }}'
+      docker ps -a --filter 'label=chelabase.dev/endpoint-id' --format '  {{ "{{.Names}}" }}\t{{ "{{.Status}}" }}'
       docker rm -f ${ids} >/dev/null
       echo "removed $(echo "${ids}" | wc -w | tr -d ' ') compute container(s)"
     fi
 
     if docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db \
-         pg_isready -U cheladb -d cheladb_metadata >/dev/null 2>&1; then
+         pg_isready -U chelabase -d chelabase_metadata >/dev/null 2>&1; then
       LOG_PREFIX=sweep-dbs
       # shellcheck disable=SC1091
       . scripts/lib/neon-common.sh
@@ -468,9 +472,9 @@ sweep-dbs: _live-check
 
 # Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
 api-gen:
-    CHELADB_BLESS=1 cargo test -p orchestrator -p auth document_is_current
-    pnpm --filter @cheladb/management-client generate
-    pnpm --filter @cheladb/studio generate:login
+    CHELABASE_BLESS=1 cargo test -p orchestrator -p auth document_is_current
+    pnpm --filter @chelabase/management-client generate
+    pnpm --filter @chelabase/studio generate:login
     just scalar-sync
 
 # Copy the pnpm-installed Scalar bundle to the orchestrator's assets (pnpm is the single source of the version)
@@ -480,16 +484,16 @@ scalar-sync:
 check:
     cargo check --workspace
     cargo test -p orchestrator -p auth openapi::tests
-    pnpm --filter @cheladb/management-client generate
-    pnpm --filter @cheladb/studio generate:login
+    pnpm --filter @chelabase/management-client generate
+    pnpm --filter @chelabase/studio generate:login
     test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
     scripts/scalar.sh check
-    pnpm --filter @cheladb/management-client typecheck
-    pnpm --filter @cheladb/management-client test
-    pnpm --filter @cheladb/studio typecheck
-    pnpm --filter @cheladb/studio test
-    pnpm --filter @cheladb/client typecheck
-    pnpm --filter @cheladb/client test
+    pnpm --filter @chelabase/management-client typecheck
+    pnpm --filter @chelabase/management-client test
+    pnpm --filter @chelabase/studio typecheck
+    pnpm --filter @chelabase/studio test
+    pnpm --filter @chelabase/client typecheck
+    pnpm --filter @chelabase/client test
 
 # Rust tests (nextest, one process per test) plus doctests, which nextest does not run.
 # The ignored live tests stay on `cargo test ... -- --ignored` (see neon-test-live).
@@ -531,7 +535,7 @@ wt-add branch base="main":
     else
       git -C "$main" worktree add "$dir" -b "$branch" "{{base}}"
     fi
-    ln -s "$main/.cheladb" "$dir/.cheladb"
+    ln -s "$main/.chelabase" "$dir/.chelabase"
     if [[ -e "$main/apps/studio/.env.local" ]]; then
       ln -s "$main/apps/studio/.env.local" "$dir/apps/studio/.env.local"
     fi
@@ -607,7 +611,7 @@ neon-test:
 
 # Round trip through the Rust storage-controller client (needs just deps-up and just dev: attach notifies the internal listener)
 neon-test-live: _live-check
-    cargo test -p cheladb-neon --test storcon_live -- --ignored
+    cargo test -p chelabase-neon --test storcon_live -- --ignored
 
 # Live sign-up/sign-in/reset/logout through the gateway and auth (needs just dev)
 auth-e2e: _live-check

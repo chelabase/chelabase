@@ -1,4 +1,4 @@
-import type { DataApiSchema, Privilege } from "@cheladb/management-client";
+import type { DataApiSchema, Privilege } from "@chelabase/management-client";
 import { CopyButton } from "./copy-button";
 
 const WRITES: Privilege[] = ["insert", "update", "delete"];

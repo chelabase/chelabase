@@ -13,7 +13,7 @@ import {
   useRevokeAppUserSessions,
   useUpdateAppUser,
   type AppUserPage,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { appUserErrorText } from "@/lib/app-user-errors";
 

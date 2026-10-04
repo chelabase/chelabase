@@ -1,0 +1,8 @@
+[package]
+name = "chelabase-routes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase public endpoint declarations shared by the gateway and services"
+
+[dependencies]

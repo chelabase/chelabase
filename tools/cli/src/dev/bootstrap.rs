@@ -1,4 +1,4 @@
-//! `cheladb dev bootstrap`: idempotent local IAM setup on a fresh Zitadel v4 instance.
+//! `chelabase dev bootstrap`: idempotent local IAM setup on a fresh Zitadel v4 instance.
 
 use crate::dev::env_files::{DemoEnv, render_demo_env, render_studio_env};
 use crate::dev::zitadel::HttpZitadel;
@@ -27,8 +27,8 @@ pub async fn run() -> Result<()> {
     let cookie_dir = auth_dir().with_context(|| {
         format!(
             "migrate auth cookie dir from {} to {}",
-            crate::paths::repo_root().join(".cheladb/auth").display(),
-            crate::paths::repo_root().join(".cheladb/auth").display()
+            crate::paths::repo_root().join(".chelabase/auth").display(),
+            crate::paths::repo_root().join(".chelabase/auth").display()
         )
     })?;
     let cookie_key = secrets_key::ensure_file(&cookie_dir, "cookie.key")?;
@@ -39,7 +39,7 @@ pub async fn run() -> Result<()> {
     let login_client = zdir.join("login-client.pat");
     wait_for_file(&login_client, "login-client.pat", 45, TOKEN_POLL).await?;
 
-    let mode = cheladb_types::mode::Mode::from_env().map_err(anyhow::Error::msg)?;
+    let mode = chelabase_types::mode::Mode::from_env().map_err(anyhow::Error::msg)?;
     let api = HttpZitadel::new(&iss, &admin_pat);
     let org_id = wait_ready(|| steps::ensure_org(&api)).await?;
     let project_id = steps::ensure_project(&api, &org_id).await?;

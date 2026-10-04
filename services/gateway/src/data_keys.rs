@@ -8,7 +8,7 @@
 //! - Revocation reaches a gateway instance only when its cache entry expires;
 //!   instances don't share caches.
 
-use cheladb_types::data_key::{self, DataKeyKind};
+use chelabase_types::data_key::{self, DataKeyKind};
 use moka::future::Cache;
 use serde::Deserialize;
 use std::net::IpAddr;

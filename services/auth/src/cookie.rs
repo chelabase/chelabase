@@ -1,17 +1,17 @@
-//! The encrypted cookies: step state between requests (`cheladb_login`) and the finished
-//! sign-in's Zitadel session, kept only to end it at logout (`cheladb_session`).
+//! The encrypted cookies: step state between requests (`chelabase_login`) and the finished
+//! sign-in's Zitadel session, kept only to end it at logout (`chelabase_session`).
 
-use cheladb_secrets::{SecretKey, open, seal};
+use chelabase_secrets::{SecretKey, open, seal};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const LOGIN_COOKIE: &str = "cheladb_login";
-pub const SESSION_COOKIE: &str = "cheladb_session";
+pub const LOGIN_COOKIE: &str = "chelabase_login";
+pub const SESSION_COOKIE: &str = "chelabase_session";
 pub const LOGIN_TTL_SECS: u64 = 900;
 pub const SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
-const LOGIN_AAD: &str = "cheladb:auth:login";
-const SESSION_AAD: &str = "cheladb:auth:session";
+const LOGIN_AAD: &str = "chelabase:auth:login";
+const SESSION_AAD: &str = "chelabase:auth:session";
 /// Plaintext is padded to this size so a decoy cookie looks like a real one.
 const LOGIN_PLAINTEXT_LEN: usize = 640;
 
@@ -95,7 +95,7 @@ pub fn read_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_secrets::SecretKey;
+    use chelabase_secrets::SecretKey;
 
     fn state(decoy: bool) -> LoginState {
         LoginState {
@@ -158,7 +158,7 @@ mod tests {
     fn cookie_attributes() {
         assert_eq!(
             set_cookie(LOGIN_COOKIE, "v", LOGIN_TTL_SECS, false),
-            "cheladb_login=v; HttpOnly; SameSite=Strict; Path=/auth/v1; Max-Age=900"
+            "chelabase_login=v; HttpOnly; SameSite=Strict; Path=/auth/v1; Max-Age=900"
         );
         assert!(
             set_cookie(SESSION_COOKIE, "v", SESSION_TTL_SECS, true)
@@ -166,15 +166,15 @@ mod tests {
         );
         assert_eq!(
             clear_cookie(LOGIN_COOKIE, false),
-            "cheladb_login=; HttpOnly; SameSite=Strict; Path=/auth/v1; Max-Age=0"
+            "chelabase_login=; HttpOnly; SameSite=Strict; Path=/auth/v1; Max-Age=0"
         );
     }
 
     #[test]
     fn reads_one_cookie_among_several() {
         let mut headers = http::HeaderMap::new();
-        headers.append("cookie", "a=1; cheladb_login=abc=; b=2".parse().unwrap());
-        headers.append("cookie", "cheladb_session=s".parse().unwrap());
+        headers.append("cookie", "a=1; chelabase_login=abc=; b=2".parse().unwrap());
+        headers.append("cookie", "chelabase_session=s".parse().unwrap());
         assert_eq!(read_cookie(&headers, LOGIN_COOKIE), Some("abc="));
         assert_eq!(read_cookie(&headers, SESSION_COOKIE), Some("s"));
         assert_eq!(read_cookie(&headers, "missing"), None);

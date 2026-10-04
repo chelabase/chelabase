@@ -1,6 +1,6 @@
 import { useId, useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { getGetDatabaseQueryKey, useUpdateDatabase, type DatabaseSettings as Settings } from "@cheladb/management-client";
+import { getGetDatabaseQueryKey, useUpdateDatabase, type DatabaseSettings as Settings } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { parseSettings, windowParts, type WindowUnit } from "@/lib/branches";

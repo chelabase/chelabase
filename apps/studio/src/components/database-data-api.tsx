@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useListBranches, type DatabaseSummary } from "@cheladb/management-client";
+import { useListBranches, type DatabaseSummary } from "@chelabase/management-client";
 import { errorText } from "@/lib/errors";
 import { DataApiPanel } from "./data-api-panel";
 

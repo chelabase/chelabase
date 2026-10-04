@@ -2,15 +2,15 @@
 //! request id → scope → route → CORS → auth → internal identity.
 //!
 //! Pure over request parts; `proxy.rs` adapts it to Pingora. Nothing here is
-//! configurable per route except the typed `Policy` from `cheladb-routes`.
+//! configurable per route except the typed `Policy` from `chelabase-routes`.
 
 use crate::data_keys::{DataKeyResolver, KeyError};
 use crate::registry::SharedRegistry;
 use crate::user_tokens::{UserTokenError, UserTokens};
-use cheladb_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
-use cheladb_auth::{AuthError, JwtVerifier};
-use cheladb_routes::{match_endpoint, Auth, Cors, Endpoint, Match, Scope, Service};
-use cheladb_types::data_key::DataKeyKind;
+use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
+use chelabase_auth::{AuthError, JwtVerifier};
+use chelabase_routes::{match_endpoint, Auth, Cors, Endpoint, Match, Scope, Service};
+use chelabase_types::data_key::DataKeyKind;
 use http::HeaderMap;
 use serde_json::{json, Value};
 use std::net::IpAddr;
@@ -25,7 +25,7 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 /// Client headers never forwarded upstream: upstreams only ever see the
 /// gateway-minted identity.
 /// The end-user token header; checked by the gateway, never forwarded.
-pub const USER_TOKEN_HEADER: &str = "cheladb-user";
+pub const USER_TOKEN_HEADER: &str = "chelabase-user";
 const STRIPPED_REQUEST_HEADERS: &[&str] = &[IDENTITY_HEADER, "authorization", USER_TOKEN_HEADER];
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id";
 const CORS_MAX_AGE_SECS: &str = "600";
@@ -233,7 +233,7 @@ impl Pipeline {
                 headers: vec![
                     ("access-control-allow-origin", "*".to_string()),
                     ("access-control-allow-methods", "GET, POST".to_string()),
-                    ("access-control-allow-headers", "authorization, content-type, cheladb-user".to_string()),
+                    ("access-control-allow-headers", "authorization, content-type, chelabase-user".to_string()),
                     ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
                 ],
                 body: None,
@@ -419,7 +419,7 @@ fn json_response(status: u16, body: Value) -> GatewayResponse {
     }
 }
 
-/// The shared error body, `{"error":{"code","message"}}`, written to match `cheladb_types`'
+/// The shared error body, `{"error":{"code","message"}}`, written to match `chelabase_types`'
 /// `ApiError::body` (the gateway doesn't depend on that type's axum feature).
 pub(crate) fn error_json(code: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message } })
@@ -493,11 +493,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::registry::Registry;
-    use cheladb_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
-    use cheladb_auth::test_support::{BrokenJwks, MockJwks};
+    use chelabase_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
+    use chelabase_auth::test_support::{BrokenJwks, MockJwks};
     use crate::user_tokens::test_support as ut;
-    use cheladb_auth::app_token::AppTokenSigner;
-    use cheladb_auth::ZitadelAuthConfig;
+    use chelabase_auth::app_token::AppTokenSigner;
+    use chelabase_auth::ZitadelAuthConfig;
     use http::{HeaderName, HeaderValue};
 
     #[test]
@@ -963,7 +963,7 @@ mod tests {
     // ---- data API keys (Task 4) ----
 
     use crate::data_keys::test_support::{self as dk, Answer};
-    use cheladb_types::data_key::DataKeyKind;
+    use chelabase_types::data_key::DataKeyKind;
 
     struct DataHarness {
         pipeline: Pipeline,
@@ -1151,7 +1151,7 @@ mod tests {
             assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some("GET, POST"));
             assert_eq!(
                 header(&resp.headers, "access-control-allow-headers"),
-                Some("authorization, content-type, cheladb-user")
+                Some("authorization, content-type, chelabase-user")
             );
             assert_eq!(header(&resp.headers, "access-control-max-age"), Some("600"));
             assert_eq!(header(&resp.headers, "access-control-allow-credentials"), None);
@@ -1260,7 +1260,7 @@ mod tests {
             "POST",
             "/data/v1/query",
             None,
-            &[("authorization", &bearer), ("cheladb-user", token)],
+            &[("authorization", &bearer), ("chelabase-user", token)],
         )
         .await
     }
@@ -1396,19 +1396,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cheladb_user_header_is_stripped_upstream() {
+    async fn chelabase_user_header_is_stripped_upstream() {
         let h = data_harness().await;
         let case = user_case(&h, DataKeyKind::Public);
         h.sessions.set(case.sid, ut::Session::Live(case.project));
         let token = user_token(&h, case.project, case.sid, 300);
         let plan = expect_plan(user_call(&h, &case.key, &token).await.outcome);
         let edits = plan.upstream_headers("rid");
-        assert!(edits.remove.contains(&"cheladb-user"));
-        assert!(!edits.set.iter().any(|(n, _)| *n == "cheladb-user"));
+        assert!(edits.remove.contains(&"chelabase-user"));
+        assert!(!edits.set.iter().any(|(n, _)| *n == "chelabase-user"));
     }
 
     #[tokio::test]
-    async fn preflight_allows_cheladb_user() {
+    async fn preflight_allows_chelabase_user() {
         let h = data_harness().await;
         let resp = expect_response(
             run(
@@ -1423,7 +1423,7 @@ mod tests {
         );
         assert_eq!(
             header(&resp.headers, "access-control-allow-headers"),
-            Some("authorization, content-type, cheladb-user")
+            Some("authorization, content-type, chelabase-user")
         );
     }
 
@@ -1447,7 +1447,7 @@ mod tests {
         let data = h.verify.verify(&minted, "auth").unwrap().data.unwrap();
         assert_eq!((data.project_id, data.role.as_str()), (Some(case.project), "anon"));
 
-        let with_user = headers(&[("authorization", &bearer), ("cheladb-user", &token)]);
+        let with_user = headers(&[("authorization", &bearer), ("chelabase-user", &token)]);
         let minted = h
             .pipeline
             .authenticate_key(Service::Auth, &parts(&with_user), false, true, "rid")
@@ -1459,7 +1459,7 @@ mod tests {
         // A secret key is refused on a public-only route before any user token is looked at.
         let secret = user_case(&h, DataKeyKind::Secret);
         let bearer = format!("Bearer {}", secret.key);
-        let hs = headers(&[("authorization", &bearer), ("cheladb-user", &token)]);
+        let hs = headers(&[("authorization", &bearer), ("chelabase-user", &token)]);
         let refused = h
             .pipeline
             .authenticate_key(Service::Auth, &parts(&hs), false, true, "rid")

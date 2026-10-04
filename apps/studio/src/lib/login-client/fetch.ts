@@ -1,4 +1,4 @@
-import { buildHeaders, requestJson, type ApiError } from "@cheladb/management-client";
+import { buildHeaders, requestJson, type ApiError } from "@chelabase/management-client";
 
 export interface LoginClientConfig {
   baseUrl: string;

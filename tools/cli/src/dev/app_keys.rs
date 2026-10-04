@@ -27,7 +27,7 @@ pub fn ensure(dir: &Path) -> Result<AppKeyPaths> {
     match (paths.private.is_file(), paths.public.is_file()) {
         (true, true) => tracing::info!("reusing app JWT key pair in {}", dir.display()),
         (false, false) => {
-            let (private_pem, public_pem) = cheladb_auth::internal::generate_keypair_pem();
+            let (private_pem, public_pem) = chelabase_auth::internal::generate_keypair_pem();
             write_private(&paths.private, &private_pem)?;
             std::fs::write(&paths.public, public_pem)
                 .with_context(|| format!("write {}", paths.public.display()))?;

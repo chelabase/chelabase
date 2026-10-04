@@ -8,8 +8,8 @@
 //! `demo.env` sourced for the Zitadel admin PAT and the app JWT key pair:
 //!
 //! ```text
-//! just live bash -c 'set -a; . .cheladb/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; set +a;
-//!   CHELADB_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
+//! just live bash -c 'set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a;
+//!   CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
 //!   cargo test -p worker --test app_users_live -- --ignored --test-threads=1 --nocapture'
 //! ```
 //!
@@ -21,16 +21,16 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cheladb_auth::app_token::{APP_ISSUER, AppClaims, AppTokenSigner, app_audience};
-use cheladb_metadata::{
+use chelabase_auth::app_token::{APP_ISSUER, AppClaims, AppTokenSigner, app_audience};
+use chelabase_metadata::{
     AppUsersStatus, BeginEnable, BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus,
     MetadataClient, NewAppSession, NewBranch, NewProjectAuth, OnDelete,
 };
-use cheladb_nats::{AppUsersJob, AppUsersSyncJob, BranchJob};
-use cheladb_neon::{ComputeBackend, ComputeLocator, DockerLocator};
-use cheladb_secrets::{Purpose, open_credential, open_role_password};
-use cheladb_types::{BranchId, DatabaseId, ProjectId};
-use cheladb_zitadel::client::NewUser;
+use chelabase_nats::{AppUsersJob, AppUsersSyncJob, BranchJob};
+use chelabase_neon::{ComputeBackend, ComputeLocator, DockerLocator};
+use chelabase_secrets::{Purpose, open_credential, open_role_password};
+use chelabase_types::{BranchId, DatabaseId, ProjectId};
+use chelabase_zitadel::client::NewUser;
 use serde_json::{Value, json};
 use uuid::Uuid;
 use worker::app_users_sql::{USERS_SYNC_ROLE, gone_call_sql, upsert_call_sql, users_bootstrap_sql};
@@ -154,7 +154,7 @@ impl Fx {
                 &users_bootstrap_sql(
                     "public",
                     "users",
-                    &cheladb_neon::scram::verifier(SYNC_PASSWORD),
+                    &chelabase_neon::scram::verifier(SYNC_PASSWORD),
                     OWNER,
                 ),
             )
@@ -203,10 +203,10 @@ impl Fx {
         }
     }
 
-    /// SQL as `cheladb_auth_sync` logged in with its password, straight to the compute's
+    /// SQL as `chelabase_auth_sync` logged in with its password, straight to the compute's
     /// Postgres (as `auth` connects).
     async fn sync_login(&self, ep: &str, sql: &str) -> Result<String, String> {
-        let locator = DockerLocator::connect("cheladb_default").expect("the Docker client");
+        let locator = DockerLocator::connect("chelabase_default").expect("the Docker client");
         let addr = locator
             .postgres_addr(ep)
             .await
@@ -301,8 +301,8 @@ impl Fx {
             .await
             .expect("insert the app session");
         let signer = AppTokenSigner::from_pem_files(
-            &env_path("CHELADB_APP_JWT_PRIVATE_KEY"),
-            &env_path("CHELADB_APP_JWT_PUBLIC_KEY"),
+            &env_path("CHELABASE_APP_JWT_PRIVATE_KEY"),
+            &env_path("CHELABASE_APP_JWT_PUBLIC_KEY"),
         )
         .expect("the app JWT key pair");
         let iat = now.timestamp() as u64;
@@ -358,7 +358,7 @@ fn env_path(var: &str) -> std::path::PathBuf {
 }
 
 fn proxy_host(ep: &str) -> String {
-    let domain = std::env::var("CHELADB_PROXY_DOMAIN")
+    let domain = std::env::var("CHELABASE_PROXY_DOMAIN")
         .ok()
         .filter(|d| !d.trim().is_empty())
         .unwrap_or_else(|| "localtest.me".into());
@@ -366,11 +366,11 @@ fn proxy_host(ep: &str) -> String {
 }
 
 fn proxy_conn(ep: &str, database: &str) -> String {
-    let port: u16 = std::env::var("CHELADB_PROXY_PG_PORT")
+    let port: u16 = std::env::var("CHELABASE_PROXY_PG_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(4432);
-    let ca = workspace_root().join(".cheladb/neon/proxy-ca.crt");
+    let ca = workspace_root().join(".chelabase/neon/proxy-ca.crt");
     assert!(
         ca.exists(),
         "{} is missing (run just deps-up)",
@@ -417,10 +417,10 @@ fn gateway() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into())
 }
 
-/// The built `cheladb` CLI, next to this test's own binary's directory.
-fn cheladb_cli() -> std::path::PathBuf {
+/// The built `chelabase` CLI, next to this test's own binary's directory.
+fn chelabase_cli() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap();
-    let cli = exe.parent().unwrap().parent().unwrap().join("cheladb");
+    let cli = exe.parent().unwrap().parent().unwrap().join("chelabase");
     assert!(
         cli.exists(),
         "{} is missing (just dev builds it)",
@@ -431,13 +431,13 @@ fn cheladb_cli() -> std::path::PathBuf {
 
 /// A management API call through the gateway as the demo tenant's user: `(status, body)`.
 async fn api(method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
-    let token = tokio::process::Command::new(cheladb_cli())
+    let token = tokio::process::Command::new(chelabase_cli())
         .args(["dev", "token"])
         .current_dir(workspace_root())
         .output()
         .await
-        .expect("cheladb dev token");
-    assert!(token.status.success(), "cheladb dev token failed");
+        .expect("chelabase dev token");
+    assert!(token.status.success(), "chelabase dev token failed");
     let token = String::from_utf8_lossy(&token.stdout).trim().to_string();
     let mut req = reqwest::Client::new()
         .request(method.parse().unwrap(), format!("{}{path}", gateway()))
@@ -460,7 +460,7 @@ async fn data(key: &str, user: Option<&str>, query: Value) -> (u16, Value) {
         .timeout(Duration::from_secs(30))
         .json(&query);
     if let Some(token) = user {
-        req = req.header("cheladb-user", token);
+        req = req.header("chelabase-user", token);
     }
     let res = req.send().await.expect("the data API answers");
     let status = res.status().as_u16();
@@ -481,15 +481,15 @@ fn ids(body: &Value) -> Vec<String> {
     ids
 }
 
-/// Whether the managed-object error names the users table as Cheladb's.
+/// Whether the managed-object error names the users table as Chelabase's.
 fn managed_refusal(err: &str) -> bool {
-    err.contains("42501") && err.contains("managed by Cheladb app users")
+    err.contains("42501") && err.contains("managed by Chelabase app users")
 }
 
 // --- The bootstrap, the guard and the protect triggers -------------------------------------
 
 /// What the users bootstrap makes, as one comparable text: the table's columns, indexes,
-/// triggers, policies and grants, the event triggers, the `cheladb` functions and the config
+/// triggers, policies and grants, the event triggers, the `chelabase` functions and the config
 /// row, and the sync role's attributes (not its password, whose SCRAM salt changes each time).
 const SNAPSHOT_SQL: &str = "SELECT string_agg(x, E'\\n' ORDER BY x) FROM (
   SELECT 'col ' || attname || ' ' || format_type(atttypid, atttypmod) || ' ' || attnotnull AS x
@@ -505,22 +505,22 @@ const SNAPSHOT_SQL: &str = "SELECT string_agg(x, E'\\n' ORDER BY x) FROM (
   UNION ALL SELECT 'evt ' || evtname || ' ' || evtevent || ' ' || evtenabled::text FROM pg_event_trigger
   UNION ALL SELECT 'fn ' || p.oid::regprocedure::text || ' ' || md5(coalesce(prosrc, '')) || ' '
       || pg_get_userbyid(proowner) || ' ' || coalesce(proacl::text, '')
-    FROM pg_proc p WHERE pronamespace = 'cheladb'::regnamespace
+    FROM pg_proc p WHERE pronamespace = 'chelabase'::regnamespace
   UNION ALL SELECT 'cfg ' || schema_name || '.' || table_name || ' ' || (table_oid = 'public.users'::regclass)
-    FROM cheladb.app_users_table
+    FROM chelabase.app_users_table
   UNION ALL SELECT 'role ' || rolname || ' ' || rolcanlogin || rolinherit || rolbypassrls || rolsuper
       || ' ' || rolconnlimit
-    FROM pg_roles WHERE rolname = 'cheladb_auth_sync'
+    FROM pg_roles WHERE rolname = 'chelabase_auth_sync'
 ) s;";
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn users_bootstrap_is_idempotent() {
     live(|fx| async move {
         fx.bootstrap().await.expect("first bootstrap");
         let first = fx.sql(SNAPSHOT_SQL).await;
-        assert!(first.contains("trg cheladb_users_guard A"), "{first}");
-        assert!(first.contains("evt cheladb_users_protect_ddl"), "{first}");
+        assert!(first.contains("trg chelabase_users_guard A"), "{first}");
+        assert!(first.contains("evt chelabase_users_protect_ddl"), "{first}");
         fx.bootstrap().await.expect("second bootstrap");
         let second = fx.sql(SNAPSHOT_SQL).await;
         assert_eq!(first, second, "the second run changed something");
@@ -529,7 +529,7 @@ async fn users_bootstrap_is_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn guard_refuses_the_owner_and_allows_sync() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -538,7 +538,7 @@ async fn guard_refuses_the_owner_and_allows_sync() {
         fx.upsert(a, "a@example.com", None).await;
 
         // The owner (postgres, through the proxy).
-        let refused_rows = "rows of public.users are created and deleted by Cheladb app users";
+        let refused_rows = "rows of public.users are created and deleted by Chelabase app users";
         let err = fx
             .owner_err(&format!("INSERT INTO users (id, email) VALUES ('{b}', 'b@example.com')"))
             .await;
@@ -557,7 +557,7 @@ async fn guard_refuses_the_owner_and_allows_sync() {
             let err = fx
                 .owner_err(&format!("UPDATE users SET {col} = {value} WHERE id = '{a}'"))
                 .await;
-            let text = format!("column {col} is managed by Cheladb app users");
+            let text = format!("column {col} is managed by Chelabase app users");
             assert!(err.contains("42501") && err.contains(&text), "update {col}: {err}");
         }
         fx.owner_ok(&format!("UPDATE users SET nickname = 'ann' WHERE id = '{a}'")).await;
@@ -574,7 +574,7 @@ async fn guard_refuses_the_owner_and_allows_sync() {
                 let ep = fx.ep.clone();
                 fx.sync_login(&ep, &sql)
                     .await
-                    .unwrap_or_else(|e| panic!("as cheladb_auth_sync: {sql}: {e}"))
+                    .unwrap_or_else(|e| panic!("as chelabase_auth_sync: {sql}: {e}"))
             }
         };
         sync(format!("INSERT INTO users (id, email) VALUES ('{b}', 'b@example.com')")).await;
@@ -592,7 +592,7 @@ async fn guard_refuses_the_owner_and_allows_sync() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn protect_refuses_drop_rename_retype_disable() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -603,17 +603,17 @@ async fn protect_refuses_drop_rename_retype_disable() {
             "ALTER TABLE users DROP COLUMN email",
             "ALTER TABLE users RENAME COLUMN email TO mail",
             "ALTER TABLE users ALTER COLUMN email TYPE varchar(320)",
-            "DROP TRIGGER cheladb_users_guard ON users",
-            "DROP TRIGGER cheladb_users_guard_truncate ON users",
-            "ALTER TRIGGER cheladb_users_guard ON users RENAME TO guard",
-            "ALTER TABLE users DISABLE TRIGGER cheladb_users_guard",
+            "DROP TRIGGER chelabase_users_guard ON users",
+            "DROP TRIGGER chelabase_users_guard_truncate ON users",
+            "ALTER TRIGGER chelabase_users_guard ON users RENAME TO guard",
+            "ALTER TABLE users DISABLE TRIGGER chelabase_users_guard",
             "ALTER TABLE users DISABLE TRIGGER ALL",
             "ALTER TABLE users SET SCHEMA other",
         ] {
             let err = fx.owner_err(sql).await;
             assert!(managed_refusal(&err), "{sql}: {err}");
         }
-        // The public schema itself: refused (as Cheladb's, or for want of ownership).
+        // The public schema itself: refused (as Chelabase's, or for want of ownership).
         let err = fx.owner_err("DROP SCHEMA public CASCADE").await;
         println!("DROP SCHEMA public CASCADE: {err}");
         assert!(err.contains("ERROR"), "{err}");
@@ -624,13 +624,13 @@ async fn protect_refuses_drop_rename_retype_disable() {
 
 /// `<enabled guard triggers>|<table in place (true/false)>|<managed columns>`.
 const SNAPSHOT_TRIGGERS: &str = "SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid = to_regclass('public.users') \
-     AND tgname LIKE 'cheladb_users_guard%' AND tgenabled IN ('O', 'A')) || '|' || \
+     AND tgname LIKE 'chelabase_users_guard%' AND tgenabled IN ('O', 'A')) || '|' || \
      (to_regclass('public.users') IS NOT NULL) || '|' || \
      (SELECT count(*) FROM pg_attribute WHERE attrelid = to_regclass('public.users') AND NOT attisdropped \
       AND attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at'));";
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn alter_index_rename_on_the_table_is_refused() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -646,7 +646,7 @@ async fn alter_index_rename_on_the_table_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn unrelated_ddl_works_when_the_users_table_is_fine_and_when_broken() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -676,7 +676,7 @@ async fn unrelated_ddl_works_when_the_users_table_is_fine_and_when_broken() {
 // --- Sync-role writes: sign-up data and marked deletes -------------------------------------
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn sign_up_data_respects_column_insert_privilege() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -710,7 +710,7 @@ async fn sign_up_data_respects_column_insert_privilege() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn mark_deleted_email_can_sign_up_again() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -742,7 +742,7 @@ async fn mark_deleted_email_can_sign_up_again() {
             .await
             .expect_err("a second live row with the same email");
         assert!(
-            format!("{err:#}").contains("cheladb_users_email_key"),
+            format!("{err:#}").contains("chelabase_users_email_key"),
             "{err:#}"
         );
     })
@@ -752,10 +752,10 @@ async fn mark_deleted_email_can_sign_up_again() {
 // --- Under the data API --------------------------------------------------------------------
 
 /// The schema's app users marker is read the same whatever the request's role: a custom role
-/// with no access to schema `cheladb` still reads its tables, before and after app users
+/// with no access to schema `chelabase` still reads its tables, before and after app users
 /// are enabled (the first request of a schema version introspects as its role).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn a_custom_role_reads_through_the_data_api() {
     live(|fx| async move {
         fx.owner_ok(
@@ -774,10 +774,10 @@ async fn a_custom_role_reads_through_the_data_api() {
         let (status, body) = data(&key, None, select.clone()).await;
         assert_eq!(status, 200, "with app users: {body}");
         // T4: a policy written without `TO` applies to PUBLIC, the custom role included, and
-        // may call the claim helpers (EXECUTE and USAGE on `cheladb` for PUBLIC).
+        // may call the claim helpers (EXECUTE and USAGE on `chelabase` for PUBLIC).
         fx.owner_ok(
             "ALTER TABLE items ENABLE ROW LEVEL SECURITY;
-             CREATE POLICY items_open ON items USING (cheladb.user_id() IS NULL OR cheladb.claims() IS NOT NULL);",
+             CREATE POLICY items_open ON items USING (chelabase.user_id() IS NULL OR chelabase.claims() IS NOT NULL);",
         )
         .await;
         let (status, body) = data(&key, None, select).await;
@@ -789,7 +789,7 @@ async fn a_custom_role_reads_through_the_data_api() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn helpers_work_under_the_data_api() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -798,7 +798,7 @@ async fn helpers_work_under_the_data_api() {
         fx.upsert(b, "b@example.com", None).await;
         fx.owner_ok(
             "CREATE TABLE notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                 owner uuid NOT NULL DEFAULT cheladb.user_id(), email text DEFAULT cheladb.user_email(),
+                 owner uuid NOT NULL DEFAULT chelabase.user_id(), email text DEFAULT chelabase.user_email(),
                  body text NOT NULL)",
         )
         .await;
@@ -806,7 +806,7 @@ async fn helpers_work_under_the_data_api() {
         let token = fx.user_token(a, "a@example.com").await;
         let (status, body) = data(&key, Some(&token), json!({"v": 1, "op": "select", "from": "users"})).await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(ids(&body), [a.to_string()], "the built-in cheladb_users_select_own");
+        assert_eq!(ids(&body), [a.to_string()], "the built-in chelabase_users_select_own");
         let (status, body) = data(
             &key,
             Some(&token),
@@ -824,7 +824,7 @@ async fn helpers_work_under_the_data_api() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn new_users_table_is_rls_locked() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -839,7 +839,7 @@ async fn new_users_table_is_rls_locked() {
                  WHERE polrelid = 'public.users'::regclass) FROM pg_class WHERE oid = 'public.users'::regclass"
             )
             .await,
-            "true|false|cheladb_users_select_own,cheladb_users_update_own"
+            "true|false|chelabase_users_select_own,chelabase_users_update_own"
         );
         let key = fx.public_key().await;
         let select = json!({"v": 1, "op": "select", "from": "users"});
@@ -871,14 +871,14 @@ async fn new_users_table_is_rls_locked() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn data_api_rebootstrap_keeps_app_users_objects() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
         let before = fx.sql(SNAPSHOT_SQL).await;
         let reply = fx
             .worker
-            .rebootstrap_data_api(&cheladb_nats::DataApiDatabaseRequest {
+            .rebootstrap_data_api(&chelabase_nats::DataApiDatabaseRequest {
                 branch_id: fx.main,
                 name: fx.database.clone(),
                 remove: false,
@@ -887,10 +887,10 @@ async fn data_api_rebootstrap_keeps_app_users_objects() {
             .await;
         assert!(reply.ok, "{reply:?}");
         assert_eq!(
-            fx.value("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'cheladb_quarantine%'")
+            fx.value("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'chelabase_quarantine%'")
                 .await,
             "0",
-            "the data API bootstrap quarantined the cheladb schema"
+            "the data API bootstrap quarantined the chelabase schema"
         );
         assert_eq!(fx.sql(SNAPSHOT_SQL).await, before);
     })
@@ -898,7 +898,7 @@ async fn data_api_rebootstrap_keeps_app_users_objects() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn remove_data_api_drops_the_helpers() {
     live(|fx| async move {
         // A second Postgres database, served by the data API (which installs the helpers).
@@ -928,16 +928,16 @@ async fn remove_data_api_drops_the_helpers() {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         };
-        let helpers = "SELECT count(*) FROM pg_proc WHERE pronamespace = to_regnamespace('cheladb') \
+        let helpers = "SELECT count(*) FROM pg_proc WHERE pronamespace = to_regnamespace('chelabase') \
                        AND proname IN ('claims', 'user_id', 'user_email')";
         enable().await;
         assert_eq!(first_line(&fx.sql_in(&fx.ep, "extra", helpers).await), "3");
         let (status, body) = api("DELETE", &format!("{path}?remove=true"), None).await;
         assert_eq!(status, 204, "remove: {body}");
         assert_eq!(
-            first_line(&fx.sql_in(&fx.ep, "extra", "SELECT to_regnamespace('cheladb') IS NULL").await),
+            first_line(&fx.sql_in(&fx.ep, "extra", "SELECT to_regnamespace('chelabase') IS NULL").await),
             "t",
-            "the cheladb schema is gone"
+            "the chelabase schema is gone"
         );
 
         // A policy still using a helper: the remove fails with Postgres' dependency message.
@@ -946,7 +946,7 @@ async fn remove_data_api_drops_the_helpers() {
             &fx.ep,
             "extra",
             "CREATE TABLE public.mine (owner uuid); ALTER TABLE public.mine ENABLE ROW LEVEL SECURITY;
-             CREATE POLICY mine_own ON public.mine USING (owner = cheladb.user_id());",
+             CREATE POLICY mine_own ON public.mine USING (owner = chelabase.user_id());",
         )
         .await;
         let (status, body) = api("DELETE", &format!("{path}?remove=true"), None).await;
@@ -954,7 +954,7 @@ async fn remove_data_api_drops_the_helpers() {
         assert_eq!(status, 409, "{body}");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("cannot drop function cheladb.user_id() because other objects depend on it"),
+            message.contains("cannot drop function chelabase.user_id() because other objects depend on it"),
             "the refusal names the dependency: {body}"
         );
         assert_eq!(first_line(&fx.sql_in(&fx.ep, "extra", helpers).await), "3");
@@ -966,8 +966,8 @@ async fn remove_data_api_drops_the_helpers() {
 
 /// The org's live count in Zitadel (v2 search by id; 0 once deleted).
 async fn org_count(org: &str) -> usize {
-    let issuer = std::env::var("CHELADB_ZITADEL_ISSUER").expect("CHELADB_ZITADEL_ISSUER");
-    let pat = std::fs::read_to_string(env_path("CHELADB_ZITADEL_ADMIN_PAT_FILE")).unwrap();
+    let issuer = std::env::var("CHELABASE_ZITADEL_ISSUER").expect("CHELABASE_ZITADEL_ISSUER");
+    let pat = std::fs::read_to_string(env_path("CHELABASE_ZITADEL_ADMIN_PAT_FILE")).unwrap();
     let res: Value = reqwest::Client::new()
         .post(format!("{issuer}/v2/organizations/_search"))
         .bearer_auth(pat.trim())
@@ -982,7 +982,7 @@ async fn org_count(org: &str) -> usize {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev, CHELADB_COMPUTE_IMAGE and demo.env (Zitadel admin)"]
+#[ignore = "needs the Neon stack, just dev, CHELABASE_COMPUTE_IMAGE and demo.env (Zitadel admin)"]
 async fn app_users_live() {
     live(|fx| async move {
         let zitadel = fx.worker.zitadel.as_ref().expect("Zitadel admin access (source demo.env)");
@@ -1089,8 +1089,8 @@ async fn app_users_live() {
                          (SELECT count(*) FROM pg_trigger WHERE tgrelid = to_regclass('public.users') AND NOT tgisinternal) || '|' || \
                          (SELECT count(*) FROM pg_policy WHERE polrelid = to_regclass('public.users')) || '|' || \
                          (SELECT relrowsecurity FROM pg_class WHERE oid = to_regclass('public.users')) || '|' || \
-                         (SELECT count(*) FROM pg_roles WHERE rolname = 'cheladb_auth_sync') || '|' || \
-                         (SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'cheladb_users%')"
+                         (SELECT count(*) FROM pg_roles WHERE rolname = 'chelabase_auth_sync') || '|' || \
+                         (SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_users%')"
                     )
                     .await
                 ),

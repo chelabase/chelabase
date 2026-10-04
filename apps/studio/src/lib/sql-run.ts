@@ -1,4 +1,4 @@
-import { streamRequest } from "@cheladb/management-client";
+import { streamRequest } from "@chelabase/management-client";
 
 export type RunEvent =
   | { t: "notice"; severity: string; code: string; message: string; detail: string | null; hint: string | null; position: number | null }

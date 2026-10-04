@@ -6,14 +6,14 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppUsersStatus, BranchKind, BranchRecord, BranchStatus, OnDelete, ProjectAuth,
 };
-use cheladb_nats::{AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob};
-use cheladb_neon::ComputeBackend;
-use cheladb_secrets::{open_role_password, seal_role_password};
-use cheladb_types::{BranchId, DatabaseId, ProjectId};
-use cheladb_zitadel::client::{UserState, ZError, ZUser, Zitadel};
+use chelabase_nats::{AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob};
+use chelabase_neon::ComputeBackend;
+use chelabase_secrets::{open_role_password, seal_role_password};
+use chelabase_types::{BranchId, DatabaseId, ProjectId};
+use chelabase_zitadel::client::{UserState, ZError, ZUser, Zitadel};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -34,7 +34,7 @@ pub const STALE_TRANSITION: Duration = Duration::from_secs(5 * 60);
 /// Sessions revoked or expired this long ago are purged.
 pub const SESSION_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// One row of the users table as `cheladb.app_users_rows()` prints it.
+/// One row of the users table as `chelabase.app_users_rows()` prints it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct UserRow {
     pub id: Uuid,
@@ -46,7 +46,7 @@ pub struct UserRow {
 /// The users whose row on one branch differs from Zitadel, in order: users without a row or
 /// with a stale email or verified flag (Zitadel's order), then rows whose user is gone
 /// (`delete`: every such row; `mark`: those not marked deleted yet). Users whose id isn't a
-/// uuid were made outside Cheladb and are skipped (P15).
+/// uuid were made outside Chelabase and are skipped (P15).
 pub fn plan_app_users_sync(users: &[ZUser], rows: &[UserRow], on_delete: OnDelete) -> Vec<Uuid> {
     let mut plan = Vec::new();
     let mut known = HashSet::new();
@@ -78,7 +78,7 @@ pub fn plan_app_users_sync(users: &[ZUser], rows: &[UserRow], on_delete: OnDelet
     plan
 }
 
-/// `cheladb.app_users_rows()`'s jsonb array, from psql's output.
+/// `chelabase.app_users_rows()`'s jsonb array, from psql's output.
 fn parse_rows(output: &str) -> anyhow::Result<Vec<UserRow>> {
     let line = output
         .lines()
@@ -102,7 +102,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// The admin Zitadel client; its absence fails the job, which is retried (P2).
     fn admin_zitadel(&self) -> Result<&Zitadel, String> {
         self.zitadel.as_ref().ok_or_else(|| {
-            "Zitadel admin access isn't configured (CHELADB_ZITADEL_ISSUER and CHELADB_ZITADEL_ADMIN_PAT_FILE)"
+            "Zitadel admin access isn't configured (CHELABASE_ZITADEL_ISSUER and CHELABASE_ZITADEL_ADMIN_PAT_FILE)"
                 .to_string()
         })
     }
@@ -124,7 +124,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// The users bootstrap on one branch of the auth database: the branch's
-    /// `cheladb_auth_sync` password (the stored one when it was made for this Postgres
+    /// `chelabase_auth_sync` password (the stored one when it was made for this Postgres
     /// database; otherwise a new one, claimed before the script sets it, so a concurrent
     /// bootstrap of the branch sets the same one), then the script. The script carries the
     /// password's SCRAM verifier, never the password (N7).
@@ -191,7 +191,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
             }
         };
-        let verifier = cheladb_neon::scram::verifier(&password);
+        let verifier = chelabase_neon::scram::verifier(&password);
         let script =
             users_bootstrap_sql(&auth.schema_name, &auth.table_name, &verifier, OWNER_ROLE);
         self.computes
@@ -265,7 +265,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let project = auth.project_id;
         let org = project.to_string();
         zitadel
-            .ensure_org(&org, &format!("cheladb-app-{org}"))
+            .ensure_org(&org, &format!("chelabase-app-{org}"))
             .await
             .map_err(|e| format!("creating the Zitadel organization: {e}"))?;
         self.metadata
@@ -632,11 +632,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use cheladb_metadata::{AppUsersStatus, BranchKind, DataApiState, ProjectStatus};
-    use cheladb_secrets::{open_role_password, seal_role_password};
-    use cheladb_types::DatabaseId;
-    use cheladb_zitadel::client::{UserState, Zitadel};
-    use cheladb_zitadel::mock::{ADMIN_TOKEN, MockZitadel, User};
+    use chelabase_metadata::{AppUsersStatus, BranchKind, DataApiState, ProjectStatus};
+    use chelabase_secrets::{open_role_password, seal_role_password};
+    use chelabase_types::DatabaseId;
+    use chelabase_zitadel::client::{UserState, Zitadel};
+    use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel, User};
     use serde_json::json;
 
     use super::*;
@@ -648,8 +648,8 @@ pub(crate) mod tests {
         FakeDbRow, FakeWorker, Journal, entries, ready_branch, ready_database, worker,
     };
 
-    pub(crate) const BOOTSTRAP: &str = "-- cheladb:users-bootstrap";
-    const HELPERS: &str = "-- cheladb:claim-helpers";
+    pub(crate) const BOOTSTRAP: &str = "-- chelabase:users-bootstrap";
+    const HELPERS: &str = "-- chelabase:claim-helpers";
 
     pub(crate) struct Setup {
         pub w: FakeWorker,
@@ -759,7 +759,7 @@ pub(crate) mod tests {
         let pw = open_role_password(
             &w.key,
             &branch.id.to_string(),
-            "cheladb_auth_sync",
+            "chelabase_auth_sync",
             &row.password_sealed,
         )
         .unwrap();
@@ -782,7 +782,7 @@ pub(crate) mod tests {
         let (iterations, salt) = params.split_once(':').unwrap();
         let salt = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, salt).unwrap();
         assert_eq!(
-            cheladb_neon::scram::verifier_with_salt(password, &salt, iterations.parse().unwrap()),
+            chelabase_neon::scram::verifier_with_salt(password, &salt, iterations.parse().unwrap()),
             verifier,
             "the verifier is the stored password's"
         );
@@ -940,13 +940,13 @@ pub(crate) mod tests {
         let kept = "KeptPasswordKeptPasswordKeptPass";
         s.w.metadata.state().auth_sync.insert(
             s.main.id,
-            cheladb_metadata::BranchAuthSync {
+            chelabase_metadata::BranchAuthSync {
                 branch_id: s.main.id,
                 pg_database: "app".into(),
                 password_sealed: seal_role_password(
                     &s.w.key,
                     &s.main.id.to_string(),
-                    "cheladb_auth_sync",
+                    "chelabase_auth_sync",
                     kept,
                 ),
             },
@@ -955,13 +955,13 @@ pub(crate) mod tests {
         let stale = "StalePasswordStalePasswordStaleP";
         s.w.metadata.state().auth_sync.insert(
             s.dev.id,
-            cheladb_metadata::BranchAuthSync {
+            chelabase_metadata::BranchAuthSync {
                 branch_id: s.dev.id,
                 pg_database: "elsewhere".into(),
                 password_sealed: seal_role_password(
                     &s.w.key,
                     &s.dev.id.to_string(),
-                    "cheladb_auth_sync",
+                    "chelabase_auth_sync",
                     stale,
                 ),
             },
@@ -990,7 +990,7 @@ pub(crate) mod tests {
         let winner = "WinnerPasswordWinnerPasswordWinn";
         s.w.metadata.state().auth_sync_racer = Some((
             "app".into(),
-            seal_role_password(&s.w.key, &s.main.id.to_string(), "cheladb_auth_sync", winner),
+            seal_role_password(&s.w.key, &s.main.id.to_string(), "chelabase_auth_sync", winner),
         ));
 
         s.w.handle_app_users_job(&enable(&s)).await.unwrap();
@@ -1008,7 +1008,7 @@ pub(crate) mod tests {
         let s = setup(AppUsersStatus::Enabling).await;
         s.w.metadata.state().auth_sync.insert(
             s.main.id,
-            cheladb_metadata::BranchAuthSync {
+            chelabase_metadata::BranchAuthSync {
                 branch_id: s.main.id,
                 pg_database: "app".into(),
                 password_sealed: "v1:garbage".into(),
@@ -1031,7 +1031,7 @@ pub(crate) mod tests {
         let s = setup(AppUsersStatus::Enabling).await;
         s.w.metadata.state().auth_sync.insert(
             s.main.id,
-            cheladb_metadata::BranchAuthSync {
+            chelabase_metadata::BranchAuthSync {
                 branch_id: s.main.id,
                 pg_database: "app".into(),
                 password_sealed: "v1:garbage".into(),
@@ -1040,7 +1040,7 @@ pub(crate) mod tests {
         let winner = "WinnerPasswordWinnerPasswordWinn";
         s.w.metadata.state().auth_sync_racer = Some((
             "app".into(),
-            seal_role_password(&s.w.key, &s.main.id.to_string(), "cheladb_auth_sync", winner),
+            seal_role_password(&s.w.key, &s.main.id.to_string(), "chelabase_auth_sync", winner),
         ));
 
         s.w.handle_app_users_job(&enable(&s)).await.unwrap();
@@ -1068,7 +1068,7 @@ pub(crate) mod tests {
 
         for b in [&s.main, &s.dev] {
             assert_eq!(
-                scripts(&s.w, &ep(b), "app", "-- cheladb:users-teardown"),
+                scripts(&s.w, &ep(b), "app", "-- chelabase:users-teardown"),
                 [USERS_TEARDOWN_SQL]
             );
         }
@@ -1100,7 +1100,7 @@ pub(crate) mod tests {
         // A teardown failure is retried, and the row stays.
         let s = setup(AppUsersStatus::Disabling).await;
         s.with_org();
-        s.w.computes.fail_when("-- cheladb:users-teardown");
+        s.w.computes.fail_when("-- chelabase:users-teardown");
         s.w.handle_app_users_job(&AppUsersJob::Disable {
             project_id: s.project,
         })
@@ -1264,7 +1264,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// N1: a user deleted outside Cheladb's API (Zitadel console, webhook, reconcile) loses
+    /// N1: a user deleted outside Chelabase's API (Zitadel console, webhook, reconcile) loses
     /// their sessions too, not only their row.
     #[tokio::test]
     async fn sync_gone_user_revokes_sessions() {
@@ -1423,7 +1423,7 @@ pub(crate) mod tests {
             zuser(&stale_email.to_string(), "new@x.io", true),
             zuser(&stale_verified.to_string(), "v@x.io", true),
             zuser(&equal.to_string(), "e@x.io", false),
-            // Not a uuid: made outside Cheladb, skipped (P15).
+            // Not a uuid: made outside Chelabase, skipped (P15).
             zuser("312345678901234567", "console@x.io", true),
         ];
         let rows = [
@@ -1464,7 +1464,7 @@ pub(crate) mod tests {
              "deleted_at": "2026-10-03T10:00:00.123456+00:00"},
         ]);
         s.w.computes
-            .answer("cheladb.app_users_rows()", &rows.to_string());
+            .answer("chelabase.app_users_rows()", &rows.to_string());
 
         s.w.reconcile_app_users(s.project).await.unwrap();
 
@@ -1481,7 +1481,7 @@ pub(crate) mod tests {
                 &s.w,
                 &ep(b),
                 "app",
-                "BEGIN; SET LOCAL ROLE cheladb_auth_sync; SELECT cheladb.app_users_",
+                "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_",
             );
             let upserts: Vec<&String> = ran
                 .iter()
@@ -1514,12 +1514,12 @@ pub(crate) mod tests {
             {"id": g2, "email": "g2@example.com", "email_verified": true, "deleted_at": null},
         ]);
         s.w.computes
-            .answer("cheladb.app_users_rows()", &rows.to_string());
+            .answer("chelabase.app_users_rows()", &rows.to_string());
 
         s.w.reconcile_app_users(s.project).await.unwrap();
 
         for b in [&s.main, &s.dev] {
-            let ran = scripts(&s.w, &ep(b), "app", "BEGIN; SET LOCAL ROLE cheladb_auth_sync; SELECT cheladb.app_users_");
+            let ran = scripts(&s.w, &ep(b), "app", "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_");
             assert!(ran.contains(&upsert_call_sql(kept, "kept@example.com", true, created(), None)));
             assert!(
                 !ran.iter().any(|x| x.contains("app_users_gone")),
@@ -1534,7 +1534,7 @@ pub(crate) mod tests {
             {"id": g1, "email": "g1@example.com", "email_verified": true, "deleted_at": null},
         ]);
         s.w.computes
-            .answer("cheladb.app_users_rows()", &rows.to_string());
+            .answer("chelabase.app_users_rows()", &rows.to_string());
         s.w.reconcile_app_users(s.project).await.unwrap();
         for b in [&s.main, &s.dev] {
             assert!(scripts(&s.w, &ep(b), "app", "BEGIN;").iter().all(|x| !x.contains("app_users_gone")));
@@ -1556,9 +1556,9 @@ pub(crate) mod tests {
         let main_rows = json!([row(kept, "kept@example.com"), row(g1, "g1@x"), row(g2, "g2@x")]);
         let dev_rows = json!([row(kept, "kept@example.com"), row(also, "also@example.com"), row(g1, "g1@x")]);
         s.w.computes
-            .answer_at(&ep(&s.main), "cheladb.app_users_rows()", &main_rows.to_string());
+            .answer_at(&ep(&s.main), "chelabase.app_users_rows()", &main_rows.to_string());
         s.w.computes
-            .answer_at(&ep(&s.dev), "cheladb.app_users_rows()", &dev_rows.to_string());
+            .answer_at(&ep(&s.dev), "chelabase.app_users_rows()", &dev_rows.to_string());
 
         s.w.reconcile_app_users(s.project).await.unwrap();
 
@@ -1587,7 +1587,7 @@ pub(crate) mod tests {
             marked(Uuid::new_v4()), marked(Uuid::new_v4()), marked(Uuid::new_v4()),
         ]);
         s.w.computes
-            .answer("cheladb.app_users_rows()", &rows.to_string());
+            .answer("chelabase.app_users_rows()", &rows.to_string());
 
         s.w.reconcile_app_users(s.project).await.unwrap();
 
@@ -1649,7 +1649,7 @@ pub(crate) mod tests {
         s.with_org();
         let user = s.add_user("ada@example.com");
         // Every branch's table is empty.
-        s.w.computes.answer("cheladb.app_users_rows()", "[]");
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
 
         let feat = ready_branch(&s.w, s.db, "feat", s.main.id).await;
         let feat = s.w.metadata.branch(feat);
@@ -1686,7 +1686,7 @@ pub(crate) mod tests {
         let broken = crate::fakes::pending_branch(&s.w, s.db, "broken", s.main.id);
         s.w.handle_branch_create(broken, None).await.unwrap();
         let broken = s.w.metadata.branch(broken);
-        assert_eq!(broken.status, cheladb_metadata::BranchStatus::Failed);
+        assert_eq!(broken.status, chelabase_metadata::BranchStatus::Failed);
         let error = broken.error.unwrap();
         assert!(error.starts_with("bootstrapping app users: "), "{error}");
     }
@@ -1722,7 +1722,7 @@ pub(crate) mod tests {
             .unwrap()
             .status = AppUsersStatus::Enabling;
         let backup = BranchRecord {
-            id: cheladb_types::BranchId::new(),
+            id: chelabase_types::BranchId::new(),
             kind: BranchKind::Backup,
             name: "backup".into(),
             endpoint_id: Some("ep-backup".into()),
@@ -1734,7 +1734,7 @@ pub(crate) mod tests {
             .branches
             .get_mut(&late.id)
             .unwrap()
-            .status = cheladb_metadata::BranchStatus::Resetting;
+            .status = chelabase_metadata::BranchStatus::Resetting;
         s.w.computes.sql.lock().unwrap().clear();
         s.w.handle_app_users_job(&AppUsersJob::Enable {
             project_id: s.project,
@@ -1769,7 +1769,7 @@ pub(crate) mod tests {
             .set_branch_auth_sync(
                 s.dev.id,
                 "app",
-                &seal_role_password(&s.w.key, &s.dev.id.to_string(), "cheladb_auth_sync", kept),
+                &seal_role_password(&s.w.key, &s.dev.id.to_string(), "chelabase_auth_sync", kept),
             )
             .await
             .unwrap();
@@ -1817,7 +1817,7 @@ pub(crate) mod tests {
         let s = setup(AppUsersStatus::Enabled).await;
         s.with_org();
         let user = s.add_user("ada@example.com");
-        s.w.computes.answer("cheladb.app_users_rows()", "[]");
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
 
         // A stale enable and a fresh one (each with its own auth database id, no branches).
         let stale_enable = s.w.metadata.insert_project();

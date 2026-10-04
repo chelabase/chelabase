@@ -19,7 +19,7 @@ LOG_PREFIX=role-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
-PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
+PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 MIGRATION="$root/scripts/fixtures/role-migration.sql"
@@ -45,13 +45,13 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p cheladb || die "cargo build -p cheladb"
-[[ -f .cheladb/zitadel/demo.env ]] || die ".cheladb/zitadel/demo.env is missing (run just dev)"
+cargo build -q -p chelabase || die "cargo build -p chelabase"
+[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
 set -a
 # shellcheck disable=SC1091
-source .cheladb/zitadel/demo.env
+source .chelabase/zitadel/demo.env
 set +a
-ca="$root/.cheladb/neon/proxy-ca.crt"
+ca="$root/.chelabase/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
 trap cleanup EXIT
 

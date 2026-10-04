@@ -1,4 +1,4 @@
-//! Cheladb worker: provisioning, deletion, credential resets and reconcile.
+//! Chelabase worker: provisioning, deletion, credential resets and reconcile.
 //!
 //! [`Worker`] runs the lifecycle over the ports in [`ports`], so it can be tested with
 //! in-memory fakes; `main.rs` wires it to the real metadata database, storage controller,
@@ -7,9 +7,9 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use cheladb_secrets::SecretKey;
-use cheladb_types::BranchId;
-use cheladb_types::role_settings::RoleSettings;
+use chelabase_secrets::SecretKey;
+use chelabase_types::BranchId;
+use chelabase_types::role_settings::RoleSettings;
 
 pub mod app_users;
 pub mod app_users_sql;
@@ -51,11 +51,11 @@ pub struct Worker<M, S, C, N, P> {
     pub cache: N,
     pub pusher: P,
     pub key: SecretKey,
-    /// `CHELADB_DB_OWNER_SUPERUSER` in self-hosted mode: the owner role becomes SUPERUSER.
+    /// `CHELABASE_DB_OWNER_SUPERUSER` in self-hosted mode: the owner role becomes SUPERUSER.
     pub owner_superuser: bool,
-    /// `CHELADB_BRANCH_ROLE_CAP` and the other login-role settings.
+    /// `CHELABASE_BRANCH_ROLE_CAP` and the other login-role settings.
     pub roles: RoleSettings,
-    /// `CHELADB_CONTROL_PLANE_URI`: where computes forward role and database DDL.
+    /// `CHELABASE_CONTROL_PLANE_URI`: where computes forward role and database DDL.
     pub control_plane_uri: String,
     /// How often provisioning checks whether a new compute answers (500 ms in production).
     pub ready_poll: Duration,
@@ -64,19 +64,19 @@ pub struct Worker<M, S, C, N, P> {
     /// How often a long reset or restore step refreshes the branch's claim (60 s in
     /// production), well inside reconcile's stale threshold.
     pub claim_refresh: Duration,
-    /// The last branch reconcile's `cheladb` schema check looked at: each pass checks the next
+    /// The last branch reconcile's `chelabase` schema check looked at: each pass checks the next
     /// few ready branches after it, wrapping around.
     pub schema_check_cursor: Mutex<Option<BranchId>>,
     /// When reconcile first saw each `enabling` database row: one still there after
     /// [`reconcile::ENABLING_RETRY_SECS`] has its enable bootstrap run again.
     pub enabling_seen: Mutex<std::collections::HashMap<(BranchId, String), std::time::Instant>>,
-    /// Zitadel with the admin PAT (`CHELADB_ZITADEL_ADMIN_PAT_FILE`, `CHELADB_ZITADEL_ISSUER`):
+    /// Zitadel with the admin PAT (`CHELABASE_ZITADEL_ADMIN_PAT_FILE`, `CHELABASE_ZITADEL_ISSUER`):
     /// org create/delete, user reads and session deletes. `None` when either is unset; app
     /// users jobs that need it then fail and are retried (P2).
-    pub zitadel: Option<cheladb_zitadel::client::Zitadel>,
-    /// How often every enabled project's users are reconciled (`CHELADB_APP_USERS_RECONCILE_SECS`).
+    pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    /// How often every enabled project's users are reconciled (`CHELABASE_APP_USERS_RECONCILE_SECS`).
     pub app_users_reconcile_every: Duration,
-    /// `CHELADB_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
+    /// `CHELABASE_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
     /// endpoint row records (off: they're logged and kept).
     pub remove_orphans: bool,
 }

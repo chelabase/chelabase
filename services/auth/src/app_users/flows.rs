@@ -12,11 +12,11 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use cheladb_auth::app_token::{APP_ISSUER, AppClaims, app_audience};
-use cheladb_query::app_users::{NewUserRow, UserRowError};
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::api_extract::ApiJson;
-use cheladb_zitadel::rules::{normalize_email, strong_password};
+use chelabase_auth::app_token::{APP_ISSUER, AppClaims, app_audience};
+use chelabase_query::app_users::{NewUserRow, UserRowError};
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::api_extract::ApiJson;
+use chelabase_zitadel::rules::{normalize_email, strong_password};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,7 +62,7 @@ pub struct AppUserView {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[schema(as = AppSession)]
 pub struct SessionResponse {
-    /// Send it as the `Cheladb-User` header.
+    /// Send it as the `Chelabase-User` header.
     pub access_token: String,
     /// Always `bearer`.
     pub token_type: &'static str,
@@ -114,7 +114,7 @@ pub struct AppRefreshBody {
 
 #[derive(Deserialize, ToSchema)]
 pub struct AppSignOutBody {
-    /// Needed only without a `Cheladb-User` token.
+    /// Needed only without a `Chelabase-User` token.
     #[serde(default)]
     refresh_token: Option<String>,
 }
@@ -273,7 +273,7 @@ async fn app_refresh(
     path = "/auth/v1/app/sign-out",
     operation_id = "appSignOut",
     tag = TAG,
-    description = "Ends the session of the `Cheladb-User` token, or, without one, the session of the refresh token in the body.",
+    description = "Ends the session of the `Chelabase-User` token, or, without one, the session of the refresh token in the body.",
     request_body = AppSignOutBody,
     responses(
         (status = 204, description = "Signed out"),
@@ -300,7 +300,7 @@ async fn app_sign_out(
     path = "/auth/v1/app/user",
     operation_id = "appGetUser",
     tag = TAG,
-    description = "The signed-in app user (needs the `Cheladb-User` token).",
+    description = "The signed-in app user (needs the `Chelabase-User` token).",
     responses(
         (status = 200, description = "The user", body = AppUserView),
         (status = 401, description = "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
@@ -447,7 +447,7 @@ async fn app_password_reset_confirm(
     path = "/auth/v1/app/change-email",
     operation_id = "appChangeEmail",
     tag = TAG,
-    description = "Changes the signed-in user's email (needs the `Cheladb-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.",
+    description = "Changes the signed-in user's email (needs the `Chelabase-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.",
     request_body = AppEmailBody,
     responses(
         (status = 204, description = "Changed"),
@@ -476,7 +476,7 @@ async fn app_change_email(
     path = "/auth/v1/app/change-password",
     operation_id = "appChangePassword",
     tag = TAG,
-    description = "Changes the signed-in user's password (needs the `Cheladb-User` token) and returns a new session; every other session of the user ends.",
+    description = "Changes the signed-in user's password (needs the `Chelabase-User` token) and returns a new session; every other session of the user ends.",
     request_body = AppChangePasswordBody,
     responses(
         (status = 200, description = "The new session", body = SessionResponse),
@@ -537,7 +537,7 @@ mod text {
     pub const DISABLED: &str = "App users are not enabled for this project";
     pub const NOT_VERIFIED: &str = "Verify your email first";
     pub const INACTIVE: &str = "This account is deactivated or locked";
-    pub const NO_USER: &str = "This needs a signed-in user (the Cheladb-User header)";
+    pub const NO_USER: &str = "This needs a signed-in user (the Chelabase-User header)";
     pub const BAD_EMAIL: &str = "email is not a valid address";
 }
 
@@ -644,8 +644,8 @@ fn org(info: &AppBranchInfo) -> &str {
     info.zitadel_org_id.as_deref().unwrap_or_default()
 }
 
-/// The org's user with this email, when it has a Cheladb (uuid) id (P15). An email several
-/// users share (made outside Cheladb's checks) names no one; it is logged (N2).
+/// The org's user with this email, when it has a Chelabase (uuid) id (P15). An email several
+/// users share (made outside Chelabase's checks) names no one; it is logged (N2).
 async fn find_user(s: &AppState, info: &AppBranchInfo, email: &str) -> Flow<Option<(Uuid, ZUser)>> {
     match s.zitadel.find_user_in_org(org(info), email).await {
         Ok(EmailMatch::One(u)) => Ok(Uuid::parse_str(&u.id).ok().map(|id| (id, u))),
@@ -919,7 +919,7 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
         }
     };
     let ev = info.email_verification;
-    // Any user with this email counts, a non-uuid one made outside Cheladb too.
+    // Any user with this email counts, a non-uuid one made outside Chelabase too.
     match s.zitadel.find_user_in_org(org(&info), &email).await {
         Ok(EmailMatch::One(owner)) => {
             pending_insert.rollback().await;
@@ -1119,7 +1119,7 @@ async fn sign_out(s: &AppState, caller: &AppCaller, b: AppSignOutBody) -> Flow {
         return Err(fail(
             401,
             ErrorCode::UserTokenInvalid,
-            "Sign-out needs the user token (Cheladb-User) or a refresh_token",
+            "Sign-out needs the user token (Chelabase-User) or a refresh_token",
         ));
     };
     done.map_err(|e| internal_down(&e))?;

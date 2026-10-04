@@ -5,14 +5,14 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use cheladb_auth::internal::{InternalVerifier, IDENTITY_HEADER};
-use cheladb_routes::{orchestrator as routes, Service};
-use cheladb_metadata::{
+use chelabase_auth::internal::{InternalVerifier, IDENTITY_HEADER};
+use chelabase_routes::{orchestrator as routes, Service};
+use chelabase_metadata::{
     AppSession, AppUsersStatus, BeginDelete, BeginEnable, BeginProjectDelete, BranchAuthSync, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus, EnableStart,
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
     NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite, SettingsPatch, TenantOverview,
 };
-use cheladb_nats::{
+use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, GrantDataRoleRequest,
     JetStreamContext, JobEnvelope,
     ProjectDeleteJob, ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
@@ -20,11 +20,11 @@ use cheladb_nats::{
     SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_GRANT_DATA_ROLE_TO_OWNER, SUBJECT_RESET_PASSWORD,
     SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
 };
-use cheladb_secrets::{open_credential, open_role_password, Purpose, SecretKey};
-use cheladb_types::api_error::{ApiError, ErrorCode};
-use cheladb_types::mode::Mode;
-use cheladb_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
-use cheladb_types::api_error::ErrorEnvelope;
+use chelabase_secrets::{open_credential, open_role_password, Purpose, SecretKey};
+use chelabase_types::api_error::{ApiError, ErrorCode};
+use chelabase_types::mode::Mode;
+use chelabase_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
+use chelabase_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -51,11 +51,11 @@ pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAdd
 pub use openapi::openapi;
 
 /// The orchestrator's log filter when `RUST_LOG` is unset.
-pub const DEFAULT_LOG_FILTER: &str = "orchestrator=info,tower_http=info,cheladb_auth=info";
+pub const DEFAULT_LOG_FILTER: &str = "orchestrator=info,tower_http=info,chelabase_auth=info";
 
-/// Port the Neon proxy serves the Postgres protocol on (default of `CHELADB_PROXY_PG_PORT`).
+/// Port the Neon proxy serves the Postgres protocol on (default of `CHELABASE_PROXY_PG_PORT`).
 pub const PROXY_PG_PORT: u16 = 4432;
-/// Port the Neon proxy serves SQL-over-HTTP on (default of `CHELADB_PROXY_HTTP_PORT`).
+/// Port the Neon proxy serves SQL-over-HTTP on (default of `CHELABASE_PROXY_HTTP_PORT`).
 pub const PROXY_HTTP_PORT: u16 = 4444;
 
 /// Where clients reach the Neon proxy: `<ep>.<domain>` on these ports.
@@ -76,8 +76,8 @@ impl ProxyAddress {
         }
     }
 
-    /// `CHELADB_PROXY_DOMAIN` (default `localtest.me`), `CHELADB_PROXY_PG_PORT` and
-    /// `CHELADB_PROXY_HTTP_PORT` (defaults 4432 and 4444). Blank values count as unset.
+    /// `CHELABASE_PROXY_DOMAIN` (default `localtest.me`), `CHELABASE_PROXY_PG_PORT` and
+    /// `CHELABASE_PROXY_HTTP_PORT` (defaults 4432 and 4444). Blank values count as unset.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let value = |name: &str| {
             get(name)
@@ -95,9 +95,9 @@ impl ProxyAddress {
             }
         };
         Ok(Self {
-            domain: value("CHELADB_PROXY_DOMAIN").unwrap_or_else(|| "localtest.me".to_string()),
-            pg_port: port("CHELADB_PROXY_PG_PORT", PROXY_PG_PORT)?,
-            http_port: port("CHELADB_PROXY_HTTP_PORT", PROXY_HTTP_PORT)?,
+            domain: value("CHELABASE_PROXY_DOMAIN").unwrap_or_else(|| "localtest.me".to_string()),
+            pg_port: port("CHELABASE_PROXY_PG_PORT", PROXY_PG_PORT)?,
+            http_port: port("CHELABASE_PROXY_HTTP_PORT", PROXY_HTTP_PORT)?,
         })
     }
 }
@@ -868,7 +868,7 @@ pub trait JobPort: Send + Sync + 'static {
         name: &str,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
-    /// Stops serving a database; `remove` also drops the `cheladb` machinery there.
+    /// Stops serving a database; `remove` also drops the `chelabase` machinery there.
     fn disable_data_api(
         &self,
         branch_id: BranchId,
@@ -992,19 +992,19 @@ pub struct NatsPorts {
 
 impl JobPort for NatsPorts {
     async fn publish_provision(&self, job: &JobEnvelope<ProvisionDatabaseJob>) -> Result<(), BoxError> {
-        cheladb_nats::publish_provision(&self.js, job)
+        chelabase_nats::publish_provision(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
     async fn publish_delete(&self, job: &JobEnvelope<DeleteDatabaseJob>) -> Result<(), BoxError> {
-        cheladb_nats::publish_delete(&self.js, job)
+        chelabase_nats::publish_delete(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
     async fn publish_branch(&self, job: &JobEnvelope<BranchJob>) -> Result<(), BoxError> {
-        cheladb_nats::publish_branch(&self.js, job)
+        chelabase_nats::publish_branch(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
@@ -1013,7 +1013,7 @@ impl JobPort for NatsPorts {
         &self,
         job: &JobEnvelope<DatabaseSettingsJob>,
     ) -> Result<(), BoxError> {
-        cheladb_nats::publish_database_settings(&self.js, job)
+        chelabase_nats::publish_database_settings(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
@@ -1141,19 +1141,19 @@ impl JobPort for NatsPorts {
     }
 
     async fn publish_project_delete(&self, job: &JobEnvelope<ProjectDeleteJob>) -> Result<(), BoxError> {
-        cheladb_nats::publish_project_delete(&self.js, job)
+        chelabase_nats::publish_project_delete(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
     async fn publish_app_users(&self, job: &JobEnvelope<AppUsersJob>) -> Result<(), BoxError> {
-        cheladb_nats::publish_app_users(&self.js, job)
+        chelabase_nats::publish_app_users(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
 
     async fn publish_app_users_sync(&self, job: &JobEnvelope<AppUsersSyncJob>) -> Result<(), BoxError> {
-        cheladb_nats::publish_app_users_sync(&self.js, job)
+        chelabase_nats::publish_app_users_sync(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
@@ -1184,26 +1184,26 @@ pub struct AppState<M, J> {
     pub rest: RestInternal,
     /// Self-hosted mode reveals the dev CA's path next to the connection details.
     pub mode: Mode,
-    /// Where the dev proxy's CA certificate is (`CHELADB_PROXY_CA_FILE`); self-hosted only.
+    /// Where the dev proxy's CA certificate is (`CHELABASE_PROXY_CA_FILE`); self-hosted only.
     pub proxy_ca_file: String,
-    /// `CHELADB_BRANCH_DATA_API_DATABASE_CAP`: databases a branch serves, main included.
+    /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: databases a branch serves, main included.
     pub data_api_database_cap: u32,
     /// Where a compute publishes Postgres: the console's owner pools connect there.
     pub locator: Arc<dyn PostgresAddr>,
     /// Studio's console: owner pools, the owner's query caches, checked roles.
     pub console: Console,
-    /// Zitadel's admin API (admin PAT); `None` when `CHELADB_ZITADEL_ADMIN_PAT_FILE` or
-    /// `CHELADB_ZITADEL_ISSUER` isn't set.
-    pub zitadel: Option<cheladb_zitadel::client::Zitadel>,
+    /// Zitadel's admin API (admin PAT); `None` when `CHELABASE_ZITADEL_ADMIN_PAT_FILE` or
+    /// `CHELABASE_ZITADEL_ISSUER` isn't set.
+    pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// The one write path to a project's users table.
-    pub users_db: Arc<dyn cheladb_query::app_users::UsersDb>,
+    pub users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
     /// Studio's SQL editor: runs in flight and the data-role grant cache.
     pub sql_editor: sql_editor::SqlEditor,
 }
 
-/// `CHELADB_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
+/// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
 pub fn data_api_database_cap(value: Option<&str>) -> Result<u32, String> {
-    const NAME: &str = "CHELADB_BRANCH_DATA_API_DATABASE_CAP";
+    const NAME: &str = "CHELABASE_BRANCH_DATA_API_DATABASE_CAP";
     match value.map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(10),
         Some(v) => v
@@ -1294,7 +1294,7 @@ where
     }
 }
 
-/// Caller whose org is bound to a Cheladb tenant (soft-bind).
+/// Caller whose org is bound to a Chelabase tenant (soft-bind).
 #[derive(Debug, Clone)]
 struct AuthPrincipal {
     sub: String,
@@ -1323,7 +1323,7 @@ where
                 ApiError::new(
                     403,
                     ErrorCode::TenantNotBound,
-                    "no Cheladb tenant bound to this Zitadel org; run just zitadel-bootstrap",
+                    "no Chelabase tenant bound to this Zitadel org; run just zitadel-bootstrap",
                 )
             })?;
 
@@ -1471,7 +1471,7 @@ impl Database {
 #[derive(Debug, Serialize, ToSchema)]
 struct Me {
     user: MeUser,
-    /// `None` when the caller's org isn't bound to a Cheladb tenant yet.
+    /// `None` when the caller's org isn't bound to a Chelabase tenant yet.
     #[schema(required = true)]
     tenant: Option<Tenant>,
 }
@@ -1571,7 +1571,7 @@ where
 {
     OpenApiRouter::new()
         .routes(routes!(create_database))
-        // GET, PATCH and DELETE share one path (cheladb-routes GET_DATABASE / UPDATE_DATABASE /
+        // GET, PATCH and DELETE share one path (chelabase-routes GET_DATABASE / UPDATE_DATABASE /
         // DELETE_DATABASE).
         .routes(routes!(get_database, branches::update_database, delete_database))
         .routes(routes!(database_connection))
@@ -1663,7 +1663,7 @@ where
         (status = 202, description = "Accepted; the database is provisioned in the background (poll it until `ready`)", body = CreateDatabaseAccepted),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant; `forbidden`: `tenant_id` isn't the caller's tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: `tenant_id` isn't the caller's tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the tenant or project doesn't exist (another tenant's project answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`name_taken`: a database with this name exists in the project; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -1694,7 +1694,7 @@ where
     if body.name.trim().is_empty() {
         return ApiError::invalid_request(422, "name is required").into_response();
     }
-    if let Err(err) = cheladb_metadata::postgres_database_name(&body.name) {
+    if let Err(err) = chelabase_metadata::postgres_database_name(&body.name) {
         return ApiError::invalid_request(422, err.to_string()).into_response();
     }
 
@@ -1763,7 +1763,7 @@ where
         (status = 200, description = "The database with its settings and main endpoint", body = Database),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -1872,8 +1872,8 @@ pub(crate) struct ConnectionDetails {
     /// Null when it can't be shown; `password_state` says why.
     #[schema(required = true)]
     password: Option<String>,
-    /// `generated`: made by Cheladb, shown here. `set_in_sql`: set in SQL, only its hash is
-    /// stored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Cheladb's proxy
+    /// `generated`: made by Chelabase, shown here. `set_in_sql`: set in SQL, only its hash is
+    /// stored; reset it to get a shown one. `md5_unusable`: an MD5 hash, which Chelabase's proxy
     /// can't use; set a new password. `unreadable`: the stored password could not be opened
     /// (a rename or branch copy dropped it); reset it.
     password_state: PasswordState,
@@ -1917,7 +1917,7 @@ const BACKUP_REFUSAL: &str =
         (status = 200, description = "The owner credentials; never cached", body = ConnectionDetails),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`database_not_ready`: the database isn't ready; `branch_not_ready`: its main isn't ready; `credentials_unavailable`: the owner credentials are missing", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored credentials can't be opened with the current secrets key; `internal`: unexpected", body = ErrorEnvelope),
@@ -2015,7 +2015,7 @@ where
             500,
             ErrorCode::CredentialsUnavailable,
             "stored credentials can't be decrypted with the current secrets key; \
-             restore the original CHELADB_SECRETS_KEY file",
+             restore the original CHELABASE_SECRETS_KEY file",
         )
         .into_response()
     };
@@ -2128,7 +2128,7 @@ where
         (status = 204, description = "The password was reset; read the new one from the connection details"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`database_not_ready`: the database isn't ready; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the owner credentials are missing", body = ErrorEnvelope),
         (status = 500, description = "`internal`: the worker failed to reset the password", body = ErrorEnvelope),
@@ -2241,7 +2241,7 @@ where
         (status = 202, description = "Accepted; the database moves to `deleting` and is removed in the background", body = OperationAccepted),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`already_deleting`: the database is already being deleted; `branch_protected`: a branch of the database is protected, unprotect it first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -2346,9 +2346,9 @@ mod proxy_address_tests {
     #[test]
     fn the_proxy_ports_and_domain_come_from_the_environment() {
         let p = ProxyAddress::from_lookup(lookup(&[
-            ("CHELADB_PROXY_PG_PORT", "4532"),
-            ("CHELADB_PROXY_HTTP_PORT", "4544"),
-            ("CHELADB_PROXY_DOMAIN", "example.test"),
+            ("CHELABASE_PROXY_PG_PORT", "4532"),
+            ("CHELABASE_PROXY_HTTP_PORT", "4544"),
+            ("CHELABASE_PROXY_DOMAIN", "example.test"),
         ]))
         .unwrap();
         assert_eq!((p.pg_port, p.http_port), (4532, 4544));
@@ -2362,12 +2362,12 @@ mod proxy_address_tests {
     #[test]
     fn a_proxy_port_that_isnt_a_port_is_refused() {
         for bad in ["x", "0", "70000"] {
-            let err = ProxyAddress::from_lookup(lookup(&[("CHELADB_PROXY_PG_PORT", bad)]))
+            let err = ProxyAddress::from_lookup(lookup(&[("CHELABASE_PROXY_PG_PORT", bad)]))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("CHELADB_PROXY_PG_PORT"), "{bad}: {err}");
+            assert!(err.contains("CHELABASE_PROXY_PG_PORT"), "{bad}: {err}");
         }
-        let blank = ProxyAddress::from_lookup(lookup(&[("CHELADB_PROXY_HTTP_PORT", " ")]));
+        let blank = ProxyAddress::from_lookup(lookup(&[("CHELABASE_PROXY_HTTP_PORT", " ")]));
         assert_eq!(blank.unwrap().http_port, 4444);
     }
 }

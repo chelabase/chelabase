@@ -4,7 +4,7 @@
 //! per-project hostnames) can replace it without touching the request path.
 
 use arc_swap::ArcSwap;
-use cheladb_routes::Scope;
+use chelabase_routes::Scope;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -56,7 +56,7 @@ impl Registry {
     }
 }
 
-/// Check one `CHELADB_API_HOSTS` entry: a hostname or IPv4 address, or a
+/// Check one `CHELABASE_API_HOSTS` entry: a hostname or IPv4 address, or a
 /// bracketed IPv6 address, optionally with `:port`.
 fn validate_host_entry(entry: &str) -> Result<(), String> {
     let port_ok = |port: &str| port.parse::<u16>().is_ok();

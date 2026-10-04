@@ -14,7 +14,7 @@ export interface ManagementClientConfig {
 /** Error type orval puts on the generated hooks. */
 export type ErrorType<_E> = ApiError;
 
-export const NETWORK_MESSAGE = "Can't reach Cheladb; check your connection";
+export const NETWORK_MESSAGE = "Can't reach Chelabase; check your connection";
 
 let config: ManagementClientConfig | undefined;
 
@@ -60,7 +60,7 @@ export async function requestJson<T>(
       const text = await response.text();
       return (text === "" ? undefined : parse(text)) as T;
     } catch {
-      throw new ApiError(response.status, "internal", "Unexpected response from Cheladb");
+      throw new ApiError(response.status, "internal", "Unexpected response from Chelabase");
     }
   }
   const restarted = response.status === 401 && onUnauthorized ? onUnauthorized() === true : false;
@@ -137,6 +137,6 @@ export async function streamRequest(path: string, body: unknown, signal: AbortSi
     const restarted = response.status === 401 ? config.onUnauthorized() === true : false;
     throw await readApiError(response, restarted);
   }
-  if (!response.body) throw new ApiError(response.status, "internal", "Unexpected response from Cheladb");
+  if (!response.body) throw new ApiError(response.status, "internal", "Unexpected response from Chelabase");
   return response.body;
 }

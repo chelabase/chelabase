@@ -1,10 +1,10 @@
 //! Provisioning a database on Neon: an endpoint row, a tenant and timeline on the storage
 //! controller, a compute, and the data API roles and bootstrap inside it.
 
-use cheladb_metadata::{DatabaseStatus, NewEndpoint};
-use cheladb_neon::{ComputeBackend, NeonId};
-use cheladb_secrets::{Purpose, seal_credential};
-use cheladb_types::{BranchId, DatabaseId};
+use chelabase_metadata::{DatabaseStatus, NewEndpoint};
+use chelabase_neon::{ComputeBackend, NeonId};
+use chelabase_secrets::{Purpose, seal_credential};
+use chelabase_types::{BranchId, DatabaseId};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -171,7 +171,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             database_name,
             password: credentials::generate_password(),
         };
-        let verifier = cheladb_neon::scram::verifier(&rec.password);
+        let verifier = chelabase_neon::scram::verifier(&rec.password);
         let token_hash = sha256_hex(&rec.compute_token);
         let endpoint = NewEndpoint {
             id: &rec.endpoint_id,
@@ -385,8 +385,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::DatabaseStatus;
-    use cheladb_secrets::{Purpose, open_credential};
+    use chelabase_metadata::DatabaseStatus;
+    use chelabase_secrets::{Purpose, open_credential};
 
     use super::*;
     use crate::fakes::{FakeWorker, Journal, STORAGE_CAUSE, entries, position, worker};
@@ -460,7 +460,7 @@ GRANT anon, authenticated TO authenticator;
         assert_eq!(db.status, DatabaseStatus::Ready, "{:?}", db.error);
         assert_eq!(db.database_name.as_deref(), Some("web_1_prod"));
         assert_eq!(db.owner_role.as_deref(), Some("postgres"));
-        assert_eq!(main.status, cheladb_metadata::BranchStatus::Ready);
+        assert_eq!(main.status, chelabase_metadata::BranchStatus::Ready);
         let ep = main.endpoint_id.clone().unwrap();
         assert_eq!(w.metadata.endpoint_ids(), std::slice::from_ref(&ep));
 
@@ -679,7 +679,7 @@ GRANT anon, authenticated TO authenticator;
         let db = w.metadata.database(id);
         let main = w.metadata.main(id);
         assert_eq!(db.status, DatabaseStatus::Deleted);
-        assert_eq!(main.status, cheladb_metadata::BranchStatus::Deleted);
+        assert_eq!(main.status, chelabase_metadata::BranchStatus::Deleted);
         assert_eq!(main.owner_password_enc, None);
         assert!(w.metadata.endpoint_ids().is_empty());
         assert!(w.storage.tenants.lock().unwrap().is_empty());
@@ -757,7 +757,7 @@ GRANT anon, authenticated TO authenticator;
             let mut state = state.lock().unwrap();
             let main = state.branches.get_mut(&BranchId::from(id)).unwrap();
             let ep = main.endpoint_id.take().unwrap();
-            main.status = cheladb_metadata::BranchStatus::Deleted;
+            main.status = chelabase_metadata::BranchStatus::Deleted;
             state.endpoints.remove(&ep);
             state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Deleted;
         }));
@@ -794,7 +794,7 @@ GRANT anon, authenticated TO authenticator;
             let mut state = state.lock().unwrap();
             let main = state.branches.get_mut(&BranchId::from(id)).unwrap();
             let ep = main.endpoint_id.take().unwrap();
-            main.status = cheladb_metadata::BranchStatus::Failed;
+            main.status = chelabase_metadata::BranchStatus::Failed;
             state.endpoints.remove(&ep);
             let db = state.databases.get_mut(&id).unwrap();
             db.status = DatabaseStatus::Failed;
@@ -835,7 +835,7 @@ GRANT anon, authenticated TO authenticator;
             db.status = DatabaseStatus::Failed;
             db.error = Some("provisioning timed out".into());
             let main = state.branches.get_mut(&BranchId::from(id)).unwrap();
-            main.status = cheladb_metadata::BranchStatus::Failed;
+            main.status = chelabase_metadata::BranchStatus::Failed;
             main.error = Some("provisioning timed out".into());
         }));
 
@@ -844,7 +844,7 @@ GRANT anon, authenticated TO authenticator;
         let (db, main) = (w.metadata.database(id), w.metadata.main(id));
         assert_eq!(db.status, DatabaseStatus::Failed, "{:?}", entries(&journal));
         assert_eq!(db.error.as_deref(), Some("provisioning timed out"));
-        assert_eq!(main.status, cheladb_metadata::BranchStatus::Failed);
+        assert_eq!(main.status, chelabase_metadata::BranchStatus::Failed);
         assert!(has(&journal, "metadata.set_branch_ready"));
         assert!(!has(&journal, "metadata.mark_deleted"));
         assert!(!has(&journal, "metadata.mark_branch_deleted"));
@@ -868,7 +868,7 @@ GRANT anon, authenticated TO authenticator;
             let mut state = w.metadata.state();
             state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Provisioning;
             state.branches.get_mut(&BranchId::from(id)).unwrap().status =
-                cheladb_metadata::BranchStatus::Provisioning;
+                chelabase_metadata::BranchStatus::Provisioning;
         }
 
         w.handle_provision(id, "app").await.unwrap();

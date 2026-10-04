@@ -5,24 +5,24 @@
 use axum::Router;
 use axum::http::StatusCode as AxumStatus;
 use axum::routing::get;
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppSession, AppUsersStatus, BranchAuthSync, BranchConnectionRow, BranchKind, BranchRecord,
     ServedDatabase, BranchStatus, DataApiSettings, DataKeyLookup, DatabaseOrigin, MetadataError,
     NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, OnDelete, ProjectAuth, ProjectRecord,
     ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
 };
-use cheladb_nats::{AppUsersSyncJob, JobEnvelope};
-use cheladb_types::{DatabaseId, ProjectId, TenantId};
-use cheladb_zitadel::client::Zitadel;
-use cheladb_zitadel::mock::MockZitadel;
+use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
+use chelabase_types::{DatabaseId, ProjectId, TenantId};
+use chelabase_zitadel::client::Zitadel;
+use chelabase_zitadel::mock::MockZitadel;
 use orchestrator::internal::app::AppJobPort;
-use cheladb_secrets::{Purpose, SecretKey, seal_credential};
-use cheladb_types::BranchId;
-use cheladb_types::data_key::DataKeyKind;
-use cheladb_neon::jwt::generate_keypair;
-use cheladb_neon::{ComputeLocator, ComputeSigner, StorconClient};
-use cheladb_types::mode::Mode;
-use cheladb_types::role_settings::RoleSettings;
+use chelabase_secrets::{Purpose, SecretKey, seal_credential};
+use chelabase_types::BranchId;
+use chelabase_types::data_key::DataKeyKind;
+use chelabase_neon::jwt::generate_keypair;
+use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
+use chelabase_types::mode::Mode;
+use chelabase_types::role_settings::RoleSettings;
 use orchestrator::internal::{
     BoxFuture, CachePort, DdlPort, InternalState, NeonMetadataPort, build_internal_router,
 };
@@ -838,7 +838,7 @@ async fn spawn_internal(neon: FakeNeon, locator: FakeLocator, storcon_base: &str
 /// The rules the receiver applies: caps 50 and 20, strength on or off.
 fn rules(mode: Mode, strength: bool) -> RoleSettings {
     RoleSettings::from_lookup(mode, |k| {
-        (k == "CHELADB_PASSWORD_STRENGTH").then(|| if strength { "on" } else { "off" }.into())
+        (k == "CHELABASE_PASSWORD_STRENGTH").then(|| if strength { "on" } else { "off" }.into())
     })
     .unwrap()
 }
@@ -970,7 +970,7 @@ async fn spawn_with_app(
         actions_signing_key: app.signing_key,
         zitadel: app
             .zitadel
-            .map(|base| Zitadel::new(&base, cheladb_zitadel::mock::ADMIN_TOKEN)),
+            .map(|base| Zitadel::new(&base, chelabase_zitadel::mock::ADMIN_TOKEN)),
         app_jobs: Arc::new(app.jobs),
     });
     let addr = serve(build_internal_router(state)).await;
@@ -1548,10 +1548,10 @@ async fn a_metadata_failure_is_retried() {
 // --- Data API: key lookup and connection info ---------------------------------
 
 const KEY_ID: uuid::Uuid = uuid::Uuid::from_u128(0x1234);
-const PROJECT_ID: cheladb_types::ProjectId = cheladb_types::ProjectId(uuid::Uuid::from_u128(0x5678));
+const PROJECT_ID: chelabase_types::ProjectId = chelabase_types::ProjectId(uuid::Uuid::from_u128(0x5678));
 
 fn sha(key: &str) -> [u8; 32] {
-    cheladb_types::data_key::hash(key)
+    chelabase_types::data_key::hash(key)
 }
 
 #[tokio::test]
@@ -2070,7 +2070,7 @@ fn rows() -> Vec<Rule> {
             setup: none,
             body: roles_delta(vec![set("anon", STRONG, SCRAM)]),
             status: 409,
-            text: "the role name \"anon\" is reserved by Cheladb",
+            text: "the role name \"anon\" is reserved by Chelabase",
             check: |s| assert!(!s.roles.contains_key("anon")),
         },
         Rule {
@@ -2079,7 +2079,7 @@ fn rows() -> Vec<Rule> {
             setup: none,
             body: roles_delta(vec![set("PG_mine", STRONG, SCRAM)]),
             status: 409,
-            text: "the role name \"PG_mine\" is reserved by Cheladb",
+            text: "the role name \"PG_mine\" is reserved by Chelabase",
             check: nothing,
         },
         Rule {
@@ -2088,7 +2088,7 @@ fn rows() -> Vec<Rule> {
             setup: none,
             body: roles_delta(vec![set("app_rw", MD5, MD5)]),
             status: 409,
-            text: "MD5 passwords can't be used through Cheladb; set a plain password",
+            text: "MD5 passwords can't be used through Chelabase; set a plain password",
             check: no_app_rw,
         },
         Rule {
@@ -2097,7 +2097,7 @@ fn rows() -> Vec<Rule> {
             setup: none,
             body: roles_delta(vec![set("app_rw", STRONG, "plain-stored")]),
             status: 409,
-            text: "this password format can't be used through Cheladb; set a plain password",
+            text: "this password format can't be used through Chelabase; set a plain password",
             check: no_app_rw,
         },
         Rule {
@@ -2160,7 +2160,7 @@ fn rows() -> Vec<Rule> {
             setup: two_sql_copies,
             body: roles_delta(vec![set("app_rw", STRONG, SCRAM)]),
             status: 409,
-            text: "this branch has reached its limit of 2 login roles (CHELADB_BRANCH_ROLE_CAP)",
+            text: "this branch has reached its limit of 2 login roles (CHELABASE_BRANCH_ROLE_CAP)",
             check: no_app_rw,
         },
         Rule {
@@ -2192,7 +2192,7 @@ fn rows() -> Vec<Rule> {
             setup: none,
             body: roles_delta(vec![set("app_rw", STRONG, SCRAM)]),
             status: 409,
-            text: "this branch has reached its limit of 0 login roles (CHELADB_BRANCH_ROLE_CAP)",
+            text: "this branch has reached its limit of 0 login roles (CHELABASE_BRANCH_ROLE_CAP)",
             check: no_app_rw,
         },
         Rule {
@@ -2282,16 +2282,16 @@ fn rows() -> Vec<Rule> {
             setup: two_sql_copies,
             body: roles_delta(vec![json!({ "op": "set", "name": "authenticator", "old_name": "r1" })]),
             status: 409,
-            text: "the role name \"authenticator\" is reserved by Cheladb",
+            text: "the role name \"authenticator\" is reserved by Chelabase",
             check: |s| assert!(s.roles.contains_key("r1")),
         },
         Rule {
             what: "a reserved rename source",
             rules: sh,
             setup: none,
-            body: roles_delta(vec![json!({ "op": "set", "name": "mine", "old_name": "cheladb_admin" })]),
+            body: roles_delta(vec![json!({ "op": "set", "name": "mine", "old_name": "chelabase_admin" })]),
             status: 409,
-            text: "the role name \"cheladb_admin\" is reserved by Cheladb",
+            text: "the role name \"chelabase_admin\" is reserved by Chelabase",
             check: nothing,
         },
         Rule {
@@ -2344,7 +2344,7 @@ fn rows() -> Vec<Rule> {
             setup: none,
             body: roles_delta(vec![json!({ "op": "del", "name": "authenticated" })]),
             status: 409,
-            text: "the role name \"authenticated\" is reserved by Cheladb",
+            text: "the role name \"authenticated\" is reserved by Chelabase",
             check: nothing,
         },
         Rule {
@@ -2364,7 +2364,7 @@ fn rows() -> Vec<Rule> {
             },
             body: dbs_delta(vec![json!({ "op": "set", "name": "more", "owner": "postgres" })]),
             status: 409,
-            text: "this branch has reached its limit of 2 databases (CHELADB_BRANCH_DATABASE_CAP)",
+            text: "this branch has reached its limit of 2 databases (CHELABASE_BRANCH_DATABASE_CAP)",
             check: |s| assert!(!s.dbs.contains_key("more")),
         },
         Rule {
@@ -2516,7 +2516,7 @@ async fn ddl_rename_reseals_an_api_password() {
     let (neon, branch) = ddl_neon();
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     let sealed =
-        cheladb_secrets::seal_role_password(&app.key, &branch.to_string(), "api_r", "the-secret");
+        chelabase_secrets::seal_role_password(&app.key, &branch.to_string(), "api_r", "the-secret");
     neon.edit(|s| {
         s.roles
             .insert("api_r".into(), copy("api_r", RoleOrigin::Api, Some(SCRAM), Some(&sealed)));
@@ -2529,10 +2529,10 @@ async fn ddl_rename_reseals_an_api_password() {
     let resealed = row.password_enc.as_deref().expect("resealed");
     let b = branch.to_string();
     assert_eq!(
-        cheladb_secrets::open_role_password(&app.key, &b, "api_r2", resealed).unwrap(),
+        chelabase_secrets::open_role_password(&app.key, &b, "api_r2", resealed).unwrap(),
         "the-secret"
     );
-    assert!(cheladb_secrets::open_role_password(&app.key, &b, "api_r", resealed).is_err());
+    assert!(chelabase_secrets::open_role_password(&app.key, &b, "api_r", resealed).is_err());
 }
 
 // A role made, renamed and given `PASSWORD NULL` in one transaction reaches the receiver as
@@ -2554,7 +2554,7 @@ fn rename(old: &str, new: &str) -> Value {
 
 fn open(app: &Internal, branch: BranchId, name: &str, sealed: Option<&str>) -> String {
     let sealed = sealed.unwrap_or_else(|| panic!("{name} is revealable"));
-    cheladb_secrets::open_role_password(&app.key, &branch.to_string(), name, sealed)
+    chelabase_secrets::open_role_password(&app.key, &branch.to_string(), name, sealed)
         .unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
@@ -2566,7 +2566,7 @@ async fn ddl_swapping_two_role_names() {
     let (neon, branch) = ddl_neon();
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     let b = branch.to_string();
-    let seal = |name: &str, pw: &str| cheladb_secrets::seal_role_password(&app.key, &b, name, pw);
+    let seal = |name: &str, pw: &str| chelabase_secrets::seal_role_password(&app.key, &b, name, pw);
     let key = uuid::Uuid::new_v4();
     neon.edit(|s| {
         s.roles.insert("a".into(), copy("a", RoleOrigin::Api, Some("SCRAM-SHA-256$a"), Some(&seal("a", "pw-a"))));
@@ -2842,7 +2842,7 @@ async fn ddl_rename_marks_an_unopenable_password_unreadable() {
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     // Sealed under another name's AAD, so it won't open for `api_r`.
     let sealed =
-        cheladb_secrets::seal_role_password(&app.key, &branch.to_string(), "other", "the-secret");
+        chelabase_secrets::seal_role_password(&app.key, &branch.to_string(), "other", "the-secret");
     neon.edit(|s| {
         s.roles
             .insert("api_r".into(), copy("api_r", RoleOrigin::Api, Some(SCRAM), Some(&sealed)));
@@ -2975,7 +2975,7 @@ async fn spec_route_sets_console_url() {
         .expect("neon.console_url");
     assert_eq!(
         console["value"],
-        cheladb_neon::spec::ddl_url(CONTROL_PLANE_URI, "ep-a")
+        chelabase_neon::spec::ddl_url(CONTROL_PLANE_URI, "ep-a")
     );
 }
 
@@ -3109,10 +3109,10 @@ fn app_world() -> AppWorld {
             BranchAuthSync {
                 branch_id: main,
                 pg_database: "shop".into(),
-                password_sealed: cheladb_secrets::seal_role_password(
+                password_sealed: chelabase_secrets::seal_role_password(
                     &key,
                     &main.to_string(),
-                    "cheladb_auth_sync",
+                    "chelabase_auth_sync",
                     SYNC_PW,
                 ),
             },
@@ -3408,7 +3408,7 @@ async fn branch_info_for_auth_branch_targets_itself() {
                 "host": "127.0.0.1",
                 "port": 55432,
                 "database": "shop",
-                "user": "cheladb_auth_sync",
+                "user": "chelabase_auth_sync",
                 "password": SYNC_PW,
                 "schema": "public",
                 "table": "users",

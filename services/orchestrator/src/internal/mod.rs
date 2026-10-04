@@ -1,5 +1,5 @@
 //! The internal listener: machine-to-machine routes for Neon's proxy, compute_ctl and the
-//! storage controller. It binds `CHELADB_INTERNAL_ADDR` (loopback by default) and never goes
+//! storage controller. It binds `CHELABASE_INTERNAL_ADDR` (loopback by default) and never goes
 //! through the gateway. Each caller has its own bearer token and can open only its own routes.
 
 pub mod app;
@@ -17,19 +17,19 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, put};
 use axum::{Json, Router};
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppSession, BranchAuthSync, BranchConnectionRow, BranchRecord, DataKeyLookup, MetadataClient,
     MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, ProjectAuth,
     ProjectRecord, RefreshNext, RefreshOutcome,
 };
-use cheladb_types::{DatabaseId, ProjectId};
+use chelabase_types::{DatabaseId, ProjectId};
 use chrono::{DateTime, Utc};
-use cheladb_secrets::SecretKey;
-use cheladb_types::BranchId;
+use chelabase_secrets::SecretKey;
+use chelabase_types::BranchId;
 use uuid::Uuid;
-use cheladb_neon::{ComputeLocator, ComputeSigner, StorconClient};
+use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
 pub use ddl::{BoxFuture, CachePort, DdlPort};
-use cheladb_types::role_settings::RoleSettings;
+use chelabase_types::role_settings::RoleSettings;
 use std::future::Future;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -163,12 +163,12 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
 // As for `MetadataPort`: each method must call `MetadataClient`'s inherent method by its full
 // path, or a rename would make it call itself.
 impl NeonMetadataPort for MetadataClient {
-    type Ddl = cheladb_metadata::DdlTx;
+    type Ddl = chelabase_metadata::DdlTx;
 
     async fn begin_ddl(
         &self,
         endpoint_id: &str,
-    ) -> Result<Option<cheladb_metadata::DdlTx>, MetadataError> {
+    ) -> Result<Option<chelabase_metadata::DdlTx>, MetadataError> {
         MetadataClient::begin_ddl(self, endpoint_id).await
     }
     async fn neon_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
@@ -305,7 +305,7 @@ pub struct InternalState<M, L> {
     pub roles: RoleSettings,
     /// Tells the proxies a role's secret changed.
     pub cache: Arc<dyn CachePort>,
-    /// `CHELADB_CONTROL_PLANE_URI`: the base of `neon.console_url` in the specs served.
+    /// `CHELABASE_CONTROL_PLANE_URI`: the base of `neon.console_url` in the specs served.
     pub control_plane_uri: String,
     /// The REST service's internal listener: told when a forwarded `DROP`/`RENAME DATABASE`
     /// changes which databases a branch serves.
@@ -319,7 +319,7 @@ pub struct InternalState<M, L> {
     /// Checks the Zitadel Actions webhook; `None` makes it answer 503.
     pub actions_signing_key: Option<String>,
     /// Admin access to Zitadel, to delete its sessions (best effort); `None` skips that.
-    pub zitadel: Option<cheladb_zitadel::client::Zitadel>,
+    pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// Publishes app-user sync jobs.
     pub app_jobs: Arc<dyn app::AppJobPort>,
 }

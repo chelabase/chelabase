@@ -1,7 +1,7 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { BranchRole, ConnectionDetails } from "@cheladb/management-client";
+import type { BranchRole, ConnectionDetails } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, sequence, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { BranchRoles } from "./branch-roles";
@@ -16,7 +16,7 @@ const role = (over: Partial<BranchRole> & { name: string }): BranchRole => ({
   created_at: "2026-10-01T09:00:00Z",
   ...over,
 });
-const owner = role({ name: "cheladb_owner", origin: "owner", level: "owner_level" });
+const owner = role({ name: "chelabase_owner", origin: "owner", level: "owner_level" });
 const reader = role({ name: "reporting" });
 const admin = role({ name: "ops", level: "owner_level" });
 const sqlRole = role({ name: "analyst", origin: "sql", password: "set_in_sql" });
@@ -38,7 +38,7 @@ const ROLES = "/v1/databases/db/branches/br/roles";
 const CONNECTION = "/v1/databases/db/branches/br/connection";
 const list = (rows: BranchRole[]): FakeHandler => () => jsonResponse(rows);
 const connection: FakeHandler = (req) => {
-  const r = new URL(req.url).searchParams.get("role") ?? "cheladb_owner";
+  const r = new URL(req.url).searchParams.get("role") ?? "chelabase_owner";
   if (r === "analyst") {
     return jsonResponse({ ...details(r, ""), password: null, password_state: "set_in_sql" });
   }
@@ -69,12 +69,12 @@ describe("BranchRoles", () => {
     expect(r.getByText("Plain")).toBeInTheDocument();
     expect(r.getByText("Pending")).toBeInTheDocument();
     expect((await rowOf("ops")).getByText("Owner-level")).toBeInTheDocument();
-    expect((await rowOf("cheladb_owner")).getByText("Owner-level")).toBeInTheDocument();
+    expect((await rowOf("chelabase_owner")).getByText("Owner-level")).toBeInTheDocument();
   });
 
   it("roles_show_origin_level_and_password_state", async () => {
     setup({}, [owner, reader, sqlRole, md5Role]);
-    const o = await rowOf("cheladb_owner");
+    const o = await rowOf("chelabase_owner");
     expect(o.getByText("Owner")).toBeInTheDocument();
     const r = await rowOf("reporting");
     expect(r.getByText("Studio")).toBeInTheDocument();
@@ -92,7 +92,7 @@ describe("BranchRoles", () => {
   it("md5_warning", async () => {
     setup({}, [owner, md5Role]);
     const r = await rowOf("legacy");
-    expect(r.getByText("MD5 password: can't log in through Cheladb; reset it")).toBeInTheDocument();
+    expect(r.getByText("MD5 password: can't log in through Chelabase; reset it")).toBeInTheDocument();
     expect(r.getByRole("button", { name: "Reset password for legacy" })).toBeInTheDocument();
   });
 
@@ -124,13 +124,13 @@ describe("BranchRoles", () => {
 
   it("role_reveal_shows_ca_file_hint", async () => {
     setup(
-      { [`GET ${CONNECTION}`]: () => jsonResponse({ ...details("cheladb_owner", "pw-xyz"), ca_file: ".cheladb/neon/proxy-ca.crt" }) },
+      { [`GET ${CONNECTION}`]: () => jsonResponse({ ...details("chelabase_owner", "pw-xyz"), ca_file: ".chelabase/neon/proxy-ca.crt" }) },
       [owner, reader],
     );
-    await userEvent.click((await rowOf("cheladb_owner")).getByRole("button", { name: "Reveal cheladb_owner" }));
-    const section = await screen.findByRole("region", { name: "Connection for cheladb_owner" });
+    await userEvent.click((await rowOf("chelabase_owner")).getByRole("button", { name: "Reveal chelabase_owner" }));
+    const section = await screen.findByRole("region", { name: "Connection for chelabase_owner" });
     expect(within(section).getByText(/Local dev: pass the proxy's CA with/)).toHaveTextContent(
-      "sslrootcert=.cheladb/neon/proxy-ca.crt",
+      "sslrootcert=.chelabase/neon/proxy-ca.crt",
     );
   });
 
@@ -173,7 +173,7 @@ describe("BranchRoles", () => {
     const del = vi.fn(refused(409, "role_in_use", "role is used by Data API keys", { keys: [{ id: "k1", name: "ci-key" }] }));
     setup({ [`DELETE ${ROLES}/reporting`]: del });
     await userEvent.click((await rowOf("reporting")).getByRole("button", { name: "Delete reporting" }));
-    expect(screen.getByText(/Objects owned by reporting move to cheladb_owner\. Its sessions are closed\./)).toBeInTheDocument();
+    expect(screen.getByText(/Objects owned by reporting move to chelabase_owner\. Its sessions are closed\./)).toBeInTheDocument();
     expect(del).not.toHaveBeenCalled();
     await userEvent.click(btn("Confirm delete role"));
     expect(await screen.findByText("ci-key")).toBeInTheDocument();
@@ -203,9 +203,9 @@ describe("BranchRoles", () => {
 
   it("owner_has_no_delete", async () => {
     setup();
-    const r = await rowOf("cheladb_owner");
-    expect(r.getByRole("button", { name: "Reveal cheladb_owner" })).toBeInTheDocument();
-    expect(r.getByRole("button", { name: "Reset password for cheladb_owner" })).toBeInTheDocument();
+    const r = await rowOf("chelabase_owner");
+    expect(r.getByRole("button", { name: "Reveal chelabase_owner" })).toBeInTheDocument();
+    expect(r.getByRole("button", { name: "Reset password for chelabase_owner" })).toBeInTheDocument();
     expect(r.queryByRole("button", { name: /Delete/ })).not.toBeInTheDocument();
   });
 

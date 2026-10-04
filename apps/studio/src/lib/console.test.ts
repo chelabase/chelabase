@@ -1,4 +1,4 @@
-import { ApiError, type ColumnDesc } from "@cheladb/management-client";
+import { ApiError, type ColumnDesc } from "@chelabase/management-client";
 import { describe, expect, it } from "vitest";
 import { buildFilterTree, buildSelect, consoleErrorText, filterOpsFor, parseValue, whereByKey } from "./console";
 

@@ -13,11 +13,11 @@ cd "$root"
 LOG_PREFIX=neon-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-[[ -z "${CHELADB_INTERNAL_ADDR:-}" ]] || check_internal_addr "$CHELADB_INTERNAL_ADDR"
+[[ -z "${CHELABASE_INTERNAL_ADDR:-}" ]] || check_internal_addr "$CHELABASE_INTERNAL_ADDR"
 STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
-PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
-PROXY_HTTP_PORT="${CHELADB_PROXY_HTTP_PORT:-4444}"
+PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
+PROXY_HTTP_PORT="${CHELABASE_PROXY_HTTP_PORT:-4444}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -41,15 +41,15 @@ refused() { grep -q "password authentication failed for user 'postgres'" "$1"; }
 
 # Built up front: a cold compile between the first connect and the cache check (step 5) could
 # outlast the proxy's 1-minute cache TTL.
-cargo build -q -p cheladb || die "cargo build -p cheladb"
+cargo build -q -p chelabase || die "cargo build -p chelabase"
 
 # The demo tenant's identity (the token is minted per request: it is short-lived).
-[[ -f .cheladb/zitadel/demo.env ]] || die ".cheladb/zitadel/demo.env is missing (run just dev)"
+[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
 set -a
 # shellcheck disable=SC1091
-source .cheladb/zitadel/demo.env
+source .chelabase/zitadel/demo.env
 set +a
-ca="$root/.cheladb/neon/proxy-ca.crt"
+ca="$root/.chelabase/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
 
 trap cleanup EXIT
@@ -143,8 +143,8 @@ pass "SQL over HTTP on $PROXY_HTTP_PORT read the rows back"
 
 # The serverless driver, over WebSocket and HTTP.
 DATABASE_URL="postgresql://postgres:$old@$host/$dbname" NODE_EXTRA_CA_CERTS="$ca" EXPECT=3 \
-  CHELADB_PROXY_HTTP_PORT="$PROXY_HTTP_PORT" \
-  pnpm --filter @cheladb/neon-e2e --silent check || die "@neondatabase/serverless"
+  CHELABASE_PROXY_HTTP_PORT="$PROXY_HTTP_PORT" \
+  pnpm --filter @chelabase/neon-e2e --silent check || die "@neondatabase/serverless"
 
 # A wrong password is refused, over Postgres wire and over HTTP.
 if sql wrong-password -c 'select 1' >/dev/null 2>"$tmp/err"; then die "a wrong password connected"; fi
@@ -189,7 +189,7 @@ for i in $(seq 60); do
   sleep 1
 done
 db_id=""
-[[ -z "$(docker ps -aq --filter "name=^cheladb-compute-$ep\$")" ]] || die "container cheladb-compute-$ep still exists"
+[[ -z "$(docker ps -aq --filter "name=^chelabase-compute-$ep\$")" ]] || die "container chelabase-compute-$ep still exists"
 status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "$STORCON/control/v1/tenant/$tenant")" ||
   die "the storage controller didn't answer"
 [[ "$status" == 404 ]] || die "tenant $tenant still exists (HTTP $status)"

@@ -4,13 +4,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-set -a; source "$ROOT/.cheladb/zitadel/demo.env"; set +a
+set -a; source "$ROOT/.chelabase/zitadel/demo.env"; set +a
 # Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in Studio's .env.local.
 CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$ROOT/apps/studio/.env.local")}"
-ISS="$CHELADB_ZITADEL_ISSUER"
+ISS="$CHELABASE_ZITADEL_ISSUER"
 GW="${GATEWAY_URL:-http://localhost:8000}"
 MAILPIT="${MAILPIT_URL:-http://localhost:8025}"
-STUDIO="${CHELADB_STUDIO_URL:-http://localhost:3000}"
+STUDIO="${CHELABASE_STUDIO_URL:-http://localhost:3000}"
 JAR="$(mktemp)"; STATUS_FILE="$(mktemp)"; trap 'rm -f "$JAR" "$STATUS_FILE"' EXIT
 EMAIL="e2e-$(date +%s)-$RANDOM@example.com"
 PASSWORD="E2e-pass-$(openssl rand -hex 4)A!"
@@ -24,7 +24,7 @@ CHALLENGE="$(printf %s "$VERIFIER" | openssl dgst -sha256 -binary | b64url)"
 
 # authorize [prompt] → the authRequest id from Zitadel's redirect to Studio's /login
 authorize() {
-  local scope="openid profile email urn:zitadel:iam:user:resourceowner urn:zitadel:iam:org:project:id:${CHELADB_ZITADEL_PROJECT_ID}:aud"
+  local scope="openid profile email urn:zitadel:iam:user:resourceowner urn:zitadel:iam:org:project:id:${CHELABASE_ZITADEL_PROJECT_ID}:aud"
   local loc
   loc="$(curl -sS -o /dev/null -w '%{redirect_url}' -G "$ISS/oauth/v2/authorize" \
     --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$STUDIO/callback" \
@@ -69,7 +69,7 @@ ar="$(authorize create)"
 signed_up="$(ui sign-up "{\"authRequest\":\"$ar\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"givenName\":\"E\",\"familyName\":\"Two\"}")"
 [[ "$(status)" == 200 ]] || die "sign-up: $(status)"
 if [[ "$(jq -r .next <<<"$signed_up")" == verify ]]; then
-  # CHELADB_REQUIRE_EMAIL_VERIFICATION=true: finish with the code from Mailpit.
+  # CHELABASE_REQUIRE_EMAIL_VERIFICATION=true: finish with the code from Mailpit.
   code="$(mail_link "$EMAIL" verify | sed -E 's/.*code=([^&]+).*/\1/')"
   signed_up="$(ui verify-email "{\"code\":\"$code\"}")"
   say "verified the email with the code from Mailpit"
@@ -117,6 +117,6 @@ again="$(ui sign-in "{\"authRequest\":\"$(authorize)\",\"email\":\"$EMAIL\",\"pa
 say "reset the password and signed in with the new one"
 
 out_headers="$(curl -sS -D - -o /dev/null -b "$JAR" -c "$JAR" -H "Origin: $STUDIO" -H 'Content-Type: application/json' -X POST "$GW/auth/v1/logout" -d '{}')"
-grep -qi '^set-cookie: cheladb_session=;.*Max-Age=0' <<<"$out_headers" || die "logout didn't clear the session cookie"
+grep -qi '^set-cookie: chelabase_session=;.*Max-Age=0' <<<"$out_headers" || die "logout didn't clear the session cookie"
 say "logged out"
 say "ok"

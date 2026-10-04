@@ -1,4 +1,4 @@
-import { ApiError } from "@cheladb/management-client";
+import { ApiError } from "@chelabase/management-client";
 import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { useSignUp } from "@/lib/login-client/generated/endpoints";
@@ -35,7 +35,7 @@ export function SignUpForm({ authRequest = "", go, toVerify, toLogin }: FormProp
   }
 
   return (
-    <LoginLayout title="Create your Cheladb account">
+    <LoginLayout title="Create your Chelabase account">
       <form onSubmit={submit} className="space-y-4">
         <Field label="First name" value={givenName} onChange={setGivenName} autoComplete="given-name" />
         <Field label="Last name" value={familyName} onChange={setFamilyName} autoComplete="family-name" />

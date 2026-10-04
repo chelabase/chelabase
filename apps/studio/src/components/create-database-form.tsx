@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { getGetMeQueryKey, useCreateDatabase, useGetDatabase, type Database } from "@cheladb/management-client";
+import { getGetMeQueryKey, useCreateDatabase, useGetDatabase, type Database } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";

@@ -1,14 +1,14 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { getListBranchDatabasesQueryKey, type BranchDatabaseView } from "@cheladb/management-client";
+import { getListBranchDatabasesQueryKey, type BranchDatabaseView } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { DataApiDatabases, KeyDatabases } from "./data-api-databases";
 
 const row = (name: string, over: Partial<BranchDatabaseView> = {}): BranchDatabaseView => ({
   name,
-  owner: "cheladb_owner",
+  owner: "chelabase_owner",
   origin: "sql",
   main: false,
   data_api: "off",
@@ -112,7 +112,7 @@ describe("DataApiDatabases", () => {
     expect(new URL(find(fetch, DISABLE("app"))!.url).search).toBe("");
 
     await userEvent.click(screen.getByRole("button", { name: "Remove data API machinery" }));
-    expect(screen.getByText(/drops the cheladb schema/i)).toBeInTheDocument();
+    expect(screen.getByText(/drops the chelabase schema/i)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Confirm remove" }));
     await waitFor(() => expect(fetch.calls.filter((c) => c.method === "DELETE")).toHaveLength(2));
     expect(new URL(fetch.calls.filter((c) => c.method === "DELETE")[1].url).search).toBe("?remove=true");

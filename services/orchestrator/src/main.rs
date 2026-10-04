@@ -1,12 +1,12 @@
-use cheladb_auth::internal::InternalVerifier;
-use cheladb_metadata::{MetadataClient, MetadataConfig};
-use cheladb_query::app_users::PgUsersDb;
-use cheladb_nats::{connect, ensure_control_stream, NatsConfig};
-use cheladb_neon::proxy_cache::ProxyCache;
-use cheladb_neon::{DockerLocator, StorconClient};
-use cheladb_types::mode::Mode;
-use cheladb_types::role_settings::RoleSettings;
-use cheladb_secrets::{key_check_value, verify_key_check, SecretKey};
+use chelabase_auth::internal::InternalVerifier;
+use chelabase_metadata::{MetadataClient, MetadataConfig};
+use chelabase_query::app_users::PgUsersDb;
+use chelabase_nats::{connect, ensure_control_stream, NatsConfig};
+use chelabase_neon::proxy_cache::ProxyCache;
+use chelabase_neon::{DockerLocator, StorconClient};
+use chelabase_types::mode::Mode;
+use chelabase_types::role_settings::RoleSettings;
+use chelabase_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
 use orchestrator::{build_router, AppState, Console, NatsPorts, ProxyAddress, RestInternal};
 use std::net::SocketAddr;
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let metadata_config = MetadataConfig::from_env().unwrap_or_else(|_| MetadataConfig {
-        database_url: "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into(),
+        database_url: "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into(),
     });
     let nats_config = NatsConfig::from_env().expect("nats config");
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
@@ -48,11 +48,11 @@ async fn main() -> anyhow::Result<()> {
     ensure_secrets_key(&metadata, &secrets).await?;
 
     let data_api_database_cap = orchestrator::data_api_database_cap(
-        std::env::var("CHELADB_BRANCH_DATA_API_DATABASE_CAP").ok().as_deref(),
+        std::env::var("CHELABASE_BRANCH_DATA_API_DATABASE_CAP").ok().as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
     let rest = RestInternal {
-        url: env_or("CHELADB_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
+        url: env_or("CHELABASE_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
         token: internal_config.rest_token.clone(),
         http: reqwest::Client::new(),
     };
@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         proxy: ProxyAddress::from_lookup(|name| std::env::var(name).ok())?,
         rest,
         mode,
-        proxy_ca_file: env_or("CHELADB_PROXY_CA_FILE", ".cheladb/neon/proxy-ca.crt"),
+        proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),
         data_api_database_cap,
         locator: Arc::new(DockerLocator::connect(&internal_config.compute_network)?),
         console: Console::default(),
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_router(Arc::new(state));
 
-    let addr: SocketAddr = std::env::var("CHELADB_ORCHESTRATOR_ADDR")
+    let addr: SocketAddr = std::env::var("CHELABASE_ORCHESTRATOR_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8081".into())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Refuse to run with a secrets key that can't open existing credentials.
 async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyhow::Result<()> {
-    use cheladb_metadata::KeyCheck;
+    use chelabase_metadata::KeyCheck;
     match metadata
         .ensure_key_check(&key_check_value(key), |stored| verify_key_check(key, stored))
         .await?
@@ -132,24 +132,24 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
             Ok(())
         }
         KeyCheck::Mismatch { sealed_rows } => anyhow::bail!(
-            "CHELADB_SECRETS_KEY is not the key {sealed_rows} database(s) were encrypted with. \
-             Restore the original .cheladb/secrets/secrets.key; in local dev you can instead \
+            "CHELABASE_SECRETS_KEY is not the key {sealed_rows} database(s) were encrypted with. \
+             Restore the original .chelabase/secrets/secrets.key; in local dev you can instead \
              remove every database with `just sweep-dbs`."
         ),
     }
 }
 
-/// Zitadel's admin API with the admin PAT from `CHELADB_ZITADEL_ADMIN_PAT_FILE`; `None`
-/// (warned) when that or `CHELADB_ZITADEL_ISSUER` is missing or the file can't be read.
-fn zitadel_admin() -> Option<cheladb_zitadel::client::Zitadel> {
+/// Zitadel's admin API with the admin PAT from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`; `None`
+/// (warned) when that or `CHELABASE_ZITADEL_ISSUER` is missing or the file can't be read.
+fn zitadel_admin() -> Option<chelabase_zitadel::client::Zitadel> {
     let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    let (Some(file), Some(issuer)) = (var("CHELADB_ZITADEL_ADMIN_PAT_FILE"), var("CHELADB_ZITADEL_ISSUER"))
+    let (Some(file), Some(issuer)) = (var("CHELABASE_ZITADEL_ADMIN_PAT_FILE"), var("CHELABASE_ZITADEL_ISSUER"))
     else {
-        warn!("CHELADB_ZITADEL_ADMIN_PAT_FILE or CHELADB_ZITADEL_ISSUER is not set; app users can't be enabled");
+        warn!("CHELABASE_ZITADEL_ADMIN_PAT_FILE or CHELABASE_ZITADEL_ISSUER is not set; app users can't be enabled");
         return None;
     };
     match std::fs::read_to_string(&file) {
-        Ok(pat) if !pat.trim().is_empty() => Some(cheladb_zitadel::client::Zitadel::new(&issuer, pat.trim())),
+        Ok(pat) if !pat.trim().is_empty() => Some(chelabase_zitadel::client::Zitadel::new(&issuer, pat.trim())),
         Ok(_) => {
             warn!("{file} is empty; app users can't be enabled");
             None

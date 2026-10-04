@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApiError } from "@cheladb/management-client";
+import { ApiError } from "@chelabase/management-client";
 import { configureLoginClient, customFetch } from "./fetch";
 
 describe("login customFetch", () => {

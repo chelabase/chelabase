@@ -1,7 +1,7 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getListKeysQueryKey, type BranchDatabaseView, type CreatedDataKey, type DataKey } from "@cheladb/management-client";
+import { getListKeysQueryKey, type BranchDatabaseView, type CreatedDataKey, type DataKey } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { DataApiKeys } from "./data-api-keys";

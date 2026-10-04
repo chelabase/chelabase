@@ -35,19 +35,19 @@ pub async fn run() -> Result<()> {
 
     if !sa_path.is_file() {
         bail!(
-            "missing {} — run: just zitadel-bootstrap (or cargo run -p cheladb -- dev bootstrap)",
+            "missing {} — run: just zitadel-bootstrap (or cargo run -p chelabase -- dev bootstrap)",
             sa_path.display()
         );
     }
 
     let env = load_dotenv_file(&env_path);
     let iss = env
-        .get("CHELADB_ZITADEL_ISSUER")
+        .get("CHELABASE_ZITADEL_ISSUER")
         .cloned()
         .unwrap_or_else(issuer);
     let project_id = env
-        .get("CHELADB_ZITADEL_PROJECT_ID")
-        .context("missing CHELADB_ZITADEL_PROJECT_ID in demo.env — run auth bootstrap")?;
+        .get("CHELABASE_ZITADEL_PROJECT_ID")
+        .context("missing CHELABASE_ZITADEL_PROJECT_ID in demo.env — run auth bootstrap")?;
 
     let key: ServiceAccountKey = serde_json::from_str(
         &std::fs::read_to_string(&sa_path).with_context(|| format!("read {}", sa_path.display()))?,

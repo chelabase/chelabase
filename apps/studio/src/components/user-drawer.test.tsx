@@ -1,7 +1,7 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { AppUser } from "@cheladb/management-client";
+import type { AppUser } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { UserDrawer } from "./user-drawer";

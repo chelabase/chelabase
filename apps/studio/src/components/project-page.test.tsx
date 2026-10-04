@@ -2,7 +2,7 @@ import { useState } from "react";
 import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Me, ProjectInfo } from "@cheladb/management-client";
+import type { Me, ProjectInfo } from "@chelabase/management-client";
 import { POLL_MS } from "@/lib/query";
 import { fakeFetch, jsonResponse, sequence, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithRouter } from "@/test/render-router";

@@ -8,7 +8,7 @@ import {
   type BranchDatabaseView,
   type CreatedDataKey,
   type DataKey,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { CopyButton } from "./copy-button";

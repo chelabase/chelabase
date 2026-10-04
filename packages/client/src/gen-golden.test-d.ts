@@ -1,4 +1,4 @@
-// The generated golden file (`cheladb gen types` over fixtures/gen/schema.json) against the
+// The generated golden file (`chelabase gen types` over fixtures/gen/schema.json) against the
 // real client types. A Rust test keeps the file equal to the generator's output.
 import { expectTypeOf, test } from "vitest";
 import { createClient } from "./index.ts";

@@ -29,7 +29,7 @@ pub fn ensure(dir: &Path) -> Result<InternalKeyPaths> {
             tracing::info!("reusing internal identity keypair in {}", dir.display());
         }
         (false, false) => {
-            let (private_pem, public_pem) = cheladb_auth::internal::generate_keypair_pem();
+            let (private_pem, public_pem) = chelabase_auth::internal::generate_keypair_pem();
             write_private(&paths.signing, &private_pem)?;
             std::fs::write(&paths.verify, public_pem)
                 .with_context(|| format!("write {}", paths.verify.display()))?;
@@ -65,7 +65,7 @@ pub(crate) fn write_private(path: &Path, pem: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_auth::internal::{AuthMethod, Identity, InternalSigner, InternalVerifier};
+    use chelabase_auth::internal::{AuthMethod, Identity, InternalSigner, InternalVerifier};
 
     #[test]
     fn creates_a_keypair_that_signs_and_verifies() {

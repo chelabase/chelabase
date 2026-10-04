@@ -10,8 +10,8 @@
 //! pass or fail.
 //!
 //! ```text
-//! set -a; . .cheladb/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; set +a
-//! CHELADB_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
+//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
+//! CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
 //!   cargo test -p rest --test rest_live -- --ignored --test-threads=1 --nocapture
 //! ```
 
@@ -20,20 +20,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cheladb_auth::internal::{
+use chelabase_auth::internal::{
     AuthMethod, DataIdentity, IDENTITY_HEADER, Identity, InternalSigner, InternalVerifier,
     generate_keypair_pem,
 };
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchRecord, BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID,
     DataApiState, DatabaseStatus, EnableStart, MetadataClient, MetadataConfig, NewBranch,
     NewDataKey,
 };
-use cheladb_nats::{BranchJob, DataApiDatabaseRequest, PointInTime};
-use cheladb_neon::{ComputeBackend, ComputeLocator, NeonId};
-use cheladb_secrets::{Purpose, SecretKey, open_credential};
-use cheladb_types::data_key::DataKeyKind;
-use cheladb_types::{BranchId, DatabaseId};
+use chelabase_nats::{BranchJob, DataApiDatabaseRequest, PointInTime};
+use chelabase_neon::{ComputeBackend, ComputeLocator, NeonId};
+use chelabase_secrets::{Purpose, SecretKey, open_credential};
+use chelabase_types::data_key::DataKeyKind;
+use chelabase_types::{BranchId, DatabaseId};
 use rest::app::{AppState, internal_router, router};
 use rest::conn::InternalSource;
 use rest::exec::Engine;
@@ -73,7 +73,7 @@ async fn setup() -> (RealWorker, MetadataClient) {
         .with_test_writer()
         .try_init();
     let mut config =
-        WorkerConfig::from_env().expect("worker config (is CHELADB_COMPUTE_IMAGE set?)");
+        WorkerConfig::from_env().expect("worker config (is CHELABASE_COMPUTE_IMAGE set?)");
     if config.compute_jwt_dir.is_relative() {
         config.compute_jwt_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -81,14 +81,14 @@ async fn setup() -> (RealWorker, MetadataClient) {
     }
     let metadata = MetadataClient::connect(&MetadataConfig {
         database_url: env_or(
-            "CHELADB_METADATA_DATABASE_URL",
-            "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata",
+            "CHELABASE_METADATA_DATABASE_URL",
+            "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata",
         ),
     })
     .await
     .expect("metadata database");
     let key =
-        SecretKey::from_env().expect("CHELADB_SECRETS_KEY (source .cheladb/zitadel/demo.env)");
+        SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (source .chelabase/zitadel/demo.env)");
     let worker = build(&config, metadata.clone(), key).expect("worker");
     (worker, metadata)
 }
@@ -157,11 +157,11 @@ where
     }
 
     let (private, public) = generate_keypair_pem();
-    let internal_token = env_or("CHELADB_REST_INTERNAL_TOKEN", "cheladb-dev-rest-internal");
+    let internal_token = env_or("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal");
     let state = Arc::new(AppState {
         engine: Engine::new(
             InternalSource::new(
-                &env_or("CHELADB_INTERNAL_URL", "http://127.0.0.1:8083"),
+                &env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
                 &internal_token,
             ),
             200,
@@ -179,7 +179,7 @@ where
         internal_token,
         signer: InternalSigner::from_pem(private.as_bytes()).unwrap(),
         http: reqwest::Client::new(),
-        key: SecretKey::from_env().expect("CHELADB_SECRETS_KEY"),
+        key: SecretKey::from_env().expect("CHELABASE_SECRETS_KEY"),
     });
     let outcome = tokio::spawn(body(ctx.clone())).await;
     cleanup(&ctx.worker, &ctx.metadata, db).await;
@@ -575,7 +575,7 @@ fn keys(row: &Value) -> Vec<&str> {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn select_insert_update_delete_call_and_batch_round_trip() {
     live("crud", |l| async move {
         l.owner(
@@ -653,7 +653,7 @@ async fn select_insert_update_delete_call_and_batch_round_trip() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn batch_failure_rolls_back_everything() {
     live("batch", |l| async move {
         l.owner("CREATE TABLE u (id int PRIMARY KEY);").await;
@@ -681,7 +681,7 @@ async fn batch_failure_rolls_back_everything() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn casts_for_enum_domain_uuid_timestamptz_numeric_arrays_jsonb() {
     live("casts", |l| async move {
         l.owner(
@@ -740,7 +740,7 @@ async fn casts_for_enum_domain_uuid_timestamptz_numeric_arrays_jsonb() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn anon_reads_and_cannot_write() {
     live("anon", |l| async move {
         l.owner("CREATE TABLE t (v text);").await;
@@ -763,7 +763,7 @@ async fn anon_reads_and_cannot_write() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn secret_key_custom_role() {
     live("role", |l| async move {
         l.owner(
@@ -802,7 +802,7 @@ async fn secret_key_custom_role() {
 /// REPLICATION or `neon_superuser` at any depth — is refused before rest switches to it. A plain
 /// role next to them still reads.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn secret_key_of_an_owner_level_role_is_refused() {
     live("ownerlvl", |l| async move {
         l.owner(
@@ -854,7 +854,7 @@ async fn secret_key_of_an_owner_level_role_is_refused() {
 /// The internal schema route with `?role=` (the console's schema as a role): what that role
 /// reaches, with its privileges; a missing role is 404 `unknown_role`, an owner-level one 403.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn internal_schema_for_a_console_role() {
     live("schemarole", |l| async move {
         l.owner(
@@ -899,7 +899,7 @@ async fn internal_schema_for_a_console_role() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn rls_policy_is_enforced() {
     live("rls", |l| async move {
         l.owner(
@@ -930,7 +930,7 @@ async fn rls_policy_is_enforced() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn unfiltered_update_is_refused() {
     live("unfiltered", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('a'), ('b');").await;
@@ -949,7 +949,7 @@ async fn unfiltered_update_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn new_column_is_visible_on_the_next_request() {
     live("ddl", |l| async move {
         l.owner("CREATE TABLE t (a int); INSERT INTO t VALUES (1);")
@@ -977,7 +977,7 @@ async fn new_column_is_visible_on_the_next_request() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_rewinds_the_schema_and_the_old_shape_is_served() {
     live("restore", |l| async move {
         l.owner("CREATE TABLE h (a int); INSERT INTO h VALUES (1);")
@@ -1018,19 +1018,19 @@ async fn restore_rewinds_the_schema_and_the_old_shape_is_served() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
-async fn dropped_cheladb_is_unavailable_then_healed_by_bootstrap() {
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn dropped_chelabase_is_unavailable_then_healed_by_bootstrap() {
     live("heal", |l| async move {
         l.owner("CREATE TABLE t (v text);").await;
         let select = json!({"v":1,"op":"select","from":"t"});
         l.anon(select.clone()).await.ok();
 
-        l.sql_on(l.main_id(), "DROP SCHEMA cheladb CASCADE;").await;
+        l.sql_on(l.main_id(), "DROP SCHEMA chelabase CASCADE;").await;
         let down = l.anon(select.clone()).await;
         let error = down.error(503, "unavailable");
         assert_eq!(
             error["message"],
-            cheladb_query::error::schema_missing_in(&l.database_name)
+            chelabase_query::error::schema_missing_in(&l.database_name)
         );
         let main = l.branch(l.main_id()).await;
         l.worker
@@ -1042,7 +1042,7 @@ async fn dropped_cheladb_is_unavailable_then_healed_by_bootstrap() {
         // Revoked grants answer the same way, until the bootstrap runs again.
         l.sql_on(
             l.main_id(),
-            "REVOKE USAGE ON SCHEMA cheladb FROM PUBLIC, authenticator;",
+            "REVOKE USAGE ON SCHEMA chelabase FROM PUBLIC, authenticator;",
         )
         .await;
         l.anon(select.clone()).await.error(503, "unavailable");
@@ -1056,7 +1056,7 @@ async fn dropped_cheladb_is_unavailable_then_healed_by_bootstrap() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn reset_moves_the_compute_and_the_engine_reconnects() {
     live("reset", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('A');")
@@ -1109,7 +1109,7 @@ async fn reset_moves_the_compute_and_the_engine_reconnects() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn unreachable_table_looks_missing() {
     live("hidden", |l| async move {
         l.owner(
@@ -1158,7 +1158,7 @@ async fn unreachable_table_looks_missing() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn hostile_names_live() {
     live("names", |l| async move {
         l.owner(r#"CREATE TABLE "Order" (id int PRIMARY KEY, "select" text, "we""ird; x" text);"#)
@@ -1189,7 +1189,7 @@ async fn hostile_names_live() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn extension_functions_work_in_defaults_and_are_not_callable() {
     live("ext", |l| async move {
         l.owner(
@@ -1213,7 +1213,7 @@ async fn extension_functions_work_in_defaults_and_are_not_callable() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn schema_endpoints_live() {
     live("schema", |l| async move {
         l.owner(
@@ -1259,13 +1259,13 @@ async fn schema_endpoints_live() {
     .await;
 }
 
-/// A `cheladb` schema the owner made before the first bootstrap (with a trigger that
+/// A `chelabase` schema the owner made before the first bootstrap (with a trigger that
 /// would make them superuser), an `=` operator planted for the first bootstrap's grants,
-/// and a membership in `cheladb_admin`: the bootstrap renames the schema aside, revokes
+/// and a membership in `chelabase_admin`: the bootstrap renames the schema aside, revokes
 /// the membership and never runs the owner's code as superuser.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
-async fn untrusted_cheladb_is_quarantined_and_runs_nothing_as_superuser() {
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn untrusted_chelabase_is_quarantined_and_runs_nothing_as_superuser() {
     live("quarantine", |l| async move {
         let superuser = || async {
             l.sql_on(l.main_id(), "SELECT rolsuper FROM pg_roles WHERE rolname = 'postgres';")
@@ -1277,26 +1277,26 @@ async fn untrusted_cheladb_is_quarantined_and_runs_nothing_as_superuser() {
         let quarantined = || async {
             l.sql_on(
                 l.main_id(),
-                "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'cheladb\\_quarantine\\_%';",
+                "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'chelabase\\_quarantine\\_%';",
             )
             .await
             .trim()
             .to_owned()
         };
         // As if the database had never been bootstrapped, and the owner made
-        // cheladb_admin first, with a login.
+        // chelabase_admin first, with a login.
         l.sql_on(
             l.main_id(),
-            "DROP SCHEMA cheladb CASCADE; DROP OWNED BY cheladb_admin; DROP ROLE cheladb_admin;",
+            "DROP SCHEMA chelabase CASCADE; DROP OWNED BY chelabase_admin; DROP ROLE chelabase_admin;",
         )
         .await;
         l.owner(
-            "CREATE ROLE cheladb_admin LOGIN PASSWORD 'pwn';
-             CREATE SCHEMA cheladb;
-             CREATE TABLE cheladb.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
+            "CREATE ROLE chelabase_admin LOGIN PASSWORD 'pwn';
+             CREATE SCHEMA chelabase;
+             CREATE TABLE chelabase.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
              CREATE FUNCTION public.escalate() RETURNS trigger LANGUAGE plpgsql
                AS 'BEGIN ALTER ROLE postgres SUPERUSER; RETURN NEW; END';
-             CREATE TRIGGER escalate BEFORE INSERT OR UPDATE ON cheladb.schema_version
+             CREATE TRIGGER escalate BEFORE INSERT OR UPDATE ON chelabase.schema_version
                FOR EACH ROW EXECUTE FUNCTION public.escalate();
              CREATE FUNCTION public.hijack(oid, regnamespace) RETURNS boolean LANGUAGE plpgsql
                AS 'BEGIN ALTER ROLE postgres SUPERUSER; RETURN $1 OPERATOR(pg_catalog.=) $2::oid; END';
@@ -1311,31 +1311,31 @@ async fn untrusted_cheladb_is_quarantined_and_runs_nothing_as_superuser() {
             .expect("bootstrap");
         assert_eq!(superuser().await, "f", "the owner's code ran as superuser");
         assert_eq!(quarantined().await, "1");
-        // The owner can't log in as cheladb_admin to plant a trigger in the new schema.
+        // The owner can't log in as chelabase_admin to plant a trigger in the new schema.
         let admin = l
             .sql_on(
                 l.main_id(),
-                "SELECT rolcanlogin::text || ',' || (rolpassword IS NULL)::text FROM pg_authid WHERE rolname = 'cheladb_admin';",
+                "SELECT rolcanlogin::text || ',' || (rolpassword IS NULL)::text FROM pg_authid WHERE rolname = 'chelabase_admin';",
             )
             .await;
         assert_eq!(admin.trim(), "false,true");
-        if let Ok(mut conn) = l.connect_as("cheladb_admin", "pwn").await {
+        if let Ok(mut conn) = l.connect_as("chelabase_admin", "pwn").await {
             sqlx::raw_sql(
-                "CREATE FUNCTION cheladb.escalate() RETURNS trigger LANGUAGE plpgsql
+                "CREATE FUNCTION chelabase.escalate() RETURNS trigger LANGUAGE plpgsql
                    AS 'BEGIN ALTER ROLE postgres SUPERUSER; RETURN NEW; END';
-                 CREATE TRIGGER escalate BEFORE UPDATE ON cheladb.schema_version
-                   FOR EACH ROW EXECUTE FUNCTION cheladb.escalate();",
+                 CREATE TRIGGER escalate BEFORE UPDATE ON chelabase.schema_version
+                   FOR EACH ROW EXECUTE FUNCTION chelabase.escalate();",
             )
             .execute(&mut conn)
             .await
             .unwrap();
             l.owner("CREATE TABLE planted (v text);").await;
-            panic!("logged in as cheladb_admin; superuser now: {}", superuser().await);
+            panic!("logged in as chelabase_admin; superuser now: {}", superuser().await);
         }
         let owner = l
-            .sql_on(l.main_id(), "SELECT nspowner::regrole FROM pg_namespace WHERE nspname = 'cheladb';")
+            .sql_on(l.main_id(), "SELECT nspowner::regrole FROM pg_namespace WHERE nspname = 'chelabase';")
             .await;
-        assert_eq!(owner.trim(), "cheladb_admin");
+        assert_eq!(owner.trim(), "chelabase_admin");
         // The fresh schema works (and its first bootstrap granted `t`).
         let select = json!({"v":1,"op":"select","from":"t"});
         assert_eq!(l.anon(select.clone()).await.ok(), &json!([]));
@@ -1343,15 +1343,15 @@ async fn untrusted_cheladb_is_quarantined_and_runs_nothing_as_superuser() {
         l.owner("CREATE TABLE t2 (v text);").await;
         assert_eq!(superuser().await, "f");
 
-        // A membership in cheladb_admin is revoked, and what it could have touched is set
+        // A membership in chelabase_admin is revoked, and what it could have touched is set
         // aside again.
-        l.sql_on(l.main_id(), "GRANT cheladb_admin TO postgres;").await;
+        l.sql_on(l.main_id(), "GRANT chelabase_admin TO postgres;").await;
         l.worker
             .bootstrap_data_api(&main, &l.database_name)
             .await
             .expect("bootstrap");
         let member = l
-            .sql_on(l.main_id(), "SELECT pg_has_role('postgres', 'cheladb_admin', 'MEMBER');")
+            .sql_on(l.main_id(), "SELECT pg_has_role('postgres', 'chelabase_admin', 'MEMBER');")
             .await;
         assert_eq!(member.trim(), "f");
         assert_eq!(quarantined().await, "2");
@@ -1368,16 +1368,16 @@ async fn untrusted_cheladb_is_quarantined_and_runs_nothing_as_superuser() {
     .await;
 }
 
-/// Cheladb's extension trigger must never run the owner's own event triggers with a
+/// Chelabase's extension trigger must never run the owner's own event triggers with a
 /// superuser current_user: its GRANTs run as whoever ran CREATE EXTENSION.
 ///
-/// The owner's trigger acts only on GRANT (what Cheladb's trigger issues; the
+/// The owner's trigger acts only on GRANT (what Chelabase's trigger issues; the
 /// extension scripts here have none). A trusted extension's script itself runs as the
 /// bootstrap superuser and fires the owner's event triggers for its own commands on Neon
 /// (session user not a superuser, so neon_fmgr_hook lets them run): that is Postgres and
 /// Neon behaviour, reported separately, not this trigger.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn owner_event_triggers_never_run_as_superuser() {
     live("evtrig", |l| async move {
         let mut owner = l.owner_session().await;
@@ -1408,7 +1408,7 @@ async fn owner_event_triggers_never_run_as_superuser() {
         assert_eq!(
             superuser.trim(),
             "f",
-            "Cheladb's GRANT ran the owner's event trigger as superuser"
+            "Chelabase's GRANT ran the owner's event trigger as superuser"
         );
         // The extension's functions work for the API's roles.
         l.owner("CREATE TABLE e (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), h text DEFAULT encode(digest('x', 'sha256'), 'hex'));")
@@ -1421,9 +1421,9 @@ async fn owner_event_triggers_never_run_as_superuser() {
 }
 
 /// A superuser's CREATE EXTENSION (compute_ctl, Neon's privileged path) must keep the
-/// extension's own revokes: Cheladb's trigger grants only the owner role's functions.
+/// extension's own revokes: Chelabase's trigger grants only the owner role's functions.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn a_superusers_extension_keeps_its_revokes() {
     live("extrevoke", |l| async move {
         let can = l
@@ -1445,7 +1445,7 @@ async fn a_superusers_extension_keeps_its_revokes() {
 /// A bare 30-digit number in the request keeps its digits: into a `numeric` column, a
 /// `jsonb` column and a filter.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn big_request_numbers_keep_their_digits() {
     live("bignum", |l| async move {
         const BIG: &str = "123456789012345678901234567890";
@@ -1475,7 +1475,7 @@ async fn big_request_numbers_keep_their_digits() {
 
 /// Each relation's `kind`, and `security_invoker` for views however the option was spelt.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn kinds_and_security_invoker_live() {
     live("kinds", |l| async move {
         l.owner(
@@ -1520,13 +1520,13 @@ async fn kinds_and_security_invoker_live() {
 /// The transaction timeout (= `statement_timeout_ms`) bounds a whole batch, even when no
 /// single statement is over it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn a_batch_past_the_transaction_timeout_answers_timeout() {
     live("txtimeout", |l| async move {
         l.metadata
             .update_database_settings(
                 l.db,
-                &cheladb_metadata::SettingsPatch {
+                &chelabase_metadata::SettingsPatch {
                     statement_timeout_ms: Some(1000),
                     ..Default::default()
                 },
@@ -1562,13 +1562,13 @@ async fn a_batch_past_the_transaction_timeout_answers_timeout() {
 /// A function that changes the session (its role, a setting) leaves nothing behind for the
 /// next request on the same connection.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn a_session_level_set_role_does_not_leak_to_the_next_request() {
     live("reset", |l| async move {
         l.metadata
             .update_database_settings(
                 l.db,
-                &cheladb_metadata::SettingsPatch {
+                &chelabase_metadata::SettingsPatch {
                     max_connections: Some(1),
                     ..Default::default()
                 },
@@ -1598,19 +1598,19 @@ async fn a_session_level_set_role_does_not_leak_to_the_next_request() {
 /// Reconcile's health check notices each thing the bootstrap repairs, and the bootstrap
 /// repairs it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn the_health_check_sees_what_the_bootstrap_repairs() {
     live("health", |l| async move {
         let main = l.branch(l.main_id()).await;
         let ep = main.endpoint_id.clone().expect("endpoint");
         assert!(l.worker.data_api_healthy(&ep).await.unwrap());
         for breakage in [
-            "ALTER EVENT TRIGGER cheladb_schema_version_ddl DISABLE;",
-            "ALTER EVENT TRIGGER cheladb_extension_functions DISABLE;",
+            "ALTER EVENT TRIGGER chelabase_schema_version_ddl DISABLE;",
+            "ALTER EVENT TRIGGER chelabase_extension_functions DISABLE;",
             "ALTER ROLE authenticator NOLOGIN;",
-            "REVOKE USAGE ON SCHEMA cheladb FROM PUBLIC, authenticator;",
-            "REVOKE SELECT ON cheladb.schema_version FROM authenticator;",
-            "DROP EVENT TRIGGER cheladb_schema_version_drop;",
+            "REVOKE USAGE ON SCHEMA chelabase FROM PUBLIC, authenticator;",
+            "REVOKE SELECT ON chelabase.schema_version FROM authenticator;",
+            "DROP EVENT TRIGGER chelabase_schema_version_drop;",
         ] {
             l.sql_on(l.main_id(), breakage).await;
             assert!(!l.worker.data_api_healthy(&ep).await.unwrap(), "{breakage}");
@@ -1685,7 +1685,7 @@ async fn owner_ddl(l: &Live, sql: &str) {
 /// A second database, enabled with its own default schema: each database answers from its own
 /// `t`, its own schema cache, and the schema endpoint lists both.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn two_databases_serve_separately_with_their_own_schema() {
     live("twodb", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('main');")
@@ -1787,7 +1787,7 @@ async fn two_databases_serve_separately_with_their_own_schema() {
 /// A stored list follows a rename made in SQL, and dropping the last listed database revokes
 /// the key (Review Focus 2).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn allow_list_limits_a_key_to_one_database() {
     live("allow", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('main');")
@@ -1926,7 +1926,7 @@ async fn allow_list_limits_a_key_to_one_database() {
 /// Disabling a served database while rest holds a warm pool and cached shapes for it: 404 at
 /// once after the invalidate, and within the 60 s info cache without it (Review Focus 4).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn disable_answers_unknown_database_at_once() {
     live("disable", |l| async move {
         l.create_database("analytics").await;
@@ -1992,7 +1992,7 @@ async fn disable_answers_unknown_database_at_once() {
 /// A child of a branch that serves a second database serves it too, with the parent's
 /// default schema, and its own bootstrap ran there (Review Focus 5).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn child_branch_serves_the_parent_second_database() {
     live("childdb", |l| async move {
         l.create_database("analytics").await;

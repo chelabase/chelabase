@@ -27,7 +27,7 @@ export default defineConfig({
   worker: { format: "es" },
   optimizeDeps: { exclude: ["@postgres-language-server/wasm"] },
   server: {
-    // 3000 (or CHELADB_STUDIO_PORT). The Zitadel redirect URI is registered for :3000; never
+    // 3000 (or CHELABASE_STUDIO_PORT). The Zitadel redirect URI is registered for :3000; never
     // drift to another port.
     port: devPort(process.env),
     strictPort: true,

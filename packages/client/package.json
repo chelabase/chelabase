@@ -1,8 +1,8 @@
 {
-  "name": "@cheladb/client",
+  "name": "@chelabase/client",
   "version": "0.1.0",
   "private": true,
-  "description": "Typed client for the Cheladb data API, built on fetch with no runtime dependencies",
+  "description": "Typed client for the Chelabase data API, built on fetch with no runtime dependencies",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",

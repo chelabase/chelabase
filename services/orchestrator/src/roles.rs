@@ -12,17 +12,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchKind, BranchRecord, BranchStatus, DataKeyRecord, DatabaseRecord, PasswordState, RoleLevel,
     RoleOrigin, RoleRow,
 };
-use cheladb_nats::{
+use chelabase_nats::{
     ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED, RoleCreateRequest, RoleReply, RoleRequest,
 };
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::data_key::DataKeyKind;
-use cheladb_types::role_name::{RoleNameError, check_any_role_name, check_login_role_name};
-use cheladb_types::{ApiJson, ApiPath};
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::data_key::DataKeyKind;
+use chelabase_types::role_name::{RoleNameError, check_any_role_name, check_login_role_name};
+use chelabase_types::{ApiJson, ApiPath};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -217,7 +217,7 @@ fn reply_error(reply: &RoleReply, what: &str, not_applied: &'static str) -> ApiE
             ApiError::new(
                 500,
                 ErrorCode::RolePrivilegeMismatch,
-                "the role's privileges in the database don't match what Cheladb recorded",
+                "the role's privileges in the database don't match what Chelabase recorded",
             )
         }
         "not_applied" => ApiError::new(503, ErrorCode::NotApplied, not_applied),
@@ -259,7 +259,7 @@ fn rpc_result(
         (status = 200, description = "The roles, owner first", body = Vec<BranchRole>),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -308,7 +308,7 @@ where
         (status = 201, description = "The role was created", body = BranchRole),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't valid JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`role_exists`: the name is taken; `role_cap_reached`: the branch has its maximum of login roles; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
         (status = 422, description = "`invalid_role_name`: the name doesn't fit the rules; `reserved_role_name`: the name is reserved; `invalid_request`: an unknown field (`privileged` is gone, use `owner_level`) or a missing one", body = ErrorEnvelope),
@@ -383,7 +383,7 @@ where
         (status = 204, description = "The password was reset"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the role doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
         (status = 422, description = "`invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte", body = ErrorEnvelope),
@@ -446,7 +446,7 @@ where
         (status = 204, description = "The role was deleted"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the role doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`role_in_use`: data API keys still use the role, listed in `keys` as `{id, name}`; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
         (status = 422, description = "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte", body = ErrorEnvelope),

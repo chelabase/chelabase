@@ -5,14 +5,14 @@ use auth::app_users::{AppUsers, InternalClient};
 use auth::config::Config;
 use auth::guard::RateLimiter;
 use auth::zitadel::Zitadel;
-use cheladb_auth::app_token::{AppClaims, AppTokenSigner, AppTokenVerifier};
-use cheladb_auth::internal::{
+use chelabase_auth::app_token::{AppClaims, AppTokenSigner, AppTokenVerifier};
+use chelabase_auth::internal::{
     AuthMethod, DataIdentity, IDENTITY_HEADER, Identity, InternalSigner, InternalVerifier,
     generate_keypair_pem,
 };
-use cheladb_query::app_users::{NewUserRow, PendingInsert, SyncTarget, UserRowError, UsersDb};
-use cheladb_secrets::SecretKey;
-use cheladb_types::data_key::DataKeyKind;
+use chelabase_query::app_users::{NewUserRow, PendingInsert, SyncTarget, UserRowError, UsersDb};
+use chelabase_secrets::SecretKey;
+use chelabase_types::data_key::DataKeyKind;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -153,7 +153,7 @@ fn info(project: Uuid, target: Uuid, verification: bool) -> Value {
         "auth_database_id": Uuid::nil(), "pg_database": "app", "schema": "public",
         "table": "users", "target_branch_id": target,
         "sync": {"branch_id": target, "host": "127.0.0.1", "port": 5432, "database": "app",
-            "user": "cheladb_auth_sync", "password": "pw", "schema": "public", "table": "users"},
+            "user": "chelabase_auth_sync", "password": "pw", "schema": "public", "table": "users"},
     })
 }
 
@@ -1061,7 +1061,7 @@ async fn change_email_taken_409() {
     assert_eq!(code(&a), "user_token_invalid");
 }
 
-/// N2: an email two users of the org already share (made outside Cheladb's checks) is taken:
+/// N2: an email two users of the org already share (made outside Chelabase's checks) is taken:
 /// sign-up makes no third account, change-email refuses it, and sign-in matches no one.
 #[tokio::test]
 async fn an_ambiguous_email_is_taken_and_signs_no_one_in() {

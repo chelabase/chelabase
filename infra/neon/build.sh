@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Build Neon images from the chelabase/neon fork at the commit pinned in NEON_REF.
 #   build.sh neon          storage image (pageserver, safekeeper, storage_broker,
-#                          storage_controller, proxy, ...): cheladb/neon-storage
+#                          storage_controller, proxy, ...): chelabase/neon-storage
 #   build.sh compute-node  compute image (Postgres 17 + neon extension + compute_ctl), run as a
-#                          plain container: cheladb/neon-compute-v17
+#                          plain container: chelabase/neon-compute-v17
 # VARIANT=dev (default): Postgres 17 only, EXTENSIONS=minimal, tags end in -dev.
 # VARIANT=platform: every Postgres version, EXTENSIONS=all, no tag suffix.
 # EXTENSIONS overrides the extension set for either variant.
@@ -75,8 +75,8 @@ case "${1:-}" in
       --build-arg GIT_VERSION="$ref" \
       --build-arg BUILD_TAG="$short" \
       "${storage_args[@]}" \
-      -t "cheladb/neon-storage:$short"
-    echo "built cheladb/neon-storage:$short"
+      -t "chelabase/neon-storage:$short"
+    echo "built chelabase/neon-storage:$short"
     ;;
   compute-node)
     require_disk
@@ -87,8 +87,8 @@ case "${1:-}" in
       --build-arg BUILD_TAG="$short" \
       --build-arg DEBIAN_VERSION=bookworm \
       --build-arg EXTENSIONS="${EXTENSIONS:-$default_extensions}" \
-      -t "cheladb/neon-compute-v17:$short"
-    echo "built cheladb/neon-compute-v17:$short"
+      -t "chelabase/neon-compute-v17:$short"
+    echo "built chelabase/neon-compute-v17:$short"
     ;;
   *) usage ;;
 esac

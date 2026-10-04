@@ -15,7 +15,7 @@ describe("run history", () => {
     expect(list).toHaveLength(100);
     expect(list[0].sql).toBe("select 105");
     expect(list[99].sql).toBe("select 6");
-    expect(localStorage.getItem("cheladb.sql.history.u1.d1")).not.toBeNull();
+    expect(localStorage.getItem("chelabase.sql.history.u1.d1")).not.toBeNull();
     expect(loadHistory("u1", "d2")).toEqual([]);
     clearHistory("u1", "d1");
     expect(loadHistory("u1", "d1")).toEqual([]);
@@ -26,9 +26,9 @@ describe("run history", () => {
     expect(loadBuffer("u1", "d1")).toBe("select 1");
     expect(loadTimeout()).toBe(60000);
     saveTimeout(300000);
-    expect(localStorage.getItem("cheladb.sql.timeout")).toBe("300000");
+    expect(localStorage.getItem("chelabase.sql.timeout")).toBe("300000");
     expect(loadTimeout()).toBe(300000);
-    localStorage.setItem("cheladb.sql.timeout", "12");
+    localStorage.setItem("chelabase.sql.timeout", "12");
     expect(loadTimeout()).toBe(60000);
   });
 
@@ -52,9 +52,9 @@ describe("run history", () => {
   });
 
   it("ignores_corrupt_history", () => {
-    localStorage.setItem("cheladb.sql.history.u1.d1", "{nope");
+    localStorage.setItem("chelabase.sql.history.u1.d1", "{nope");
     expect(loadHistory("u1", "d1")).toEqual([]);
-    localStorage.setItem("cheladb.sql.history.u1.d1", JSON.stringify([{ bad: 1 }, entry(2)]));
+    localStorage.setItem("chelabase.sql.history.u1.d1", JSON.stringify([{ bad: 1 }, entry(2)]));
     expect(loadHistory("u1", "d1")).toEqual([entry(2)]);
   });
 });

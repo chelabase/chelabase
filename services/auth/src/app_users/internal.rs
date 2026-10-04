@@ -1,7 +1,7 @@
 //! The orchestrator's internal app-auth routes (`/internal/app/*`, bearer
-//! `CHELADB_APP_AUTH_INTERNAL_TOKEN`): branch settings, app sessions and the sync job.
+//! `CHELABASE_APP_AUTH_INTERNAL_TOKEN`): branch settings, app sessions and the sync job.
 
-use cheladb_query::app_users::SyncTarget;
+use chelabase_query::app_users::SyncTarget;
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

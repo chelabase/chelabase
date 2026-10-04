@@ -2,29 +2,29 @@
 //!
 //! Needs `just deps-up` (storage controller, proxy, Valkey, metadata database, Docker)
 //! and `just dev` running (computes pull their spec from the orchestrator's internal
-//! listener on `CHELADB_INTERNAL_ADDR`, default :8083), plus `CHELADB_COMPUTE_IMAGE` exported from `scripts/neon-images.sh`:
+//! listener on `CHELABASE_INTERNAL_ADDR`, default :8083), plus `CHELABASE_COMPUTE_IMAGE` exported from `scripts/neon-images.sh`:
 //!
 //! ```text
-//! set -a; . .cheladb/zitadel/demo.env; eval "$(scripts/neon-images.sh)"
-//! CHELADB_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
+//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
+//! CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
 //!   cargo test -p worker --test neon_live -- --ignored --test-threads=1 --nocapture
 //! ```
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cheladb_metadata::{
+use chelabase_metadata::{
     DEMO_PROJECT_ID, DEMO_TENANT_ID, DatabaseStatus, MetadataClient,
 };
-use cheladb_neon::{ComputeBackend, NeonId, StorconClient, StorconError};
-use cheladb_types::{BranchId, DatabaseId};
+use chelabase_neon::{ComputeBackend, NeonId, StorconClient, StorconError};
+use chelabase_types::{BranchId, DatabaseId};
 use worker::config::{RealWorker, WorkerConfig};
 
 mod common;
 use common::{cleanup, setup, sqlx_delete};
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELADB_COMPUTE_IMAGE"]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn provision_reset_and_delete_a_database() {
     let (worker, metadata, config) = setup().await;
     let worker = Arc::new(worker);
@@ -122,7 +122,7 @@ async fn lifecycle(
         .scram_verifier
         .clone();
     let started = Instant::now();
-    worker.reset_password(cheladb_types::BranchId::from(id)).await.expect("reset_password");
+    worker.reset_password(chelabase_types::BranchId::from(id)).await.expect("reset_password");
     println!("reset took {:?}", started.elapsed());
     let after = metadata.neon_roles(&ep).await.unwrap();
     let after = after
@@ -155,7 +155,7 @@ async fn lifecycle(
     let record = metadata.get_database(id).await.unwrap().unwrap();
     assert_eq!(record.status, DatabaseStatus::Deleted);
     let main = metadata.get_branch(BranchId::from(id)).await.unwrap().unwrap();
-    assert_eq!(main.status, cheladb_metadata::BranchStatus::Deleted);
+    assert_eq!(main.status, chelabase_metadata::BranchStatus::Deleted);
     // The tombstone of a test database isn't worth keeping.
     sqlx_delete(metadata, id).await.unwrap();
 }

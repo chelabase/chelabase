@@ -1,4 +1,4 @@
-import { ApiError, type ColumnDesc } from "@cheladb/management-client";
+import { ApiError, type ColumnDesc } from "@chelabase/management-client";
 
 /** Rows per page (P12). */
 export const PAGE_SIZE = 50;
@@ -193,7 +193,7 @@ function describe(err: unknown, ctx: { role: string | null; op: ConsoleOp }): st
   const who = ctx.role ?? "The owner";
   switch (code) {
     case "network":
-      return "Can't reach Cheladb; check your connection";
+      return "Can't reach Chelabase; check your connection";
     case "permission_denied":
       return `${who} can't ${VERB[ctx.op]}.`;
     case "data_api_disabled":
@@ -201,7 +201,7 @@ function describe(err: unknown, ctx: { role: string | null; op: ConsoleOp }): st
     case "not_found":
       return "That branch or database no longer exists.";
     case "owner_password_unknown":
-      return "The owner password isn't known to Cheladb (it was set in SQL); reset it to continue.";
+      return "The owner password isn't known to Chelabase (it was set in SQL); reset it to continue.";
     case "role_refused":
       return `${who} can bypass row-level security, so the console won't run as it.`;
     case "role_not_allowed":

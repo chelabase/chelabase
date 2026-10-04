@@ -12,7 +12,7 @@ use super::*;
 pub fn openapi() -> OpenApi {
     let (_, mut doc) = api_router::<Doc, Doc>().split_for_parts();
     doc.info = InfoBuilder::new()
-        .title("Cheladb Management API")
+        .title("Chelabase Management API")
         .version("1")
         .license(Some(LicenseBuilder::new().name("Apache-2.0").build()))
         .build();
@@ -469,7 +469,7 @@ impl JobPort for Doc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_routes::{ENDPOINTS, Service};
+    use chelabase_routes::{ENDPOINTS, Service};
     use serde_json::Value;
     use std::collections::BTreeSet;
 
@@ -497,7 +497,7 @@ mod tests {
     fn document_is_current() {
         let mut json = serde_json::to_string_pretty(&openapi()).unwrap();
         json.push('\n');
-        if std::env::var_os("CHELADB_BLESS").is_some() {
+        if std::env::var_os("CHELABASE_BLESS").is_some() {
             std::fs::write(DOCUMENT, &json).unwrap();
         }
         let committed = std::fs::read_to_string(DOCUMENT)
@@ -698,7 +698,7 @@ mod tests {
     fn every_response_has_a_description_and_errors_use_the_envelope() {
         let doc = document();
         assert!(!operations(&doc).is_empty(), "the document has operations");
-        assert_eq!(doc["info"]["title"], "Cheladb Management API");
+        assert_eq!(doc["info"]["title"], "Chelabase Management API");
         assert_eq!(doc["info"]["version"], "1");
         assert_eq!(doc["info"]["license"]["name"], "Apache-2.0");
         assert_eq!(

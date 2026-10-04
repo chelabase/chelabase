@@ -21,14 +21,14 @@ pub struct DemoEnv<'a> {
 
 pub fn render_demo_env(e: &DemoEnv<'_>) -> String {
     format!(
-        "CHELADB_ZITADEL_ISSUER={}\nCHELADB_ZITADEL_JWKS_URL={}/oauth/v2/keys\nCHELADB_ZITADEL_AUDIENCES={}\n\
-CHELADB_ZITADEL_ORG_ID={}\nCHELADB_ZITADEL_PROJECT_ID={}\nCHELADB_ZITADEL_API_CLIENT_ID={}\n\
-CHELADB_DEMO_USER_ID={}\nCHELADB_DEMO_TENANT_ID={}\nCHELADB_INTERNAL_SIGNING_KEY={}\n\
-CHELADB_INTERNAL_VERIFY_KEY={}\nCHELADB_SECRETS_KEY={}\nCHELADB_AUTH_TOKEN_FILE={}\n\
-CHELADB_AUTH_COOKIE_KEY={}\nCHELADB_COMPUTE_JWT_DIR={}\n\
-CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\nCHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n\
-CHELADB_ZITADEL_ADMIN_PAT_FILE={}\nCHELADB_APP_JWT_PRIVATE_KEY={}\nCHELADB_APP_JWT_PUBLIC_KEY={}\n\
-CHELADB_APP_AUTH_INTERNAL_TOKEN=cheladb-dev-app-auth\nCHELADB_APP_SESSIONS_INTERNAL_TOKEN=cheladb-dev-app-sessions\n",
+        "CHELABASE_ZITADEL_ISSUER={}\nCHELABASE_ZITADEL_JWKS_URL={}/oauth/v2/keys\nCHELABASE_ZITADEL_AUDIENCES={}\n\
+CHELABASE_ZITADEL_ORG_ID={}\nCHELABASE_ZITADEL_PROJECT_ID={}\nCHELABASE_ZITADEL_API_CLIENT_ID={}\n\
+CHELABASE_DEMO_USER_ID={}\nCHELABASE_DEMO_TENANT_ID={}\nCHELABASE_INTERNAL_SIGNING_KEY={}\n\
+CHELABASE_INTERNAL_VERIFY_KEY={}\nCHELABASE_SECRETS_KEY={}\nCHELABASE_AUTH_TOKEN_FILE={}\n\
+CHELABASE_AUTH_COOKIE_KEY={}\nCHELABASE_COMPUTE_JWT_DIR={}\n\
+CHELABASE_DATA_KEYS_TOKEN=chelabase-dev-data-keys\nCHELABASE_REST_INTERNAL_TOKEN=chelabase-dev-rest-internal\n\
+CHELABASE_ZITADEL_ADMIN_PAT_FILE={}\nCHELABASE_APP_JWT_PRIVATE_KEY={}\nCHELABASE_APP_JWT_PUBLIC_KEY={}\n\
+CHELABASE_APP_AUTH_INTERNAL_TOKEN=chelabase-dev-app-auth\nCHELABASE_APP_SESSIONS_INTERNAL_TOKEN=chelabase-dev-app-sessions\n",
         e.issuer,
         e.issuer,
         e.audiences,
@@ -57,7 +57,7 @@ pub fn render_studio_env(
     api_url: &str,
 ) -> String {
     format!(
-        "# Written by `cheladb dev bootstrap`; regenerate instead of editing.\n\
+        "# Written by `chelabase dev bootstrap`; regenerate instead of editing.\n\
 VITE_ZITADEL_ISSUER={issuer}\nVITE_ZITADEL_CLIENT_ID={client_id}\nVITE_ZITADEL_PROJECT_ID={project_id}\n\
 VITE_ZITADEL_ORG_ID={org_id}\nVITE_API_URL={api_url}\n"
     )
@@ -87,9 +87,9 @@ mod tests {
             app_jwt_private_key: "/a/k",
             app_jwt_public_key: "/a/p",
         });
-        assert!(text.contains("CHELADB_AUTH_TOKEN_FILE=/z/login-client.pat\n"));
-        assert!(text.contains("CHELADB_AUTH_COOKIE_KEY=/u/cookie.key\n"));
-        assert!(text.contains("CHELADB_ZITADEL_JWKS_URL=http://localhost:8080/oauth/v2/keys\n"));
+        assert!(text.contains("CHELABASE_AUTH_TOKEN_FILE=/z/login-client.pat\n"));
+        assert!(text.contains("CHELABASE_AUTH_COOKIE_KEY=/u/cookie.key\n"));
+        assert!(text.contains("CHELABASE_ZITADEL_JWKS_URL=http://localhost:8080/oauth/v2/keys\n"));
     }
 
     #[test]
@@ -113,16 +113,16 @@ mod tests {
             app_jwt_public_key: "/a/p",
         });
         for line in [
-            "CHELADB_DATA_KEYS_TOKEN=cheladb-dev-data-keys\n",
-            "CHELADB_REST_INTERNAL_TOKEN=cheladb-dev-rest-internal\n",
+            "CHELABASE_DATA_KEYS_TOKEN=chelabase-dev-data-keys\n",
+            "CHELABASE_REST_INTERNAL_TOKEN=chelabase-dev-rest-internal\n",
         ] {
             assert!(text.contains(line), "{line} in {text}");
         }
         // No ports in demo.env: the apps default to the dev stack's.
         for key in [
-            "CHELADB_REST_URL=",
-            "CHELADB_REST_INTERNAL_URL=",
-            "CHELADB_INTERNAL_URL=",
+            "CHELABASE_REST_URL=",
+            "CHELABASE_REST_INTERNAL_URL=",
+            "CHELABASE_INTERNAL_URL=",
         ] {
             assert!(!text.contains(key), "{key} in {text}");
         }
@@ -169,7 +169,7 @@ mod tests {
             app_jwt_public_key: "/a/p",
         });
         assert!(
-            text.contains("\nCHELADB_COMPUTE_JWT_DIR=/abs/neon\n"),
+            text.contains("\nCHELABASE_COMPUTE_JWT_DIR=/abs/neon\n"),
             "{text}"
         );
     }
@@ -195,11 +195,11 @@ mod tests {
             app_jwt_public_key: "/a/app-jwt.pub",
         });
         for line in [
-            "CHELADB_ZITADEL_ADMIN_PAT_FILE=/z/admin.pat\n",
-            "CHELADB_APP_JWT_PRIVATE_KEY=/a/app-jwt.key\n",
-            "CHELADB_APP_JWT_PUBLIC_KEY=/a/app-jwt.pub\n",
-            "CHELADB_APP_AUTH_INTERNAL_TOKEN=cheladb-dev-app-auth\n",
-            "CHELADB_APP_SESSIONS_INTERNAL_TOKEN=cheladb-dev-app-sessions\n",
+            "CHELABASE_ZITADEL_ADMIN_PAT_FILE=/z/admin.pat\n",
+            "CHELABASE_APP_JWT_PRIVATE_KEY=/a/app-jwt.key\n",
+            "CHELABASE_APP_JWT_PUBLIC_KEY=/a/app-jwt.pub\n",
+            "CHELABASE_APP_AUTH_INTERNAL_TOKEN=chelabase-dev-app-auth\n",
+            "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN=chelabase-dev-app-sessions\n",
         ] {
             assert!(text.contains(line), "{line} in {text}");
         }

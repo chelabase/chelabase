@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-pub const INTERNAL_TOKEN: &str = "cheladb-dev-app-auth";
+pub const INTERNAL_TOKEN: &str = "chelabase-dev-app-auth";
 
 #[derive(Clone, Debug)]
 pub struct FakeSession {

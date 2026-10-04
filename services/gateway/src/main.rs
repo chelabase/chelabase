@@ -1,13 +1,13 @@
-//! Cheladb HTTP API gateway: the single front door on plain HTTP.
+//! Chelabase HTTP API gateway: the single front door on plain HTTP.
 
-use cheladb_auth::internal::InternalSigner;
-use cheladb_auth::JwtVerifier;
+use chelabase_auth::internal::InternalSigner;
+use chelabase_auth::JwtVerifier;
 use gateway::config::GatewayConfig;
 use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
 use gateway::proxy::Gateway;
 use gateway::user_tokens::UserTokens;
-use cheladb_auth::app_token::AppTokenVerifier;
+use chelabase_auth::app_token::AppTokenVerifier;
 use gateway::registry::{Registry, SharedRegistry};
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::Server;
@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gateway=info,cheladb_auth=info,pingora=warn".into()),
+                .unwrap_or_else(|_| "gateway=info,chelabase_auth=info,pingora=warn".into()),
         )
         .init();
 

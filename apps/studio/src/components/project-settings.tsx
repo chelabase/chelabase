@@ -7,7 +7,7 @@ import {
   useUpdateProject,
   type DatabaseSummary,
   type ProjectInfo,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { AppUsersCard } from "./app-users-card";

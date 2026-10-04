@@ -1,4 +1,4 @@
-import { ApiError, type ErrorCode } from "@cheladb/management-client";
+import { ApiError, type ErrorCode } from "@chelabase/management-client";
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 import { createStudioQueryClient, POLL_MS, pollWhile, TRANSITIONAL } from "./query";

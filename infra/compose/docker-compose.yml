@@ -1,20 +1,20 @@
-# Cheladb local control-plane dependencies.
+# Chelabase local control-plane dependencies.
 # Rust apps and Studio run on the host against these services.
 
-name: cheladb
+name: chelabase
 
 # --- Neon storage (part of the base stack: `just deps-up`) ---
 # Pinned by digest; `just deps-up` overrides these with a local `just neon-build` when present.
 # The packages are public on ghcr.io (infra/neon/README.md).
 x-neon-images:
-  neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:8ae1b8f227e9-dev@sha256:db5b3281f548e5d0e4d95bc4fbdcbd7039a88c2f935e0875c1b71aa1c8ce798d}
-  # The image of the compute containers the worker starts (CHELADB_COMPUTE_IMAGE); pinned here.
-  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/neon-compute-v17:8ae1b8f227e9-dev@sha256:a41ebfec1bbea3892e1a6da09bd62b1baef925a9f1e13ef5a71b70bb165f8706}
+  neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:956332507a7b-dev@sha256:db5b3281f548e5d0e4d95bc4fbdcbd7039a88c2f935e0875c1b71aa1c8ce798d}
+  # The image of the compute containers the worker starts (CHELABASE_COMPUTE_IMAGE); pinned here.
+  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/neon-compute-v17:956332507a7b-dev@sha256:a41ebfec1bbea3892e1a6da09bd62b1baef925a9f1e13ef5a71b70bb165f8706}
 
 # S3 credentials for SeaweedFS. Local dev only.
 x-neon-s3-env: &neon-s3-env
-  AWS_ACCESS_KEY_ID: cheladb-dev
-  AWS_SECRET_ACCESS_KEY: cheladb-dev-secret
+  AWS_ACCESS_KEY_ID: chelabase-dev
+  AWS_SECRET_ACCESS_KEY: chelabase-dev-secret
   AWS_DEFAULT_REGION: us-east-1
 
 services:
@@ -22,15 +22,15 @@ services:
     image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     restart: unless-stopped
     environment:
-      POSTGRES_USER: cheladb
-      POSTGRES_PASSWORD: cheladb
-      POSTGRES_DB: cheladb_metadata
+      POSTGRES_USER: chelabase
+      POSTGRES_PASSWORD: chelabase
+      POSTGRES_DB: chelabase_metadata
     ports:
       - "127.0.0.1:5433:5432"
     volumes:
       - metadata_pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cheladb -d cheladb_metadata"]
+      test: ["CMD-SHELL", "pg_isready -U chelabase -d chelabase_metadata"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -100,13 +100,13 @@ services:
       ZITADEL_EXTERNALDOMAIN: localhost
       ZITADEL_EXTERNALPORT: "8080"
       ZITADEL_FIRSTINSTANCE_PATPATH: /zitadel-bootstrap/admin.pat
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: cheladb-bootstrap
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Cheladb Bootstrap
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: chelabase-bootstrap
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Chelabase Bootstrap
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
       ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
       ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH: /zitadel-bootstrap/login-client.pat
       ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_USERNAME: login-client
-      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Cheladb auth
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Chelabase auth
       ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
       ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
       ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: http://localhost:3000/
@@ -123,7 +123,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ../../.cheladb/zitadel:/zitadel-bootstrap
+      - ../../.chelabase/zitadel:/zitadel-bootstrap
 
   # Local mail catcher: Zitadel's signup verification codes land here (UI :8025).
   mailpit:
@@ -150,7 +150,7 @@ services:
       - |
         cat > /tmp/s3.json <<EOT
         {"identities": [{"name": "neon",
-          "credentials": [{"accessKey": "cheladb-dev", "secretKey": "cheladb-dev-secret"}],
+          "credentials": [{"accessKey": "chelabase-dev", "secretKey": "chelabase-dev-secret"}],
           "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
         EOT
         exec weed server -s3 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
@@ -243,7 +243,7 @@ services:
       # internal listener on the host; a tenant's reconcile waits until it answers. The
       # token is local dev only.
       - --control-plane-url=http://host.docker.internal:8083/storcon
-      - --control-plane-jwt-token=${CHELADB_STORCON_HOOK_TOKEN:-cheladb-dev-storcon-hook}
+      - --control-plane-jwt-token=${CHELABASE_STORCON_HOOK_TOKEN:-chelabase-dev-storcon-hook}
       - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
       # The controller creates and deletes each timeline on the safekeepers (one, here). Without
       # these, the compute creates them implicitly and a deleted database, branch or superseded
@@ -325,7 +325,7 @@ services:
 
   # Writes the proxy's TLS certificate once: a local CA and a *.localtest.me certificate signed
   # by it. Clients verify against the CA; `just deps-up` copies it to
-  # .cheladb/neon/proxy-ca.crt.
+  # .chelabase/neon/proxy-ca.crt.
   proxy-tls:
     image: *neon-image
     restart: "no"
@@ -339,7 +339,7 @@ services:
           echo "certificate for *.localtest.me exists"; exit 0
         fi
         [ -s ca.key ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-          -keyout ca.key -out ca.crt -days 3650 -subj "/CN=Cheladb local CA"
+          -keyout ca.key -out ca.crt -days 3650 -subj "/CN=Chelabase local CA"
         openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out tls.csr \
           -subj "/CN=*.localtest.me"
         printf 'subjectAltName=DNS:*.localtest.me\n' > ext.cnf
@@ -373,7 +373,7 @@ services:
       - --redis-auth-type=plain
       - --redis-plain=redis://valkey:6379
     environment:
-      NEON_PROXY_TO_CONTROLPLANE_TOKEN: ${CHELADB_PROXY_API_TOKEN:-cheladb-dev-proxy-api}
+      NEON_PROXY_TO_CONTROLPLANE_TOKEN: ${CHELABASE_PROXY_API_TOKEN:-chelabase-dev-proxy-api}
     ports:
       - "127.0.0.1:4432:4432"
       - "127.0.0.1:4444:4444"

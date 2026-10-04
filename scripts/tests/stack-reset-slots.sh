@@ -68,14 +68,14 @@ chmod +x "$tmp/nogit-bin/git"
 fake_state() { # the slot leftovers the fake docker reports
   state="$tmp/state"
   rm -rf "$state" && mkdir -p "$state"
-  printf '%s\n' c1a c1b >"$state/ps.cheladb-s1"
-  echo c2a >"$state/ps.cheladb-s2"
-  printf '%s\n' cheladb-s1_nats_data cheladb-s1_valkey_data cheladb-s1_mystery >"$state/vol.cheladb-s1"
-  echo cheladb-s2_nats_data >"$state/vol.cheladb-s2"
-  echo n1 >"$state/net.cheladb-s1"
+  printf '%s\n' c1a c1b >"$state/ps.chelabase-s1"
+  echo c2a >"$state/ps.chelabase-s2"
+  printf '%s\n' chelabase-s1_nats_data chelabase-s1_valkey_data chelabase-s1_mystery >"$state/vol.chelabase-s1"
+  echo chelabase-s2_nats_data >"$state/vol.chelabase-s2"
+  echo n1 >"$state/net.chelabase-s1"
   echo relay >"$state/relay"
   : >"$state/image"
-  printf '%s\n' cheladb_metadata_s1 cheladb_metadata_s2 >"$state/dbs"
+  printf '%s\n' chelabase_metadata_s1 chelabase_metadata_s2 >"$state/dbs"
 }
 cat >"$bin/just" <<'EOF'
 #!/usr/bin/env bash
@@ -87,24 +87,24 @@ fake_main() { # a main checkout with every slot leftover, and things that must s
   main="$tmp/main"
   rm -rf "$main" && mkdir -p "$main/.git"
   fake_state
-  mkdir -p "$main/.cheladb/slots" "$main/.cheladb/dev/s1" "$main/.cheladb/dev/s2" \
-    "$main/.cheladb/zitadel" "$main/.cheladb/secrets" "$main/.worktrees/.cargo" \
+  mkdir -p "$main/.chelabase/slots" "$main/.chelabase/dev/s1" "$main/.chelabase/dev/s2" \
+    "$main/.chelabase/zitadel" "$main/.chelabase/secrets" "$main/.worktrees/.cargo" \
     "$main/.worktrees/target/debug" "$main/.worktrees/a" "$main/.worktrees/b"
-  echo 1 >"$main/.cheladb/slots/1.env"
-  echo 123 >"$main/.cheladb/dev/pids"
-  echo log >"$main/.cheladb/dev/studio.log"
-  echo x >"$main/.cheladb/zitadel/studio-s1.env"
-  echo x >"$main/.cheladb/zitadel/demo.env"
-  echo key >"$main/.cheladb/secrets/secrets.key"
+  echo 1 >"$main/.chelabase/slots/1.env"
+  echo 123 >"$main/.chelabase/dev/pids"
+  echo log >"$main/.chelabase/dev/studio.log"
+  echo x >"$main/.chelabase/zitadel/studio-s1.env"
+  echo x >"$main/.chelabase/zitadel/demo.env"
+  echo key >"$main/.chelabase/secrets/secrets.key"
   echo '[build]' >"$main/.worktrees/.cargo/config.toml"
-  printf '# Written by just wt-add\nCHELADB_SLOT=1\n' >"$main/.worktrees/a/.env.local"
+  printf '# Written by just wt-add\nCHELABASE_SLOT=1\n' >"$main/.worktrees/a/.env.local"
   printf 'MY_OWN=1\n' >"$main/.worktrees/b/.env.local"
 }
 reset() { # reset <args...>: runs the script against the fake main; sets status
   : >"$tmp/log"
   status=0
   env -i HOME="$tmp" PATH="$bin:/usr/bin:/bin" FAKE_LOG="$tmp/log" FAKE_STATE="$state" \
-    CHELADB_MAIN="$main" "$script" "$@" >"$tmp/out" 2>"$tmp/err" </dev/null || status=$?
+    CHELABASE_MAIN="$main" "$script" "$@" >"$tmp/out" 2>"$tmp/err" </dev/null || status=$?
 }
 logged() { grep -qxF -- "$1" "$tmp/log"; }
 not_logged() { ! grep -qF -- "$1" "$tmp/log"; }
@@ -118,7 +118,7 @@ fakes=()
 spawn_app() { # spawn_app <slot>: starts the fake app, records its pid in the slot's pids file
   setsid "$tmp/target/debug/sleep" 300 >/dev/null 2>&1 </dev/null &
   fakes+=("$!")
-  { echo "$!"; echo 999999999; } >"$main/.cheladb/dev/s$1/pids"
+  { echo "$!"; echo 999999999; } >"$main/.chelabase/dev/s$1/pids"
   app="$!"
 }
 reap() { for p in "${fakes[@]+"${fakes[@]}"}"; do kill "$p" 2>/dev/null || true; done; }
@@ -133,18 +133,18 @@ reset --dry-run
 check "a dry run leaves a slot's app running" alive "$app"
 check "a dry run names the app it would stop" grep -q "stop.*$app" "$tmp/out"
 check "a dry run exits 0" test "$status" -eq 0
-check "a dry run names the slot projects" grep -q 'cheladb-s1' "$tmp/out"
-check "a dry run names the slot databases" grep -q 'cheladb_metadata_s2' "$tmp/out"
+check "a dry run names the slot projects" grep -q 'chelabase-s1' "$tmp/out"
+check "a dry run names the slot databases" grep -q 'chelabase_metadata_s2' "$tmp/out"
 check "a dry run removes nothing" not_logged ' rm '
 check "a dry run drops nothing" not_logged 'DROP DATABASE'
-check "a dry run leaves the files" test -d "$main/.cheladb/slots" -a -f "$main/.worktrees/a/.env.local"
+check "a dry run leaves the files" test -d "$main/.chelabase/slots" -a -f "$main/.worktrees/a/.env.local"
 check "a dry run doesn't start the stack" not_logged 'deps-up'
 
 # --- no --yes and no answer: refuses ----------------------------------------------------------
 fake_main
 reset
 check "without --yes or a yes, nothing happens" \
-  bash -c 'test "$1" -ne 0 && ! grep -qF " rm " "$2" && test -d "$3"' _ "$status" "$tmp/log" "$main/.cheladb/slots"
+  bash -c 'test "$1" -ne 0 && ! grep -qF " rm " "$2" && test -d "$3"' _ "$status" "$tmp/log" "$main/.chelabase/slots"
 
 # --- --yes: does every step ----------------------------------------------------------------------
 fake_main
@@ -158,22 +158,22 @@ check "slot 1's containers are removed" logged "docker rm -f c1a c1b"
 check "slot 2's containers are removed" logged "docker rm -f c2a"
 check "slot 1's network is removed" logged "docker network rm n1"
 check "slot volumes for NATS and Valkey are removed" \
-  logged "docker volume rm cheladb-s1_nats_data cheladb-s1_valkey_data"
-check "an unknown slot volume is kept" not_logged "cheladb-s1_mystery"
+  logged "docker volume rm chelabase-s1_nats_data chelabase-s1_valkey_data"
+check "an unknown slot volume is kept" not_logged "chelabase-s1_mystery"
 check "the relay container is removed" logged "docker rm -f relay"
-check "the relay image is removed" logged "docker image rm cheladb/hook-relay:dev"
+check "the relay image is removed" logged "docker image rm chelabase/hook-relay:dev"
 check "slot databases are dropped" \
-  bash -c 'grep -q "DROP DATABASE IF EXISTS \"cheladb_metadata_s1\"" "$1" && grep -q "DROP DATABASE IF EXISTS \"cheladb_metadata_s2\"" "$1"' _ "$tmp/log"
-check "cheladb_metadata itself is never dropped" not_logged 'DROP DATABASE IF EXISTS "cheladb_metadata"'
+  bash -c 'grep -q "DROP DATABASE IF EXISTS \"chelabase_metadata_s1\"" "$1" && grep -q "DROP DATABASE IF EXISTS \"chelabase_metadata_s2\"" "$1"' _ "$tmp/log"
+check "chelabase_metadata itself is never dropped" not_logged 'DROP DATABASE IF EXISTS "chelabase_metadata"'
 check "the shared volumes are never touched" \
-  bash -c '! grep -E "volume rm.*cheladb_(metadata|nats|valkey|zitadel|neon)" "$1"' _ "$tmp/log"
+  bash -c '! grep -E "volume rm.*chelabase_(metadata|nats|valkey|zitadel|neon)" "$1"' _ "$tmp/log"
 check "the stack comes back up with deps-up" grep -q "^just .*deps-up" "$tmp/log"
-check ".cheladb/slots is gone" test ! -e "$main/.cheladb/slots"
-check "the slot dev dirs are gone" test ! -e "$main/.cheladb/dev/s1" -a ! -e "$main/.cheladb/dev/s2"
-check "the dev pids and logs stay" test -f "$main/.cheladb/dev/pids" -a -f "$main/.cheladb/dev/studio.log"
-check "per-slot Studio env files are gone" test ! -e "$main/.cheladb/zitadel/studio-s1.env"
-check "demo.env stays" test -f "$main/.cheladb/zitadel/demo.env"
-check "secrets.key stays" test -f "$main/.cheladb/secrets/secrets.key"
+check ".chelabase/slots is gone" test ! -e "$main/.chelabase/slots"
+check "the slot dev dirs are gone" test ! -e "$main/.chelabase/dev/s1" -a ! -e "$main/.chelabase/dev/s2"
+check "the dev pids and logs stay" test -f "$main/.chelabase/dev/pids" -a -f "$main/.chelabase/dev/studio.log"
+check "per-slot Studio env files are gone" test ! -e "$main/.chelabase/zitadel/studio-s1.env"
+check "demo.env stays" test -f "$main/.chelabase/zitadel/demo.env"
+check "secrets.key stays" test -f "$main/.chelabase/secrets/secrets.key"
 check "a generated .env.local is gone" test ! -e "$main/.worktrees/a/.env.local"
 check "someone's own .env.local stays" test -f "$main/.worktrees/b/.env.local"
 check "the shared cargo config is gone" test ! -e "$main/.worktrees/.cargo/config.toml"
@@ -185,7 +185,7 @@ check "a second run exits 0" test "$status" -eq 0
 check "a second run removes nothing" not_logged ' rm '
 check "a second run drops nothing" not_logged 'DROP DATABASE'
 check "a second run finds only the kept volume" \
-  bash -c 'grep -q "keep unknown volumes \[cheladb-s1_mystery\]" "$1" && ! grep -q "remove containers \[c" "$1"' _ "$tmp/out"
+  bash -c 'grep -q "keep unknown volumes \[chelabase-s1_mystery\]" "$1" && ! grep -q "remove containers \[c" "$1"' _ "$tmp/out"
 
 # --- the main checkout can't be found: refuses, changes nothing -------------------------------------
 fake_main
@@ -202,15 +202,15 @@ rm -rf "$main/.git"
 reset --yes
 check "a main checkout without .git exits 2" test "$status" -eq 2
 check "a main checkout without .git is named" grep -qF "$main" "$tmp/err"
-check "a main checkout without .git keeps its files" test -d "$main/.cheladb/slots"
+check "a main checkout without .git keeps its files" test -d "$main/.chelabase/slots"
 
 # --- a yes on stdin works too --------------------------------------------------------------------
 fake_main
 : >"$tmp/log"
 status=0
 echo y | env -i HOME="$tmp" PATH="$bin:/usr/bin:/bin" FAKE_LOG="$tmp/log" FAKE_STATE="$state" \
-  CHELADB_MAIN="$main" "$script" >"$tmp/out" 2>&1 || status=$?
-check "answering y proceeds" bash -c 'test "$1" -eq 0 && test ! -e "$2"' _ "$status" "$main/.cheladb/slots"
+  CHELABASE_MAIN="$main" "$script" >"$tmp/out" 2>&1 || status=$?
+check "answering y proceeds" bash -c 'test "$1" -eq 0 && test ! -e "$2"' _ "$status" "$main/.chelabase/slots"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

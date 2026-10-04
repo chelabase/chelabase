@@ -31,7 +31,7 @@ describe("PasswordResetForm", () => {
     });
     await userEvent.type(screen.getByLabelText("New password"), "New-pass-12");
     await userEvent.click(screen.getByRole("button", { name: "Set password" }));
-    expect(await screen.findByText("Your password is set. Sign in from Cheladb Studio.")).toBeInTheDocument();
+    expect(await screen.findByText("Your password is set. Sign in from Chelabase Studio.")).toBeInTheDocument();
     expect(await body(f, "/auth/v1/password-reset/confirm")).toEqual({ userId: "u1", code: "654321", password: "New-pass-12" });
     await waitFor(() => {
       expect(JSON.stringify(queryClient.getMutationCache().getAll().map((m) => m.state))).not.toContain("New-pass-12");

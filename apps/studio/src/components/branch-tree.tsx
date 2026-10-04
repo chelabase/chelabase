@@ -1,4 +1,4 @@
-import type { Branch } from "@cheladb/management-client";
+import type { Branch } from "@chelabase/management-client";
 import { buildTree } from "@/lib/branches";
 import { BranchActions } from "./branch-actions";
 

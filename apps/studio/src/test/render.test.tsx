@@ -1,4 +1,4 @@
-import { customFetch } from "@cheladb/management-client";
+import { customFetch } from "@chelabase/management-client";
 import { QueryClient, useQuery } from "@tanstack/react-query";
 import { screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";

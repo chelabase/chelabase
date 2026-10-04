@@ -9,10 +9,10 @@
 //! `pending_timeline_id` and `superseded_timeline_id`. A guarded write that returns false
 //! means a delete landed: the run removes what it made, and the delete job owns the rest.
 
-use cheladb_metadata::{BranchKind, BranchRecord, BranchStatus, MetadataError};
-use cheladb_nats::PointInTime;
-use cheladb_neon::{ComputeBackend, NeonId, StorconError};
-use cheladb_types::BranchId;
+use chelabase_metadata::{BranchKind, BranchRecord, BranchStatus, MetadataError};
+use chelabase_nats::PointInTime;
+use chelabase_neon::{ComputeBackend, NeonId, StorconError};
+use chelabase_types::BranchId;
 use tracing::{info, warn};
 
 use crate::branch_create::deleted;
@@ -31,7 +31,7 @@ pub const BACKUP_REFUSAL: &str =
 
 /// How long after a restore records its pending timeline an unresolved detach is retried
 /// before the branch fails: twice the detach's own timeout.
-pub const STUCK_DETACH_SECS: i64 = 2 * cheladb_neon::storcon::DETACH_TIMEOUT.as_secs() as i64;
+pub const STUCK_DETACH_SECS: i64 = 2 * chelabase_neon::storcon::DETACH_TIMEOUT.as_secs() as i64;
 
 /// Recorded when reconcile puts a branch back on its old timeline after an attempt that left
 /// no error of its own (a crash before the switch).
@@ -334,7 +334,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .map(|_| ())
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
-        // A reset or restore brings back the timeline's own `cheladb_auth_sync` password:
+        // A reset or restore brings back the timeline's own `chelabase_auth_sync` password:
         // the branch's stored one is set again (with the rest of the users machinery).
         let database = self
             .metadata
@@ -1096,9 +1096,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::{BranchKind, BranchRecord, BranchStatus, NewBranch};
-    use cheladb_neon::{Lsn, NeonId};
-    use cheladb_types::DatabaseId;
+    use chelabase_metadata::{BranchKind, BranchRecord, BranchStatus, NewBranch};
+    use chelabase_neon::{Lsn, NeonId};
+    use chelabase_types::DatabaseId;
 
     use super::*;
     use crate::fakes::{
@@ -1413,9 +1413,9 @@ mod tests {
     }
 
     fn past_at(w: &FakeWorker, lsn: Lsn) {
-        *w.storage.lsn_at.lock().unwrap() = Some(cheladb_neon::storcon::LsnAtTime {
+        *w.storage.lsn_at.lock().unwrap() = Some(chelabase_neon::storcon::LsnAtTime {
             lsn,
-            kind: cheladb_neon::storcon::LsnKind::Past,
+            kind: chelabase_neon::storcon::LsnKind::Past,
         });
     }
 
@@ -1646,7 +1646,7 @@ mod tests {
                 branched_at_time: None,
                 branched_at_lsn: None,
             }),
-            cheladb_metadata::CreateBranchOutcome::Created
+            chelabase_metadata::CreateBranchOutcome::Created
         );
     }
 

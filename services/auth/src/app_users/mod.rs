@@ -1,5 +1,5 @@
 //! App users' flows (`/auth/v1/app/*`): sign-up, sign-in and sessions for a project's end
-//! users, who live in the project's own Zitadel organization and get Cheladb-signed tokens.
+//! users, who live in the project's own Zitadel organization and get Chelabase-signed tokens.
 
 pub mod flows;
 pub mod identity;
@@ -11,9 +11,9 @@ pub use internal::{AppBranchInfo, InternalClient};
 use crate::config::AppConfig;
 use crate::zitadel::Zitadel;
 use anyhow::Context;
-use cheladb_auth::app_token::AppTokenSigner;
-use cheladb_auth::internal::InternalVerifier;
-use cheladb_query::app_users::{PgUsersDb, UsersDb};
+use chelabase_auth::app_token::AppTokenSigner;
+use chelabase_auth::internal::InternalVerifier;
+use chelabase_query::app_users::{PgUsersDb, UsersDb};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -59,7 +59,7 @@ impl AppUsers {
 
     pub fn from_config(c: &AppConfig, issuer: &str) -> anyhow::Result<Self> {
         let verifier = InternalVerifier::from_pem_file(&c.verify_key)
-            .map_err(|e| anyhow::anyhow!("CHELADB_INTERNAL_VERIFY_KEY: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("CHELABASE_INTERNAL_VERIFY_KEY: {e}"))?;
         let signer = AppTokenSigner::from_pem_files(&c.private_key, &c.public_key)
             .map_err(|e| anyhow::anyhow!("app token keys: {e}"))?;
         let admin_pat = std::fs::read_to_string(&c.admin_pat_file)

@@ -1,5 +1,5 @@
 /**
- * `@cheladb/client`: a typed client for the Cheladb data API. No runtime dependencies;
+ * `@chelabase/client`: a typed client for the Chelabase data API. No runtime dependencies;
  * built on `fetch`, so it runs in browsers, Node and edge runtimes. See the README.
  *
  * @module
@@ -62,7 +62,7 @@ export interface ClientOptions {
 const RUNTIMES = "Node 21+, Chrome 114+, Firefox 135+ or Safari 18.4+";
 
 /**
- * Creates a client. `Database` is the type `cheladb gen types` writes; pass its `types`
+ * Creates a client. `Database` is the type `chelabase gen types` writes; pass its `types`
  * too so int8 and numeric values are read exactly. With a generated `Database`, `types`
  * is required (a compile error without it; the generic is erased at run time, so there
  * is no run-time check). The untyped `createClient({ url, key })` needs none.
@@ -88,7 +88,7 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
   const bigint = opts.bigint === true;
   if (bigint && opts.types === undefined) {
     throw new Error(
-      "createClient({ bigint: true }) needs the generated `types` (from `cheladb gen types`) to know which values are int8.",
+      "createClient({ bigint: true }) needs the generated `types` (from `chelabase gen types`) to know which values are int8.",
     );
   }
   const sourceText = hasSourceText();
@@ -102,7 +102,7 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
   const make = (types: TypeMap | undefined, database: string | undefined): unknown => {
     if (bigint && types === undefined) {
       throw new Error(
-        "createClient({ bigint: true }) needs the generated `types` (from `cheladb gen types`) to know which values are int8.",
+        "createClient({ bigint: true }) needs the generated `types` (from `chelabase gen types`) to know which values are int8.",
       );
     }
     if (!sourceText) {

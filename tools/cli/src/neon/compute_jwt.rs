@@ -1,7 +1,7 @@
 //! The key pair the control plane signs compute_ctl tokens with (`ComputeSigner`).
 
 use anyhow::{Context, Result};
-use cheladb_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE, generate_keypair};
+use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE, generate_keypair};
 use std::path::{Path, PathBuf};
 
 use crate::dev::internal_keys::write_private;
@@ -89,7 +89,7 @@ fn publish(paths: &ComputeJwtPaths, private_tmp: &Path, public_tmp: &Path) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_neon::ComputeSigner;
+    use chelabase_neon::ComputeSigner;
 
     fn signer(paths: &ComputeJwtPaths) -> anyhow::Result<ComputeSigner> {
         ComputeSigner::new(

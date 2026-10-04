@@ -13,14 +13,14 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use cheladb_metadata::{MetadataError, RoleCopy, RoleOrigin};
-use cheladb_neon::ComputeLocator;
-use cheladb_neon::proxy_cache::ProxyCache;
-use cheladb_secrets::{SecretKey, open_role_password, seal_role_password};
-use cheladb_types::BranchId;
-use cheladb_types::role_name::is_reserved_for;
-use cheladb_types::role_password::check_forwarded_password;
-use cheladb_types::role_settings::RoleSettings;
+use chelabase_metadata::{MetadataError, RoleCopy, RoleOrigin};
+use chelabase_neon::ComputeLocator;
+use chelabase_neon::proxy_cache::ProxyCache;
+use chelabase_secrets::{SecretKey, open_role_password, seal_role_password};
+use chelabase_types::BranchId;
+use chelabase_types::role_name::is_reserved_for;
+use chelabase_types::role_password::check_forwarded_password;
+use chelabase_types::role_settings::RoleSettings;
 use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
@@ -52,7 +52,7 @@ impl CachePort for ProxyCache {
     }
 }
 
-/// The receiver's transaction: [`cheladb_metadata::DdlTx`]'s methods, so tests can use a
+/// The receiver's transaction: [`chelabase_metadata::DdlTx`]'s methods, so tests can use a
 /// fake. Dropping it without [`DdlPort::commit`] rolls everything back.
 pub trait DdlPort: Send + Sized + 'static {
     fn branch_id(&self) -> Option<BranchId>;
@@ -114,36 +114,36 @@ pub trait DdlPort: Send + Sized + 'static {
 
 // Each method calls `DdlTx`'s inherent method by its full path, so a rename there can't make
 // it call itself.
-impl DdlPort for cheladb_metadata::DdlTx {
+impl DdlPort for chelabase_metadata::DdlTx {
     fn branch_id(&self) -> Option<BranchId> {
-        cheladb_metadata::DdlTx::branch_id(self)
+        chelabase_metadata::DdlTx::branch_id(self)
     }
     fn owner(&self) -> &str {
-        cheladb_metadata::DdlTx::owner(self)
+        chelabase_metadata::DdlTx::owner(self)
     }
     fn main_database(&self) -> Option<&str> {
-        cheladb_metadata::DdlTx::main_database(self)
+        chelabase_metadata::DdlTx::main_database(self)
     }
     async fn role(&mut self, name: &str) -> Result<Option<RoleCopy>, MetadataError> {
-        cheladb_metadata::DdlTx::role(self, name).await
+        chelabase_metadata::DdlTx::role(self, name).await
     }
     async fn copy_count(&mut self) -> Result<u32, MetadataError> {
-        cheladb_metadata::DdlTx::copy_count(self).await
+        chelabase_metadata::DdlTx::copy_count(self).await
     }
     async fn live_secret_keys(&mut self, role: &str) -> Result<Vec<(Uuid, String)>, MetadataError> {
-        cheladb_metadata::DdlTx::live_secret_keys(self, role).await
+        chelabase_metadata::DdlTx::live_secret_keys(self, role).await
     }
     async fn upsert_sql_copy(&mut self, name: &str, verifier: &str) -> Result<(), MetadataError> {
-        cheladb_metadata::DdlTx::upsert_sql_copy(self, name, verifier).await
+        chelabase_metadata::DdlTx::upsert_sql_copy(self, name, verifier).await
     }
     async fn set_owner_verifier(&mut self, verifier: &str) -> Result<(), MetadataError> {
-        cheladb_metadata::DdlTx::set_owner_verifier(self, verifier).await
+        chelabase_metadata::DdlTx::set_owner_verifier(self, verifier).await
     }
     async fn mark_password_unreadable(&mut self, name: &str) -> Result<(), MetadataError> {
-        cheladb_metadata::DdlTx::mark_password_unreadable(self, name).await
+        chelabase_metadata::DdlTx::mark_password_unreadable(self, name).await
     }
     async fn remove_copy(&mut self, name: &str) -> Result<bool, MetadataError> {
-        cheladb_metadata::DdlTx::remove_copy(self, name).await
+        chelabase_metadata::DdlTx::remove_copy(self, name).await
     }
     async fn rename_copy(
         &mut self,
@@ -151,25 +151,25 @@ impl DdlPort for cheladb_metadata::DdlTx {
         new: &str,
         resealed: Option<&str>,
     ) -> Result<bool, MetadataError> {
-        cheladb_metadata::DdlTx::rename_copy(self, old, new, resealed).await
+        chelabase_metadata::DdlTx::rename_copy(self, old, new, resealed).await
     }
     async fn has_database(&mut self, name: &str) -> Result<bool, MetadataError> {
-        cheladb_metadata::DdlTx::has_database(self, name).await
+        chelabase_metadata::DdlTx::has_database(self, name).await
     }
     async fn database_count(&mut self) -> Result<u32, MetadataError> {
-        cheladb_metadata::DdlTx::database_count(self).await
+        chelabase_metadata::DdlTx::database_count(self).await
     }
     async fn upsert_database(&mut self, name: &str, owner: &str) -> Result<(), MetadataError> {
-        cheladb_metadata::DdlTx::upsert_database(self, name, owner).await
+        chelabase_metadata::DdlTx::upsert_database(self, name, owner).await
     }
     async fn rename_database(&mut self, old: &str, new: &str) -> Result<bool, MetadataError> {
-        cheladb_metadata::DdlTx::rename_database(self, old, new).await
+        chelabase_metadata::DdlTx::rename_database(self, old, new).await
     }
     async fn remove_database(&mut self, name: &str) -> Result<bool, MetadataError> {
-        cheladb_metadata::DdlTx::remove_database(self, name).await
+        chelabase_metadata::DdlTx::remove_database(self, name).await
     }
     async fn commit(self) -> Result<(), MetadataError> {
-        cheladb_metadata::DdlTx::commit(self).await
+        chelabase_metadata::DdlTx::commit(self).await
     }
 }
 
@@ -504,7 +504,7 @@ mod text {
 
     pub fn reserved(name: &str) -> String {
         fit(format!(
-            "the role name \"{}\" is reserved by Cheladb",
+            "the role name \"{}\" is reserved by Chelabase",
             clean(name)
         ))
     }
@@ -517,12 +517,12 @@ mod text {
     }
 
     pub fn role_cap(cap: u32) -> String {
-        format!("this branch has reached its limit of {cap} login roles (CHELADB_BRANCH_ROLE_CAP)")
+        format!("this branch has reached its limit of {cap} login roles (CHELABASE_BRANCH_ROLE_CAP)")
     }
 
     pub fn database_cap(cap: u32) -> String {
         format!(
-            "this branch has reached its limit of {cap} databases (CHELADB_BRANCH_DATABASE_CAP)"
+            "this branch has reached its limit of {cap} databases (CHELABASE_BRANCH_DATABASE_CAP)"
         )
     }
 
@@ -815,7 +815,7 @@ struct Move {
 /// random tag (so no existing or forwarded name can be one) and the index; 52 bytes at most,
 /// within the 63-byte limit.
 fn aside_name(tag: &str, i: usize) -> String {
-    format!("\u{1}cheladb rename {tag} {i}")
+    format!("\u{1}chelabase rename {tag} {i}")
 }
 
 /// The old name of a rename step.
@@ -925,13 +925,13 @@ fn publish(cache: Arc<dyn CachePort>, endpoint: String, roles: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cheladb_types::mode::Mode;
+    use chelabase_types::mode::Mode;
 
     const SCRAM: &str = "SCRAM-SHA-256$4096:c2FsdA==$a2V5:c2VydmVy";
 
     fn rules(mode: Mode, strength: bool) -> RoleSettings {
         RoleSettings::from_lookup(mode, |k| {
-            (k == "CHELADB_PASSWORD_STRENGTH").then(|| if strength { "on" } else { "off" }.into())
+            (k == "CHELABASE_PASSWORD_STRENGTH").then(|| if strength { "on" } else { "off" }.into())
         })
         .unwrap()
     }
@@ -1029,7 +1029,7 @@ mod tests {
         let got = decide(&s[0], &facts(), &rules(Mode::SelfHosted, false));
         assert_eq!(
             got,
-            Err("this password format can't be used through Cheladb; set a plain password".into())
+            Err("this password format can't be used through Chelabase; set a plain password".into())
         );
     }
 
@@ -1067,21 +1067,21 @@ mod tests {
                 Step::SetRole { name: "neon_superuser", password: Some(PW) },
                 facts(),
                 sh,
-                Err("the role name \"neon_superuser\" is reserved by Cheladb".into()),
+                Err("the role name \"neon_superuser\" is reserved by Chelabase".into()),
             ),
             (
                 "reserved group role",
                 Step::SetRole { name: "cloud_admin", password: None },
                 facts(),
                 sh,
-                Err("the role name \"cloud_admin\" is reserved by Cheladb".into()),
+                Err("the role name \"cloud_admin\" is reserved by Chelabase".into()),
             ),
             (
                 "cap at",
                 Step::SetRole { name: "app", password: Some(PW) },
                 Facts { copy_count: 1, ..facts() },
                 capped,
-                Err("this branch has reached its limit of 1 login roles (CHELADB_BRANCH_ROLE_CAP)".into()),
+                Err("this branch has reached its limit of 1 login roles (CHELABASE_BRANCH_ROLE_CAP)".into()),
             ),
             (
                 "cap below",
@@ -1102,7 +1102,7 @@ mod tests {
                 Step::SetRole { name: "app", password: Some(PW) },
                 Facts { copy_count: 1, row: row(RoleOrigin::Sql, false, false), ..facts() },
                 capped,
-                Err("this branch has reached its limit of 1 login roles (CHELADB_BRANCH_ROLE_CAP)".into()),
+                Err("this branch has reached its limit of 1 login roles (CHELABASE_BRANCH_ROLE_CAP)".into()),
             ),
             (
                 "password null with a row",
@@ -1165,7 +1165,7 @@ mod tests {
                 Step::RenameRole { old: "a", new: "pg_x" },
                 facts(),
                 sh,
-                Err("the role name \"pg_x\" is reserved by Cheladb".into()),
+                Err("the role name \"pg_x\" is reserved by Chelabase".into()),
             ),
             (
                 "drop owner",
@@ -1207,7 +1207,7 @@ mod tests {
                 Step::SetDb { name: "x", owner: "postgres" },
                 Facts { database_count: 1, ..facts() },
                 capped,
-                Err("this branch has reached its limit of 1 databases (CHELADB_BRANCH_DATABASE_CAP)".into()),
+                Err("this branch has reached its limit of 1 databases (CHELABASE_BRANCH_DATABASE_CAP)".into()),
             ),
             (
                 "db owner change at cap",
@@ -1240,7 +1240,7 @@ mod tests {
     fn texts_are_one_line_and_short() {
         assert_eq!(
             text::reserved("a\nb"),
-            "the role name \"a?b\" is reserved by Cheladb"
+            "the role name \"a?b\" is reserved by Chelabase"
         );
         let long = "x".repeat(300);
         assert!(text::reserved(&long).len() <= text::MAX);

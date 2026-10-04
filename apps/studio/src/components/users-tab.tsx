@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useListAppUsers } from "@cheladb/management-client";
+import { useListAppUsers } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { appUserErrorText } from "@/lib/app-user-errors";
 import { CreateUserDialog } from "./create-user-dialog";

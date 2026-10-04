@@ -6,17 +6,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
-use cheladb_metadata::{BranchKind, BranchStatus, InsertRoleOutcome, RoleOrigin};
-use cheladb_nats::{
+use chelabase_metadata::{BranchKind, BranchStatus, InsertRoleOutcome, RoleOrigin};
+use chelabase_nats::{
     KeyRef, RESET_NOT_APPLIED, ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED, RoleCreateRequest,
     RoleReply, RoleRequest, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
 };
-use cheladb_neon::ComputeBackend;
-use cheladb_neon::backend::admin_psql_command;
-use cheladb_secrets::seal_role_password;
-use cheladb_types::BranchId;
-use cheladb_types::data_key::DataKeyKind;
-use cheladb_types::role_name::{
+use chelabase_neon::ComputeBackend;
+use chelabase_neon::backend::admin_psql_command;
+use chelabase_secrets::seal_role_password;
+use chelabase_types::BranchId;
+use chelabase_types::data_key::DataKeyKind;
+use chelabase_types::role_name::{
     RoleNameError, check_any_role_name, check_login_role_name, is_reserved_for, quote_ident,
     quote_literal,
 };
@@ -195,7 +195,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
 
         let password = credentials::generate_password();
-        let verifier = cheladb_neon::scram::verifier(&password);
+        let verifier = chelabase_neon::scram::verifier(&password);
         let sealed = seal_role_password(&self.key, &branch.to_string(), name, &password);
         let cap = self.roles.role_cap;
         match self
@@ -258,7 +258,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Err(e) => return failed(branch, "locking the endpoint", &e),
         };
         let password = credentials::generate_password();
-        let verifier = cheladb_neon::scram::verifier(&password);
+        let verifier = chelabase_neon::scram::verifier(&password);
         let sealed = seal_role_password(&self.key, &branch.to_string(), name, &password);
         match self
             .metadata
@@ -545,9 +545,9 @@ fn failed(branch: BranchId, what: &str, err: &dyn std::fmt::Display) -> RoleOutc
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::RoleLevel;
-    use cheladb_nats::RESET_NOT_APPLIED;
-    use cheladb_secrets::open_role_password;
+    use chelabase_metadata::RoleLevel;
+    use chelabase_nats::RESET_NOT_APPLIED;
+    use chelabase_secrets::open_role_password;
     use uuid::Uuid;
 
     use super::*;
@@ -648,7 +648,7 @@ mod tests {
         assert!(!pending, "confirmed");
         let password =
             open_role_password(&w.key, &branch.to_string(), "app", &sealed.unwrap()).unwrap();
-        assert!(cheladb_neon::scram::verifier(&password).starts_with("SCRAM-SHA-256$"));
+        assert!(chelabase_neon::scram::verifier(&password).starts_with("SCRAM-SHA-256$"));
         let sent = sql(&w);
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert_eq!(
@@ -777,7 +777,7 @@ mod tests {
         );
         let pending = w
             .metadata
-            .insert_database("p", cheladb_metadata::DatabaseStatus::Pending);
+            .insert_database("p", chelabase_metadata::DatabaseStatus::Pending);
         assert_eq!(
             w.create_role(BranchId::from(pending), "app", false).await,
             RoleOutcome::NotReady
@@ -898,7 +898,7 @@ mod tests {
             .decode(salt)
             .unwrap();
         assert_eq!(
-            cheladb_neon::scram::verifier_with_salt(&password, &salt, iterations.parse().unwrap()),
+            chelabase_neon::scram::verifier_with_salt(&password, &salt, iterations.parse().unwrap()),
             verifier
         );
         assert_eq!(
@@ -1058,11 +1058,11 @@ mod tests {
         (branch, ep, db)
     }
 
-    fn secret(branch: BranchId, role: &str, name: &str) -> cheladb_metadata::NewDataKey {
-        cheladb_metadata::NewDataKey {
+    fn secret(branch: BranchId, role: &str, name: &str) -> chelabase_metadata::NewDataKey {
+        chelabase_metadata::NewDataKey {
             id: Uuid::new_v4(),
             branch_id: branch,
-            kind: cheladb_types::data_key::DataKeyKind::Secret,
+            kind: chelabase_types::data_key::DataKeyKind::Secret,
             role: role.to_string(),
             name: name.to_string(),
             prefix: "sk_test".to_string(),
@@ -1146,7 +1146,7 @@ mod tests {
         assert!(login(&w, &ep, name).is_none());
         // The hyphenated database reached psql as a quoted conninfo.
         assert_eq!(
-            cheladb_neon::backend::admin_psql_command("my-app")
+            chelabase_neon::backend::admin_psql_command("my-app")
                 .unwrap()
                 .iter()
                 .filter(|a| a.as_str() == "dbname='my-app'")

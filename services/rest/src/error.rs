@@ -1,5 +1,5 @@
 //! The data API's error body, `{"error":{"code","message","detail"?,"hint"?,"sqlstate"?}}`.
-//! The mapping from Postgres SQLSTATEs to it lives in [`cheladb_query::error`]; this is its
+//! The mapping from Postgres SQLSTATEs to it lives in [`chelabase_query::error`]; this is its
 //! HTTP edge.
 
 use axum::Json;
@@ -8,10 +8,10 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 use sqlx::error::DatabaseError;
 
-pub use cheladb_query::error::{SCHEMA_MISSING, UNREACHABLE, classify};
-use cheladb_query::error::QueryFailure;
-use cheladb_query::query::QueryError;
-use cheladb_query::sql::PlanError;
+pub use chelabase_query::error::{SCHEMA_MISSING, UNREACHABLE, classify};
+use chelabase_query::error::QueryFailure;
+use chelabase_query::query::QueryError;
+use chelabase_query::sql::PlanError;
 
 /// [`ApiError::unknown_database`]'s text.
 pub const UNKNOWN_DATABASE: &str = "the database doesn't exist or isn't served by this key";

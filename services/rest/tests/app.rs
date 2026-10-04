@@ -5,11 +5,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cheladb_auth::internal::{
+use chelabase_auth::internal::{
     AuthMethod, DataIdentity, IDENTITY_HEADER, Identity, InternalSigner, InternalVerifier,
     generate_keypair_pem,
 };
-use cheladb_types::data_key::DataKeyKind;
+use chelabase_types::data_key::DataKeyKind;
 use rest::app::{AppState, internal_router, router};
 use rest::conn::{ConnError, ConnInfo, ConnSource};
 use rest::exec::Engine;
@@ -215,7 +215,7 @@ async fn public_key_identity_cannot_read_schema() {
         .get(
             h.addr,
             "/data/v1/schema",
-            Some(("x-cheladb-identity", token)),
+            Some(("x-chelabase-identity", token)),
         )
         .await;
     assert_eq!(status, 401);
@@ -228,7 +228,7 @@ async fn public_key_identity_cannot_read_schema() {
         .get(
             h.addr,
             "/data/v1/schema",
-            Some(("x-cheladb-identity", token)),
+            Some(("x-chelabase-identity", token)),
         )
         .await;
     assert_eq!(status, 503);

@@ -3,10 +3,10 @@ language: "rust"
 tasks:
   check:
     command: "cargo"
-    args: ["check", "-p", "cheladb"]
+    args: ["check", "-p", "chelabase"]
   build:
     command: "cargo"
-    args: ["build", "-p", "cheladb"]
+    args: ["build", "-p", "chelabase"]
   run:
     command: "cargo"
-    args: ["run", "-p", "cheladb"]
+    args: ["run", "-p", "chelabase"]

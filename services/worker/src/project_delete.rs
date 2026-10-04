@@ -1,8 +1,8 @@
 //! A project's delete, after its databases: its app sessions, its Zitadel org, then the rows.
 
-use cheladb_metadata::ProjectStatus;
-use cheladb_neon::ComputeBackend;
-use cheladb_types::ProjectId;
+use chelabase_metadata::ProjectStatus;
+use chelabase_neon::ComputeBackend;
+use chelabase_types::ProjectId;
 use tracing::{info, warn};
 
 use crate::Worker;
@@ -62,7 +62,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let zitadel = match (&org, &self.zitadel) {
             (Some(_), None) => {
                 return Err(
-                    "the project has a Zitadel organization but Zitadel admin access isn't configured (CHELADB_ZITADEL_ISSUER and CHELADB_ZITADEL_ADMIN_PAT_FILE)"
+                    "the project has a Zitadel organization but Zitadel admin access isn't configured (CHELABASE_ZITADEL_ISSUER and CHELABASE_ZITADEL_ADMIN_PAT_FILE)"
                         .to_string(),
                 );
             }
@@ -103,7 +103,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::{AppUsersStatus, DatabaseStatus};
+    use chelabase_metadata::{AppUsersStatus, DatabaseStatus};
     use uuid::Uuid;
 
     use super::*;

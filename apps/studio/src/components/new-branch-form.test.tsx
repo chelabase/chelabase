@@ -1,7 +1,7 @@
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { getGetDatabaseQueryKey, getListBranchesQueryKey, type Branch } from "@cheladb/management-client";
+import { getGetDatabaseQueryKey, getListBranchesQueryKey, type Branch } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { NewBranchForm } from "./new-branch-form";

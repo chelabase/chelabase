@@ -1,14 +1,14 @@
 //! Who is calling an app flow: the gateway's identity token (`aud = "auth"`) for a public
-//! data key, and the app user when the request carried a valid `Cheladb-User` token.
+//! data key, and the app user when the request carried a valid `Chelabase-User` token.
 
 use super::AppUsers;
 use crate::app::AppState;
 use crate::guard::client_ip;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use cheladb_auth::internal::{AuthMethod, IDENTITY_HEADER};
-use cheladb_types::api_error::{ApiError, ErrorCode};
-use cheladb_types::data_key::DataKeyKind;
+use chelabase_auth::internal::{AuthMethod, IDENTITY_HEADER};
+use chelabase_types::api_error::{ApiError, ErrorCode};
+use chelabase_types::data_key::DataKeyKind;
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;

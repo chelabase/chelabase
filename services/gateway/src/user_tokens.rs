@@ -1,4 +1,4 @@
-//! End-user (app-user) tokens: verify the `Cheladb-User` JWT offline, then check the session
+//! End-user (app-user) tokens: verify the `Chelabase-User` JWT offline, then check the session
 //! is still live through the orchestrator's internal listener.
 //!
 //! - The signature, issuer, audience (the key's project) and expiry are checked locally.
@@ -7,7 +7,7 @@
 //! - A session counts as dead when the answer says so (`live: false` / `revoked: true`), when
 //!   its `expires_at` is in the past, when it is unknown (404) or belongs to another project.
 
-use cheladb_auth::app_token::{AppClaims, AppTokenError, AppTokenVerifier};
+use chelabase_auth::app_token::{AppClaims, AppTokenError, AppTokenVerifier};
 use moka::future::Cache;
 use serde::Deserialize;
 use std::time::Duration;
@@ -157,8 +157,8 @@ pub(crate) mod test_support {
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::get;
     use axum::{Json, Router};
-    use cheladb_auth::app_token::{APP_ISSUER, AppTokenSigner, app_audience};
-    use cheladb_auth::internal::generate_keypair_pem;
+    use chelabase_auth::app_token::{APP_ISSUER, AppTokenSigner, app_audience};
+    use chelabase_auth::internal::generate_keypair_pem;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};

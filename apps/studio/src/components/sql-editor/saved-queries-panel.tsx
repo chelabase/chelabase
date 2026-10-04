@@ -11,7 +11,7 @@ import {
   useListSavedQueries,
   type SavedQuery,
   type SavedQuerySummary,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/dialog";
 import { errorText } from "@/lib/errors";

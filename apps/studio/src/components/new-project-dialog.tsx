@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { getGetMeQueryKey, getListProjectsQueryKey, useCreateProject, type ProjectInfo } from "@cheladb/management-client";
+import { getGetMeQueryKey, getListProjectsQueryKey, useCreateProject, type ProjectInfo } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/dialog";
 import { errorText } from "@/lib/errors";

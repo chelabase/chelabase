@@ -1,7 +1,7 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getGetMeQueryKey, type ConnectionDetails, type DatabaseSummary } from "@cheladb/management-client";
+import { getGetMeQueryKey, type ConnectionDetails, type DatabaseSummary } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { DatabaseActions } from "./database-actions";
@@ -94,11 +94,11 @@ describe("DatabaseActions", () => {
   });
 
   it("connection_shows_ca_file_hint", async () => {
-    setup({ [CONNECTION]: () => jsonResponse({ ...details("s3cret"), ca_file: ".cheladb/neon/proxy-ca.crt" }) });
+    setup({ [CONNECTION]: () => jsonResponse({ ...details("s3cret"), ca_file: ".chelabase/neon/proxy-ca.crt" }) });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
     const note = await screen.findByText(/Local dev: pass the proxy's CA with/);
     expect(note).toHaveTextContent(
-      "Local dev: pass the proxy's CA with sslrootcert=.cheladb/neon/proxy-ca.crt. If localtest.me resolves to ::1 first on your machine, add hostaddr=127.0.0.1.",
+      "Local dev: pass the proxy's CA with sslrootcert=.chelabase/neon/proxy-ca.crt. If localtest.me resolves to ::1 first on your machine, add hostaddr=127.0.0.1.",
     );
   });
 
@@ -288,10 +288,10 @@ describe("DatabaseActions", () => {
       login: true, password: "generated", blocked_keys: [], pending: false, created_at: "2026-10-01T09:00:00Z",
     } as const);
     const f = fakeFetch({
-      "GET /v1/databases/d1/branches/b2/roles": () => jsonResponse([row("cheladb_owner", "owner"), row("reporting", "login")]),
+      "GET /v1/databases/d1/branches/b2/roles": () => jsonResponse([row("chelabase_owner", "owner"), row("reporting", "login")]),
       "GET /v1/databases/d1/branches/b2/connection": (req) => {
         const r = new URL(req.url).searchParams.get("role");
-        return jsonResponse({ ...details(r ? "rolepw" : "ownerpw"), user: r ?? "cheladb_owner" });
+        return jsonResponse({ ...details(r ? "rolepw" : "ownerpw"), user: r ?? "chelabase_owner" });
       },
     });
     renderWithQuery(<DatabaseActions database={ready} branch={branch} />, { fetch: f });
@@ -302,8 +302,8 @@ describe("DatabaseActions", () => {
     expect(screen.getByLabelText("Role", { exact: true })).toBe(picker);
     const labels = Array.from((picker as HTMLSelectElement).labels ?? []).map((l) => l.textContent);
     expect(labels).toEqual(["Role"]);
-    expect(picker).toHaveValue("cheladb_owner");
-    expect(await screen.findByText("cheladb_owner", { selector: "dd" })).toBeInTheDocument();
+    expect(picker).toHaveValue("chelabase_owner");
+    expect(await screen.findByText("chelabase_owner", { selector: "dd" })).toBeInTheDocument();
     await userEvent.selectOptions(picker, "reporting");
     expect(await screen.findByText("reporting", { selector: "dd" })).toBeInTheDocument();
     expect(f.calls.some((r) => r.url.includes("/connection?role=reporting"))).toBe(true);
@@ -316,7 +316,7 @@ describe("DatabaseActions", () => {
     protected: false, main_database_missing: false,
   } as const;
   const ownerRow = {
-    name: "cheladb_owner", origin: "owner", level: "owner_level", login: true, password: "generated",
+    name: "chelabase_owner", origin: "owner", level: "owner_level", login: true, password: "generated",
     blocked_keys: [], pending: false, created_at: "2026-10-01T09:00:00Z",
   } as const;
 
@@ -326,8 +326,8 @@ describe("DatabaseActions", () => {
       "GET /v1/databases/d1/branches/b2/databases": () =>
         jsonResponse([
           { name: "postgres", origin: "system", owner: "cloud_admin", main: false },
-          { name: "web1", origin: "main", owner: "cheladb_owner", main: true },
-          { name: "extra", origin: "sql", owner: "cheladb_owner", main: false },
+          { name: "web1", origin: "main", owner: "chelabase_owner", main: true },
+          { name: "extra", origin: "sql", owner: "chelabase_owner", main: false },
         ]),
       "GET /v1/databases/d1/branches/b2/connection": (req) =>
         jsonResponse({ ...details("pw"), database: new URL(req.url).searchParams.get("database") ?? "web1" }),

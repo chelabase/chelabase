@@ -1,8 +1,8 @@
 //! The database settings job: push the history window to the tenant as its `pitr_interval`.
 
-use cheladb_metadata::DatabaseStatus;
-use cheladb_neon::{ComputeBackend, NeonId};
-use cheladb_types::DatabaseId;
+use chelabase_metadata::DatabaseStatus;
+use chelabase_neon::{ComputeBackend, NeonId};
+use chelabase_types::DatabaseId;
 use tracing::{info, warn};
 
 use crate::Worker;
@@ -49,8 +49,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 mod tests {
     use std::time::Duration;
 
-    use cheladb_metadata::DatabaseStatus;
-    use cheladb_neon::NeonId;
+    use chelabase_metadata::DatabaseStatus;
+    use chelabase_neon::NeonId;
 
     use crate::fakes::{STORAGE_CAUSE, entries, position, ready_database, worker};
 
@@ -108,7 +108,7 @@ mod tests {
         let (w, journal) = worker();
         let pending = w.metadata.insert_database("app", DatabaseStatus::Pending);
         w.handle_database_settings(pending).await.unwrap();
-        w.handle_database_settings(cheladb_types::DatabaseId::new())
+        w.handle_database_settings(chelabase_types::DatabaseId::new())
             .await
             .unwrap();
         let db = ready_database(&w).await;

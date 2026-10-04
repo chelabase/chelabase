@@ -1,5 +1,5 @@
 {
-  "name": "@cheladb/neon-e2e",
+  "name": "@chelabase/neon-e2e",
   "private": true,
   "type": "module",
   "scripts": {

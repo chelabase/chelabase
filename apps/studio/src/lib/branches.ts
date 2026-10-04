@@ -3,7 +3,7 @@ import {
   getListBranchesQueryKey,
   type Branch,
   type DatabaseSettings,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import type { QueryClient } from "@tanstack/react-query";
 import { TRANSITIONAL } from "@/lib/query";
 

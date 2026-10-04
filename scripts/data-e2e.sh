@@ -3,7 +3,7 @@
 # deps-up and just dev):
 # - a public and a secret key; the secret key inserts, the public key reads, and the public key's
 #   insert is refused (403); a batch rolls back on error (packages/client/scripts/e2e.mjs);
-# - `cheladb gen types` output typechecks against the SDK, and a wrong column doesn't;
+# - `chelabase gen types` output typechecks against the SDK, and a wrong column doesn't;
 # - row-level security hides a row from the public key but not from the secret key's role;
 # - a revoked key gets 401 within the gateway's 30 s cache (35 s allowed).
 # KEEP=1 leaves the database in place.
@@ -16,7 +16,7 @@ LOG_PREFIX=data-e2e
 . scripts/lib/neon-common.sh
 STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
-PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
+PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -35,13 +35,13 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p cheladb || die "cargo build -p cheladb"
-[[ -f .cheladb/zitadel/demo.env ]] || die ".cheladb/zitadel/demo.env is missing (run just dev)"
+cargo build -q -p chelabase || die "cargo build -p chelabase"
+[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
 set -a
 # shellcheck disable=SC1091
-source .cheladb/zitadel/demo.env
+source .chelabase/zitadel/demo.env
 set +a
-ca="$root/.cheladb/neon/proxy-ca.crt"
+ca="$root/.chelabase/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
 command -v pnpm >/dev/null || die "pnpm is missing"
 trap cleanup EXIT
@@ -123,11 +123,11 @@ pass "secret insert, public select, public insert refused, batch rollback"
 
 # 4. Generated types against the SDK: a valid call compiles, a wrong column doesn't.
 # The key goes through the environment, never argv (other users can read a process's argv).
-CHELADB_DATA_KEY="$SECRET_KEY" cargo run -q -p cheladb -- gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
-  die "cheladb gen types"
+CHELABASE_DATA_KEY="$SECRET_KEY" cargo run -q -p chelabase -- gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
+  die "chelabase gen types"
 grep -q 'notes' "$tmp/db.ts" || die "the generated types don't mention notes"
 cat >"$tmp/sample.ts" <<EOF
-import { createClient } from "@cheladb/client";
+import { createClient } from "@chelabase/client";
 import { type Database, types } from "./db.ts";
 
 const db = createClient<Database>({ url: "$GATEWAY", key: "chk_pub_x", types });
@@ -154,14 +154,14 @@ cat >"$tmp/tsconfig.json" <<EOF
     "target": "ES2022", "module": "ESNext", "moduleResolution": "Bundler", "lib": ["ES2022", "DOM"],
     "types": [], "strict": true, "skipLibCheck": true, "noEmit": true, "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true, "isolatedModules": true,
-    "paths": { "@cheladb/client": ["$root/packages/client/src/index.ts"] }
+    "paths": { "@chelabase/client": ["$root/packages/client/src/index.ts"] }
   },
   "files": ["sample.ts"]
 }
 EOF
-pnpm --filter @cheladb/client exec tsc -p "$tmp/tsconfig.json" >"$tmp/tsc.out" 2>&1 ||
+pnpm --filter @chelabase/client exec tsc -p "$tmp/tsconfig.json" >"$tmp/tsc.out" 2>&1 ||
   die "the generated types don't typecheck: $(cat "$tmp/tsc.out")"
-pass "cheladb gen types output typechecks (and the wrong calls are rejected)"
+pass "chelabase gen types output typechecks (and the wrong calls are rejected)"
 
 # 5. Row-level security: the secret key's role (authenticated) sees every row, the public key's
 # (anon) doesn't see 'hidden'.

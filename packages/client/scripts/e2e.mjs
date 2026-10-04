@@ -55,7 +55,7 @@ function email(name) {
 /** A raw call through the gateway: `[status, body]`. */
 async function raw(path, { method = "POST", body, user } = {}) {
   const headers = { authorization: `Bearer ${process.env.PUBLIC_KEY}`, "content-type": "application/json" };
-  if (user !== undefined) headers["cheladb-user"] = user;
+  if (user !== undefined) headers["chelabase-user"] = user;
   const res = await fetch(`${url}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await res.text();
   let json = null;
@@ -181,12 +181,12 @@ Object.assign(phases, {
       (e) => (e instanceof DataApiError && [403, 404].includes(e.status) ? [] : Promise.reject(e)),
     );
     assert.deepEqual(anonNotes, []);
-    console.log("notes: USING (owner = cheladb.user_id()) shows each user their own; anon nothing");
+    console.log("notes: USING (owner = chelabase.user_id()) shows each user their own; anon nothing");
   },
 
   async "auth-refresh"() {
     const { db, storage } = userClient("a");
-    const key = `cheladb.${process.env.PUBLIC_KEY.slice(0, 12)}.refresh`;
+    const key = `chelabase.${process.env.PUBLIC_KEY.slice(0, 12)}.refresh`;
     const old = storage.get(key);
     assert.ok(old, "A has no stored refresh token");
     const s = await db.auth.refresh();

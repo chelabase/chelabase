@@ -1,0 +1,18 @@
+[package]
+name = "chelabase-nats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NATS JetStream subject names and helpers for Chelabase"
+
+[dependencies]
+chelabase-types = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+async-nats = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

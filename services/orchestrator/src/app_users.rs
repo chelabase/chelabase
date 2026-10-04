@@ -10,13 +10,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{
+use chelabase_metadata::{
     AppUsersStatus, BeginEnable, BranchKind, BranchStatus, DatabaseOrigin, DatabaseStatus, MetadataError,
     NewProjectAuth, OnDelete, ProjectAuth, ProjectRecord,
 };
-use cheladb_nats::{AppUsersCheckRequest, AppUsersJob, JobEnvelope};
-use cheladb_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
-use cheladb_types::{ApiJson, ApiPath, DatabaseId};
+use chelabase_nats::{AppUsersCheckRequest, AppUsersJob, JobEnvelope};
+use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::{ApiJson, ApiPath, DatabaseId};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
@@ -47,7 +47,7 @@ pub struct AppUsersSettings {
     /// Why enabling failed; `null` otherwise.
     #[schema(required = true)]
     pub error: Option<String>,
-    /// The Cheladb database whose Postgres database holds the users table.
+    /// The Chelabase database whose Postgres database holds the users table.
     pub database_id: DatabaseId,
     pub pg_database: String,
     pub schema: String,
@@ -78,7 +78,7 @@ impl From<ProjectAuth> for AppUsersSettings {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PutAppUsersRequest {
-    /// The Cheladb database (of this project) that holds the users table.
+    /// The Chelabase database (of this project) that holds the users table.
     pub database_id: DatabaseId,
     /// Defaults to the database's main Postgres database. Fixed once app users are enabled.
     #[serde(default)]
@@ -108,7 +108,7 @@ where
     J: JobPort,
 {
     let project = load_project(state, principal, id).await?;
-    if project.status != cheladb_metadata::ProjectStatus::Active {
+    if project.status != chelabase_metadata::ProjectStatus::Active {
         return Err(project_deleting());
     }
     Ok(project)
@@ -138,7 +138,7 @@ where
 
 /// Reserved schemas, `information_schema` and the `pg_` prefix (I8).
 fn schema_is_reserved(schema: &str) -> bool {
-    cheladb_query::schema::is_reserved(schema) || schema == "information_schema" || schema.starts_with("pg_")
+    chelabase_query::schema::is_reserved(schema) || schema == "information_schema" || schema.starts_with("pg_")
 }
 
 #[utoipa::path(
@@ -152,7 +152,7 @@ fn schema_is_reserved(schema: &str) -> bool {
         (status = 200, description = "The settings and where enabling is", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same); `app_users_disabled`: app users were never enabled", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -196,7 +196,7 @@ fn check_request(body: PutAppUsersRequest) -> Result<Wanted, ApiError> {
         }
         if schema_is_reserved(schema) {
             return Err(unprocessable(
-                "schema is reserved (cheladb, information_schema, pg_* and Postgres's and Neon's own)",
+                "schema is reserved (chelabase, information_schema, pg_* and Postgres's and Neon's own)",
             ));
         }
     }
@@ -314,7 +314,7 @@ where
             .map_err(|e| internal("list branch databases", e))?;
         let on = rows
             .iter()
-            .any(|d| d.name == pg_database && d.data_api == cheladb_metadata::DataApiState::On);
+            .any(|d| d.name == pg_database && d.data_api == chelabase_metadata::DataApiState::On);
         if !on {
             return Err(conflict(
                 ErrorCode::DataApiNotEnabled,
@@ -374,12 +374,12 @@ where
         (status = 202, description = "Enabling started (or started again)", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project, database or Postgres database (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: a field is missing or invalid, the schema is reserved (`cheladb`, `information_schema`, `pg_*`, Neon's), or `on_delete` isn't `delete` or `mark`", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: a field is missing or invalid, the schema is reserved (`chelabase`, `information_schema`, `pg_*`, Neon's), or `on_delete` isn't `delete` or `mark`", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker can't check the table", body = ErrorEnvelope),
     ),
@@ -495,7 +495,7 @@ where
         (status = 202, description = "Disabling started", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same); `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_has_users`: users exist; `conflict`: app users are being enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),

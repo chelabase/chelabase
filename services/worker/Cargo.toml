@@ -3,7 +3,7 @@ name = "worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cheladb provisioning / reconciliation worker"
+description = "Chelabase provisioning / reconciliation worker"
 
 [lib]
 name = "worker"
@@ -14,11 +14,11 @@ name = "worker"
 path = "src/main.rs"
 
 [dependencies]
-cheladb-metadata = { workspace = true }
-cheladb-neon = { workspace = true, features = ["metadata"] }
-cheladb-nats = { workspace = true }
-cheladb-types = { workspace = true }
-cheladb-zitadel = { workspace = true }
+chelabase-metadata = { workspace = true }
+chelabase-neon = { workspace = true, features = ["metadata"] }
+chelabase-nats = { workspace = true }
+chelabase-types = { workspace = true }
+chelabase-zitadel = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -29,7 +29,7 @@ dotenvy = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
 rand = { workspace = true }
-cheladb-secrets = { workspace = true }
+chelabase-secrets = { workspace = true }
 async-nats = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
@@ -38,10 +38,10 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-cheladb-auth = { workspace = true }
+chelabase-auth = { workspace = true }
 tempfile = { workspace = true }
 sqlx = { workspace = true }
 base64 = { workspace = true }
-cheladb-neon = { workspace = true, features = ["fake"] }
-cheladb-zitadel = { workspace = true, features = ["mock"] }
+chelabase-neon = { workspace = true, features = ["fake"] }
+chelabase-zitadel = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }

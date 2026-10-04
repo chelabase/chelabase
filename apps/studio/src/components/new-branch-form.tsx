@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCreateBranch, type Branch, type CreateBranchRequest } from "@cheladb/management-client";
+import { useCreateBranch, type Branch, type CreateBranchRequest } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { invalidateBranches, pointToUtc, restoreBounds, validateBranchName } from "@/lib/branches";
 import { errorText } from "@/lib/errors";

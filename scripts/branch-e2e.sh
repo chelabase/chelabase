@@ -15,7 +15,7 @@ LOG_PREFIX=branch-e2e
 . scripts/lib/neon-common.sh
 STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
 GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
-PROXY_PG_PORT="${CHELADB_PROXY_PG_PORT:-4432}"
+PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -34,13 +34,13 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p cheladb || die "cargo build -p cheladb"
-[[ -f .cheladb/zitadel/demo.env ]] || die ".cheladb/zitadel/demo.env is missing (run just dev)"
+cargo build -q -p chelabase || die "cargo build -p chelabase"
+[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
 set -a
 # shellcheck disable=SC1091
-source .cheladb/zitadel/demo.env
+source .chelabase/zitadel/demo.env
 set +a
-ca="$root/.cheladb/neon/proxy-ca.crt"
+ca="$root/.chelabase/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
 trap cleanup EXIT
 
@@ -226,7 +226,7 @@ for i in $(seq 120); do
 done
 db_id=""
 for ep in $(sort -u "$tmp/endpoints"); do
-  [[ -z "$(docker ps -aq --filter "name=^cheladb-compute-$ep\$")" ]] || die "container cheladb-compute-$ep still exists"
+  [[ -z "$(docker ps -aq --filter "name=^chelabase-compute-$ep\$")" ]] || die "container chelabase-compute-$ep still exists"
   [[ "$(metadata_sql -v ep="$ep" <<<"SELECT count(*) FROM neon_endpoints WHERE id = :'ep';")" == 0 ]] ||
     die "endpoint $ep still has a row in neon_endpoints"
 done

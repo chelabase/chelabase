@@ -1,7 +1,7 @@
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import type { DatabaseSummary, ProjectInfo } from "@cheladb/management-client";
+import type { DatabaseSummary, ProjectInfo } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { ProjectSettings } from "./project-settings";

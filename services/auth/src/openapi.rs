@@ -8,7 +8,7 @@ use utoipa::openapi::{InfoBuilder, LicenseBuilder, OpenApi};
 pub fn openapi() -> OpenApi {
     let (_, mut doc) = crate::app::api_router().split_for_parts();
     doc.info = InfoBuilder::new()
-        .title("Cheladb login API")
+        .title("Chelabase login API")
         .version("1")
         .license(Some(LicenseBuilder::new().name("Apache-2.0").build()))
         .build();
@@ -18,7 +18,7 @@ pub fn openapi() -> OpenApi {
 #[cfg(test)]
 mod tests {
     use super::openapi;
-    use cheladb_routes::{ENDPOINTS, Service};
+    use chelabase_routes::{ENDPOINTS, Service};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -50,14 +50,14 @@ mod tests {
         let mut text = serde_json::to_string_pretty(&openapi()).unwrap();
         text.push('\n');
         let path = json_path();
-        if std::env::var_os("CHELADB_BLESS").is_some() {
+        if std::env::var_os("CHELABASE_BLESS").is_some() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, &text).unwrap();
         }
         let committed = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(
             committed == text,
-            "openapi/login.json is stale; run `just api-gen` (CHELADB_BLESS=1)"
+            "openapi/login.json is stale; run `just api-gen` (CHELABASE_BLESS=1)"
         );
     }
 

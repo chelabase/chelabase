@@ -12,15 +12,15 @@ use axum::{
     http::{StatusCode, header::CACHE_CONTROL},
     response::{IntoResponse, Response},
 };
-use cheladb_metadata::{
+use chelabase_metadata::{
     BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
     CreateBranchOutcome, DataApiState, DatabaseOrigin, DatabaseRecord, NewBranch, SettingsPatch,
 };
-use cheladb_nats::{BranchJob, DatabaseSettingsJob, JobEnvelope, PointInTime};
-use cheladb_types::api_error::{ApiError, ErrorCode};
-use cheladb_types::{ApiJson, ApiPath, BranchId};
+use chelabase_nats::{BranchJob, DatabaseSettingsJob, JobEnvelope, PointInTime};
+use chelabase_types::api_error::{ApiError, ErrorCode};
+use chelabase_types::{ApiJson, ApiPath, BranchId};
 use chrono::{DateTime, Utc};
-use cheladb_types::api_error::ErrorEnvelope;
+use chelabase_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -94,9 +94,9 @@ impl Branch {
             .flatten();
         let (host, port) = proxy_address(
             if b.status == BranchStatus::Ready {
-                cheladb_metadata::DatabaseStatus::Ready
+                chelabase_metadata::DatabaseStatus::Ready
             } else {
-                cheladb_metadata::DatabaseStatus::Pending
+                chelabase_metadata::DatabaseStatus::Pending
             },
             endpoint,
             proxy,
@@ -311,7 +311,7 @@ where
         (status = 200, description = "The branches that aren't deleted, oldest first, backups included", body = Vec<Branch>),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -373,7 +373,7 @@ struct CreateBranchRequest {
         (status = 202, description = "Accepted; the branch is created in the background (poll it until `ready`)", body = Branch),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the parent branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`name_taken`: a branch with this name exists; `branch_cap_reached`: the database has `max_branches`; `branch_not_ready`: the parent isn't ready; `database_not_ready`: the database is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -516,7 +516,7 @@ struct ConnectionQuery {
         (status = 200, description = "The role's credentials; never cached", body = ConnectionDetails),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch, the requested role or the requested database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
         (status = 422, description = "`invalid_role_name`: `role` is empty, over 63 bytes or has a NUL", body = ErrorEnvelope),
@@ -576,7 +576,7 @@ where
         (status = 204, description = "The password was reset; read the new one from the connection details"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the owner credentials are missing; `backup_branch`: a restore backup has no compute", body = ErrorEnvelope),
         (status = 500, description = "`internal`: the worker failed to reset the password", body = ErrorEnvelope),
@@ -710,7 +710,7 @@ fn check_rewritable(branch: &BranchRecord) -> Result<(), ApiError> {
         (status = 202, description = "Accepted; the branch moves to `resetting` and is rewritten in the background", body = OperationAccepted),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_protected`: the branch is protected, unprotect it first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -804,7 +804,7 @@ fn backup_name(name: &str, now: DateTime<Utc>) -> String {
         (status = 202, description = "Accepted; the branch moves to `resetting`, and a backup of its current state is kept as a new branch", body = RestoreAccepted),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -884,7 +884,7 @@ where
         (status = 202, description = "Accepted; the branch moves to `deleting` and is removed in the background", body = OperationAccepted),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches; `branch_protected`: the branch is protected, unprotect it first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -1018,7 +1018,7 @@ struct UpdateBranchRequest {
         (status = 200, description = "The branch with its new flag", body = Branch),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup can't be protected; `branch_not_ready`: the branch is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -1114,7 +1114,7 @@ impl From<BranchDatabase> for BranchDatabaseView {
         (status = 200, description = "The databases, main first", body = Vec<BranchDatabaseView>),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -1222,7 +1222,7 @@ fn in_range(
         (status = 200, description = "The settings after the change", body = DatabaseSettings),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Cheladb tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`database_not_ready`: the database is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),

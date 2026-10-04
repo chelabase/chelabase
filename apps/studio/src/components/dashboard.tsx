@@ -1,6 +1,6 @@
 import { useEffect, type ReactNode } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useGetMe, type Me, type Project } from "@cheladb/management-client";
+import { useGetMe, type Me, type Project } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";
@@ -63,7 +63,7 @@ function Workspace({ me }: { me: Me }) {
       <section className="space-y-2">
         <h1 className="text-2xl font-semibold">Your organization isn't set up yet</h1>
         <p className="text-muted-foreground">
-          You're signed in (org <code>{me.user.org_id}</code>), but no Cheladb tenant is bound to that
+          You're signed in (org <code>{me.user.org_id}</code>), but no Chelabase tenant is bound to that
           organization. In this self-hosted setup, run <code>just zitadel-bootstrap</code>.
         </p>
       </section>

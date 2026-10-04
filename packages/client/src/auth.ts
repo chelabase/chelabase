@@ -3,7 +3,7 @@ import { DataApiError } from "./error.ts";
 import type { AppUser, Auth, AuthEvent, AuthOptions, AuthStorage, DatabaseShape, Session } from "./types.ts";
 
 /** Header carrying the signed-in user's access token. */
-export const USER_HEADER = "cheladb-user";
+export const USER_HEADER = "chelabase-user";
 
 const REFRESH_LEAD_MS = 60_000;
 /** A token this close to expiry is refreshed before use. */
@@ -15,7 +15,7 @@ export const SESSION_GONE = "user_session_revoked";
 
 export interface AuthCore<DB extends DatabaseShape> {
   auth: Auth<DB>;
-  /** The access token to send as `cheladb-user` (refreshing first when needed), or undefined. */
+  /** The access token to send as `chelabase-user` (refreshing first when needed), or undefined. */
   accessToken(): Promise<string | undefined>;
   /** After a data `401 user_token_expired`: refresh once and return the new token. */
   refreshAfterExpiry(sent: string): Promise<string | undefined>;
@@ -64,7 +64,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 }): AuthCore<DB> {
   const storage = cfg.options?.storage ?? defaultStorage();
   const autoRefresh = cfg.options?.autoRefresh ?? true;
-  const storeKey = `cheladb.${cfg.key.slice(0, 12)}.refresh`;
+  const storeKey = `chelabase.${cfg.key.slice(0, 12)}.refresh`;
 
   let access: string | undefined;
   let expMs = 0;

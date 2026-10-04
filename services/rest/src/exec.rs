@@ -1,7 +1,7 @@
 //! One request, one transaction: pick the database (main when the tree names none; it must
 //! be served and on the key's list, else 404 `unknown_database`); `BEGIN`; for a secret
 //! key, refuse an owner-level role ([`OWNER_LEVEL_SQL`]); run the request through
-//! [`cheladb_query::run`] (preamble, schema cache, shape cache, plans, response cap) with
+//! [`chelabase_query::run`] (preamble, schema cache, shape cache, plans, response cap) with
 //! that database's `default_schema`; `COMMIT`.
 //!
 //! The caches are keyed by `(branch, database)`; [`Engine::invalidate`] drops a branch's
@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use cheladb_auth::internal::DataIdentity;
-use cheladb_query::engine::{self, QueryCache, RunAs, RunSettings};
-use cheladb_query::schema::{RoleView, Schema, Visibility};
-use cheladb_types::data_key::DataKeyKind;
+use chelabase_auth::internal::DataIdentity;
+use chelabase_query::engine::{self, QueryCache, RunAs, RunSettings};
+use chelabase_query::schema::{RoleView, Schema, Visibility};
+use chelabase_types::data_key::DataKeyKind;
 use serde_json::Value;
 use sqlx::{Acquire, PgConnection};
 use uuid::Uuid;
@@ -21,8 +21,8 @@ use crate::conn::{AcquireError, ConnError, ConnInfo, ConnSource, Pools, ServedDa
 use crate::error::ApiError;
 
 #[cfg(test)]
-use cheladb_query::engine::SchemaKey;
-pub use cheladb_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, SCHEMA_CACHE};
+use chelabase_query::engine::SchemaKey;
+pub use chelabase_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, SCHEMA_CACHE};
 
 /// Whether role `$1` is owner-level: any attribute that bypasses or administers, or
 /// membership in `neon_superuser`. The one wide definition. No row: the role doesn't exist.
@@ -181,8 +181,8 @@ impl From<ApiError> for Failure {
     }
 }
 
-impl From<cheladb_query::QueryFailure> for Failure {
-    fn from(e: cheladb_query::QueryFailure) -> Self {
+impl From<chelabase_query::QueryFailure> for Failure {
+    fn from(e: chelabase_query::QueryFailure) -> Self {
         Failure::Api(e.into())
     }
 }
@@ -311,7 +311,7 @@ impl<S: ConnSource> Engine<S> {
         request_id: &str,
         body: &[u8],
     ) -> Result<String, Failure> {
-        let parsed = cheladb_query::parse(body).map_err(ApiError::from)?;
+        let parsed = chelabase_query::parse(body).map_err(ApiError::from)?;
         let (_, database) = self
             .database(
                 data.branch_id,
@@ -334,7 +334,7 @@ impl<S: ConnSource> Engine<S> {
     ) -> Result<String, Failure> {
         let body = serde_json::to_vec(tree)
             .map_err(|e| ApiError::invalid_query(format!("the tree: {e}")))?;
-        let parsed = cheladb_query::parse(&body).map_err(ApiError::from)?;
+        let parsed = chelabase_query::parse(&body).map_err(ApiError::from)?;
         let requested = match (database, parsed.database.as_deref()) {
             (Some(a), Some(b)) if a != b => {
                 return Err(ApiError::invalid_query(
@@ -355,7 +355,7 @@ impl<S: ConnSource> Engine<S> {
         &self,
         data: &DataIdentity,
         database: &ServedDatabase,
-        op: &cheladb_query::Op,
+        op: &chelabase_query::Op,
         console: bool,
         request_id: &str,
     ) -> Result<String, Failure> {
@@ -375,7 +375,7 @@ impl<S: ConnSource> Engine<S> {
         } else {
             self.check_owner_level(&mut tx, data, request_id).await?;
         }
-        let out = cheladb_query::run(
+        let out = chelabase_query::run(
             &mut tx,
             &self.cache,
             (branch, &database.name),
@@ -474,7 +474,7 @@ impl<S: ConnSource> Engine<S> {
             }
         }
         let claims = Value::Object(Default::default());
-        let (schema, _, _) = cheladb_query::load_schema(
+        let (schema, _, _) = chelabase_query::load_schema(
             &mut tx,
             &self.cache,
             (branch, &database.name),
@@ -521,7 +521,7 @@ mod tests {
     use super::*;
 
     /// Failing to connect answers a fixed message (the preamble's half of this test is in
-    /// `cheladb_query::engine`).
+    /// `chelabase_query::engine`).
     #[test]
     fn connection_and_role_failures_are_fixed_messages() {
         const SECRET: &str = "10.1.2.3:5432: permission denied to set role \"x\"";
@@ -748,7 +748,7 @@ mod tests {
     /// keeps its own.
     #[tokio::test]
     async fn invalidate_drops_pools_and_caches_at_once() {
-        use cheladb_query::schema::Raw;
+        use chelabase_query::schema::Raw;
         let engine = Engine::new(crate::conn::test_support::RefusedSource, 10);
         let (branch, other) = (Uuid::new_v4(), Uuid::new_v4());
         let schema_key = |b: Uuid| SchemaKey {

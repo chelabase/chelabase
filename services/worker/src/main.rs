@@ -1,6 +1,6 @@
 use axum::{Json, Router, routing::get};
-use cheladb_metadata::{MetadataClient, MetadataConfig};
-use cheladb_nats::{
+use chelabase_metadata::{MetadataClient, MetadataConfig};
+use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
     DataApiDatabaseRequest, GrantDataRoleRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
     ResetPasswordRequest, RoleReply, SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE,
@@ -10,8 +10,8 @@ use cheladb_nats::{
     run_branch_consumer, run_delete_consumer, run_project_delete_consumer, run_provision_consumer,
     run_settings_consumer,
 };
-use cheladb_secrets::{SecretKey, key_check_value, verify_key_check};
-use cheladb_types::mode::Mode;
+use chelabase_secrets::{SecretKey, key_check_value, verify_key_check};
+use chelabase_types::mode::Mode;
 use futures_util::StreamExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 /// 15 s in the orchestrator): keep at least 5 s between them.
 const RESET_DEADLINE: Duration = Duration::from_secs(8);
 /// Queue group: with several workers, each reset is handled exactly once.
-const RESET_QUEUE_GROUP: &str = "cheladb-worker";
+const RESET_QUEUE_GROUP: &str = "chelabase-worker";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     // Before anything is contacted, so a missing image is the first thing a user sees.
     let config = WorkerConfig::from_env()?;
     let metadata_config = MetadataConfig::from_env().unwrap_or_else(|_| MetadataConfig {
-        database_url: "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into(),
+        database_url: "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into(),
     });
     let nats_config = NatsConfig::from_env().expect("nats config");
 
@@ -55,13 +55,13 @@ async fn main() -> anyhow::Result<()> {
 
     let worker = Arc::new(build(&config, metadata, key)?);
     if config.owner_superuser_requested && config.mode == Mode::Platform {
-        warn!("CHELADB_DB_OWNER_SUPERUSER is ignored in platform mode");
+        warn!("CHELABASE_DB_OWNER_SUPERUSER is ignored in platform mode");
     }
     if worker.owner_superuser {
-        warn!("CHELADB_DB_OWNER_SUPERUSER is on: new databases' owner role is SUPERUSER");
+        warn!("CHELABASE_DB_OWNER_SUPERUSER is on: new databases' owner role is SUPERUSER");
     }
 
-    let health_addr: SocketAddr = std::env::var("CHELADB_WORKER_HEALTH_ADDR")
+    let health_addr: SocketAddr = std::env::var("CHELABASE_WORKER_HEALTH_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8082".into())
         .parse()?;
     let health_app = Router::new().route("/health", get(health));
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
     if worker.zitadel.is_none() {
-        warn!("Zitadel admin access isn't configured: app users and project delete jobs wait (CHELADB_ZITADEL_ISSUER, CHELADB_ZITADEL_ADMIN_PAT_FILE)");
+        warn!("Zitadel admin access isn't configured: app users and project delete jobs wait (CHELABASE_ZITADEL_ISSUER, CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
     }
 
     let project_delete_worker = worker.clone();
@@ -188,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Refuse to run with a secrets key that can't open existing credentials.
 async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyhow::Result<()> {
-    use cheladb_metadata::KeyCheck;
+    use chelabase_metadata::KeyCheck;
     match metadata
         .ensure_key_check(&key_check_value(key), |stored| {
             verify_key_check(key, stored)
@@ -203,8 +203,8 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
             Ok(())
         }
         KeyCheck::Mismatch { sealed_rows } => anyhow::bail!(
-            "CHELADB_SECRETS_KEY is not the key {sealed_rows} database(s) were encrypted with. \
-             Restore the original .cheladb/secrets/secrets.key; in local dev you can instead \
+            "CHELABASE_SECRETS_KEY is not the key {sealed_rows} database(s) were encrypted with. \
+             Restore the original .chelabase/secrets/secrets.key; in local dev you can instead \
              remove every database with `just sweep-dbs`."
         ),
     }

@@ -28,16 +28,16 @@ die() {
 # hex <bytes>: that many random bytes as lowercase hex.
 hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
 # SQL on stdin; values are passed as psql variables (-v name=value, used as :'name').
-# The database is the path of CHELADB_METADATA_DATABASE_URL when set (a branch may run on its own
-# metadata database), else cheladb_metadata.
+# The database is the path of CHELABASE_METADATA_DATABASE_URL when set (a branch may run on its own
+# metadata database), else chelabase_metadata.
 metadata_db() {
-  local db="${CHELADB_METADATA_DATABASE_URL:-}"
+  local db="${CHELABASE_METADATA_DATABASE_URL:-}"
   db="${db#*://}"
   [[ "$db" == */* ]] && db="${db#*/}" || db=""
   db="${db%%[?#]*}"
-  echo "${db:-cheladb_metadata}"
+  echo "${db:-chelabase_metadata}"
 }
-metadata_sql() { "${compose[@]}" exec -T metadata-db psql -U cheladb -d "$(metadata_db)" -v ON_ERROR_STOP=1 -qtA "$@"; }
+metadata_sql() { "${compose[@]}" exec -T metadata-db psql -U chelabase -d "$(metadata_db)" -v ON_ERROR_STOP=1 -qtA "$@"; }
 
 # call <method> <url> [json body]: prints the response body; dies on no answer or non-2xx.
 # Each request is limited to $MAX_TIME seconds (default 60).
@@ -60,18 +60,18 @@ call() {
 check_internal_addr() {
   local addr="$1" port
   [[ "$addr" =~ ^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):([0-9]{1,5})$ ]] ||
-    die "CHELADB_INTERNAL_ADDR='$addr' is not host:port with a numeric port (e.g. 127.0.0.1:8083 or [::1]:8083)"
+    die "CHELABASE_INTERNAL_ADDR='$addr' is not host:port with a numeric port (e.g. 127.0.0.1:8083 or [::1]:8083)"
   port="${BASH_REMATCH[2]}"
   ((10#$port >= 1 && 10#$port <= 65535)) ||
-    die "CHELADB_INTERNAL_ADDR='$addr': port $port is out of range (1-65535)"
+    die "CHELABASE_INTERNAL_ADDR='$addr': port $port is out of range (1-65535)"
 }
 
 # api <method> <path> [json body]: a gateway call as the demo tenant's user (needs $GATEWAY, $tmp and
-# the built cheladb). Prints the HTTP status; the body goes to $tmp/body. The token is minted per
+# the built chelabase). Prints the HTTP status; the body goes to $tmp/body. The token is minted per
 # request: it is short-lived.
 api() {
   local token args
-  token="$(cargo run -q -p cheladb -- dev token)" || die "cheladb dev token"
+  token="$(cargo run -q -p chelabase -- dev token)" || die "chelabase dev token"
   args=(-sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -X "$1" "$GATEWAY$2" -H "Authorization: Bearer $token")
   if [[ -n "${3:-}" ]]; then args+=(-H 'content-type: application/json' -d "$3"); fi
   curl "${args[@]}" || true

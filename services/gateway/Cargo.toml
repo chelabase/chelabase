@@ -3,7 +3,7 @@ name = "gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cheladb HTTP API gateway (Pingora)"
+description = "Chelabase HTTP API gateway (Pingora)"
 
 [lib]
 name = "gateway"
@@ -14,9 +14,9 @@ name = "gateway"
 path = "src/main.rs"
 
 [dependencies]
-cheladb-auth = { workspace = true }
-cheladb-routes = { workspace = true }
-cheladb-types = { workspace = true }
+chelabase-auth = { workspace = true }
+chelabase-routes = { workspace = true }
+chelabase-types = { workspace = true }
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
 pingora-http = { workspace = true }
@@ -39,6 +39,6 @@ serde = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-cheladb-auth = { workspace = true, features = ["test-support"] }
+chelabase-auth = { workspace = true, features = ["test-support"] }
 axum = { workspace = true }
 tempfile = { workspace = true }

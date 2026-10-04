@@ -78,7 +78,7 @@ check "build.sh with an unknown target exits 2" refuses 2 "$here/build.sh" bogus
 check "build.sh no longer builds vm-compute" refuses 2 "$here/build.sh" vm-compute
 
 # --- Compose ------------------------------------------------------------------------------
-# One file, one project (`cheladb`).
+# One file, one project (`chelabase`).
 compose_file="$root/infra/compose/docker-compose.yml"
 check "one Compose file" \
   test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$compose_file "
@@ -95,8 +95,8 @@ if command -v docker >/dev/null; then
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
   check "the stack has every service (NATS, Valkey and the proxy too; no hook relay)" \
     test "$(services)" = "create-bucket mailpit metadata-db nats pageserver proxy proxy-tls register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db valkey zitadel zitadel-db "
-  check "the project is cheladb" \
-    test "$("${compose[@]}" config --format json | jq -r '.name')" = "cheladb"
+  check "the project is chelabase" \
+    test "$("${compose[@]}" config --format json | jq -r '.name')" = "chelabase"
   neon_json="$("${compose[@]}" config --format json)"
   published="$(jq <<<"$neon_json" -r '
     [.services | to_entries[]
@@ -117,9 +117,9 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2' <<<"$zitadel")" = "http://localhost:3000/login?authRequest="
   check "zitadel writes the login-client token" \
     test "$(jq -r '.environment.ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH' <<<"$zitadel")" = "/zitadel-bootstrap/login-client.pat"
-  token="$(CHELADB_STORCON_HOOK_TOKEN=from-env "${compose[@]}" config --format json |
+  token="$(CHELABASE_STORCON_HOOK_TOKEN=from-env "${compose[@]}" config --format json |
     jq -r '.services["storage-controller"].command[]' | grep -- '--control-plane-jwt-token=' || true)"
-  check "the hook token comes from CHELADB_STORCON_HOOK_TOKEN" \
+  check "the hook token comes from CHELABASE_STORCON_HOOK_TOKEN" \
     test "$token" = "--control-plane-jwt-token=from-env"
   storcon="$(jq -r '.services["storage-controller"]' <<<"$neon_json")"
   check "the storage controller calls the orchestrator's internal listener" \
@@ -149,9 +149,9 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.healthcheck.timeout // empty' <<<"$valkey")" != ""
   check "the proxy waits for its TLS certificate" \
     test "$(jq -r '.depends_on["proxy-tls"].condition' <<<"$proxy")" = "service_completed_successfully"
-  ptoken="$(CHELADB_PROXY_API_TOKEN=from-env "${compose[@]}" config --format json |
+  ptoken="$(CHELABASE_PROXY_API_TOKEN=from-env "${compose[@]}" config --format json |
     jq -r '.services.proxy.environment.NEON_PROXY_TO_CONTROLPLANE_TOKEN')"
-  check "the proxy's token comes from CHELADB_PROXY_API_TOKEN" test "$ptoken" = "from-env"
+  check "the proxy's token comes from CHELABASE_PROXY_API_TOKEN" test "$ptoken" = "from-env"
 else
   pass "no docker: skipped the compose config checks"
 fi
@@ -175,8 +175,8 @@ images() { # images <local images> <ok|fail>: runs neon-images.sh against the st
   env PATH="$stub:$PATH" STUB_LOG="$stub/log" STUB_LOCAL="$1" STUB_PULL="$2" \
     "$root/scripts/neon-images.sh" 2>"$stub/err"
 }
-local_neon="cheladb/neon-storage:$neon_dev_tag"
-local_compute="cheladb/neon-compute-v17:$neon_dev_tag"
+local_neon="chelabase/neon-storage:$neon_dev_tag"
+local_compute="chelabase/neon-compute-v17:$neon_dev_tag"
 pinned_neon='NEON_IMAGE=ghcr\.io/chelabase/neon-storage:[^@]+@sha256:[0-9a-f]{64}'
 pinned_compute='COMPUTE_NODE_IMAGE=ghcr\.io/chelabase/neon-compute-v17:[^@]+@sha256:[0-9a-f]{64}'
 
@@ -307,31 +307,31 @@ else
   pass "no python3: skipped the smoke cleanup checks"
 fi
 
-# --- CHELADB_INTERNAL_ADDR validation (fails before touching docker) -----------------------
+# --- CHELABASE_INTERNAL_ADDR validation (fails before touching docker) -----------------------
 for script in neon-e2e; do
   for bad in localhost 127.0.0.1: 127.0.0.1:http ":8083" "[::1]" "127.0.0.1:99999"; do
     status=0
-    CHELADB_INTERNAL_ADDR="$bad" "$root/scripts/$script.sh" >/dev/null 2>"$stub/addr-err" || status=$?
-    check "$script rejects CHELADB_INTERNAL_ADDR='$bad'" \
-      bash -c 'test "$1" -eq 1 && grep -q "CHELADB_INTERNAL_ADDR=" "$2"' _ "$status" "$stub/addr-err"
+    CHELABASE_INTERNAL_ADDR="$bad" "$root/scripts/$script.sh" >/dev/null 2>"$stub/addr-err" || status=$?
+    check "$script rejects CHELABASE_INTERNAL_ADDR='$bad'" \
+      bash -c 'test "$1" -eq 1 && grep -q "CHELABASE_INTERNAL_ADDR=" "$2"' _ "$status" "$stub/addr-err"
   done
 done
 addr_ok() { # addr_ok <value>: passes the shared validator
   bash -c 'LOG_PREFIX=t; . "$1/scripts/lib/neon-common.sh"; check_internal_addr "$2"' _ "$root" "$1" >/dev/null 2>&1
 }
-check "CHELADB_INTERNAL_ADDR accepts 127.0.0.1:8083" addr_ok 127.0.0.1:8083
-check "CHELADB_INTERNAL_ADDR accepts [::1]:8083" addr_ok "[::1]:8083"
-check "CHELADB_INTERNAL_ADDR accepts a host name" addr_ok host.docker.internal:8083
+check "CHELABASE_INTERNAL_ADDR accepts 127.0.0.1:8083" addr_ok 127.0.0.1:8083
+check "CHELABASE_INTERNAL_ADDR accepts [::1]:8083" addr_ok "[::1]:8083"
+check "CHELABASE_INTERNAL_ADDR accepts a host name" addr_ok host.docker.internal:8083
 
 # --- justfile -----------------------------------------------------------------------------
 check "neon-ps shows exited one-shots too" bash -c "just --justfile '$root/justfile' --show neon-ps | grep -q ' ps -a '"
-check "deps-down also removes demo computes" bash -c "just --justfile '$root/justfile' --show deps-down | grep -q 'cheladb-compute-'"
+check "deps-down also removes demo computes" bash -c "just --justfile '$root/justfile' --show deps-down | grep -q 'chelabase-compute-'"
 check "deps-up copies the proxy CA" \
   bash -c "just --justfile '$root/justfile' --show deps-up | grep -q 'cp proxy:/tls/ca.crt'"
-check "dev exports CHELADB_COMPUTE_IMAGE" \
-  bash -c "just --justfile '$root/justfile' --show dev | grep -q 'export CHELADB_COMPUTE_IMAGE='"
-check "worker exports CHELADB_COMPUTE_IMAGE" \
-  bash -c "just --justfile '$root/justfile' --show worker | grep -q 'export CHELADB_COMPUTE_IMAGE='"
+check "dev exports CHELABASE_COMPUTE_IMAGE" \
+  bash -c "just --justfile '$root/justfile' --show dev | grep -q 'export CHELABASE_COMPUTE_IMAGE='"
+check "worker exports CHELABASE_COMPUTE_IMAGE" \
+  bash -c "just --justfile '$root/justfile' --show worker | grep -q 'export CHELABASE_COMPUTE_IMAGE='"
 check "branch-e2e recipe exists" \
   bash -c "just --justfile '$root/justfile' --show branch-e2e | grep -q 'scripts/branch-e2e.sh'"
 check "data-e2e recipe exists" \
@@ -361,16 +361,16 @@ check "stack-reset-slots' offline checks pass" \
   bash -c '"$1/scripts/tests/stack-reset-slots.sh" >/dev/null 2>&1' _ "$root"
 
 # The lock check: a recipe that touches the stack refuses (exit 3, holder printed) while another
-# worktree holds it, before touching anything; inside `just live` (CHELADB_LIVE_HOLDER=1) it
+# worktree holds it, before touching anything; inside `just live` (CHELABASE_LIVE_HOLDER=1) it
 # skips the check. Safe by construction, even when a recipe ignores the check: the recipes run
-# in a sandbox copy (justfile, scripts, infra; an empty .cheladb), and every command that could
+# in a sandbox copy (justfile, scripts, infra; an empty .chelabase), and every command that could
 # reach a real service (docker, cargo, pnpm, curl, psql, ss, git) is a fake that logs and fails.
 # The recipes get none of the caller's environment (env -i): a temp HOME, PATH = the fakes, just
 # itself and the system directories.
 lock="$(mktemp -d)"
 trap 'rm -rf "$stub" "$lock"' EXIT
 sandbox="$lock/repo"
-mkdir -p "$sandbox/.cheladb" "$lock/bin" "$lock/home"
+mkdir -p "$sandbox/.chelabase" "$lock/bin" "$lock/home"
 printf 'p:\n    @echo {{just_executable()}}\n' >"$lock/justfile"
 ln -s "$(just --justfile "$lock/justfile" p)" "$lock/bin/just"
 rm "$lock/justfile"
@@ -389,26 +389,26 @@ in_sandbox() { # in_sandbox [--ask] <env assignments...> -- <recipe>: runs the r
   while [ "$1" != -- ]; do envs+=("$1"); shift; done
   shift
   env -i HOME="$lock/home" PATH="$lock/bin:/usr/bin:/bin" LOCK_LOG="$lock/log" \
-    CHELADB_LIVE_SCRIPT="$lock/live.sh" "${envs[@]}" \
+    CHELABASE_LIVE_SCRIPT="$lock/live.sh" "${envs[@]}" \
     "$lock/bin/just" --justfile "$sandbox/justfile" --working-directory "$sandbox" ${yes[@]+"${yes[@]}"} "$@" </dev/null
 }
 # The sandbox shares nothing with the caller's environment: with the stack free (the check
-# passes), recipes that delete files run to the end, and a canary named by CHELADB_ZITADEL_DIR
-# and CHELADB_MAIN in the outer environment survives.
+# passes), recipes that delete files run to the end, and a canary named by CHELABASE_ZITADEL_DIR
+# and CHELABASE_MAIN in the outer environment survives.
 printf '%s\n' '#!/usr/bin/env bash' 'echo "live.sh $*" >>"$LOCK_LOG"' 'exit 0' >"$lock/live-free.sh"
 chmod +x "$lock/live-free.sh"
 canary="$lock/canary"
-mkdir -p "$canary/zitadel" "$canary/main/.cheladb/slots" "$canary/main/.worktrees/target"
+mkdir -p "$canary/zitadel" "$canary/main/.chelabase/slots" "$canary/main/.worktrees/target"
 echo keep >"$canary/zitadel/admin.pat"
-echo keep >"$canary/main/.cheladb/slots/1.env"
+echo keep >"$canary/main/.chelabase/slots/1.env"
 (
-  export CHELADB_ZITADEL_DIR="$canary/zitadel" CHELADB_MAIN="$canary/main"
-  in_sandbox CHELADB_LIVE_SCRIPT="$lock/live-free.sh" -- zitadel-reset >/dev/null 2>&1 || true
-  in_sandbox CHELADB_LIVE_SCRIPT="$lock/live-free.sh" -- stack-reset-slots --yes >/dev/null 2>&1 || true
+  export CHELABASE_ZITADEL_DIR="$canary/zitadel" CHELABASE_MAIN="$canary/main"
+  in_sandbox CHELABASE_LIVE_SCRIPT="$lock/live-free.sh" -- zitadel-reset >/dev/null 2>&1 || true
+  in_sandbox CHELABASE_LIVE_SCRIPT="$lock/live-free.sh" -- stack-reset-slots --yes >/dev/null 2>&1 || true
 )
-check "the sandbox ignores CHELADB_ZITADEL_DIR from outside" test -f "$canary/zitadel/admin.pat"
-check "the sandbox ignores CHELADB_MAIN from outside" \
-  test -f "$canary/main/.cheladb/slots/1.env" -a -d "$canary/main/.worktrees/target"
+check "the sandbox ignores CHELABASE_ZITADEL_DIR from outside" test -f "$canary/zitadel/admin.pat"
+check "the sandbox ignores CHELABASE_MAIN from outside" \
+  test -f "$canary/main/.chelabase/slots/1.env" -a -d "$canary/main/.worktrees/target"
 for recipe in dev deps-up deps-down sweep-dbs cleanup zitadel-reset zitadel-bootstrap stack-reset-slots neon-smoke \
   neon-e2e branch-e2e data-e2e console-e2e role-e2e auth-e2e neon-test-live; do
   : >"$lock/log"
@@ -419,30 +419,30 @@ for recipe in dev deps-up deps-down sweep-dbs cleanup zitadel-reset zitadel-boot
     _ "$status" "$lock/out" "$lock/log"
 done
 : >"$lock/log"
-in_sandbox CHELADB_LIVE_HOLDER=1 -- deps-down >/dev/null 2>&1 || true
+in_sandbox CHELABASE_LIVE_HOLDER=1 -- deps-down >/dev/null 2>&1 || true
 check "inside just live the check is skipped" \
   bash -c '! grep -q "live.sh check" "$1" && grep -q "^touched: docker" "$1"' _ "$lock/log"
 # With the lock free but just dev running from another worktree, a plain recipe would hit that
 # worktree's apps: it warns (stderr, no failure). Quiet inside just live, when dev runs here, or
 # when it doesn't run.
-mkdir -p "$sandbox/.cheladb/dev"
+mkdir -p "$sandbox/.chelabase/dev"
 warn_run() { # warn_run <worktree file content|-> [env...]: deps-down with the stack free
   local wt="$1"
   shift
-  rm -f "$sandbox/.cheladb/dev/worktree"
-  if [ "$wt" != - ]; then echo "$wt" >"$sandbox/.cheladb/dev/worktree"; fi
-  in_sandbox CHELADB_LIVE_SCRIPT="$lock/live-free.sh" "$@" -- deps-down >"$lock/out" 2>"$lock/err" || true
+  rm -f "$sandbox/.chelabase/dev/worktree"
+  if [ "$wt" != - ]; then echo "$wt" >"$sandbox/.chelabase/dev/worktree"; fi
+  in_sandbox CHELABASE_LIVE_SCRIPT="$lock/live-free.sh" "$@" -- deps-down >"$lock/out" 2>"$lock/err" || true
 }
 warn_run /elsewhere
 check "a plain recipe warns when just dev runs from another worktree" \
   bash -c 'grep -q "/elsewhere" "$1" && grep -qi "warning" "$1" && ! grep -q "/elsewhere" "$2"' _ "$lock/err" "$lock/out"
-warn_run /elsewhere CHELADB_LIVE_HOLDER=1
+warn_run /elsewhere CHELABASE_LIVE_HOLDER=1
 check "inside just live there is no warning" bash -c '! grep -q "/elsewhere" "$1"' _ "$lock/err"
 warn_run "$sandbox"
 check "no warning when just dev runs here" bash -c '! grep -qi "warning" "$1"' _ "$lock/err"
 warn_run -
 check "no warning when just dev isn't running" bash -c '! grep -qi "warning" "$1"' _ "$lock/err"
-rm -f "$sandbox/.cheladb/dev/worktree"
+rm -f "$sandbox/.chelabase/dev/worktree"
 # sweep-builds without cargo-sweep: a hint and a clean exit (cleanup's last step must not fail).
 status=0
 in_sandbox -- sweep-builds >"$lock/out" 2>&1 || status=$?
@@ -468,33 +468,33 @@ in_sandbox -- live just neon-e2e >/dev/null 2>&1 || true
 check "just live just <recipe> queues just <recipe>" grep -qx 'live.sh run just neon-e2e' "$lock/log"
 check "just live passes the dev swap" grep -Eq '^swap: .*--working-directory "?[^ ]*repo"? _live-swap-dev' "$lock/log"
 # The dev swap `just live` runs while holding the stack (same sandbox and fakes).
-mkdir -p "$sandbox/.cheladb/dev"
+mkdir -p "$sandbox/.chelabase/dev"
 : >"$lock/log"
-rm -f "$sandbox/.cheladb/dev/pids" "$sandbox/.cheladb/dev/worktree"
-in_sandbox CHELADB_LIVE_HOLDER=1 -- _live-swap-dev >/dev/null 2>&1 || true
+rm -f "$sandbox/.chelabase/dev/pids" "$sandbox/.chelabase/dev/worktree"
+in_sandbox CHELABASE_LIVE_HOLDER=1 -- _live-swap-dev >/dev/null 2>&1 || true
 check "the dev swap does nothing when just dev isn't running" bash -c '! grep -q "^touched" "$1"' _ "$lock/log"
 # A live pid (a sleep: dev-down's cmdline guard would never stop it).
 sleep 300 &
 alive=$!
-echo "$alive" >"$sandbox/.cheladb/dev/pids"
-echo "$sandbox" >"$sandbox/.cheladb/dev/worktree"
-in_sandbox CHELADB_LIVE_HOLDER=1 -- _live-swap-dev >/dev/null 2>&1 || true
+echo "$alive" >"$sandbox/.chelabase/dev/pids"
+echo "$sandbox" >"$sandbox/.chelabase/dev/worktree"
+in_sandbox CHELABASE_LIVE_HOLDER=1 -- _live-swap-dev >/dev/null 2>&1 || true
 check "the dev swap does nothing when just dev runs here" \
-  bash -c '! grep -q "^touched" "$1" && test -f "$2"' _ "$lock/log" "$sandbox/.cheladb/dev/pids"
+  bash -c '! grep -q "^touched" "$1" && test -f "$2"' _ "$lock/log" "$sandbox/.chelabase/dev/pids"
 kill "$alive" 2>/dev/null || true
 wait "$alive" 2>/dev/null || true
 # Here, but every pid is gone (a reboot, a crash): restart it.
 : >"$lock/log"
-echo 999999999 >"$sandbox/.cheladb/dev/pids"
-in_sandbox CHELADB_LIVE_HOLDER=1 -- _live-swap-dev >"$lock/out" 2>&1 || true
+echo 999999999 >"$sandbox/.chelabase/dev/pids"
+in_sandbox CHELABASE_LIVE_HOLDER=1 -- _live-swap-dev >"$lock/out" 2>&1 || true
 check "the dev swap restarts a stale just dev here" \
-  bash -c 'test ! -e "$1" && grep -q "^touched: docker" "$2"' _ "$sandbox/.cheladb/dev/pids" "$lock/log"
-echo 999999999 >"$sandbox/.cheladb/dev/pids"
+  bash -c 'test ! -e "$1" && grep -q "^touched: docker" "$2"' _ "$sandbox/.chelabase/dev/pids" "$lock/log"
+echo 999999999 >"$sandbox/.chelabase/dev/pids"
 : >"$lock/log"
-echo /elsewhere >"$sandbox/.cheladb/dev/worktree"
+echo /elsewhere >"$sandbox/.chelabase/dev/worktree"
 in_sandbox -- _live-swap-dev >"$lock/out" 2>&1 || true
 check "the dev swap stops just dev from another worktree" \
-  bash -c 'test ! -e "$1" && grep -q "moving it to" "$2"' _ "$sandbox/.cheladb/dev/pids" "$lock/out"
+  bash -c 'test ! -e "$1" && grep -q "moving it to" "$2"' _ "$sandbox/.chelabase/dev/pids" "$lock/out"
 check "then starts just dev here (deps-up first)" grep -q "^touched: docker" "$lock/log"
 check "the dev swap waits for the gateway and Studio" \
   bash -c 'grep -q "127.0.0.1:8000/health" <<<"$1" && grep -q "localhost:3000" <<<"$1"' _ "$(show _live-swap-dev)"

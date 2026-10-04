@@ -1,8 +1,8 @@
 //! auth settings from the environment (`demo.env` in local dev).
 
 use anyhow::{Context, Result};
-use cheladb_secrets::SecretKey;
-pub use cheladb_types::mode::Mode;
+use chelabase_secrets::SecretKey;
+pub use chelabase_types::mode::Mode;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,7 +29,7 @@ pub struct Config {
 fn var(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| {
         format!(
-            "{name} is not set; run `just zitadel-bootstrap` and load .cheladb/zitadel/demo.env"
+            "{name} is not set; run `just zitadel-bootstrap` and load .chelabase/zitadel/demo.env"
         )
     })
 }
@@ -46,7 +46,7 @@ fn flag(name: &str) -> bool {
 }
 
 /// Self-hosted mode creates sign-ups with the email already verified; platform mode sends a
-/// code and requires it. A non-blank `CHELADB_REQUIRE_EMAIL_VERIFICATION` overrides the mode.
+/// code and requires it. A non-blank `CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides the mode.
 fn requires_email_verification(mode: Mode, overridden: Option<&str>) -> bool {
     match overridden.map(str::trim).filter(|v| !v.is_empty()) {
         Some(value) => truthy(Some(value)),
@@ -55,7 +55,7 @@ fn requires_email_verification(mode: Mode, overridden: Option<&str>) -> bool {
 }
 
 /// Cookies get `Secure` on platform (served over TLS), not in self-hosted local dev; a non-blank
-/// `CHELADB_AUTH_SECURE_COOKIES` overrides.
+/// `CHELABASE_AUTH_SECURE_COOKIES` overrides.
 fn secure_cookies(mode: Mode, overridden: Option<&str>) -> bool {
     match overridden.map(str::trim).filter(|v| !v.is_empty()) {
         Some(value) => truthy(Some(value)),
@@ -76,8 +76,8 @@ fn check_listen(listen: &str, trusted_proxy: bool) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "CHELADB_AUTH_ADDR={listen} is reachable without the gateway, so clients could forge \
-         X-Forwarded-For. Bind to loopback, or set CHELADB_AUTH_TRUSTED_PROXY=true if only a \
+        "CHELABASE_AUTH_ADDR={listen} is reachable without the gateway, so clients could forge \
+         X-Forwarded-For. Bind to loopback, or set CHELABASE_AUTH_TRUSTED_PROXY=true if only a \
          proxy that appends X-Forwarded-For can reach it."
     )
 }
@@ -104,45 +104,45 @@ fn warn_if_open(path: &str) {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
-        let token_file = var("CHELADB_AUTH_TOKEN_FILE")?;
+        let token_file = var("CHELABASE_AUTH_TOKEN_FILE")?;
         warn_if_open(&token_file);
         let token =
             std::fs::read_to_string(&token_file).with_context(|| format!("read {token_file}"))?;
-        let cookie_key_file = var("CHELADB_AUTH_COOKIE_KEY")?;
+        let cookie_key_file = var("CHELABASE_AUTH_COOKIE_KEY")?;
         warn_if_open(&cookie_key_file);
         let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file))
             .map_err(|e| anyhow::anyhow!("cookie key: {e}"))?;
-        let studio_url = std::env::var("CHELADB_STUDIO_ORIGINS")
+        let studio_url = std::env::var("CHELABASE_STUDIO_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:3000".into())
             .split(',')
             .map(str::trim)
             .find(|o| !o.is_empty() && *o != "*")
             .unwrap_or("http://localhost:3000")
             .to_string();
-        let min_ms: u64 = std::env::var("CHELADB_AUTH_MIN_RESPONSE_MS")
+        let min_ms: u64 = std::env::var("CHELABASE_AUTH_MIN_RESPONSE_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MIN_RESPONSE_MS);
         let listen =
-            std::env::var("CHELADB_AUTH_ADDR").unwrap_or_else(|_| "127.0.0.1:8084".into());
-        check_listen(&listen, flag("CHELADB_AUTH_TRUSTED_PROXY"))?;
+            std::env::var("CHELABASE_AUTH_ADDR").unwrap_or_else(|_| "127.0.0.1:8084".into());
+        check_listen(&listen, flag("CHELABASE_AUTH_TRUSTED_PROXY"))?;
         Ok(Self {
             listen,
-            issuer: var("CHELADB_ZITADEL_ISSUER")?,
+            issuer: var("CHELABASE_ZITADEL_ISSUER")?,
             token: token.trim().to_string(),
             cookie_key,
-            org_id: var("CHELADB_ZITADEL_ORG_ID")?,
+            org_id: var("CHELABASE_ZITADEL_ORG_ID")?,
             studio_url,
             skip_email_verification: !requires_email_verification(
                 mode,
-                std::env::var("CHELADB_REQUIRE_EMAIL_VERIFICATION")
+                std::env::var("CHELABASE_REQUIRE_EMAIL_VERIFICATION")
                     .ok()
                     .as_deref(),
             ),
             mode,
             secure_cookies: secure_cookies(
                 mode,
-                std::env::var("CHELADB_AUTH_SECURE_COOKIES")
+                std::env::var("CHELABASE_AUTH_SECURE_COOKIES")
                     .ok()
                     .as_deref(),
             ),
@@ -170,7 +170,7 @@ pub struct AppConfig {
 
 pub const DEFAULT_APP_ACCESS_TTL_SECS: u64 = 900;
 pub const DEFAULT_INTERNAL_URL: &str = "http://127.0.0.1:8083";
-pub const DEFAULT_APP_AUTH_INTERNAL_TOKEN: &str = "cheladb-dev-app-auth";
+pub const DEFAULT_APP_AUTH_INTERNAL_TOKEN: &str = "chelabase-dev-app-auth";
 
 impl AppConfig {
     pub fn from_env() -> Result<Option<Self>> {
@@ -180,41 +180,41 @@ impl AppConfig {
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
         let get = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let (Some(private_key), Some(public_key)) = (
-            get("CHELADB_APP_JWT_PRIVATE_KEY"),
-            get("CHELADB_APP_JWT_PUBLIC_KEY"),
+            get("CHELABASE_APP_JWT_PRIVATE_KEY"),
+            get("CHELABASE_APP_JWT_PUBLIC_KEY"),
         ) else {
-            tracing::info!("app users are off: CHELADB_APP_JWT_PRIVATE_KEY/PUBLIC_KEY are not set");
+            tracing::info!("app users are off: CHELABASE_APP_JWT_PRIVATE_KEY/PUBLIC_KEY are not set");
             return Ok(None);
         };
         let mut missing = Vec::new();
-        let verify_key = get("CHELADB_INTERNAL_VERIFY_KEY");
+        let verify_key = get("CHELABASE_INTERNAL_VERIFY_KEY");
         if verify_key.is_none() {
-            missing.push("CHELADB_INTERNAL_VERIFY_KEY");
+            missing.push("CHELABASE_INTERNAL_VERIFY_KEY");
         }
-        let admin_pat_file = get("CHELADB_ZITADEL_ADMIN_PAT_FILE");
+        let admin_pat_file = get("CHELABASE_ZITADEL_ADMIN_PAT_FILE");
         if admin_pat_file.is_none() {
-            missing.push("CHELADB_ZITADEL_ADMIN_PAT_FILE");
+            missing.push("CHELABASE_ZITADEL_ADMIN_PAT_FILE");
         }
         let (Some(verify_key), Some(admin_pat_file)) = (verify_key, admin_pat_file) else {
             tracing::warn!("app users are off: {} not set", missing.join(" and "));
             return Ok(None);
         };
-        let access_ttl = match get("CHELADB_APP_ACCESS_TTL_SECS") {
+        let access_ttl = match get("CHELABASE_APP_ACCESS_TTL_SECS") {
             None => DEFAULT_APP_ACCESS_TTL_SECS,
             Some(v) => v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| (60..=86_400).contains(n))
                 .with_context(|| {
-                    format!("CHELADB_APP_ACCESS_TTL_SECS={v}: expected seconds from 60 to 86400")
+                    format!("CHELABASE_APP_ACCESS_TTL_SECS={v}: expected seconds from 60 to 86400")
                 })?,
         };
         Ok(Some(Self {
             private_key: private_key.into(),
             public_key: public_key.into(),
             access_ttl: Duration::from_secs(access_ttl),
-            internal_url: get("CHELADB_INTERNAL_URL").unwrap_or_else(|| DEFAULT_INTERNAL_URL.into()),
-            internal_token: get("CHELADB_APP_AUTH_INTERNAL_TOKEN")
+            internal_url: get("CHELABASE_INTERNAL_URL").unwrap_or_else(|| DEFAULT_INTERNAL_URL.into()),
+            internal_token: get("CHELABASE_APP_AUTH_INTERNAL_TOKEN")
                 .unwrap_or_else(|| DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()),
             verify_key: verify_key.into(),
             admin_pat_file: admin_pat_file.into(),
@@ -235,10 +235,10 @@ mod tests {
     }
 
     const FULL: [(&str, &str); 4] = [
-        ("CHELADB_APP_JWT_PRIVATE_KEY", "/k/app-jwt.key"),
-        ("CHELADB_APP_JWT_PUBLIC_KEY", "/k/app-jwt.pub"),
-        ("CHELADB_INTERNAL_VERIFY_KEY", "/k/internal.pub"),
-        ("CHELADB_ZITADEL_ADMIN_PAT_FILE", "/k/admin.pat"),
+        ("CHELABASE_APP_JWT_PRIVATE_KEY", "/k/app-jwt.key"),
+        ("CHELABASE_APP_JWT_PUBLIC_KEY", "/k/app-jwt.pub"),
+        ("CHELABASE_INTERNAL_VERIFY_KEY", "/k/internal.pub"),
+        ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/k/admin.pat"),
     ];
 
     #[test]
@@ -246,11 +246,11 @@ mod tests {
         let c = AppConfig::from_vars(vars(&FULL)).unwrap().unwrap();
         assert_eq!(c.access_ttl, Duration::from_secs(900));
         assert_eq!(c.internal_url, "http://127.0.0.1:8083");
-        assert_eq!(c.internal_token, "cheladb-dev-app-auth");
+        assert_eq!(c.internal_token, "chelabase-dev-app-auth");
         assert_eq!(c.admin_pat_file, PathBuf::from("/k/admin.pat"));
         let mut more = FULL.to_vec();
-        more.push(("CHELADB_APP_ACCESS_TTL_SECS", "300"));
-        more.push(("CHELADB_INTERNAL_URL", "http://10.0.0.1:9000"));
+        more.push(("CHELABASE_APP_ACCESS_TTL_SECS", "300"));
+        more.push(("CHELABASE_INTERNAL_URL", "http://10.0.0.1:9000"));
         let c = AppConfig::from_vars(vars(&more)).unwrap().unwrap();
         assert_eq!(c.access_ttl, Duration::from_secs(300));
         assert_eq!(c.internal_url, "http://10.0.0.1:9000");
@@ -264,7 +264,7 @@ mod tests {
             assert_eq!(AppConfig::from_vars(vars(&some)).unwrap(), None, "without {name}");
         }
         let mut bad = FULL.to_vec();
-        bad.push(("CHELADB_APP_ACCESS_TTL_SECS", "soon"));
+        bad.push(("CHELABASE_APP_ACCESS_TTL_SECS", "soon"));
         assert!(AppConfig::from_vars(vars(&bad)).is_err());
     }
 
@@ -283,7 +283,7 @@ mod tests {
         assert!(check_listen("[::1]:8084", false).is_ok());
         assert!(check_listen("localhost:8084", false).is_ok());
         let err = check_listen("0.0.0.0:8084", false).unwrap_err().to_string();
-        assert!(err.contains("CHELADB_AUTH_TRUSTED_PROXY"), "{err}");
+        assert!(err.contains("CHELABASE_AUTH_TRUSTED_PROXY"), "{err}");
         assert!(check_listen("0.0.0.0:8084", true).is_ok());
     }
 
@@ -296,7 +296,7 @@ mod tests {
     }
 
     // Self-hosted (the default mode) skips verification; platform requires it.
-    // CHELADB_REQUIRE_EMAIL_VERIFICATION, when set, overrides either way.
+    // CHELABASE_REQUIRE_EMAIL_VERIFICATION, when set, overrides either way.
     #[test]
     fn email_verification_follows_the_mode_unless_overridden() {
         assert!(!requires_email_verification(Mode::SelfHosted, None));

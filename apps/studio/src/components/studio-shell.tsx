@@ -18,7 +18,7 @@ export function StudioShell({ profile, onSignOut, nav, children }: StudioShellPr
     <div className="min-h-screen bg-background text-foreground">
       <header className="flex items-center justify-between border-b px-8 py-4">
         <Link to="/app" className="font-semibold">
-          Cheladb Studio
+          Chelabase Studio
         </Link>
         <div className="flex items-center gap-4 text-sm">
           <span className="flex flex-col items-end leading-tight">

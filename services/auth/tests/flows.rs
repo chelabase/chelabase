@@ -1,6 +1,6 @@
 mod support;
 
-use cheladb_secrets::SecretKey;
+use chelabase_secrets::SecretKey;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -155,8 +155,8 @@ async fn sign_in_finishes_and_sets_the_session_cookie() {
             .unwrap()
             .starts_with("http://localhost:3000/callback?code=")
     );
-    assert!(a.cookie("cheladb_session").is_some());
-    assert!(a.cookies.iter().any(|c| c.starts_with("cheladb_session=")
+    assert!(a.cookie("chelabase_session").is_some());
+    assert!(a.cookies.iter().any(|c| c.starts_with("chelabase_session=")
         && c.contains("HttpOnly; SameSite=Strict; Path=/auth/v1")));
 }
 
@@ -210,7 +210,7 @@ async fn sign_in_with_an_unverified_email_asks_for_the_code() {
         (StatusCode::OK, json!({"next": "verify"}))
     );
     assert_eq!(h.mock.emails(), vec![(id, "verify".to_string())]);
-    let login = a.cookie("cheladb_login").unwrap();
+    let login = a.cookie("chelabase_login").unwrap();
     let done = h
         .post(
             "/auth/v1/verify-email",
@@ -223,7 +223,7 @@ async fn sign_in_with_an_unverified_email_asks_for_the_code() {
     assert!(
         done.cookies
             .iter()
-            .any(|c| c.starts_with("cheladb_login=;") && c.contains("Max-Age=0"))
+            .any(|c| c.starts_with("chelabase_login=;") && c.contains("Max-Age=0"))
     );
 }
 
@@ -243,7 +243,7 @@ async fn sign_up_then_verify_finishes() {
         (a.status, a.body.clone()),
         (StatusCode::OK, json!({"next": "verify"}))
     );
-    let login = a.cookie("cheladb_login").unwrap();
+    let login = a.cookie("chelabase_login").unwrap();
     let bad = h
         .post(
             "/auth/v1/verify-email",
@@ -303,8 +303,8 @@ async fn a_taken_email_looks_the_same_and_its_code_never_works() {
         (taken.status, taken.body.clone()),
         (fresh.status, fresh.body.clone())
     );
-    let decoy = taken.cookie("cheladb_login").unwrap();
-    assert_eq!(decoy.len(), fresh.cookie("cheladb_login").unwrap().len());
+    let decoy = taken.cookie("chelabase_login").unwrap();
+    assert_eq!(decoy.len(), fresh.cookie("chelabase_login").unwrap().len());
     let a = h
         .post(
             "/auth/v1/verify-email",
@@ -432,7 +432,7 @@ async fn verify_email_is_rate_limited() {
             "3.3.3.3",
         )
         .await;
-    let login = a.cookie("cheladb_login").unwrap();
+    let login = a.cookie("chelabase_login").unwrap();
     for _ in 0..10 {
         h.post(
             "/auth/v1/verify-email",
@@ -614,13 +614,13 @@ async fn logout_ends_the_session_and_clears_both_cookies() {
         .post(
             "/auth/v1/logout",
             json!({}),
-            Some(&a.cookie("cheladb_session").unwrap()),
+            Some(&a.cookie("chelabase_session").unwrap()),
             "1.1.1.1",
         )
         .await;
     assert_eq!((out.status, out.body), (StatusCode::OK, json!({})));
     assert_eq!(h.mock.session_count(), 0);
-    for name in ["cheladb_login=;", "cheladb_session=;"] {
+    for name in ["chelabase_login=;", "chelabase_session=;"] {
         assert!(
             out.cookies
                 .iter()
@@ -722,7 +722,7 @@ async fn resend_limits_do_not_reveal_a_decoy() {
         .post(
             "/auth/v1/resend-code",
             json!({}),
-            Some(&taken.cookie("cheladb_login").unwrap()),
+            Some(&taken.cookie("chelabase_login").unwrap()),
             "4.4.4.4",
         )
         .await;
@@ -746,7 +746,7 @@ async fn code_endpoints_take_the_minimum_time() {
             "5.5.5.5",
         )
         .await;
-    let decoy = taken.cookie("cheladb_login").unwrap();
+    let decoy = taken.cookie("chelabase_login").unwrap();
     for (path, body) in [
         ("/auth/v1/verify-email", json!({"code": "000000"})),
         ("/auth/v1/resend-code", json!({})),

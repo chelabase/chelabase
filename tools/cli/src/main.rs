@@ -1,4 +1,4 @@
-//! Cheladb local CLI — local development setup / token mint (foundation for a fuller control-plane CLI).
+//! Chelabase local CLI — local development setup / token mint (foundation for a fuller control-plane CLI).
 
 mod dev;
 mod generate;
@@ -8,7 +8,7 @@ mod paths;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "cheladb", about = "Cheladb local control-plane CLI", version)]
+#[command(name = "chelabase", about = "Chelabase local control-plane CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -35,13 +35,13 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum GenCommands {
-    /// Write the TypeScript `Database` and runtime `types` for `@cheladb/client`
+    /// Write the TypeScript `Database` and runtime `types` for `@chelabase/client`
     Types {
         /// The gateway's base URL (the data API is under `/data/v1`)
         #[arg(long)]
         url: String,
         /// A secret data key (`chk_sec_…`)
-        #[arg(long, env = "CHELADB_DATA_KEY", hide_env_values = true)]
+        #[arg(long, env = "CHELABASE_DATA_KEY", hide_env_values = true)]
         key: Option<String>,
         /// Write to this file instead of stdout
         #[arg(long)]
@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cheladb=info".into()),
+                .unwrap_or_else(|_| "chelabase=info".into()),
         )
         .with_writer(std::io::stderr)
         .init();

@@ -7,8 +7,8 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use cheladb_metadata::NeonEndpoint;
-use cheladb_neon::ComputeLocator;
+use chelabase_metadata::NeonEndpoint;
+use chelabase_neon::ComputeLocator;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -26,13 +26,13 @@ pub(crate) async fn endpoint_config<M: NeonMetadataPort, L: ComputeLocator>(
 ) -> anyhow::Result<Value> {
     let roles = state.metadata.neon_roles(&endpoint.id).await?;
     let databases = state.metadata.neon_databases(&endpoint.id).await?;
-    cheladb_neon::spec::stored_endpoint_config(
+    chelabase_neon::spec::stored_endpoint_config(
         &state.storcon,
         endpoint,
         roles,
         databases,
         state.signer.jwks(),
-        Some(cheladb_neon::spec::ddl_url(
+        Some(chelabase_neon::spec::ddl_url(
             &state.control_plane_uri,
             &endpoint.id,
         )),

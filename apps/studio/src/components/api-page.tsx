@@ -8,7 +8,7 @@ export function ApiPage() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="flex items-center justify-between border-b px-8 py-4">
-        <span className="font-semibold">Cheladb Studio</span>
+        <span className="font-semibold">Chelabase Studio</span>
         <Link to="/app" className="text-sm underline-offset-4 hover:underline">
           Back to dashboard
         </Link>

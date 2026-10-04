@@ -1,8 +1,8 @@
 //! Deleting a database: every branch's compute, the tenant, the endpoint rows, then the
 //! tombstones.
 
-use cheladb_neon::{ComputeBackend, NeonId};
-use cheladb_types::DatabaseId;
+use chelabase_neon::{ComputeBackend, NeonId};
+use chelabase_types::DatabaseId;
 use tracing::info;
 
 use crate::Worker;
@@ -104,7 +104,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests {
-    use cheladb_metadata::{BranchStatus, DatabaseStatus};
+    use chelabase_metadata::{BranchStatus, DatabaseStatus};
 
     use super::*;
     use crate::fakes::{
@@ -128,7 +128,7 @@ mod tests {
             state.databases.get_mut(&id).unwrap().status = DatabaseStatus::Deleting;
             state
                 .branches
-                .get_mut(&cheladb_types::BranchId::from(id))
+                .get_mut(&chelabase_types::BranchId::from(id))
                 .unwrap()
                 .status = BranchStatus::Deleting;
         }
@@ -224,7 +224,7 @@ mod tests {
         let (w, journal) = worker();
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         w.handle_provision(id, "app").await.unwrap();
-        let main = cheladb_types::BranchId::from(id);
+        let main = chelabase_types::BranchId::from(id);
         let dev = ready_branch(&w, id, "dev", main).await;
         let backup = restored_by_hand(&w, dev, "dev-before-restore-20260930T120000Z");
         let other = ready_branch(&w, id, "other", main).await;

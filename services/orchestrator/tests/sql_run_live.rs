@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use cheladb_types::BranchId;
+use chelabase_types::BranchId;
 use futures_util::StreamExt;
 use orchestrator::sql_editor::events::{Outcome, RunEvent};
 use orchestrator::sql_editor::registry::{RunGuard, RunRegistry};
@@ -13,8 +13,8 @@ use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 fn admin_url() -> String {
-    std::env::var("CHELADB_METADATA_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://cheladb:cheladb@127.0.0.1:5433/cheladb_metadata".into())
+    std::env::var("CHELABASE_METADATA_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into())
 }
 
 async fn admin_connect() -> tokio_postgres::Client {

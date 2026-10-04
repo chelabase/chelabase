@@ -9,7 +9,7 @@ export function studioScopes(env: StudioEnv): string[] {
     "offline_access",
     // Puts the user's org id in the access token; the gateway maps it to a tenant.
     "urn:zitadel:iam:user:resourceowner",
-    // Adds the project to `aud`, matching the gateway's CHELADB_ZITADEL_AUDIENCES.
+    // Adds the project to `aud`, matching the gateway's CHELABASE_ZITADEL_AUDIENCES.
     `urn:zitadel:iam:org:project:id:${env.projectId}:aud`,
     // Pins sign-in and sign-up to the bootstrapped org (single-org mode).
     // Drop this to let each signup create its own organization.

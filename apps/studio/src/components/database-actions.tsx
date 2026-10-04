@@ -14,7 +14,7 @@ import {
   type Branch,
   type ConnectionDetails,
   type DatabaseSummary,
-} from "@cheladb/management-client";
+} from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { PASSWORD_STATE_TEXT } from "@/lib/password-state";

@@ -15,8 +15,8 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use cheladb_auth::internal::{AuthMethod, DataIdentity, IDENTITY_HEADER, InternalVerifier};
-use cheladb_types::data_key::DataKeyKind;
+use chelabase_auth::internal::{AuthMethod, DataIdentity, IDENTITY_HEADER, InternalVerifier};
+use chelabase_types::data_key::DataKeyKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -47,7 +47,7 @@ pub struct Config {
     /// The bearer for the internal listener, both ways.
     pub internal_token: String,
     pub max_connections: usize,
-    /// The largest query response (`CHELADB_REST_MAX_RESPONSE_BYTES`, default 16 MiB).
+    /// The largest query response (`CHELABASE_REST_MAX_RESPONSE_BYTES`, default 16 MiB).
     pub max_response_bytes: usize,
 }
 
@@ -62,13 +62,13 @@ fn env_or(name: &str, default: &str) -> String {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Config {
-            addr: env_or("CHELADB_REST_ADDR", "127.0.0.1:8085").parse()?,
-            internal_addr: env_or("CHELADB_REST_INTERNAL_ADDR", "127.0.0.1:8086").parse()?,
-            internal_url: env_or("CHELADB_INTERNAL_URL", "http://127.0.0.1:8083"),
-            internal_token: env_or("CHELADB_REST_INTERNAL_TOKEN", "cheladb-dev-rest-internal"),
-            max_connections: env_or("CHELADB_REST_MAX_CONNECTIONS", "200").parse()?,
+            addr: env_or("CHELABASE_REST_ADDR", "127.0.0.1:8085").parse()?,
+            internal_addr: env_or("CHELABASE_REST_INTERNAL_ADDR", "127.0.0.1:8086").parse()?,
+            internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
+            internal_token: env_or("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
+            max_connections: env_or("CHELABASE_REST_MAX_CONNECTIONS", "200").parse()?,
             max_response_bytes: env_or(
-                "CHELADB_REST_MAX_RESPONSE_BYTES",
+                "CHELABASE_REST_MAX_RESPONSE_BYTES",
                 &crate::exec::DEFAULT_MAX_RESPONSE_BYTES.to_string(),
             )
             .parse()?,

@@ -16,7 +16,7 @@ pinned() {
 }
 
 choose() { # choose <VAR> <image name>
-  local var="$1" local_ref="cheladb/$2:$neon_dev_tag" ref
+  local var="$1" local_ref="chelabase/$2:$neon_dev_tag" ref
   if docker image inspect "$local_ref" >/dev/null 2>&1; then
     echo "[neon-images] using local build $local_ref" >&2
     echo "$var=$local_ref"
