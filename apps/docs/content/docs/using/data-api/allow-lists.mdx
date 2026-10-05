@@ -1,0 +1,27 @@
+---
+title: Allow-lists
+description: Limit a data key to some of a branch's databases.
+---
+
+A key may carry a list of the Postgres databases it reaches. Without one it reaches every served database of the branch. Both kinds of key can have a list, the public key included.
+
+## Setting a list
+
+- `POST …/keys` takes `"databases": ["analytics"]`. Absent or `null` means every served database.
+- `PATCH …/keys/{key_id}` with `{ "databases": [...] | null }` edits either kind. `databases` is required (`null` means every served database), so an empty body can't widen a key by accident.
+- Rotation keeps the list.
+
+## Rules
+
+- Each name is 1 to 63 bytes, with at most 20 names and no duplicates.
+- Each name must be a database of the branch. It may be served or not (Studio marks the others "not served").
+- The system `postgres` database is refused.
+- An empty list is refused (422). Use `null` for every served database.
+
+## What a request sees
+
+A database that doesn't exist, isn't served, or isn't on the key's list answers 404 `unknown_database` with one text for all three ("the database doesn't exist or isn't served by this key"), so a key can't discover database names.
+
+A narrowed list reaches `rest` at once. The gateway's key cache can keep serving the old list for up to 30 seconds, the same window as a revoke.
+
+See also [Serving more databases](/docs/using/data-api/databases), for what happens to lists when a database is renamed or dropped in SQL.

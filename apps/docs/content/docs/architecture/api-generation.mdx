@@ -1,0 +1,93 @@
+---
+title: "API generation"
+description: "How the OpenAPI documents, the generated clients, the error shape and the API reference are produced."
+---
+
+Chelabase's APIs describe themselves from the Rust code. Three OpenAPI documents are committed under `openapi/`, typed clients are generated from them, and this site renders them as the API reference. Nothing here is edited by hand.
+
+## The documents
+
+OpenAPI documents are generated from the Rust route handlers with utoipa 6 and utoipa-axum, and the paths come from the endpoint registry in `crates/chelabase-routes`.
+
+| Document | Describes | Built in |
+| --- | --- | --- |
+| `openapi/management.json` | The Management API: the orchestrator's `/v1` | `services/orchestrator/src/openapi.rs` |
+| `openapi/login.json` | The login API: auth's `/auth/v1`, for Studio only | `services/auth/src/openapi.rs` |
+| `openapi/data.json` | The data API: `rest`'s `/data/v1` | `services/rest/src/openapi.rs` |
+
+The [management](/docs/reference/management/databases/createDatabase) and [data](/docs/reference/data/runQuery) references are published under `/docs/reference/` and the [login API](/docs/architecture/login-api/login/signIn) under `/docs/architecture/login-api`; each page is generated from its document when the site is built.
+
+### Tests that keep them honest
+
+Each service has tests in its `openapi` module that fail when a document is stale or a route isn't documented:
+
+- `document_is_current`: the committed file equals what the code generates (set `CHELABASE_BLESS` to rewrite it);
+- `document_matches_the_registry`: the document's method and path set equals the registry's public endpoints for that service;
+- `operation_ids_are_the_contract`: operation ids are stable, because generated clients take their function names from them;
+- `every_response_has_a_description_and_errors_use_the_envelope`: every response is described, and every error status references the shared error envelope;
+- `schema_names_are_api_facing` (or `schema_names_are_specific_and_unique` for the login document): component names are meaningful in the generated clients.
+
+### The data API document
+
+The data API document is built differently, because the request body is one JSON tree that `rest` parses by hand rather than through serde types. `chelabase_query::openapi` (behind the `openapi` feature) holds marker types for the query language's schemas: `QueryRequest` (one of the six top-level operations: select, insert, update, delete, call and batch), the batch members, and the shared `Filter`, `TableName`, `SelectItem`, `OrderBy`, `Returning` and `QueryResult`. One helper builds each operation twice, once for the top level (`v` required, `database` allowed) and once as a batch member (`v` optional, no `database`).
+
+`services/rest/src/openapi.rs` assembles the document: `POST /data/v1/query` (`runQuery`) and `GET /data/v1/schema` (`getDataSchema`), the `bearer` and `user` security schemes (the `Chelabase-User` header), and the data API's own error envelope (`code`, `message`, and optionally `detail`, `hint` and `sqlstate`) for every status of 400 and above.
+
+Because the schema is written by hand next to a hand-written parser, a fidelity test keeps the two together. `crates/chelabase-query/tests/openapi_fidelity.rs` reads the committed `openapi/data.json` and checks that:
+
+- every contract fixture of the TypeScript client (`packages/client/fixtures`) is valid against the request schema;
+- the schema and the parser reject the same invalid inputs, and accept the same edge inputs;
+- the known gaps (inputs the schema accepts but the parser rejects, such as keys that differ between insert rows or an alias of 32 multi-byte characters) are exactly the listed ones.
+
+## Regenerating
+
+After changing any route, its request or response types, or an error code, run:
+
+```bash
+just api-gen
+```
+
+This command:
+
+- rewrites the OpenAPI documents with `CHELABASE_BLESS=1` on the document tests;
+- runs orval 8 to regenerate the TypeScript clients;
+- syncs the Scalar API reference bundle with `just scalar-sync`.
+
+Commit the result. `just check` fails if the documents, the generated code or the Scalar bundle are out of date.
+
+## Generated clients
+
+Two packages are generated from the documents with orval 8:
+
+- `packages/management-client` (`@chelabase/management-client`, private for now): TanStack Query hooks (`useGetDatabase`, `useCreateBranch`), plain functions (`getDatabase(id)`) and query key helpers (`getGetDatabaseQueryKey(id)`). Configure it once with `configureManagementClient({ baseUrl, getToken, onUnauthorized })`.
+- `apps/studio/src/lib/login-client`: Studio's internal login client, generated the same way.
+
+Generated files are never edited by hand. Errors from these clients are thrown as `ApiError { status, code, message, extra, signInRestarted }`, so a caller can switch on the stable `code` rather than the message.
+
+The application-facing data API client is a separate, hand-written package (`@chelabase/client`), checked against the data API document by the fidelity test above.
+
+## Error shape
+
+All management, login and gateway errors use one shape:
+
+```json
+{ "error": { "code": "<code>", "message": "<sentence>" } }
+```
+
+Some codes add extra keys (for example `keys` on `role_in_use`). The `code` is stable snake_case (for example `not_found`, `branch_not_ready`, `has_children`, `name_taken`, `tenant_not_bound`, `invalid_request`, `too_large`, `rate_limited`, `unavailable`, `worker_unavailable`, `not_applied`, `sign_in_expired`, `invalid_credentials`). The full list is the `ErrorCode` enum in `crates/chelabase-types/src/api_error.rs` and the OpenAPI documents; see also [Error codes](/docs/reference/errors). Another tenant's database answers 404 `not_found`, exactly like a missing one.
+
+The data API keeps its own codes and extra fields (`detail`, `hint`, `sqlstate`).
+
+## API reference UI
+
+Scalar provides a self-hosted API reference at `GET /v1/docs` behind the gateway. It is public: the orchestrator serves the page and `/v1/docs/scalar.js` (the embedded bundle), and the page reads `GET /v1/openapi.json`. Studio has an **API** page (`/app/api`, linked next to Sign out) that renders the same document, with "Try it out" sending the signed-in user's token automatically.
+
+Scalar is configured never to contact scalar.com: telemetry off, default fonts off, no request proxy (`proxyUrl` is the empty string, because leaving it unset falls back to a scalar.com proxy), external URLs empty, agent and MCP off, developer tools never.
+
+Scalar is versioned through pnpm pinning: `@scalar/api-reference` at the repository root and `@scalar/api-reference-react` in Studio, both exact. To update it:
+
+1. Bump both with pnpm (the minimum release age applies).
+2. Run `just scalar-sync` to copy `dist/browser/standalone.js` into `services/orchestrator/assets/scalar/` with a `VERSION` file.
+3. Commit.
+
+The orchestrator embeds Scalar at compile time, so Rust builds need no Node.

@@ -1,0 +1,64 @@
+---
+title: "Neon"
+description: "The Neon storage stack behind every database, the proxy, the internal listener and the local ports."
+---
+
+Chelabase runs Neon's storage stack and Neon's compute, from its own hard fork ([`chelabase/neon`](https://github.com/chelabase/neon)). `just deps-up` starts the storage stack with the rest of the local dependencies, and it backs every database.
+
+## What runs
+
+Docker Compose (`infra/compose/docker-compose.yml`) starts, besides the control plane's own dependencies:
+
+- **SeaweedFS**, an S3-compatible object store, with a `neon` bucket for the safekeeper's WAL backups;
+- the **storage broker**, one **safekeeper** (enough for local development), the **storage controller** (with its own Postgres) and the **pageserver**;
+- **Neon's proxy**, which terminates TLS and speaks Postgres wire and SQL over HTTP;
+- **Valkey**, for the proxy's cache invalidation and query cancel.
+
+The worker starts one compute container per database (and per branch) through the Docker socket, from the compute image pinned in Compose. Each compute reaches its storage through the pageserver and safekeepers, and reports to the control plane.
+
+The storage controller creates each safekeeper timeline and deletes it (local WAL and the S3 backup) with the database, branch or superseded timeline. `just storage-leak-e2e` checks that deleting reclaims the storage. The image pins and the build and bump procedure are in [`infra/neon/README.md`](https://github.com/chelabase/chelabase/blob/main/infra/neon/README.md).
+
+## The internal listener
+
+The orchestrator's internal listener is on `127.0.0.1:8083` (`CHELABASE_INTERNAL_ADDR`). It serves the machines that call the control plane: Neon's proxy (to look up roles and endpoints), `compute_ctl` (for each compute's spec and hooks) and the storage controller, plus the gateway, `rest` and `auth` for their lookups. Each caller has its own bearer token and can open only its own routes, and nothing goes through the gateway.
+
+## Proxy and connections
+
+Neon's proxy listens on `127.0.0.1:4432` (Postgres wire) and `127.0.0.1:4444` (WebSocket and SQL over HTTP), for hostnames of the form `<endpoint>.localtest.me`. `localtest.me` resolves to loopback; `CHELABASE_PROXY_DOMAIN`, `CHELABASE_PROXY_PG_PORT` and `CHELABASE_PROXY_HTTP_PORT` change the domain and the ports the control plane reports.
+
+The proxy asks the orchestrator for each role's SCRAM secret. It caches role secrets for at most a minute, so a password change must publish `/password_updated` after the compute is reconfigured; `chelabase neon password-updated` does that. It fails loudly when no proxy is subscribed, rather than reporting success.
+
+Valkey is what makes query cancel work through the proxy, and it carries the cache invalidation.
+
+## Local ports
+
+| Service | Host port | Notes |
+| --- | --- | --- |
+| Studio | 3000 | The web app (dev server) |
+| Gateway | 8000 | HTTP front door (Pingora) |
+| Orchestrator | 8081 | Management API; internal to the gateway |
+| Orchestrator internal listener | 8083 | For the proxy, `compute_ctl`, the storage controller, the gateway, `rest` and `auth` |
+| Worker health | 8082 | `/health` |
+| auth | 8084 | Sign-in backend (via the gateway at `/auth/v1`) |
+| rest | 8085 | Data API engine (via the gateway at `/data/v1`) |
+| rest internal | 8086 | The orchestrator's schema and console calls to `rest` |
+| metadata Postgres | 5433 | Control-plane metadata |
+| NATS (with JetStream) | 4222 (monitor 8222) | Provision queue and jobs |
+| Zitadel | 8080 | Console: `http://localhost:8080/ui/console` |
+| Zitadel Postgres | 5434 | Zitadel's own database |
+| Mailpit | 8025 | Local email inbox (verification codes, resets) |
+| Neon storage controller | 1234 | Tenants and timelines |
+| Neon pageserver | 9898 | Pageserver HTTP API |
+| Neon proxy | 4432, 4444 | Postgres wire; WebSocket and SQL over HTTP |
+| Valkey | 6379 | Proxy cache invalidation and query cancel |
+
+Copy [`infra/compose/.env.example`](https://github.com/chelabase/chelabase/blob/main/infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer the values in `.chelabase/zitadel/demo.env` after bootstrap.
+
+<Callout type="info" title="Native Linux Docker">
+  `host.docker.internal` resolves to the bridge gateway, which can't reach a listener on `127.0.0.1`. On native Linux Docker, set `CHELABASE_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`). Only the host part may change: the port stays 8083, because Compose and the compute use it. The scripts derive their internal URL from the same variable. Docker Desktop (WSL2) works as is.
+</Callout>
+
+## Checks
+
+- `just neon-smoke` checks the storage stack alone: the safekeeper is active, the pageserver answers, and a throwaway tenant and timeline can be created, read back and deleted. It also needs the orchestrator running (`just dev`), which answers the tenant's compute notification.
+- `just neon-e2e` goes through the gateway API to create a test database, then proves that it answers through the proxy over Postgres wire, SQL over HTTP and the serverless driver; that a wrong password is refused; that query cancel works; and that a changed password works at once.

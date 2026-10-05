@@ -1,0 +1,1647 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Chelabase Data API",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/data/v1/query": {
+      "post": {
+        "tags": [
+          "data"
+        ],
+        "summary": "Run a query",
+        "description": "Runs one operation (select, insert, update, delete or a function call), or a batch of them in order, in one transaction as the key's role. With a public key and a `Chelabase-User` token it runs as `authenticated` with the user's claims. Row-level security applies throughout.",
+        "operationId": "runQuery",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The result as JSON: an array of row objects for a select and for writes (`[]` without `returning`), the function's result for a call, and for a batch the array of each operation's result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_query`, `unknown_column`, `invalid_value`, `raised`, `user_token_with_secret_key`: the body isn't a valid query or doesn't plan (`invalid_query`), names a column the role can't see (`unknown_column`), carries a value Postgres rejects (`invalid_value`), a function raised an exception (`raised`), or a `Chelabase-User` token came with a secret key (`user_token_with_secret_key`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`, `user_token_invalid`, `user_token_expired`, `user_session_revoked`: the key is missing, invalid or revoked, or its branch is gone (`unauthorized`); or the `Chelabase-User` token is invalid, expired or from a revoked session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`permission_denied`, `role_not_allowed`: Postgres refused the role (`permission_denied`), or the secret key's role can bypass row-level security (`role_not_allowed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown_table`, `unknown_function`, `unknown_database`: the role can't see the table or function, or the database doesn't exist, isn't served or isn't on the key's list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`, `retry`: a unique, foreign-key or exclusion constraint failed (`conflict`), or a serialization failure or deadlock: run it again (`retry`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over 1 MiB, or the response is over the server's limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`rate_limited`: too many requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: an unexpected error; the message carries the request id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the database can't be reached right now; retry after `Retry-After`",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: a statement ran past its timeout",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "bearer": [],
+            "user": []
+          }
+        ]
+      }
+    },
+    "/data/v1/schema": {
+      "get": {
+        "tags": [
+          "data"
+        ],
+        "summary": "The schema as the key's role sees it",
+        "description": "The tables, views, columns, functions and enums the secret key's role can reach in the database (without privileges), and the databases the key may reach. `chelabase gen types` reads it.",
+        "operationId": "getDataSchema",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database to describe; the key's main database when left out. It must be\nserved and, when the key has a database list, on it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The schema, and the reachable databases as `databases`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataSchemaResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`user_token_with_secret_key`: a `Chelabase-User` token came with the secret key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: the key is missing, invalid, revoked or not a secret key, or its branch is gone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`role_not_allowed`: the key's role can bypass row-level security",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown_database`: the database doesn't exist, isn't served or isn't on the key's list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`rate_limited`: too many requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: an unexpected error; the message carries the request id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the database can't be reached right now; retry after `Retry-After`",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: reading the schema ran past the statement timeout",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AppUsersTable": {
+        "type": "object",
+        "description": "The branch's app users table: where `chelabase.app_users_table` points.",
+        "required": [
+          "schema",
+          "table"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          }
+        }
+      },
+      "ArgDesc": {
+        "type": "object",
+        "required": [
+          "name",
+          "type",
+          "array",
+          "has_default"
+        ],
+        "properties": {
+          "array": {
+            "type": "boolean"
+          },
+          "has_default": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "BatchCall": {
+        "type": "object",
+        "required": [
+          "op",
+          "fn"
+        ],
+        "properties": {
+          "args": {
+            "type": "object",
+            "description": "Named arguments, each any JSON value"
+          },
+          "fn": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "call"
+            ]
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "BatchDelete": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "op",
+              "from"
+            ],
+            "properties": {
+              "all": {
+                "type": "boolean",
+                "description": "`true` to act on every row without `where`"
+              },
+              "from": {
+                "$ref": "#/components/schemas/TableName"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "delete"
+                ]
+              },
+              "returning": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Returning"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "v": {
+                "type": "integer",
+                "description": "The query language's version",
+                "enum": [
+                  1
+                ]
+              },
+              "where": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Filter"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The rows to change; required unless `all` is true"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "anyOf": [
+              {
+                "type": "object",
+                "required": [
+                  "where"
+                ],
+                "properties": {
+                  "where": {
+                    "type": "object"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "all"
+                ],
+                "properties": {
+                  "all": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "BatchInsert": {
+        "type": "object",
+        "required": [
+          "op",
+          "into",
+          "values"
+        ],
+        "properties": {
+          "into": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "insert"
+            ]
+          },
+          "returning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Returning"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "minProperties": 1
+            },
+            "description": "The rows, each an object of column values; every row has the same keys",
+            "minItems": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "BatchRequest": {
+        "type": "object",
+        "required": [
+          "v",
+          "op",
+          "ops"
+        ],
+        "properties": {
+          "database": {
+            "type": "string",
+            "description": "The Postgres database every operation runs in (1 to 63 bytes); the key's main database when left out",
+            "maxLength": 63,
+            "minLength": 1
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "batch"
+            ]
+          },
+          "ops": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/BatchSelect"
+                },
+                {
+                  "$ref": "#/components/schemas/BatchInsert"
+                },
+                {
+                  "$ref": "#/components/schemas/BatchUpdate"
+                },
+                {
+                  "$ref": "#/components/schemas/BatchDelete"
+                },
+                {
+                  "$ref": "#/components/schemas/BatchCall"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "op",
+                "mapping": {
+                  "call": "#/components/schemas/BatchCall",
+                  "delete": "#/components/schemas/BatchDelete",
+                  "insert": "#/components/schemas/BatchInsert",
+                  "select": "#/components/schemas/BatchSelect",
+                  "update": "#/components/schemas/BatchUpdate"
+                }
+              }
+            },
+            "description": "At most 50 operations; batches don't nest",
+            "maxItems": 50
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "BatchSelect": {
+        "type": "object",
+        "required": [
+          "op",
+          "from"
+        ],
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "At most this many rows (the server caps it)",
+            "minimum": 0
+          },
+          "offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Skip this many rows first",
+            "minimum": 0
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "select"
+            ]
+          },
+          "orderBy": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderBy"
+            }
+          },
+          "select": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SelectItem"
+            },
+            "description": "The columns to return; every column when left out",
+            "minItems": 1
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          },
+          "where": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "BatchUpdate": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "op",
+              "table",
+              "set"
+            ],
+            "properties": {
+              "all": {
+                "type": "boolean",
+                "description": "`true` to act on every row without `where`"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "update"
+                ]
+              },
+              "returning": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Returning"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "set": {
+                "type": "object",
+                "description": "The new column values",
+                "minProperties": 1
+              },
+              "table": {
+                "$ref": "#/components/schemas/TableName"
+              },
+              "v": {
+                "type": "integer",
+                "description": "The query language's version",
+                "enum": [
+                  1
+                ]
+              },
+              "where": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Filter"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The rows to change; required unless `all` is true"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "anyOf": [
+              {
+                "type": "object",
+                "required": [
+                  "where"
+                ],
+                "properties": {
+                  "where": {
+                    "type": "object"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "all"
+                ],
+                "properties": {
+                  "all": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "CallRequest": {
+        "type": "object",
+        "required": [
+          "v",
+          "op",
+          "fn"
+        ],
+        "properties": {
+          "args": {
+            "type": "object",
+            "description": "Named arguments, each any JSON value"
+          },
+          "database": {
+            "type": "string",
+            "description": "The Postgres database to run in (1 to 63 bytes); the key's main database when left out",
+            "maxLength": 63,
+            "minLength": 1
+          },
+          "fn": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "call"
+            ]
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ColumnDesc": {
+        "type": "object",
+        "required": [
+          "type",
+          "array",
+          "nullable",
+          "has_default",
+          "generated"
+        ],
+        "properties": {
+          "array": {
+            "type": "boolean"
+          },
+          "enum": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Qualified enum name (`schema.name`) when the column is an enum."
+          },
+          "generated": {
+            "type": "boolean"
+          },
+          "has_default": {
+            "type": "boolean"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "DataApiSchema": {
+        "type": "object",
+        "description": "The Data API schema: everything the asking roles can reach.",
+        "required": [
+          "version",
+          "default_schema",
+          "schemas"
+        ],
+        "properties": {
+          "app_users": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AppUsersTable",
+                "description": "The table app users are mirrored into, when the branch has one (left out otherwise)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "default_schema": {
+            "type": "string"
+          },
+          "schemas": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SchemaEntry"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "DataErrorBody": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/DataErrorCode"
+          },
+          "detail": {
+            "type": "string",
+            "description": "Postgres's detail, on a mapped database error."
+          },
+          "hint": {
+            "type": "string",
+            "description": "Postgres's hint, on a mapped database error."
+          },
+          "message": {
+            "type": "string",
+            "description": "What went wrong, for a person; not stable."
+          },
+          "sqlstate": {
+            "type": "string",
+            "description": "The SQLSTATE, on a mapped database error."
+          }
+        }
+      },
+      "DataErrorCode": {
+        "type": "string",
+        "description": "The stable error code. Each response's description lists the codes its status carries.",
+        "enum": [
+          "invalid_query",
+          "unknown_column",
+          "invalid_value",
+          "raised",
+          "user_token_with_secret_key",
+          "unauthorized",
+          "user_token_invalid",
+          "user_token_expired",
+          "user_session_revoked",
+          "permission_denied",
+          "role_not_allowed",
+          "unknown_table",
+          "unknown_function",
+          "unknown_database",
+          "conflict",
+          "retry",
+          "too_large",
+          "rate_limited",
+          "internal",
+          "unavailable",
+          "timeout"
+        ]
+      },
+      "DataErrorEnvelope": {
+        "type": "object",
+        "description": "Every data API error: `{\"error\": {...}}`.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/DataErrorBody"
+          }
+        }
+      },
+      "DataSchemaResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DataApiSchema"
+          },
+          {
+            "type": "object",
+            "required": [
+              "databases"
+            ],
+            "properties": {
+              "databases": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The served databases the key may reach (`database` on a query), main first."
+              }
+            }
+          }
+        ],
+        "description": "`GET /data/v1/schema`'s body: the schema as the key's role sees it, and the databases\nthe key may reach."
+      },
+      "DeleteRequest": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "v",
+              "op",
+              "from"
+            ],
+            "properties": {
+              "all": {
+                "type": "boolean",
+                "description": "`true` to act on every row without `where`"
+              },
+              "database": {
+                "type": "string",
+                "description": "The Postgres database to run in (1 to 63 bytes); the key's main database when left out",
+                "maxLength": 63,
+                "minLength": 1
+              },
+              "from": {
+                "$ref": "#/components/schemas/TableName"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "delete"
+                ]
+              },
+              "returning": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Returning"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "v": {
+                "type": "integer",
+                "description": "The query language's version",
+                "enum": [
+                  1
+                ]
+              },
+              "where": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Filter"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The rows to change; required unless `all` is true"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "anyOf": [
+              {
+                "type": "object",
+                "required": [
+                  "where"
+                ],
+                "properties": {
+                  "where": {
+                    "type": "object"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "all"
+                ],
+                "properties": {
+                  "all": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "Filter": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "and"
+            ],
+            "properties": {
+              "and": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Filter"
+                },
+                "minItems": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "or"
+            ],
+            "properties": {
+              "or": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Filter"
+                },
+                "minItems": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "not"
+            ],
+            "properties": {
+              "not": {
+                "$ref": "#/components/schemas/Filter"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "description": "One condition: `col` and exactly one operator. Comparisons take any value but null (use `is`); `in` a list; `is` null, true or false; `like`/`ilike` a pattern",
+            "required": [
+              "col"
+            ],
+            "properties": {
+              "col": {
+                "type": "string",
+                "description": "A column name (any string, `\"and\"` included)"
+              },
+              "eq": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              },
+              "gt": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              },
+              "gte": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              },
+              "ilike": {
+                "type": "string"
+              },
+              "in": {
+                "type": "array",
+                "items": {}
+              },
+              "is": {
+                "type": [
+                  "null",
+                  "boolean"
+                ]
+              },
+              "like": {
+                "type": "string"
+              },
+              "lt": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              },
+              "lte": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              },
+              "neq": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "maxProperties": 2,
+            "minProperties": 2
+          }
+        ]
+      },
+      "FunctionDesc": {
+        "type": "object",
+        "required": [
+          "args",
+          "returns"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArgDesc"
+            }
+          },
+          "returns": {
+            "$ref": "#/components/schemas/ReturnDesc"
+          }
+        }
+      },
+      "InsertRequest": {
+        "type": "object",
+        "required": [
+          "v",
+          "op",
+          "into",
+          "values"
+        ],
+        "properties": {
+          "database": {
+            "type": "string",
+            "description": "The Postgres database to run in (1 to 63 bytes); the key's main database when left out",
+            "maxLength": 63,
+            "minLength": 1
+          },
+          "into": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "insert"
+            ]
+          },
+          "returning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Returning"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "minProperties": 1
+            },
+            "description": "The rows, each an object of column values; every row has the same keys",
+            "minItems": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "OrderBy": {
+        "type": "object",
+        "required": [
+          "col"
+        ],
+        "properties": {
+          "col": {
+            "type": "string"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Ascending when left out",
+            "enum": [
+              "asc",
+              "desc"
+            ]
+          },
+          "nulls": {
+            "type": "string",
+            "description": "Postgres's default for the direction when left out",
+            "enum": [
+              "first",
+              "last"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "Privilege": {
+        "type": "string",
+        "enum": [
+          "select",
+          "insert",
+          "update",
+          "delete"
+        ]
+      },
+      "QueryRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SelectRequest"
+          },
+          {
+            "$ref": "#/components/schemas/InsertRequest"
+          },
+          {
+            "$ref": "#/components/schemas/UpdateRequest"
+          },
+          {
+            "$ref": "#/components/schemas/DeleteRequest"
+          },
+          {
+            "$ref": "#/components/schemas/CallRequest"
+          },
+          {
+            "$ref": "#/components/schemas/BatchRequest"
+          }
+        ],
+        "description": "One operation, or a batch of them, as a JSON tree. Unknown fields are rejected everywhere",
+        "discriminator": {
+          "propertyName": "op",
+          "mapping": {
+            "batch": "#/components/schemas/BatchRequest",
+            "call": "#/components/schemas/CallRequest",
+            "delete": "#/components/schemas/DeleteRequest",
+            "insert": "#/components/schemas/InsertRequest",
+            "select": "#/components/schemas/SelectRequest",
+            "update": "#/components/schemas/UpdateRequest"
+          }
+        }
+      },
+      "QueryResult": {
+        "description": "Rows as an array of objects for a select and for writes (`[]` without `returning`); the function's result for a call (an array for a set-returning function, `null` for a void one); for a batch, the array of each operation's result in order"
+      },
+      "ReturnDesc": {
+        "type": "object",
+        "required": [
+          "type",
+          "array",
+          "set"
+        ],
+        "properties": {
+          "array": {
+            "type": "boolean"
+          },
+          "set": {
+            "type": "boolean"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "Returning": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "*"
+            ]
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          }
+        ],
+        "description": "The changed rows' columns to return: `\"*\"` for all, or a list of column names; no rows (`[]`) when left out"
+      },
+      "SchemaEntry": {
+        "type": "object",
+        "description": "One schema's tables, functions (overloads by name) and enums (labels by name).",
+        "required": [
+          "tables",
+          "functions",
+          "enums"
+        ],
+        "properties": {
+          "enums": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "functions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/FunctionDesc"
+              }
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "tables": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TableDesc"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SelectItem": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "A column name"
+          },
+          {
+            "type": "object",
+            "required": [
+              "col",
+              "as"
+            ],
+            "properties": {
+              "as": {
+                "type": "string",
+                "description": "The key in each result row: 1 to 63 bytes, no NUL",
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[^\\x00]+$"
+              },
+              "col": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "SelectRequest": {
+        "type": "object",
+        "required": [
+          "v",
+          "op",
+          "from"
+        ],
+        "properties": {
+          "database": {
+            "type": "string",
+            "description": "The Postgres database to run in (1 to 63 bytes); the key's main database when left out",
+            "maxLength": 63,
+            "minLength": 1
+          },
+          "from": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "At most this many rows (the server caps it)",
+            "minimum": 0
+          },
+          "offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Skip this many rows first",
+            "minimum": 0
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "select"
+            ]
+          },
+          "orderBy": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderBy"
+            }
+          },
+          "select": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SelectItem"
+            },
+            "description": "The columns to return; every column when left out",
+            "minItems": 1
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          },
+          "where": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "TableDesc": {
+        "type": "object",
+        "description": "A table, view or foreign table. `privileges` (role to held privileges) is `null` unless asked for.",
+        "required": [
+          "kind",
+          "rls",
+          "security_invoker",
+          "columns"
+        ],
+        "properties": {
+          "columns": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ColumnDesc"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TableKind"
+          },
+          "primary_key": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The primary key's columns, in the key's order; left out when there is none (a view,\nor a table without a key)."
+          },
+          "privileges": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/Privilege"
+              }
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "rls": {
+            "type": "boolean"
+          },
+          "security_invoker": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TableKind": {
+        "type": "string",
+        "enum": [
+          "table",
+          "view",
+          "materialized_view",
+          "foreign_table"
+        ]
+      },
+      "TableName": {
+        "type": "string",
+        "description": "`\"name\"` (in the database's default schema) or `\"schema.name\"`, matched exactly",
+        "pattern": "^[^.]+(\\.[^.]+)?$"
+      },
+      "UpdateRequest": {
+        "allOf": [
+          {
+            "type": "object",
+            "required": [
+              "v",
+              "op",
+              "table",
+              "set"
+            ],
+            "properties": {
+              "all": {
+                "type": "boolean",
+                "description": "`true` to act on every row without `where`"
+              },
+              "database": {
+                "type": "string",
+                "description": "The Postgres database to run in (1 to 63 bytes); the key's main database when left out",
+                "maxLength": 63,
+                "minLength": 1
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "update"
+                ]
+              },
+              "returning": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Returning"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "set": {
+                "type": "object",
+                "description": "The new column values",
+                "minProperties": 1
+              },
+              "table": {
+                "$ref": "#/components/schemas/TableName"
+              },
+              "v": {
+                "type": "integer",
+                "description": "The query language's version",
+                "enum": [
+                  1
+                ]
+              },
+              "where": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/Filter"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The rows to change; required unless `all` is true"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "anyOf": [
+              {
+                "type": "object",
+                "required": [
+                  "where"
+                ],
+                "properties": {
+                  "where": {
+                    "type": "object"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "all"
+                ],
+                "properties": {
+                  "all": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "data API key",
+        "description": "A data API key (`chk_pub_…` or `chk_sec_…`) as `Authorization: Bearer <key>`"
+      },
+      "user": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Chelabase-User",
+        "description": "An app user's access token, with a public key only: the query runs as `authenticated` with the user's claims"
+      }
+    }
+  }
+}

@@ -16,15 +16,19 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, IDENTITY_HEADER, InternalVerifier};
+use chelabase_query::openapi::{QueryRequest, QueryResult};
 use chelabase_types::data_key::DataKeyKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::conn::{ConnError, ConnSource};
 use crate::error::ApiError;
 use crate::exec::{Engine, Failure};
+use crate::openapi::{DataErrorEnvelope, DataSchemaResponse};
 
 /// Largest request body (1 MiB).
 pub const MAX_BODY: usize = 1_048_576;
@@ -76,10 +80,17 @@ impl Config {
     }
 }
 
+/// The public routes with their OpenAPI annotations ([`crate::openapi::openapi`]).
+pub fn api_router<S: ConnSource>() -> OpenApiRouter<Arc<AppState<S>>> {
+    OpenApiRouter::new()
+        .routes(routes!(query))
+        .routes(routes!(role_schema))
+}
+
 pub fn router<S: ConnSource>(state: Arc<AppState<S>>) -> Router {
-    Router::new()
-        .route("/data/v1/query", post(query::<S>))
-        .route("/data/v1/schema", get(role_schema::<S>))
+    api_router()
+        .split_for_parts()
+        .0
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
@@ -130,8 +141,11 @@ fn check_bearer<S>(state: &AppState<S>, headers: &HeaderMap) -> Result<(), ApiEr
 }
 
 /// `?database=` on the schema routes.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct DatabaseParam {
+    /// The Postgres database to describe; the key's main database when left out. It must be
+    /// served and, when the key has a database list, on it.
     database: Option<String>,
 }
 
@@ -185,6 +199,31 @@ fn internal_failure(f: Failure, request_id: &str) -> Response {
     }
 }
 
+/// Runs one operation, or a batch, in one transaction as the key's role.
+#[utoipa::path(
+    post,
+    path = "/data/v1/query",
+    operation_id = "runQuery",
+    tag = "data",
+    summary = "Run a query",
+    description = "Runs one operation (select, insert, update, delete or a function call), or a batch of them in order, in one transaction as the key's role. With a public key and a `Chelabase-User` token it runs as `authenticated` with the user's claims. Row-level security applies throughout.",
+    request_body(content = QueryRequest, content_type = "application/json"),
+    security(("bearer" = []), ("bearer" = [], "user" = [])),
+    responses(
+        (status = 200, description = "The result as JSON: an array of row objects for a select and for writes (`[]` without `returning`), the function's result for a call, and for a batch the array of each operation's result", body = QueryResult),
+        (status = 400, description = "`invalid_query`, `unknown_column`, `invalid_value`, `raised`, `user_token_with_secret_key`: the body isn't a valid query or doesn't plan (`invalid_query`), names a column the role can't see (`unknown_column`), carries a value Postgres rejects (`invalid_value`), a function raised an exception (`raised`), or a `Chelabase-User` token came with a secret key (`user_token_with_secret_key`)", body = DataErrorEnvelope),
+        (status = 401, description = "`unauthorized`, `user_token_invalid`, `user_token_expired`, `user_session_revoked`: the key is missing, invalid or revoked, or its branch is gone (`unauthorized`); or the `Chelabase-User` token is invalid, expired or from a revoked session", body = DataErrorEnvelope),
+        (status = 403, description = "`permission_denied`, `role_not_allowed`: Postgres refused the role (`permission_denied`), or the secret key's role can bypass row-level security (`role_not_allowed`)", body = DataErrorEnvelope),
+        (status = 404, description = "`unknown_table`, `unknown_function`, `unknown_database`: the role can't see the table or function, or the database doesn't exist, isn't served or isn't on the key's list", body = DataErrorEnvelope),
+        (status = 409, description = "`conflict`, `retry`: a unique, foreign-key or exclusion constraint failed (`conflict`), or a serialization failure or deadlock: run it again (`retry`)", body = DataErrorEnvelope),
+        (status = 413, description = "`too_large`: the body is over 1 MiB, or the response is over the server's limit", body = DataErrorEnvelope),
+        (status = 429, description = "`rate_limited`: too many requests", body = DataErrorEnvelope),
+        (status = 500, description = "`internal`: an unexpected error; the message carries the request id", body = DataErrorEnvelope),
+        (status = 503, description = "`unavailable`: the database can't be reached right now; retry after `Retry-After`", body = DataErrorEnvelope,
+            headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
+        (status = 504, description = "`timeout`: a statement ran past its timeout", body = DataErrorEnvelope),
+    ),
+)]
 async fn query<S: ConnSource>(
     State(state): State<Arc<AppState<S>>>,
     headers: HeaderMap,
@@ -207,6 +246,29 @@ async fn query<S: ConnSource>(
     }
 }
 
+/// What the key's role can reach in a database, and the databases the key may reach.
+#[utoipa::path(
+    get,
+    path = "/data/v1/schema",
+    operation_id = "getDataSchema",
+    tag = "data",
+    summary = "The schema as the key's role sees it",
+    description = "The tables, views, columns, functions and enums the secret key's role can reach in the database (without privileges), and the databases the key may reach. `chelabase gen types` reads it.",
+    params(DatabaseParam),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The schema, and the reachable databases as `databases`", body = DataSchemaResponse),
+        (status = 400, description = "`user_token_with_secret_key`: a `Chelabase-User` token came with the secret key", body = DataErrorEnvelope),
+        (status = 401, description = "`unauthorized`: the key is missing, invalid, revoked or not a secret key, or its branch is gone", body = DataErrorEnvelope),
+        (status = 403, description = "`role_not_allowed`: the key's role can bypass row-level security", body = DataErrorEnvelope),
+        (status = 404, description = "`unknown_database`: the database doesn't exist, isn't served or isn't on the key's list", body = DataErrorEnvelope),
+        (status = 429, description = "`rate_limited`: too many requests", body = DataErrorEnvelope),
+        (status = 500, description = "`internal`: an unexpected error; the message carries the request id", body = DataErrorEnvelope),
+        (status = 503, description = "`unavailable`: the database can't be reached right now; retry after `Retry-After`", body = DataErrorEnvelope,
+            headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
+        (status = 504, description = "`timeout`: reading the schema ran past the statement timeout", body = DataErrorEnvelope),
+    ),
+)]
 async fn role_schema<S: ConnSource>(
     State(state): State<Arc<AppState<S>>>,
     Query(param): Query<DatabaseParam>,

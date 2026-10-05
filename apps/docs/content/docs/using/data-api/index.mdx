@@ -1,0 +1,34 @@
+---
+title: Data API
+description: Read and write a branch's tables over one HTTP endpoint with per-branch keys.
+---
+
+Apps read and write a branch's tables over `POST /data/v1/query` with per-branch keys. The gateway checks the key; the `rest` service (`services/rest`, `just rest`) turns the request into SQL and runs it.
+
+## Endpoints
+
+| Endpoint | Does |
+|---|---|
+| `POST /data/v1/query` | Runs one operation (or a batch) from a JSON tree. See [Query language](/docs/using/data-api/query-language). |
+| `GET /data/v1/schema` | Describes what the key's role can reach. `?database=<name>` picks another served database; the response's `databases` lists the served databases the key reaches. |
+
+Both take the key in the `Authorization: Bearer <key>` header. Requests go to the gateway (`http://localhost:8000` in development).
+
+```bash
+curl -s http://localhost:8000/data/v1/query \
+  -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "v": 1, "op": "select", "from": "orders", "limit": 10 }'
+```
+
+The body is limited to 1 MiB. A failed request answers `{"error": {"code", "message", "detail"?, "hint"?, "sqlstate"?}}`; every status and code is listed once, on [Error codes](/docs/reference/errors).
+
+## Where to go next
+
+- [Keys](/docs/using/data-api/keys): public and secret keys, roles, rotation and revocation.
+- [Serving more databases](/docs/using/data-api/databases): enable other Postgres databases of a branch.
+- [Allow-lists](/docs/using/data-api/allow-lists): limit a key to some databases.
+- [Query language](/docs/using/data-api/query-language): the operations and filters.
+- [Settings](/docs/using/data-api/settings) and [Limits](/docs/using/data-api/limits).
+- [TypeScript client](/docs/using/client): a typed SDK over this endpoint.
+- [How a request flows, and which objects a key can reach](/docs/architecture/data-api).

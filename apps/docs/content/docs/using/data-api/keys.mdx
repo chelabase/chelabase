@@ -1,0 +1,36 @@
+---
+title: Keys
+description: Public and secret data keys, the roles behind them, rotation and revocation.
+---
+
+Each branch has exactly one live **public key** (role `anon`, safe for browsers) and zero or more **secret keys** (a role you choose, server only). A key starts with a prefix (`chk_pub_` or `chk_sec_`) and is 51 characters in total.
+
+## What is stored
+
+Chelabase stores the SHA-256 of every key and its first 12 characters (shown in lists). A secret key is returned once and Chelabase keeps no copy, so save it when you create it. The public key is also stored encrypted, so Studio can show it again.
+
+## Public key
+
+The branch gets its public key when it first becomes ready. It can't be revoked (409 `public_key_not_revocable`): rotate it instead. Rotating creates a new key with the same role and name and revokes the old one in one transaction. The old key keeps working until the gateway's 30-second key cache expires.
+
+## Secret keys
+
+Create one with `POST /v1/databases/{id}/branches/{bid}/keys`, or in Studio's Data API view. The body takes a `name` (1 to 63 characters), optionally a `role` (default `authenticated`) and a [`databases` allow-list](/docs/using/data-api/allow-lists).
+
+The role is checked and granted to `authenticator` when the key is created. A refused role is a 422 `role_refused` whose message says why. A role is refused when it:
+
+- isn't a valid role name (a letter or `_`, then letters, digits, `_` or `$`; at most 63 characters);
+- is `authenticator`, `chelabase_admin` or `chelabase_auth_sync` (roles Chelabase owns), or any `pg_*` role;
+- doesn't exist in the branch's database;
+- is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`;
+- is owner-level: it has `CREATEROLE`, `CREATEDB`, `BYPASSRLS` or `REPLICATION` (`the role <name> is owner-level (owner-level roles can't back a secret key; use a plain role)`).
+
+Rotating a secret key keeps its role and doesn't run the check or the grant again. A reset or restore rewinds the grant, so the worker's bootstrap grants each live secret key's role again. A role that is gone or now refused is skipped with a warning, and its key stops working.
+
+## Revocation
+
+Revoking a key takes effect within 30 seconds, the gateway's cache lifetime. A key that was never valid is cached for 30 seconds too. Cache misses (lookups that reach the orchestrator) are limited per client IP address; see [Limits](/docs/using/data-api/limits).
+
+## Lifecycle
+
+Keys belong to the branch, not to its timeline, so reset and restore keep them. Deleting a branch deletes its keys.

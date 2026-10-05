@@ -1,0 +1,62 @@
+# Product
+
+<!-- impeccable:product-schema 1 -->
+
+## Platform
+
+web
+
+## Users
+
+App developers (full-stack and product engineers) building applications on Postgres. They use the typed client (`@chelabase/client`) and the data API from their app, and use Studio while building to manage projects, databases, branches, schema, data, API keys, row-level security and their app's users.
+
+Self-hosted mode puts every signed-up user in one shared org/tenant/project, a shared team workspace by design. Other audiences (self-hosting operators, platform-mode customers) are not confirmed as primary.
+
+## Product Purpose
+
+Chelabase is a database-as-a-service control plane on Neon. Each database gets its own tenant, timeline and compute, plus branches, login roles, encrypted re-revealable credentials, a data API (`anon` / `authenticated` roles, RLS) and app-user auth. Studio is the only user-facing app.
+
+Success means a developer goes from sign-up to a working, secured database their app queries through the typed client, without reaching for a second tool.
+
+## Positioning
+
+Secure-by-default developer experience. The data API is a typed JSON query endpoint (`POST /data/v1/query`) with a builder client and generated types, not a URL grammar. Credentials are encrypted at rest, secrets never enter client caches, and RLS gaps are surfaced, not hidden. The safe path is the easy path, and Studio makes the security state of a database visible.
+
+Chelabase's designs are its own. It never mirrors Supabase (PostgREST URL grammar, postgrest-js/supabase-js compatibility, GoTrue-style auth). Supabase and Neon are references for pitfalls only.
+
+## Operating Context
+
+- Modes: `self-hosted` (the default; today's dev mode, with email verification off and a shared workspace) and `platform` (the hosted cloud, not built yet; behaviour decided separately, e.g. verification required, no account-existence leaks).
+- Studio screens: sign-in/register/verify/password reset (Zitadel OIDC + PKCE), the projects dashboard, project view with databases, the branch tree, login roles, the Tables console (grid, filters, row editor), the SQL editor (run as owner or a chosen role, cancel, server-side guard, saved queries, history), Data API panels (keys, per-database access, RLS warning), Users (app users and sessions), settings, and the API reference.
+- Transitional resources (creating, deleting) poll every 2s until settled.
+- All traffic goes through the gateway on :8000. Studio runs on :3000 in dev (`just studio`).
+
+## Capabilities and Constraints
+
+- Studio stack: React 19, Vite, TanStack Router/Query, Tailwind 4, shadcn-style components on Base UI, lucide icons, CodeMirror with the Postgres language server.
+- Secrets must never enter the query/mutation cache or any persisted client state.
+- Terminology: project, database, branch, login role, owner (`postgres`), `anon`, `authenticated`, data API, app users.
+- Undecided: platform-mode product scope, pricing, i18n (Studio is English-only today).
+
+## Brand Commitments
+
+- Name: **Chelabase** (display casing fixed). The Studio title is "Chelabase Studio". Renamed from Cheladb on 2026-10-04.
+- Voice: plain and terse, like the repo's docs.
+- No logo, favicon or brand marks exist yet.
+
+## Evidence on Hand
+
+Pre-launch, private repo. No customers, testimonials, case studies or published benchmarks exist. A data-API benchmark is planned (roadmap step 6e) but has no results. Future work must not invent any of these.
+
+## Product Principles
+
+1. Safe by default: the secure option is the default and the easiest one. Risky states (missing RLS, exposed keys) are visible.
+2. Developer flow first: building, querying and inspecting happen in one place with minimal context switching.
+3. Postgres stays legible: branches, roles and policies are shown as what they are, not hidden behind abstractions.
+4. Our own design: solve the problem directly instead of copying a neighbour's interface or API shape.
+
+## Accessibility & Inclusion
+
+- WCAG 2.2 AA is the required standard for Studio: contrast, full keyboard paths, and screen-reader names and states.
+- Dark mode is a product requirement (not implemented yet; Studio is light-only today).
+- English-only; i18n is undecided.

@@ -1,0 +1,64 @@
+---
+title: Branches
+description: Branch a database at a point in time, reset it, restore it, protect it.
+---
+
+Every database can have branches: copies of another branch's data, each with its own Neon timeline, endpoint, compute container and `postgres` password. Main is itself a branch, created when the database is provisioned. Branches form a tree: a branch can be created from any other branch.
+
+## Limits and settings
+
+Both settings are changed with `PATCH /v1/databases/{id}`, or in Studio's database settings.
+
+| Setting | Default | Range | What it does |
+|---|---|---|---|
+| `max_branches` | 5 | 0 to 20 | The most live normal branches a database may have, not counting main or backup branches. Checked when a branch is created; a create over the cap is refused with `branch_cap_reached`. |
+| `history_window` (seconds) | 7 days | 1 hour to 30 days | How far back you can restore or branch from. It is sent to Neon's storage controller, and shrinking it lets the pageserver remove older history. |
+
+A branch that failed stays listed as `failed` and counts toward the cap until you delete it.
+
+## Create a branch
+
+`POST /v1/databases/{id}/branches` takes a `name`, an optional `parent_branch_id` (main when omitted), and an optional point in time `at` (the parent's present when omitted), given as `{"timestamp": "<RFC 3339>"}` or `{"lsn": "<lsn>"}`.
+
+The create is asynchronous. The branch appears at once as `pending`, moves to `provisioning`, and is `ready` when its compute is up.
+
+A point the history can't serve fails the branch with its reason in `error`:
+
+- outside the window: `outside the history window; the oldest available point is <time>`. That is the time of the oldest commit Neon still keeps, or the source branch's creation time when there is no commit yet (a database younger than its window);
+- before the source branch's own history begins (it starts where the source was branched from its parent): `before <source>'s history begins (<time>); branch from <its parent> instead`, or, for a restore backup, `before the history of <backup> begins (<time>)`.
+
+Restoring a branch to such a point fails the same way. Studio's time pickers start at the later of the window's start and the branch's `history_start`, which the API returns (`null` when unknown).
+
+A storage-controller failure that may pass (a 5xx, no answer or a timeout) is retried: the job is delivered 5 times in all, 30 seconds apart, enough for a storage-controller restart, before the branch fails with it. A refusal (4xx) fails at once. Reset to parent and restore retry the same way before they switch timelines.
+
+## Reset to parent
+
+`POST /v1/databases/{id}/branches/{branch_id}/reset-to-parent` moves a branch's timeline to its parent's latest state. The branch keeps its connection string and password.
+
+## Restore
+
+`POST /v1/databases/{id}/branches/{branch_id}/restore` takes a branch back to a point in time on a new timeline. The branch keeps its connection string and its `postgres` password.
+
+Restore also creates a backup branch, `<name>-before-restore-<yyyymmddThhmmssZ>`, that holds the old timeline for recovery. A backup has no compute; to connect to it, create a branch from it. Backup branches never count toward the cap, can't be reset, restored or protected, and are deleted when their branch is deleted.
+
+A restore that stays stuck fails the branch with a message ending "delete the branch to remove it"; such a branch can only be deleted. A detach that times out is never undone while it may still be running: the job is retried, and the retry finishes the detach. If it is still unresolved 20 minutes after the restore made its timeline, the branch fails with the recorded cause, and nothing is deleted: the branch keeps its old timeline.
+
+## Delete, and the children rule
+
+Delete, reset-to-parent and restore are refused (`has_children`) while the branch has live normal child branches. Each child's timeline branches from its parent's, and Neon refuses to delete a timeline that others branch from, so the children go first. Backup branches never count as children. Main can't be deleted or reset.
+
+## Passwords on a new branch
+
+- The owner `postgres` gets its own password on every branch.
+- Every other role keeps the parent branch's password, unless the parent is **protected**.
+- From a protected branch, a child gives every role in its own database that has a password a fresh generated, revealable one. That covers roles made in Studio, through the API or in SQL, MD5 ones and roles without `LOGIN` included, and also a role the parent has dropped since the child's point in time.
+
+For roles in general, see [Login roles](/docs/using/login-roles).
+
+## Protected branches
+
+Protect a branch in Studio's branch settings, or with `PATCH /v1/databases/{id}/branches/{branch_id}` and the body `{"protected": true}` (`false` unprotects it). Main can be protected; backup branches can't.
+
+- Delete and reset-to-parent are refused with 409 `branch_protected` while a branch is protected.
+- Deleting the database, or the project that holds it, is refused too.
+- Restore is allowed. The owner and the roles made in Studio or through the API keep their current passwords; roles made in SQL are as they were at the restore point, passwords included (a role made after it is gone).

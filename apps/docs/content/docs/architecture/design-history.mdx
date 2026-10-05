@@ -1,0 +1,52 @@
+---
+title: "Design history"
+description: "The design specs behind Chelabase, grouped by area, with a link and one line for each."
+---
+
+Each feature began as a written design spec in [`docs/superpowers/specs`](https://github.com/chelabase/chelabase/tree/main/docs/superpowers/specs). The pages in this section describe how things work today; the specs record why they were designed that way, and the decisions made along the way. Where a spec and a page disagree, the page (checked against the code) is current.
+
+The same folder also holds brainstorm and research notes for some areas. They are not listed here.
+
+## Foundations
+
+- [Control-plane skeleton](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-cheladb-scaffold-design.md): the local-only monorepo, with compiling service stubs and local infrastructure.
+- [Create-database vertical slice](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-create-database-vertical-slice-design.md): the first end-to-end path, from an API call to a provisioned database record.
+- [Orchestrator auth](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-orchestrator-auth-design.md): verifying Zitadel tokens against JWKS and binding an organization to a tenant.
+- [API gateway](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-gateway-design.md): the Pingora front door, its fixed request pipeline and the internal identity token.
+- [Product rename](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-04-product-rename-design.md): moving every name the product shows or uses to Chelabase.
+
+## Identity and sign-in
+
+- [Studio sign-up, sign-in and project landing](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-studio-auth-design.md): how Studio authenticates against Zitadel and lands on the user's projects.
+- [Zitadel v4 and Studio's own login](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-28-zitadel-v4-and-own-login-design.md): moving to Zitadel v4 and serving the sign-in pages from Studio through the `auth` service.
+- [Projects and app users](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-03-app-users-design.md): projects as a resource, and end-user sign-up and sign-in with tokens issued by Chelabase.
+
+## Neon and databases
+
+- [Neon data plane in Compose](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-28-neon-data-plane-design.md): running Neon's storage stack locally.
+- [The Neon crate](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-28-cheladb-neon-crate-design.md): the library of Neon-facing building blocks the control plane uses.
+- [Internal control-plane listener and Neon's proxy](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-28-neon-control-plane-listener-design.md): the machine-to-machine routes Neon calls, and the proxy with its cache invalidation.
+- [Switching provisioning to Neon](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-29-neon-provisioning-design.md): creating databases as Neon computes instead of plain containers.
+- [Database lifecycle](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-28-db-lifecycle-design.md): statuses, deletion, credential reset and reconcile.
+- [Branching](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-30-branching-design.md): branches at a point in time, reset and restore.
+- [Hard fork of Neon](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-01-neon-fork-design.md): the `chelabase/neon` and `chelabase/postgres` forks and how images are published.
+- [Login roles](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-01-login-roles-design.md): roles and databases managed from SQL through the proxy.
+
+## Data API
+
+- [Data API](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-01-data-api-design.md): the JSON query language, keys, roles and the `rest` engine.
+- [Data API across databases and schemas](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-02-data-api-databases-design.md): serving any database of a branch, key allow-lists and Studio's console.
+- [Data API on tokio-postgres](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-04-data-api-pipelining-design.md): one-round-trip pipelining, and the benchmark that justified it.
+
+## Studio and clients
+
+- [Generated API client and TanStack Query](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-01-api-client-design.md): OpenAPI documents from the Rust handlers, generated clients and typed data fetching in Studio.
+- [SQL editor](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-03-sql-editor-design.md): streamed SQL runs, the guard, saved queries and completion.
+
+## Documentation
+
+- [Docs site](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-05-docs-site-design.md): this site, organized by reader and checked against the code.
+
+## Benchmarks
+
+- [Data API pipelining benchmark](https://github.com/chelabase/chelabase/blob/main/docs/benchmarks/2026-10-04-data-api-pipelining.md): latency and throughput of the data API paths at several network round-trip times.

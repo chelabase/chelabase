@@ -1,0 +1,126 @@
+---
+title: TypeScript client
+description: A typed client for the Chelabase data API, built on fetch with no runtime dependencies.
+---
+
+`@chelabase/client` is a typed client for the data API (`POST /data/v1/query`). It has no runtime dependencies: it's built on `fetch`, so it runs in browsers, Node and edge runtimes.
+
+The package lives in the repository (`packages/client`) and is a workspace package, not yet published to npm. Add it to a workspace app as `"@chelabase/client": "workspace:*"`.
+
+## Create a client
+
+`chelabase gen types` writes a `Database` type and a `types` constant from a branch's schema (see [Generated types](/docs/using/client/types)). Pass both to `createClient`, with the gateway's URL and a [key](/docs/using/data-api/keys):
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+```
+
+The key is sent as a bearer token. A public key (role `anon`) is safe in a browser; keep a secret key on a server.
+
+## Read
+
+`db.from(table)` starts a query; `"billing.invoices"` is a qualified name, and a bare name means the database's default schema. Builders are immutable and lazy: nothing is sent until you `await` (each `await` sends the request once). They also have `.catch()` and `.finally()`.
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+// ---cut---
+const rows = await db
+  .from("orders")
+  .select("id", "total", { col: "slug", as: "handle" })
+  .where({ status: "paid", total: { gte: "100" }, or: [{ qty: { gt: 2 } }, { vip: true }] })
+  .orderBy("created_at", "desc", "last")
+  .limit(50);
+
+const first = rows[0];
+//    ^?
+```
+
+`select()` and `returning()` need at least one column. Leave `select()` out for every column. Filters are covered on [Filters](/docs/using/client/filters).
+
+`toTree()` returns the exact JSON tree a builder sends, the [query language](/docs/using/data-api/query-language) of the data API:
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+// ---cut---
+const tree = db.from("orders").select("id").where({ vip: true }).limit(1).toTree();
+//    ^?
+```
+
+## Write
+
+{/* @noStaticSemanticInfo: hover info for update()/delete() crashes fumadocs-twoslash on TypeScript 7.0.2 (RangeError in signatureToSignatureDeclaration); type checking still runs. */}
+
+```ts twoslash
+// @noStaticSemanticInfo
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_sec_…", types });
+// ---cut---
+// Insert: all rows must have the same keys; returning is optional.
+const created = await db
+  .from("orders")
+  .insert([{ total: "12.50", vip: false, history: [] }])
+  .returning("id", "total");
+
+// Update and delete: .where() or .all() first.
+await db.from("orders").update({ status: "paid" }).where({ id: created[0].id });
+await db.from("orders").delete().where({ vip: false }).returning("*");
+await db.from("billing.invoices").delete().all();
+```
+
+An `update` or `delete` runs only after `.where()` or `.all()`. Before that, awaiting it or putting it in a `batch` is a compile error (and the server refuses it anyway). `.returning()` works before or after:
+
+```ts twoslash
+// @noStaticSemanticInfo
+// @errors: 1320
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_sec_…", types });
+// ---cut---
+await db.from("orders").update({ status: "paid" });
+```
+
+## Call a function
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_sec_…", types });
+// ---cut---
+const points = await db.call("add_points", { user_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7", n: 5 });
+//    ^?
+const next = await db.call("next_id");
+//    ^?
+```
+
+## Batch
+
+`db.batch` runs its operations in order in one transaction, all or nothing (at most 50), and resolves to a typed tuple with each result. Batches don't nest:
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_sec_…", types });
+// ---cut---
+const [order, points] = await db.batch((tx) => [
+  tx.from("orders").insert({ total: "1.00", vip: false, history: [] }).returning("id"),
+  tx.call("add_points", { user_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7" }),
+]);
+const results = { order, points };
+//    ^?
+```
+
+## More
+
+- [Filters](/docs/using/client/filters)
+- [Errors](/docs/using/client/errors)
+- [Big numbers](/docs/using/client/big-numbers): `int8` and `numeric`.
+- [Generated types](/docs/using/client/types) and other databases of a branch.
+- [App users](/docs/using/client/auth): `db.auth`.

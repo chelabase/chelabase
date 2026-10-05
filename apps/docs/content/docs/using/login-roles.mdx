@@ -1,0 +1,59 @@
+---
+title: Login roles
+description: Create and manage Postgres roles through Studio, the API or plain SQL, and what Chelabase checks on the way.
+---
+
+Each branch has its own roles. You can create them three ways, and they all end up in the same list:
+
+- in Studio, on the branch's roles panel;
+- through the API: `GET` and `POST /v1/databases/{id}/branches/{branch_id}/roles`, `POST …/roles/{role}/reset-password` and `DELETE …/roles/{role}`. A role made this way gets a generated password, which you read with the branch's connection details and the `role` name. Names match `^[a-z_][a-z0-9_]{0,62}$` and can't be reserved (`postgres`, `anon`, `pg_…`, and others). `owner_level: true` gives the role the owner's attributes (`CREATEROLE`, `CREATEDB`, `BYPASSRLS`, `REPLICATION`) and membership of `neon_superuser`;
+- in SQL, as the owner `postgres`, through the proxy.
+
+Projects run their own migrations and setup scripts through Chelabase's proxy. `CREATE ROLE … LOGIN PASSWORD`, `ALTER ROLE … PASSWORD`, `ALTER ROLE … RENAME`, `DROP ROLE`, `GRANT role TO role` and `CREATE DATABASE` all work when run as the owner.
+
+## What works in SQL
+
+- `CREATE ROLE <name> LOGIN PASSWORD <secret>`: the role can log in through the proxy. The password may be plain or a pre-hashed SCRAM verifier (see the password rules); an MD5 one is refused.
+- `ALTER ROLE <name> PASSWORD <secret>`: stored and synced to the proxy.
+- `ALTER ROLE <name> RENAME TO <new>`: the role's login works under its new name. A rename with `PASSWORD NULL` in the same transaction needs a compute image that isn't pinned yet. With the current image the copy keeps its old password under the new name until the next periodic resync removes it; run `ALTER ROLE <new> PASSWORD NULL` in its own transaction to remove it at once.
+- `DROP ROLE <name>`: removed from the proxy's cache. Dropping a role that a live secret data key uses is refused.
+- `GRANT <role> TO <app>`: role inheritance is active; `SET ROLE app` and `INHERIT` work after creation.
+- `CREATE DATABASE <name>`: tracked and shown in Studio.
+- Roles made in SQL can log in after the first resync once the database is running.
+- `ALTER TABLE … OWNER TO <role>` also needs `GRANT CREATE ON SCHEMA public TO <role>` (Postgres 15 and later). The owner can `SET ROLE` to any role it creates, right after `CREATE ROLE`.
+- Replaying a `pg_dumpall` globals file: its `ALTER ROLE … WITH NOSUPERUSER …` lines are refused for the owner, which isn't a superuser (`Only roles with the SUPERUSER attribute may change the SUPERUSER attribute`). Remove `NOSUPERUSER` from those lines; the SCRAM password literals are accepted as they are.
+
+## Password rules
+
+| Rule | Behavior |
+|---|---|
+| Strength (`CHELABASE_PASSWORD_STRENGTH`) | Self-hosted: `off` by default, opt in with `on`. Platform: forced on. When on, a password needs at least 12 characters and an estimated 60 bits of entropy (character classes times length). |
+| MD5 | Refused: `MD5 passwords can't be used through Chelabase; set a plain password`. A role that already has an MD5 password (from an older dump, say) is listed as unusable through the proxy until its password is reset. |
+| Pre-hashed SCRAM | Accepted in self-hosted mode (strength rules don't apply to pre-hashed ones), refused in platform mode. |
+| `PASSWORD NULL` | Removes a role's login copy. A group role with no password has no proxy copy. |
+| `PASSWORD ''` | Postgres takes this as no password, and it fails in the compute with `Failed to get encrypted password: User "<name>" has no password assigned.` Nothing changes; use `PASSWORD NULL`. |
+| Unreadable | A rename or a branch copy couldn't reseal the stored password, so it was dropped; reset the password. Studio shows "Stored password can't be read; reset it." A wrong secrets key instead gives a 500 `credentials_unavailable` when the password is revealed. |
+
+## Caps
+
+| Cap | Variable | Default | Range |
+|---|---|---|---|
+| Login roles per branch (group roles without a password don't count) | `CHELABASE_BRANCH_ROLE_CAP` | 50 | 0 to 500 |
+| Databases per branch | `CHELABASE_BRANCH_DATABASE_CAP` | 20 | 1 to 1000 |
+
+The system `postgres` database is listed in Studio and the connection picker, and isn't counted in the database cap. Dropping the branch's main database is refused (`the branch's main database "<name>" can't be dropped`, also with `IF EXISTS` or `WITH (FORCE)`), and so is renaming it.
+
+An owner-level role made in Studio or through the API keeps the owner's attributes; if any of them is taken away in SQL, the next resync gives it back.
+
+## Resync
+
+- **Database DDL guard:** after any `CREATE DATABASE`, `ALTER DATABASE … RENAME` or `DROP DATABASE`, the resync leaves that branch's databases alone for 10 seconds. A restore or reset to parent clears this guard before the resync runs.
+- **Role repairs:** a failing role repair (create, set password, owner attributes or grant admin) is logged and skipped, and other repairs continue. The resync returns an error naming the failed roles once all repairs are done.
+
+## When the control plane is down
+
+When Chelabase can't reach the control plane, role and database DDL fails after about 5 seconds with `role and database changes are unavailable right now; try again` (SQLSTATE `55000`). The change doesn't take effect; retry the statement. Other refusals reach the client as their own one-line message, for example `the branch owner's password can't be removed; reset it instead`.
+
+## Passwords across branches
+
+A new branch keeps its parent's role passwords unless the parent is protected. See [Branches](/docs/using/branches).

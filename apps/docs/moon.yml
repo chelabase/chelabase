@@ -1,0 +1,30 @@
+language: "typescript"
+
+tasks:
+  dev:
+    command: "pnpm"
+    args: ["dev"]
+    options:
+      persistent: true
+      cache: false
+  build:
+    command: "pnpm"
+    args: ["build"]
+    inputs:
+      - "content/**/*"
+      - "src/**/*"
+      - "source.config.ts"
+      - "vite.config.ts"
+      - "/openapi/*.json"
+      - "/packages/client/src/**/*"
+      - "/packages/client/fixtures/gen/**/*"
+    outputs:
+      - "dist"
+  typecheck:
+    command: "pnpm"
+    args: ["typecheck"]
+  test:
+    command: "pnpm"
+    args: ["test"]
+    deps:
+      - "~:build"

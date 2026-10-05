@@ -1,0 +1,30 @@
+---
+title: Claim helpers
+description: chelabase.claims(), chelabase.user_id() and chelabase.user_email(), for row-level security policies and column defaults.
+---
+
+In the `chelabase` schema of every database the data API serves, Chelabase installs three functions that read the claims of the signed-in app user:
+
+| Function | Returns | Without a user |
+|---|---|---|
+| `chelabase.claims()` | `jsonb`, the request's claims | `{}` |
+| `chelabase.user_id()` | `uuid` (the `sub` claim) | `null` |
+| `chelabase.user_email()` | `text` (the `email` claim) | `null` |
+
+They are `STABLE` and executable by every role, so a policy written without `TO` works for custom data API roles and for Studio's console too. They only read the request's claims.
+
+Use them in policies and defaults:
+
+```sql
+CREATE TABLE notes (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  owner uuid NOT NULL DEFAULT chelabase.user_id(), body text NOT NULL);
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY notes_own ON notes FOR ALL TO authenticated
+  USING (owner = chelabase.user_id()) WITH CHECK (owner = chelabase.user_id());
+```
+
+A signed-in user's requests run as `authenticated`, so `notes_own` shows each user only their own rows, and the default fills `owner` on insert.
+
+<Callout type="warn">
+Removing the data API machinery from a Postgres database (`DELETE …/pg-databases/{name}/data-api?remove=true`, or **Remove data API machinery** in Studio) drops the helpers too. While a policy or view still uses one, the removal is refused with 409 and Postgres' dependency message: drop those first.
+</Callout>

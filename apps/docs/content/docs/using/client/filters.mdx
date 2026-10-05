@@ -1,0 +1,53 @@
+---
+title: Filters
+description: Build where conditions with objects, operators, and, or and not.
+---
+
+`where({...})` takes an object whose keys are combined with `and`:
+
+- a bare value means `eq`: `{ status: "paid" }`;
+- `null` means `is null`: `{ raw: null }`;
+- an operator object uses the operators: `{ total: { gte: "10", lt: "20" } }`. The operators are `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `in`, `is`, `like` and `ilike`; several in one object are combined with `and`, and `in: []` matches nothing;
+- `and` and `or` take lists of filters, and `not` takes one filter.
+
+Calling `where` again adds its conditions with `and`.
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+// ---cut---
+const tree = db
+  .from("orders")
+  .where({ status: "paid", total: { gte: "10", lt: "20" } })
+  .where({ not: { tags: null }, or: [{ vip: true }, { qty: { in: [1, 2] } }] })
+  .toTree();
+```
+
+An `undefined` value throws a `TypeError` rather than silently dropping the condition; leave the key out instead.
+
+## Columns named `and`, `or` or `not`
+
+A column named `and`, `or` or `not` can't be a key, because those keys are the combinators. Reach it with a condition object `{ col, <operator>: value }` inside an `and`/`or` list, or under `not`:
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+// ---cut---
+const tree = db.from("orders").where({ and: [{ col: "and", eq: "x" }, { status: "paid" }] }).toTree();
+```
+
+Inside a list (or under `not`), an object whose only keys are `col` (a string) and operators is read as a condition object; any other object is a filter.
+
+## json and jsonb values that look like operators
+
+A json or jsonb value that looks like operators (`{ meta: { eq: 1 } }`) is read as operators, not as the object to compare with. Compare such a value with a condition object:
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+// ---cut---
+const tree = db.from("orders").where({ and: [{ col: "meta", eq: { eq: 1 } }] }).toTree();
+```

@@ -1,0 +1,49 @@
+---
+title: Quickstart
+description: Sign up, create a database and connect to it.
+---
+
+This takes you from a running stack to a database you can connect to. It uses self-hosted mode, the dev mode, and needs Docker (the worker starts each database's compute container).
+
+## 1. Start the stack and sign up
+
+1. Run `just dev`, then open [http://localhost:3000](http://localhost:3000) and choose **Create account** (or **Sign in**).
+2. You land in Studio straight away: email verification is off in self-hosted mode. Emails such as password resets land in Mailpit at [http://localhost:8025](http://localhost:8025).
+3. On `/app` you see your project, its databases, and a form to create one.
+
+<Callout type="info">
+Everyone who signs up joins the same organization, tenant and project, a shared team workspace. Use `http://localhost:3000`; visits to `127.0.0.1:3000` are redirected there, because the sign-in redirect and the gateway's CORS settings are registered for `localhost`.
+</Callout>
+
+To require a verification code (it lands in Mailpit), set `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true`; `=false` turns it off. Without it the default follows the mode: off when self-hosted, required in platform mode.
+
+## 2. Create a database
+
+Enter a name in the form on `/app` and create it. The database shows as provisioning while its Neon tenant, timeline and compute are made, then as ready. Studio polls every 2 seconds until the status settles.
+
+From a terminal, `just create-db-demo demo1` creates one through the gateway (give the name positionally: `name=demo1` would become the literal name). `GET http://127.0.0.1:8000/v1/databases/<id>` reports its `status`.
+
+## 3. Connect
+
+Open **Connection details** on the database in Studio, or call `GET /v1/databases/{id}/connection`. You get the owner credentials and a URI such as:
+
+```txt
+postgresql://postgres:…@<endpoint>.localtest.me:4432/<db>?sslmode=verify-full
+```
+
+Connect with the proxy's CA certificate:
+
+```sh
+psql "<uri>&sslrootcert=.chelabase/neon/proxy-ca.crt"
+```
+
+If `localtest.me` resolves to `::1` first, also add `&hostaddr=127.0.0.1`. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). You can show the connection details as often as you like.
+
+## 4. Remove it
+
+Delete the database in Studio (it asks you to type the name) or with `DELETE /v1/databases/{id}`. `just sweep-dbs` removes every database in the dev stack.
+
+## Next
+
+- Query the database from your app with the [data API](/docs/using/data-api) and its [TypeScript client](/docs/using/client).
+- Learn how [projects and databases](/docs/using/projects-and-databases) and [branches](/docs/using/branches) work.

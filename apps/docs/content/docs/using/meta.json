@@ -1,0 +1,15 @@
+{
+  "title": "Using",
+  "root": true,
+  "pages": [
+    "quickstart",
+    "projects-and-databases",
+    "branches",
+    "login-roles",
+    "data-api",
+    "client",
+    "app-users",
+    "sql-editor",
+    "studio"
+  ]
+}

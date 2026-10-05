@@ -1,0 +1,57 @@
+---
+title: "Studio"
+description: "How Studio signs people in, fetches data and gets configured by the dev bootstrap."
+---
+
+Studio is the web app (`apps/studio`: React, TanStack Router and TanStack Query). For what it does, see the [Studio tour](/docs/using/studio). This page covers how it is wired.
+
+## Sign-in
+
+Studio has its own sign-in pages: `/login`, `/register`, `/verify`, `/password-reset` and `/logout`. Zitadel v4 sends every sign-in there. The pages call the `auth` service through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login client's token and keeps the step state in encrypted, HttpOnly cookies. The login API is documented from its own OpenAPI document (`openapi/login.json`, published as the [login API](/docs/architecture/login-api/login/signIn) reference); it is for Studio only.
+
+Studio itself is an OIDC client of Zitadel (a public app using PKCE, with JWT access tokens). After sign-in it returns to `/callback` and then `/app`, and every Management API call carries the access token. The requested scopes put the user's organization in the token, which the gateway maps to a tenant, and add the Chelabase project to the token's audience.
+
+- In **platform mode**, answers don't reveal whether an account exists. One known limit: signing up and then signing in with the same email and password tells a new email from a taken one.
+- In **self-hosted mode**, a sign-up for a taken email says so and sends you to sign in.
+
+### Mode and email verification
+
+`CHELABASE_MODE` is `self-hosted` (the default, the dev mode) or `platform` (the hosted cloud, not built yet). Email verification follows the mode: off in self-hosted mode (sign-ups are created with the email already verified), required in platform mode. `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true` or `=false` overrides it. When it is on, codes land in Mailpit.
+
+### One workspace per instance
+
+Everyone who signs up joins the same organization, tenant and project: a shared team workspace, which is by design for self-hosting. The pin is one scope in `apps/studio/src/lib/auth.ts` (`urn:zitadel:iam:org:id:<org>`). Giving each sign-up its own organization means dropping that scope; the [Studio auth spec](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-studio-auth-design.md) sketches it.
+
+`GET /v1/me` returns the caller plus their tenant, projects and databases, or `tenant: null` when the organization has no tenant.
+
+## Local sign-in flow
+
+1. `just dev`, then open `http://localhost:3000` and choose **Create account** (or **Sign in**).
+2. You land in Studio straight away, because email verification is off in self-hosted mode. Emails such as password resets land in Mailpit at `http://localhost:8025`.
+3. Studio opens on your projects and their databases; everything goes through the gateway on `:8000` with your Zitadel token.
+
+Open Studio at `http://localhost:3000`: visits to `127.0.0.1:3000` are redirected there, because the Zitadel redirect URI and the gateway's CORS origins are registered for `localhost`. `CHELABASE_STUDIO_PORT` changes the dev server's port, but the redirect URI is registered for `:3000`.
+
+## What the dev bootstrap does
+
+`chelabase dev bootstrap` is idempotent. For Studio it:
+
+- registers the `chelabase-studio` OIDC app (PKCE, JWT access tokens; drifted redirect settings are corrected in place);
+- points Zitadel's SMTP at Mailpit;
+- creates `.chelabase/auth/cookie.key`;
+- writes `apps/studio/.env.local` (git-ignored).
+
+It needs `.chelabase/zitadel/login-client.pat`, which Zitadel writes only on a fresh instance. If it is missing, run `just zitadel-reset` and bootstrap again.
+
+The bootstrap also creates the key material the other services need (the gateway's identity key pair, the secrets key, the compute JWT keys and the app-user token key pair), the Zitadel Actions target for app users, and the demo tenant binding. None of these files is ever overwritten once it exists.
+
+## Data fetching
+
+Studio uses TanStack Query for all data fetching, through the generated Management API client (see [API generation](/docs/architecture/api-generation)).
+
+- **Polling.** Lists poll every 2 seconds while a database or branch is pending, provisioning, resetting or deleting; polling stops when the status settles.
+- **Invalidation.** Writes invalidate exactly the queries they change, not whole cache keys.
+- **Secrets stay out of the cache.** Connection details, passwords and created or rotated API keys never enter the query or mutation cache. They live in component state and disappear when the panel closes.
+- **Retries.** A request is retried at most twice, and only for network failures and 5xx answers; a 4xx answer is never retried.
+- **Errors.** Errors are thrown as `ApiError { status, code, message, extra }`, and Studio switches on the stable `code`. A 401 restarts sign-in once; if the fresh token is refused too, the dashboard shows the gateway's error instead of looping.
+- **Devtools.** In dev builds, the TanStack Router and Query devtools are available.

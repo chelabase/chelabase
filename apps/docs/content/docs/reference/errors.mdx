@@ -1,0 +1,193 @@
+---
+title: "Error codes"
+description: "Every error code, its status and meaning, for the management, login and data APIs."
+---
+
+Every error response is JSON with the same outer shape:
+
+```json
+{ "error": { "code": "name_taken", "message": "a branch with this name exists" } }
+```
+
+`code` is stable and snake_case; match on it. `message` is for people and can change. A few codes add keys inside `error` (listed below). The HTTP status says the class of failure; the code says which one.
+
+The data API adds `detail`, `hint` and `sqlstate` to errors that come from Postgres. See [Data API errors](#data-api-errors).
+
+## Management, login and gateway codes
+
+These come from the management API, the login API (the dashboard sign-in and app users) and the gateway. Where a code has two statuses, each row says when.
+
+### Request and authentication
+
+| Status | Code | Meaning |
+|---|---|---|
+| 400 | `invalid_request` | A path id isn't a valid UUID, the body isn't well-formed JSON, or the query string is malformed. |
+| 415 | `invalid_request` | The request isn't `Content-Type: application/json`. |
+| 422 | `invalid_request` | The body is JSON but has the wrong fields, a field is missing or out of range, or a name is invalid. |
+| 401 | `unauthorized` | No credential, or a bad token or key. |
+| 403 | `tenant_not_bound` | The caller's organization isn't bound to a Chelabase tenant. |
+| 403 | `forbidden` | The `tenant_id` in the body isn't the caller's tenant. |
+| 404 | `not_found` | The resource doesn't exist, or belongs to another tenant (both answer the same). The gateway also answers `not_found` for an unknown host or route. |
+| 405 | `method_not_allowed` | The gateway has no handler for this method on this path; the `Allow` header lists the methods it has. |
+| 413 | `too_large` | The body is over the limit (2 MB on the management API, 8 KiB on the dashboard login endpoints, 64 KiB on the app-user endpoints). |
+| 429 | `rate_limited` | Too many attempts on a login endpoint. |
+| 500 | `internal` | Unexpected; details are only in the server logs. |
+| 502 | `unavailable` | A service behind the API answered something unexpected, or failed. |
+| 503 | `unavailable` | A service behind the API (the compute, the user service, the identity provider) can't be reached right now. |
+| 504 | `timeout` | A service didn't answer in time. The gateway also answers `timeout` with 408 when a request times out. |
+
+### Projects and databases
+
+| Status | Code | Meaning |
+|---|---|---|
+| 409 | `name_taken` | A database or branch with this name exists. |
+| 409 | `project_deleting` | The project is being deleted. |
+| 409 | `database_not_ready` | The database isn't ready, or is being deleted. |
+| 409 | `already_deleting` | The database is already being deleted. |
+| 409 | `data_api_disabled` | The Postgres database isn't served by the data API; enable it first. |
+| 409 | `data_api_not_enabled` | The data API is off for the Postgres database on a branch. |
+| 409 | `conflict` | The change conflicts with the current state (for example the main database can't be removed from the data API, or the worker refused the change; the message says why). |
+| 502 | `unavailable` | The worker failed to apply the change. |
+| 503 | `worker_unavailable` | The worker can't be reached. |
+| 503 | `not_applied` | The change is stored but not applied yet; it will be retried. |
+
+### Branches
+
+| Status | Code | Meaning |
+|---|---|---|
+| 409 | `branch_not_ready` | The branch isn't ready, or is busy or being deleted. |
+| 409 | `backup_branch` | A restore backup can't take this operation (no compute, can't be protected or rewritten). |
+| 409 | `main_branch` | Main can't be deleted and has no parent to reset to. |
+| 409 | `has_children` | The branch (or one of its backups) has child branches. |
+| 409 | `branch_protected` | The branch is protected; unprotect it first. |
+| 409 | `branch_cap_reached` | The database has `max_branches`. |
+| 409 | `credentials_unavailable` | The branch has no endpoint, or its owner credentials are missing. |
+| 500 | `credentials_unavailable` | Stored credentials can't be opened with the current secrets key. |
+| 409 | `owner_password_unknown` | The owner's password was set in SQL; reset it first. |
+
+### Login roles and data API keys
+
+| Status | Code | Meaning |
+|---|---|---|
+| 409 | `role_exists` | A login role with this name exists. |
+| 409 | `role_cap_reached` | The branch has its maximum number of login roles. |
+| 409 | `role_in_use` | Data API keys still use the role. `error.keys` lists them as `{id, name}`. |
+| 422 | `invalid_role_name` | The name is empty, too long (over 63 bytes), has a NUL byte, or doesn't fit the naming rules. |
+| 422 | `reserved_role_name` | The name is reserved, or the role is the owner, which can't be deleted. |
+| 403 | `role_refused` | The worker refused the role (on the SQL editor and console routes). |
+| 422 | `role_refused` | The worker refused the role when a key is created (it doesn't exist, or it can bypass row-level security; the message says which). |
+| 500 | `role_privilege_mismatch` | The role's privileges in the database don't match what Chelabase recorded. |
+| 409 | `public_key_exists` | The branch already has a public key. |
+| 409 | `public_key_not_revocable` | A public key can only be rotated. |
+
+### App users
+
+| Status | Code | Meaning |
+|---|---|---|
+| 404 | `app_users_disabled` | App users were never enabled for the project. |
+| 409 | `app_users_disabled` | App users aren't enabled (management API and login API). |
+| 409 | `app_users_has_users` | The users table has users, so app users can't be disabled. |
+| 409 | `app_users_table_exists` | The users table exists already. |
+| 409 | `app_users_location_fixed` | The users table's location can't change. |
+| 409 | `email_taken` | Another user has this email. On sign-up this happens only when email verification is off. |
+| 401 | `invalid_credentials` | Wrong email or password, or the current password is wrong. |
+| 401 | `refresh_token_invalid` | The refresh token is invalid. |
+| 401 | `refresh_token_reused` | The refresh token was used already; the session is revoked. |
+| 401 | `user_token_invalid` | No user token, or an invalid one. |
+| 403 | `email_not_verified` | The email isn't verified. |
+| 403 | `user_inactive` | The user is deactivated or locked. |
+| 410 | `sign_in_expired` | The sign-in has expired or is unknown. |
+| 400, 422 | `invalid_code` | The verification or reset code is wrong or expired. The dashboard login API answers 400; the app-user API answers 422. |
+| 400, 422 | `weak_password` | The password doesn't meet the policy. Same split: 400 on the dashboard login API, 422 on the app-user API and the management API. |
+| 422 | `unknown_column` | Sign-up `data` names a column the users table doesn't have or sign-up can't set. |
+| 422 | `constraint_violation` | The users table refused the row. `error.constraint` names the constraint. |
+
+### SQL editor
+
+| Status | Code | Meaning |
+|---|---|---|
+| 409 | `sql_confirm_required` | The guard held statements back. `error.statements` lists them; send again with `confirm: true` to run them. |
+| 409 | `run_id_in_use` | You have a run with this id in flight. |
+| 429 | `sql_run_limit` | You have 4 runs in flight, or the Postgres database has 4. Comes with `Retry-After`. |
+| 422 | `schema_too_large` | The schema is over 8 MiB; use keyword completion. |
+| 409 | `saved_query_name_taken` | You have a saved query with that name. |
+| 409 | `saved_query_conflict` | `version` is stale. `error.current` carries the current row. |
+| 409 | `saved_query_cap` | You already keep 500 saved queries (the cap is per user and database). |
+
+### Data API codes on the gateway
+
+The gateway authenticates data API requests before they reach the data API, and answers with the data API's error body. These codes come from the gateway, with the statuses below.
+
+| Status | Code | Meaning |
+|---|---|---|
+| 401 | `unauthorized` | The key is missing, invalid or revoked, or an endpoint that needs a secret key got another kind (or a public one got a secret key). |
+| 401 | `user_token_invalid` | The `Chelabase-User` token is missing, malformed or invalid. |
+| 401 | `user_token_expired` | The `Chelabase-User` token has expired. |
+| 401 | `user_session_revoked` | The user's session was revoked. |
+| 400 | `user_token_with_secret_key` | A `Chelabase-User` token came with a secret key. |
+| 429 | `rate_limited` | More than 20 lookups per second of keys the gateway doesn't know, from one IP address. |
+
+A bad user token never falls back to the key's own role.
+
+## Data API errors
+
+The data API (`POST /data/v1/query`, `GET /data/v1/schema`) answers with:
+
+```json
+{
+  "error": {
+    "code": "conflict",
+    "message": "duplicate key value violates unique constraint \"users_email_key\"",
+    "detail": "Key (email)=(a@example.com) already exists.",
+    "sqlstate": "23505"
+  }
+}
+```
+
+`detail`, `hint` and `sqlstate` are present only on a database error that Chelabase maps to a code, and carry Postgres's own text. Everything else has `code` and `message` only. A 503 and a 500 never show Postgres's text; the 500 message carries a request id and the details go to the log with it.
+
+| Status | Code | Meaning |
+|---|---|---|
+| 400 | `invalid_query` | The body isn't a valid query or doesn't plan: syntax error, bad filter, wrong types, empty `select` or `returning`, an update or delete with neither `where` nor `all`. |
+| 400 | `unknown_column` | A column that doesn't exist or that the key's role can't reach. |
+| 400 | `invalid_value` | Postgres rejected a value: not-null (23502) or check (23514) violation, or any type or value error (class 22). |
+| 400 | `raised` | A function raised an exception (`RAISE EXCEPTION`, P0001). |
+| 400 | `user_token_with_secret_key` | A `Chelabase-User` token came with a secret key. |
+| 401 | `unauthorized` | The key is missing, unknown or revoked, or its branch is gone. |
+| 401 | `user_token_invalid` | The `Chelabase-User` token is invalid. |
+| 401 | `user_token_expired` | The `Chelabase-User` token has expired. |
+| 401 | `user_session_revoked` | The user's session was revoked. |
+| 403 | `permission_denied` | Postgres refused the role (42501). |
+| 403 | `role_not_allowed` | A secret key's role can bypass row-level security. Make the role plain, or use another role. |
+| 404 | `unknown_table` | A table or view that doesn't exist or that the key's role can't reach. |
+| 404 | `unknown_function` | A function that doesn't exist, can't be called through the API, or that the key's role can't execute. |
+| 404 | `unknown_database` | The database doesn't exist, isn't served, or isn't on the key's allow-list. One text for all three, so a key can't discover database names. |
+| 404 | `unknown_role` | Studio's console only: the chosen role doesn't exist (any more). |
+| 409 | `conflict` | A unique (23505), foreign-key (23503) or exclusion (23P01) violation. |
+| 409 | `retry` | A serialization failure or deadlock (40001, 40P01). Safe to run again. |
+| 413 | `too_large` | The body is over 1 MiB, or the response is over the response limit (`CHELABASE_REST_MAX_RESPONSE_BYTES`, default 16 MiB). |
+| 429 | `rate_limited` | See the gateway table above. |
+| 500 | `internal` | Unexpected. The message includes a request id; check the logs. |
+| 503 | `unavailable` | The database can't be reached right now. See below. |
+| 504 | `timeout` | A statement ran past its timeout (57014), or the transaction timeout passed (25P04). Both follow `statement_timeout_ms`. |
+
+On a data API route the gateway also answers an unknown path (404) or a wrong method (405) with `invalid_query`, and the 405 carries `Allow`.
+
+### 503 and Retry-After
+
+Every 503 from the data API carries `Retry-After`: `1` when the gateway answers it, `2` when the data API service does. Causes:
+
+- the branch's database can't be reached, refuses the connection, or is out of connections or resources (Postgres classes 08, 28 and 53, and 57P01 to 57P03);
+- no connection to the branch in time, or too many connections in use;
+- the service can't look up the branch, or the branch isn't ready;
+- the key's role can't be used right now (dropped, or its grant is gone until the bootstrap runs again);
+- the data API's schema is missing; it will be reinstalled;
+- the gateway can't check the key or the user's session.
+
+The 503 message is fixed text.
+
+<Callout type="info">
+A response that didn't come from the data API (a proxy error page) has no error body from it. The gateway then builds one from the failure: 502 is `unavailable`, 504 and 408 are `timeout`, 400 is `invalid_request`, 413 is `too_large`, anything else is `internal`.
+</Callout>
+
+For how to send queries and handle these errors, see the [Data API guide](/docs/using/data-api).

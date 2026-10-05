@@ -16,6 +16,8 @@ pub mod engine;
 pub mod error;
 #[cfg(test)]
 mod fake_pg;
+#[cfg(feature = "openapi")]
+pub mod openapi;
 pub mod pipeline;
 pub mod query;
 pub mod schema;

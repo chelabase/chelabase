@@ -1,0 +1,17 @@
+{
+  "title": "Architecture",
+  "root": true,
+  "pages": [
+    "index",
+    "gateway",
+    "studio",
+    "data-api",
+    "app-users",
+    "sql-editor",
+    "neon",
+    "api-generation",
+    "security",
+    "design-history",
+    "login-api"
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "title": "Data API",
+  "pages": ["index", "keys", "databases", "allow-lists", "query-language", "settings", "limits"]
+}

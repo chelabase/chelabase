@@ -1,0 +1,67 @@
+---
+title: "Overview"
+description: "The services, the front door and the shared stack that Chelabase runs on."
+---
+
+Chelabase is a control plane for Postgres databases, built on Neon's storage stack. Every database runs as a Neon compute backed by a shared pageserver, safekeeper and object store; the control plane creates, branches, resets and deletes them, and gives apps a typed data API in front of them.
+
+This section describes how the parts fit together. For how to use them, start with the [Introduction](/docs).
+
+## Repository layout
+
+```
+apps/studio          the web app (the only user-facing app)
+apps/docs            this documentation site
+services/            gateway, orchestrator, worker, rest, auth
+tools/cli            the `chelabase` binary (dev bootstrap, token minting, type generation)
+tools/bench-data-api the data API benchmark harness
+crates/              shared Rust libraries
+packages/            shared TypeScript packages (client, management-client, neon-e2e)
+openapi/             the generated OpenAPI documents
+infra/compose/       Docker Compose: metadata Postgres, NATS JetStream, Valkey, Zitadel, Mailpit, Neon storage
+infra/neon/          Neon image pins and build scripts
+```
+
+Workflow (setup, worktrees, the live queue, tests, commits) is in [CONTRIBUTING.md](https://github.com/chelabase/chelabase/blob/main/CONTRIBUTING.md).
+
+The Rust workspace holds the control plane; a pnpm workspace holds Studio, this site and the TypeScript packages. Tooling is proto, moon and just.
+
+## The services
+
+| Service | Role | Page |
+| --- | --- | --- |
+| Gateway | Pingora front door on `:8000`: authenticates every request and routes it | [Gateway](/docs/architecture/gateway) |
+| Orchestrator | The Management API (`/v1`), the metadata store and the internal listener | [Neon](/docs/architecture/neon) |
+| Worker | Runs the jobs: provisions computes, resets, bootstraps the data API, reconciles | [Neon](/docs/architecture/neon) |
+| rest | The data API engine: turns a JSON query into SQL and runs it | [Data API](/docs/architecture/data-api) |
+| auth | Sign-in backend for Studio and for app users | [Studio](/docs/architecture/studio), [App users](/docs/architecture/app-users) |
+| Studio | The web app | [Studio](/docs/architecture/studio) |
+
+Zitadel is the identity provider, NATS JetStream carries the jobs, a metadata Postgres holds the control plane's own state, Valkey backs the proxy's cache invalidation and Mailpit catches local email.
+
+## How a request travels
+
+All API traffic enters through the gateway. It checks the credential (a Zitadel token for the Management API, a data API key for the data API), then calls the owning service with a short-lived internal identity token. Services never see the client's own credential, and they trust only the gateway's token. Postgres connections do not go through the gateway: they reach each database through Neon's proxy.
+
+```
+client ──HTTP──▶ gateway ──identity token──▶ orchestrator | auth | rest
+client ──Postgres wire / SQL over HTTP──▶ Neon proxy ──▶ compute ◀── pageserver, safekeepers
+```
+
+## The docs app
+
+This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, prerendered to static files. The API reference pages are generated from the OpenAPI documents in `openapi/` (see [API generation](/docs/architecture/api-generation)), and TypeScript samples are type-checked at build time with twoslash. `just docs` serves it on `http://localhost:3001` and needs no running stack.
+
+## Pages in this section
+
+<Cards>
+  <Card title="Gateway" href="/docs/architecture/gateway">Authentication, routing, limits and the internal identity token.</Card>
+  <Card title="Studio" href="/docs/architecture/studio">Sign-in, data fetching and how the bootstrap wires it up.</Card>
+  <Card title="Data API" href="/docs/architecture/data-api">The request flow, the schema model and the benchmark.</Card>
+  <Card title="App users" href="/docs/architecture/app-users">Identity, tokens and how users are synced.</Card>
+  <Card title="SQL editor" href="/docs/architecture/sql-editor">Execution, the guard, limits and audit.</Card>
+  <Card title="Neon" href="/docs/architecture/neon">The storage stack, the proxy and local ports.</Card>
+  <Card title="API generation" href="/docs/architecture/api-generation">OpenAPI documents, generated clients and the reference UI.</Card>
+  <Card title="Security" href="/docs/architecture/security">Trust boundaries and security notes.</Card>
+  <Card title="Design history" href="/docs/architecture/design-history">The design specs, by area.</Card>
+</Cards>

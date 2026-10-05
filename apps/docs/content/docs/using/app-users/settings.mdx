@@ -1,0 +1,25 @@
+---
+title: Settings
+description: The environment variables that configure app users.
+---
+
+These are service settings for a self-hosted stack. `just dev` and `chelabase dev bootstrap` set them up; you only change them to tune lifetimes or to point services at each other.
+
+| Variable | Default | Read by |
+|---|---|---|
+| `CHELABASE_ZITADEL_ADMIN_PAT_FILE` | from `.chelabase/zitadel/demo.env` (`.chelabase/zitadel/admin.pat`) | orchestrator, worker, auth. Organization and user administration (the orchestrator and worker also need `CHELABASE_ZITADEL_ISSUER`). Without it the app-user routes answer 503 and the worker's jobs wait. |
+| `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | from `demo.env` (`.chelabase/auth/app-jwt.{key,pub}`, made once by bootstrap, never overwritten) | auth signs, the gateway verifies. Without them app users are off. |
+| `CHELABASE_APP_AUTH_INTERNAL_TOKEN` | `chelabase-dev-app-auth` | auth to the orchestrator's internal app routes |
+| `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | gateway to the orchestrator, for session liveness |
+| `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY` | from `.chelabase/zitadel/actions.env` | orchestrator. Checks the signature of Zitadel's user-event webhook. |
+| `CHELABASE_APP_ACCESS_TTL_SECS` | `900` (60 to 86400) | auth |
+| `CHELABASE_APP_REFRESH_TTL_SECS` | `2592000` (30 days; 1 to 7776000, the 90-day cap) | orchestrator |
+| `CHELABASE_APP_USERS_RECONCILE_SECS` | `300` (30 to 86400) | worker |
+| `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | auth, gateway and rest (the orchestrator's internal listener) |
+| `CHELABASE_WORKER_REMOVE_ORPHANS` | `true` | worker. Whether reconcile removes compute containers no endpoint row records. |
+
+A value outside its range stops the service at start with an error that names the variable.
+
+<Callout type="warn">
+The two `*_INTERNAL_TOKEN` defaults are for local development. Set your own values anywhere the stack isn't just on your machine.
+</Callout>

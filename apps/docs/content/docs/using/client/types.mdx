@@ -1,0 +1,53 @@
+---
+title: Generated types
+description: Generate Database and types with chelabase gen types, and use other databases of a branch.
+---
+
+`chelabase gen types` reads a branch's data API schema and writes a typed `Database` type and a `types` constant. Pass both to `createClient`: `createClient<Database>({ url, key, types })`. Without them (`createClient({ url, key })`), the client accepts any table, column and function, and types values as `unknown`.
+
+```bash
+export CHELABASE_DATA_KEY=chk_sec_…
+cargo run -p chelabase -- gen types --url http://localhost:8000 --out db.ts
+```
+
+| Flag | Meaning |
+|---|---|
+| `--url` | The gateway's base URL (required). |
+| `--key` | A secret data key (`chk_sec_…`); a public key is refused. Set the environment variable `CHELABASE_DATA_KEY` instead of the flag, so the key stays out of the process list. |
+| `--out` | The file to write; without it the module goes to stdout. |
+| `--database <name>` | Generate that database (not the main one) as `Database`. |
+| `--all-databases` | Generate every database the key reaches. Can't be combined with `--database`. |
+
+The types follow the key you generate with: what the key's role can't reach isn't in them.
+
+## Other databases
+
+A branch can serve more than its main database (see [Serving more databases](/docs/using/data-api/databases)). `db.database("analytics")` returns a client bound to that database: every request it sends carries the top-level `database` field (a batch carries it once; an operation inside a batch never names one). It keeps the `bigint` mode, and in that mode `db.database(name, types)` needs the `types` (they decode `int8`), which the type system enforces. `database()` siblings share the same [app user session](/docs/using/client/auth).
+
+`--all-databases` writes every database the key reaches: `Databases` (a key per database), `Database` (`= Databases["main"]`) and a `types` map keyed alike. Main is always under the key `main`, whatever its real name, and the key must reach main, since the list of databases comes from main's schema response.
+
+```ts twoslash
+import { createClient, type TypeMap } from "@chelabase/client";
+import { type Database as Main, types as mainTypes } from "./db";
+// What `gen types --all-databases` writes (shortened here):
+type Databases = {
+  main: Main;
+  analytics: {
+    defaultSchema: "app";
+    schemas: {
+      app: {
+        tables: { events: { Row: { id: string }; Insert: { id?: string }; Update: { id?: string } } };
+        functions: {};
+      };
+    };
+  };
+};
+type Database = Databases["main"];
+const types = {
+  main: mainTypes,
+  analytics: { defaultSchema: "app", schemas: { app: { tables: { events: {} }, functions: {} } } },
+} as const satisfies Record<string, TypeMap>;
+// ---cut---
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_sec_…", types: types.main });
+const analytics = db.database<Databases["analytics"]>("analytics", types.analytics);
+```

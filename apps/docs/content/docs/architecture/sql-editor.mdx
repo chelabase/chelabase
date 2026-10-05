@@ -1,0 +1,95 @@
+---
+title: "SQL editor"
+description: "How the SQL view runs scripts: execution, limits, the guard, run as, saved queries and audit."
+---
+
+Studio's SQL view runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. It uses the owner's credentials, so it is for people who already own the database. For how to use it, see the [SQL editor guide](/docs/using/sql-editor).
+
+The API (all under `/v1/databases/{id}`):
+
+| Route | Purpose |
+| --- | --- |
+| `POST /branches/{branch_id}/sql` | Run a script; the answer is an NDJSON stream |
+| `POST /branches/{branch_id}/sql/runs/{run_id}/cancel` | Cancel a run in flight |
+| `GET /branches/{branch_id}/sql/schema?database=` | The schema document that feeds completion |
+| `/sql-queries` and `/sql-queries/{query_id}` | Saved queries |
+
+## Execution
+
+- A script is sent as **one simple query**: Postgres runs its statements in order inside an implicit transaction, so an error rolls the whole script back. `BEGIN` and `COMMIT` in the script are honoured and end that implicit transaction as you wrote it.
+- `VACUUM`, `CREATE INDEX CONCURRENTLY` and `CREATE DATABASE` can't run in a transaction block, so they are accepted only as the script's single statement.
+- `COPY … FROM STDIN` isn't supported in the editor, because there is no way to send the data. Use psql through the proxy for it.
+- The run opens a fresh connection as the database's owner, so it needs the owner's password to be known (otherwise 409 `owner_password_unknown` until a reset).
+
+### Limits
+
+| Limit | Value |
+| --- | --- |
+| SQL per run | 1 MiB, no NUL bytes |
+| `timeout_ms` | 100 to 900000; 60 s by default, up to 15 min |
+| Rows per result set | 1,000 (more set `truncated` on its `complete` event), sent in `rows` events of up to 200 |
+| Response size | 10 MiB per response, notices included |
+| Runs in flight | 4 per user and 4 per Postgres database (429 `sql_run_limit` with `Retry-After`); a schema read takes a slot while it lasts |
+| Heartbeat | an event after 15 s without another one |
+| Schema document | at most 8 MiB (422 `schema_too_large`; Studio falls back to keyword completion) |
+
+Past the response cap the run stops with `truncated_response`. A single `rows` event that would cross the cap isn't sent, so a very wide row can end a run with no rows shown. The orchestrator buffers at most the cap plus one row, and a notice flood is held back at the socket rather than queued. pgls's introspection of the system catalogs alone is about 2.5 MiB.
+
+### The stream
+
+Column types in `columns` events name the built-in types only (`int4`, `text`, `jsonb` and their arrays); any other type (enums, domains, extension types) is `""`.
+
+The stream carries these events:
+
+- `columns`, `rows` and `complete` (with the command tag) for each statement;
+- `notice`, and `error` (with the `position` in the script);
+- `heartbeat`, which keeps the gateway's connection open during a long statement;
+- a final `done`, whose `outcome` is `ok`, `error`, `cancelled`, `timeout` or `truncated_response`.
+
+Closing the stream, or calling the cancel route, sends Postgres's cancel request.
+
+## The guard
+
+Before running, the script is parsed (pg_query, Postgres's own parser) and each statement is classified.
+
+- On a normal branch the guard holds back **risky** statements: `DROP`, `TRUNCATE`, `DELETE` and `UPDATE` without a `WHERE`, and the like. The run answers 409 `sql_confirm_required` with the held statements; the client asks the user and sends the run again with `confirm: true`.
+- On a **protected** branch (`PATCH …/branches/{id}` with `protected: true`) every statement that isn't a read is held, with reason `protected`; `confirm: true` still runs them.
+- `EXPLAIN ANALYZE` (it runs its statement) and `PREPARE` of a risky statement count as risky.
+- A script that doesn't parse is held as `unparsed`.
+
+<Callout type="warn" title="The guard is a confirmation step, not an authorization boundary">
+  A client that sends `confirm: true` skips it. The guard looks at the statement, not at what it calls. On a protected branch, a `SELECT` that calls a function which writes, `SELECT … FOR UPDATE` inside a subquery or CTE, and writing functions such as `nextval` all pass as reads, so a protected branch isn't a safety boundary against them. On a normal branch, `EXECUTE` of a prepared risky statement, a data-modifying CTE (`WITH d AS (DELETE FROM t) …`), `MERGE`, `DO` blocks, and functions and rules that delete pass without confirmation.
+</Callout>
+
+## Run as
+
+The run's role picker (`role` in the request) does `SET ROLE` first, to preview what `anon`, `authenticated` or a custom role would see under row-level security. It is a **preview, not a security boundary**: the connection is the owner's.
+
+For `anon` and `authenticated` (offered where the data API was set up), the worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the owner inheriting the role's privileges. The orchestrator re-checks that grant at most every 5 minutes per branch. Other roles of the branch need no grant: roles the owner created are already its own (Postgres's `createrole_self_grant`).
+
+## Saved queries and history
+
+Saved queries are private to their author, per database (unique name ignoring case, up to 500, 1 MiB of SQL each). Updates carry the `version` the client saw: a stale one answers 409 `saved_query_conflict` with the current row. An empty `pg_database` or `role` hint is stored as null. Studio keeps a history of runs (and the open buffer) in the browser.
+
+## Audit
+
+Every run writes one `info` line on the `orchestrator::sql_editor::audit` log target (on with the default log filter). It records:
+
+- the user, database, branch, Postgres database and role (`owner` when none);
+- the run id;
+- the number of statements and their command tags (the first 50);
+- the duration and outcome;
+- a SHA-256 of the script (never its text);
+- whether the branch is protected and whether the run was confirmed.
+
+A run the guard held logs one line with outcome `confirm_required`. A run whose client went away first logs `cancelled`. Requests answered with a JSON error before the connection opens (validation, limits, a compute that can't be reached) log no audit line, because nothing ran.
+
+## Dependencies
+
+- **tokio-postgres is a fork** (`chelabase/rust-postgres`, pinned by `rev` in the workspace `Cargo.toml`). Simple queries don't expose what the editor needs upstream: command tags, the empty-query marker and column types. The data API also uses the fork, for `Client::transaction_status`. Upstream pull requests are pending, and the dependency returns to crates.io once they are released ([rust-postgres#1391](https://github.com/rust-postgres/rust-postgres/pull/1391) covers the simple-query part).
+- The language server in Studio is **pgls 0.26.0** ([`supabase-community/postgres-language-server`](https://github.com/supabase-community/postgres-language-server), MIT). The introspection queries are copied from it byte for byte; the upgrade steps are in `services/orchestrator/src/sql_editor/pgls/README.md`.
+- `pg_query` builds Postgres's parser from C, so a Rust build needs clang and protoc.
+
+## Tests
+
+`just live sql-editor-e2e` (needs `just deps-up` and `just dev`) runs a script as owner and as `anon` under RLS, a notice, an error with its position, a cancel, closing the stream through the gateway (the run's slot is freed), a 75 s `pg_sleep` through the gateway (heartbeats), the guard (`DROP` needs `confirm`; a protected branch holds writes), saved queries (including a stale version) and the schema document. `KEEP=1` leaves the database in place.

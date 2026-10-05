@@ -1,0 +1,97 @@
+---
+title: "Data API"
+description: "How a data API request becomes SQL: the request flow, pooling, caches, the schema model and the benchmark."
+---
+
+Apps read and write a branch's tables over `POST /data/v1/query` with per-branch keys. The gateway checks the key; the `rest` service (`services/rest`, `just rest`) turns the request into SQL and runs it on the branch's compute. For how to use it, see the [data API guide](/docs/using/data-api).
+
+## Request flow
+
+```
+POST /data/v1/query, Authorization: Bearer <key>  →  gateway
+  ↓ sha256(key) → cached internal listener answer (30 s)
+  ↓ branch_id, role, key_id, claims, database allow-list from the key
+  ↓ mint internal identity token (aud: "rest")
+  ↓ rest service, verified identity
+  ↓ parse the body (1 MiB at most, unknown fields rejected)
+  ↓ GET internal listener for the branch's connection info (cached 60 s):
+  ↓   its served databases and settings
+  ↓ the body's top-level "database" (main when omitted): served, and on the key's allow-list
+  ↓ pool for the branch and that database (tokio-postgres, deadpool, as `authenticator`)
+  ↓ owner-level check of the key's role (cached 30 s)
+  ↓ one round trip: [ROLLBACK;] BEGIN; reset; set_config for role, request.jwt.claims,
+  ↓   statement_timeout and transaction_timeout; assert the schema version; the query
+  ↓   (each result capped in SQL); COMMIT; reset
+  ↓ JSON response
+```
+
+Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key and mints an internal token that `rest` verifies; the token carries the key's database allow-list, and `rest` enforces it. The gateway's caching and rate limit are described on the [Gateway](/docs/architecture/gateway) page.
+
+`rest` has two listeners:
+
+- the public one on `127.0.0.1:8085`, for the gateway: `POST /data/v1/query` and `GET /data/v1/schema`, trusting only the gateway's identity token;
+- an internal one on `127.0.0.1:8086`, for the orchestrator, behind a static bearer: a schema read for Studio, `POST /internal/branches/{id}/invalidate` (the orchestrator calls it when a branch's served databases or default schema change) and Studio's console route.
+
+### Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CHELABASE_REST_ADDR` | `127.0.0.1:8085` | Public listener |
+| `CHELABASE_REST_INTERNAL_ADDR` | `127.0.0.1:8086` | Internal listener |
+| `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | The orchestrator's internal listener, for connection info |
+| `CHELABASE_REST_INTERNAL_TOKEN` | `chelabase-dev-rest-internal` | Bearer for the internal listener, both directions (dev default) |
+| `CHELABASE_REST_MAX_CONNECTIONS` | `200` | Permits shared by every pool, on top of each branch's own `max_connections` setting (one budget for all of the branch's database pools) |
+| `CHELABASE_REST_MAX_RESPONSE_BYTES` | 16 MiB | The largest response; the first result past the cap rolls the request back and answers 413 `too_large` |
+
+## Connections and pools
+
+Connection info for a branch comes from the orchestrator and is cached for 60 seconds, or until the orchestrator invalidates it. Each served database of a branch gets its own pool, dropped after 5 minutes unused.
+
+- Every pool of a branch waits on one set of slots (the branch's `max_connections`), and one global semaphore caps connections across all branches. Open connections, idle ones included, stay within the branch's limit: before a pool opens a connection, idle connections of the branch's other pools are closed, least recently used first.
+- Idle connections close after 60 seconds. Opening a connection takes at most 5 seconds, and a request waits at most 5 seconds for a connection (6 seconds in all, counting a retry).
+- A connection that fails to open (the compute moved after a reset or a restore, or its password changed) drops the cached info, fetches it again and retries once. Nothing is retried once a statement was sent.
+- Nothing runs when a connection returns to its pool. Every request starts with a reset (`SET ROLE NONE; RESET ALL`) inside its transaction and ends with one after the commit, so a function that changed the session cannot leak into the next request. A request that doesn't finish closes its connection instead of returning it.
+
+## Pipelining and caches
+
+When the database's schema version, schema and the role's view of it are cached, the whole request goes out as one pipeline: one round trip from the reset to `COMMIT`. The schema version is asserted in SQL (`chelabase.assert_schema_version`), so a schema change since the cache was filled makes the request fall back to the sequential path instead of running against a stale plan. The response cap is applied in SQL too (`chelabase.cap_response`).
+
+Anything else (a cold start, a changed schema, a database without these helper functions) takes the sequential path: one round trip sets the role, claims and timeouts and reads `chelabase.schema_version`; a version not seen before is introspected in the same transaction; then the query runs. That path records the version for the next request.
+
+What is cached, per branch and database:
+
+- **Schemas**, by schema version. A DDL event trigger bumps `chelabase.schema_version`.
+- **Each role's view** of a schema: what that role can reach (up to 64 roles per schema version).
+- **Plans**, by shape: the generated SQL is keyed by branch, database, schema version, role, default schema and the query's shape hash (at most 1,000 per branch and about 50,000 in all). Values are always bound parameters; every statement declares its parameter types, so the server never infers one.
+- **Owner-level answers** for a role (30 seconds).
+
+Every plan returns one `text` row, the operation's JSON, which is sent on unparsed; a batch joins its results into one array.
+
+### Benchmark
+
+The pipelined design was chosen with a benchmark against the previous path (sqlx, with several round trips per request). With an added network round trip of about 0.8 ms, a by-key read took 3.96 ms at the median on the old path and about 0.95 ms with one pipeline; at about 2.4 ms it fell from 11.8 ms to 2.5 ms. The shipped `rest` path measured within 4% of the bare pipeline. The full tables, setup and verdicts are in the [benchmark record](https://github.com/chelabase/chelabase/blob/main/docs/benchmarks/2026-10-04-data-api-pipelining.md).
+
+## Schema model
+
+The `chelabase` schema holds machinery only, reserved and never exposed. The other reserved schemas are `pg_catalog`, `information_schema`, `pg_toast`, `neon`, `neon_migration` and temp schemas.
+
+An object is reachable when the key's role has `USAGE` on its schema and any privilege on the object: any column-level `SELECT`, `INSERT` or `UPDATE`, or table-level `DELETE`, for tables, views, materialized views and foreign tables, and `EXECUTE` for functions. Anything else answers like a name that doesn't exist (`unknown_table`, `unknown_column`, `unknown_function`).
+
+### Default privileges
+
+The worker's bootstrap runs on every compute (re)creation and from reconcile, and is idempotent. In each served database it sets, for objects the owner role (`postgres`) creates, in that database's default schema (`public` unless you change it):
+
+- `anon`: `SELECT` on tables and views, and `USAGE` on the schema.
+- `authenticated`: `SELECT, INSERT, UPDATE, DELETE` on tables and views; `USAGE, SELECT` on sequences; `USAGE` on the schema.
+- Functions: `EXECUTE` is revoked from `PUBLIC` for every function the owner creates (any schema) and granted to `authenticated` in the default schema. `anon` gets no function by default. Functions that belong to an extension keep their default access, so extensions keep working.
+- The `authenticator` role, which `rest` connects as, also gets `USAGE` on the schema.
+
+The first bootstrap of a database also grants the same on what already exists in the default schema (tables, sequences and functions the owner made; extension functions are skipped). Later bootstraps don't repeat it.
+
+### Row-level security
+
+Row-level security (RLS) is off by default. Studio warns about every reachable object without it:
+
+- a table: `ALTER TABLE … ENABLE ROW LEVEL SECURITY; CREATE POLICY …`;
+- a view runs with its owner's rights, so RLS on the tables it reads doesn't apply: `ALTER VIEW … SET (security_invoker = true)`;
+- a materialized view or a foreign table can't have RLS: `REVOKE ALL … FROM anon, authenticated`.

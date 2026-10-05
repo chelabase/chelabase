@@ -1,0 +1,6 @@
+dist/
+.tanstack/
+.source/
+.twoslash/
+.output/
+node_modules/

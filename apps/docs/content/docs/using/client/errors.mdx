@@ -1,0 +1,41 @@
+---
+title: Errors
+description: DataApiError, UnsafeIntegerError and what the client throws.
+---
+
+A failed request throws `DataApiError` with `status`, `code` (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …), `message`, and `detail`, `hint` and `sqlstate` when the server sends them. Every code is listed on [Error codes](/docs/reference/errors).
+
+```ts twoslash
+import { createClient, DataApiError } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+// ---cut---
+try {
+  await db.from("orders").insert({ total: "1.00", vip: false, history: [] });
+} catch (e) {
+  if (e instanceof DataApiError && e.code === "permission_denied") {
+    console.log(e.status, e.message, e.sqlstate);
+  } else {
+    throw e;
+  }
+}
+```
+
+## Answers without the data API's error body
+
+A non-2xx answer without the data API's error body (a proxy's error page) gets its `code` from the status:
+
+| Status | `code` |
+|---|---|
+| 401 | `unauthorized` |
+| 413 | `too_large` |
+| 429 | `rate_limited` |
+| 502, 503 | `unavailable` |
+| 504 | `timeout` |
+| anything else | `internal` |
+
+Its message holds the status and the first 200 characters of the body. A 2xx answer that isn't JSON is a `DataApiError` with `code: "internal"`. Network failures are rethrown unchanged.
+
+## UnsafeIntegerError
+
+An `int8` outside JavaScript's safe range throws `UnsafeIntegerError` instead of returning a rounded number. See [Big numbers](/docs/using/client/big-numbers).

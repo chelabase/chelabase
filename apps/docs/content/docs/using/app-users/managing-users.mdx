@@ -1,0 +1,52 @@
+---
+title: Managing users
+description: Create, change, deactivate and delete a project's app users from Studio or the platform admin API.
+---
+
+You manage a project's users as a platform user, not through the public key. In Studio, the project's **Users** tab (it appears once app users are enabled) has all of it. The same operations are in the Management API, under `/v1/projects/{id}/users`, with your Zitadel user token.
+
+| Operation | Request |
+|---|---|
+| List | `GET /v1/projects/{id}/users` |
+| Create | `POST /v1/projects/{id}/users` |
+| Get | `GET /v1/projects/{id}/users/{user_id}` |
+| Change email or password | `PATCH /v1/projects/{id}/users/{user_id}` |
+| Deactivate | `POST …/users/{user_id}/deactivate` |
+| Reactivate | `POST …/users/{user_id}/reactivate` |
+| List live sessions | `GET …/users/{user_id}/sessions` |
+| Sign out everywhere | `DELETE …/users/{user_id}/sessions` |
+| Delete | `DELETE /v1/projects/{id}/users/{user_id}` |
+
+Each user has a `state`: `active`, `inactive` (deactivated: it can't sign in) or `locked` (locked after too many failed sign-ins).
+
+## List
+
+50 users per page. `search` matches part of the email, ignoring case; `page_token` is the `next_page_token` of the previous page.
+
+## Create
+
+```json
+{ "email": "ann@example.com", "password": "Str0ng!pass", "email_verified": true }
+```
+
+`email_verified` defaults to `true`: the address counts as verified and no email is sent. The user's row is written to the users table first, so the table's own constraints can refuse it (422 `constraint_violation`, with the constraint's name). Columns of your own get their defaults. An address another user has is 409 `email_taken`.
+
+## Change
+
+`PATCH` takes `email`, `email_verified` and `password`, at least one:
+
+- a new `email` is verified unless `email_verified` is `false`;
+- `email_verified: true` alone marks the current address verified; `false` alone is refused for an address that is already verified, but sends a code to an unverified one;
+- a new `password` ends the user's sessions.
+
+The users table follows through the sync.
+
+## Deactivate and sessions
+
+Deactivating a user stops sign-in and ends their sessions. Reactivating lets them sign in again. Listing sessions returns the live (not revoked) sessions, oldest first, with their creation, last-use and expiry times, never a token. **Sign out everywhere** revokes them all; the data API stops accepting the user's access tokens within 30 seconds.
+
+## Delete
+
+Deletes the Zitadel user and ends their sessions. The users table's row follows the project's `on_delete` setting (delete it, or set `deleted_at`). In Studio you confirm by typing the user's email.
+
+All of these answer 409 `app_users_disabled` when app users aren't enabled for the project, and 409 `project_deleting` while the project is being deleted.

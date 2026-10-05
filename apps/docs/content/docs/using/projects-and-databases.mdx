@@ -1,0 +1,76 @@
+---
+title: Projects and databases
+description: How projects hold databases, what a database is made of, and its connection, password and delete operations.
+---
+
+## Projects
+
+A tenant's databases live in projects. Each project has a display `name` (1 to 64 characters, renamable) and a `slug` made from the name when the project is created. The slug never changes: lowercase `[a-z0-9-]`, up to 40 characters, with `-2`, `-3` and so on added on a clash.
+
+| Operation | Endpoint |
+|---|---|
+| List | `GET /v1/projects` |
+| Create | `POST /v1/projects {name}` (201) |
+| Get, rename | `GET` and `PATCH /v1/projects/{id}` (`{name}`) |
+| Delete | `DELETE /v1/projects/{id}` with `{"confirm": "<slug>"}` (202) |
+
+Another tenant's project answers 404.
+
+**Deleting a project** turns it `deleting`. Every database in it is deleted (computes, tenants, stored data), then the worker revokes the app sessions, deletes the project's Zitadel organization (when app users were on) and the project. A failure leaves the project `deleting` with `error` set, and the worker retries.
+
+Delete is refused with 409 while a database is still provisioning (`database_not_ready`), a branch is protected (`branch_protected`), or app users are being enabled or disabled (`conflict`). A wrong `confirm` is 422. A `deleting` project refuses every change with 409 `project_deleting`, and `POST /v1/databases` refuses it too.
+
+In Studio, the dashboard lists your projects and has **New project**. The project page has **Databases** and **Settings** tabs; Settings holds rename, app users and the danger zone, where deleting asks for the slug and lists the databases that go with it.
+
+## What a database is
+
+Each database gets a Neon tenant and timeline on the storage controller, plus one compute container per branch. The `postgres` role is the owner and a member of `neon_superuser`. It is a real superuser only when `CHELABASE_DB_OWNER_SUPERUSER` is on and `CHELABASE_MODE` is `self-hosted`; see below.
+
+Clients connect through Neon's proxy, never straight to a compute:
+
+- Postgres wire at `<endpoint>.localtest.me:4432`.
+- SQL over HTTP and WebSocket at `https://<endpoint>.localtest.me:4444/sql`.
+
+Use `sslrootcert=.chelabase/neon/proxy-ca.crt`; if `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`. The ports can be changed with `CHELABASE_PROXY_PG_PORT` and `CHELABASE_PROXY_HTTP_PORT`.
+
+Every database has the data API roles `anon` (`NOLOGIN`), `authenticated` (`NOLOGIN`) and `authenticator` (`LOGIN NOINHERIT`, with its own encrypted password per branch). Main is itself a branch, created when the database is provisioned; see [Branches](/docs/using/branches).
+
+## Connection details
+
+`GET /v1/databases/{id}/connection` (Studio: **Connection details**) returns the owner credentials and the connection URI, and can be called any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key in the file named by `CHELABASE_SECRETS_KEY` (`.chelabase/secrets/secrets.key`, created by the dev bootstrap).
+
+<Callout type="warn">
+Keep the secrets key file. Without it the stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist. After `just sweep-dbs` a new key is simply adopted.
+</Callout>
+
+## Reset the owner password
+
+`POST /v1/databases/{id}/reset-password` sets a new owner password. Existing sessions keep working until they reconnect.
+
+- If the worker isn't running you get 503.
+- A 503 saying the password "was changed but not yet applied" means the new password is stored (the connection details show it, and Studio shows it with the error) and the worker's reconcile applies it.
+
+## Delete a database
+
+`DELETE /v1/databases/{id}` (Studio asks you to type the name) removes every compute and the tenant, with all its data. The row stays as a `deleted` tombstone, hidden from the API, and the name can be reused. Deleting a database is refused while it has a protected branch.
+
+## Settings
+
+`PATCH /v1/databases/{id}` (Studio: the database's settings) sets the history window and the branch cap; see [Branches](/docs/using/branches).
+
+## Reconcile
+
+Every 30 seconds the worker repairs what drifted:
+
+- fails databases stuck provisioning for more than 10 minutes and tears down what they built;
+- retries deletes that have been stuck for more than a minute;
+- starts a new compute for a ready database whose container is gone (an exited container is left to Docker's restart policy);
+- applies a password reset that was stored but not applied;
+- removes compute containers that have no endpoint row, unless `CHELABASE_WORKER_REMOVE_ORPHANS=false` (for a worker on its own metadata database that shares the machine's Docker with another stack: it then logs them and keeps them);
+- retries the teardown of an endpoint whose database is failed or deleted.
+
+A storage-controller tenant with no endpoint row, or an endpoint row with no database, is only reported in the worker log, never removed: it may hold the only copy of someone's data. In local dev, `just sweep-dbs` removes every database, endpoint and endpoint tenant; delete an unknown tenant by hand.
+
+## Owner as superuser
+
+`CHELABASE_DB_OWNER_SUPERUSER=true` makes the `postgres` role of new databases a real superuser (self-hosted mode only; ignored in platform mode). Users can then alter `cloud_admin` or `neon_superuser` and break the compute's reconfigure and the worker's admin SQL for that database.

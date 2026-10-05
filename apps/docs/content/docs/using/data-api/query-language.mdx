@@ -1,0 +1,112 @@
+---
+title: Query language
+description: The JSON tree one data API request carries, operation by operation.
+---
+
+One request is one operation: a JSON tree sent to `POST /data/v1/query`. The [TypeScript client](/docs/using/client) builds these trees for you (`toTree()` shows the one it sends); the examples here follow the contract fixtures in `packages/client/fixtures`, which the client's tests and the server's parser both run.
+
+- `"v": 1` is required at the top, and unknown fields are rejected anywhere.
+- A table or function name is `"name"` (in the database's `default_schema`) or `"schema.name"`. It is matched exactly, with no case folding.
+- An optional top-level `"database": "<name>"` picks a served database (the main one when omitted; 1 to 63 bytes). Inside a `batch` only the top level may name it, so a batch runs in one database. See [Serving more databases](/docs/using/data-api/databases).
+- A request that breaks a rule here answers 400 `invalid_query`.
+- The full request schema is on the [`runQuery`](/docs/reference/data/runQuery) reference page, and the endpoint that lists a database's tables and columns is [`getDataSchema`](/docs/reference/data/getDataSchema). The schema can't express every rule: the server also rejects an insert whose rows have different keys, an alias or `database` over 63 bytes (the schema counts characters), `"v": 1.0` or `"limit": 1.0` (write integers), and a `limit` or `offset` above 9223372036854775807. A client that validates only against the schema can still get a 400.
+- Two inputs are accepted that you might not expect: an empty batch (`"ops": []`), and an update or delete that carries both `where` and `"all": true`.
+
+## select
+
+`from`, and optionally `select` (a list of column names or `{"col", "as"}`; omitted means every column), `where`, `orderBy`, `limit` and `offset`.
+
+```json
+{
+  "v": 1,
+  "op": "select",
+  "from": "orders",
+  "select": ["id", "total", { "col": "customer_name", "as": "customer" }],
+  "where": { "and": [{ "col": "status", "eq": "paid" }, { "col": "total", "gte": "100" }] },
+  "orderBy": [{ "col": "created_at", "dir": "desc", "nulls": "last" }],
+  "limit": 50
+}
+```
+
+- `dir` is `asc` or `desc`, `nulls` is `first` or `last`; both are optional.
+- `select` can't be empty (leave it out for every column). An alias is 1 to 63 bytes.
+- `limit` and `offset` can't be negative. The server also clamps the result to the branch's `max_rows` [setting](/docs/using/data-api/settings).
+
+## insert
+
+`into`, `values` (a non-empty array of non-empty objects that all have the same keys), and optionally `returning` (`"*"` or a non-empty list of columns).
+
+```json
+{ "v": 1, "op": "insert", "into": "orders", "values": [{ "total": "12.50", "region": "eu" }], "returning": ["id", "total"] }
+```
+
+## update
+
+`table`, `set` (a non-empty object), and `where` or `"all": true`; optionally `returning`.
+
+```json
+{ "v": 1, "op": "update", "table": "orders", "set": { "status": "shipped" }, "where": { "col": "id", "eq": 7 }, "returning": "*" }
+```
+
+## delete
+
+`from`, and `where` or `"all": true`; optionally `returning`.
+
+```json
+{ "v": 1, "op": "delete", "from": "orders", "where": { "col": "status", "eq": "pending" } }
+```
+
+An update or delete with neither `where` nor `"all": true` is refused (`invalid_query`). To touch every row, say so:
+
+```json
+{ "v": 1, "op": "delete", "from": "billing.invoices", "all": true }
+```
+
+## call
+
+`fn` and named `args`, returning a scalar or rows.
+
+```json
+{ "v": 1, "op": "call", "fn": "add_points", "args": { "user_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "n": 5 } }
+```
+
+## batch
+
+`ops`, up to 50 operations, all or nothing in one transaction. Batches don't nest, and an operation inside may leave out `"v"`.
+
+```json
+{
+  "v": 1,
+  "op": "batch",
+  "ops": [
+    { "op": "insert", "into": "orders", "values": [{ "total": "1.00", "region": "eu" }], "returning": ["id"] },
+    { "op": "update", "table": "events", "set": { "label": "x" }, "where": { "col": "id", "eq": 1 } },
+    { "op": "call", "fn": "add_points", "args": { "user_id": "u" } }
+  ]
+}
+```
+
+## Filters
+
+A condition is `{ "col": "<column>", "<operator>": value }` with exactly one operator:
+
+| Operator | Value |
+|---|---|
+| `eq`, `neq`, `lt`, `lte`, `gt`, `gte` | anything but `null` (use `is` for null) |
+| `in` | an array |
+| `is` | `null`, `true` or `false` |
+| `like`, `ilike` | a string pattern |
+
+Combine conditions with `{ "and": [...] }`, `{ "or": [...] }` (both need at least one filter) and `{ "not": filter }`. A filter holds one of them and nothing beside it.
+
+```json
+{ "or": [{ "col": "region", "in": ["eu"] }, { "and": [{ "col": "vip", "eq": true }, { "col": "qty", "gt": 2 }] }] }
+```
+
+## Numbers keep every digit
+
+A big JSON number in a request body (say a 30-digit `numeric`) reaches Postgres exactly. Responses carry `int8` and `numeric` values with every digit too; the TypeScript client reads them exactly (see [Big numbers](/docs/using/client/big-numbers)).
+
+## Errors
+
+Every status and code a request can answer is on [Error codes](/docs/reference/errors).

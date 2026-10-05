@@ -1,0 +1,52 @@
+---
+title: "Security"
+description: "Trust boundaries, what each credential can do, and the security notes kept in the repository."
+---
+
+This page lists where Chelabase draws its trust boundaries and what is not a boundary. Self-hosted mode is the development mode; several defaults below are for local use only.
+
+## Trust boundaries
+
+**The gateway is the only door.** Every API request is authenticated there. Backend services trust only the gateway's internal identity token: an EdDSA JWT valid for 60 seconds, signed for one target service. The gateway never forwards the client's `Authorization` header, a `Chelabase-User` header or a client-supplied identity header, and calling a service's port directly without a valid token is refused. See [Gateway](/docs/architecture/gateway).
+
+**The internal listener is separate.** Machine-to-machine routes (for Neon's proxy, `compute_ctl`, the storage controller, `rest` and `auth`) are on their own listener, bound to loopback by default, each caller with its own bearer token. Nothing on it goes through the gateway. The default bearer values in a development setup are fixed strings and must not be used outside local development.
+
+**Management API.** Callers present a Zitadel access token, which the gateway verifies against Zitadel's keys. Another tenant's resources answer exactly like missing ones (404 `not_found`).
+
+**Data API keys.** Chelabase stores only the SHA-256 of a key and its first 12 characters. A secret key is shown once and Chelabase keeps no copy; the public key is also stored encrypted so Studio can show it again. Keys resolve to a role, and `rest` refuses to run a request as an owner-level role (one that is a superuser or has `CREATEROLE`, `CREATEDB`, `BYPASSRLS` or `REPLICATION`, or belongs to `neon_superuser`). Revocation takes effect within 30 seconds. Unknown-key lookups are rate limited per client address.
+
+**Row-level security is off by default.** A new table is reachable by the roles that hold default privileges on it; Studio warns about every reachable object without RLS. Policies are yours to write. See [Data API](/docs/architecture/data-api#row-level-security).
+
+**Sessions are reset between requests.** A pooled connection starts every request as the `authenticator` role with default settings, so a function that changes the session cannot leak into another request.
+
+**App users.** Access tokens are short-lived, signed by `auth` and checked by the gateway together with a session-liveness check. Refresh tokens rotate on every use, only their SHA-256 is stored, and presenting an old one after a short grace window revokes the session. See [App users](/docs/architecture/app-users).
+
+**Sign-in cookies.** The login API keeps step state in encrypted, `HttpOnly`, `SameSite=Strict` cookies scoped to `/auth/v1`. Its answers are padded to a minimum response time (1.5 s by default) and rate limited.
+
+**Errors don't leak internals.** A 503 carries fixed text; what happened goes to the log with the request id.
+
+## What is not a boundary
+
+- **The SQL editor's guard** is a confirmation step. A client that sends `confirm: true` skips it, and it looks at statements, not at what they call.
+- **The SQL editor's "run as"** is a preview of a role's view under RLS. The connection is the owner's.
+- **A protected branch** holds non-read statements for confirmation; it is not a safety boundary against functions that write.
+- **`X-Forwarded-For`** is appended by the gateway and must never be used for authorization.
+
+See [SQL editor](/docs/architecture/sql-editor) for the details.
+
+## Local-only defaults
+
+- Email verification is off in self-hosted mode (`CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides it).
+- Everyone who signs up to Studio joins one shared workspace.
+- The Zitadel Actions target needs Zitadel's HTTP client denylist relaxed so it can call the host.
+- Key material under `.chelabase/` is created once and never overwritten.
+
+## The Scalar reference never phones home
+
+The API reference UI is configured with telemetry, default fonts, the request proxy, external URLs, the agent and MCP all off. See [API generation](/docs/architecture/api-generation#api-reference-ui).
+
+## Security notes in the repository
+
+Security findings are kept as dated notes in [`docs/security`](https://github.com/chelabase/chelabase/tree/main/docs/security):
+
+- [Neon event-trigger privilege escalation](https://github.com/chelabase/chelabase/blob/main/docs/security/2026-10-01-neon-event-trigger-escalation.md): a database owner who belongs to `neon_superuser` could become a superuser through an event trigger firing while a trusted extension installs. The fix is carried in Chelabase's Neon fork.

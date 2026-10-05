@@ -1,0 +1,82 @@
+---
+title: The users table
+description: The table Chelabase creates for your app's users, which columns are managed, and how sign-up data reaches your own columns.
+---
+
+Every app user has one row in the users table (`public.users` unless you chose another name). The table is owned by the database's owner role (`postgres` unless the database was created with another owner), so you manage it with ordinary migrations.
+
+## Columns
+
+| Column | Type | Who owns it |
+|---|---|---|
+| `id` | `uuid`, primary key | Chelabase. It is the Zitadel user id. |
+| `email` | `text` | Chelabase. |
+| `email_verified` | `boolean` | Chelabase. |
+| `created_at` | `timestamptz` | Chelabase. |
+| `deleted_at` | `timestamptz` | Chelabase. Set only when `on_delete` is `mark`. |
+
+Every other column is yours. Add columns, constraints, indexes and foreign keys with ordinary migrations.
+
+## Rows are Chelabase's
+
+A guard trigger refuses `INSERT`, `DELETE` and `TRUNCATE` on the table, and any change to a managed column, for every role except `chelabase_auth_sync`. The error is `42501`:
+
+```text
+rows of public.users are created and deleted by Chelabase app users
+column email is managed by Chelabase app users
+```
+
+Your own columns can be updated, by the owner or by users through their policy.
+
+## Its shape is protected
+
+Event triggers refuse:
+
+- dropping or renaming the table, or moving it to another schema;
+- dropping, renaming or retyping a managed column;
+- dropping, renaming, replacing or disabling the guard triggers.
+
+A superuser can still get around them (with `event_triggers = off`). The users bootstrap runs again when the branch's compute is re-created, reset or restored, and puts back a dropped table and the triggers.
+
+## It starts locked down
+
+On a new table:
+
+- `anon` has no privileges;
+- row-level security is on;
+- `authenticated` can select and update, narrowed by two own-row policies: `chelabase_users_select_own` (`USING (id = chelabase.user_id())`) and `chelabase_users_update_own`. (It holds a `DELETE` grant too, but the guard refuses every delete.)
+
+The policies aren't protected: change or drop them like any policy. Studio's [RLS warning](/docs/using/studio) names the users table while RLS is off.
+
+## Sign-up data is opt-in per column
+
+`signUp`'s `data` reaches a column only when `authenticated` may insert into it:
+
+```sql
+GRANT INSERT (display_name) ON users TO authenticated;
+```
+
+Any other key is 422 `unknown_column`. That includes managed columns, generated columns and `GENERATED ALWAYS` identity columns. `REVOKE INSERT (display_name) ON users FROM authenticated` takes a column out again.
+
+The values go through your column types and constraints. A failure is 422 `constraint_violation` with Postgres' message (and the constraint's name when it has one), and no Zitadel user is created.
+
+`chelabase gen types` marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
+
+## Defaults and triggers run as `chelabase_auth_sync`
+
+Rows are written by the sync login `chelabase_auth_sync`, so a column default or a `BEFORE INSERT` trigger of yours on the users table runs with its privileges. Grant it what they touch:
+
+```sql
+GRANT INSERT ON profiles TO chelabase_auth_sync;
+```
+
+or make the trigger function `SECURITY DEFINER`.
+
+## `on_delete`
+
+When a user is deleted in Zitadel:
+
+- `delete` (default) deletes the row; your foreign keys cascade as you defined them;
+- `mark` sets `deleted_at` and keeps the row.
+
+The unique email index (on `lower(email)`) skips marked rows, so the address can sign up again.

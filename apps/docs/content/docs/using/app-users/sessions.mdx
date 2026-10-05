@@ -1,0 +1,126 @@
+---
+title: Tokens, sessions and the SDK
+description: The app-user sign-in flows, the access and refresh tokens, and how the TypeScript client manages the session.
+---
+
+```ts twoslash
+import { createClient } from '@chelabase/client';
+
+const db = createClient({ url: 'http://127.0.0.1:8000', key: 'chk_pub_…' });
+await db.auth.signUp({ email: 'ann@example.com', password: 'Str0ng!pass', data: { display_name: 'Ann' } });
+const mine = await db.from('users').select('id', 'display_name'); // only the signed-in user's row
+```
+
+`signUp` creates the user and, with email verification off, signs them in. After that the client sends the user's token with every data API request, which runs as `authenticated` with the user's claims. The public key alone (no signed-in user) runs as `anon`.
+
+## The SDK
+
+`db.auth` has these methods. Types come from `@chelabase/client`.
+
+| Method | What it does |
+|---|---|
+| `signUp({ email, password, data? })` | Returns `{ user, session, verificationRequired }`. `session` is `null` when the project requires email verification; confirm with `verifyEmail`, then `signIn`. |
+| `signIn({ email, password })` | Returns the session. |
+| `signOut()` | Ends the session on the server and signs out locally, even if the call fails. |
+| `refresh()` | Exchanges the stored refresh token for a new pair. The client does this for you. |
+| `getUser()` | The signed-in user. |
+| `verifyEmail({ email, code })`, `resendCode({ email })` | Confirm an address with the emailed code, or send it again. |
+| `requestPasswordReset({ email })`, `confirmPasswordReset({ email, code, password })` | Reset a forgotten password with an emailed code. |
+| `changeEmail({ email })`, `changePassword({ currentPassword, password })` | Change the signed-in user's email or password. `changePassword` returns a fresh session. |
+| `onChange(callback)` | Subscribe to `signed_in`, `signed_out` and `refreshed`; returns the unsubscribe function. |
+
+The client keeps the refresh token in `localStorage` in browsers and in memory elsewhere. Pass your own `{ get, set, remove }` (sync or async) as `auth.storage` to change that, and `auth.autoRefresh: false` to turn off the background refresh timer:
+
+```ts twoslash
+import { createClient } from '@chelabase/client';
+
+const values = new Map<string, string>();
+
+const db = createClient({
+  url: 'http://127.0.0.1:8000',
+  key: 'chk_pub_…',
+  auth: {
+    storage: {
+      get: (key) => values.get(key) ?? null,
+      set: (key, value) => void values.set(key, value),
+      remove: (key) => void values.delete(key),
+    },
+  },
+});
+
+const stop = db.auth.onChange((event, user) => {
+  console.log(event, user?.email);
+});
+stop();
+```
+
+## Flows
+
+The flows live under `/auth/v1/app/` on the gateway and take a **public** key as `Authorization: Bearer <key>` (a secret key is refused), except `jwks`, which needs no key:
+
+| Path | Method | Needs the user token |
+|---|---|---|
+| `sign-up`, `sign-in`, `refresh` | POST | no |
+| `sign-out` | POST | yes, or the refresh token in the body |
+| `user` | GET | yes |
+| `verify-email`, `resend-code` | POST | no |
+| `password-reset`, `password-reset/confirm` | POST | no |
+| `change-email`, `change-password` | POST | yes |
+| `jwks` | GET | no |
+
+`jwks` is public: your own servers can verify access tokens with it. The credential flows are rate limited, and sign-up and sign-in answer after a minimum response time, so they don't give away whether an account exists. With email verification on, sign-up and `resend-code` answer the same for a taken address; with verification off, sign-up for a taken email is 409 `email_taken`.
+
+Passwords need at least 8 characters, with a lowercase letter, an uppercase letter, a digit and a symbol (422 `weak_password` otherwise).
+
+## Access token
+
+An EdDSA-signed JWT with these claims:
+
+| Claim | Value |
+|---|---|
+| `iss` | `chelabase-auth` |
+| `aud` | `chelabase-project:<project id>` |
+| `sub` | the user's id |
+| `sid` | the session id |
+| `email`, `email_verified` | the user's address and its state |
+| `role` | `authenticated` |
+
+It is valid for `CHELABASE_APP_ACCESS_TTL_SECS` (default 900, so 15 minutes). Requests send it as `Chelabase-User: <token>` beside `Authorization: Bearer <public key>`; the client does this for you.
+
+The gateway checks the token and that its session is still live. Liveness is cached for 30 seconds, so a revocation reaches the data API within 30 seconds. The gateway never falls back to `anon`:
+
+| Status | Code | When |
+|---|---|---|
+| 401 | `user_token_invalid` | The header isn't a valid token for this project. |
+| 401 | `user_token_expired` | The token has expired. |
+| 401 | `user_session_revoked` | The session is revoked or expired. |
+| 400 | `user_token_with_secret_key` | A secret key was sent with the header. Secret keys don't take a user. |
+
+## Refresh token
+
+A string of the form `<session id>.<secret>`. It expires on a sliding schedule of `CHELABASE_APP_REFRESH_TTL_SECS` (default 30 days), capped at 90 days from sign-in.
+
+- Every refresh rotates it.
+- Within 10 seconds of a rotation, presenting the previous token returns the same new pair (two tabs refreshing at once).
+- After that, presenting it revokes the session: 401 `refresh_token_reused`.
+
+The client refreshes 60 seconds before the access token expires, refreshes first when a request would carry a token with under 5 seconds left, and refreshes once after a data request answers 401 `user_token_expired`. It signs out locally (and emits `signed_out`) when a refresh answers `refresh_token_reused`, `refresh_token_invalid`, `user_session_revoked` or `user_inactive`, or when any request answers `user_session_revoked`.
+
+## Password changes
+
+A password change (`change-password`) ends the user's other sessions; the caller gets a fresh pair. A password reset ends all of them.
+
+## Errors
+
+The codes above, plus the sign-up and sign-in answers:
+
+| Status | Code | When |
+|---|---|---|
+| 401 | `invalid_credentials` | Wrong email or password. |
+| 403 | `email_not_verified` | Sign-in before the address is confirmed. |
+| 403 | `user_inactive` | The user is deactivated or locked. |
+| 409 | `app_users_disabled` | The project doesn't have app users enabled. |
+| 422 | `unknown_column`, `constraint_violation` | Sign-up `data` the table refuses. See [The users table](/docs/using/app-users/users-table). |
+| 429 | `rate_limited` | Too many attempts. |
+
+All codes are listed in [Error codes](/docs/reference/errors).

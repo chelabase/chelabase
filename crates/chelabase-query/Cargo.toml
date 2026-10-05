@@ -28,9 +28,17 @@ thiserror = { workspace = true }
 # Every compute-facing statement (the fork pinned in the workspace; `NoTls`).
 tokio-postgres = { workspace = true, features = ["with-serde_json-1", "with-uuid-1"] }
 tracing = { workspace = true }
+# The request grammar's hand-written OpenAPI schemas (`openapi` feature, used by rest's document).
+utoipa = { workspace = true, optional = true }
 uuid = { workspace = true }
 
+[features]
+openapi = ["dep:utoipa", "chelabase-types/openapi"]
+
 [dev-dependencies]
+# The fidelity test validates requests against the committed openapi/data.json. Arbitrary
+# precision matches this crate's serde_json (a 20-digit integer is still an integer).
+jsonschema = { version = "0.58.5", default-features = false, features = ["arbitrary-precision"] }
 # Live tests' own admin sessions.
 sqlx = { workspace = true }
 tokio = { workspace = true }

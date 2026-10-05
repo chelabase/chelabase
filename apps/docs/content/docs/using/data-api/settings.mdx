@@ -1,0 +1,19 @@
+---
+title: Settings
+description: Row cap, statement timeout and connection budget of a branch's data API.
+---
+
+| Setting | Default | Min | Max |
+|---|---|---|---|
+| `max_rows` | 1000 | 1 | 100000 |
+| `statement_timeout_ms` | 8000 | 100 | 120000 |
+| `max_connections` | 5 | 1 | 50 |
+
+Change them with `PATCH /v1/databases/{id}`, or in Studio's database settings. They apply to every database the branch serves.
+
+- `max_rows` caps the rows a `select` returns (a `limit` above it is clamped), and the rows a write's `returning` returns.
+- `statement_timeout_ms` also sets Postgres's `transaction_timeout`, so it bounds the whole request: a batch of 50 operations shares one timeout, not 50. A request past it answers 504 `timeout`.
+- `max_connections` is per branch: one budget shared by that branch's database pools.
+- `default_schema` is per Postgres database (`public` by default). See [Serving more databases](/docs/using/data-api/databases).
+
+Every setting takes up to 60 seconds to take effect (the connection-info cache).

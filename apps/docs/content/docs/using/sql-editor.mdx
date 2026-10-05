@@ -1,0 +1,97 @@
+---
+title: SQL editor
+description: Run SQL scripts against a branch from Studio, with a confirmation guard for risky statements, a role preview and saved queries.
+---
+
+Studio's **SQL** view runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. To open it, choose **SQL** on a database in the project's **Databases** tab.
+
+The editor connects with the database owner's credentials, so it is for people who already own the database. Everything below is also available over the API:
+
+| Request | What it does |
+|---|---|
+| `POST /v1/databases/{id}/branches/{branch_id}/sql` | Runs a script. The answer is an NDJSON stream. |
+| `POST /v1/databases/{id}/branches/{branch_id}/sql/runs/{run_id}/cancel` | Cancels a run. |
+| `GET /v1/databases/{id}/branches/{branch_id}/sql/schema?database=` | The schema document that feeds completion. |
+| `/v1/databases/{id}/sql-queries` and `…/{query_id}` | Saved queries. |
+
+For how the run engine, guard and schema read work inside, see [SQL editor internals](/docs/architecture/sql-editor).
+
+## Using the editor
+
+The toolbar picks the **Branch**, the **Database** (Postgres database), the role to **Run as** and a **Timeout** (60 s, 5 min or 15 min; the API accepts any value from 100 ms to 15 min). **Ctrl/Cmd+Enter** runs the selection, or the whole buffer when nothing is selected. **Cancel** replaces **Run** while a script runs.
+
+Results appear in one tab per statement, with the command tag, and a **Messages** tab for notices and errors. A column's header shows its type on hover. The editor completes names from the branch's schema (with the Postgres language server), and falls back to keyword completion when the schema can't be loaded.
+
+While you run as the owner, the editor says so: row-level security is bypassed. On a protected branch it says that every change asks for confirmation.
+
+## Execution
+
+- A script is sent as **one simple query**: Postgres runs its statements in order inside an implicit transaction, so an error rolls the whole script back. `BEGIN` and `COMMIT` in the script are honoured and end that implicit transaction as you wrote it.
+- `VACUUM`, `CREATE INDEX CONCURRENTLY` and `CREATE DATABASE` can't run in a transaction block, so they are accepted only as the script's single statement.
+- `COPY … FROM STDIN` isn't supported in the editor (there is no way to send the data). Use `psql` with a [login role](/docs/using/login-roles) for it.
+- Row values come back as text (or `null`).
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| SQL per run | 1 byte to 1 MiB, no NUL bytes (422 `invalid_request`) |
+| `timeout_ms` | 100 to 900000; 60000 by default |
+| Rows per result set | 1,000. More set `truncated` on the statement's `complete` event. Rows are sent in `rows` events of up to 200. |
+| Response size | 10 MiB per response, notices included. Past it the run stops with outcome `truncated_response`. A single `rows` event that would cross the cap isn't sent, so a very wide row can end a run with no rows shown. |
+| Runs in flight | 4 per user and 4 per Postgres database of a branch (429 `sql_run_limit`, with `Retry-After`). A schema read takes a slot while it lasts. |
+| Heartbeat | a `heartbeat` event after 15 seconds without another event |
+| Schema document | at most 8 MiB (422 `schema_too_large`; Studio falls back to keyword completion). The system catalogs alone are about 2.5 MiB. |
+
+Column types in `columns` events name the built-in types only (`int4`, `text`, `jsonb`, … and their arrays). Any other type (enums, domains, extension types) is `""`.
+
+### The stream
+
+A run answers JSON errors until its connection is open, then `200 application/x-ndjson`: one JSON event per line, each with a `t` field.
+
+| `t` | Fields |
+|---|---|
+| `columns` | `statement`, `columns: [{ name, type }]` |
+| `rows` | `statement`, `rows` (up to 200 rows of text-or-null values) |
+| `complete` | `statement`, `tag` (the command tag), `rows`, `truncated` |
+| `notice` | `severity`, `code`, `message`, `detail`, `hint`, `position` |
+| `error` | `statement`, `code`, `message`, `detail`, `hint`, `position` (1-based in the script) |
+| `heartbeat` | none; keeps the gateway's connection open during a long statement |
+| `done` | Always last. `outcome` is `ok`, `error`, `cancelled`, `timeout` or `truncated_response`; `duration_ms`. |
+
+Closing the stream, or the cancel route, sends Postgres's cancel request.
+
+## The guard
+
+Before running, the script is parsed (with pg_query, Postgres's own parser) and each statement is classified.
+
+- On a normal branch the guard holds back **risky** statements: `DROP` of an object, database, role, owned objects, subscription or tablespace, `TRUNCATE`, `DELETE` and `UPDATE` without a `WHERE`, and `ALTER TABLE` that drops a column or a constraint. `EXPLAIN ANALYZE` (it runs its statement) and `PREPARE` of a risky statement count as risky.
+- On a **protected** branch every statement that isn't a read is held, with reason `protected`. Reads are `SELECT` (without `INTO` or a locking clause, and without a data-modifying `WITH`), `SHOW`, and plain `EXPLAIN` of a read. Even `BEGIN`, `SET` and `COMMIT` are held. See [Branches](/docs/using/branches) for protecting a branch.
+- A script that doesn't parse is held as `unparsed`.
+
+A held run answers 409 `sql_confirm_required` and nothing runs. The body lists the held statements (`index`, `kind`, `text_preview` of up to 200 characters, `reason` of `risky` or `protected`). Studio shows them in a dialog; **Confirm** sends the run again with `confirm: true`, which runs the whole script, held statements included.
+
+<Callout type="warn" title="The guard is a confirmation step, not a security boundary">
+It looks at the statement, not at what the statement calls, and a client that sends `confirm: true` skips it. On a protected branch, a `SELECT` that calls a function which writes, `SELECT … FOR UPDATE` inside a subquery or CTE, and writing functions such as `nextval` all pass as reads. On a normal branch, `EXECUTE` of a prepared risky statement, a data-modifying CTE (`WITH d AS (DELETE FROM t) …`), `MERGE`, `DO` blocks, and functions and rules that delete pass without confirmation.
+</Callout>
+
+## Run as
+
+The **Run as** picker (`role` in the request) runs `SET ROLE` first, to preview what `anon`, `authenticated` or a custom role would see under row-level security. It is a **preview, not a security boundary**: the connection is the owner's.
+
+- `anon` and `authenticated` are offered where the data API was set up. The worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the owner inheriting the role's privileges. The orchestrator re-checks the grant at most every 5 minutes per branch.
+- Other roles of the branch need no grant: roles the owner created are already its own.
+- System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`) are refused (422), and a role that doesn't exist is 404.
+
+## Saved queries and history
+
+Saved queries are private to their author, per database:
+
+- a name of 1 to 120 characters, unique ignoring case (409 `saved_query_name_taken`);
+- up to 500 per user and database (409 `saved_query_cap`), and up to 1 MiB of SQL each;
+- an optional `pg_database` and `role` hint, remembered from the last run (an empty value is stored as null);
+- updates carry the `version` the client saw: a stale one answers 409 `saved_query_conflict` with the current row.
+
+They are stored on the server. Don't save secrets in them.
+
+Studio keeps a **History** of your last 100 runs per database, the open buffer and the chosen timeout in the browser (`localStorage`), not on the server.

@@ -1,0 +1,4 @@
+{
+  "title": "App users",
+  "pages": ["index", "users-table", "claim-helpers", "sessions", "managing-users", "settings"]
+}

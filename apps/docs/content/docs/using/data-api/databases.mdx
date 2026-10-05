@@ -1,0 +1,50 @@
+---
+title: Serving more databases
+description: Enable the data API on other Postgres databases of a branch, set their default schema, and what SQL changes do.
+---
+
+A branch's data API serves its main database, and any other Postgres database of the branch you enable. A database made in SQL (`CREATE DATABASE analytics`) is listed with the branch's databases, but not served.
+
+A request names its database with the top-level `"database"` field (see [Query language](/docs/using/data-api/query-language)). `GET /data/v1/schema?database=<name>` reads that database's schema, and the response's `databases` lists the served databases the key reaches. To limit a key to some databases, see [Allow-lists](/docs/using/data-api/allow-lists).
+
+## Enable
+
+`POST /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api` answers 202. The worker then runs the data API bootstrap in that database: the `chelabase` schema, its event triggers, the default privileges and, the first time, the grants on existing objects, all in that database's `default_schema`.
+
+The database's `data_api` reads `enabling`, then `on`, or `error` with `data_api_error`. `GET …/branches/{branch_id}/databases` lists each database's state. Studio's Data API view has the same controls, per database. Asking again retries a failed or stuck enable; a database that is already `on` answers 200.
+
+## Disable
+
+`DELETE …/pg-databases/{name}/data-api` stops serving at once: the orchestrator tells `rest` to drop the branch's pools and caches. If that call fails, the 60-second connection-info cache bounds the delay. The machinery stays, so enabling again is quick.
+
+`?remove=true` also drops the `chelabase` schema and its event triggers. Grants already made to `anon` and `authenticated` stay.
+
+The main database can't be switched off (409), and neither can a database that the project's app users use. `?remove=true` on a database the data API was never enabled on is a 409 too.
+
+## The system database
+
+The system `postgres` database can't be enabled (422): `cloud_admin` owns it, so the owner couldn't manage its grants.
+
+## Default schema, per database
+
+`PATCH …/pg-databases/{name}` with `{ "default_schema": "app" }` sets the schema an unqualified table or function name means. The name must match `^[a-z_][a-z0-9_]{0,62}$`.
+
+For a served database the bootstrap runs again, so the default privileges cover the new schema. Objects already in it are granted only with `"grant_existing": true` (grants only, never revokes). Studio shows the same opt-in as the checkbox "Also grant existing objects in *schema*" next to Save default schema; it clears after a save.
+
+## Cap
+
+A branch serves at most `CHELABASE_BRANCH_DATA_API_DATABASE_CAP` databases (an orchestrator environment variable; default 10, from 1 to 100, the main database included). Each costs `rest` a connection pool. Over the cap, enabling answers 409 `conflict` ("this branch already serves *n* databases (the cap is *n*)").
+
+## Changes made in SQL
+
+- **Rename:** a rename keeps the database's state and default schema, and every key list naming it follows.
+- **Drop:** a drop removes the database from every key list. A key whose list would be left empty is revoked, because an empty list can't mean "every database".
+- **Resync:** the resync paths can revoke keys too. A rename seen only by the resync (not by a tracked `ALTER DATABASE … RENAME`) looks like a drop plus a create, and a reset or restore that rewinds a database's creation inserts its row again. In both cases a key that listed only that database is revoked, and the database comes back with the data API off.
+
+## Branches, reset and restore
+
+A child branch serves what its parent serves: states and default schemas are copied after its first sync. The bootstrap runs in every served database wherever it runs for main: after each compute (re)creation and from the worker's reconcile.
+
+## Studio's console
+
+Studio's Tables view browses and edits rows in any served database and schema through the data API's own query language. See [Studio](/docs/using/studio).

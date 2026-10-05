@@ -1,0 +1,55 @@
+---
+title: Big numbers
+description: Reading int8 and numeric values exactly, and why a typed client requires types.
+---
+
+Postgres writes `int8` and `numeric` as JSON numbers with every digit. JavaScript's `number` holds integers exactly only up to ±(2^53 − 1), so the client reads those values from their source text. It finds them with the generated `types` map (pass it to `createClient`), including through `select` aliases, `returning` keys, a function's scalar return and a set-returning function's columns.
+
+## A typed client requires `types`
+
+`createClient<Database>({ url, key })` without `types` is a compile error, because without the map the client can't tell an `int8` or a `numeric` from any other number (a `numeric` typed `string` would come back as a number).
+
+```ts twoslash
+// @errors: 2769
+import { createClient } from "@chelabase/client";
+import { type Database } from "./db";
+
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…" });
+```
+
+The check is compile-time only, since the generic is erased at run time. `bigint: true` also throws at run time when `types` is missing. The untyped `createClient({ url, key })` needs no `types`.
+
+## What you get
+
+| Postgres | Default | `bigint: true` |
+|---|---|---|
+| `int2`, `int4` | `number` | `number` |
+| `int8` | `number`; **throws `UnsafeIntegerError`** outside the safe range | `bigint`, always |
+| `numeric` | `string` with the exact digits | `string` |
+
+Use `bigint: true` together with `types` to get `bigint` for all `int8` columns, arguments and returns:
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+// ---cut---
+const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types, bigint: true });
+
+const row = await db.from("orders").select("id", "total").limit(1);
+//    ^?
+const next = await db.call("next_id");
+//    ^?
+```
+
+- A column's type never depends on its value: an `int8` is `number` or `bigint` for the whole client, chosen by `bigint` and followed by the types.
+- Forgetting `bigint: true` is loud, not silent: an `int8` outside the safe range throws `UnsafeIntegerError` (with `column` and the exact `source` digits) instead of returning a rounded number.
+- Without `types`, any integer literal outside the safe range throws `UnsafeIntegerError`, wherever it is; other numbers stay numbers.
+- With `types`, a value the map doesn't cover (a column added after `gen types`, a function with no `int8` or `numeric` return) still throws `UnsafeIntegerError` when it's a top-level integer, or an array of them, outside the safe range. It's never rounded silently; run `gen types` again.
+- Only top-level row keys (and scalar returns) are mapped. Numbers inside `json` and `jsonb` objects are parsed as plain JSON numbers.
+- Writes are exact too: a `bigint` in `insert`, `update`, `where` or call arguments is sent as its digits. Send `numeric` values as strings.
+
+## Runtime requirement
+
+Reading exactly uses `JSON.parse` source text access, available in **Node 21+, Chrome 114+, Firefox 135+ and Safari 18.4+**.
+
+On an older runtime, `createClient` throws when given `bigint: true`, or `types` that include a `numeric` column. The default mode still works and still throws `UnsafeIntegerError` for an `int8` outside the safe range (checked after a plain parse). There, an integer is recognised by its printed form (no exponent or point), so a float between 2^53 and 1e21 (`1.5e20`) is also refused; floats printed with an exponent (`1e300`) are not.

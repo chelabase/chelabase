@@ -17,8 +17,8 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 chelabase-auth = { workspace = true }
-chelabase-query = { workspace = true }
-chelabase-types = { workspace = true }
+chelabase-query = { workspace = true, features = ["openapi"] }
+chelabase-types = { workspace = true, features = ["openapi"] }
 deadpool-postgres = { workspace = true }
 dotenvy = { workspace = true }
 moka = { workspace = true }
@@ -34,12 +34,16 @@ tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 chelabase-auth = { workspace = true, features = ["keygen"] }
 chelabase-metadata = { workspace = true }
 chelabase-nats = { workspace = true }
+# The OpenAPI document's registry test.
+chelabase-routes = { workspace = true }
 chelabase-neon = { workspace = true }
 chelabase-secrets = { workspace = true }
 chrono = { workspace = true }

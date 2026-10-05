@@ -14,7 +14,7 @@
 
 ## Status
 
-- **Current: MERGE PAUSE.** Step 6e is done and verified; the user decides the merge into `main`.
+- **DONE: merged into `main` on 2026-10-04 (`--no-ff`, the user's go).** The merged `main` builds and passes `cargo test --workspace`.
 - **End-of-step review (opus):** "with fixes", with no data-integrity or tenant-isolation defects. One fix wave (`f768126..dced3c8`), re-reviewed clean:
   - **I1:** `authenticator` gets USAGE on the exposed default schema, so non-`public` schemas pipeline too instead of silently falling back. The health check (`schema_check_sql(schema)`) brings existing branches along. Prepares use `join_all` (no leaked named statements), debug logs say which path ran, and the `pipelined_runs` counter backs the live test `a_non_public_default_schema_runs_pipelined`.
   - **I2:** the per-connection statement cache is capped at `STATEMENT_CACHE_CAP` = 500, then cleared.

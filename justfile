@@ -234,6 +234,10 @@ auth:
 studio:
     pnpm --filter @chelabase/studio dev
 
+# The docs site (apps/docs) on http://localhost:3001; needs no stack
+docs:
+    pnpm --filter @chelabase/docs dev
+
 # --- Detached full stack ---
 
 # Start deps + control-plane apps + Studio in background; print seed info
@@ -472,7 +476,7 @@ sweep-dbs: _live-check
 
 # Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
 api-gen:
-    CHELABASE_BLESS=1 cargo test -p orchestrator -p auth document_is_current
+    CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest document_is_current
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
     just scalar-sync
@@ -483,7 +487,8 @@ scalar-sync:
 
 check:
     cargo check --workspace
-    cargo test -p orchestrator -p auth openapi::tests
+    cargo test -p orchestrator -p auth -p rest openapi::tests
+    cargo test -p chelabase-query --test openapi_fidelity
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
     test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
@@ -494,6 +499,9 @@ check:
     pnpm --filter @chelabase/studio test
     pnpm --filter @chelabase/client typecheck
     pnpm --filter @chelabase/client test
+    pnpm --filter @chelabase/docs typecheck
+    pnpm --filter @chelabase/docs build
+    pnpm --filter @chelabase/docs test
 
 # Rust tests (nextest, one process per test) plus doctests, which nextest does not run.
 # The ignored live tests stay on `cargo test ... -- --ignored` (see neon-test-live).
