@@ -1,0 +1,85 @@
+/*
+ * Scalar in the lagoon palette. Rendered in a <style> after Scalar's own CSS, only while the API
+ * page is mounted, and every rule is scoped to `.studio-api` (the page wrapper): nothing global.
+ *
+ * Scalar declares its colours inside `@layer scalar-base` on `.dark-mode` (set on <body>), so any
+ * unlayered rule wins whatever the specificity. The derived variables (sidebar, tooltip, alert,
+ * danger) are resolved on <body> and inherited as final values, so they are redeclared here too.
+ *
+ * One Meaning: coral = hazard (red, danger, alert), seafoam = yes (green), sand = action, selection
+ * and focus only (accent, button), palm = reserved. Hairline Not Shadow.
+ */
+.studio-api,
+.studio-api .dark-mode,
+/* Scalar teleports its dropdowns and popovers to <body> (`body > .scalar-app`), outside the wrapper.
+   Still page-scoped: this <style> unmounts with the API page. */
+body > .scalar-app {
+  --scalar-font: var(--font-sans);
+  --scalar-font-code: var(--font-mono);
+
+  --scalar-background-1: var(--ink);
+  --scalar-background-2: var(--deep);
+  --scalar-background-3: var(--channel);
+  --scalar-background-accent: rgb(242 199 163 / 0.12);
+  --scalar-color-1: var(--chalk);
+  --scalar-color-2: var(--chalk-dim);
+  --scalar-color-3: var(--chalk-dim);
+  --scalar-color-accent: var(--sand);
+  /* Control borders need 3:1 on ink, deep and channel: --input (0.4 chalk) gives 3.4, 3.2, 3.1. */
+  --scalar-border-color: var(--input);
+
+  --scalar-button-1: var(--sand);
+  --scalar-button-1-hover: var(--sand-lit);
+  --scalar-button-1-color: var(--ink);
+
+  --scalar-scrollbar-color: rgb(230 237 231 / 0.2);
+  --scalar-scrollbar-color-active: rgb(230 237 231 / 0.4);
+
+  /* Method colours: each method its own hue, as API docs conventionally do. POST (green, also 2xx)
+     = seafoam and DELETE (red, also errors) = coral keep their lagoon meanings (yes, hazard). GET,
+     PUT and PATCH get method-only tones that mean nothing else in Studio. Scalar also paints 3xx
+     with yellow and "required" with orange, so those take the PATCH and PUT tones. OPTIONS
+     (purple) is chalk-dim like HEAD and TRACE. Sand stays action/selection/focus only, palm
+     reserved. Every tone is >= 5.6:1 on ink, deep and channel, and on its 10% badge tint. */
+  --method-get: #9cc8ea;
+  --method-put: #c4b6ec;
+  --method-patch: #e3d58c;
+  --scalar-color-red: var(--coral);
+  --scalar-color-green: var(--seafoam);
+  --scalar-color-blue: var(--method-get);
+  --scalar-color-orange: var(--method-put);
+  --scalar-color-yellow: var(--method-patch);
+  --scalar-color-purple: var(--chalk-dim);
+  --scalar-color-query: var(--chalk);
+  --scalar-color-alert: var(--coral);
+  --scalar-color-danger: var(--coral);
+  --scalar-background-alert: rgb(237 166 170 / 0.1);
+  --scalar-background-danger: rgb(237 166 170 / 0.1);
+
+  --scalar-link-color: var(--chalk);
+  --scalar-link-color-hover: var(--sand);
+
+  --scalar-tooltip-background: var(--deep);
+  --scalar-tooltip-color: var(--chalk);
+
+  --scalar-sidebar-background-1: var(--ink);
+  --scalar-sidebar-color-1: var(--chalk);
+  --scalar-sidebar-color-2: var(--chalk-dim);
+  --scalar-sidebar-border-color: var(--line-strong);
+  /* (decorative separators, not controls) */
+  --scalar-sidebar-item-hover-background: var(--deep);
+  --scalar-sidebar-item-hover-color: var(--chalk);
+  --scalar-sidebar-item-active-background: var(--deep);
+  --scalar-sidebar-color-active: var(--chalk);
+  --scalar-sidebar-indent-border: var(--line);
+  --scalar-sidebar-indent-border-hover: var(--line-strong);
+  --scalar-sidebar-indent-border-active: var(--sand);
+  --scalar-sidebar-search-background: var(--deep);
+  --scalar-sidebar-search-color: var(--chalk-dim);
+  /* The search field is a control: its border needs 3:1. */
+  --scalar-sidebar-search-border-color: var(--input);
+
+  /* Hairline, not shadow. */
+  --scalar-shadow-1: none;
+  --scalar-shadow-2: 0 0 0 1px var(--input);
+}

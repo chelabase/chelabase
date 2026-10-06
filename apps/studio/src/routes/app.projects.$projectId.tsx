@@ -1,5 +1,4 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { ApiNavLink } from "@/components/api-nav-link";
 import { ProjectPage } from "@/components/project-page";
 import { useAppSession } from "@/lib/app-session";
 
@@ -10,7 +9,7 @@ export const Route = createFileRoute("/app/projects/$projectId")({
 });
 
 function ProjectRoute() {
-  const { apiUrl, profile, onLoaded, onSignOut } = useAppSession();
+  const { apiUrl, onLoaded } = useAppSession();
   const { projectId } = Route.useParams();
   const { tab } = Route.useSearch();
   const navigate = useNavigate();
@@ -18,10 +17,7 @@ function ProjectRoute() {
     <ProjectPage
       projectId={projectId}
       apiUrl={apiUrl}
-      profile={profile}
       onLoaded={onLoaded}
-      onSignOut={onSignOut}
-      nav={<ApiNavLink />}
       tab={tab ?? "databases"}
       onTabChange={(next) =>
         void navigate({

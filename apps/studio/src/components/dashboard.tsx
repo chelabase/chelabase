@@ -1,22 +1,17 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useGetMe, type Me, type Project } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";
 import { NewProjectDialog } from "./new-project-dialog";
-import { StudioShell } from "./studio-shell";
 
 export interface DashboardProps {
-  profile: { name?: string; email?: string };
-  onSignOut: () => void;
   /** Called on the first successful `getMe` (and again after a failed one recovers): re-arms the re-auth guard. */
   onLoaded?: () => void;
-  /** Extra header links, shown before "Sign out". */
-  nav?: ReactNode;
 }
 
-export function Dashboard({ profile, onSignOut, onLoaded, nav }: DashboardProps) {
+export function Dashboard({ onLoaded }: DashboardProps) {
   // While anything is being created or deleted, keep the list fresh.
   const me = useGetMe({ query: { refetchInterval: pollWhile<Me>(hasTransitional) } });
   const loaded = me.isSuccess;
@@ -28,7 +23,7 @@ export function Dashboard({ profile, onSignOut, onLoaded, nav }: DashboardProps)
   const restarting = me.error?.signInRestarted === true;
 
   return (
-    <StudioShell profile={profile} onSignOut={onSignOut} nav={nav}>
+    <div className="mx-auto max-w-4xl space-y-8 p-8">
       {restarting ? (
         <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
       ) : me.data === undefined ? (
@@ -51,7 +46,7 @@ export function Dashboard({ profile, onSignOut, onLoaded, nav }: DashboardProps)
           <Workspace me={me.data} />
         </>
       )}
-    </StudioShell>
+    </div>
   );
 }
 

@@ -19,7 +19,7 @@ export function StudioDevtools() {
   if (!import.meta.env.DEV) return null;
   return (
     <TanStackDevtools
-      config={{ position: "bottom-left" }}
+      config={{ position: "bottom-right" }}
       plugins={[
         { name: "TanStack Router", render: <TanStackRouterDevtoolsPanel /> },
         { name: "TanStack Query", render: <QueryDevtoolsPlugin /> },

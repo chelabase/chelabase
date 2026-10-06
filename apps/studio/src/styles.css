@@ -1,4 +1,10 @@
 @import "tailwindcss";
+@import "@fontsource-variable/atkinson-hyperlegible-next";
+@import "@fontsource/spectral/700.css";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* Studio is always dark (D4): make `dark:` always apply, not only under prefers-color-scheme. */
+@custom-variant dark (&:where(:root, :root *));
 
 @theme inline {
   --color-background: var(--background);
@@ -13,24 +19,64 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-ink: var(--ink);
+  --color-deep: var(--deep);
+  --color-channel: var(--channel);
+  --color-sand: var(--sand);
+  --color-sand-lit: var(--sand-lit);
+  --color-seafoam: var(--seafoam);
+  --color-coral: var(--coral);
+  --color-palm: var(--palm);
+  --color-chalk: var(--chalk);
+  --color-chalk-dim: var(--chalk-dim);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif;
+  --font-serif: Spectral, "Iowan Old Style", Georgia, serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --ease-lagoon: cubic-bezier(0.16, 1, 0.3, 1);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
 }
 
 :root {
-  --background: oklch(0.985 0 0);
-  --foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  color-scheme: dark;
+
+  /* Lagoon palette (same values as the landing page). */
+  --ink: #0b1c1f;
+  --deep: #0f2a2d;
+  --channel: #14363a;
+  --shallows: #163d3e; /* reserved: unused in Studio, shared with the landing page */
+  --sand: #f2c7a3;
+  --sand-lit: #f7d6b9; /* primary button hover, as on the landing */
+  --seafoam: #9fd4c6;
+  --coral: #eda6aa;
+  --palm: #a9c89a;
+  --chalk: #e6ede7;
+  --chalk-dim: #aebfc0;
+  --line: rgb(230 237 231 / 0.16);
+  --line-strong: rgb(230 237 231 / 0.34);
+  /* The claw mark. */
+  --shell: #f2936e;
+  --shell-dark: #b85a3e;
+  --shell-light: #f8b896;
+  --tip: #fde3cf;
+
+  /* shadcn semantic tokens, remapped onto the lagoon. */
+  --background: var(--ink);
+  --foreground: var(--chalk);
+  --primary: var(--sand);
+  --primary-foreground: var(--ink);
+  --secondary: var(--channel);
+  --secondary-foreground: var(--chalk);
+  --muted: var(--deep);
+  --muted-foreground: var(--chalk-dim);
+  --destructive: var(--coral);
+  --border: var(--line);
+  /* Control borders need 3:1 (WCAG 1.4.11): chalk at 40% clears it on ink, deep and channel. */
+  --input: rgb(230 237 231 / 0.4);
+  --ring: var(--sand);
   --radius: 0.5rem;
 }
 
@@ -50,6 +96,42 @@ body {
   color: var(--foreground);
 }
 
+::selection {
+  background: var(--sand);
+  color: var(--ink);
+}
+
+* {
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+/* App shell hooks (rail, wordmark) */
+.app-rail {
+  --claw-gap: var(--deep);
+}
+.app-rail .wordmark {
+  font-family: var(--font-serif);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--chalk);
+}
+.app-rail .wordmark__visual {
+  display: inline-flex;
+  align-items: flex-end;
+}
+.app-rail .wordmark__claw {
+  width: auto;
+  height: 1.32em;
+  margin-right: -0.14em;
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-rail,
+  .app-rail * {
+    transition-duration: 0s !important;
+  }
+}
+
 /* SQL editor */
 .cm-sql-error {
   text-decoration: underline wavy var(--destructive);
@@ -61,7 +143,7 @@ body {
   max-height: 16rem;
   overflow: auto;
   padding: 0.5rem 0.75rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   white-space: pre-wrap;
 }

@@ -7,10 +7,6 @@ vi.mock("@/components/api-reference", () => {
   return { default: () => <div data-testid="reference" /> };
 });
 
-vi.mock("@tanstack/react-router", () => ({
-  Link: ({ children, to }: { children: React.ReactNode; to: string }) => <a href={to}>{children}</a>,
-}));
-
 import { ApiPage } from "./api-page";
 
 describe("ApiPage", () => {

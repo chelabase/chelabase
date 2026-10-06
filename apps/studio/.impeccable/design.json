@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-06T12:30:00Z",
+  "title": "Design System: Chelabase Studio",
+  "extensions": {
+    "colorMeta": {
+      "ink": { "role": "neutral", "displayName": "Lagoon Ink", "canonical": "#0b1c1f", "cssVar": "--ink (--background, --primary-foreground)", "tonalRamp": ["#010e11", "#16272a", "#314347", "#4f6165", "#6e8185", "#8ea3a7", "#b4c9cd", "#ddf3f7"] },
+      "deep-water": { "role": "neutral", "displayName": "Deep Water", "canonical": "#0f2a2d", "cssVar": "--deep (--muted)", "tonalRamp": ["#000f12", "#0e292c", "#2a4548", "#486367", "#678387", "#87a5a8", "#accbce", "#d6f5f9"] },
+      "channel": { "role": "neutral", "displayName": "Channel", "canonical": "#14363a", "cssVar": "--channel (--secondary)", "tonalRamp": ["#000f13", "#06292d", "#24464a", "#426469", "#618489", "#82a6aa", "#a7ccd1", "#d1f7fc"] },
+      "shallows": { "role": "neutral", "displayName": "Shallows", "canonical": "#163d3e", "cssVar": "--shallows", "note": "Reserved: unused in Studio, shared with the landing page." },
+      "sand-lit": { "role": "primary", "displayName": "Sand Lit", "canonical": "#f7d6b9", "cssVar": "--sand-lit (--color-sand-lit)", "note": "Primary button hover (with the landing's soft sand glow and a 1px lift); never dims." },
+      "sand": { "role": "primary", "displayName": "Sand", "canonical": "#f2c7a3", "cssVar": "--sand (--primary, --ring)", "tonalRamp": ["#1e0200", "#3b1a00", "#593715", "#7a5434", "#9b7452", "#be9573", "#e5bb97", "#ffe5c0"] },
+      "seafoam": { "role": "secondary", "displayName": "Seafoam", "canonical": "#9fd4c6", "cssVar": "--seafoam", "tonalRamp": ["#00120b", "#002d23", "#154a3f", "#36695d", "#56897c", "#77ab9d", "#9cd1c3", "#c6fced"] },
+      "coral": { "role": "secondary", "displayName": "Coral Blush", "canonical": "#eda6aa", "cssVar": "--coral (--destructive)", "tonalRamp": ["#240002", "#440c16", "#652a31", "#86494e", "#a9686d", "#cd898d", "#f6aeb2", "#ffd8dc"] },
+      "palm": { "role": "tertiary", "displayName": "Palm", "canonical": "#a9c89a", "cssVar": "--palm", "tonalRamp": ["#001100", "#132b03", "#2e4820", "#4b673d", "#6a875c", "#8ba97c", "#b0cfa1", "#dafaca"] },
+      "chalk": { "role": "neutral", "displayName": "Chalk", "canonical": "#e6ede7", "cssVar": "--chalk (--foreground)", "tonalRamp": ["#080c09", "#202621", "#3c413d", "#595f5a", "#797f7a", "#9aa09b", "#bfc6c0", "#eaf1eb"] },
+      "chalk-dim": { "role": "neutral", "displayName": "Chalk Dim", "canonical": "#aebfc0", "cssVar": "--chalk-dim (--muted-foreground)", "tonalRamp": ["#030e0e", "#192728", "#344344", "#526162", "#718182", "#92a2a3", "#b7c8c9", "#e1f3f4"] },
+      "hairline": { "role": "neutral", "displayName": "Hairline", "canonical": "rgb(230 237 231 / 0.16)", "cssVar": "--line (--border)" },
+      "hairline-strong": { "role": "neutral", "displayName": "Strong Hairline", "canonical": "rgb(230 237 231 / 0.34)", "cssVar": "--line-strong" },
+      "control-border": { "role": "neutral", "displayName": "Control Border", "canonical": "rgb(230 237 231 / 0.4)", "cssVar": "--input", "note": "Chalk 40% clears WCAG 1.4.11 3:1 on ink, deep water and channel." },
+      "chalk-wash": { "role": "neutral", "displayName": "Chalk Wash", "canonical": "rgb(230 237 231 / 0.06)", "note": "Rail row and behaviour-trigger hover." },
+      "chalk-wash-strong": { "role": "neutral", "displayName": "Chalk Wash Strong", "canonical": "rgb(230 237 231 / 0.08)", "note": "Header trigger hover/open and menu item highlight." },
+      "sand-tint": { "role": "primary", "displayName": "Sand Tint", "canonical": "rgb(242 199 163 / 0.25)", "note": "SQL editor selection: sand tint, chalk glyphs." },
+      "shell": { "role": "brand", "displayName": "Shell", "canonical": "#f2936e", "cssVar": "--shell", "note": "Claw mark only.", "tonalRamp": ["#2e0000", "#500000", "#702100", "#94421f", "#b86240", "#dd8461", "#ffa986", "#ffd4af"] },
+      "shell-dark": { "role": "brand", "displayName": "Shell Dark", "canonical": "#b85a3e", "cssVar": "--shell-dark", "note": "Claw mark only." },
+      "shell-light": { "role": "brand", "displayName": "Shell Light", "canonical": "#f8b896", "cssVar": "--shell-light", "note": "Claw mark only." },
+      "shell-tip": { "role": "brand", "displayName": "Shell Tip", "canonical": "#fde3cf", "cssVar": "--tip", "note": "Claw mark only." }
+    },
+    "typographyMeta": {
+      "wordmark": { "displayName": "Wordmark", "purpose": "Spectral 700, the expanded rail's \"Chelabase\" wordmark only." },
+      "headline": { "displayName": "Headline", "purpose": "Page titles in the page body." },
+      "body": { "displayName": "Body", "purpose": "All shell UI text: rail labels, account trigger, menu items." },
+      "label": { "displayName": "Label", "purpose": "Tooltips and the account menu's email line." },
+      "code": { "displayName": "Code", "purpose": "SQL editor (13px) and hover docs (12px)." }
+    },
+    "shadows": [],
+    "focus": [
+      { "name": "focus-inset", "value": "outline: 2px solid var(--sand); outline-offset: -2px", "purpose": "Rail rows, home link, behaviour trigger, highlighted menu items. Square, no shadow." },
+      { "name": "focus-outset", "value": "outline: 2px solid var(--sand); outline-offset: 2px", "purpose": "Header account trigger and skip link." }
+    ],
+    "motion": [
+      { "name": "ease-lagoon", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Rail width and grid column changes, 200ms; instant under prefers-reduced-motion." },
+      { "name": "rail-hover-open-delay", "value": "150ms", "purpose": "Pointer rest before the hover-mode rail widens." },
+      { "name": "rail-hover-close-delay", "value": "200ms", "purpose": "Grace after pointer leave before it narrows; re-entry cancels." },
+      { "name": "tooltip-delay", "value": "300ms", "purpose": "Collapsed-rail label tooltips." }
+    ],
+    "breakpoints": [],
+    "apiReference": "Scalar is themed onto the lagoon by components/api-reference.css, scoped to .studio-api. Surfaces ink/deep/channel, text chalk/chalk-dim, accent and button sand (ink text), borders --input (3:1), shadows replaced by a hairline. Method colours are their own small set, the one carve-out from One Meaning: each method has its own hue. POST and 2xx are seafoam (yes); DELETE, errors and alerts are coral (hazard). GET #9cc8ea, PUT #c4b6ec and PATCH #e3d58c are method-only tones (--method-get/put/patch, scoped to the API page); Scalar also uses PATCH's for 3xx and PUT's for required. OPTIONS, HEAD and TRACE are chalk-dim. Each is at least 5.6:1 on every ground. Sand never marks a method or status; palm stays reserved. Code samples default to JavaScript / Axios.",
+    "openGaps": [
+      "Phone width is not designed: a later pass gives the rail a drawer and the header its own menu trigger.",
+      "Buttons, dialogs and fields keep inherited shapes (8px radius) until the lagoon plates pass.",
+      "The shared button's focus is still the shadcn glow (ring-3 ring/50); the Primary Button sample shows the target 2px sand outline, not what ships."
+    ]
+  },
+  "components": [
+    {
+      "name": "Rail",
+      "kind": "nav",
+      "refersTo": "rail",
+      "description": "Deep-water icon rail with a sand edge-mark on the current item and a dashed not-built-yet slot.",
+      "html": "<nav class=\"ds-rail\" aria-label=\"Studio\"><ul><li><a class=\"ds-rail-item\" href=\"#\" aria-current=\"page\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.8a2 2 0 0 0 2.06 0L12 19v-5.5l-5-3-4.03 2.42Z\"/><path d=\"m7 16.5-4.74-2.85\"/><path d=\"m7 16.5 5-3\"/><path d=\"M7 16.5v5.17\"/><path d=\"M12 13.5V19l3.97 2.38a2 2 0 0 0 2.06 0l3-1.8a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71L17 10.5l-5 3Z\"/><path d=\"m17 16.5-5-3\"/><path d=\"m17 16.5 4.74-2.85\"/><path d=\"M17 16.5v5.17\"/><path d=\"M7.97 4.42A2 2 0 0 0 7 6.13v4.37l5 3 5-3V6.13a2 2 0 0 0-.97-1.71l-3-1.8a2 2 0 0 0-2.06 0l-3 1.8Z\"/><path d=\"M12 8 7.26 5.15\"/><path d=\"m12 8 4.74-2.85\"/><path d=\"M12 13.5V8\"/></svg><span>Projects</span></a></li><li><a class=\"ds-rail-item\" href=\"#\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 7v14\"/><path d=\"M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z\"/></svg><span>API reference</span></a></li><li><div class=\"ds-rail-placeholder\" aria-disabled=\"true\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" stroke-dasharray=\"3 3\"/></svg><span>Placeholder</span></div></li></ul></nav>",
+      "css": ".ds-rail { width: 232px; padding: 8px 0; background: var(--deep, #0f2a2d); border-right: 1px solid var(--line-strong, rgb(230 237 231 / 0.34)); color: var(--chalk, #e6ede7); font-family: 'Atkinson Hyperlegible Next Variable', 'Atkinson Hyperlegible', system-ui, sans-serif; } .ds-rail ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; } .ds-rail-item, .ds-rail-placeholder { position: relative; display: flex; align-items: center; gap: 12px; height: 36px; font-size: 14px; white-space: nowrap; text-decoration: none; } .ds-rail-item { padding: 0 19px; color: var(--chalk-dim, #aebfc0); transition: color 150ms, background-color 150ms; } .ds-rail-item:hover { background: rgb(230 237 231 / 0.06); color: var(--chalk, #e6ede7); } .ds-rail-item:focus-visible { outline: 2px solid var(--sand, #f2c7a3); outline-offset: -2px; } .ds-rail-item[aria-current=page] { color: var(--chalk, #e6ede7); } .ds-rail-item[aria-current=page]::before { content: ''; position: absolute; top: 6px; bottom: 6px; left: 0; width: 2px; background: var(--sand, #f2c7a3); } .ds-rail-placeholder { margin: 0 8px; padding: 0 10px; border: 1px dashed var(--line-strong, rgb(230 237 231 / 0.34)); color: var(--chalk-dim, #aebfc0); }"
+    },
+    {
+      "name": "Header with account trigger",
+      "kind": "nav",
+      "refersTo": "header",
+      "description": "52px ink header with a hairline below, an empty context slot and the account trigger.",
+      "html": "<header class=\"ds-header\"><div></div><button class=\"ds-header-trigger\" type=\"button\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/><path d=\"M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662\"/></svg><span>Shell Tester</span></button></header>",
+      "css": ".ds-header { display: flex; align-items: center; justify-content: space-between; height: 52px; padding: 0 16px; background: var(--ink, #0b1c1f); border-bottom: 1px solid var(--line, rgb(230 237 231 / 0.16)); color: var(--chalk, #e6ede7); font-family: 'Atkinson Hyperlegible Next Variable', 'Atkinson Hyperlegible', system-ui, sans-serif; } .ds-header-trigger { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 8px; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; font-size: 14px; } .ds-header-trigger:hover { background: rgb(230 237 231 / 0.08); } .ds-header-trigger:focus-visible { outline: 2px solid var(--sand, #f2c7a3); outline-offset: 2px; }"
+    },
+    {
+      "name": "Menu",
+      "kind": "custom",
+      "refersTo": "menu-popup",
+      "description": "Deep-water popup with a strong hairline; highlighted items take a chalk wash and an inset sand outline; radio items show a sand check.",
+      "html": "<div class=\"ds-menu\" role=\"menu\"><div class=\"ds-menu-item\" role=\"menuitemradio\" aria-checked=\"false\"><span></span><span>Expanded</span></div><div class=\"ds-menu-item\" role=\"menuitemradio\" aria-checked=\"false\" tabindex=\"0\"><span></span><span>Collapsed</span></div><div class=\"ds-menu-item\" role=\"menuitemradio\" aria-checked=\"true\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 6 9 17l-5-5\"/></svg><span>Expand on hover</span></div></div>",
+      "css": ".ds-menu { min-width: 208px; padding: 4px 0; background: var(--deep, #0f2a2d); border: 1px solid var(--line-strong, rgb(230 237 231 / 0.34)); color: var(--chalk, #e6ede7); font-family: 'Atkinson Hyperlegible Next Variable', 'Atkinson Hyperlegible', system-ui, sans-serif; font-size: 14px; } .ds-menu-item { display: grid; grid-template-columns: 1rem 1fr; align-items: center; gap: 8px; padding: 8px 12px; cursor: default; outline: none; } .ds-menu-item svg { color: var(--sand, #f2c7a3); } .ds-menu-item:hover, .ds-menu-item:focus-visible { background: rgb(230 237 231 / 0.08); outline: 2px solid var(--sand, #f2c7a3); outline-offset: -2px; }"
+    },
+    {
+      "name": "Tooltip",
+      "kind": "custom",
+      "refersTo": "tooltip",
+      "description": "Collapsed-rail label: deep water, strong hairline, 12px chalk, square.",
+      "html": "<div class=\"ds-tooltip\" role=\"tooltip\">API reference</div>",
+      "css": ".ds-tooltip { display: inline-block; padding: 4px 8px; background: var(--deep, #0f2a2d); border: 1px solid var(--line-strong, rgb(230 237 231 / 0.34)); color: var(--chalk, #e6ede7); font-family: 'Atkinson Hyperlegible Next Variable', 'Atkinson Hyperlegible', system-ui, sans-serif; font-size: 12px; line-height: 16px; }"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The page's one sand action, ink text; inherited 8px radius until the plates pass.",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">New project</button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; height: 32px; padding: 0 10px; border: 1px solid transparent; border-radius: 0.5rem; background: var(--sand, #f2c7a3); color: var(--ink, #0b1c1f); font-family: 'Atkinson Hyperlegible Next Variable', 'Atkinson Hyperlegible', system-ui, sans-serif; font-size: 14px; font-weight: 500; transition: background-color 150ms; } .ds-btn-primary:hover { background: rgb(242 199 163 / 0.8); } .ds-btn-primary:focus-visible { outline: 2px solid var(--sand, #f2c7a3); outline-offset: 2px; }"
+    },
+    {
+      "name": "Text field",
+      "kind": "input",
+      "refersTo": "control-border",
+      "description": "Ink ground with a chalk-40% control border (3:1 on every lagoon ground). No shared focus treatment yet.",
+      "html": "<input class=\"ds-input\" type=\"text\" placeholder=\"database name\">",
+      "css": ".ds-input { height: 32px; padding: 0 8px; border: 1px solid var(--input, rgb(230 237 231 / 0.4)); border-radius: 0.5rem; background: var(--ink, #0b1c1f); color: var(--chalk, #e6ede7); font-family: 'Atkinson Hyperlegible Next Variable', 'Atkinson Hyperlegible', system-ui, sans-serif; font-size: 14px; } .ds-input::placeholder { color: var(--chalk-dim, #aebfc0); }"
+    },
+    {
+      "name": "SQL editor frame",
+      "kind": "custom",
+      "refersTo": "code-editor",
+      "description": "Ink ground, chalk mono, deep-water gutter, sand focus outline; selection is a sand tint with chalk glyphs; errors get a wavy coral underline.",
+      "html": "<div class=\"ds-editor\"><div class=\"ds-editor-gutter\">1<br>2</div><pre class=\"ds-editor-code\">select <span class=\"ds-editor-sel\">id, name</span>\nfrom <span class=\"ds-editor-err\">projets</span>;</pre></div>",
+      "css": ".ds-editor { display: flex; border: 1px solid var(--line, rgb(230 237 231 / 0.16)); border-radius: 0.5rem; overflow: hidden; background: var(--ink, #0b1c1f); color: var(--chalk, #e6ede7); font-family: 'JetBrains Mono Variable', ui-monospace, monospace; font-size: 13px; } .ds-editor:focus-within { outline: 2px solid var(--sand, #f2c7a3); } .ds-editor-gutter { padding: 4px 8px; background: var(--deep, #0f2a2d); color: var(--chalk-dim, #aebfc0); text-align: right; line-height: 1.4; } .ds-editor-code { margin: 0; padding: 4px 8px; font: inherit; line-height: 1.4; } .ds-editor-sel { background: rgb(242 199 163 / 0.25); color: var(--chalk, #e6ede7); } .ds-editor-err { text-decoration: underline wavy var(--coral, #eda6aa); text-underline-offset: 3px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Tool Frame in Lagoon Water",
+    "overview": "Studio is a dark tool that recedes. One deep-water rail and an ink header, separated only by hairlines, frame a page body where developers work for long stretches. The lagoon world shows in precise details rather than in decoration: chalk text, pastel colours that each carry one meaning, square-cut chrome, and a brand that speaks once, as the claw wordmark and a sand \"you are here\" mark.\n\nDensity is calm and even: 36px rows, 18px line icons, a 14px UI face built for legibility. There are no depth bands, chart drawings or neat-line ticks in the app chrome. The confirmed rejections are a grey or green SaaS sidebar with glowing active pills, tinted cards and icon tiles; neon glow; purple SaaS; cream-and-terracotta editorial; and anything taken from Supabase's look, menu tree or wording.\n\nThe shell is desktop first. Phone-width behaviour is an open gap, not a rule (see Layout).",
+    "keyCharacteristics": [
+      "Dark by default: `color-scheme: dark` on `:root`, lagoon ink ground everywhere, auth pages included.",
+      "Sand is the only action and selection colour; coral means hazard; seafoam means yes.",
+      "Hairlines, not fills or shadows, separate regions.",
+      "Shell chrome is square-cut; focus is a square 2px sand outline.",
+      "Spectral appears only in the wordmark."
+    ],
+    "rules": [
+      { "name": "The One Meaning Rule", "body": "Every pastel has one job: sand acts and selects, coral warns, seafoam affirms. A pastel is never used as decoration or as a second accent.", "section": "colors" },
+      { "name": "The Sand Is Here Rule", "body": "The current location is marked by a 2px sand bar on the rail's edge plus chalk text, never by a filled or glowing pill.", "section": "colors" },
+      { "name": "The One Serif Rule", "body": "Spectral is the wordmark and nothing else. Headings, labels and buttons stay in Atkinson.", "section": "typography" },
+      { "name": "The Hairline Not Shadow Rule", "body": "A surface that sits above another gets a deep-water fill and a strong hairline. It never gets a drop shadow or glow.", "section": "elevation" }
+    ],
+    "dos": [
+      "**Do** mark the current section with a 2px sand edge-mark and chalk text.",
+      "**Do** draw every focus state as a 2px square sand outline with no shadow.",
+      "**Do** separate surfaces with hairlines: chalk 16% for dividers, 34% for overlay and popup edges, 40% for control borders.",
+      "**Do** keep popups, menus and tooltips on deep water with a strong hairline.",
+      "**Do** set UI in Atkinson Hyperlegible Next at 14px and icons as lucide line icons at 18px, stroke 1.5.",
+      "**Do** use a dashed hairline only to mean \"not built yet\".",
+      "**Do** make width changes 200ms on `ease-lagoon`, instant under reduced motion."
+    ],
+    "donts": [
+      "**Don't** use glowing or filled active pills, tinted cards or icon tiles in the chrome.",
+      "**Don't** add drop shadows or glows to shell surfaces, overlays included.",
+      "**Don't** use a pastel for anything but its one meaning; never a second accent beside sand.",
+      "**Don't** use Spectral outside the wordmark.",
+      "**Don't** take Supabase's look, menu tree or wording.",
+      "**Don't** colour UI with the claw mark's shell tones."
+    ]
+  }
+}

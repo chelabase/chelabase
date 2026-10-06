@@ -136,7 +136,7 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
                 {/* Zitadel can't take a verification back without a new address: once verified, it stays. */}
                 {u.email_verified ? (
                   <p className="flex items-center gap-1.5 text-sm">
-                    <Check className="size-4 text-green-600" aria-hidden="true" />
+                    <Check className="size-4 text-seafoam" aria-hidden="true" />
                     <span>Verified</span>
                   </p>
                 ) : (

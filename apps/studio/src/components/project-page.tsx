@@ -16,7 +16,6 @@ import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
 import { DatabaseDataApi } from "./database-data-api";
 import { ProjectSettings } from "./project-settings";
-import { StudioShell } from "./studio-shell";
 import { TablesView } from "./tables-view";
 import { UsersTab } from "./users-tab";
 
@@ -29,18 +28,15 @@ export interface ProjectPageProps {
   projectId: string;
   /** The gateway's base URL (shown as the data API endpoint). */
   apiUrl: string;
-  profile: { name?: string; email?: string };
-  onSignOut: () => void;
   /** Called on the first successful load (and again after a failed one recovers): re-arms the re-auth guard. */
   onLoaded?: () => void;
-  nav?: ReactNode;
   tab: ProjectTab;
   onTabChange: (tab: ProjectTab) => void;
   /** The project doesn't exist (any more): go back to the dashboard. */
   onGone: () => void;
 }
 
-export function ProjectPage({ projectId, apiUrl, profile, onSignOut, onLoaded, nav, tab, onTabChange, onGone }: ProjectPageProps) {
+export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onGone }: ProjectPageProps) {
   // The project itself (status, error, app users), followed while it is being deleted.
   const project = useGetProject(projectId, {
     query: { refetchInterval: pollWhile<ProjectInfo>((p) => p.status === "deleting") },
@@ -71,7 +67,7 @@ export function ProjectPage({ projectId, apiUrl, profile, onSignOut, onLoaded, n
   const restarting = project.error?.signInRestarted === true || me.error?.signInRestarted === true;
 
   return (
-    <StudioShell profile={profile} onSignOut={onSignOut} nav={nav}>
+    <div className="mx-auto max-w-4xl space-y-8 p-8">
       {restarting ? (
         <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
       ) : gone ? (
@@ -146,7 +142,7 @@ export function ProjectPage({ projectId, apiUrl, profile, onSignOut, onLoaded, n
           )}
         </>
       )}
-    </StudioShell>
+    </div>
   );
 }
 

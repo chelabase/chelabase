@@ -51,8 +51,6 @@ function setup(routes: Record<string, FakeHandler>, props: Partial<ProjectPagePr
       <ProjectPage
         projectId="p1"
         apiUrl="http://gw"
-          profile={{ name: "Ada" }}
-        onSignOut={() => {}}
         tab={tab}
         onTabChange={(next) => {
           onTabChange(next);

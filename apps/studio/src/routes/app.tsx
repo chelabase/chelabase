@@ -3,6 +3,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Outlet, createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useAuth, type AuthContextProps } from "react-oidc-context";
+import { AppShell } from "@/components/app-shell/app-shell";
 import { SignInError } from "@/components/sign-in-error";
 import { AccessTokenContext } from "@/lib/access-token";
 import { useRegisterDevtoolsQueryClient } from "@/lib/devtools-query-client";
@@ -53,7 +54,7 @@ function AppPage() {
       apiUrl: env.apiUrl,
       profile: { name, email },
       onLoaded: () => guard.reset(),
-      // The dashboard clears the query cache before this runs.
+      // The header clears the query cache before this runs.
       onSignOut: () => void signOut(() => authRef.current.signoutRedirect()),
     }),
     [env.apiUrl, name, email, guard],
@@ -73,7 +74,9 @@ function AppPage() {
       {/* The token value (not a getter) so pages re-render when it refreshes. */}
       <AccessTokenContext.Provider value={auth.user?.access_token}>
         <AppSessionContext.Provider value={session}>
-          <Outlet />
+          <AppShell profile={session.profile} onSignOut={session.onSignOut}>
+            <Outlet />
+          </AppShell>
         </AppSessionContext.Provider>
       </AccessTokenContext.Provider>
     </QueryClientProvider>

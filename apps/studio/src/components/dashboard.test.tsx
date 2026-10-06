@@ -1,7 +1,7 @@
 import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getGetMeQueryKey, type DatabaseSummary, type Me, type ProjectStatusView } from "@chelabase/management-client";
+import { type DatabaseSummary, type Me, type ProjectStatusView } from "@chelabase/management-client";
 import { POLL_MS } from "@/lib/query";
 import { createReauthGuard, restartSignInOnce } from "@/lib/reauth";
 import { fakeFetch, jsonResponse, sequence, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
@@ -39,8 +39,6 @@ const ok = (me: Me) => () => jsonResponse(me);
 const fail = (status: number, code: string, message: string) => () => jsonResponse({ error: { code, message } }, status);
 const meCalls = (f: FakeFetch) => f.calls.filter((r) => new URL(r.url).pathname === "/v1/me").length;
 
-const profile = { name: "Ada Lovelace", email: "ada@example.com" };
-
 function setup(
   me: FakeHandler,
   props: Partial<DashboardProps> = {},
@@ -49,7 +47,7 @@ function setup(
 ) {
   const f = fakeFetch({ "GET /v1/me": me, ...routes });
   const result = renderWithRouter(
-    <Dashboard profile={profile} onSignOut={() => {}} {...props} />,
+    <Dashboard {...props} />,
     { fetch: f, onUnauthorized },
   );
   return { ...result, fetch: f };
@@ -74,8 +72,6 @@ describe("Dashboard", () => {
     expect(screen.getByText("default")).toBeInTheDocument();
     expect(screen.getByText("active")).toBeInTheDocument();
     expect(screen.getByText("1 database")).toBeInTheDocument();
-    expect(screen.getByText("Ada Lovelace")).toBeInTheDocument();
-    expect(screen.getByText("ada@example.com")).toBeInTheDocument();
     await userEvent.click(link);
     expect(await screen.findByText("project route p1")).toBeInTheDocument();
   });
@@ -190,14 +186,5 @@ describe("Dashboard", () => {
     expect(meCalls(fetch)).toBeGreaterThanOrEqual(3);
     expect(screen.queryByText(/Couldn't load your workspace/)).toBeNull();
     expect(screen.queryByText(/Couldn't refresh/)).toBeNull();
-  });
-
-  it("signs out and clears the query cache", async () => {
-    const onSignOut = vi.fn();
-    const { queryClient } = setup(ok(bound), { onSignOut });
-    await userEvent.click(await screen.findByRole("button", { name: "Sign out" }));
-    expect(onSignOut).toHaveBeenCalledTimes(1);
-    expect(queryClient.getQueryData(getGetMeQueryKey())).toBeUndefined();
-    expect(queryClient.getQueryCache().findAll()).toHaveLength(0);
   });
 });

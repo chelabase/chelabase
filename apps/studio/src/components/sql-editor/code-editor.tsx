@@ -49,12 +49,25 @@ const errorField = StateField.define<{ pos: number | null; deco: DecorationSet }
   provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
 });
 
-const theme = EditorView.theme({
-  "&": { fontSize: "13px", minHeight: "10rem", maxHeight: "24rem", border: "1px solid var(--border)", borderRadius: "0.5rem", backgroundColor: "var(--background)", color: "var(--foreground)" },
-  ".cm-scroller": { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", overflow: "auto" },
-  ".cm-gutters": { backgroundColor: "var(--muted)", color: "var(--muted-foreground)", border: "none" },
-  "&.cm-focused": { outline: "2px solid var(--ring)" },
-});
+// `dark: true`: Studio's ground is dark, so CodeMirror's base theme must use its dark caret,
+// active-line and selection colours (the light ones give a black caret and pale washes under chalk text).
+const SELECTION = "rgb(242 199 163 / 0.25)";
+
+const theme = EditorView.theme(
+  {
+    "&": { fontSize: "13px", minHeight: "10rem", maxHeight: "24rem", border: "1px solid var(--border)", borderRadius: "0.5rem", backgroundColor: "var(--background)", color: "var(--foreground)" },
+    ".cm-scroller": { fontFamily: "var(--font-mono)", overflow: "auto" },
+    ".cm-gutters": { backgroundColor: "var(--muted)", color: "var(--muted-foreground)", border: "none" },
+    "&.cm-focused": { outline: "2px solid var(--ring)" },
+    // Sand at low alpha, like the global ::selection; the dark base theme's #233 barely shows on ink.
+    // The base theme's rules are `&dark.cm-focused > .cm-scroller > .cm-selectionLayer ...`: match their specificity.
+    "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground": { background: SELECTION },
+    // drawSelection() makes the native selection transparent, but its glyph colour still comes from the global
+    // ::selection (ink, 1.9:1 on the sand tint): keep selected text chalk, with no native background of its own.
+    ".cm-content ::selection, .cm-content::selection": { color: "var(--foreground)", backgroundColor: "transparent" },
+  },
+  { dark: true },
+);
 
 /** CodeMirror 6 used directly (no React wrapper). `extensions` may change over the editor's life. */
 export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function CodeEditor({ initialDoc, extensions, onChange, onRun }, ref) {

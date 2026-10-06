@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { render } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AccessTokenContext } from "@/lib/access-token";
@@ -12,7 +13,7 @@ vi.mock("@scalar/api-reference-react", () => ({
   },
 }));
 
-import ApiReference from "./api-reference";
+import ApiReference, { apiReferenceConfiguration } from "./api-reference";
 
 const env: StudioEnv = {
   issuer: "http://issuer",
@@ -59,6 +60,47 @@ describe("ApiReference", () => {
     expect(last().mcp).toEqual({ disabled: true });
     expect(last().showDeveloperTools).toBe("never");
     expect(last()).not.toHaveProperty("url");
+  });
+
+  it("forces Scalar's dark mode and hides its toggle", () => {
+    const config = apiReferenceConfiguration("http://gw", "t") as any;
+    expect(config.forceDarkModeState).toBe("dark");
+    expect(config.hideDarkModeToggle).toBe(true);
+  });
+
+  it("defaults the code samples to JavaScript / Axios", () => {
+    const config = apiReferenceConfiguration("http://gw", "t") as any;
+    expect(config.defaultHttpClient).toEqual({ targetKey: "js", clientKey: "axios" });
+  });
+
+  it("themes Scalar onto the lagoon tokens, scoped to the page wrapper", () => {
+    const { container } = render(wrap("t"));
+    const wrapper = container.querySelector(".studio-api");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper!.querySelector('[data-testid="scalar"]')).not.toBeNull();
+    // Both stylesheets render as <style> next to the wrapper (vitest inlines CSS as "", so the
+    // override's text is read from its file).
+    expect(container.querySelectorAll("style")).toHaveLength(2);
+    const css = readFileSync("src/components/api-reference.css", "utf8");
+    expect(css).toContain("--scalar-background-1: var(--ink)");
+    expect(css).toContain("--scalar-color-accent: var(--sand)");
+    expect(css).toContain("--scalar-color-red: var(--coral)");
+    expect(css).toContain("--scalar-font: var(--font-sans)");
+    // Every rule of the override is under .studio-api, or Scalar's teleported popovers
+    // (`body > .scalar-app`); its selectors never start elsewhere.
+    const selectors = css
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("{")
+      .slice(0, -1)
+      .map((chunk) => chunk.split("}").pop()!.trim());
+    expect(selectors.length).toBeGreaterThan(0);
+    for (const selector of selectors) {
+      for (const part of selector.split(",")) {
+        const p = part.trim();
+        expect(p.startsWith(".studio-api") || p === "body > .scalar-app").toBe(true);
+      }
+    }
+    expect(css).toContain("body > .scalar-app");
   });
 
   it("removes the color-mode classes Scalar leaves on document.body when unmounted", () => {
