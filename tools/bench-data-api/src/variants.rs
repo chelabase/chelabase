@@ -295,6 +295,8 @@ impl VariantA {
                 .bind(&ctx.role)
                 .bind(&ctx.claims)
                 .bind(&ctx.timeout)
+                // No role OID: the name-only check, as for the public key.
+                .bind(None::<i64>)
                 .fetch_one(&mut *tx)
                 .await?;
         anyhow::ensure!(version.is_some(), "chelabase.schema_version is empty");
@@ -784,7 +786,7 @@ impl VariantD {
         let client = pool.get().await?;
 
         let (preamble, stmts) = futures_util::try_join!(
-            client.prepare_typed_cached(PREAMBLE_SQL, &[Type::TEXT, Type::TEXT, Type::TEXT]),
+            client.prepare_typed_cached(PREAMBLE_SQL, &[Type::TEXT, Type::TEXT, Type::TEXT, Type::INT8]),
             futures_util::future::try_join_all(
                 typed
                     .iter()
@@ -797,7 +799,9 @@ impl VariantD {
             params.push(plan_params(&op.op, p, ctx.max_rows)?);
         }
         let refs: Vec<Vec<&(dyn ToSql + Sync)>> = params.iter().map(|v| param_refs(v)).collect();
-        let preamble_params: [&(dyn ToSql + Sync); 3] = [&ctx.role, &ctx.claims, &ctx.timeout];
+        // No role OID: the name-only check, as for the public key.
+        let no_oid: Option<i64> = None;
+        let preamble_params: [&(dyn ToSql + Sync); 4] = [&ctx.role, &ctx.claims, &ctx.timeout, &no_oid];
 
         let c = &**client;
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(op.plans.len() + 2);
@@ -883,6 +887,7 @@ pub fn r_identity(branch: uuid::Uuid) -> DataIdentity {
         claims: fixed_claims(),
         databases: None,
         project_id: None,
+        role_oid: None,
     }
 }
 

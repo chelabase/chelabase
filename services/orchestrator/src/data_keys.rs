@@ -121,6 +121,7 @@ fn summary(
 }
 
 /// Builds the row and the plaintext of a new key. Public keys are sealed for display.
+/// `role_oid`: the secret key's role identity from the worker's check.
 fn new_key(
     secrets: &chelabase_secrets::SecretKey,
     branch: BranchId,
@@ -128,6 +129,7 @@ fn new_key(
     role: &str,
     name: &str,
     databases: Option<Vec<String>>,
+    role_oid: Option<i64>,
 ) -> (NewDataKey, String) {
     let generated = data_key::generate(kind);
     let id = Uuid::new_v4();
@@ -144,6 +146,7 @@ fn new_key(
             sha256: generated.sha256,
             sealed,
             databases,
+            role_oid,
         },
         generated.key,
     )
@@ -268,9 +271,9 @@ struct CreateKeyRequest {
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (the message says why)", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
+        (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached; `unavailable`: the branch's roles are being changed, retry", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the worker didn't answer in time", body = ErrorEnvelope),
     ),
 )]
@@ -314,30 +317,12 @@ where
     if branch.status != BranchStatus::Ready {
         return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
     }
-    match state.js.check_data_role(branch.id, &role).await {
-        Ok(reply) if reply.ok => {}
-        Ok(reply) => match (reply.kind.as_deref(), reply.error) {
-            (Some("refused"), Some(message)) => {
-                return ApiError::new(422, ErrorCode::RoleRefused, message).into_response();
-            }
-            (Some("not_ready"), _) => {
-                return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
-            }
-            (kind, message) => {
-                error!(branch_id = %branch.id, ?kind, "check data role failed: {message:?}");
-                return ApiError::internal().into_response();
-            }
-        },
-        Err(ResetError::Timeout) => {
-            return ApiError::new(504, ErrorCode::Timeout, "worker did not respond; try again")
-                .into_response();
-        }
-        Err(ResetError::Transport(err)) => {
-            error!(branch_id = %branch.id, "check data role: {err}");
-            return ApiError::new(503, ErrorCode::WorkerUnavailable, "worker unavailable")
-                .into_response();
-        }
-    }
+    let role_oid = match check_role(&state, branch.id, &role).await {
+        Ok(oid) => oid,
+        Err(err) => return err.into_response(),
+    };
+    // Bound to the role's OID: a role dropped or recreated after the check leaves a dead key,
+    // never one of another role (see `chelabase_metadata`'s data API docs).
     let (key, plaintext) = new_key(
         &state.secrets,
         branch.id,
@@ -345,10 +330,10 @@ where
         &role,
         &request.name,
         request.databases,
+        role_oid,
     );
-    if let Err(err) = state.metadata.insert_data_key(&key).await {
-        error!("insert data key: {err}");
-        return ApiError::internal().into_response();
+    if let Err(err) = state.metadata.create_secret_key(&key).await {
+        return key_write_error("create", err).into_response();
     }
     info!(request_id = %principal.request_id, branch_id = %branch.id, key_id = %key.id, "secret key created");
     created(&key, plaintext)
@@ -367,8 +352,11 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`public_key_exists`: the branch already has a public key", body = ErrorEnvelope),
+        (status = 409, description = "`public_key_exists`: the branch already has a public key; `branch_not_ready`: a secret key's role can't be checked while the branch isn't ready", body = ErrorEnvelope),
+        (status = 422, description = "`role_refused`: the worker refused the secret key's role (it no longer exists or may not back a key; a rename is followed), or the role was dropped and created again since the key was made", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: the branch's roles are being changed, retry after `Retry-After`; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope, headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
+        (status = 504, description = "`timeout`: the worker didn't answer in time", body = ErrorEnvelope),
     ),
 )]
 async fn rotate_key<M, J>(
@@ -388,11 +376,35 @@ where
         Ok(branch) => branch,
         Err(resp) => return resp.into_response(),
     };
-    let old = match find_live_key(&state, branch.id, key_id).await {
+    let mut old = match find_live_key(&state, branch.id, key_id).await {
         Ok(Some(old)) => old,
         Ok(None) => return ApiError::not_found("key not found").into_response(),
         Err(resp) => return resp.into_response(),
     };
+    // A secret key's role is checked on the compute again, for its OID: the store refuses a
+    // role dropped and created again since the old key was made. A refusal may be a rename
+    // that landed meanwhile (the key moved with it): the key is read again and its new name
+    // checked once.
+    let mut role_oid = None;
+    if old.kind == DataKeyKind::Secret {
+        role_oid = match check_role(&state, branch.id, &old.role).await {
+            Ok(oid) => oid,
+            Err(err) => {
+                let renamed = match find_live_key(&state, branch.id, key_id).await {
+                    Ok(Some(now)) if now.role != old.role => now,
+                    Ok(Some(_)) => return err.into_response(),
+                    Ok(None) => return ApiError::not_found("key not found").into_response(),
+                    Err(resp) => return resp.into_response(),
+                };
+                let oid = match check_role(&state, branch.id, &renamed.role).await {
+                    Ok(oid) => oid,
+                    Err(err) => return err.into_response(),
+                };
+                old = renamed;
+                oid
+            }
+        };
+    }
     // The new key is the old one's kind, role and name; the old one stops working with it.
     let (key, plaintext) = new_key(
         &state.secrets,
@@ -401,12 +413,18 @@ where
         &old.role,
         &old.name,
         old.databases.clone(),
+        role_oid,
     );
-    match state
-        .metadata
-        .rotate_data_key(branch.id, old.id, &key)
-        .await
-    {
+    let rotated = match old.kind {
+        DataKeyKind::Secret => {
+            state
+                .metadata
+                .rotate_secret_key(branch.id, old.id, &key)
+                .await
+        }
+        DataKeyKind::Public => state.metadata.rotate_data_key(branch.id, old.id, &key).await,
+    };
+    match rotated {
         Ok(true) => {
             info!(request_id = %principal.request_id, branch_id = %branch.id, old_key_id = %old.id, key_id = %key.id, "key rotated");
             created(&key, plaintext)
@@ -416,9 +434,68 @@ where
             conflict(ErrorCode::PublicKeyExists, "the branch already has a public key")
                 .into_response()
         }
-        Err(err) => {
-            error!("rotate data key: {err}");
-            ApiError::internal().into_response()
+        Err(err) => key_write_error("rotate", err).into_response(),
+    }
+}
+
+/// The worker's check that `role` may back a secret key on the branch, on its compute: any
+/// existing role that isn't refused for its attributes, with or without a password. The
+/// role's OID (`None` from a worker that predates it).
+async fn check_role<M, J>(
+    state: &AppState<M, J>,
+    branch: BranchId,
+    role: &str,
+) -> Result<Option<i64>, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    match state.js.check_data_role(branch, role).await {
+        Ok(reply) if reply.ok => Ok(reply.role_oid),
+        Ok(reply) => match (reply.kind.as_deref(), reply.error) {
+            (Some("refused"), Some(message)) => {
+                Err(ApiError::new(422, ErrorCode::RoleRefused, message))
+            }
+            (Some("not_ready"), _) => {
+                Err(conflict(ErrorCode::BranchNotReady, "branch is not ready"))
+            }
+            (kind, message) => {
+                error!(branch_id = %branch, ?kind, "check data role failed: {message:?}");
+                Err(ApiError::internal())
+            }
+        },
+        Err(ResetError::Timeout) => Err(ApiError::new(
+            504,
+            ErrorCode::Timeout,
+            "worker did not respond; try again",
+        )),
+        Err(ResetError::Transport(err)) => {
+            error!(branch_id = %branch, "check data role: {err}");
+            Err(ApiError::new(503, ErrorCode::WorkerUnavailable, "worker unavailable"))
+        }
+    }
+}
+
+/// A failed secret key write: a role recreated since the key was made is the caller's 422, a
+/// busy endpoint a 503.
+fn key_write_error(what: &str, err: MetadataError) -> ApiError {
+    match err {
+        MetadataError::RoleRecreated(role) => ApiError::new(
+            422,
+            ErrorCode::RoleRefused,
+            format!(
+                "the role {role} was dropped and created again since this key was made; create a new key for it"
+            ),
+        ),
+        MetadataError::EndpointLockTimeout(_) => ApiError::new(
+            503,
+            ErrorCode::Unavailable,
+            "the branch's roles are being changed; try again",
+        )
+        .retry_after(1),
+        err => {
+            error!("{what} data key: {err}");
+            ApiError::internal()
         }
     }
 }

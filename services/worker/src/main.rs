@@ -2,13 +2,14 @@ use axum::{Json, Router, routing::get};
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
-    DataApiDatabaseRequest, GrantDataRoleRequest, NatsConfig, RESET_NOT_APPLIED, ResetPasswordReply,
-    ResetPasswordRequest, RoleReply, SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE,
-    SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP,
-    SUBJECT_GRANT_DATA_ROLE_TO_OWNER, SUBJECT_RESET_PASSWORD, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, connect,
-    ensure_control_stream, run_app_users_consumer, run_app_users_sync_consumer,
-    run_branch_consumer, run_delete_consumer, run_project_delete_consumer, run_provision_consumer,
-    run_settings_consumer,
+    DataApiDatabaseRequest, GrantDataRoleRequest, NatsConfig, RESET_NOT_APPLIED,
+    ResetPasswordReply, ResetPasswordRequest, ResyncBranchRequest, RoleReply,
+    SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
+    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_GRANT_DATA_ROLE_TO_OWNER,
+    SUBJECT_RESET_PASSWORD, SUBJECT_RESYNC_BRANCH, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE,
+    SUBJECT_ROLE_RESET, connect, ensure_control_stream, run_app_users_consumer,
+    run_app_users_sync_consumer, run_branch_consumer, run_delete_consumer,
+    run_project_delete_consumer, run_provision_consumer, run_settings_consumer,
 };
 use chelabase_secrets::{SecretKey, key_check_value, verify_key_check};
 use chelabase_types::mode::Mode;
@@ -19,6 +20,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 use worker::branch_job::Attempt;
 use worker::config::{RealWorker, WorkerConfig, build};
+use worker::resync::{PendingResyncs, TOUCHED_RESYNC_DELAY};
 
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 /// Hard cap on one reset, below the orchestrator's NATS request timeout (`RESET_TIMEOUT`,
@@ -83,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     for subject in [SUBJECT_ROLE_CREATE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_DELETE] {
         tokio::spawn(serve_role_rpc(worker.clone(), nats.clone(), subject));
     }
+    tokio::spawn(serve_resync_branch(worker.clone(), nats.clone()));
     tokio::spawn(reconcile_loop(worker.clone()));
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
@@ -530,6 +533,46 @@ async fn serve_data_api_rpc(
                 if let Err(err) = client.publish(reply_to, body.into()).await {
                     warn!(subject, "data API reply failed: {err}");
                 }
+            }
+        });
+    }
+}
+
+// --- Touched roles (core NATS publish) -------------------------------------------
+
+/// Serves the touched-roles publish (no reply): the DDL receiver saw a role's attributes or
+/// grants change. Each branch gets one resync a few seconds after its first message; the
+/// periodic reconcile stays as the backstop.
+async fn serve_resync_branch(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_RESYNC_BRANCH, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("resync-branch subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(
+        subject = SUBJECT_RESYNC_BRANCH,
+        "serving touched-roles resyncs"
+    );
+    let pending = Arc::new(PendingResyncs::default());
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let pending = pending.clone();
+        tokio::spawn(async move {
+            match serde_json::from_slice::<ResyncBranchRequest>(&message.payload) {
+                Ok(request) => {
+                    if let Err(err) = worker
+                        .resync_touched(&pending, request.branch_id, TOUCHED_RESYNC_DELAY)
+                        .await
+                    {
+                        warn!(branch_id = %request.branch_id, "touched-roles resync: {err}");
+                    }
+                }
+                Err(err) => warn!("bad resync-branch request: {err}"),
             }
         });
     }

@@ -15,9 +15,10 @@ Projects run their own migrations and setup scripts through Chelabase's proxy. `
 
 - `CREATE ROLE <name> LOGIN PASSWORD <secret>`: the role can log in through the proxy. The password may be plain or a pre-hashed SCRAM verifier (see the password rules); an MD5 one is refused.
 - `ALTER ROLE <name> PASSWORD <secret>`: stored and synced to the proxy.
-- `ALTER ROLE <name> RENAME TO <new>`: the role's login works under its new name. A rename with `PASSWORD NULL` in the same transaction needs a compute image that isn't pinned yet. With the current image the copy keeps its old password under the new name until the next periodic resync removes it; run `ALTER ROLE <new> PASSWORD NULL` in its own transaction to remove it at once.
+- `ALTER ROLE <name> LOGIN` and `NOLOGIN`: take effect at once for roles other than the owner (the owner stays `LOGIN`: the compute forces it). `VALID UNTIL` is enforced by Postgres at connect time; Chelabase keeps no expiry of its own.
+- `ALTER ROLE <name> RENAME TO <new>`: the role's login works under its new name. A rename with `PASSWORD NULL` in the same transaction works.
 - `DROP ROLE <name>`: removed from the proxy's cache. Dropping a role that a live secret data key uses is refused.
-- `GRANT <role> TO <app>`: role inheritance is active; `SET ROLE app` and `INHERIT` work after creation.
+- `GRANT <role> TO <app>`: role inheritance is active; `SET ROLE app` and `INHERIT` work after creation. Studio shows the derived flags (such as owner-level) within a few seconds.
 - `CREATE DATABASE <name>`: tracked and shown in Studio.
 - Roles made in SQL can log in after the first resync once the database is running.
 - `ALTER TABLE … OWNER TO <role>` also needs `GRANT CREATE ON SCHEMA public TO <role>` (Postgres 15 and later). The owner can `SET ROLE` to any role it creates, right after `CREATE ROLE`.
@@ -31,7 +32,7 @@ Projects run their own migrations and setup scripts through Chelabase's proxy. `
 | MD5 | Refused: `MD5 passwords can't be used through Chelabase; set a plain password`. A role that already has an MD5 password (from an older dump, say) is listed as unusable through the proxy until its password is reset. |
 | Pre-hashed SCRAM | Accepted in self-hosted mode (strength rules don't apply to pre-hashed ones), refused in platform mode. |
 | `PASSWORD NULL` | Removes a role's login copy. A group role with no password has no proxy copy. |
-| `PASSWORD ''` | Postgres takes this as no password, and it fails in the compute with `Failed to get encrypted password: User "<name>" has no password assigned.` Nothing changes; use `PASSWORD NULL`. |
+| `PASSWORD ''` | As in plain Postgres, this means no password (with a notice), the same as `PASSWORD NULL`: the role can't log in through the proxy until you set a password again. |
 | Unreadable | A rename or a branch copy couldn't reseal the stored password, so it was dropped; reset the password. Studio shows "Stored password can't be read; reset it." A wrong secrets key instead gives a 500 `credentials_unavailable` when the password is revealed. |
 
 ## Caps
@@ -44,6 +45,8 @@ Projects run their own migrations and setup scripts through Chelabase's proxy. `
 The system `postgres` database is listed in Studio and the connection picker, and isn't counted in the database cap. Dropping the branch's main database is refused (`the branch's main database "<name>" can't be dropped`, also with `IF EXISTS` or `WITH (FORCE)`), and so is renaming it.
 
 An owner-level role made in Studio or through the API keeps the owner's attributes; if any of them is taken away in SQL, the next resync gives it back.
+
+Other attributes (`CREATEDB`, `CREATEROLE`, `INHERIT`, `REPLICATION`, `BYPASSRLS`, `CONNECTION LIMIT`) and grants take effect in Postgres at once. Chelabase reads them back in a resync that starts about 3 seconds after the statement commits (one resync for a burst of statements), so Studio's role list catches up within seconds; the periodic resync stays as the backstop.
 
 ## Resync
 

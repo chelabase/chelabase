@@ -112,7 +112,7 @@ async fn cleanup(worker: &RealWorker, metadata: &MetadataClient, id: DatabaseId)
         if let Ok(Some(endpoint)) = metadata.neon_endpoint(&ep).await
             && let Ok(tenant) = endpoint.tenant_id.parse::<NeonId>()
         {
-            let _ = worker.storage.delete_tenant(&tenant).await;
+            let _ = worker.storage.storcon.delete_tenant(&tenant).await;
         }
         let _ = metadata.delete_endpoint(&ep).await;
     }
@@ -416,6 +416,36 @@ impl Live {
         self.token_for(branch, kind, role, None)
     }
 
+    /// A secret key's request on main bound to the role OID `oid`.
+    async fn query_bound(&self, role: &str, oid: i64, body: Value) -> Answer {
+        let key_id = Uuid::new_v4();
+        let identity = Identity {
+            sub: key_id.to_string(),
+            org_id: String::new(),
+            auth: AuthMethod::DataKey,
+            request_id: format!("live-{key_id}"),
+            data: Some(DataIdentity {
+                branch_id: self.main_id().as_uuid(),
+                key_id,
+                kind: DataKeyKind::Secret,
+                role: role.into(),
+                claims: json!({}),
+                databases: None,
+                project_id: None,
+                role_oid: Some(oid),
+            }),
+        };
+        let resp = self
+            .http
+            .post(format!("http://{}/data/v1/query", self.rest))
+            .header(IDENTITY_HEADER, self.signer.sign("rest", &identity).unwrap())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        Self::answer(resp).await
+    }
+
     /// A token whose key may reach only `databases` (`None`: every served database).
     fn token_for(
         &self,
@@ -438,6 +468,7 @@ impl Live {
                 claims: json!({}),
                 databases,
                 project_id: None,
+                role_oid: None,
             }),
         };
         self.signer.sign("rest", &identity).unwrap()
@@ -788,10 +819,10 @@ async fn secret_key_custom_role() {
              GRANT SELECT ON r TO reporter;",
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             l.worker.check_data_role(l.main_id(), "reporter").await,
-            RoleCheck::Ok
-        );
+            RoleCheck::Ok(_)
+        ));
         let reporter = |body| l.query_on(l.main_id(), DataKeyKind::Secret, "reporter", body);
         assert_eq!(
             reporter(json!({"v":1,"op":"select","from":"r"})).await.ok(),
@@ -807,6 +838,48 @@ async fn secret_key_custom_role() {
         let schema = l.role_schema("reporter").await;
         let tables = &schema.ok()["schemas"]["public"]["tables"];
         assert_eq!(keys(tables), ["r"]);
+    })
+    .await;
+}
+
+/// A secret key is bound to its role's OID: the role dropped and created again under the same
+/// name (in SQL as cloud_admin, which the DDL receiver never sees: a late commit it couldn't
+/// refuse) gets no request of the old key, on the sequential path or the pipeline, and the
+/// key bound to the new OID works.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn secret_key_is_bound_to_its_roles_oid() {
+    live("roleoid", |l| async move {
+        l.owner(
+            "CREATE TABLE r (v text);
+             INSERT INTO r VALUES ('seen');
+             CREATE ROLE bound_reader NOLOGIN;
+             GRANT SELECT ON r TO bound_reader;",
+        )
+        .await;
+        let RoleCheck::Ok(old) = l.worker.check_data_role(l.main_id(), "bound_reader").await else {
+            panic!("the role check passes");
+        };
+        let select = json!({"v":1,"op":"select","from":"r"});
+        for _ in 0..2 {
+            assert_eq!(l.query_bound("bound_reader", old, select.clone()).await.ok(), &json!([{"v":"seen"}]));
+        }
+        l.sql_on(
+            l.main_id(),
+            "REVOKE ALL ON r FROM bound_reader; DROP ROLE bound_reader; CREATE ROLE bound_reader NOLOGIN; \
+             GRANT SELECT ON r TO bound_reader;",
+        )
+        .await;
+        let RoleCheck::Ok(new) = l.worker.check_data_role(l.main_id(), "bound_reader").await else {
+            panic!("the recreated role passes the check");
+        };
+        assert_ne!(old, new, "a recreated role has another OID");
+        for _ in 0..2 {
+            l.query_bound("bound_reader", old, select.clone())
+                .await
+                .error(503, "unavailable");
+        }
+        assert_eq!(l.query_bound("bound_reader", new, select.clone()).await.ok(), &json!([{"v":"seen"}]));
     })
     .await;
 }
@@ -835,10 +908,10 @@ async fn secret_key_of_an_owner_level_role_is_refused() {
         // The owner can't grant neon_superuser; cloud_admin can.
         l.sql_on(l.main_id(), "GRANT neon_superuser TO by_group;")
             .await;
-        assert_eq!(
+        assert!(matches!(
             l.worker.check_data_role(l.main_id(), "plain_reader").await,
-            RoleCheck::Ok
-        );
+            RoleCheck::Ok(_)
+        ));
         let select = json!({"v":1,"op":"select","from":"r"});
         assert_eq!(
             l.query_on(l.main_id(), DataKeyKind::Secret, "plain_reader", select.clone())
@@ -1931,6 +2004,7 @@ async fn stored_key(l: &Live, name: &str, databases: Vec<String>) -> [u8; 32] {
             sha256,
             sealed: None,
             databases: Some(databases),
+            role_oid: None,
         })
         .await
         .expect("insert the key");

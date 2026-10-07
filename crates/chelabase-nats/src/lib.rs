@@ -220,6 +220,16 @@ pub struct GrantDataRoleRequest {
 /// Core publish (no reply awaited): bootstrap the data API in a database the orchestrator just
 /// marked `enabling`. The worker records `on` or `error`; reconcile retries rows left `enabling`.
 pub const SUBJECT_DATA_API_ENABLE: &str = "chelabase.rpc.data_api.enable";
+/// Core publish (no reply awaited): roles of the branch were touched in SQL (attributes or
+/// grants the DDL receiver can't mirror). The worker waits a few seconds, then runs the
+/// branch's resync once however many arrived.
+pub const SUBJECT_RESYNC_BRANCH: &str = "chelabase.resync.branch";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResyncBranchRequest {
+    pub branch_id: BranchId,
+}
+
 /// Core request/reply: stop serving a database (`remove` also drops the `chelabase` machinery).
 /// Answers a [`CheckDataRoleReply`].
 pub const SUBJECT_DATA_API_DISABLE: &str = "chelabase.rpc.data_api.disable";
@@ -291,23 +301,32 @@ pub struct CheckDataRoleReply {
     pub error: Option<String>,
     #[serde(default)]
     pub kind: Option<String>,
+    /// The checked role's `pg_roles.oid` (a secret key is bound to it); absent in other
+    /// replies and from workers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_oid: Option<i64>,
 }
 
 impl CheckDataRoleReply {
     pub fn ok() -> Self {
-        Self { ok: true, error: None, kind: None }
+        Self { ok: true, error: None, kind: None, role_oid: None }
+    }
+
+    /// A role check that passed: the role's OID.
+    pub fn ok_with_oid(oid: i64) -> Self {
+        Self { role_oid: Some(oid), ..Self::ok() }
     }
 
     pub fn refused(message: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(message.into()), kind: Some("refused".into()) }
+        Self { ok: false, error: Some(message.into()), kind: Some("refused".into()), role_oid: None }
     }
 
     pub fn not_ready() -> Self {
-        Self { ok: false, error: Some("not ready".into()), kind: Some("not_ready".into()) }
+        Self { ok: false, error: Some("not ready".into()), kind: Some("not_ready".into()), role_oid: None }
     }
 
     pub fn failed(message: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(message.into()), kind: Some("failed".into()) }
+        Self { ok: false, error: Some(message.into()), kind: Some("failed".into()), role_oid: None }
     }
 }
 
@@ -782,6 +801,15 @@ mod tests {
     }
 
     #[test]
+    fn resync_branch_wire_shape() {
+        assert_eq!(SUBJECT_RESYNC_BRANCH, "chelabase.resync.branch");
+        let branch_id = BranchId::new();
+        let body = serde_json::to_vec(&ResyncBranchRequest { branch_id }).unwrap();
+        let back: ResyncBranchRequest = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back.branch_id, branch_id);
+    }
+
+    #[test]
     fn data_api_database_wire_shapes() {
         assert_eq!(SUBJECT_DATA_API_ENABLE, "chelabase.rpc.data_api.enable");
         assert_eq!(SUBJECT_DATA_API_DISABLE, "chelabase.rpc.data_api.disable");
@@ -832,6 +860,15 @@ mod tests {
         // A reply without `kind` (the two-field shape) still parses.
         let old: CheckDataRoleReply = serde_json::from_str(r#"{"ok":false,"error":"x"}"#).unwrap();
         assert_eq!(old.kind, None);
+        assert_eq!(old.role_oid, None);
+        // A secret key's check answers the role's OID; replies without one omit it.
+        let with_oid = serde_json::to_value(CheckDataRoleReply::ok_with_oid(16390)).unwrap();
+        assert_eq!(
+            with_oid,
+            serde_json::json!({ "ok": true, "error": null, "kind": null, "role_oid": 16390 })
+        );
+        let back: CheckDataRoleReply = serde_json::from_value(with_oid).unwrap();
+        assert_eq!(back.role_oid, Some(16390));
     }
 
     /// Opt-in, against the Compose NATS (`just deps-up`): a stream and consumer of their own,

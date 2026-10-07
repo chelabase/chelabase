@@ -30,6 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 type KeyRow = (DataKeyRecord, [u8; 32]);
+/// A key store, a key id and the role name it takes.
+type RenameOnCheck = (Arc<Mutex<Vec<KeyRow>>>, uuid::Uuid, String);
 
 #[derive(Clone, Default)]
 struct FakeMetadata {
@@ -47,6 +49,8 @@ struct FakeMetadata {
     overviews: Arc<Mutex<HashMap<TenantId, TenantOverview>>>,
     /// Calls to `main_branches_with_counts`: /v1/me makes exactly one per request.
     main_count_queries: Arc<AtomicUsize>,
+    /// While set, `create_secret_key` and `rotate_secret_key` fail with `EndpointLockTimeout` (a DDL transaction holds the endpoint).
+    endpoint_busy: Arc<Mutex<bool>>,
     /// Data API keys, live and revoked, with their hashes.
     keys: Arc<Mutex<Vec<KeyRow>>>,
     /// Roles by endpoint id, and login roles' sealed passwords by (endpoint id, name).
@@ -613,6 +617,43 @@ impl MetadataPort for FakeMetadata {
         insert_key(&mut keys, key)
     }
 
+    async fn create_secret_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        if *self.endpoint_busy.lock().unwrap() {
+            return Err(MetadataError::EndpointLockTimeout("ep-test".into()));
+        }
+        let mut keys = self.keys.lock().unwrap();
+        insert_key(&mut keys, key)
+    }
+
+    async fn rotate_secret_key(
+        &self,
+        branch: BranchId,
+        old: uuid::Uuid,
+        new: &NewDataKey,
+    ) -> Result<bool, MetadataError> {
+        if *self.endpoint_busy.lock().unwrap() {
+            return Err(MetadataError::EndpointLockTimeout("ep-test".into()));
+        }
+        // As the store: the old key's OID wins; a different checked OID is a recreated role.
+        let stored = self
+            .keys
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.id == old && k.branch_id == branch && k.revoked_at.is_none())
+            .map(|(k, _)| (k.role.clone(), k.role_oid));
+        let mut new = new.clone();
+        if let Some((role, stored)) = stored {
+            if let (Some(stored), Some(checked)) = (stored, new.role_oid)
+                && stored != checked
+            {
+                return Err(MetadataError::RoleRecreated(role));
+            }
+            new.role_oid = stored.or(new.role_oid);
+        }
+        self.rotate_data_key(branch, old, &new).await
+    }
+
     async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
         let mut list: Vec<_> = self
             .keys
@@ -1175,6 +1216,7 @@ fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataEr
             last_used_at: None,
             revoked_at: None,
             databases: key.databases.clone(),
+            role_oid: key.role_oid,
         },
         key.sha256,
     ));
@@ -1210,6 +1252,9 @@ struct FakeJobs {
     /// (branch, role) of each check-role request.
     role_checks: Arc<Mutex<Vec<(BranchId, String)>>>,
     role_check: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
+    /// On the next check-role request, the key `id` in this store takes role `name` (a rename
+    /// that lands while the worker looks).
+    rename_on_check: Arc<Mutex<Option<RenameOnCheck>>>,
     /// (branch, role, owner) of each grant-to-owner request.
     role_grants: Arc<Mutex<Vec<(BranchId, String, String)>>>,
     /// What the worker answers to a grant-to-owner request; `ok` when unset.
@@ -1284,6 +1329,13 @@ impl JobPort for FakeJobs {
         role: &str,
     ) -> Result<CheckDataRoleReply, ResetError> {
         self.role_checks.lock().unwrap().push((branch_id, role.to_string()));
+        if let Some((keys, id, name)) = self.rename_on_check.lock().unwrap().take() {
+            for (k, _) in keys.lock().unwrap().iter_mut() {
+                if k.id == id {
+                    k.role = name.clone();
+                }
+            }
+        }
         match self.role_check.lock().unwrap().clone() {
             Some(answer) => answer,
             None => Ok(CheckDataRoleReply::ok()),
@@ -3393,6 +3445,7 @@ impl Branching {
             sha256: generated.sha256,
             sealed: Some(seal_credential(&self.app.key, &id.to_string(), Purpose::DataKey, &generated.key)),
             databases: None,
+            role_oid: None,
         };
         insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
         (id, generated.key)
@@ -3411,6 +3464,7 @@ impl Branching {
             sha256: generated.sha256,
             sealed: None,
             databases: None,
+            role_oid: None,
         };
         insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
         (id, generated.key)
@@ -3518,6 +3572,155 @@ async fn create_validates_the_body() {
 }
 
 #[tokio::test]
+async fn secret_keys_store_the_role_oid_the_check_found() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16390)));
+    let created: Value = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" })))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let oid_of = |id: uuid::Uuid| {
+        t.metadata.keys.lock().unwrap().iter().find(|(k, _)| k.id == id).unwrap().0.role_oid
+    };
+    assert_eq!(oid_of(id), Some(16390));
+    let rotated: Value = t
+        .send(Method::POST, &format!("{}/{id}/rotate", t.keys(t.main())), None)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let new_id: uuid::Uuid = rotated["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(oid_of(new_id), Some(16390), "the rotated key keeps the identity");
+}
+
+// The role was dropped and created again under the same name (a new OID): the old key is
+// dead, and rotating it must not hand the new role a key.
+#[tokio::test]
+async fn rotate_refuses_a_key_whose_role_was_recreated() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16390)));
+    let created: Value = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" })))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16391)));
+    let resp = t.send(Method::POST, &format!("{}/{id}/rotate", t.keys(t.main())), None).await;
+    let body = error_of(resp, 422).await;
+    assert_eq!(code_of(&body), "role_refused");
+    assert_eq!(
+        message_of(&body),
+        "the role reporting was dropped and created again since this key was made; create a new key for it"
+    );
+    let list = t.list_keys(t.main()).await;
+    assert!(list.iter().any(|k| k["id"] == json!(id)), "the old key is still listed");
+    assert_eq!(list.len(), 2, "nothing inserted");
+}
+
+#[tokio::test]
+async fn secret_key_writes_while_the_endpoint_is_busy_are_503_with_retry_after() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    let (old_id, _) = t.seed_secret_key(t.main(), "ci", "reporting");
+    *t.metadata.endpoint_busy.lock().unwrap() = true;
+    let create = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "x", "role": "reporting" })))
+        .await;
+    assert_eq!(create.status(), 503);
+    assert_eq!(create.headers()["retry-after"], "1");
+    assert_eq!(code_of(&create.json::<Value>().await.unwrap()), "unavailable");
+    let rotate = t.send(Method::POST, &format!("{}/{old_id}/rotate", t.keys(t.main())), None).await;
+    assert_eq!(rotate.status(), 503);
+    assert_eq!(rotate.headers()["retry-after"], "1");
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(list.len(), 2, "nothing changed");
+    assert!(list.iter().any(|k| k["id"] == json!(old_id)));
+}
+
+// C1: a NOLOGIN role without a password has no `neon_roles` row; the worker's check on the
+// compute is what decides it exists, for create and for rotate.
+#[tokio::test]
+async fn secret_key_create_and_rotate_for_a_rowless_nologin_role() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    let created = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reader" })))
+        .await;
+    assert_eq!(created.status(), 201);
+    let created: Value = created.json().await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let rotated = t.send(Method::POST, &format!("{}/{id}/rotate", t.keys(t.main())), None).await;
+    assert_eq!(rotated.status(), 201);
+    let rotated: Value = rotated.json().await.unwrap();
+    assert_eq!(rotated["role"], "reader");
+    assert_eq!(
+        *t.jobs.role_checks.lock().unwrap(),
+        vec![(t.main(), "reader".to_string()), (t.main(), "reader".to_string())],
+        "rotation re-checks the role on the compute"
+    );
+}
+
+#[tokio::test]
+async fn rotate_maps_check_role_refusal() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    let (old_id, _) = t.seed_secret_key(t.main(), "ci", "reporting");
+    let path = format!("{}/{old_id}/rotate", t.keys(t.main()));
+    #[allow(clippy::type_complexity)]
+    let cases: [(Result<CheckDataRoleReply, ResetError>, u16, &str); 4] = [
+        (Ok(CheckDataRoleReply::refused("role reporting doesn't exist")), 422, "role_refused"),
+        (Ok(CheckDataRoleReply::not_ready()), 409, "branch_not_ready"),
+        (Err(ResetError::Timeout), 504, "timeout"),
+        (Err(ResetError::Transport("no worker listening".into())), 503, "worker_unavailable"),
+    ];
+    for (answer, status, code) in cases {
+        *t.jobs.role_check.lock().unwrap() = Some(answer);
+        let body = error_of(t.send(Method::POST, &path, None).await, status).await;
+        assert_eq!(code_of(&body), code);
+    }
+    let list = t.list_keys(t.main()).await;
+    assert!(list.iter().any(|k| k["id"] == json!(old_id)), "the old key is still live");
+    assert_eq!(list.len(), 2, "nothing inserted");
+}
+
+// The public key's role is `anon`, which no DDL can drop: its rotation asks no worker.
+#[tokio::test]
+async fn rotate_public_key_skips_the_role_check() {
+    let t = branching().await;
+    let (public_id, _) = t.seed_public_key(t.main());
+    let resp = t.send(Method::POST, &format!("{}/{public_id}/rotate", t.keys(t.main())), None).await;
+    assert_eq!(resp.status(), 201);
+    assert!(t.jobs.role_checks.lock().unwrap().is_empty());
+}
+
+// A rotation whose key was renamed after it was read: the worker refuses the old name, the
+// key is read again and its new name checked.
+#[tokio::test]
+async fn rotate_follows_a_rename_seen_by_the_check() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    let (old_id, _) = t.seed_secret_key(t.main(), "ci", "reporting");
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::refused("gone")));
+    *t.jobs.rename_on_check.lock().unwrap() =
+        Some((t.metadata.keys.clone(), old_id, "reporting2".into()));
+    let resp = t.send(Method::POST, &format!("{}/{old_id}/rotate", t.keys(t.main())), None).await;
+    // The fake refuses every check; what matters is that the new name was asked.
+    let body = error_of(resp, 422).await;
+    assert_eq!(code_of(&body), "role_refused");
+    assert_eq!(
+        *t.jobs.role_checks.lock().unwrap(),
+        vec![(t.main(), "reporting".to_string()), (t.main(), "reporting2".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn create_maps_check_role_refusal_to_422() {
     let t = branching().await;
     let body = || Some(json!({ "name": "ci", "role": "boss" }));
@@ -3529,7 +3732,7 @@ async fn create_maps_check_role_refusal_to_422() {
         (Err(ResetError::Timeout), 504, "timeout", None),
         (Err(ResetError::Transport("no worker listening".into())), 503, "worker_unavailable", None),
         // A reply that says no without saying why is our failure.
-        (Ok(CheckDataRoleReply { ok: false, error: None, kind: None }), 500, "internal", None),
+        (Ok(CheckDataRoleReply { ok: false, error: None, kind: None, role_oid: None }), 500, "internal", None),
     ];
     for (answer, status, code, message) in cases {
         *t.jobs.role_check.lock().unwrap() = Some(answer);
@@ -4163,6 +4366,7 @@ async fn list_roles_shapes_and_blocked_keys() {
                 sealed: None,
                 sha256: [id.as_bytes()[0]; 32],
                 databases: None,
+                role_oid: None,
             },
         )
         .unwrap();

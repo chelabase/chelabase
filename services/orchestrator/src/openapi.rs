@@ -160,6 +160,9 @@ impl MetadataPort for Doc {
     async fn insert_data_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
         match *self {}
     }
+    async fn create_secret_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        match *self {}
+    }
     async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
         match *self {}
     }
@@ -167,6 +170,14 @@ impl MetadataPort for Doc {
         match *self {}
     }
     async fn rotate_data_key(
+        &self,
+        branch: BranchId,
+        old: Uuid,
+        new: &NewDataKey,
+    ) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn rotate_secret_key(
         &self,
         branch: BranchId,
         old: Uuid,

@@ -227,6 +227,13 @@ pub trait MetadataPort: Send + Sync + 'static {
         key: &NewDataKey,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
 
+    /// Stores a secret key bound to the role OID the worker's check found, under the
+    /// endpoint's lock (a DDL DROP or rename either sees the key or ran first).
+    fn create_secret_key(
+        &self,
+        key: &NewDataKey,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
     /// The branch's live keys, newest first.
     fn list_data_keys(
         &self,
@@ -243,6 +250,17 @@ pub trait MetadataPort: Send + Sync + 'static {
     /// Revokes `old` and stores `new` in one step; false when `old` isn't a live key of the
     /// branch.
     fn rotate_data_key(
+        &self,
+        branch: BranchId,
+        old: Uuid,
+        new: &NewDataKey,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// [`Self::rotate_data_key`] for a secret key, under the endpoint's lock like
+    /// [`Self::create_secret_key`]; the new key takes the old row's current role and OID.
+    /// `MetadataError::RoleRecreated` when `new.role_oid` (the check's) differs from the old
+    /// key's.
+    fn rotate_secret_key(
         &self,
         branch: BranchId,
         old: Uuid,
@@ -565,6 +583,10 @@ impl MetadataPort for MetadataClient {
         MetadataClient::insert_data_key(self, key).await
     }
 
+    async fn create_secret_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        MetadataClient::create_secret_key(self, key).await
+    }
+
     async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
         MetadataClient::list_data_keys(self, branch).await
     }
@@ -580,6 +602,15 @@ impl MetadataPort for MetadataClient {
         new: &NewDataKey,
     ) -> Result<bool, MetadataError> {
         MetadataClient::rotate_data_key(self, branch, old, new).await
+    }
+
+    async fn rotate_secret_key(
+        &self,
+        branch: BranchId,
+        old: Uuid,
+        new: &NewDataKey,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::rotate_secret_key(self, branch, old, new).await
     }
 
     async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {

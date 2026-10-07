@@ -52,8 +52,16 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// `$1` role, `$2` claims, `$3` statement timeout in ms, also the transaction timeout
 /// (Postgres 17: set inside a transaction, it starts counting then and ends with it), all
-/// `text`. `set_config` returns its value; the last column is the schema version.
-pub const PREAMBLE_SQL: &str = "SELECT set_config('role', $1, true), \
+/// `text`; `$4` (`int8`) the role's OID a secret key is bound to, or `NULL`. `set_config`
+/// returns its value; the last column is the schema version.
+///
+/// The role is set only while the role named `$1` has OID `$4`: a dropped role, or another
+/// role created under the name since the key was made, sets `''` instead, which no role can
+/// be named (Postgres refuses zero-length names), so the preamble fails as for a missing role
+/// and nothing runs as anyone. The check and the `SET ROLE` are one expression: no window.
+pub const PREAMBLE_SQL: &str = "SELECT set_config('role', CASE WHEN $4::int8 IS NULL OR \
+     (SELECT r.oid::int8 FROM pg_catalog.pg_roles r WHERE r.rolname = $1) = $4::int8 \
+     THEN $1 ELSE '' END, true), \
      set_config('request.jwt.claims', $2, true), set_config('statement_timeout', $3, true), \
      set_config('transaction_timeout', $3, true), \
      (SELECT version::text FROM chelabase.schema_version)";
@@ -65,12 +73,14 @@ pub const OWNER_PREAMBLE_SQL: &str = "SELECT set_config('statement_timeout', $1,
      set_config('transaction_timeout', $1, true), current_user::text, \
      (SELECT version::text FROM chelabase.schema_version)";
 
-/// [`PREAMBLE_SQL`] in the pipeline: `$4` (`uuid`) the version the request was planned
+/// [`PREAMBLE_SQL`] in the pipeline: `$5` (`uuid`) the version the request was planned
 /// against, asserted (`CB001` when the database's differs) rather than read.
-pub const GUARDED_PREAMBLE_SQL: &str = "SELECT set_config('role', $1, true), \
+pub const GUARDED_PREAMBLE_SQL: &str = "SELECT set_config('role', CASE WHEN $4::int8 IS NULL OR \
+     (SELECT r.oid::int8 FROM pg_catalog.pg_roles r WHERE r.rolname = $1) = $4::int8 \
+     THEN $1 ELSE '' END, true), \
      set_config('request.jwt.claims', $2, true), set_config('statement_timeout', $3, true), \
      set_config('transaction_timeout', $3, true), \
-     chelabase.assert_schema_version($4)";
+     chelabase.assert_schema_version($5)";
 
 /// [`OWNER_PREAMBLE_SQL`] in the pipeline: `$2` (`uuid`) the version asserted.
 pub const OWNER_GUARDED_PREAMBLE_SQL: &str = "SELECT set_config('statement_timeout', $1, true), \
@@ -84,10 +94,13 @@ pub const NO_GUARD_TTL: Duration = Duration::from_secs(60);
 /// Who a request runs as.
 #[derive(Debug, Clone, Copy)]
 pub enum RunAs<'a> {
-    /// `SET ROLE role` (the connection's user must be a member) with these JWT claims.
+    /// `SET ROLE role` (the connection's user must be a member) with these JWT claims;
+    /// `oid`: the role's identity a secret key is bound to (the preamble refuses another
+    /// role under the name), `None` to check the name only.
     Role {
         role: &'a str,
         claims: &'a serde_json::Value,
+        oid: Option<i64>,
     },
     /// The connection's own user, the database's owner (P5): `user` is the connection's
     /// login user, the role its view and plans are cached under. The preamble checks the
@@ -418,7 +431,7 @@ pub async fn preamble(
 ) -> Result<Preamble, QueryFailure> {
     let timeout = statement_timeout_ms.to_string();
     let read = match run_as {
-        RunAs::Role { role, claims } => {
+        RunAs::Role { role, claims, oid } => {
             let claims = claims.to_string();
             client
                 .query_typed_one(
@@ -427,6 +440,7 @@ pub async fn preamble(
                         (&role, Type::TEXT),
                         (&claims, Type::TEXT),
                         (&timeout, Type::TEXT),
+                        (&oid, Type::INT8),
                     ],
                 )
                 .await
@@ -670,13 +684,14 @@ pub(crate) async fn pipelined<C: QueryClient + ?Sized>(
     }
     let timeout = settings.statement_timeout_ms.to_string();
     let preamble = match run_as {
-        RunAs::Role { role, claims } => Call {
+        RunAs::Role { role, claims, oid } => Call {
             sql: GUARDED_PREAMBLE_SQL,
-            types: vec![Type::TEXT, Type::TEXT, Type::TEXT, Type::UUID],
+            types: vec![Type::TEXT, Type::TEXT, Type::TEXT, Type::INT8, Type::UUID],
             values: vec![
                 Box::new(role),
                 Box::new(claims.to_string()),
                 Box::new(timeout),
+                Box::new(oid),
                 Box::new(expected),
             ],
         },
@@ -902,6 +917,21 @@ mod tests {
         );
     }
 
+    /// A secret key runs as its role only while the role of that name still has the key's
+    /// OID (`$4`): a dropped role, or another one created under the name, makes the
+    /// `SET ROLE` target `''`, which no role can be named, so the preamble fails as for a
+    /// missing role. No OID (`NULL`: the public key, a user token, a key not backfilled yet)
+    /// checks the name only. One expression, so there is no window between check and use.
+    #[test]
+    fn preamble_binds_the_role_to_its_oid() {
+        let guard = "set_config('role', CASE WHEN $4::int8 IS NULL OR \
+             (SELECT r.oid::int8 FROM pg_catalog.pg_roles r WHERE r.rolname = $1) = $4::int8 \
+             THEN $1 ELSE '' END, true)";
+        assert!(PREAMBLE_SQL.starts_with(&format!("SELECT {guard}, ")), "{PREAMBLE_SQL}");
+        assert!(GUARDED_PREAMBLE_SQL.starts_with(&format!("SELECT {guard}, ")), "{GUARDED_PREAMBLE_SQL}");
+        assert!(!PREAMBLE_SQL.contains("set_config('role', $1"), "{PREAMBLE_SQL}");
+    }
+
     /// The owner runs as itself: no `SET ROLE`, no claims, but the same timeouts and the
     /// same version read (P5).
     #[test]
@@ -986,7 +1016,7 @@ mod tests {
             GUARDED_PREAMBLE_SQL,
             PREAMBLE_SQL.replace(
                 "(SELECT version::text FROM chelabase.schema_version)",
-                "chelabase.assert_schema_version($4)"
+                "chelabase.assert_schema_version($5)"
             )
         );
         assert_eq!(
@@ -1001,7 +1031,8 @@ mod tests {
         assert_eq!(
             RunAs::Role {
                 role: "anon",
-                claims: &claims
+                claims: &claims,
+                oid: None,
             }
             .role(),
             "anon"
@@ -1021,6 +1052,7 @@ mod tests {
         let run_as = RunAs::Role {
             role: "anon",
             claims: &claims,
+            oid: None,
         };
         let settings = RunSettings {
             max_rows: 1000,

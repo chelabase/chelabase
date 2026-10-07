@@ -31,7 +31,7 @@ pub use saved_queries::{
 };
 pub use ddl::DdlTx;
 pub use data_api::{
-    BranchConnectionRow, DataApiSettings, DataKeyLookup, DataKeyRecord, NewDataKey,
+    BranchConnectionRow, DataApiSettings, DataKeyLookup, DataKeyRecord, KeyRoleFix, NewDataKey,
     ServedDatabase,
 };
 pub use neon::{
@@ -166,6 +166,10 @@ pub enum MetadataError {
     /// [`MetadataClient::lock_endpoint`] waited [`ENDPOINT_LOCK_TIMEOUT`] in vain.
     #[error("another password change for {0} is still being applied")]
     EndpointLockTimeout(String),
+    /// A secret key's role was dropped and created again under its name (another OID): the
+    /// key can't be rotated onto the new role.
+    #[error("the role {0} was dropped and created again")]
+    RoleRecreated(String),
 }
 
 /// How [`MetadataClient::begin_delete`] ended.

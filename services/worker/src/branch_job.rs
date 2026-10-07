@@ -43,6 +43,13 @@ impl StepFailure {
 
     /// A storage-controller failure under `prefix`: transient unless the controller refused
     /// the request (4xx).
+    ///
+    /// A branch create whose start LSN the pageserver hasn't ingested yet doesn't come back
+    /// as a 406: the pageserver waits up to `WaitLsnTimeout::Default` (300 s), longer than the
+    /// worker's `CREATE_TIMELINE_TIMEOUT` (120 s), so a catch-up timeout surfaces here as a
+    /// client-side timeout (`Other`, transient: tear down and retry). A 406 comes only from
+    /// a real refusal (start LSN below the ancestor's, below the GC cutoff, an archived
+    /// ancestor), which is permanent.
     pub fn storage(prefix: &str, e: &StorconError) -> Self {
         Self {
             message: format!("{prefix}: {e:#}"),

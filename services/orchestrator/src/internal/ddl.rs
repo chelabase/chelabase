@@ -14,6 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chelabase_metadata::{MetadataError, RoleCopy, RoleOrigin};
+use chelabase_nats::{ResyncBranchRequest, SUBJECT_RESYNC_BRANCH};
 use chelabase_neon::ComputeLocator;
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_secrets::{SecretKey, open_role_password, seal_role_password};
@@ -52,6 +53,22 @@ impl CachePort for ProxyCache {
     }
 }
 
+/// Asks the worker to resync a branch's roles soon (`chelabase.resync.branch`). NATS in
+/// production, a fake in tests.
+pub trait ResyncPort: Send + Sync + 'static {
+    fn resync_branch(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>>;
+}
+
+impl ResyncPort for async_nats::Client {
+    fn resync_branch(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            let body = serde_json::to_vec(&ResyncBranchRequest { branch_id: branch })?;
+            self.publish(SUBJECT_RESYNC_BRANCH, body.into()).await?;
+            Ok(())
+        })
+    }
+}
+
 /// The receiver's transaction: [`chelabase_metadata::DdlTx`]'s methods, so tests can use a
 /// fake. Dropping it without [`DdlPort::commit`] rolls everything back.
 pub trait DdlPort: Send + Sized + 'static {
@@ -72,6 +89,11 @@ pub trait DdlPort: Send + Sized + 'static {
         name: &str,
         verifier: &str,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    fn set_login(
+        &mut self,
+        name: &str,
+        login: bool,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn set_owner_verifier(
         &mut self,
         verifier: &str,
@@ -136,6 +158,9 @@ impl DdlPort for chelabase_metadata::DdlTx {
     async fn upsert_sql_copy(&mut self, name: &str, verifier: &str) -> Result<(), MetadataError> {
         chelabase_metadata::DdlTx::upsert_sql_copy(self, name, verifier).await
     }
+    async fn set_login(&mut self, name: &str, login: bool) -> Result<bool, MetadataError> {
+        chelabase_metadata::DdlTx::set_login(self, name, login).await
+    }
     async fn set_owner_verifier(&mut self, verifier: &str) -> Result<(), MetadataError> {
         chelabase_metadata::DdlTx::set_owner_verifier(self, verifier).await
     }
@@ -195,6 +220,21 @@ struct RoleOp {
     #[serde(default, deserialize_with = "nullable")]
     password: Option<Option<String>>,
     encrypted_password: Option<String>,
+    /// `LOGIN`/`NOLOGIN` as written in the statement; absent when it didn't say.
+    #[serde(default)]
+    login: Option<bool>,
+    /// `VALID UNTIL` as written. Accepted and not mirrored (Chelabase keeps no expiry, S1),
+    /// but it makes the entry an attribute change.
+    #[serde(default)]
+    valid_until: Option<String>,
+    /// The role was dropped and created again in the same transaction (the fork sends the key
+    /// only when true, with `touched`). Old payloads lack it.
+    #[serde(default)]
+    recreated: bool,
+    /// The statement changed something the receiver can't mirror (an attribute, a grant): the
+    /// branch gets a resync shortly.
+    #[serde(default)]
+    touched: bool,
 }
 
 /// Tells an absent key (`None`, through `default`) from an explicit null (`Some(None)`).
@@ -242,6 +282,17 @@ enum Step<'a> {
         name: &'a str,
         password: Option<Password<'a>>,
     },
+    /// The role was dropped and created again in one transaction (`recreated`): the drop's
+    /// refusals apply before the set that follows, and the dropped role's row goes, so the new
+    /// role starts from a fresh one (origin `sql`, plain, no API fields).
+    CheckRecreated {
+        name: &'a str,
+    },
+    /// A forwarded `LOGIN`/`NOLOGIN` for a role with a copy.
+    SetLogin {
+        name: &'a str,
+        login: bool,
+    },
     DelRole {
         name: &'a str,
     },
@@ -261,9 +312,12 @@ enum Step<'a> {
 /// Neon's order: role renames, role sets, role deletes, then databases the same way.
 ///
 /// An entry with `old_name` is a rename; it is also a set only when it carries a password
-/// (a plain rename has none and must not remove the copy), and a delete when its op is `del`
-/// (renamed, then dropped, in one transaction). A database `set` without an owner (a rename
-/// of a database created elsewhere) has nothing more to record.
+/// (a plain rename has none and must not remove the copy). Since round 2's OID tracking the
+/// fork sends a role renamed, then dropped, in one transaction as a `del` under its name from
+/// before the transaction (no `old_name`); a `del` with `old_name` from older computes is
+/// still accepted. The fork relies on this order (renames, then sets with `CheckRecreated`
+/// before `SetRole`, then deletes) and on keys moving with every rename. A database `set`
+/// without an owner (a rename of a database created elsewhere) has nothing more to record.
 fn steps(delta: &Delta) -> Vec<Step<'_>> {
     let mut out = Vec::new();
     for r in &delta.roles {
@@ -283,10 +337,27 @@ fn steps(delta: &Delta) -> Vec<Step<'_>> {
         // An explicit null next to `old_name` removes the copy (or is refused for the owner);
         // without `old_name` it is the same as a missing password.
         let explicit_null = matches!(r.password, Some(None));
-        if r.old_name.is_none() || password.is_some() || explicit_null {
+        // An entry with no password key that carries a login or a touch is an attribute
+        // change (`ALTER ROLE … NOLOGIN`, `GRANT`), not a group role or a password removal.
+        let attribute_only = r.password.is_none()
+            && r.encrypted_password.is_none()
+            && (r.login.is_some() || r.valid_until.is_some() || r.touched);
+        // A `recreated` entry that also carries `old_name` checks the new name's keys. The
+        // rename step before it has moved the dropped role's keys (live and revoked, with or
+        // without a `neon_roles` row) to that name, so they are found there.
+        if r.recreated {
+            out.push(Step::CheckRecreated { name: &r.name });
+        }
+        if !attribute_only && (r.old_name.is_none() || password.is_some() || explicit_null) {
             out.push(Step::SetRole {
                 name: &r.name,
                 password,
+            });
+        }
+        if let Some(login) = r.login {
+            out.push(Step::SetLogin {
+                name: &r.name,
+                login,
             });
         }
     }
@@ -316,6 +387,12 @@ fn steps(delta: &Delta) -> Vec<Step<'_>> {
     out
 }
 
+/// Some role of the delta was touched, or dropped (a dropped group changes its members'
+/// derived levels): the branch is resynced soon.
+fn touched(delta: &Delta) -> bool {
+    delta.roles.iter().any(|r| r.touched || r.op == Op::Del)
+}
+
 /// What the transaction knows that a step's decision needs.
 #[derive(Debug, Default)]
 struct Facts<'a> {
@@ -323,8 +400,6 @@ struct Facts<'a> {
     main_database: Option<&'a str>,
     /// The row the step names (the old name for a rename).
     row: Option<RowFacts>,
-    /// Copies the role cap counts (R5).
-    copy_count: u32,
     /// Names of the live secret data keys using the role.
     live_keys: Vec<String>,
     /// The database the step names has a row.
@@ -356,6 +431,11 @@ enum Action<'a> {
     Nothing,
     SetOwnerVerifier(&'a str),
     UpsertCopy(&'a str),
+    /// The copy's `login` flag (and `forwarded_at`).
+    SetLogin {
+        name: &'a str,
+        login: bool,
+    },
     RemoveCopy(&'a str),
     /// `reseal`: the row's sealed password (an `api` row's, or an `sql` row's made revealable
     /// by an API reset) is opened under the old name and sealed under the new one.
@@ -421,11 +501,7 @@ fn decide<'a>(
             reserved(name)?;
             check_forwarded_password(pw.plain, pw.encrypted, rules)
                 .map_err(|r| r.message().to_string())?;
-            // An MD5 row (no verifier) isn't counted yet; giving it one adds a copy.
-            let new_copy = !facts.row.is_some_and(|r| r.has_verifier);
-            if new_copy && facts.copy_count >= rules.role_cap {
-                return Err(text::role_cap(rules.role_cap));
-            }
+            // The role cap isn't checked per step: `apply` checks it once on the final count.
             Ok(Action::UpsertCopy(pw.encrypted))
         }
         Step::SetRole {
@@ -440,6 +516,25 @@ fn decide<'a>(
                 Some(_) => Action::RemoveCopy(name),
                 None => Action::Nothing,
             })
+        }
+        // The owner always logs in, a reserved name has no copy, and a role with no copy
+        // (no password, so no verifier) has nothing to flag: none of these is a refusal.
+        Step::SetLogin { name, login } => Ok(
+            if name == owner || is_reserved_for(name, owner) || facts.row.is_none() {
+                Action::Nothing
+            } else {
+                Action::SetLogin { name, login }
+            },
+        ),
+        Step::CheckRecreated { name } => {
+            if name == owner {
+                return Err(text::owner(owner));
+            }
+            reserved(name)?;
+            if !facts.live_keys.is_empty() {
+                return Err(text::in_use(name, &facts.live_keys));
+            }
+            Ok(Action::RemoveCopy(name))
         }
         Step::DelRole { name } => {
             if name == owner {
@@ -602,31 +697,66 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
     if delta.roles.is_empty() && delta.dbs.is_empty() {
         return StatusCode::OK.into_response();
     }
+    let plan = steps(&delta);
+    // A delta that only touches roles (`ALTER ROLE … CREATEDB`, `GRANT`) changes no row here:
+    // no transaction and no endpoint lock, just the resync request.
+    if plan.is_empty() && delta.dbs.is_empty() {
+        if touched(&delta) {
+            match state.metadata.endpoint_branch(&id).await {
+                Ok(Some(branch)) => request_resync(state.resync.clone(), branch),
+                // An unknown or deleted endpoint with a step-less delta answers 200 on purpose:
+                // there is nothing to apply and no branch to resync.
+                Ok(None) => {}
+                Err(e) => warn!(endpoint = %id, "ddl: resync not requested: {e:#}"),
+            }
+        }
+        return StatusCode::OK.into_response();
+    }
     let tx = match state.metadata.begin_ddl(&id).await {
         Ok(Some(tx)) => tx,
         Ok(None) => return answer(StatusCode::NOT_FOUND, text::UNKNOWN_ENDPOINT),
         Err(e) => return metadata_failure(&id, &e),
     };
-    let Applied { roles: changed, served_databases_changed } =
-        match apply(tx, &steps(&delta), &state.roles, &state.secrets, &id).await {
-            Ok(applied) => applied,
-            Err(Failure::Refused(message)) => return answer(StatusCode::CONFLICT, message),
-            Err(Failure::Metadata(e)) => return metadata_failure(&id, &e),
-        };
+    let Applied {
+        roles: changed,
+        branch,
+        served_databases_changed,
+    } = match apply(tx, &plan, &state.roles, &state.secrets, &id).await {
+        Ok(applied) => applied,
+        Err(Failure::Refused(message)) => return answer(StatusCode::CONFLICT, message),
+        Err(Failure::Metadata(e)) => return metadata_failure(&id, &e),
+    };
     // A dropped or renamed database may be one rest serves: it must forget it. Off the response
     // path (compute_ctl waits for us), and its failure is only logged.
     if let Some(branch) = served_databases_changed {
         let state = state.clone();
         tokio::spawn(async move { state.rest.invalidate(branch).await });
     }
+    // Attributes and grants aren't mirrored here: the worker reads them from the catalog
+    // soon. After the commit, once per request; its failure only delays that to the periodic
+    // resync.
+    if let (true, Some(branch)) = (touched(&delta), branch) {
+        request_resync(state.resync.clone(), branch);
+    }
     publish(state.cache.clone(), id, changed);
     StatusCode::OK.into_response()
+}
+
+/// Asks the worker for a resync of `branch`, off the response path.
+fn request_resync(resync: Arc<dyn ResyncPort>, branch: BranchId) {
+    tokio::spawn(async move {
+        if let Err(e) = resync.resync_branch(branch).await {
+            warn!(%branch, "ddl: resync not requested: {e:#}");
+        }
+    });
 }
 
 /// What a committed delta changed.
 struct Applied {
     /// The role names whose secrets changed.
     roles: Vec<String>,
+    /// The endpoint's branch, if any.
+    branch: Option<BranchId>,
     /// The branch whose databases lost or renamed one, if any.
     served_databases_changed: Option<BranchId>,
 }
@@ -664,6 +794,21 @@ async fn apply<T: DdlPort>(
     let mut role_moves: Vec<Move> = Vec::new();
     let mut db_moves: Vec<Move> = Vec::new();
     let mut databases_changed = false;
+    // The role cap is checked once, on the final count, so the order of a delta's steps
+    // doesn't matter: only a delta that ends over the cap and above where it began is refused.
+    let copies_before = if steps.iter().any(|s| {
+        matches!(
+            s,
+            Step::SetRole {
+                password: Some(_),
+                ..
+            }
+        )
+    }) {
+        Some(tx.copy_count().await?)
+    } else {
+        None
+    };
     for step in steps {
         if !matches!(step, Step::RenameRole { .. }) {
             finish_role_moves(&mut tx, &mut role_moves).await?;
@@ -686,19 +831,12 @@ async fn apply<T: DdlPort>(
             ..Facts::default()
         };
         match *step {
-            Step::RenameRole { old: name, .. } | Step::SetRole { name, .. } => {
+            Step::RenameRole { old: name, .. }
+            | Step::SetRole { name, .. }
+            | Step::SetLogin { name, .. } => {
                 facts.row = tx.role(name).await?.as_ref().map(RowFacts::of);
-                if matches!(
-                    step,
-                    Step::SetRole {
-                        password: Some(_),
-                        ..
-                    }
-                ) {
-                    facts.copy_count = tx.copy_count().await?;
-                }
             }
-            Step::DelRole { name } => {
+            Step::DelRole { name } | Step::CheckRecreated { name } => {
                 facts.live_keys = tx
                     .live_secret_keys(name)
                     .await?
@@ -716,13 +854,19 @@ async fn apply<T: DdlPort>(
         // An accepted rename frees its new name of any stale row, even when its old name
         // has none.
         match (step, &action) {
-            (Step::RenameRole { new, .. }, Action::Nothing) => {
+            // A role with no copy (no password) can still back keys (key creation checks the
+            // role on the compute, not its row): they go aside with the name, so they keep
+            // their role's current name (their OID binds them to it either way).
+            (Step::RenameRole { old, new }, Action::Nothing) => {
+                let aside = aside_name(&tag, role_moves.len());
+                tx.rename_copy(old, &aside, None).await?;
                 role_moves.push(Move {
-                    aside: None,
+                    aside: Some(aside),
                     new: new.to_string(),
                     resealed: None,
                     unreadable: false,
                 });
+                touch(old);
                 touch(new);
             }
             (Step::RenameDb { new, .. }, _) => {
@@ -749,6 +893,10 @@ async fn apply<T: DdlPort>(
                     unreachable!("an upsert comes from a set")
                 };
                 tx.upsert_sql_copy(name, verifier).await?;
+                touch(name);
+            }
+            Action::SetLogin { name, login } => {
+                tx.set_login(name, login).await?;
                 touch(name);
             }
             Action::RemoveCopy(name) => {
@@ -788,9 +936,16 @@ async fn apply<T: DdlPort>(
     }
     finish_role_moves(&mut tx, &mut role_moves).await?;
     finish_db_moves(&mut tx, &mut db_moves).await?;
+    if let Some(before) = copies_before {
+        let after = tx.copy_count().await?;
+        if after > rules.role_cap && after > before {
+            return Err(Failure::Refused(text::role_cap(rules.role_cap)));
+        }
+    }
     tx.commit().await?;
     Ok(Applied {
         roles: changed,
+        branch,
         served_databases_changed: branch.filter(|_| databases_changed),
     })
 }
@@ -802,7 +957,8 @@ async fn apply<T: DdlPort>(
 /// removed. So a swap of two names, which Neon sends as two renames onto each other's names,
 /// moves both rows instead of hitting the unique key.
 struct Move {
-    /// Where the row waits; `None` when the old name had no row.
+    /// Where the row and the keys of the old name wait (a name without a row still has keys
+    /// to move); `None` for a database with no row.
     aside: Option<String>,
     new: String,
     /// The sealed password for the new name (`rename_copy` sets it on each hop).
@@ -1023,6 +1179,239 @@ mod tests {
     }
 
     #[test]
+    fn a_forwarded_login_becomes_a_step_after_the_password() {
+        let d = delta(
+            r#"{"roles":[
+                {"op":"set","name":"new_copy","password":"p","encrypted_password":"SCRAM-SHA-256$x","login":false},
+                {"op":"set","name":"app","login":false,"valid_until":"2030-01-01","touched":true},
+                {"op":"set","name":"grp","touched":true},
+                {"op":"set","name":"b","old_name":"a","login":true}
+            ]}"#,
+        );
+        let p = Password {
+            plain: "p",
+            encrypted: "SCRAM-SHA-256$x",
+        };
+        assert_eq!(
+            steps(&d),
+            vec![
+                Step::RenameRole { old: "a", new: "b" },
+                Step::SetRole {
+                    name: "new_copy",
+                    password: Some(p)
+                },
+                Step::SetLogin {
+                    name: "new_copy",
+                    login: false
+                },
+                Step::SetLogin {
+                    name: "app",
+                    login: false
+                },
+                Step::SetLogin {
+                    name: "b",
+                    login: true
+                },
+            ],
+            "a touched-only entry is not a password removal"
+        );
+        assert!(touched(&d));
+    }
+
+    // The fork sends an explicit `"password": null` beside `login` for a CREATE ROLE without
+    // PASSWORD, so the refusals and RemoveCopy apply (characterization pins of the contract).
+    #[test]
+    fn create_role_without_password_is_a_set_then_a_login() {
+        let d = delta(r#"{"roles":[{"op":"set","name":"r1","password":null,"login":false}]}"#);
+        assert_eq!(
+            steps(&d),
+            vec![
+                Step::SetRole {
+                    name: "r1",
+                    password: None
+                },
+                Step::SetLogin {
+                    name: "r1",
+                    login: false
+                },
+            ]
+        );
+        let sh = rules(Mode::SelfHosted, false);
+        let refused = |name: &str, with_row: bool| {
+            let body = format!(
+                r#"{{"roles":[{{"op":"set","name":"{name}","password":null,"login":false}}]}}"#
+            );
+            let d = delta(&body);
+            let s = steps(&d);
+            let f = Facts {
+                row: if with_row {
+                    row(RoleOrigin::Sql, true, false)
+                } else {
+                    None
+                },
+                ..facts()
+            };
+            // Debug text: the action borrows from the local delta.
+            decide(&s[0], &f, &sh).map(|a| format!("{a:?}"))
+        };
+        assert_eq!(
+            refused("chelabase_admin", false),
+            Err("the role name \"chelabase_admin\" is reserved by Chelabase".into()),
+            "reserved"
+        );
+        assert_eq!(
+            refused("postgres", false),
+            Err("the branch owner's password can't be removed; reset it instead".into()),
+            "owner"
+        );
+        assert_eq!(
+            refused("r1", true),
+            Ok("RemoveCopy(\"r1\")".to_string()),
+            "existing copy"
+        );
+        assert_eq!(refused("r1", false), Ok("Nothing".to_string()), "no copy");
+    }
+
+    #[test]
+    fn a_valid_until_only_entry_is_no_set_role() {
+        let d = delta(
+            r#"{"roles":[{"op":"set","name":"app","valid_until":"infinity"},
+                {"op":"set","name":"postgres","valid_until":"2030-01-01","touched":true}]}"#,
+        );
+        assert_eq!(steps(&d), vec![], "an attribute change, not a password removal");
+    }
+
+    // D20: the fork marks a drop-and-create in one transaction; the drop's key check runs
+    // first, with a password and without one.
+    #[test]
+    fn a_recreated_entry_checks_keys_before_its_set() {
+        let d = delta(
+            r#"{"roles":[
+                {"op":"set","name":"a","password":"p","encrypted_password":"SCRAM-SHA-256$x","recreated":true,"touched":true},
+                {"op":"set","name":"b","password":null,"recreated":true,"touched":true},
+                {"op":"set","name":"c","password":"p","encrypted_password":"SCRAM-SHA-256$x","recreated":false}
+            ]}"#,
+        );
+        let p = Password {
+            plain: "p",
+            encrypted: "SCRAM-SHA-256$x",
+        };
+        assert_eq!(
+            steps(&d),
+            vec![
+                Step::CheckRecreated { name: "a" },
+                Step::SetRole { name: "a", password: Some(p) },
+                Step::CheckRecreated { name: "b" },
+                Step::SetRole { name: "b", password: None },
+                Step::SetRole { name: "c", password: Some(p) },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_recreated_check_refuses_the_owner() {
+        let sh = rules(Mode::SelfHosted, false);
+        assert_eq!(
+            decide(&Step::CheckRecreated { name: "postgres" }, &facts(), &sh),
+            Err("the branch owner \"postgres\" can't be dropped or renamed".into())
+        );
+    }
+
+    #[test]
+    fn a_recreated_check_refuses_like_a_drop_while_keys_live() {
+        let sh = rules(Mode::SelfHosted, false);
+        let step = Step::CheckRecreated { name: "app" };
+        assert_eq!(
+            decide(&step, &facts(), &sh),
+            Ok(Action::RemoveCopy("app")),
+            "no live keys: the dropped role's row goes, the new role starts fresh"
+        );
+        assert_eq!(
+            decide(&Step::CheckRecreated { name: "anon" }, &facts(), &sh),
+            Err("the role name \"anon\" is reserved by Chelabase".into()),
+            "a reserved name can't be dropped, so not recreated either"
+        );
+        assert_eq!(
+            decide(
+                &step,
+                &Facts { live_keys: vec!["k1".into(), "k2".into()], ..facts() },
+                &sh
+            ),
+            Err("role \"app\" backs data API key(s) k1, k2; revoke them first".into())
+        );
+    }
+
+    #[test]
+    fn a_role_drop_is_touched() {
+        let d = delta(r#"{"roles":[{"op":"del","name":"grp"}]}"#);
+        assert!(touched(&d), "a dropped group changes its members' derived levels");
+        let d = delta(r#"{"roles":[{"op":"set","name":"app","password":"p","encrypted_password":"SCRAM-SHA-256$x"}]}"#);
+        assert!(!touched(&d));
+    }
+
+    #[test]
+    fn an_old_payload_parses_and_touches_nothing() {
+        let d = delta(
+            r#"{"roles":[{"op":"set","name":"app","password":"p","encrypted_password":"SCRAM-SHA-256$x"},{"op":"set","name":"grp"}]}"#,
+        );
+        assert!(!touched(&d));
+        assert!(
+            d.roles
+                .iter()
+                .all(|r| r.login.is_none() && r.valid_until.is_none() && !r.recreated)
+        );
+        let p = Password {
+            plain: "p",
+            encrypted: "SCRAM-SHA-256$x",
+        };
+        assert_eq!(
+            steps(&d),
+            vec![
+                Step::SetRole {
+                    name: "app",
+                    password: Some(p)
+                },
+                Step::SetRole {
+                    name: "grp",
+                    password: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn set_login_decisions() {
+        let sh = rules(Mode::SelfHosted, false);
+        let step = |name| Step::SetLogin { name, login: false };
+        let with_row = Facts {
+            row: row(RoleOrigin::Sql, true, false),
+            ..facts()
+        };
+        assert_eq!(
+            decide(&step("app"), &with_row, &sh),
+            Ok(Action::SetLogin {
+                name: "app",
+                login: false
+            })
+        );
+        assert_eq!(
+            decide(&step("app"), &facts(), &sh),
+            Ok(Action::Nothing),
+            "no copy"
+        );
+        assert_eq!(
+            decide(&step("postgres"), &with_row, &sh),
+            Ok(Action::Nothing),
+            "owner"
+        );
+        assert_eq!(
+            decide(&step("anon"), &with_row, &sh),
+            Ok(Action::Nothing),
+            "reserved"
+        );
+    }
+
+    #[test]
     fn a_password_without_its_hash_fails_the_scram_check() {
         let d = delta(r#"{"roles":[{"op":"set","name":"x","password":"Tr0ub4dor&3x-horse"}]}"#);
         let s = steps(&d);
@@ -1077,32 +1466,32 @@ mod tests {
                 Err("the role name \"cloud_admin\" is reserved by Chelabase".into()),
             ),
             (
-                "cap at",
+                "cap at (checked once by apply, not per step)",
                 Step::SetRole { name: "app", password: Some(PW) },
-                Facts { copy_count: 1, ..facts() },
+                facts(),
                 capped,
-                Err("this branch has reached its limit of 1 login roles (CHELABASE_BRANCH_ROLE_CAP)".into()),
+                Ok(Action::UpsertCopy(SCRAM)),
             ),
             (
                 "cap below",
                 Step::SetRole { name: "app", password: Some(PW) },
-                Facts { copy_count: 0, ..facts() },
+                facts(),
                 capped,
                 Ok(Action::UpsertCopy(SCRAM)),
             ),
             (
                 "cap at, existing copy",
                 Step::SetRole { name: "app", password: Some(PW) },
-                Facts { copy_count: 1, row: row(RoleOrigin::Sql, true, false), ..facts() },
+                Facts { row: row(RoleOrigin::Sql, true, false), ..facts() },
                 capped,
                 Ok(Action::UpsertCopy(SCRAM)),
             ),
             (
-                "cap at, MD5 row gains a verifier",
+                "cap at, MD5 row gains a verifier (checked once by apply)",
                 Step::SetRole { name: "app", password: Some(PW) },
-                Facts { copy_count: 1, row: row(RoleOrigin::Sql, false, false), ..facts() },
+                Facts { row: row(RoleOrigin::Sql, false, false), ..facts() },
                 capped,
-                Err("this branch has reached its limit of 1 login roles (CHELABASE_BRANCH_ROLE_CAP)".into()),
+                Ok(Action::UpsertCopy(SCRAM)),
             ),
             (
                 "password null with a row",

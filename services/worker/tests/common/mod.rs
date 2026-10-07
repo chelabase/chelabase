@@ -42,7 +42,7 @@ pub async fn cleanup(worker: &RealWorker, metadata: &MetadataClient, id: Databas
         if let Ok(Some(endpoint)) = metadata.neon_endpoint(&ep).await
             && let Ok(tenant) = endpoint.tenant_id.parse::<NeonId>()
         {
-            let _ = worker.storage.delete_tenant(&tenant).await;
+            let _ = worker.storage.storcon.delete_tenant(&tenant).await;
         }
         let _ = metadata.delete_endpoint(&ep).await;
     }

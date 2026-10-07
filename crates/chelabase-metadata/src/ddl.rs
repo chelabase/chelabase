@@ -28,7 +28,7 @@ pub struct DdlTx {
 }
 
 /// A lock timeout becomes [`MetadataError::EndpointLockTimeout`]; other errors pass through.
-fn lock_timeout(err: sqlx::Error, endpoint_id: &str) -> MetadataError {
+pub(crate) fn lock_timeout(err: sqlx::Error, endpoint_id: &str) -> MetadataError {
     match err {
         sqlx::Error::Database(e) if e.code().as_deref() == Some(LOCK_NOT_AVAILABLE) => {
             MetadataError::EndpointLockTimeout(endpoint_id.to_string())
@@ -38,6 +38,21 @@ fn lock_timeout(err: sqlx::Error, endpoint_id: &str) -> MetadataError {
 }
 
 impl MetadataClient {
+    /// The live branch linked to `endpoint_id`, read without the endpoint's lock.
+    pub async fn endpoint_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<BranchId>, MetadataError> {
+        let branch: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM branches
+             WHERE endpoint_id = $1 AND status NOT IN ('deleting', 'deleted')",
+        )
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(branch.map(BranchId))
+    }
+
     /// Opens the receiver's transaction for `endpoint_id`: `lock_timeout` of 2 s, the linked
     /// branch's row (`FOR NO KEY UPDATE`, first: the branch row comes before the endpoint row
     /// in the lock order, and `set_owner_verifier` writes to it), then the endpoint's row
@@ -147,7 +162,8 @@ impl DdlTx {
 
     /// Inserts a copy (origin `sql`, login true, level plain) or, for an existing row,
     /// replaces its verifier and drops its sealed password (the password was typed in SQL).
-    /// `forwarded_at = now()` either way.
+    /// `forwarded_at = now()` either way. A recreated role's old row is removed first by the
+    /// receiver, so it starts from a fresh one.
     pub async fn upsert_sql_copy(
         &mut self,
         name: &str,
@@ -168,6 +184,23 @@ impl DdlTx {
         .await?;
         self.wrote = true;
         Ok(())
+    }
+
+    /// A forwarded `LOGIN`/`NOLOGIN`: the non-owner row's `login` flag, with `forwarded_at =
+    /// now()` (the resync leaves it alone for 10 s). False when there is no such row.
+    pub async fn set_login(&mut self, name: &str, login: bool) -> Result<bool, MetadataError> {
+        let updated = sqlx::query(
+            "UPDATE neon_roles SET login = $3, forwarded_at = now()
+             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
+        )
+        .bind(&self.endpoint_id)
+        .bind(name)
+        .bind(login)
+        .execute(&mut *self.tx)
+        .await?
+        .rows_affected();
+        self.wrote |= updated > 0;
+        Ok(updated > 0)
     }
 
     /// The owner row's verifier and `forwarded_at`; the branch's `owner_password_enc` becomes
@@ -226,7 +259,13 @@ impl DdlTx {
 
     /// Moves a row (keeping its origin and level) to `new`, replaces its sealed password with
     /// `resealed` (`None` leaves it NULL) and sets `forwarded_at = now()`. The branch's data
-    /// keys with role `old` (revoked ones included) follow (R19). False when there was no row.
+    /// keys with role `old` follow (R19), live and revoked alike, whether or not there is a
+    /// row: a role without a password has none and can still back keys, and its live keys
+    /// must not stay under a name the next `CREATE ROLE` will take. Revoked keys are inert
+    /// and unlisted; moving them keeps their history with the role. They can still stay
+    /// under a name that is dropped and created again (`DROP b; CREATE b`), or onto which a
+    /// rename lands when all its keys are revoked: audit noise only.
+    /// True when a row moved.
     pub async fn rename_copy(
         &mut self,
         old: &str,
@@ -246,20 +285,21 @@ impl DdlTx {
         .execute(&mut *self.tx)
         .await?
         .rows_affected();
-        if moved == 0 {
-            return Ok(false);
-        }
+        let mut keys_moved = 0;
         if let Some(branch) = self.branch_id {
-            sqlx::query("UPDATE data_api_keys SET role = $3 WHERE branch_id = $1 AND role = $2")
-                .bind(branch.as_uuid())
-                .bind(old)
-                .bind(new)
-                .execute(&mut *self.tx)
-                .await
-                .map_err(|e| lock_timeout(e, &self.endpoint_id))?;
+            keys_moved = sqlx::query(
+                "UPDATE data_api_keys SET role = $3 WHERE branch_id = $1 AND role = $2",
+            )
+            .bind(branch.as_uuid())
+            .bind(old)
+            .bind(new)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(|e| lock_timeout(e, &self.endpoint_id))?
+            .rows_affected();
         }
-        self.wrote = true;
-        Ok(true)
+        self.wrote |= moved > 0 || keys_moved > 0;
+        Ok(moved > 0)
     }
 
     /// Rows of origin `main` or `sql` (R23: the system database isn't counted).

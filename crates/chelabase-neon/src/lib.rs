@@ -10,6 +10,7 @@ pub mod lsn;
 pub mod proxy_api;
 pub mod proxy_cache;
 pub mod reconfigure;
+pub mod safekeeper;
 pub mod scram;
 pub mod spec;
 pub mod storcon;

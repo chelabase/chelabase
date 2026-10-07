@@ -1,9 +1,34 @@
 //! Data API metadata: keys, the authenticator password and the per-database settings the REST
 //! service reads.
 //!
-//! Lock order: see `branches.rs`. Only [`MetadataClient::rotate_data_key`] spans more than one
-//! statement; it locks the database row, then the branch row, then touches key rows. The other
-//! writes are single statements on one table.
+//! Lock order: see `branches.rs`. [`MetadataClient::rotate_data_key`] spans more than one
+//! statement; it locks the database row, then the branch row, then touches key rows. Secret key
+//! creation and rotation also take the endpoint row `FOR SHARE` after the branch row (database,
+//! branch, endpoint: `begin_ddl` takes branch, endpoint). The other writes are single statements
+//! on one table.
+//!
+//! # Secret keys and their roles
+//!
+//! **Invariant:** a secret key is bound to its role's identity on the compute
+//! (`pg_roles.oid`, the `role_oid` column), not to the role's name. A key whose OID no longer
+//! exists, or whose name is now held by a different role, is dead: it never runs as anyone.
+//!
+//! How each side keeps it:
+//! - Creation: the worker checks the role on the compute (any role, with or without a
+//!   password, so with or without a `neon_roles` row) and answers its OID;
+//!   [`MetadataClient::create_secret_key`] stores the key with it.
+//! - Use: rest's preamble sets the role only while the role named `role` has `role_oid`, in
+//!   the same expression as the `SET ROLE` (no window, no cache). A role dropped, or dropped
+//!   and created again, between the check and the store (or at any time later) leaves a key
+//!   that is refused on every request.
+//! - Rotation re-checks the role on the compute; a different OID than the old key's is
+//!   [`MetadataError::RoleRecreated`], nothing written. The new key keeps the old key's OID,
+//!   and its role is the old row's current name (read under the lock, so it follows a rename).
+//! - The resync revokes keys whose OID is gone, renames keys whose OID now has another name (a
+//!   rename the receiver didn't see), and fills the OID of keys made before the column existed.
+//! - The DDL receiver (endpoint row `FOR UPDATE`, key writes take it `FOR SHARE`) refuses a
+//!   DROP or recreate of a role with live keys and moves keys with every rename: the
+//!   friendly path, so a key rarely goes dead in the first place.
 
 use std::fmt;
 
@@ -33,6 +58,9 @@ pub struct NewDataKey {
     pub sealed: Option<String>,
     /// The databases the key may reach; `None` is every served database.
     pub databases: Option<Vec<String>>,
+    /// A secret key's role identity (`pg_roles.oid`) from the worker's check; `None` for the
+    /// public key.
+    pub role_oid: Option<i64>,
 }
 
 impl fmt::Debug for NewDataKey {
@@ -47,6 +75,7 @@ impl fmt::Debug for NewDataKey {
             .field("sha256", &"<redacted>")
             .field("sealed", &self.sealed.as_ref().map(|_| "<redacted>"))
             .field("databases", &self.databases)
+            .field("role_oid", &self.role_oid)
             .finish()
     }
 }
@@ -65,6 +94,8 @@ pub struct DataKeyRecord {
     pub revoked_at: Option<DateTime<Utc>>,
     /// The databases the key may reach; `None` is every served database.
     pub databases: Option<Vec<String>>,
+    /// A secret key's role identity; `None` for the public key and keys not backfilled yet.
+    pub role_oid: Option<i64>,
 }
 
 impl fmt::Debug for DataKeyRecord {
@@ -81,6 +112,7 @@ impl fmt::Debug for DataKeyRecord {
             .field("last_used_at", &self.last_used_at)
             .field("revoked_at", &self.revoked_at)
             .field("databases", &self.databases)
+            .field("role_oid", &self.role_oid)
             .finish()
     }
 }
@@ -96,6 +128,20 @@ pub struct DataKeyLookup {
     pub role: String,
     /// The databases the key may reach; `None` is every served database.
     pub databases: Option<Vec<String>>,
+    /// The role identity rest holds the key to; `None` checks the name only.
+    pub role_oid: Option<i64>,
+}
+
+/// One repair the resync makes to a live secret key from the compute's `pg_roles`. Each is
+/// applied only while the row still looks as the resync saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyRoleFix {
+    /// The key's OID is gone, or (no OID yet) its name is: the role is dropped.
+    Revoke { id: Uuid, role: String, oid: Option<i64> },
+    /// The key's OID now has another name (a rename the DDL receiver didn't see).
+    Follow { id: Uuid, from: String, to: String, oid: i64 },
+    /// A key made before OIDs were stored: its name's current OID.
+    Backfill { id: Uuid, role: String, oid: i64 },
 }
 
 /// A database's data API settings.
@@ -128,7 +174,7 @@ pub struct BranchConnectionRow {
 }
 
 const KEY_COLUMNS: &str = "id, branch_id, kind, role, name, prefix, sealed, created_at, \
-     last_used_at, revoked_at, databases";
+     last_used_at, revoked_at, databases, role_oid";
 
 fn parse_kind(value: &str) -> Result<DataKeyKind, MetadataError> {
     DataKeyKind::parse(value)
@@ -148,12 +194,14 @@ fn key_from_row(r: &PgRow) -> Result<DataKeyRecord, MetadataError> {
         last_used_at: r.get("last_used_at"),
         revoked_at: r.get("revoked_at"),
         databases: r.get("databases"),
+        role_oid: r.get("role_oid"),
     })
 }
 
 const INSERT_KEY: &str =
-    "INSERT INTO data_api_keys (id, branch_id, kind, role, name, prefix, sha256, sealed, databases)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+    "INSERT INTO data_api_keys
+         (id, branch_id, kind, role, name, prefix, sha256, sealed, databases, role_oid)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
 /// A second live public key on a branch is a [`MetadataError::Conflict`]; anything else passes.
 fn map_insert_error(err: sqlx::Error) -> MetadataError {
@@ -165,6 +213,38 @@ fn map_insert_error(err: sqlx::Error) -> MetadataError {
     }
 }
 
+/// How long key creation and rotation wait for the endpoint row before giving up.
+const ENDPOINT_WAIT: &str = "5s";
+
+/// Takes the branch row (`FOR NO KEY UPDATE`) and then its endpoint row (`FOR SHARE`), with a
+/// `lock_timeout`. A missing branch is `RowNotFound`.
+async fn lock_endpoint_of_branch(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    branch: BranchId,
+) -> Result<(), MetadataError> {
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(ENDPOINT_WAIT)
+        .execute(&mut **tx)
+        .await?;
+    let endpoint: Option<Option<String>> =
+        sqlx::query_scalar("SELECT endpoint_id FROM branches WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(branch.as_uuid())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| crate::ddl::lock_timeout(e, &branch.to_string()))?;
+    let Some(endpoint) = endpoint else {
+        return Err(sqlx::Error::RowNotFound.into());
+    };
+    if let Some(endpoint) = &endpoint {
+        sqlx::query("SELECT id FROM neon_endpoints WHERE id = $1 FOR SHARE")
+            .bind(endpoint)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| crate::ddl::lock_timeout(e, endpoint))?;
+    }
+    Ok(())
+}
+
 impl MetadataClient {
     /// Stores a key. A second live public key on the branch is [`MetadataError::Conflict`].
     pub async fn insert_data_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
@@ -172,6 +252,30 @@ impl MetadataClient {
             .execute(&self.pool)
             .await
             .map_err(map_insert_error)?;
+        Ok(())
+    }
+
+    /// Stores a secret key, with the role OID the worker's check found (the key is bound to
+    /// that identity; see the module docs). The role needs no `neon_roles` row.
+    ///
+    /// Lock order: branch row (`FOR NO KEY UPDATE`, as [`Self::rotate_data_key`] and
+    /// `begin_ddl` take it), then the endpoint row `FOR SHARE`: the DDL receiver holds the same
+    /// row `FOR UPDATE` while it reads `live_secret_keys` and drops or renames the role, so a
+    /// DROP forwarded after the store sees the key and is refused, and a rename moves it. A
+    /// DROP or recreate the store didn't wait for leaves a key bound to an OID that is gone:
+    /// dead, never a key of the next role under the name. A lock wait over 5 s is
+    /// [`MetadataError::EndpointLockTimeout`].
+    ///
+    /// Public keys keep [`Self::insert_data_key`]: their role is `anon`, which no DDL can drop,
+    /// and branch creation stores one before the endpoint is linked.
+    pub async fn create_secret_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_endpoint_of_branch(&mut tx, key.branch_id).await?;
+        bind_new_key(sqlx::query(INSERT_KEY), key, key.branch_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_insert_error)?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -199,7 +303,7 @@ impl MetadataClient {
         sha256: &[u8; 32],
     ) -> Result<Option<DataKeyLookup>, MetadataError> {
         let row = sqlx::query(
-            "SELECT k.id, k.branch_id, d.project_id, k.kind, k.role, k.databases
+            "SELECT k.id, k.branch_id, d.project_id, k.kind, k.role, k.databases, k.role_oid
              FROM data_api_keys k
              JOIN branches b ON b.id = k.branch_id
              JOIN databases d ON d.id = b.database_id
@@ -217,9 +321,60 @@ impl MetadataClient {
                 kind: parse_kind(r.get("kind"))?,
                 role: r.get("role"),
                 databases: r.get("databases"),
+                role_oid: r.get("role_oid"),
             })
         })
         .transpose()
+    }
+
+    /// Applies the resync's [`KeyRoleFix`]es to `branch`'s live secret keys in one
+    /// transaction, each only while the row still has the role (and OID) the resync saw: a
+    /// key renamed, rotated or revoked meanwhile is left alone. Returns how many rows changed.
+    pub async fn fix_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[KeyRoleFix],
+    ) -> Result<u64, MetadataError> {
+        if fixes.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut changed = 0;
+        for fix in fixes {
+            let query = match fix {
+                KeyRoleFix::Revoke { id, role, oid } => sqlx::query(
+                    "UPDATE data_api_keys SET revoked_at = now()
+                     WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
+                       AND role = $3 AND role_oid IS NOT DISTINCT FROM $4",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(role)
+                .bind(*oid),
+                KeyRoleFix::Follow { id, from, to, oid } => sqlx::query(
+                    "UPDATE data_api_keys SET role = $4
+                     WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
+                       AND role = $3 AND role_oid = $5",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(from)
+                .bind(to)
+                .bind(*oid),
+                KeyRoleFix::Backfill { id, role, oid } => sqlx::query(
+                    "UPDATE data_api_keys SET role_oid = $4
+                     WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
+                       AND role = $3 AND role_oid IS NULL",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(role)
+                .bind(*oid),
+            };
+            changed += query.execute(&mut *tx).await?.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Stamps `last_used_at`, at most once a minute per key.
@@ -256,33 +411,84 @@ impl MetadataClient {
     /// Revokes the live key `old` of `branch` and stores `new` (for that branch) in one
     /// transaction. False, nothing written, when `old` isn't a live key of the branch. A failing
     /// insert (a second live public key: [`MetadataError::Conflict`]) rolls the revoke back.
+    /// Public keys only: a secret `old` is false, as for an unknown key; secret keys go through
+    /// [`Self::rotate_secret_key`], which also holds the role in place.
     pub async fn rotate_data_key(
         &self,
         branch: BranchId,
         old: Uuid,
         new: &NewDataKey,
     ) -> Result<bool, MetadataError> {
+        self.rotate_in_tx(branch, old, new, false).await
+    }
+
+    /// [`Self::rotate_data_key`] for a live secret key. The endpoint row is held `FOR SHARE`,
+    /// so a concurrent role DROP, recreate or rename (the DDL receiver holds it `FOR UPDATE`)
+    /// either finishes before this runs or sees the new key. The new key's role is the revoked
+    /// row's current one (a rename may have moved it since the caller read it), and its OID the
+    /// old key's: the identity carries over. `new.role_oid` is what the caller's check found;
+    /// a different OID than the old key's means the role was dropped and created again, so
+    /// [`MetadataError::RoleRecreated`], the revoke rolled back. An old key without an OID
+    /// takes the checked one. False for a public key.
+    pub async fn rotate_secret_key(
+        &self,
+        branch: BranchId,
+        old: Uuid,
+        new: &NewDataKey,
+    ) -> Result<bool, MetadataError> {
+        self.rotate_in_tx(branch, old, new, true).await
+    }
+
+    /// Lock order (the DDL receiver's, `ddl.rs::begin_ddl`, is a suffix of it): database row,
+    /// branch row (`FOR NO KEY UPDATE`), endpoint row (`FOR SHARE`, secret keys only), then
+    /// key rows.
+    async fn rotate_in_tx(
+        &self,
+        branch: BranchId,
+        old: Uuid,
+        new: &NewDataKey,
+        secret: bool,
+    ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
         lock_database_of_branch(&mut tx, branch).await?;
-        sqlx::query("SELECT 1 FROM branches WHERE id = $1 FOR NO KEY UPDATE")
-            .bind(branch.as_uuid())
-            .execute(&mut *tx)
-            .await?;
+        if secret {
+            lock_endpoint_of_branch(&mut tx, branch).await?;
+        } else {
+            sqlx::query("SELECT 1 FROM branches WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(branch.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+        }
         // The new key reaches what the old one did: its list is copied, whatever `new` carries.
-        let revoked: Option<Option<Vec<String>>> = sqlx::query_scalar(
+        // A secret key's role is the old row's now, under the lock.
+        let revoked: Option<(Option<Vec<String>>, String, Option<i64>)> = sqlx::query_as(
             "UPDATE data_api_keys SET revoked_at = now()
              WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
-             RETURNING databases",
+               AND kind = CASE WHEN $3 THEN 'secret' ELSE 'public' END
+             RETURNING databases, role, role_oid",
         )
         .bind(old)
         .bind(branch.as_uuid())
+        .bind(secret)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(databases) = revoked else {
+        let Some((databases, role, stored_oid)) = revoked else {
             return Ok(false);
+        };
+        let role_oid = if secret {
+            if let (Some(stored), Some(checked)) = (stored_oid, new.role_oid)
+                && stored != checked
+            {
+                return Err(MetadataError::RoleRecreated(role));
+            }
+            stored_oid.or(new.role_oid)
+        } else {
+            None
         };
         let new = NewDataKey {
             databases,
+            role: if secret { role } else { new.role.clone() },
+            role_oid,
             ..new.clone()
         };
         bind_new_key(sqlx::query(INSERT_KEY), &new, branch)
@@ -412,6 +618,7 @@ fn bind_new_key<'q>(
         .bind(key.sha256.as_slice())
         .bind(key.sealed.as_deref())
         .bind(key.databases.as_deref())
+        .bind(key.role_oid)
 }
 
 #[cfg(test)]
@@ -430,6 +637,7 @@ mod tests {
             sha256: [0xab; 32],
             sealed: Some("v1:SECRETSEALED".into()),
             databases: None,
+            role_oid: None,
         };
         let shown = format!("{key:?}");
         assert!(
@@ -449,6 +657,7 @@ mod tests {
             last_used_at: None,
             revoked_at: None,
             databases: None,
+            role_oid: None,
         };
         assert!(!format!("{record:?}").contains("SECRETSEALED"));
     }

@@ -41,7 +41,7 @@ A storage-controller failure that may pass (a 5xx, no answer or a timeout) is re
 
 Restore also creates a backup branch, `<name>-before-restore-<yyyymmddThhmmssZ>`, that holds the old timeline for recovery. A backup has no compute; to connect to it, create a branch from it. Backup branches never count toward the cap, can't be reset, restored or protected, and are deleted when their branch is deleted.
 
-A restore that stays stuck fails the branch with a message ending "delete the branch to remove it"; such a branch can only be deleted. A detach that times out is never undone while it may still be running: the job is retried, and the retry finishes the detach. If it is still unresolved 20 minutes after the restore made its timeline, the branch fails with the recorded cause, and nothing is deleted: the branch keeps its old timeline.
+A restore right after a storage restart can wait up to 30 seconds per ancestor level in the restore's depth before retrying. A restore that stays stuck fails the branch with a message ending "delete the branch to remove it"; such a branch can only be deleted. A detach that times out is never undone while it may still be running: the job is retried, and the retry finishes the detach. If it is still unresolved 20 minutes after the restore made its timeline, the branch fails with the recorded cause, and nothing is deleted: the branch keeps its old timeline.
 
 ## Delete, and the children rule
 

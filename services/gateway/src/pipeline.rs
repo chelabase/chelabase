@@ -310,11 +310,13 @@ impl Pipeline {
         if let Some(refused) = key_kind_refusal(secret_only, public_only, resolved.kind) {
             return Err(refused);
         }
-        let (role, claims) = match header_str(req.headers, USER_TOKEN_HEADER) {
+        // The key's role OID binds the request to the role's identity; a user token runs as
+        // `authenticated`, which isn't the key's role, so it carries none.
+        let (role, claims, role_oid) = match header_str(req.headers, USER_TOKEN_HEADER) {
             None if req.headers.contains_key(USER_TOKEN_HEADER) => {
                 return Err(user_token_error(UserTokenError::Invalid));
             }
-            None => (resolved.role, json!({})),
+            None => (resolved.role, json!({}), resolved.role_oid),
             Some(_) if resolved.kind == DataKeyKind::Secret => {
                 return Err(data_error(
                     400,
@@ -336,6 +338,7 @@ impl Pipeline {
                         "email": claims.email, "email_verified": claims.email_verified,
                         "role": "authenticated", "exp": claims.exp,
                     }),
+                    None,
                 )
             }
         };
@@ -352,6 +355,7 @@ impl Pipeline {
                 claims,
                 databases: resolved.databases,
                 project_id: Some(resolved.project_id),
+                role_oid,
             }),
         };
         self.signer.sign(service.name(), &identity).map_err(|err| {
@@ -1031,6 +1035,24 @@ mod tests {
         assert_eq!(data.kind, DataKeyKind::Public);
         assert_eq!(data.role, "anon");
         assert_eq!(data.claims, json!({}));
+    }
+
+    /// A secret key's role OID rides in the minted identity, so rest runs the key only as the
+    /// role with that identity; a key without one (public, or not backfilled) mints none.
+    #[tokio::test]
+    async fn the_role_oid_is_carried_in_the_minted_token() {
+        let h = data_harness().await;
+        let bound = dk::new_key(DataKeyKind::Secret);
+        let mut resolved = dk::resolved(DataKeyKind::Secret);
+        resolved.role_oid = Some(16390);
+        h.mock.set(&bound, Answer::Known(resolved));
+        let legacy = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&legacy, Answer::Known(dk::resolved(DataKeyKind::Secret)));
+        for (key, oid) in [(&bound, Some(16390)), (&legacy, None)] {
+            let plan = expect_plan(data_call(&h, "POST", "/data/v1/query", Some(key)).await.outcome);
+            let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap();
+            assert_eq!(claims.data.unwrap().role_oid, oid);
+        }
     }
 
     /// A key's allow-list rides in the minted identity; a key without one mints none.

@@ -28,7 +28,7 @@ use chelabase_secrets::SecretKey;
 use chelabase_types::BranchId;
 use uuid::Uuid;
 use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
-pub use ddl::{BoxFuture, CachePort, DdlPort};
+pub use ddl::{BoxFuture, CachePort, DdlPort, ResyncPort};
 use chelabase_types::role_settings::RoleSettings;
 use std::future::Future;
 use std::sync::Arc;
@@ -53,6 +53,11 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         id: &str,
     ) -> impl Future<Output = Result<Option<NeonEndpoint>, MetadataError>> + Send;
+    /// The live branch linked to the endpoint, read without its lock.
+    fn endpoint_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<Option<BranchId>, MetadataError>> + Send;
     fn neon_role_secret(
         &self,
         endpoint_id: &str,
@@ -173,6 +178,12 @@ impl NeonMetadataPort for MetadataClient {
     }
     async fn neon_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
         MetadataClient::neon_endpoint(self, id).await
+    }
+    async fn endpoint_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<BranchId>, MetadataError> {
+        MetadataClient::endpoint_branch(self, endpoint_id).await
     }
     async fn neon_role_secret(
         &self,
@@ -305,6 +316,8 @@ pub struct InternalState<M, L> {
     pub roles: RoleSettings,
     /// Tells the proxies a role's secret changed.
     pub cache: Arc<dyn CachePort>,
+    /// Asks the worker to resync a branch whose roles a DDL touched.
+    pub resync: Arc<dyn ResyncPort>,
     /// `CHELABASE_CONTROL_PLANE_URI`: the base of `neon.console_url` in the specs served.
     pub control_plane_uri: String,
     /// The REST service's internal listener: told when a forwarded `DROP`/`RENAME DATABASE`

@@ -32,6 +32,7 @@ pub mod reconcile;
 pub mod reset;
 pub mod resync;
 pub mod roles;
+pub mod safekeepers;
 pub mod settings;
 
 /// The role that owns every database, and whose password is revealed.

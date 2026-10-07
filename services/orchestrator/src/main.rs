@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         secrets: secrets.clone(),
         roles,
         cache: Arc::new(ProxyCache::new(&internal_config.valkey_url)?),
+        resync: Arc::new(nats.clone()),
         control_plane_uri: internal_config.control_plane_uri.clone(),
         rest: rest.clone(),
         app_auth_token: internal_config.app_auth_token.clone(),

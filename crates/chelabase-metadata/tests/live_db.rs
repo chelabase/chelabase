@@ -11,7 +11,7 @@
 use chelabase_metadata::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, CreateBranchOutcome, DatabaseSettings, DatabaseStatus,
     BeginDelete, ClaimOutcome, CopyUpsert, DatabaseOrigin, InsertRoleOutcome, MetadataClient, MetadataConfig,
-    MetadataError, NewBranch, NewDataKey, NewEndpoint, NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied,
+    KeyRoleFix, MetadataError, NewBranch, NewDataKey, NewEndpoint, NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied,
     ResyncWrite, RoleLevel, RoleOrigin, SealedChange, SettingsPatch,
     DataApiState, EnableStart, ServedDatabase,
     BeginEnable, BeginProjectDelete, NewAppSession, NewProjectAuth, OnDelete, ProjectStatus, RefreshNext,
@@ -2357,6 +2357,7 @@ fn new_key(branch: BranchId, kind: DataKeyKind, role: &str, name: &str) -> (NewD
             sha256: generated.sha256,
             sealed,
             databases: None,
+            role_oid: None,
         },
         generated.key,
     )
@@ -2462,7 +2463,8 @@ async fn second_live_public_key_conflicts() {
 async fn rotate_is_atomic() {
     let _sealed = sealed_lock().await;
     let client = client().await;
-    let (id, _) = ready_database(&client).await;
+    let (id, ep) = ready_database(&client).await;
+    client.insert_api_role(&ep, "service_role", true, "SCRAM-SHA-256$o", "v1:sr", 10).await.unwrap();
     let branch = main_of(id);
     let (public, _) = new_key(branch, DataKeyKind::Public, "anon", "default");
     let (secret, _) = new_key(branch, DataKeyKind::Secret, "service_role", "backend");
@@ -2488,15 +2490,16 @@ async fn rotate_is_atomic() {
     let (replacement, _) = new_key(branch, DataKeyKind::Secret, "service_role", "stolen");
     let cross = client.rotate_data_key(branch, foreign.id, &replacement).await.unwrap();
 
-    // A failing insert rolls the revoke back: a secret rotated into a second live public key.
+    // `rotate_data_key` is for public keys: a secret `old` is refused, nothing written.
     let (clash, _) = new_key(branch, DataKeyKind::Public, "anon", "clash");
     let failed = client.rotate_data_key(branch, secret.id, &clash).await;
+    let clash_inserted = client.lookup_data_key(&clash.sha256).await.unwrap();
     let secret_still_live = client.lookup_data_key(&secret.sha256).await.unwrap();
 
-    // A duplicate hash fails the same way.
+    // A failing insert rolls the revoke back: a duplicate hash.
     let (dup, _) = new_key(branch, DataKeyKind::Secret, "service_role", "dup");
     let dup = NewDataKey { sha256: secret.sha256, ..dup };
-    let failed_dup = client.rotate_data_key(branch, secret.id, &dup).await;
+    let failed_dup = client.rotate_secret_key(branch, secret.id, &dup).await;
     let still_live = client.lookup_data_key(&secret.sha256).await.unwrap();
 
     let live = client.list_data_keys(branch).await.unwrap();
@@ -2508,7 +2511,8 @@ async fn rotate_is_atomic() {
     assert!(!stale && !missing);
     assert!(inserted.is_none());
     assert!(!cross);
-    assert!(matches!(failed, Err(MetadataError::Conflict)), "{failed:?}");
+    assert!(matches!(failed, Ok(false)), "{failed:?}");
+    assert!(clash_inserted.is_none());
     assert!(secret_still_live.is_some());
     assert!(failed_dup.is_err());
     assert!(still_live.is_some());
@@ -3193,6 +3197,43 @@ async fn resync_skips_recently_forwarded_rows() {
     assert_eq!(after_again, after);
 }
 
+// The 10 s guard covers what the receiver owns (verifier, sealed password, login); the
+// catalog-owned `level` and `pending` of a row stamped a moment ago still update.
+#[tokio::test]
+#[ignore]
+async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$forwarded"), None).await;
+    sqlx::query("UPDATE neon_roles SET pending = true, login = false WHERE endpoint_id = $1 AND name = 'app'")
+        .bind(&ep)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    set_forwarded(&client, &ep, "app", 1).await;
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let mut row = upsert("app", RoleOrigin::Sql, "SCRAM-SHA-256$catalog");
+    row.level = RoleLevel::OwnerLevel;
+    row.pending = false;
+    row.login = true;
+    let write = ResyncWrite {
+        upserts: vec![row],
+        removals: vec![],
+        databases: vec![observed("db", "postgres", false)],
+    };
+    let applied = client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let (copies, _) = client.role_copies(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    let app = copies.iter().find(|c| c.name == "app").unwrap();
+    assert_eq!(applied, ResyncApplied::Applied { changed: vec!["app".into()] });
+    assert_eq!(app.level, RoleLevel::OwnerLevel, "level follows the catalog");
+    assert!(!app.pending, "pending follows the catalog");
+    assert_eq!(app.scram_verifier.as_deref(), Some("SCRAM-SHA-256$forwarded"));
+    assert!(!app.login, "the forwarded login is kept");
+}
+
 #[tokio::test]
 #[ignore]
 async fn resync_upsert_keeps_the_origin_and_applies_the_sealed_change() {
@@ -3852,6 +3893,30 @@ async fn unreadable_password_state() {
     assert_eq!(after_sql, PasswordState::SetInSql);
 }
 
+#[tokio::test]
+#[ignore]
+async fn ddl_set_login_flags_a_copy_and_stamps_it() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "app", "sql", Some("SCRAM-SHA-256$a"), None).await;
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let flagged = tx.set_login("app", false).await.unwrap();
+    let missing = tx.set_login("ghost", false).await.unwrap();
+    tx.commit().await.unwrap();
+    let (login, stamped): (bool, bool) = sqlx::query_as(
+        "SELECT login, forwarded_at > now() - interval '10 seconds' FROM neon_roles
+         WHERE endpoint_id = $1 AND name = 'app'",
+    )
+    .bind(&ep)
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    cleanup(&client, id).await;
+    assert!(flagged && !missing);
+    assert!(!login && stamped);
+}
+
 async fn password_of(client: &MetadataClient, ep: &str, name: &str) -> PasswordState {
     client.list_roles(ep).await.unwrap().into_iter().find(|r| r.name == name).unwrap().password
 }
@@ -4317,13 +4382,14 @@ async fn dropping_the_last_allowed_database_revokes_the_key() {
 async fn rotation_keeps_the_list() {
     let _sealed = sealed_lock().await;
     let client = client().await;
-    let (id, _) = ready_database(&client).await;
+    let (id, ep) = ready_database(&client).await;
+    client.insert_api_role(&ep, "service_role", true, "SCRAM-SHA-256$o", "v1:sr", 10).await.unwrap();
     let branch = main_of(id);
     let old = key_with(branch, "service_role", "old", Some(&["db", "x"]));
     client.insert_data_key(&old).await.unwrap();
     let (mut new, _) = new_key(branch, DataKeyKind::Secret, "service_role", "old");
     new.databases = Some(vec!["ignored".into()]);
-    assert!(client.rotate_data_key(branch, old.id, &new).await.unwrap());
+    assert!(client.rotate_secret_key(branch, old.id, &new).await.unwrap());
     let after = key_databases(&client, branch, new.id).await;
     cleanup(&client, id).await;
     assert_eq!(after, Some(vec!["db".to_string(), "x".to_string()]));
@@ -5334,4 +5400,358 @@ async fn saved_queries_cascade_with_their_database() {
         .await
         .unwrap();
     assert_eq!(left, 0);
+}
+
+// ---- secret keys vs role DROP / recreate (T13h) ----
+
+/// How long a call that must be waiting on the endpoint lock is given to finish (it must not).
+const STILL_BLOCKED: std::time::Duration = std::time::Duration::from_millis(400);
+
+async fn key_rows(client: &MetadataClient, branch: BranchId, role: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM data_api_keys WHERE branch_id = $1 AND role = $2")
+        .bind(branch.as_uuid())
+        .bind(role)
+        .fetch_one(client.pool())
+        .await
+        .unwrap()
+}
+
+/// A secret key bound to role OID `oid`.
+fn bound_key(branch: BranchId, role: &str, name: &str, oid: Option<i64>) -> NewDataKey {
+    let (key, _) = new_key(branch, DataKeyKind::Secret, role, name);
+    NewDataKey { role_oid: oid, ..key }
+}
+
+// C1: the worker checks the role on the compute; the store needs no `neon_roles` row (a
+// NOLOGIN or password-less role has none) and keeps the role's OID, which the lookup returns.
+#[tokio::test]
+#[ignore]
+async fn create_secret_key_stores_a_rowless_role_with_its_oid() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let key = bound_key(branch, "reader", "rowless", Some(16390));
+    let created = client.create_secret_key(&key).await;
+    let listed = client.list_data_keys(branch).await.unwrap();
+    let looked_up = client.lookup_data_key(&key.sha256).await.unwrap();
+    cleanup(&client, id).await;
+    assert!(created.is_ok(), "{created:?}");
+    assert_eq!(listed.iter().find(|k| k.id == key.id).unwrap().role_oid, Some(16390));
+    assert_eq!(looked_up.unwrap().role_oid, Some(16390));
+}
+
+// The receiver's transaction holds the endpoint row: a key creation waits for it, so a DROP
+// forwarded first runs first (the key is then bound to an OID that is gone: dead), and one
+// forwarded after sees the key.
+#[tokio::test]
+#[ignore]
+async fn create_secret_key_waits_for_the_ddl_transaction() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let mut ddl = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(ddl.live_secret_keys("app").await.unwrap().is_empty());
+
+    let key = bound_key(branch, "app", "late", Some(16390));
+    let c = client.clone();
+    let k = key.clone();
+    let mut creating = tokio::spawn(async move { c.create_secret_key(&k).await });
+    let waited = tokio::time::timeout(STILL_BLOCKED, &mut creating).await;
+    assert!(waited.is_err(), "key creation must wait for the DDL transaction");
+
+    ddl.commit().await.unwrap();
+    let result = creating.await.unwrap();
+    let rows = key_rows(&client, branch, "app").await;
+    cleanup(&client, id).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(rows, 1);
+}
+
+// Rotation keeps the identity: the old key's OID carries over; a different checked OID (the
+// role dropped and created again) is refused with the revoke rolled back; a key without an
+// OID takes the checked one.
+#[tokio::test]
+#[ignore]
+async fn rotate_secret_key_holds_the_role_oid() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let old = bound_key(branch, "app", "old", Some(16390));
+    client.create_secret_key(&old).await.unwrap();
+    let recreated = bound_key(branch, "app", "old", Some(16391));
+    let refused = client.rotate_secret_key(branch, old.id, &recreated).await;
+    let after_refusal: Vec<uuid::Uuid> = client.list_data_keys(branch).await.unwrap().iter().map(|k| k.id).collect();
+    let same = bound_key(branch, "app", "old", Some(16390));
+    let rotated = client.rotate_secret_key(branch, old.id, &same).await;
+    let legacy = bound_key(branch, "legacy", "legacy", None);
+    client.create_secret_key(&legacy).await.unwrap();
+    let adopted = bound_key(branch, "legacy", "legacy", Some(16400));
+    let adopted_ok = client.rotate_secret_key(branch, legacy.id, &adopted).await;
+    let keys = client.list_data_keys(branch).await.unwrap();
+    cleanup(&client, id).await;
+    assert!(matches!(&refused, Err(MetadataError::RoleRecreated(r)) if r == "app"), "{refused:?}");
+    assert_eq!(after_refusal, [old.id], "the revoke rolled back, nothing inserted");
+    assert!(matches!(rotated, Ok(true)), "{rotated:?}");
+    assert!(matches!(adopted_ok, Ok(true)), "{adopted_ok:?}");
+    let oid_of = |id| keys.iter().find(|k| k.id == id).map(|k| k.role_oid);
+    assert_eq!(oid_of(same.id), Some(Some(16390)));
+    assert_eq!(oid_of(adopted.id), Some(Some(16400)));
+}
+
+// The resync's repairs apply only while the row still looks as the resync saw it.
+#[tokio::test]
+#[ignore]
+async fn fix_key_roles_applies_each_repair_conditionally() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let dead = bound_key(branch, "gone", "dead", Some(16385));
+    let moved = bound_key(branch, "old_name", "moved", Some(16390));
+    let legacy = bound_key(branch, "app", "legacy", None);
+    let stale = bound_key(branch, "app", "stale", Some(16384));
+    for key in [&dead, &moved, &legacy, &stale] {
+        client.create_secret_key(key).await.unwrap();
+    }
+    let changed = client
+        .fix_key_roles(
+            branch,
+            &[
+                KeyRoleFix::Revoke { id: dead.id, role: "gone".into(), oid: Some(16385) },
+                KeyRoleFix::Follow { id: moved.id, from: "old_name".into(), to: "renamed".into(), oid: 16390 },
+                KeyRoleFix::Backfill { id: legacy.id, role: "app".into(), oid: 16384 },
+                // Seen with another OID than the row has now: left alone.
+                KeyRoleFix::Revoke { id: stale.id, role: "app".into(), oid: Some(1) },
+            ],
+        )
+        .await
+        .unwrap();
+    let keys = client.list_data_keys(branch).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(changed, 3);
+    let find = |id| keys.iter().find(|k| k.id == id);
+    assert!(find(dead.id).is_none(), "revoked");
+    assert_eq!(find(moved.id).unwrap().role, "renamed");
+    assert_eq!(find(legacy.id).unwrap().role_oid, Some(16384));
+    assert!(find(stale.id).is_some(), "a repair that no longer matches is skipped");
+}
+
+#[tokio::test]
+#[ignore]
+async fn create_secret_key_before_a_ddl_drop_is_seen_by_it() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "app", true, "SCRAM-SHA-256$o", "v1:app", 10).await.unwrap();
+    let (key, _) = new_key(branch, DataKeyKind::Secret, "app", "first");
+    client.create_secret_key(&key).await.unwrap();
+    let mut ddl = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let live = ddl.live_secret_keys("app").await.unwrap();
+    drop(ddl);
+    cleanup(&client, id).await;
+    assert_eq!(live.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [key.id]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn rotate_secret_key_waits_for_a_password_removal_and_keeps_the_rowless_role() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "app", true, "SCRAM-SHA-256$o", "v1:app", 10).await.unwrap();
+    let (old, _) = new_key(branch, DataKeyKind::Secret, "app", "old");
+    client.create_secret_key(&old).await.unwrap();
+    // `ALTER ROLE app PASSWORD NULL` through the receiver, uncommitted: the row goes, the role
+    // stays (C1: a role without a row still backs its keys).
+    let mut ddl = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(ddl.remove_copy("app").await.unwrap());
+
+    let (new, _) = new_key(branch, DataKeyKind::Secret, "app", "old");
+    let c = client.clone();
+    let n = new.clone();
+    let old_id = old.id;
+    let mut rotating = tokio::spawn(async move { c.rotate_secret_key(branch, old_id, &n).await });
+    let waited = tokio::time::timeout(STILL_BLOCKED, &mut rotating).await;
+    assert!(waited.is_err(), "rotation must wait for the DDL transaction");
+
+    ddl.commit().await.unwrap();
+    let result = rotating.await.unwrap();
+    let live: Vec<uuid::Uuid> = client.list_data_keys(branch).await.unwrap().iter().map(|k| k.id).collect();
+    cleanup(&client, id).await;
+    assert!(matches!(result, Ok(true)), "{result:?}");
+    assert_eq!(live, [new.id], "the old key revoked, the new one live for the same role");
+}
+
+#[tokio::test]
+#[ignore]
+async fn rotate_secret_key_follows_a_rename_made_while_it_waited() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "app", true, "SCRAM-SHA-256$o", "v1:app", 10).await.unwrap();
+    let (old, _) = new_key(branch, DataKeyKind::Secret, "app", "old");
+    client.create_secret_key(&old).await.unwrap();
+    let mut ddl = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(ddl.rename_copy("app", "app2", None).await.unwrap());
+
+    // The caller read the old role name before the rename committed.
+    let (new, _) = new_key(branch, DataKeyKind::Secret, "app", "old");
+    let c = client.clone();
+    let n = new.clone();
+    let old_id = old.id;
+    let mut rotating = tokio::spawn(async move { c.rotate_secret_key(branch, old_id, &n).await });
+    assert!(tokio::time::timeout(STILL_BLOCKED, &mut rotating).await.is_err());
+    ddl.commit().await.unwrap();
+    let result = rotating.await.unwrap();
+    let roles: Vec<String> = client.list_data_keys(branch).await.unwrap().into_iter().map(|k| k.role).collect();
+    cleanup(&client, id).await;
+    assert!(matches!(result, Ok(true)), "{result:?}");
+    assert_eq!(roles, ["app2"], "the new key has the role's current name");
+}
+
+#[tokio::test]
+#[ignore]
+async fn rotate_secret_key_before_a_ddl_drop_is_seen_by_it() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "app", true, "SCRAM-SHA-256$o", "v1:app", 10).await.unwrap();
+    let (old, _) = new_key(branch, DataKeyKind::Secret, "app", "old");
+    client.create_secret_key(&old).await.unwrap();
+    let (new, _) = new_key(branch, DataKeyKind::Secret, "app", "old");
+    let rotated = client.rotate_secret_key(branch, old.id, &new).await.unwrap();
+    let mut ddl = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let live = ddl.live_secret_keys("app").await.unwrap();
+    drop(ddl);
+    cleanup(&client, id).await;
+    assert!(rotated);
+    assert_eq!(live.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [new.id]);
+}
+
+// The API's delete drops the role in SQL (forwarding off), then deletes the row: a key stored
+// while it dropped the role (after its own key check) is revoked with it.
+#[tokio::test]
+#[ignore]
+async fn delete_role_copy_revokes_late_keys() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$o", "v1:app", 10).await.unwrap();
+    let (late, _) = new_key(branch, DataKeyKind::Secret, "app", "late");
+    let (other, _) = new_key(branch, DataKeyKind::Secret, "authenticated", "other");
+    client.create_secret_key(&late).await.unwrap();
+    client.create_secret_key(&other).await.unwrap();
+    let deleted = client.delete_role_copy(&ep, "app").await.unwrap();
+    let live: Vec<uuid::Uuid> = client.list_data_keys(branch).await.unwrap().iter().map(|k| k.id).collect();
+    cleanup(&client, id).await;
+    assert!(deleted);
+    assert_eq!(live, [other.id], "only the dropped role's key is revoked");
+}
+
+#[tokio::test]
+#[ignore]
+async fn rotate_secret_key_refuses_a_public_key() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (public, _) = new_key(branch, DataKeyKind::Public, "anon", "default");
+    client.insert_data_key(&public).await.unwrap();
+    let (next, _) = new_key(branch, DataKeyKind::Secret, "anon", "default");
+    let rotated = client.rotate_secret_key(branch, public.id, &next).await;
+    let live: Vec<uuid::Uuid> = client.list_data_keys(branch).await.unwrap().iter().map(|k| k.id).collect();
+    cleanup(&client, id).await;
+    assert!(matches!(rotated, Ok(false)), "{rotated:?}");
+    assert_eq!(live, [public.id], "the public key is still live, nothing inserted");
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_rowless_rename_moves_the_keys() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    // No neon_roles row for "authenticated" or "nopw": a role without a password has none.
+    let (live, _) = new_key(branch, DataKeyKind::Secret, "nopw", "live");
+    let (revoked, _) = new_key(branch, DataKeyKind::Secret, "nopw", "revoked");
+    let (other, _) = new_key(branch, DataKeyKind::Secret, "authenticated", "other");
+    for key in [&live, &revoked, &other] {
+        client.insert_data_key(key).await.unwrap();
+    }
+    sqlx::query("UPDATE data_api_keys SET revoked_at = now() WHERE id = $1")
+        .bind(revoked.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let v = version(&client, &ep).await;
+
+    // Two hops, as the receiver does; then a new role takes the old name.
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    let row = tx.rename_copy("nopw", "aside", None).await.unwrap();
+    let rename = tx.rename_copy("aside", "moved", None).await.unwrap();
+    tx.upsert_sql_copy("nopw", SQL_VERIFIER).await.unwrap();
+    let inherited = tx.live_secret_keys("nopw").await.unwrap();
+    let moved = tx.live_secret_keys("moved").await.unwrap();
+    tx.commit().await.unwrap();
+
+    let roles: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, role FROM data_api_keys WHERE branch_id = $1 ORDER BY name")
+            .bind(branch.as_uuid())
+            .fetch_all(client.pool())
+            .await
+            .unwrap();
+    let v_after = version(&client, &ep).await;
+    cleanup(&client, id).await;
+    assert!(!row && !rename, "no row moved");
+    assert!(inherited.is_empty(), "the new role has no keys");
+    assert_eq!(moved.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [live.id]);
+    assert_eq!(
+        roles,
+        [
+            ("live".to_string(), "moved".to_string()),
+            ("other".to_string(), "authenticated".to_string()),
+            ("revoked".to_string(), "moved".to_string()),
+        ]
+    );
+    assert!(v_after > v, "moving keys is a write");
+}
+
+#[tokio::test]
+#[ignore]
+async fn ddl_rowless_swap_moves_each_roles_keys() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    // "a" has a row, "b" none (mixed); both back a key.
+    client.insert_api_role(&ep, "a", true, "SCRAM-SHA-256$a", "v1:a", 10).await.unwrap();
+    let (ka, _) = new_key(branch, DataKeyKind::Secret, "a", "key-a");
+    let (kb, _) = new_key(branch, DataKeyKind::Secret, "b", "key-b");
+    client.insert_data_key(&ka).await.unwrap();
+    client.insert_data_key(&kb).await.unwrap();
+
+    // a -> aside1, b -> aside2, then aside1 -> b, aside2 -> a.
+    let mut tx = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    tx.rename_copy("a", "aside1", None).await.unwrap();
+    tx.rename_copy("b", "aside2", None).await.unwrap();
+    tx.rename_copy("aside1", "b", None).await.unwrap();
+    tx.rename_copy("aside2", "a", None).await.unwrap();
+    tx.commit().await.unwrap();
+    let roles: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, role FROM data_api_keys WHERE branch_id = $1 ORDER BY name")
+            .bind(branch.as_uuid())
+            .fetch_all(client.pool())
+            .await
+            .unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(roles, [("key-a".to_string(), "b".to_string()), ("key-b".to_string(), "a".to_string())]);
 }

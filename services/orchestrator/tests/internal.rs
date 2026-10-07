@@ -24,7 +24,8 @@ use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
 use chelabase_types::mode::Mode;
 use chelabase_types::role_settings::RoleSettings;
 use orchestrator::internal::{
-    BoxFuture, CachePort, DdlPort, InternalState, NeonMetadataPort, build_internal_router,
+    BoxFuture, CachePort, DdlPort, InternalState, NeonMetadataPort, ResyncPort,
+    build_internal_router,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -112,6 +113,8 @@ struct DdlState {
     owner_password_cleared: bool,
     /// Rows `mark_password_unreadable` was called for.
     unreadable: std::collections::BTreeSet<String>,
+    /// Rows `set_login` stamped with `forwarded_at`.
+    stamped: std::collections::BTreeSet<String>,
     roles_version: u64,
 }
 
@@ -193,6 +196,17 @@ impl DdlPort for FakeDdl {
         self.wrote = true;
         Ok(())
     }
+    async fn set_login(&mut self, name: &str, login: bool) -> Result<bool, MetadataError> {
+        match self.state.roles.get_mut(name) {
+            Some(r) if r.origin != RoleOrigin::Owner => {
+                r.login = login;
+                self.wrote = true;
+                self.state.stamped.insert(name.into());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
     async fn set_owner_verifier(&mut self, verifier: &str) -> Result<(), MetadataError> {
         for r in self.state.roles.values_mut() {
             if r.origin == RoleOrigin::Owner {
@@ -231,25 +245,27 @@ impl DdlPort for FakeDdl {
         new: &str,
         resealed: Option<&str>,
     ) -> Result<bool, MetadataError> {
-        if !self.state.roles.contains_key(old) {
-            return Ok(false);
-        }
-        if self.state.roles.contains_key(new) {
+        let row_moves = self.state.roles.contains_key(old);
+        if row_moves && self.state.roles.contains_key(new) {
             return Err(duplicate_key());
         }
-        let mut row = self.state.roles.remove(old).unwrap();
-        row.name = new.into();
-        row.password_enc = resealed.map(str::to_string);
-        self.state.roles.insert(new.into(), row);
+        if row_moves {
+            let mut row = self.state.roles.remove(old).unwrap();
+            row.name = new.into();
+            row.password_enc = resealed.map(str::to_string);
+            self.state.roles.insert(new.into(), row);
+        }
+        // The keys follow the name, row or no row.
         if self.state.branch.is_some() {
             for key in &mut self.state.keys {
                 if key.2 == old {
                     key.2 = new.into();
+                    self.wrote = true;
                 }
             }
         }
-        self.wrote = true;
-        Ok(true)
+        self.wrote |= row_moves;
+        Ok(row_moves)
     }
     async fn has_database(&mut self, name: &str) -> Result<bool, MetadataError> {
         Ok(self.state.branch.is_some() && self.state.dbs.contains_key(name))
@@ -453,6 +469,14 @@ impl NeonMetadataPort for FakeNeon {
         } else {
             vec![]
         })
+    }
+
+    async fn endpoint_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<BranchId>, MetadataError> {
+        self.check()?;
+        Ok(self.ddl.lock().unwrap().get(endpoint_id).and_then(|s| s.branch))
     }
 
     async fn neon_endpoints_for_tenant(
@@ -756,8 +780,8 @@ async fn storcon(healthy: bool) -> String {
                 "/control/v1/safekeeper",
                 get(|| async {
                     axum::Json(json!([
-                        { "host": "sk1", "port": 5454, "scheduling_policy": "Active" },
-                        { "host": "sk2", "port": 5454, "scheduling_policy": "Pause" },
+                        { "id": 1, "host": "sk1", "port": 5454, "scheduling_policy": "Active" },
+                        { "id": 2, "host": "sk2", "port": 5454, "scheduling_policy": "Pause" },
                     ]))
                 }),
             )
@@ -903,6 +927,7 @@ struct AppSetup {
     signing_key: Option<String>,
     zitadel: Option<String>,
     jobs: FakeJobs,
+    resync: FakeResync,
 }
 
 impl Default for AppSetup {
@@ -912,7 +937,23 @@ impl Default for AppSetup {
             signing_key: Some(SIGNING_KEY.into()),
             zitadel: None,
             jobs: FakeJobs::default(),
+            resync: FakeResync::default(),
         }
+    }
+}
+
+/// Records each branch the receiver asked the worker to resync.
+#[derive(Clone, Default)]
+struct FakeResync {
+    asked: Arc<Mutex<Vec<BranchId>>>,
+}
+
+impl ResyncPort for FakeResync {
+    fn resync_branch(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.asked.lock().unwrap().push(branch);
+            Ok(())
+        })
     }
 }
 
@@ -958,6 +999,7 @@ async fn spawn_with_app(
         secrets: key.clone(),
         roles,
         cache: Arc::new(cache),
+        resync: Arc::new(app.resync),
         control_plane_uri: CONTROL_PLANE_URI.into(),
         rest: orchestrator::RestInternal {
             url: rest_url.into(),
@@ -1560,7 +1602,7 @@ async fn key_lookup_requires_the_data_keys_bearer() {
     let branch = BranchId::new();
     neon.data_keys.lock().unwrap().push((
         sha("chk_sec_x"),
-        DataKeyLookup { key_id: KEY_ID, branch_id: branch, project_id: PROJECT_ID, kind: DataKeyKind::Secret, role: "reporting".into(), databases: None },
+        DataKeyLookup { key_id: KEY_ID, branch_id: branch, project_id: PROJECT_ID, kind: DataKeyKind::Secret, role: "reporting".into(), databases: None, role_oid: Some(16390) },
     ));
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     let path = format!("/internal/data/keys/{}", hex::encode(sha("chk_sec_x")));
@@ -1575,7 +1617,7 @@ async fn key_lookup_requires_the_data_keys_bearer() {
     assert_eq!(status, 200);
     assert_eq!(
         body,
-        json!({ "key_id": KEY_ID, "branch_id": branch, "project_id": PROJECT_ID, "kind": "secret", "role": "reporting", "databases": null })
+        json!({ "key_id": KEY_ID, "branch_id": branch, "project_id": PROJECT_ID, "kind": "secret", "role": "reporting", "databases": null, "role_oid": 16390 })
     );
     // `last_used_at` is stamped off the response path.
     for _ in 0..50 {
@@ -1600,6 +1642,7 @@ async fn key_lookup_returns_databases() {
             kind: DataKeyKind::Secret,
             role: "reporting".into(),
             databases: Some(vec!["web1".into(), "analytics".into()]),
+            role_oid: None,
         },
     ));
     let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
@@ -1621,6 +1664,7 @@ async fn key_lookup_returns_project_id() {
             kind: DataKeyKind::Secret,
             role: "reporting".into(),
             databases: None,
+            role_oid: None,
         },
     ));
     let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
@@ -2196,6 +2240,79 @@ fn rows() -> Vec<Rule> {
             check: no_app_rw,
         },
         Rule {
+            what: "the owner dropped and created again",
+            rules: sh,
+            setup: none,
+            body: roles_delta(vec![json!({
+                "op": "set", "name": "postgres", "recreated": true,
+                "password": STRONG, "encrypted_password": SCRAM
+            })]),
+            status: 409,
+            text: "the branch owner \"postgres\" can't be dropped or renamed",
+            check: |s| {
+                assert!(s.roles.contains_key("postgres"));
+                assert!(!s.owner_password_cleared);
+                assert_eq!(s.roles_version, 0);
+            },
+        },
+        Rule {
+            what: "at the cap, a drop and a new copy in one delta",
+            rules: with_caps(sh, 2, 20),
+            setup: two_sql_copies,
+            body: roles_delta(vec![set("app_rw", STRONG, SCRAM), json!({ "op": "del", "name": "r1" })]),
+            status: 200,
+            text: "",
+            check: |s| assert!(s.roles.contains_key("app_rw") && !s.roles.contains_key("r1")),
+        },
+        Rule {
+            what: "at the cap, a new copy and no drop",
+            rules: with_caps(sh, 2, 20),
+            setup: two_sql_copies,
+            body: roles_delta(vec![set("app_rw", STRONG, SCRAM), set("r1", STRONG, SCRAM2)]),
+            status: 409,
+            text: "this branch has reached its limit of 2 login roles (CHELABASE_BRANCH_ROLE_CAP)",
+            check: |s| {
+                assert!(!s.roles.contains_key("app_rw"));
+                assert_eq!(s.roles["r1"].scram_verifier.as_deref(), Some(SCRAM));
+            },
+        },
+        Rule {
+            what: "at the cap, PASSWORD NULL then a new copy",
+            rules: with_caps(sh, 2, 20),
+            setup: two_sql_copies,
+            body: roles_delta(vec![json!({ "op": "set", "name": "r1" }), set("app_rw", STRONG, SCRAM)]),
+            status: 200,
+            text: "",
+            check: |s| assert!(s.roles.contains_key("app_rw") && !s.roles.contains_key("r1")),
+        },
+        Rule {
+            what: "at the cap, a new copy then PASSWORD NULL",
+            rules: with_caps(sh, 2, 20),
+            setup: two_sql_copies,
+            body: roles_delta(vec![set("app_rw", STRONG, SCRAM), json!({ "op": "set", "name": "r1" })]),
+            status: 200,
+            text: "",
+            check: |s| assert!(s.roles.contains_key("app_rw") && !s.roles.contains_key("r1")),
+        },
+        Rule {
+            what: "over the cap from before, a delta that doesn't add a copy",
+            rules: with_caps(sh, 1, 20),
+            setup: two_sql_copies,
+            body: roles_delta(vec![set("r2", STRONG, SCRAM2)]),
+            status: 200,
+            text: "",
+            check: |s| assert_eq!(s.roles["r2"].scram_verifier.as_deref(), Some(SCRAM2)),
+        },
+        Rule {
+            what: "over the cap from before, a drop and a new copy",
+            rules: with_caps(sh, 1, 20),
+            setup: two_sql_copies,
+            body: roles_delta(vec![set("app_rw", STRONG, SCRAM), json!({ "op": "del", "name": "r1" })]),
+            status: 200,
+            text: "",
+            check: |s| assert!(s.roles.contains_key("app_rw") && !s.roles.contains_key("r1")),
+        },
+        Rule {
             what: "the owner re-passworded",
             rules: sh,
             setup: none,
@@ -2640,25 +2757,78 @@ async fn ddl_rename_onto_a_dropped_keys_role_is_refused() {
     assert_eq!(state.roles["a"].scram_verifier.as_deref(), Some("SCRAM-SHA-256$b"));
 }
 
-// A swap of two roles that both back live keys is taken: each key follows its role.
+// A role with no row (NOLOGIN, no password: `authenticated` is the usual one) backs keys too.
+// `DROP app; CREATE app; ALTER app RENAME TO app2` reaches the receiver as one entry (renamed,
+// recreated): the keys moved to `app2` with the rename, so the recreate check finds them.
 #[tokio::test]
-async fn ddl_swap_with_keys_on_both_roles() {
+async fn ddl_drop_create_rename_of_a_rowless_role_with_a_key_is_refused() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| s.keys.push((uuid::Uuid::new_v4(), "ci-key".into(), "app".into(), false)));
+    let before = neon.ddl_state();
+    let mut op = json!({ "op": "set", "name": "app2", "old_name": "app", "recreated": true });
+    op["touched"] = json!(true);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
+    assert_eq!(
+        (status, text.as_str()),
+        (409, "role \"app2\" backs data API key(s) ci-key; revoke them first")
+    );
+    assert_eq!(neon.ddl_state(), before, "nothing written");
+}
+
+// `ALTER ROLE app RENAME TO x; CREATE ROLE app`: the key goes with the old role to `x`, and the
+// new `app` starts with none (live and revoked alike).
+#[tokio::test]
+async fn ddl_rename_of_a_rowless_role_then_create_of_its_old_name() {
     let (neon, _) = ddl_neon();
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     neon.edit(|s| {
-        s.roles.insert("a".into(), copy("a", RoleOrigin::Sql, Some("SCRAM-SHA-256$a"), None));
-        s.roles.insert("b".into(), copy("b", RoleOrigin::Sql, Some("SCRAM-SHA-256$b"), None));
-        s.keys.push((uuid::Uuid::new_v4(), "key-a".into(), "a".into(), false));
-        s.keys.push((uuid::Uuid::new_v4(), "key-b".into(), "b".into(), false));
+        s.keys.push((uuid::Uuid::new_v4(), "ci-key".into(), "app".into(), false));
+        s.keys.push((uuid::Uuid::new_v4(), "old-key".into(), "app".into(), true));
     });
-    let (status, _, text) = app
-        .ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![rename("a", "b"), rename("b", "a")]))
-        .await;
+    let body = roles_delta(vec![rename("app", "x"), set("app", STRONG, SCRAM2)]);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await;
     assert_eq!(status, 200, "{text}");
     let state = neon.ddl_state();
-    assert_eq!(state.roles["b"].scram_verifier.as_deref(), Some("SCRAM-SHA-256$a"));
-    let role_of = |key: &str| state.keys.iter().find(|k| k.1 == key).unwrap().2.clone();
-    assert_eq!((role_of("key-a"), role_of("key-b")), ("b".to_string(), "a".to_string()));
+    assert!(state.keys.iter().all(|k| k.2 == "x"), "{:?}", state.keys);
+    assert!(state.roles.contains_key("app"), "the new role has its copy");
+}
+
+// A swap of two roles that both back live keys is taken: each key follows its role, whether
+// both roles have a row, neither has, or only one does.
+#[tokio::test]
+async fn ddl_swap_with_keys_on_both_roles() {
+    for (row_a, row_b) in [(true, true), (false, false), (true, false), (false, true)] {
+        let (neon, _) = ddl_neon();
+        let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+        neon.edit(|s| {
+            if row_a {
+                s.roles.insert("a".into(), copy("a", RoleOrigin::Sql, Some("SCRAM-SHA-256$a"), None));
+            }
+            if row_b {
+                s.roles.insert("b".into(), copy("b", RoleOrigin::Sql, Some("SCRAM-SHA-256$b"), None));
+            }
+            s.keys.push((uuid::Uuid::new_v4(), "key-a".into(), "a".into(), false));
+            s.keys.push((uuid::Uuid::new_v4(), "key-b".into(), "b".into(), false));
+        });
+        let (status, _, text) = app
+            .ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![rename("a", "b"), rename("b", "a")]))
+            .await;
+        assert_eq!(status, 200, "rows {row_a}/{row_b}: {text}");
+        let state = neon.ddl_state();
+        // A row follows its name; a name without one stays without.
+        assert_eq!(state.roles.contains_key("b"), row_a, "rows {row_a}/{row_b}");
+        assert_eq!(state.roles.contains_key("a"), row_b, "rows {row_a}/{row_b}");
+        if row_a {
+            assert_eq!(state.roles["b"].scram_verifier.as_deref(), Some("SCRAM-SHA-256$a"));
+        }
+        let role_of = |key: &str| state.keys.iter().find(|k| k.1 == key).unwrap().2.clone();
+        assert_eq!(
+            (role_of("key-a"), role_of("key-b")),
+            ("b".to_string(), "a".to_string()),
+            "rows {row_a}/{row_b}"
+        );
+    }
 }
 
 // M2: a rename onto a name whose row is stale (the role was dropped in the same transaction,
@@ -2741,6 +2911,127 @@ async fn ddl_publishes_twice_and_survives_valkey_down() {
         }
         assert_eq!(late.len(), 6, "only the changed roles: {late:?}");
     }
+}
+
+async fn spawn_with_resync(neon: FakeNeon, resync: FakeResync) -> Internal {
+    spawn_with_app(
+        neon,
+        FakeLocator::default(),
+        "http://127.0.0.1:9",
+        rules(Mode::SelfHosted, false),
+        FakeCache::default(),
+        "http://127.0.0.1:9",
+        AppSetup { resync, ..AppSetup::default() },
+    )
+    .await
+}
+
+/// Polls until `done` holds (the spawned publish ran); false after 2 s.
+async fn wait_until(done: impl Fn() -> bool) -> bool {
+    for _ in 0..200 {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    done()
+}
+
+// T12b: a forwarded `NOLOGIN` flags the existing copy (stamped against the resync's 10 s
+// guard); the owner and a role with no copy are left alone. No password row is added or removed.
+#[tokio::test]
+async fn ddl_login_updates_the_existing_copy() {
+    let (neon, _) = ddl_neon();
+    neon.edit(two_sql_copies);
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let body = roles_delta(vec![
+        json!({ "op": "set", "name": "r1", "login": false, "valid_until": "2030-01-01" }),
+        json!({ "op": "set", "name": "postgres", "login": false }),
+        json!({ "op": "set", "name": "ghost", "login": false }),
+    ]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let state = neon.ddl_state();
+    assert!(!state.roles["r1"].login);
+    assert_eq!(state.roles["r1"].scram_verifier.as_deref(), Some(SCRAM), "password untouched");
+    assert!(state.roles["r2"].login);
+    assert!(state.roles["postgres"].login);
+    assert!(!state.roles.contains_key("ghost"));
+    assert_eq!(state.stamped.iter().collect::<Vec<_>>(), ["r1"]);
+    assert_eq!(state.roles_version, 1);
+
+    let body = roles_delta(vec![json!({ "op": "set", "name": "r1", "login": true })]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    assert!(neon.ddl_state().roles["r1"].login);
+}
+
+#[tokio::test]
+async fn ddl_a_new_copy_takes_the_forwarded_login() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let mut nologin = set("app_rw", STRONG, SCRAM);
+    nologin["login"] = json!(false);
+    let mut login = set("app_ro", STRONG, SCRAM);
+    login["login"] = json!(true);
+    let body = roles_delta(vec![nologin, login, set("app_plain", STRONG, SCRAM)]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let state = neon.ddl_state();
+    assert!(!state.roles["app_rw"].login);
+    assert!(state.roles["app_ro"].login);
+    assert!(state.roles["app_plain"].login, "no login key: the default");
+}
+
+#[tokio::test]
+async fn ddl_touched_roles_ask_for_one_resync() {
+    let (neon, branch) = ddl_neon();
+    neon.edit(two_sql_copies);
+    let resync = FakeResync::default();
+    let app = spawn_with_resync(neon.clone(), resync.clone()).await;
+    let before = neon.ddl_state();
+    let body = roles_delta(vec![
+        json!({ "op": "set", "name": "r1", "touched": true }),
+        json!({ "op": "set", "name": "grp", "touched": true }),
+        json!({ "op": "set", "name": "r2", "touched": true }),
+    ]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    assert!(wait_until(|| !resync.asked.lock().unwrap().is_empty()).await);
+    assert_eq!(*resync.asked.lock().unwrap(), [branch], "once, for the branch");
+    assert_eq!(neon.begins.load(Ordering::SeqCst), 0, "a touch-only delta takes no lock");
+    let state = neon.ddl_state();
+    assert_eq!(state.roles, before.roles, "a touch removes no copy and stamps nothing");
+    assert!(state.stamped.is_empty());
+    assert_eq!(state.roles_version, before.roles_version);
+}
+
+// M1: dropping a group role changes its members' derived levels, so a `del` resyncs too.
+#[tokio::test]
+async fn ddl_a_role_drop_asks_for_one_resync() {
+    let (neon, branch) = ddl_neon();
+    neon.edit(two_sql_copies);
+    let resync = FakeResync::default();
+    let app = spawn_with_resync(neon.clone(), resync.clone()).await;
+    let body = roles_delta(vec![json!({ "op": "del", "name": "grp" })]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    assert!(wait_until(|| !resync.asked.lock().unwrap().is_empty()).await);
+    assert_eq!(*resync.asked.lock().unwrap(), [branch], "once, for the branch");
+}
+
+#[tokio::test]
+async fn ddl_untouched_and_refused_requests_ask_for_no_resync() {
+    let (neon, _) = ddl_neon();
+    let resync = FakeResync::default();
+    let app = spawn_with_resync(neon.clone(), resync.clone()).await;
+    // Passwords only (an old payload), then a refused delta that is also touched.
+    let body = roles_delta(vec![set("app_rw", STRONG, SCRAM)]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let body = roles_delta(vec![json!({ "op": "set", "name": "anon", "touched": true }), {
+        set("anon", STRONG, SCRAM)
+    }]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 409);
+    // A later touched request marks the point by which a wrongly sent request would show.
+    let body = roles_delta(vec![json!({ "op": "set", "name": "grp", "touched": true })]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    assert!(wait_until(|| !resync.asked.lock().unwrap().is_empty()).await);
+    assert_eq!(resync.asked.lock().unwrap().len(), 1, "only the later, accepted request");
 }
 
 // The route is reachable from every compute's network: a body over 64 KiB is refused before
@@ -2833,6 +3124,131 @@ async fn ddl_rename_without_password_key_keeps_the_copy() {
     let state = neon.ddl_state();
     assert!(!state.roles.contains_key("r1"));
     assert_eq!(state.roles["r2"].scram_verifier.as_deref(), Some(SCRAM));
+}
+
+// T13d (re-review I1): `ALTER ROLE … VALID UNTIL` alone arrives as a `set` with `valid_until`
+// and no password key. It is an attribute change: the owner is not refused, and an API-created
+// row keeps its copy and its sealed password.
+#[tokio::test]
+async fn ddl_valid_until_alone_is_an_attribute_change() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| {
+        s.roles
+            .insert("api_r".into(), copy("api_r", RoleOrigin::Api, Some(SCRAM), Some("sealed")));
+    });
+    let before = neon.ddl_state();
+    let body = roles_delta(vec![
+        json!({ "op": "set", "name": "postgres", "valid_until": "2030-01-01" }),
+    ]);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await;
+    assert_eq!(status, 200, "owner: {text}");
+    let body = roles_delta(vec![
+        json!({ "op": "set", "name": "api_r", "valid_until": "infinity" }),
+    ]);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await;
+    assert_eq!(status, 200, "api row: {text}");
+    let state = neon.ddl_state();
+    assert_eq!(state.roles, before.roles, "no row removed or changed");
+    assert_eq!(state.roles["api_r"].password_enc.as_deref(), Some("sealed"));
+}
+
+// T13d (D20): the fork marks a role dropped and created again in one transaction with
+// `"recreated": true`. The drop's live-key refusal applies, with or without a new password.
+#[tokio::test]
+async fn ddl_recreated_role_with_a_live_key_is_refused() {
+    for with_password in [true, false] {
+        let (neon, _) = ddl_neon();
+        let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+        neon.edit(|s| {
+            s.roles.insert("app".into(), copy("app", RoleOrigin::Sql, Some(SCRAM), None));
+            s.keys.push((uuid::Uuid::new_v4(), "ci-key".into(), "app".into(), false));
+            s.keys.push((uuid::Uuid::new_v4(), "old-key".into(), "app".into(), true));
+        });
+        let before = neon.ddl_state();
+        let mut op = if with_password {
+            set("app", STRONG, SCRAM2)
+        } else {
+            json!({ "op": "set", "name": "app", "password": null })
+        };
+        op["recreated"] = json!(true);
+        op["touched"] = json!(true);
+        let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
+        assert_eq!(
+            (status, text.as_str()),
+            (409, "role \"app\" backs data API key(s) ci-key; revoke them first"),
+            "with password: {with_password}"
+        );
+        assert_eq!(neon.ddl_state(), before, "nothing written");
+    }
+}
+
+#[tokio::test]
+async fn ddl_recreated_role_without_keys_is_taken() {
+    // With a password: the copy gets the new verifier.
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| {
+        s.roles.insert("app".into(), copy("app", RoleOrigin::Sql, Some(SCRAM), None));
+        s.keys.push((uuid::Uuid::new_v4(), "old-key".into(), "app".into(), true));
+    });
+    let mut op = set("app", STRONG, SCRAM2);
+    op["recreated"] = json!(true);
+    op["touched"] = json!(true);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(neon.ddl_state().roles["app"].scram_verifier.as_deref(), Some(SCRAM2));
+    // Without a password: the copy goes.
+    let mut op = json!({ "op": "set", "name": "app", "password": null, "recreated": true });
+    op["touched"] = json!(true);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(!neon.ddl_state().roles.contains_key("app"));
+}
+
+// I1: a recreated role is a new role. Its row starts fresh (origin `sql`, plain, no API
+// fields, not pending), so the resync can't treat it as the dropped API role and give it back
+// owner attributes or `neon_superuser`.
+#[tokio::test]
+async fn ddl_recreated_role_starts_from_a_fresh_row() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| {
+        let mut old = copy("app", RoleOrigin::Api, Some(SCRAM), Some("sealed"));
+        old.level = RoleLevel::OwnerLevel;
+        old.api_owner_level = true;
+        old.pending = true;
+        old.login = false;
+        s.roles.insert("app".into(), old);
+    });
+    let mut op = set("app", STRONG, SCRAM2);
+    op["recreated"] = json!(true);
+    op["touched"] = json!(true);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
+    assert_eq!(status, 200, "{text}");
+    let row = neon.ddl_state().roles["app"].clone();
+    assert_eq!(row.origin, RoleOrigin::Sql);
+    assert_eq!(row.level, RoleLevel::Plain);
+    assert!(!row.api_owner_level && !row.pending, "no API fields carried over");
+    assert!(row.login, "the new role's defaults, not the dropped one's");
+    assert_eq!(row.scram_verifier.as_deref(), Some(SCRAM2));
+    assert_eq!(row.password_enc, None);
+}
+
+// Not recreated, with live keys: an ordinary password change, taken as before.
+#[tokio::test]
+async fn ddl_a_password_change_with_a_live_key_is_still_taken() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| {
+        s.roles.insert("app".into(), copy("app", RoleOrigin::Sql, Some(SCRAM), None));
+        s.keys.push((uuid::Uuid::new_v4(), "ci-key".into(), "app".into(), false));
+    });
+    let mut op = set("app", STRONG, SCRAM2);
+    op["recreated"] = json!(false);
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(neon.ddl_state().roles["app"].scram_verifier.as_deref(), Some(SCRAM2));
 }
 
 // C4: a sealed password that won't open is dropped and the row is marked unreadable.
@@ -3160,6 +3576,7 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
             signing_key: signing_key.map(str::to_string),
             zitadel: zitadel.map(|z| z.base.clone()),
             jobs: jobs.clone(),
+            resync: FakeResync::default(),
         },
     )
     .await;

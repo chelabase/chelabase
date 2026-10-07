@@ -1115,6 +1115,12 @@ impl MetadataClient {
 
     /// One transaction: deletes a non-owner row, `roles_version += 1` (no reconfigure: the spec
     /// lists only the owner). False when there was none (the owner's row is never deleted here).
+    ///
+    /// The API's delete calls it once the role is dropped in SQL (forwarding off, so the DDL
+    /// receiver never sees it). With the row deleted, any live secret key the branch got for
+    /// the name after the caller's key check, while the role was being dropped, is revoked at
+    /// once (its OID is gone, so it was already dead; this only tidies it up before the
+    /// resync would).
     pub async fn delete_role_copy(
         &self,
         endpoint_id: &str,
@@ -1135,6 +1141,16 @@ impl MetadataClient {
         if deleted != 1 {
             return Ok(false);
         }
+        sqlx::query(
+            "UPDATE data_api_keys k SET revoked_at = now()
+             FROM branches b
+             WHERE b.endpoint_id = $1 AND k.branch_id = b.id
+               AND k.role = $2 AND k.kind = 'secret' AND k.revoked_at IS NULL",
+        )
+        .bind(endpoint_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
         bump_roles_version_only(&mut tx, endpoint_id).await?;
         tx.commit().await?;
         Ok(true)
@@ -1183,10 +1199,12 @@ impl MetadataClient {
     }
 
     /// The resync's one transaction. Locks the endpoint row; if `roles_version` isn't
-    /// `read_version` nothing is written (`VersionMoved`). Otherwise applies `write`, skipping
-    /// in SQL every row whose `forwarded_at` is under 10 s old (a DDL the receiver answered
-    /// whose commit the catalog read may not have seen) and never touching the owner's row, and
-    /// sets the branch's `branch_databases` to exactly `write.databases`. A database's origin is
+    /// `read_version` nothing is written (`VersionMoved`). Otherwise applies `write`. For a
+    /// row whose `forwarded_at` is under 10 s old (a DDL the receiver answered whose commit the
+    /// catalog read may not have seen) the verifier, sealed password and login are kept and
+    /// the row isn't removed; `level` and `pending` still update. The owner's row is never
+    /// touched. It sets the
+    /// branch's `branch_databases` to exactly `write.databases`. A database's origin is
     /// `system` when observed as system, `main` for the recorded main database's name
     /// (`neon_databases`), `sql` otherwise. `roles_version += 1` when anything changed (the
     /// compute needs no reconfigure for this). An unknown endpoint is a `RowNotFound` error.
@@ -1214,41 +1232,50 @@ impl MetadataClient {
                 SealedChange::Clear => (1, None),
                 SealedChange::Set(sealed) => (2, Some(sealed.as_str())),
             };
-            let name: Option<String> = sqlx::query_scalar(
+            // The guard holds back only what the receiver owns (verifier, sealed password,
+            // login); `level` and `pending` come from the catalog and always update.
+            let held = "(r.forwarded_at IS NOT NULL AND r.forwarded_at > now() - interval '10 seconds')";
+            let sql = format!(
                 "INSERT INTO neon_roles AS r
                      (endpoint_id, name, scram_verifier, origin, password_enc, login, level, pending)
                  VALUES ($1, $2, $3, $4, CASE WHEN $7::int = 2 THEN $8 ELSE NULL END, $5, $6, $9)
                  ON CONFLICT (endpoint_id, name) DO UPDATE SET
-                     scram_verifier = EXCLUDED.scram_verifier,
-                     password_enc = CASE $7::int WHEN 0 THEN r.password_enc WHEN 1 THEN NULL
-                                    ELSE $8 END,
-                     login = EXCLUDED.login,
+                     scram_verifier = CASE WHEN {held} THEN r.scram_verifier
+                                           ELSE EXCLUDED.scram_verifier END,
+                     password_enc = CASE WHEN {held} THEN r.password_enc
+                                         ELSE CASE $7::int WHEN 0 THEN r.password_enc
+                                                           WHEN 1 THEN NULL ELSE $8 END END,
+                     login = CASE WHEN {held} THEN r.login ELSE EXCLUDED.login END,
                      level = EXCLUDED.level,
                      pending = EXCLUDED.pending,
-                     password_unreadable = CASE WHEN r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
-                                                  OR $7::int <> 0
+                     password_unreadable = CASE WHEN NOT {held}
+                                                  AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
+                                                       OR $7::int <> 0)
                                                 THEN false ELSE r.password_unreadable END
                  WHERE r.origin <> 'owner'
-                   AND (r.forwarded_at IS NULL OR r.forwarded_at <= now() - interval '10 seconds')
-                   AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
-                        OR r.login IS DISTINCT FROM EXCLUDED.login
-                        OR r.level IS DISTINCT FROM EXCLUDED.level
+                   AND (r.level IS DISTINCT FROM EXCLUDED.level
                         OR r.pending IS DISTINCT FROM EXCLUDED.pending
-                        OR r.password_enc IS DISTINCT FROM
-                           CASE $7::int WHEN 0 THEN r.password_enc WHEN 1 THEN NULL ELSE $8 END)
-                 RETURNING r.name",
-            )
-            .bind(endpoint_id)
-            .bind(&up.name)
-            .bind(up.verifier.as_deref())
-            .bind(up.origin.as_str())
-            .bind(up.login)
-            .bind(up.level.as_str())
-            .bind(mode)
-            .bind(sealed)
-            .bind(up.pending)
-            .fetch_optional(&mut *tx)
-            .await?;
+                        OR (NOT {held}
+                            AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
+                                 OR r.login IS DISTINCT FROM EXCLUDED.login
+                                 OR r.password_enc IS DISTINCT FROM
+                                    CASE $7::int WHEN 0 THEN r.password_enc WHEN 1 THEN NULL ELSE $8 END)))
+                 RETURNING r.name"
+            );
+            // SAFETY (AssertSqlSafe): the interpolated `{held}` fragment is a compile-time
+            // constant; every value is a bound parameter.
+            let name: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(endpoint_id)
+                .bind(&up.name)
+                .bind(up.verifier.as_deref())
+                .bind(up.origin.as_str())
+                .bind(up.login)
+                .bind(up.level.as_str())
+                .bind(mode)
+                .bind(sealed)
+                .bind(up.pending)
+                .fetch_optional(&mut *tx)
+                .await?;
             changed.extend(name);
         }
         if !write.removals.is_empty() {

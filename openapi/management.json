@@ -1860,7 +1860,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (the message says why)",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1880,7 +1880,7 @@
             }
           },
           "503": {
-            "description": "`worker_unavailable`: the worker or job queue can't be reached",
+            "description": "`worker_unavailable`: the worker or job queue can't be reached; `unavailable`: the branch's roles are being changed, retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -2246,7 +2246,17 @@
             }
           },
           "409": {
-            "description": "`public_key_exists`: the branch already has a public key",
+            "description": "`public_key_exists`: the branch already has a public key; `branch_not_ready`: a secret key's role can't be checked while the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`role_refused`: the worker refused the secret key's role (it no longer exists or may not back a key; a rename is followed), or the role was dropped and created again since the key was made",
             "content": {
               "application/json": {
                 "schema": {
@@ -2257,6 +2267,36 @@
           },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the branch's roles are being changed, retry after `Retry-After`; `worker_unavailable`: the worker can't be reached",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
             "content": {
               "application/json": {
                 "schema": {

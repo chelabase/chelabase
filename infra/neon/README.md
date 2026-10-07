@@ -6,6 +6,21 @@ controller, proxy) and a compute image. Both come from our hard fork,
 (`956332507a7be94a00db47f0813412e1fa6d5b0d`). Design: `docs/superpowers/specs/` and
 `docs/superpowers/plans/2026-10-01-neon-fork.md`.
 
+**Round 2:** `NEON_REF` pins fork `main` at `c8d1bb68b`. Shipped: detach waits for each ancestor's WAL
+and multi-level detach copies every ancestor's layers; multixact redo writes the next offset like
+Postgres; the worker reads the safekeepers' `commit_lsn` over HTTP (compose publishes
+safekeeper1 on `127.0.0.1:7676`; `CHELABASE_SAFEKEEPER_HTTP`) for a branch's head; reads at kept LSNs
+(patch 4: an LSN below the GC cutoff is readable and leasable when a child's branch point or a lease
+keeps it exactly, and branch create at such a point takes a short lease); DDL forwarding of role
+attributes (patch 5: LOGIN and VALID UNTIL are forwarded; other attributes and GRANT trigger a
+delayed per-branch resync). Published 2026-10-08 as `c8d1bb68b81f-dev` (pinned by digest in
+`infra/compose/docker-compose.yml`).
+
+**Rollback hazard (round 2):** once the new pageserver ingests multixact `CREATE_ID` records, stored
+layers contain the new `NeonWalRecord::MultixactOffsetCreateWithNext` variant (enum index 8). Rolling
+the pageserver image back to a pin from before round 2 (`956332507a7b` or older) makes those pages
+unreadable. Never roll the pageserver back to a pre-round-2 pin once a round-2 image has run.
+
 ## Pull (default)
 
 `just deps-up` pulls `ghcr.io/chelabase/neon-storage` and `ghcr.io/chelabase/neon-compute-v17`
@@ -55,15 +70,20 @@ landed in chelabase/neon-pre-replay#25 (https://github.com/chelabase/neon-pre-re
 >
 > The `956332507a7b-dev` tags are re-tags of the same digests (made with `docker buildx imagetools create --prefer-index=false`).
 
-1. Merge the change in `chelabase/neon` (`main`).
-2. In a fork checkout, run `.github/scripts/publish-dev.sh`. It builds the dev images, pushes
-   them to GHCR and prints the digests. (Publishing is by hand: pushes to `main` publish
-   nothing, and chelabase has no copy of the script.)
-3. Put the full commit sha in `infra/neon/NEON_REF`, and paste the new tags and digests into
+1. Build once and test: in a fork checkout on the round branch, run
+   `.github/scripts/publish-dev.sh --no-push --allow-unpushed`, re-tag the two
+   `ghcr.io/chelabase/neon-*:<sha12>-dev` images as `chelabase/neon-*:<sha12>-dev` (what
+   `scripts/neon-images.sh` picks up), and run the live suites on them.
+2. Fast-forward `chelabase/neon` `main` to that commit (same SHA, no merge commit).
+3. Run `.github/scripts/publish-dev.sh --push-only`. It pushes those exact local images without
+   rebuilding (refusing unless each image's `org.opencontainers.image.revision` label equals
+   HEAD) and prints the digests. (Publishing is by hand: pushes to `main` publish nothing, and
+   chelabase has no copy of the script.) Plain `publish-dev.sh` builds and pushes in one go.
+4. Put the full commit sha in `infra/neon/NEON_REF`, and paste the new tags and digests into
    `infra/compose/docker-compose.yml` (both images).
-4. `just neon-test` (it checks the ref exists on the fork and that both pins carry
+5. `just neon-test` (it checks the ref exists on the fork and that both pins carry
    `:<sha12>-dev@sha256:`).
-5. Move the stack onto the new pins with `just live just deps-up`, then run the e2e scripts
+6. Move the stack onto the new pins with `just live just deps-up`, then run the e2e scripts
    through the queue (`just live just neon-e2e`, and likewise `branch-e2e`, `data-e2e`,
    `console-e2e`, `role-e2e`, `auth-e2e` and `storage-leak-e2e`).
 

@@ -1069,6 +1069,7 @@ mod tests {
             sha256: [0; 32],
             sealed: None,
             databases: None,
+            role_oid: None,
         }
     }
 

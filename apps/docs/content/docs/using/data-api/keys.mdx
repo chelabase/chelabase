@@ -25,7 +25,13 @@ The role is checked and granted to `authenticator` when the key is created. A re
 - is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`;
 - is owner-level: it has `CREATEROLE`, `CREATEDB`, `BYPASSRLS` or `REPLICATION` (`the role <name> is owner-level (owner-level roles can't back a secret key; use a plain role)`).
 
-Rotating a secret key keeps its role and doesn't run the check or the grant again. A reset or restore rewinds the grant, so the worker's bootstrap grants each live secret key's role again. A role that is gone or now refused is skipped with a warning, and its key stops working.
+Any role that exists can back a key, with or without a password or `LOGIN`: the usual one is a `NOLOGIN` role made for the data API.
+
+A secret key belongs to the role itself, not to its name: Chelabase stores the role's identity (its `pg_roles` OID) with the key. A key works only while the role with that identity exists under the key's role name. If the role is dropped, or dropped and created again under the same name, the key stops working at once (requests get a 503 `unavailable`: `the key's role <name> can't be used right now`), and the next role sync revokes it. A role renamed in SQL takes its keys with it.
+
+Rotating a secret key keeps its name and its role, and checks the role on the branch's compute again, as creation does. If the role was renamed, the key follows the rename and rotation checks the new name. A refused or missing role is a 422 `role_refused`, and so is a role that was dropped and created again since the key was made (create a new key for it); a branch that isn't ready is a 409 `branch_not_ready`; a worker that can't be reached is a 503 `worker_unavailable` (or a 504 `timeout`), and a branch whose roles are being changed at that moment a 503 `unavailable` with `Retry-After`. The old key stays live whenever rotation fails.
+
+SQL can't drop a key's role (or drop and create it again in one transaction) until its keys are revoked. A reset or restore rewinds the grant, so the worker's bootstrap grants each live secret key's role again. A role that is gone or now refused is skipped with a warning, and its key stops working.
 
 ## Revocation
 

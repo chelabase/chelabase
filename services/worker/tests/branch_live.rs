@@ -20,7 +20,7 @@ use chelabase_metadata::{
     DatabaseStatus, MetadataClient, NewBranch,
 };
 use chelabase_nats::{BranchJob, PointInTime};
-use chelabase_neon::{ComputeBackend, NeonId, StorconClient, StorconError};
+use chelabase_neon::{ComputeBackend, Lsn, NeonId, StorconClient, StorconError};
 use chelabase_types::{BranchId, DatabaseId};
 use worker::config::{RealWorker, WorkerConfig};
 
@@ -334,4 +334,167 @@ async fn story(
         assert_eq!(branch.status, BranchStatus::Deleted, "{}", branch.name);
     }
     sqlx_delete(metadata, id).await.unwrap();
+}
+
+/// Patch 6 (D11): right after the pageserver restarts, its `last_record_lsn` for main can lag
+/// what the safekeepers have committed; a branch of main with no point must still see main's
+/// last committed write. The test forces that window (restart the pageserver container right
+/// after a committed write) and asserts it was real; it fails rather than passing vacuously.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn branch_right_after_a_pageserver_restart_sees_the_last_write() {
+    let (worker, metadata, _config) = setup().await;
+    let worker = Arc::new(worker);
+    let id = DatabaseId::new();
+    let name = format!("live-{}", &id.to_string()[..8]);
+    metadata
+        .insert_database_pending(id, DEMO_TENANT_ID.into(), DEMO_PROJECT_ID.into(), &name)
+        .await
+        .expect("insert pending database");
+
+    let outcome = tokio::spawn({
+        let (worker, metadata) = (worker.clone(), metadata.clone());
+        async move { stale_head_story(&worker, &metadata, id, &name).await }
+    })
+    .await;
+    if let Err(panic) = outcome {
+        cleanup(&worker, &metadata, id).await;
+        std::panic::resume_unwind(panic.into_panic());
+    }
+    worker.handle_delete(id).await.expect("handle_delete");
+    sqlx_delete(&metadata, id).await.unwrap();
+}
+
+/// How many write+restart rounds to try for a pageserver that lags the safekeepers.
+const STALE_HEAD_ATTEMPTS: u32 = 8;
+
+/// The compose container of the pageserver.
+const PAGESERVER_CONTAINER: &str = "chelabase-pageserver-1";
+
+async fn restart_pageserver() {
+    let status = tokio::process::Command::new("docker")
+        .args(["restart", PAGESERVER_CONTAINER])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .await
+        .expect("run docker");
+    assert!(status.success(), "docker restart {PAGESERVER_CONTAINER}");
+}
+
+async fn stale_head_story(
+    worker: &RealWorker,
+    metadata: &MetadataClient,
+    id: DatabaseId,
+    name: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(90), worker.handle_provision(id, name))
+        .await
+        .expect("provision took over 90 s")
+        .expect("handle_provision");
+    let record = metadata.get_database(id).await.unwrap().unwrap();
+    assert_eq!(record.status, DatabaseStatus::Ready, "{:?}", record.error);
+    let database_name = record.database_name.clone().expect("database name");
+    let story = Story {
+        worker,
+        metadata,
+        db: id,
+        database_name: database_name.clone(),
+    };
+    let main_id = BranchId::from(id);
+    let main = story.branch(main_id).await;
+    let tenant: NeonId = record
+        .neon_tenant_id
+        .as_deref()
+        .expect("tenant")
+        .parse()
+        .unwrap();
+    let timeline: NeonId = main
+        .timeline_id
+        .as_deref()
+        .expect("main timeline")
+        .parse()
+        .unwrap();
+    let endpoint = main.endpoint_id.clone().expect("main endpoint");
+
+    story.sql(&main, "CREATE TABLE t (v text);").await;
+
+    let mut written = Vec::new();
+    let mut produced = false;
+    for attempt in 1..=STALE_HEAD_ATTEMPTS {
+        // A committed write; right after a restart the compute may need a moment to reconnect
+        // to the pageserver, so retry the statement for a while.
+        let value = format!("w{attempt}");
+        let sql = format!("INSERT INTO t VALUES ('{value}');");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match worker
+                .computes
+                .admin_sql(&endpoint, &database_name, &sql)
+                .await
+            {
+                Ok(_) => break,
+                Err(e) if Instant::now() < deadline => {
+                    println!("write retry: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => panic!("write on main: {e:#}"),
+            }
+        }
+        written.push(value);
+
+        restart_pageserver().await;
+        // Storcon answers again for main's timeline.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let info = loop {
+            match worker
+                .storage
+                .storcon
+                .get_timeline(&tenant, &timeline)
+                .await
+            {
+                Ok(info) => break info,
+                Err(e) if Instant::now() < deadline => {
+                    println!("waiting for get_timeline: {e:?}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => panic!("get_timeline after the restart: {e:?}"),
+            }
+        };
+        // The safekeepers' commit LSN (the head over a last record of 0 is their maximum).
+        let active = worker
+            .storage
+            .storcon
+            .active_safekeeper_ids()
+            .await
+            .expect("active safekeepers");
+        let commit = worker
+            .storage
+            .safekeepers
+            .head(Lsn(0), &active, &tenant, &timeline)
+            .await;
+        println!(
+            "attempt {attempt}: pageserver last_record_lsn {:?}, safekeepers commit_lsn {commit:?}",
+            info.last_record_lsn
+        );
+        if commit > info.last_record_lsn {
+            produced = true;
+            break;
+        }
+    }
+    assert!(
+        produced,
+        "could not produce a stale head: after {STALE_HEAD_ATTEMPTS} write+restart rounds the \
+         pageserver's last_record_lsn was never behind the safekeepers' commit_lsn"
+    );
+
+    // At once: a branch of main with no point sees every committed write.
+    let after_id = story.create("after-restart", main_id, None).await;
+    let after = story.branch(after_id).await;
+    assert_eq!(after.status, BranchStatus::Ready, "{:?}", after.error);
+    written.sort();
+    assert_eq!(
+        story.rows(&after).await,
+        written.join(","),
+        "branch right after a pageserver restart"
+    );
 }

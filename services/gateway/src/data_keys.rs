@@ -34,6 +34,10 @@ pub struct ResolvedKey {
     /// The key's allow-list; absent or `null` means every database the branch serves.
     #[serde(default)]
     pub databases: Option<Vec<String>>,
+    /// A secret key's role identity (`pg_roles.oid`); absent for the public key, a key not
+    /// backfilled yet, and in answers from an older orchestrator.
+    #[serde(default)]
+    pub role_oid: Option<i64>,
 }
 
 /// Why a key was refused. Maps to 401 | 401 | 429 | 503.
@@ -239,6 +243,7 @@ pub(crate) mod test_support {
             }
             .to_string(),
             databases: None,
+            role_oid: None,
         }
     }
 
@@ -271,7 +276,7 @@ pub(crate) mod test_support {
                                 Json(serde_json::json!({
                                     "key_id": k.key_id, "branch_id": k.branch_id, "project_id": k.project_id,
                                     "kind": k.kind.as_str(), "role": k.role,
-                                    "databases": k.databases,
+                                    "databases": k.databases, "role_oid": k.role_oid,
                                 })),
                             )
                                 .into_response_pair(),
@@ -317,6 +322,11 @@ mod tests {
         });
         let k: ResolvedKey = serde_json::from_value(base.clone()).unwrap();
         assert_eq!(k.databases, None);
+        assert_eq!(k.role_oid, None, "an answer without role_oid has none");
+        let mut with_oid = base.clone();
+        with_oid["role_oid"] = serde_json::json!(16390);
+        let k: ResolvedKey = serde_json::from_value(with_oid).unwrap();
+        assert_eq!(k.role_oid, Some(16390));
         let mut listed = base;
         listed["databases"] = serde_json::json!(["main"]);
         let k: ResolvedKey = serde_json::from_value(listed).unwrap();

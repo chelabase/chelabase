@@ -696,6 +696,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_branch_with_no_point_branches_at_the_heads_commit_lsn() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        // The safekeepers are ahead of what the pageserver has ingested (a reloaded tenant).
+        let ahead = Lsn(FRESH_HEAD.0 + 0x1000);
+        w.storage.set_commit_lsn(&s.tenant, &s.main_timeline, ahead);
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        assert_eq!(dev.branched_at_lsn, Some(ahead.to_string()));
+        let timeline = dev.timeline_id.clone().unwrap();
+        let stored = w.storage.timeline(&s.tenant, &timeline).unwrap();
+        let main_tl: NeonId = s.main_timeline.parse().unwrap();
+        assert_eq!(stored.ancestor, Some((main_tl, ahead)));
+    }
+
+    #[tokio::test]
     async fn create_branch_happy_path() {
         let (w, journal) = worker();
         let s = setup(&w, &journal).await;

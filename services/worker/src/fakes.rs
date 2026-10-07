@@ -18,7 +18,7 @@ use chelabase_metadata::{
 use chelabase_neon::backend::fake::FakeBackend;
 pub use chelabase_neon::backend::fake::Journal;
 use chelabase_neon::spec::Placement;
-use chelabase_neon::storcon::{LsnAtTime, LsnKind};
+use chelabase_neon::storcon::{LsnAtTime, LsnKind, head_lsn};
 use chelabase_neon::{Lsn, NeonId, StorconError};
 use chelabase_secrets::SecretKey;
 use chelabase_types::data_key::DataKeyKind;
@@ -155,6 +155,8 @@ pub struct FakeState {
     /// Data API keys; live unless their id is in `revoked_keys`.
     pub data_keys: Vec<NewDataKey>,
     pub revoked_keys: HashSet<uuid::Uuid>,
+    /// Each `fix_key_roles` call: the branch and its repairs.
+    pub key_fixes: Vec<(BranchId, Vec<chelabase_metadata::KeyRoleFix>)>,
     /// Runs once, just before the next `finish_enable_data_api`: a write landing while the
     /// enable's bootstrap ran (a `default_schema` PATCH, say).
     pub before_finish_enable: Option<StateHook>,
@@ -1518,8 +1520,19 @@ impl WorkerMetadata for FakeMetadata {
                 last_used_at: None,
                 revoked_at: None,
                 databases: k.databases.clone(),
+                role_oid: k.role_oid,
             })
             .collect())
+    }
+
+    async fn fix_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[chelabase_metadata::KeyRoleFix],
+    ) -> Result<u64, MetadataError> {
+        let mut state = self.write("fix_key_roles")?;
+        state.key_fixes.push((branch, fixes.to_vec()));
+        Ok(fixes.len() as u64)
     }
 
     async fn branch_databases(
@@ -2060,6 +2073,8 @@ pub struct FakeTimeline {
     /// `(parent timeline, LSN)`; `None` for a fresh timeline or once detached.
     pub ancestor: Option<(NeonId, Lsn)>,
     pub head: Lsn,
+    /// The safekeepers' commit LSN, when ahead of what the pageserver ingested.
+    pub commit: Option<Lsn>,
 }
 
 /// The head of every fresh timeline.
@@ -2165,14 +2180,24 @@ impl FakeStorage {
             FakeTimeline {
                 ancestor: None,
                 head,
+                commit: None,
             },
         );
+    }
+
+    /// Makes the safekeepers' commit LSN of a timeline `commit` (it may be ahead of the head).
+    pub fn set_commit_lsn(&self, tenant: &str, timeline: &str, commit: Lsn) {
+        let key = (tenant.parse().unwrap(), timeline.parse().unwrap());
+        lock(&self.timelines)
+            .get_mut(&key)
+            .expect("no such timeline")
+            .commit = Some(commit);
     }
 
     fn head(&self, tenant: &NeonId, timeline: &NeonId) -> Result<Lsn, StorconError> {
         lock(&self.timelines)
             .get(&(tenant.clone(), timeline.clone()))
-            .map(|t| t.head)
+            .map(|t| head_lsn(t.head, t.commit))
             .ok_or_else(|| Self::not_found(format!("timeline {timeline}")))
     }
 }
@@ -2209,6 +2234,7 @@ impl Storage for FakeStorage {
             FakeTimeline {
                 ancestor: None,
                 head: FRESH_HEAD,
+                commit: None,
             },
         );
         Ok(())
@@ -2252,13 +2278,16 @@ impl Storage for FakeStorage {
             return Err(Self::not_found(format!("tenant {tenant}")));
         }
         let parent_head = self.head(tenant, parent)?;
-        // Like the pageserver: a branch point must already be written on the parent.
+        // `parent_head` includes the parent's commit LSN. The real pageserver doesn't refuse a
+        // start LSN ahead of its last record: it waits for the WAL to arrive (up to its wait
+        // timeout). The fake refuses at once instead, so a test that branches at an LSN nobody
+        // has written fails fast.
         if lsn > parent_head {
             return Err(StorconError::Rejected {
                 status: reqwest::StatusCode::BAD_REQUEST,
                 message: format!(
-                    "invalid branch start lsn: {lsn} is ahead of the ancestor's last record lsn \
-                     {parent_head}"
+                    "invalid branch start lsn: {lsn} is ahead of the ancestor's head \
+                     {parent_head} (last record or commit lsn)"
                 ),
             });
         }
@@ -2267,6 +2296,7 @@ impl Storage for FakeStorage {
             FakeTimeline {
                 ancestor: Some((parent.clone(), lsn)),
                 head: lsn,
+                commit: None,
             },
         );
         Ok(())

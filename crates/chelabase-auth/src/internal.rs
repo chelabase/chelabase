@@ -45,6 +45,11 @@ pub struct DataIdentity {
     /// tokens minted before app users existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+    /// A secret key's role identity (`pg_roles.oid`): rest runs the request as `role` only
+    /// while the role of that name has this OID. Absent for the public key, a user token, a
+    /// key not backfilled yet, and in tokens minted before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_oid: Option<i64>,
 }
 
 /// The caller, as established by the gateway. For a data key, `sub` is the key id and

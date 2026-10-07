@@ -70,12 +70,38 @@ async fn spawn_upstream() -> (String, Seen) {
     (format!("http://{addr}"), seen)
 }
 
+/// Ports this test process has already handed out. The kernel may give the same ephemeral
+/// port to two concurrent `bind(0)` calls once the first listener is closed; two gateways
+/// would then race for it and a test could talk to another test's gateway (which its owner
+/// then kills mid-request).
+static LEASED_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    let mut leased = LEASED_PORTS.lock().unwrap();
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if !leased.contains(&port) {
+            leased.push(port);
+            return port;
+        }
+    }
+}
+
+/// An address nothing listens on, so connecting is refused at once. The socket is bound but
+/// never listens, and the caller keeps it for the test's duration: the port stays reserved
+/// (no other test's `bind(0)` can get it, which would answer the request) and connecting
+/// to it is refused. (A fixed low port like 1 is not an option: on WSL a connect to it
+/// times out instead of being refused.)
+fn refused_upstream() -> (String, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    LEASED_PORTS.lock().unwrap().push(port);
+    (format!("http://127.0.0.1:{port}"), socket)
 }
 
 /// Spawn the gateway binary in front of `upstream_url`, trusting `jwks`.
@@ -88,55 +114,149 @@ async fn spawn_gateway_with(
     jwks: &MockJwks,
     extra_env: &[(&str, &str)],
 ) -> (String, InternalVerifier, GatewayProcess) {
-    // A temp working dir keeps dotenvy from picking up a repo-level .env.
-    let workdir = tempfile::tempdir().unwrap();
     let (private_pem, public_pem) = generate_keypair_pem();
-    let signing_key = workdir.path().join("internal-signing.pem");
-    std::fs::write(&signing_key, private_pem).unwrap();
 
-    let port = free_port();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_gateway"));
-    command.envs(extra_env.iter().copied());
-    let child = command
-        .current_dir(workdir.path())
-        .env("CHELABASE_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
-        .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
-        .env("CHELABASE_API_HOSTS", "")
-        .env("CHELABASE_STUDIO_ORIGINS", STUDIO)
-        .env("CHELABASE_ZITADEL_ISSUER", jwks.issuer())
-        .env("CHELABASE_ZITADEL_JWKS_URL", jwks.jwks_url())
-        .env("CHELABASE_ZITADEL_AUDIENCES", "")
-        .env("CHELABASE_INTERNAL_SIGNING_KEY", &signing_key)
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn gateway binary");
+    // The port comes from a bind(0) that is closed again before the gateway binds it, so
+    // another test's `bind(0)` can be handed the same port in between (then the gateway
+    // exits with "address in use", and the other listener would answer our health check).
+    // A gateway that did not get its port is therefore retried on a new one.
+    for _ in 0..10 {
+        // A temp working dir keeps dotenvy from picking up a repo-level .env.
+        let workdir = tempfile::tempdir().unwrap();
+        let signing_key = workdir.path().join("internal-signing.pem");
+        std::fs::write(&signing_key, &private_pem).unwrap();
 
-    let base = format!("http://127.0.0.1:{port}");
-    let process = GatewayProcess {
-        child,
-        _workdir: workdir,
-    };
-    wait_ready(&base).await;
-    (
-        base,
-        InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
-        process,
-    )
+        let port = free_port();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gateway"));
+        command.envs(extra_env.iter().copied());
+        let child = command
+            .current_dir(workdir.path())
+            .env("CHELABASE_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
+            .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
+            .env("CHELABASE_API_HOSTS", "")
+            .env("CHELABASE_STUDIO_ORIGINS", STUDIO)
+            .env("CHELABASE_ZITADEL_ISSUER", jwks.issuer())
+            .env("CHELABASE_ZITADEL_JWKS_URL", jwks.jwks_url())
+            .env("CHELABASE_ZITADEL_AUDIENCES", "")
+            .env("CHELABASE_INTERNAL_SIGNING_KEY", &signing_key)
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn gateway binary");
+
+        // Guarded from the spawn on: every way out of here (a panic included) kills it.
+        let mut gateway = GatewayProcess {
+            child,
+            _workdir: workdir,
+        };
+        let base = format!("http://127.0.0.1:{port}");
+        if wait_ready(&base, port, &mut gateway).await {
+            return (
+                base,
+                InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
+                gateway,
+            );
+        }
+        // Exited during startup (the guard reaps it); try again on another port.
+    }
+    panic!("the gateway never got a port to listen on (see stderr above)");
 }
 
-async fn wait_ready(base: &str) {
+/// Whether process `pid` holds the TCP socket listening on 127.0.0.1:`port` (Linux: the
+/// socket's inode from /proc/net/tcp, looked up among the process's open fds). This proves
+/// that whatever answers on the port is our child, not another test binary's gateway or
+/// mock that got the port first.
+#[cfg(target_os = "linux")]
+fn process_owns_listener(pid: u32, port: u16) -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    let local = format!("0100007F:{port:04X}");
+    let inodes: Vec<&str> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // f[1] local address, f[3] state (0A = LISTEN), f[9] inode
+            (f.len() > 9 && f[1] == local && f[3] == "0A").then_some(f[9])
+        })
+        .collect();
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .any(|link| {
+            let link = link.to_string_lossy();
+            inodes.iter().any(|inode| link == format!("socket:[{inode}]"))
+        })
+}
+
+/// Other targets have no /proc: readiness falls back to the health check alone, so the
+/// cross-process guarantee (that the answer comes from our child, not another test binary's
+/// listener on the same port) does not hold there; within one process the port lease and
+/// the child-exit retry still cover it.
+#[cfg(not(target_os = "linux"))]
+fn process_owns_listener(_pid: u32, _port: u16) -> bool {
+    true
+}
+
+async fn health_is_ok(client: &reqwest::Client, base: &str) -> bool {
+    match client.get(format!("{base}/_gateway/health")).send().await {
+        Ok(resp) => resp.status() == 200,
+        Err(_) => false,
+    }
+}
+
+/// Waits until our gateway child listens on `port` and answers its health check: `true`
+/// then, `false` when the process exited first (it lost the race for its port). A 200 alone
+/// proves nothing (a listener that took over the port answers 200 too), so the listening
+/// socket must belong to the child. A debug binary can take long to start on a loaded
+/// machine, so the budget is generous; failing paths panic and the guard kills the child.
+async fn wait_ready(base: &str, port: u16, gateway: &mut GatewayProcess) -> bool {
     let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if let Ok(resp) = client.get(format!("{base}/_gateway/health")).send().await
-            && resp.status() == 200
-        {
-            return;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        let exited = gateway.child.try_wait().expect("poll the gateway child").is_some();
+        if exited {
+            return false;
+        }
+        if process_owns_listener(gateway.child.id(), port) && health_is_ok(&client, base).await {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("gateway at {base} did not become ready within 5s (see stderr above)");
+    panic!("gateway at {base} did not become ready within 60s (see stderr above)");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn listener_owner_check_matches_only_the_owning_process() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert!(process_owns_listener(std::process::id(), port));
+    // pid 1 (init) certainly doesn't hold this socket.
+    assert!(!process_owns_listener(1, port));
+    drop(listener);
+    // Closed: nobody listens on it any more.
+    assert!(!process_owns_listener(std::process::id(), port));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_the_guard_kills_a_child_that_never_became_ready() {
+    // A child that lives on (it never listens); the guard must kill it on drop even when
+    // the caller bails out early (a panic in `wait_ready`'s failure paths).
+    let child = Command::new("tail").args(["-f", "/dev/null"]).spawn().unwrap();
+    let pid = child.id();
+    let guard = GatewayProcess {
+        child,
+        _workdir: tempfile::tempdir().unwrap(),
+    };
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    drop(guard);
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "child outlived its guard");
 }
 
 async fn start_stack() -> Stack {
@@ -344,7 +464,7 @@ async fn proxied_response_carries_cors_headers_for_studio() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_down_is_502_json() {
     let jwks = MockJwks::start().await;
-    let dead_upstream = format!("http://127.0.0.1:{}", free_port());
+    let (dead_upstream, _reserved) = refused_upstream();
     let (base, _verify, _gateway) = spawn_gateway(&dead_upstream, &jwks).await;
 
     let resp = reqwest::get(format!("{base}/health")).await.unwrap();
@@ -401,12 +521,15 @@ async fn upstream_failure_after_response_started_does_not_inject_error_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incoming_forwarded_proto_is_preserved() {
     let stack = start_stack().await;
-    reqwest::Client::new()
+    let resp = reqwest::Client::new()
         .get(format!("{}/health", stack.base))
         .header("x-forwarded-proto", "https")
         .send()
         .await
         .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "gateway answered {body:?}");
     assert_eq!(stack.upstream_saw().unwrap()["x-forwarded-proto"], "https");
 }
 
@@ -537,7 +660,7 @@ async fn client_authorization_header_is_not_forwarded_to_rest() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_failures_are_json_on_data_routes_too() {
     let jwks = MockJwks::start().await;
-    let dead_rest = format!("http://127.0.0.1:{}", free_port());
+    let (dead_rest, _reserved) = refused_upstream();
     let internal = spawn_internal_listener().await;
     let (base, _verify, _gateway) = spawn_gateway_with(
         &dead_rest,

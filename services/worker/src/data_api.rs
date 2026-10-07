@@ -460,7 +460,7 @@ fn role_check_sql(role: &str) -> String {
          THEN 'owner_level' \
          WHEN EXISTS (SELECT FROM pg_roles s WHERE (s.rolsuper OR s.rolname IN ({SYSTEM_ROLES})) \
          AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'system' \
-         ELSE 'ok' END FROM pg_roles r WHERE r.rolname = {};",
+         ELSE 'ok ' || r.oid::text END FROM pg_roles r WHERE r.rolname = {};",
         quote_literal(role)
     )
 }
@@ -471,8 +471,8 @@ const RESERVED_ROLES: [&str; 3] = [AUTHENTICATOR, "chelabase_admin", crate::app_
 /// What [`Worker::check_data_role`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleCheck {
-    /// Allowed, and granted to `authenticator`.
-    Ok,
+    /// Allowed, and granted to `authenticator`: the role's OID (a secret key is bound to it).
+    Ok(i64),
     /// The caller's fault (422): the message says why.
     Refused(String),
     /// The branch isn't ready, or its compute can't be reached (409).
@@ -623,7 +623,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         roles.dedup();
         for role in roles {
             match self.check_and_grant(branch, ep, database_name, &role).await {
-                RoleCheck::Ok => {}
+                RoleCheck::Ok(_) => {}
                 other => {
                     warn!(branch_id = %branch, %role, "not granting a secret key's role to {AUTHENTICATOR}: {other:?}");
                 }
@@ -700,6 +700,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 &generated.key,
             )),
             databases: None,
+            role_oid: None,
         };
         match self.metadata.insert_data_key(&key).await {
             Ok(()) => {
@@ -985,7 +986,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// [`Self::check_data_role`] as the RPC's reply.
     pub async fn check_data_role_reply(&self, request: &CheckDataRoleRequest) -> CheckDataRoleReply {
         match self.check_data_role(request.branch_id, &request.role).await {
-            RoleCheck::Ok => CheckDataRoleReply::ok(),
+            RoleCheck::Ok(oid) => CheckDataRoleReply::ok_with_oid(oid),
             RoleCheck::Refused(message) => CheckDataRoleReply::refused(message),
             RoleCheck::NotReady => CheckDataRoleReply::not_ready(),
             RoleCheck::Failed(message) => CheckDataRoleReply::failed(message),
@@ -1057,29 +1058,32 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         };
         let refused = |why: &str| RoleCheck::Refused(format!("the role {role} {why}"));
-        match answer.trim() {
-            "ok" => {}
-            "" => return refused("does not exist"),
-            "superuser" => return refused("is a superuser"),
-            "neon_superuser" => {
-                return refused(
+        let answer = answer.trim();
+        // `ok <oid>`: allowed, and the identity the key is bound to.
+        let Some(oid) = answer
+            .strip_prefix("ok ")
+            .and_then(|oid| oid.parse::<i64>().ok())
+            .filter(|oid| *oid > 0)
+        else {
+            return match answer {
+                "" => refused("does not exist"),
+                "superuser" => refused("is a superuser"),
+                "neon_superuser" => refused(
                     "is a member of neon_superuser (owner-level roles can't back a secret \
                      key; use a plain role)",
-                );
-            }
-            "owner_level" => {
-                return refused(
+                ),
+                "owner_level" => refused(
                     "is owner-level (owner-level roles can't back a secret key; use a plain role)",
-                );
-            }
-            "system" => return refused("has system privileges"),
-            other => {
-                warn!(branch_id = %branch, "checking role {role}: unexpected answer {other:?}");
-                return RoleCheck::Failed(format!(
-                    "checking the role {role} gave an unexpected answer {other:?}"
-                ));
-            }
-        }
+                ),
+                "system" => refused("has system privileges"),
+                other => {
+                    warn!(branch_id = %branch, "checking role {role}: unexpected answer {other:?}");
+                    RoleCheck::Failed(format!(
+                        "checking the role {role} gave an unexpected answer {other:?}"
+                    ))
+                }
+            };
+        };
         let grant = format!("GRANT {} TO {AUTHENTICATOR};", quote_ident(role));
         if let Err(e) = self.computes.admin_sql(ep, database_name, &grant).await {
             warn!(branch_id = %branch, endpoint_id = %ep, "granting {role} to {AUTHENTICATOR}: {e:#}");
@@ -1088,7 +1092,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             ));
         }
         info!(branch_id = %branch, %role, "granted to {AUTHENTICATOR}");
-        RoleCheck::Ok
+        RoleCheck::Ok(oid)
     }
 }
 
@@ -1884,6 +1888,7 @@ COMMIT;
             sha256: generated.sha256,
             sealed: None,
             databases: None,
+            role_oid: None,
         }
     }
 
@@ -1913,7 +1918,7 @@ COMMIT;
         // `gone` was dropped, `now_super` became a superuser: skipped, not fatal.
         w.computes.answer("rolname = 'gone'", "");
         w.computes.answer("rolname = 'now_super'", "superuser\n");
-        answer_check(&w, "ok\n");
+        answer_check(&w, "ok 16384\n");
         journal.lock().unwrap().clear();
 
         w.bootstrap_data_api(&main, "app").await.unwrap();
@@ -2008,6 +2013,25 @@ COMMIT;
         }
     }
 
+    // The check answers the role's OID: the key is bound to that identity, not to the name.
+    #[tokio::test]
+    async fn check_role_returns_the_roles_oid() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        answer_check(&w, "ok 16390\n");
+        let main = BranchId::from(id);
+        assert_eq!(w.check_data_role(main, "reader").await, RoleCheck::Ok(16390));
+        let reply = w
+            .check_data_role_reply(&chelabase_nats::CheckDataRoleRequest { branch_id: main, role: "reader".into() })
+            .await;
+        assert_eq!(reply, CheckDataRoleReply::ok_with_oid(16390));
+        assert!(role_check_sql("reader").contains("'ok ' || r.oid::text"));
+        // An `ok` without an OID is an answer it doesn't know.
+        w.computes.answers.lock().unwrap().clear();
+        answer_check(&w, "ok\n");
+        assert!(matches!(w.check_data_role(main, "reader").await, RoleCheck::Failed(_)));
+    }
+
     #[tokio::test]
     async fn check_role_refusal_names_plain_roles() {
         let (w, _journal) = worker();
@@ -2084,7 +2108,7 @@ COMMIT;
     async fn check_role_refuses_reserved_and_built_in_roles_before_sql() {
         let (w, journal) = worker();
         let id = ready_database(&w).await;
-        answer_check(&w, "ok\n");
+        answer_check(&w, "ok 16384\n");
         journal.lock().unwrap().clear();
         let main = BranchId::from(id);
         for (role, message) in [
@@ -2206,8 +2230,8 @@ COMMIT;
         let main = BranchId::from(id);
         let ask = |role: &str, branch| CheckDataRoleRequest { branch_id: branch, role: role.into() };
 
-        answer_check(&w, "ok\n");
-        assert_eq!(w.check_data_role_reply(&ask("reporting", main)).await, CheckDataRoleReply::ok());
+        answer_check(&w, "ok 16384\n");
+        assert_eq!(w.check_data_role_reply(&ask("reporting", main)).await, CheckDataRoleReply::ok_with_oid(16384));
 
         w.computes.answers.lock().unwrap().clear();
         answer_check(&w, "superuser\n");
@@ -2261,7 +2285,7 @@ COMMIT;
         ));
         // A failed GRANT.
         w.computes.answers.lock().unwrap().clear();
-        answer_check(&w, "ok\n");
+        answer_check(&w, "ok 16384\n");
         *w.computes.fail_sql_containing.lock().unwrap() =
             Some(("GRANT".into(), "circular membership".into()));
         assert!(matches!(
@@ -2274,7 +2298,7 @@ COMMIT;
     async fn check_role_rejects_invalid_names_before_sql() {
         let (w, journal) = worker();
         let id = ready_database(&w).await;
-        answer_check(&w, "ok\n");
+        answer_check(&w, "ok 16384\n");
         journal.lock().unwrap().clear();
         let too_long = format!("a{}", "b".repeat(63));
         for bad in [
@@ -2300,7 +2324,7 @@ COMMIT;
         for good in ["_", "a$1", "Ab_9", longest.as_str()] {
             assert_eq!(
                 w.check_data_role(BranchId::from(id), good).await,
-                RoleCheck::Ok
+                RoleCheck::Ok(16384)
             );
         }
     }
@@ -2310,11 +2334,11 @@ COMMIT;
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
         let ep = w.metadata.main(id).endpoint_id.unwrap();
-        answer_check(&w, "ok\n");
+        answer_check(&w, "ok 16384\n");
         for role in ["app_user", "AppUser", "anon", "authenticated"] {
             assert_eq!(
                 w.check_data_role(BranchId::from(id), role).await,
-                RoleCheck::Ok,
+                RoleCheck::Ok(16384),
                 "{role}"
             );
         }

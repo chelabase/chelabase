@@ -161,6 +161,7 @@ fn console_identity(branch: Uuid, role: &str) -> DataIdentity {
         claims: Value::Object(Default::default()),
         databases: None,
         project_id: None,
+        role_oid: None,
     }
 }
 
@@ -195,6 +196,16 @@ enum Guard<'a> {
     Key(&'a DataIdentity),
     /// The console's role: it must exist and not be owner-level.
     Console(&'a str),
+}
+
+impl Guard<'_> {
+    /// The role OID the preamble holds the role to: a key's, when it has one.
+    fn role_oid(&self) -> Option<i64> {
+        match self {
+            Guard::Key(data) => data.role_oid,
+            Guard::None | Guard::Console(_) => None,
+        }
+    }
 }
 
 /// The served databases a key may reach, main first.
@@ -445,6 +456,7 @@ impl<S: ConnSource> Engine<S> {
                     RunAs::Role {
                         role: &data.role,
                         claims: &data.claims,
+                        oid: guard.role_oid(),
                     },
                     &run_settings(&conn.info, database),
                     self.max_response_bytes,
@@ -538,6 +550,7 @@ impl<S: ConnSource> Engine<S> {
                         RunAs::Role {
                             role,
                             claims: &claims,
+                            oid: guard.role_oid(),
                         },
                         info.settings.statement_timeout_ms,
                         request_id,
@@ -740,7 +753,20 @@ mod tests {
             claims: serde_json::json!({}),
             databases: None,
             project_id: None,
+            role_oid: None,
         }
+    }
+
+    /// A secret key's request runs as its role held to the key's OID; the console's role and
+    /// the internal schema route check the name only (they aren't a key's identity).
+    #[test]
+    fn only_a_keys_guard_holds_the_role_to_an_oid() {
+        let mut data = identity(DataKeyKind::Secret, Uuid::new_v4(), "reader");
+        assert_eq!(Guard::Key(&data).role_oid(), None, "a key not backfilled yet");
+        data.role_oid = Some(16390);
+        assert_eq!(Guard::Key(&data).role_oid(), Some(16390));
+        assert_eq!(Guard::Console("reader").role_oid(), None);
+        assert_eq!(Guard::None.role_oid(), None);
     }
 
     fn owner_cache() -> moka::future::Cache<(Uuid, String), bool> {

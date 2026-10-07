@@ -45,6 +45,13 @@ pub struct TimelineInfo {
     pub last_record_lsn: Lsn,
 }
 
+/// A timeline's head: its `last_record_lsn`, or the safekeepers' commit LSN (read from them
+/// by [`crate::safekeeper::SafekeeperClient`]) when that's ahead (the pageserver hasn't
+/// ingested it yet, e.g. right after a tenant reload).
+pub fn head_lsn(last_record: Lsn, safekeeper_commit: Option<Lsn>) -> Lsn {
+    safekeeper_commit.map_or(last_record, |commit| commit.max(last_record))
+}
+
 /// `GET /control/v1/tenant/{id}`: per-shard reconcile state.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TenantDescribe {
@@ -77,6 +84,7 @@ struct LocateShard {
 
 #[derive(Debug, Deserialize)]
 struct Safekeeper {
+    id: u64,
     host: String,
     port: u16,
     scheduling_policy: String,
@@ -275,6 +283,15 @@ impl StorconClient {
 
     /// `host:port` of every active safekeeper.
     pub async fn active_safekeepers(&self) -> Result<Vec<String>, StorconError> {
+        Ok(self
+            .active_safekeeper_list()
+            .await?
+            .into_iter()
+            .map(|sk| format!("{}:{}", sk.host, sk.port))
+            .collect())
+    }
+
+    async fn active_safekeeper_list(&self) -> Result<Vec<Safekeeper>, StorconError> {
         let resp = self
             .http
             .get(self.url("/control/v1/safekeeper"))
@@ -284,7 +301,16 @@ impl StorconClient {
         Ok(all
             .into_iter()
             .filter(|sk| sk.scheduling_policy == "Active")
-            .map(|sk| format!("{}:{}", sk.host, sk.port))
+            .collect())
+    }
+
+    /// The ids of the active safekeepers (the same filter as [`Self::active_safekeepers`]).
+    pub async fn active_safekeeper_ids(&self) -> Result<Vec<u64>, StorconError> {
+        Ok(self
+            .active_safekeeper_list()
+            .await?
+            .into_iter()
+            .map(|sk| sk.id)
             .collect())
     }
 
@@ -470,5 +496,25 @@ async fn check(resp: reqwest::Response) -> Result<reqwest::Response, StorconErro
         Err(StorconError::Rejected { status, message })
     } else {
         Err(anyhow::anyhow!("storage controller returned {status}: {message}").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn head_lsn_none_is_last_record() {
+        assert_eq!(head_lsn(Lsn(0x100), None), Lsn(0x100));
+    }
+
+    #[test]
+    fn head_lsn_lower_commit_is_last_record() {
+        assert_eq!(head_lsn(Lsn(0x100), Some(Lsn(0x80))), Lsn(0x100));
+    }
+
+    #[test]
+    fn head_lsn_higher_commit_wins() {
+        assert_eq!(head_lsn(Lsn(0x100), Some(Lsn(0x180))), Lsn(0x180));
     }
 }

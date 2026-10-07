@@ -148,6 +148,7 @@ fn data_identity_round_trips_in_claims() {
         claims: serde_json::json!({}),
         databases: Some(vec!["main".into(), "analytics".into()]),
         project_id: None,
+        role_oid: Some(16390),
     };
     let identity = Identity {
         sub: data.key_id.to_string(),
@@ -251,6 +252,8 @@ fn old_identity_tokens_without_project_parse() {
     });
     let data: DataIdentity = serde_json::from_value(old).unwrap();
     assert_eq!(data.project_id, None);
+    assert_eq!(data.role_oid, None, "older tokens carry no role OID");
+    assert!(serde_json::to_value(&data).unwrap().get("role_oid").is_none());
     // None is not serialised; Some round-trips.
     assert!(serde_json::to_value(&data).unwrap().get("project_id").is_none());
     let with = DataIdentity { project_id: Some(Uuid::new_v4()), ..data };

@@ -2524,8 +2524,9 @@ mod tests {
             sha256: generated.sha256,
             sealed: None,
             databases: None,
+            role_oid: None,
         });
-        w.computes.answer("pg_has_role", "ok\n");
+        w.computes.answer("pg_has_role", "ok 16384\n");
         w.computes.answer_in("app", "to_regclass('chelabase.schema_version')", "f\n");
         w.computes.sql.lock().unwrap().clear();
 

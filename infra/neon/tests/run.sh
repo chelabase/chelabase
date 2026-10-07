@@ -103,8 +103,8 @@ if command -v docker >/dev/null; then
       | select(.key | IN("seaweedfs","storage-broker","safekeeper1","storcon-db","storage-controller","pageserver","proxy"))
       | .value.ports[]?
       | "\(.host_ip // "0.0.0.0"):\(.published)"] | sort | join(" ")')"
-  check "neon publishes only 1234, 4432, 4444 and 9898, on 127.0.0.1" \
-    test "$published" = "127.0.0.1:1234 127.0.0.1:4432 127.0.0.1:4444 127.0.0.1:9898"
+  check "neon publishes only 1234, 4432, 4444, 7676 and 9898, on 127.0.0.1" \
+    test "$published" = "127.0.0.1:1234 127.0.0.1:4432 127.0.0.1:4444 127.0.0.1:7676 127.0.0.1:9898"
   unexposed="$(jq <<<"$neon_json" -r '
     [.services | to_entries[] | .key as $s | .value.ports[]?
       | select(.host_ip != "127.0.0.1") | "\($s):\(.published)"] | join(" ")')"

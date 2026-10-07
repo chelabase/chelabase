@@ -6,12 +6,13 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chelabase_metadata::{
-    CopyUpsert, ObservedDatabase, ResyncApplied, ResyncWrite, RoleCopy, RoleLevel, RoleOrigin,
-    SealedChange,
+    CopyUpsert, DataKeyRecord, KeyRoleFix, ObservedDatabase, ResyncApplied, ResyncWrite,
+    RoleCopy, RoleLevel, RoleOrigin, SealedChange,
 };
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::seal_role_password;
 use chelabase_types::BranchId;
+use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{quote_ident, quote_literal};
 use chelabase_types::role_password::{PasswordKind, hash_kind};
 use tracing::{error, info, warn};
@@ -24,8 +25,88 @@ use crate::{OWNER_ROLE, Worker, credentials};
 /// `pg_database` are cluster-wide, so any database sees the same catalog.
 pub const SYSTEM_DATABASE: &str = "postgres";
 
+/// Every role's OID and hex-encoded name, for the secret keys' identities. The comment is the
+/// fakes' needle.
+pub const KEY_ROLES_SQL: &str = "SET search_path = pg_catalog, pg_temp;\n\
+     SELECT /* chelabase: key roles */ oid::text || ' ' || encode(convert_to(rolname, 'UTF8'), 'hex') \
+     FROM pg_roles;";
+
+/// [`KEY_ROLES_SQL`]'s lines: `(oid, name)`.
+pub fn parse_key_roles(out: &str) -> anyhow::Result<Vec<(i64, String)>> {
+    out.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (oid, name) = line
+                .trim()
+                .split_once(' ')
+                .ok_or_else(|| anyhow::anyhow!("a role line without a name: {line:?}"))?;
+            let oid = oid
+                .parse::<i64>()
+                .map_err(|e| anyhow::anyhow!("a role line with a bad OID {oid:?}: {e}"))?;
+            let name = unhex(name).ok_or_else(|| anyhow::anyhow!("a role line with a bad name"))?;
+            Ok((oid, name))
+        })
+        .collect()
+}
+
+/// The repairs that make the live secret keys agree with the compute's roles, by identity:
+/// a key whose OID is gone is revoked (its role was dropped, maybe recreated under the name);
+/// a key whose OID now has another name follows it; a key without an OID yet takes its name's
+/// current OID, or is revoked when the name is gone. Public keys are left alone.
+pub fn plan_key_roles(keys: &[DataKeyRecord], catalog: &[(i64, String)]) -> Vec<KeyRoleFix> {
+    let name_of = |oid: i64| catalog.iter().find(|(o, _)| *o == oid).map(|(_, n)| n);
+    let oid_of = |name: &str| catalog.iter().find(|(_, n)| n == name).map(|(o, _)| *o);
+    keys.iter()
+        .filter(|k| k.kind == DataKeyKind::Secret && k.revoked_at.is_none())
+        .filter_map(|k| match k.role_oid {
+            Some(oid) => match name_of(oid) {
+                None => Some(KeyRoleFix::Revoke { id: k.id, role: k.role.clone(), oid: Some(oid) }),
+                Some(name) if *name != k.role => Some(KeyRoleFix::Follow {
+                    id: k.id,
+                    from: k.role.clone(),
+                    to: name.clone(),
+                    oid,
+                }),
+                Some(_) => None,
+            },
+            None => Some(match oid_of(&k.role) {
+                Some(oid) => KeyRoleFix::Backfill { id: k.id, role: k.role.clone(), oid },
+                None => KeyRoleFix::Revoke { id: k.id, role: k.role.clone(), oid: None },
+            }),
+        })
+        .collect()
+}
+
 /// How long after the first `password_updated` the second one goes out (R22).
 pub const REPUBLISH_DELAY: Duration = Duration::from_secs(1);
+
+/// How long a touched-roles message waits before the branch is resynced: the compute's DDL
+/// commit has to be visible to the catalog read, and a burst of statements shares one run.
+pub const TOUCHED_RESYNC_DELAY: Duration = Duration::from_secs(3);
+
+/// The branches with a touched-roles resync waiting in this worker process (one pending run
+/// per branch per process; with several workers each queue message goes to one of them).
+#[derive(Default)]
+pub struct PendingResyncs {
+    waiting: std::sync::Mutex<std::collections::HashSet<BranchId>>,
+}
+
+impl PendingResyncs {
+    /// True when the caller now owns the branch's pending run; false when one is waiting.
+    fn claim(&self, branch: BranchId) -> bool {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(branch)
+    }
+
+    fn release(&self, branch: BranchId) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&branch);
+    }
+}
 
 /// How many times the resync reads and writes before giving up on a moving `roles_version`.
 const RESYNC_TRIES: usize = 3;
@@ -498,6 +579,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             if !names.is_empty() {
                 info!(branch_id = %branch, endpoint_id = %ep, roles = %names.join(","), "login roles resynced");
             }
+            self.sync_key_roles(branch, ep, database).await;
             if !failed.is_empty() {
                 let failures: Vec<String> = failed.into_iter().map(|(_, what)| what).collect();
                 return Err(format!("syncing login roles: {}", failures.join("; ")));
@@ -507,6 +589,52 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         Err(format!(
             "syncing login roles: roles kept changing; gave up after {RESYNC_TRIES} tries"
         ))
+    }
+
+    /// Makes the branch's live secret keys agree with the compute's roles by OID
+    /// ([`plan_key_roles`]): revokes dead keys, follows renames the DDL receiver didn't see and
+    /// backfills keys made before OIDs were stored. Only when the branch has live secret keys.
+    /// A failure is logged: keys are still held to their OID by rest on every request, so this
+    /// is tidying, and the next resync tries again. An empty catalog (never real: `pg_roles`
+    /// always has the bootstrap roles) is taken as unreadable, never as "every role is gone".
+    async fn sync_key_roles(&self, branch: BranchId, ep: &str, database: &str) {
+        let keys = match self.metadata.list_data_keys(branch).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(branch_id = %branch, "secret keys versus roles: listing the keys: {e}");
+                return;
+            }
+        };
+        if !keys.iter().any(|k| k.kind == DataKeyKind::Secret) {
+            return;
+        }
+        let catalog = match self.computes.admin_sql(ep, database, KEY_ROLES_SQL).await {
+            Ok(out) => match parse_key_roles(&out) {
+                Ok(catalog) if !catalog.is_empty() => catalog,
+                Ok(_) => {
+                    warn!(branch_id = %branch, "secret keys versus roles: the role list came back empty");
+                    return;
+                }
+                Err(e) => {
+                    warn!(branch_id = %branch, "secret keys versus roles: {e:#}");
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!(branch_id = %branch, "secret keys versus roles: reading the roles: {e:#}");
+                return;
+            }
+        };
+        let fixes = plan_key_roles(&keys, &catalog);
+        if fixes.is_empty() {
+            return;
+        }
+        match self.metadata.fix_key_roles(branch, &fixes).await {
+            Ok(changed) => {
+                info!(branch_id = %branch, changed, ?fixes, "secret keys made to agree with the roles");
+            }
+            Err(e) => warn!(branch_id = %branch, "secret keys versus roles: writing: {e}"),
+        }
     }
 
     /// Runs each group as its own script (C1: psql stops at a script's first error, so one
@@ -550,6 +678,25 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .map_err(|e| format!("syncing login roles: locking the endpoint: {e}"))?;
         self.resync_locked(branch, &ep, SYSTEM_DATABASE).await
+    }
+
+    /// The resync a touched role asks for (`chelabase.resync.branch`): waits `delay` (so the
+    /// DDL's commit is visible and a burst of statements is one run), then [`Self::resync`].
+    /// A call while another for the same branch is still waiting returns at once: the waiting
+    /// one covers it. The claim is released before the run, so a touch that arrives during
+    /// the run schedules the next one.
+    pub async fn resync_touched(
+        &self,
+        pending: &PendingResyncs,
+        branch: BranchId,
+        delay: Duration,
+    ) -> Result<(), String> {
+        if !pending.claim(branch) {
+            return Ok(());
+        }
+        tokio::time::sleep(delay).await;
+        pending.release(branch);
+        self.resync(branch).await
     }
 
     /// `password_updated` for each name now, and again [`REPUBLISH_DELAY`] later. A failure
@@ -673,6 +820,97 @@ mod tests {
 
     fn upsert(write: &ResyncWrite, name: &str) -> Option<CopyUpsert> {
         write.upserts.iter().find(|u| u.name == name).cloned()
+    }
+
+    fn key(role: &str, oid: Option<i64>) -> DataKeyRecord {
+        DataKeyRecord {
+            id: uuid::Uuid::new_v4(),
+            branch_id: BranchId::new(),
+            kind: DataKeyKind::Secret,
+            role: role.into(),
+            name: format!("{role}-key"),
+            prefix: "chk_sec_xxxx".into(),
+            sealed: None,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            last_used_at: None,
+            revoked_at: None,
+            databases: None,
+            role_oid: oid,
+        }
+    }
+
+    // Keys versus roles, by OID: a key whose OID is gone is revoked; one whose OID now has
+    // another name follows it (a rename the receiver didn't see); a key without an OID gets
+    // the OID of its name, or is revoked when the name is gone; a key whose name now belongs
+    // to another OID (dropped and created again) is revoked. Exhaustive over the cases.
+    #[test]
+    fn plan_key_roles_follows_identity() {
+        let catalog = vec![(16384, "app".to_string()), (16390, "renamed".to_string()), (16400, "again".to_string())];
+        let alive = key("app", Some(16384));
+        let gone = key("dropped", Some(16385));
+        let moved = key("old_name", Some(16390));
+        let recreated = key("again", Some(16399));
+        let legacy = key("app", None);
+        let legacy_gone = key("ghost", None);
+        let keys = vec![alive.clone(), gone.clone(), moved.clone(), recreated.clone(), legacy.clone(), legacy_gone.clone()];
+        assert_eq!(
+            plan_key_roles(&keys, &catalog),
+            vec![
+                KeyRoleFix::Revoke { id: gone.id, role: "dropped".into(), oid: Some(16385) },
+                KeyRoleFix::Follow { id: moved.id, from: "old_name".into(), to: "renamed".into(), oid: 16390 },
+                KeyRoleFix::Revoke { id: recreated.id, role: "again".into(), oid: Some(16399) },
+                KeyRoleFix::Backfill { id: legacy.id, role: "app".into(), oid: 16384 },
+                KeyRoleFix::Revoke { id: legacy_gone.id, role: "ghost".into(), oid: None },
+            ]
+        );
+        assert!(plan_key_roles(&[alive], &catalog).is_empty(), "a key whose OID has its name");
+        // Public keys are never touched.
+        let mut public = key("anon", None);
+        public.kind = DataKeyKind::Public;
+        assert!(plan_key_roles(&[public], &[]).is_empty());
+    }
+
+    #[test]
+    fn key_roles_catalog_parses_oid_and_hex_name() {
+        let out = format!("16384 {}\n16390 {}\n", hex::encode("app"), hex::encode("a b\n\"c"));
+        assert_eq!(
+            parse_key_roles(&out).unwrap(),
+            vec![(16384, "app".to_string()), (16390, "a b\n\"c".to_string())]
+        );
+        assert!(parse_key_roles("x 61\n").is_err());
+        assert!(parse_key_roles("16384 zz\n").is_err());
+        assert!(KEY_ROLES_SQL.contains("FROM pg_roles"), "{KEY_ROLES_SQL}");
+        assert!(KEY_ROLES_SQL.contains("chelabase: key roles"), "the fakes' needle");
+    }
+
+    // The resync applies the plan after the roles: a key whose OID is gone is revoked.
+    #[tokio::test]
+    async fn resync_revokes_a_key_whose_role_oid_is_gone() {
+        let (w, journal) = worker();
+        let (branch, _ep) = ready(&w, &journal).await;
+        let alive = key("app", Some(16384));
+        let gone = key("app", Some(16385));
+        for k in [&alive, &gone] {
+            w.metadata.state().data_keys.push(chelabase_metadata::NewDataKey {
+                id: k.id,
+                branch_id: branch,
+                kind: DataKeyKind::Secret,
+                role: k.role.clone(),
+                name: k.name.clone(),
+                prefix: k.prefix.clone(),
+                sha256: [0; 32],
+                sealed: None,
+                databases: None,
+                role_oid: k.role_oid,
+            });
+        }
+        w.computes.answer("chelabase: key roles", &format!("16384 {}\n", hex::encode("app")));
+        w.resync(branch).await.unwrap();
+        let fixes = w.metadata.state().key_fixes.clone();
+        assert_eq!(
+            fixes,
+            vec![(branch, vec![KeyRoleFix::Revoke { id: gone.id, role: "app".into(), oid: Some(16385) }])]
+        );
     }
 
     // I3: every catalog role with a password (MD5 too) gets its fresh verifier: the recorded
@@ -1469,5 +1707,61 @@ mod tests {
             "{:?}",
             entries(&journal)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn touched_resyncs_coalesce_into_one_run_after_the_delay() {
+        let (w, journal) = worker();
+        let (branch, _ep) = ready(&w, &journal).await;
+        let pending = PendingResyncs::default();
+        let burst = async {
+            tokio::join!(
+                w.resync_touched(&pending, branch, TOUCHED_RESYNC_DELAY),
+                w.resync_touched(&pending, branch, TOUCHED_RESYNC_DELAY),
+                w.resync_touched(&pending, branch, TOUCHED_RESYNC_DELAY),
+            )
+        };
+        let observer = async {
+            tokio::time::sleep(TOUCHED_RESYNC_DELAY - Duration::from_millis(100)).await;
+            assert_eq!(count(&journal, "metadata.apply_resync"), 0, "still waiting");
+        };
+        let (results, ()) = tokio::join!(burst, observer);
+        assert!(results.0.is_ok() && results.1.is_ok() && results.2.is_ok());
+        assert_eq!(
+            count(&journal, "metadata.apply_resync"),
+            1,
+            "{:?}",
+            entries(&journal)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_touch_after_the_run_schedules_another() {
+        let (w, journal) = worker();
+        let (branch, _ep) = ready(&w, &journal).await;
+        let pending = PendingResyncs::default();
+        w.resync_touched(&pending, branch, TOUCHED_RESYNC_DELAY)
+            .await
+            .unwrap();
+        w.resync_touched(&pending, branch, TOUCHED_RESYNC_DELAY)
+            .await
+            .unwrap();
+        assert_eq!(count(&journal, "metadata.apply_resync"), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn touched_resyncs_of_different_branches_do_not_coalesce() {
+        let (w, journal) = worker();
+        let (branch, _ep) = ready(&w, &journal).await;
+        let other = BranchId::new();
+        let pending = PendingResyncs::default();
+        let (a, b) = tokio::join!(
+            w.resync_touched(&pending, branch, TOUCHED_RESYNC_DELAY),
+            w.resync_touched(&pending, other, TOUCHED_RESYNC_DELAY),
+        );
+        assert!(a.is_ok());
+        // The unknown branch fails on its own and is not swallowed by the first one's claim.
+        assert!(b.unwrap_err().starts_with("syncing login roles: "));
+        assert_eq!(count(&journal, "metadata.apply_resync"), 1);
     }
 }

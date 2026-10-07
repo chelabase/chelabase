@@ -1171,29 +1171,35 @@ async fn protected_child_at_a_past_point_refuses_a_dropped_roles_password() {
     .await;
 }
 
-// M7: an empty password. Postgres takes `PASSWORD ''` as no password (with a notice), but
-// Neon forwards the typed password and then finds no stored hash for it, so the compute fails
-// the statement before anything reaches the receiver: no role is made, and an existing role
-// keeps its password and its copy.
+// M7, revised in round 2 (user, 2026-10-08): an empty password means no password, as in plain
+// Postgres (`PASSWORD ''` is taken as PASSWORD NULL, with a notice). The role is made without a
+// password, so it has no copy and can't log in through the proxy; `ALTER ROLE … PASSWORD ''`
+// clears a password and removes the copy. Setting a password again restores the login.
+// (Refusing '' explicitly in the fork is parked until the next fork work.)
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
-async fn empty_password_fails_in_the_compute() {
+async fn empty_password_means_no_password() {
     live(|fx| async move {
-        const REFUSED: &str = "has no password assigned";
-        let err = fx.owner_err("CREATE ROLE blank LOGIN PASSWORD ''").await;
-        assert!(
-            err.contains(&format!("Failed to get encrypted password: User \"blank\" {REFUSED}")),
-            "{err}"
-        );
-        assert_eq!(fx.role_count(&fx.ep, "blank").await, "0");
+        fx.owner_ok("CREATE ROLE blank LOGIN PASSWORD ''").await;
+        assert_eq!(fx.role_count(&fx.ep, "blank").await, "1");
         assert_eq!(fx.copies(&fx.ep).await, []);
 
         fx.owner_ok("CREATE ROLE later LOGIN PASSWORD 'later-pass-12345'")
             .await;
-        let err = fx.owner_err("ALTER ROLE later PASSWORD ''").await;
-        assert!(err.contains(REFUSED), "{err}");
-        assert_eq!(fx.copies(&fx.ep).await, [("later".to_string(), RoleOrigin::Sql)]);
         assert_logs_in(&fx.ep, &fx.database, "later", "later-pass-12345").await;
+        fx.owner_ok("ALTER ROLE later PASSWORD ''").await;
+        assert_eq!(fx.copies(&fx.ep).await, []);
+        assert!(
+            psql(&fx.ep, &fx.database, "later", "later-pass-12345", "SELECT 1")
+                .await
+                .is_err(),
+            "a cleared password must not log in"
+        );
+
+        fx.owner_ok("ALTER ROLE later PASSWORD 'later-pass-67890'")
+            .await;
+        assert_eq!(fx.copies(&fx.ep).await, [("later".to_string(), RoleOrigin::Sql)]);
+        assert_logs_in(&fx.ep, &fx.database, "later", "later-pass-67890").await;
     })
     .await;
 }
@@ -1310,6 +1316,110 @@ async fn key_role_drop_refused() {
         assert_eq!(status, 204, "{body}");
         fx.owner_ok("DROP ROLE kr").await;
         assert_eq!(fx.copies(&fx.ep).await, []);
+    })
+    .await;
+}
+
+// C1: the usual role behind a secret key is NOLOGIN without a password, so it has no
+// `neon_roles` row. Create and rotate check it on the compute; the key works; a drop is
+// refused while it lives; and a just-dropped name is refused a key.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn nologin_role_backs_a_secret_key() {
+    live(|fx| async move {
+        fx.owner_ok(
+            "CREATE TABLE notes (id int); INSERT INTO notes VALUES (1); \
+             CREATE ROLE api_reader NOLOGIN; GRANT SELECT ON notes TO api_reader",
+        )
+        .await;
+        assert_eq!(fx.copies(&fx.ep).await, [], "no row for a role without a password");
+        let (key_id, key) = fx.secret_key("reader-key", "api_reader").await;
+        let body = wait_for_data_status(&key, "notes", 200, Duration::from_secs(30)).await;
+        assert!(body.to_string().contains('1'), "{body}");
+
+        let (status, body) = api(
+            "POST",
+            &format!("{}/keys/{key_id}/rotate", fx.branch_path(fx.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 201, "rotate: {body}");
+        assert_eq!(body["role"], "api_reader");
+        let rotated = body["key"].as_str().unwrap().to_string();
+        wait_for_data_status(&rotated, "notes", 200, Duration::from_secs(30)).await;
+        wait_for_data_status(&key, "notes", 401, Duration::from_secs(40)).await;
+
+        // REVOKE first, in the same transaction: Postgres refuses to drop a role that holds a
+        // grant before anything is forwarded. The refusal rolls the REVOKE back too.
+        let err = fx
+            .owner_err("BEGIN; REVOKE ALL ON notes FROM api_reader; DROP ROLE api_reader; COMMIT;")
+            .await;
+        assert!(
+            err.contains("role \"api_reader\" backs data API key(s) reader-key; revoke them first"),
+            "{err}"
+        );
+
+        // The key is bound to the role's OID.
+        let oid: i64 = sqlx::query_scalar("SELECT role_oid FROM data_api_keys WHERE id = $1::uuid")
+            .bind(body["id"].as_str().unwrap())
+            .fetch_one(fx.metadata.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.value(&fx.ep, "SELECT oid FROM pg_roles WHERE rolname = 'api_reader';").await,
+            oid.to_string()
+        );
+        // A role that's gone is refused a key.
+        fx.owner_ok("CREATE ROLE gone_reader NOLOGIN; DROP ROLE gone_reader").await;
+        let (status, body) = api(
+            "POST",
+            &format!("{}/keys", fx.branch_path(fx.main)),
+            Some(json!({ "name": "late", "role": "gone_reader" })),
+        )
+        .await;
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["error"]["code"], "role_refused", "{body}");
+    })
+    .await;
+}
+
+// A key's role dropped and created again under the same name where the DDL receiver can't
+// refuse it (as cloud_admin, forwarding off: the late commit no check sees). The key is
+// bound to the old OID: the data API refuses it at once, and the resync revokes it. A key
+// made for the new role works.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn recreated_role_kills_its_key_and_the_resync_revokes_it() {
+    live(|fx| async move {
+        fx.owner_ok(
+            "CREATE TABLE notes (id int); INSERT INTO notes VALUES (1); \
+             CREATE ROLE twin NOLOGIN; GRANT SELECT ON notes TO twin",
+        )
+        .await;
+        let (old_id, old_key) = fx.secret_key("old", "twin").await;
+        wait_for_data_status(&old_key, "notes", 200, Duration::from_secs(30)).await;
+
+        fx.sql(
+            "DROP OWNED BY twin; DROP ROLE twin; CREATE ROLE twin NOLOGIN; \
+             GRANT SELECT ON notes TO twin; GRANT twin TO authenticator;",
+        )
+        .await;
+        // At once: the gateway's key cache still has the key, the preamble refuses the OID.
+        let (status, body) = data_select(&old_key, "notes").await;
+        assert_eq!(status, 503, "{body}");
+
+        fx.worker.resync(fx.main).await.expect("resync");
+        let revoked: bool =
+            sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM data_api_keys WHERE id = $1::uuid")
+                .bind(&old_id)
+                .fetch_one(fx.metadata.pool())
+                .await
+                .unwrap();
+        assert!(revoked, "the resync revoked the dead key");
+        wait_for_data_status(&old_key, "notes", 401, Duration::from_secs(40)).await;
+
+        let (_, new_key) = fx.secret_key("new", "twin").await;
+        wait_for_data_status(&new_key, "notes", 200, Duration::from_secs(30)).await;
     })
     .await;
 }
@@ -1435,6 +1545,136 @@ async fn forwarding_off_then_resync_picks_up() {
             [("quiet".to_string(), RoleOrigin::Sql)]
         );
         assert_logs_in(&fx.ep, &fx.database, "quiet", "quiet-pass-12345").await;
+    })
+    .await;
+}
+
+// T12b: LOGIN and NOLOGIN reach the control plane in the statement's own transaction.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn alter_role_nologin_blocks_the_proxy_login_at_once() {
+    live(|fx| async move {
+        fx.owner_ok("CREATE ROLE nl_role LOGIN PASSWORD 'nl-pass-12345'")
+            .await;
+        assert_logs_in(&fx.ep, &fx.database, "nl_role", "nl-pass-12345").await;
+        assert_eq!(fx.listed_role("nl_role").await["login"], json!(true));
+
+        fx.owner_ok("ALTER ROLE nl_role NOLOGIN").await;
+        // Right away, no waiting for a resync.
+        if let Ok(out) = psql(&fx.ep, &fx.database, "nl_role", "nl-pass-12345", "SELECT 1").await {
+            panic!("nl_role logged in after NOLOGIN: {out}");
+        }
+        assert_eq!(fx.listed_role("nl_role").await["login"], json!(false));
+
+        fx.owner_ok("ALTER ROLE nl_role LOGIN").await;
+        assert_logs_in(&fx.ep, &fx.database, "nl_role", "nl-pass-12345").await;
+        assert_eq!(fx.listed_role("nl_role").await["login"], json!(true));
+    })
+    .await;
+}
+
+// T13d (re-review I1): `ALTER ROLE … VALID UNTIL` alone is an attribute change; it must not
+// remove an API role's copy (login, revealable password). The owner can't set its own VALID
+// UNTIL (Postgres requires CREATEROLE and ADMIN on the role), so the owner case is covered by
+// `ddl_valid_until_alone_is_an_attribute_change` in the orchestrator's internal tests.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn alter_role_valid_until_keeps_the_copy() {
+    live(|fx| async move {
+        fx.create(fx.main, "api_vu", false).await;
+        let password = fx.password(fx.main, "api_vu").await;
+        assert_logs_in(&fx.ep, &fx.database, "api_vu", &password).await;
+
+        fx.owner_ok("ALTER ROLE api_vu VALID UNTIL 'infinity'").await;
+        assert_logs_in(&fx.ep, &fx.database, "api_vu", &password).await;
+        assert_eq!(fx.password(fx.main, "api_vu").await, password, "still revealable");
+        assert_eq!(fx.listed_role("api_vu").await["login"], json!(true));
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [("api_vu".to_string(), RoleOrigin::Api)]
+        );
+    })
+    .await;
+}
+
+// T13d (D20): a role dropped and created again in one transaction is refused while a secret
+// data key uses it (the key keeps working), and goes through when none does. Needs a fork
+// build that sends `recreated`.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn drop_and_create_in_one_transaction_is_refused_while_a_key_uses_the_role() {
+    live(|fx| async move {
+        let setup = "CREATE TABLE notes (id int PRIMARY KEY, body text);\n\
+                     INSERT INTO notes VALUES (1, 'n');\n\
+                     CREATE ROLE app LOGIN PASSWORD 'app-pass-12345';\n\
+                     GRANT SELECT ON notes TO app;\n";
+        psql_script(&fx.ep, &fx.database, "postgres", &fx.owner_password, setup)
+            .await
+            .expect("setup");
+        let (_, key) = fx.secret_key("k1", "app").await;
+        let body = wait_for_data_status(&key, "notes", 200, Duration::from_secs(30)).await;
+        assert_eq!(body, json!([{ "id": 1, "body": "n" }]));
+
+        // The REVOKE comes first: Postgres refuses to drop a role that still holds a grant,
+        // before the fork forwards anything. The refusal rolls the transaction back, so the
+        // grant (and the key) survive.
+        let err = fx
+            .owner_err(
+                "BEGIN; REVOKE ALL ON notes FROM app; DROP ROLE app; \
+                 CREATE USER app PASSWORD 'recreated-pass-1'; COMMIT;",
+            )
+            .await;
+        assert!(
+            err.contains("role \"app\" backs data API key(s) k1; revoke them first"),
+            "{err}"
+        );
+        assert_eq!(fx.role_count(&fx.ep, "app").await, "1");
+        assert_logs_in(&fx.ep, &fx.database, "app", "app-pass-12345").await;
+        assert_eq!(data_select(&key, "notes").await.0, 200, "the key still works");
+
+        // No live key on `other`: the same statement goes through.
+        fx.owner_ok("CREATE ROLE other LOGIN PASSWORD 'other-pass-1234'")
+            .await;
+        fx.owner_ok("BEGIN; DROP ROLE other; CREATE USER other PASSWORD 'recreated-pass-1'; COMMIT;")
+            .await;
+        assert_logs_in(&fx.ep, &fx.database, "other", "recreated-pass-1").await;
+    })
+    .await;
+}
+
+// T12b: a GRANT (nothing the receiver can mirror) is read back by a resync a few seconds
+// later, not at reconcile's next pass (every 30 s).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn grant_shows_the_derived_flag_within_seconds() {
+    live(|fx| async move {
+        fx.create(fx.main, "api_admin", true).await;
+        // Create, then grant within milliseconds: the copy's `forwarded_at` is fresh when the
+        // touched resync runs, and its level must still update.
+        let granted = Instant::now();
+        psql_script(
+            &fx.ep,
+            &fx.database,
+            "postgres",
+            &fx.owner_password,
+            "CREATE ROLE by_grant LOGIN PASSWORD 'by-grant-pass-123';\n\
+             GRANT api_admin TO by_grant;\n",
+        )
+        .await
+        .expect("create and grant");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let row = loop {
+            let row = fx.listed_role("by_grant").await;
+            if row["level"] == "owner_level" || Instant::now() >= deadline {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        println!(
+            "by_grant: listed as owner-level after {:?}",
+            granted.elapsed()
+        );
+        assert_eq!(row["level"], "owner_level", "{row}");
     })
     .await;
 }

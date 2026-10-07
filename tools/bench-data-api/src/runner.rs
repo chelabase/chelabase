@@ -99,7 +99,10 @@ pub async fn throughput<E: Exec + 'static>(
     plan: &ThroughputPlan,
     next: std::sync::Arc<dyn Fn(OpKind) -> BenchOp + Send + Sync>,
 ) -> anyhow::Result<f64> {
-    let t0 = std::time::Instant::now() + plan.warmup;
+    // tokio's clock, so a test can run the window on paused time (deterministic, whatever
+    // the machine's load). It is the monotonic wall clock when time isn't paused.
+    use tokio::time::Instant;
+    let t0 = Instant::now() + plan.warmup;
     let t1 = t0 + plan.window;
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..plan.concurrency {
@@ -107,12 +110,12 @@ pub async fn throughput<E: Exec + 'static>(
         let next = next.clone();
         workers.spawn(async move {
             let mut counted = 0u64;
-            while std::time::Instant::now() < t1 {
+            while Instant::now() < t1 {
                 let bop = next(op);
                 variant.exec(&bop).await.map_err(|e| {
                     anyhow::anyhow!("variant {:?}, op {:?}: {e:#}", variant.kind(), op)
                 })?;
-                let done = std::time::Instant::now();
+                let done = Instant::now();
                 if done >= t0 && done < t1 {
                     counted += 1;
                 }
@@ -259,7 +262,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // Paused time: the 10 ms sleeps take exactly 10 ms, so the count doesn't depend on load.
+    #[tokio::test(start_paused = true)]
     async fn throughput_counts_completions() {
         let (a, _, _) = doubles(10, None);
         let rps = throughput(
@@ -273,10 +277,10 @@ mod tests {
         assert!((300.0..=420.0).contains(&rps), "{rps}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn throughput_warmup_is_not_counted() {
         let (a, _, log) = doubles(10, None);
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let rps = throughput(
             std::sync::Arc::new(a),
             OpKind::ByKey,
@@ -355,34 +359,45 @@ mod tests {
         assert_eq!(rotated(&all, 4), [A, B, C, D]);
     }
 
-    struct Busy;
+    /// Every call takes 5 ms and records how many calls are in flight at once.
+    struct Tracked {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
 
-    impl Exec for Busy {
+    impl Exec for Tracked {
         fn kind(&self) -> VariantKind {
             VariantKind::A
         }
         async fn exec(&self, _op: &BenchOp) -> anyhow::Result<String> {
-            let end = std::time::Instant::now() + Duration::from_millis(5);
-            while std::time::Instant::now() < end {
-                std::hint::spin_loop();
-            }
-            tokio::task::yield_now().await;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok("x".into())
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // Paused time needs the current-thread runtime. The workers are still concurrent: they
+    // interleave at the sleep, so all four calls are in flight at once. Run one after the
+    // other the same four workers would reach a max in flight of 1 and 200 req/s; here
+    // each worker completes 199 calls inside the 1 s window (at 5, 10, .. 995 ms): 796/s.
+    #[tokio::test(start_paused = true)]
     async fn throughput_uses_parallel_tasks() {
+        let v = std::sync::Arc::new(Tracked {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
         let rps = throughput(
-            std::sync::Arc::new(Busy),
+            v.clone(),
             OpKind::ByKey,
             &tplan(0, 1000),
             std::sync::Arc::new(bench_op),
         )
         .await
         .unwrap();
-        // one thread tops out at 1000/5 = 200 req/s
-        assert!(rps > 300.0, "{rps}");
+        assert_eq!(v.max_in_flight.load(Ordering::SeqCst), 4);
+        assert!((790.0..=800.0).contains(&rps), "{rps}");
     }
 
     #[tokio::test]

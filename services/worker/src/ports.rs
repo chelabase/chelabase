@@ -13,12 +13,15 @@ use chelabase_metadata::{
     ServedDatabase,
 };
 use chelabase_neon::proxy_cache::ProxyCache;
+use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::spec::Placement;
 use chelabase_neon::storcon::LsnAtTime;
 use chelabase_neon::{ComputeSigner, Lsn, NeonId, StorconClient, StorconError};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+
+use crate::safekeepers::SafekeeperSet;
 
 /// The metadata calls the worker makes. See [`MetadataClient`] for each one's guards.
 pub trait WorkerMetadata: Send + Sync + 'static {
@@ -297,6 +300,12 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Vec<DataKeyRecord>, MetadataError>> + Send;
+    /// The resync's repairs of secret keys versus the compute's roles (by OID).
+    fn fix_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[chelabase_metadata::KeyRoleFix],
+    ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
     fn has_live_public_key(
         &self,
         branch: BranchId,
@@ -788,6 +797,14 @@ impl WorkerMetadata for MetadataClient {
         MetadataClient::list_data_keys(self, branch).await
     }
 
+    async fn fix_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[chelabase_metadata::KeyRoleFix],
+    ) -> Result<u64, MetadataError> {
+        MetadataClient::fix_key_roles(self, branch, fixes).await
+    }
+
     async fn has_live_public_key(&self, branch: BranchId) -> Result<bool, MetadataError> {
         MetadataClient::has_live_public_key(self, branch).await
     }
@@ -990,7 +1007,8 @@ pub trait Storage: Placement + 'static {
         tenant: &NeonId,
         timeline: &NeonId,
     ) -> impl Future<Output = Result<(), StorconError>> + Send;
-    /// The timeline's head: its `last_record_lsn`.
+    /// The timeline's head: its `last_record_lsn`, or the safekeepers' commit LSN when ahead
+    /// (see [`crate::safekeepers::SafekeeperSet::head`]).
     fn get_timeline(
         &self,
         tenant: &NeonId,
@@ -1039,9 +1057,25 @@ pub trait Storage: Placement + 'static {
 /// The Postgres major version every new timeline gets (the compute image is v17).
 const PG_VERSION: u32 = 17;
 
-impl Storage for StorconClient {
+/// The storage controller plus the safekeepers the worker reads commit LSNs from.
+pub struct RealStorage {
+    pub storcon: StorconClient,
+    pub safekeepers: SafekeeperSet<SafekeeperClient>,
+}
+
+impl Placement for RealStorage {
+    async fn pageserver_connstring(&self, tenant: &NeonId) -> Result<String, StorconError> {
+        self.storcon.pageserver_connstring(tenant).await
+    }
+
+    async fn active_safekeepers(&self) -> Result<Vec<String>, StorconError> {
+        self.storcon.active_safekeepers().await
+    }
+}
+
+impl Storage for RealStorage {
     async fn create_tenant(&self, tenant: &NeonId) -> Result<(), StorconError> {
-        StorconClient::create_tenant(self, tenant).await
+        StorconClient::create_tenant(&self.storcon, tenant).await
     }
 
     async fn create_timeline(
@@ -1049,17 +1083,17 @@ impl Storage for StorconClient {
         tenant: &NeonId,
         timeline: &NeonId,
     ) -> Result<(), StorconError> {
-        StorconClient::create_timeline(self, tenant, timeline, PG_VERSION, None)
+        StorconClient::create_timeline(&self.storcon, tenant, timeline, PG_VERSION, None)
             .await
             .map(drop)
     }
 
     async fn delete_tenant(&self, tenant: &NeonId) -> Result<(), StorconError> {
-        StorconClient::delete_tenant(self, tenant).await
+        StorconClient::delete_tenant(&self.storcon, tenant).await
     }
 
     async fn list_tenant_ids(&self) -> Result<Vec<NeonId>, StorconError> {
-        StorconClient::list_tenant_ids(self).await
+        StorconClient::list_tenant_ids(&self.storcon).await
     }
 
     async fn create_branch_timeline(
@@ -1070,7 +1104,7 @@ impl Storage for StorconClient {
         lsn: Lsn,
     ) -> Result<(), StorconError> {
         StorconClient::create_timeline(
-            self,
+            &self.storcon,
             tenant,
             timeline,
             PG_VERSION,
@@ -1085,13 +1119,19 @@ impl Storage for StorconClient {
         tenant: &NeonId,
         timeline: &NeonId,
     ) -> Result<(), StorconError> {
-        StorconClient::delete_timeline(self, tenant, timeline).await
+        StorconClient::delete_timeline(&self.storcon, tenant, timeline).await
     }
 
     async fn get_timeline(&self, tenant: &NeonId, timeline: &NeonId) -> Result<Lsn, StorconError> {
-        StorconClient::get_timeline(self, tenant, timeline)
-            .await
-            .map(|t| t.last_record_lsn)
+        let (info, active) = tokio::join!(
+            StorconClient::get_timeline(&self.storcon, tenant, timeline),
+            self.storcon.active_safekeeper_ids(),
+        );
+        let (info, active) = (info?, active?);
+        Ok(self
+            .safekeepers
+            .head(info.last_record_lsn, &active, tenant, timeline)
+            .await)
     }
 
     async fn ancestor_lsn(
@@ -1099,7 +1139,7 @@ impl Storage for StorconClient {
         tenant: &NeonId,
         timeline: &NeonId,
     ) -> Result<Option<Lsn>, StorconError> {
-        StorconClient::get_timeline(self, tenant, timeline)
+        StorconClient::get_timeline(&self.storcon, tenant, timeline)
             .await
             .map(|t| t.ancestor_lsn)
     }
@@ -1110,7 +1150,7 @@ impl Storage for StorconClient {
         timeline: &NeonId,
         at: DateTime<Utc>,
     ) -> Result<LsnAtTime, StorconError> {
-        StorconClient::lsn_by_timestamp(self, tenant, timeline, at).await
+        StorconClient::lsn_by_timestamp(&self.storcon, tenant, timeline, at).await
     }
 
     async fn timestamp_of_lsn(
@@ -1119,7 +1159,7 @@ impl Storage for StorconClient {
         timeline: &NeonId,
         lsn: Lsn,
     ) -> Result<Option<DateTime<Utc>>, StorconError> {
-        StorconClient::timestamp_of_lsn(self, tenant, timeline, lsn).await
+        StorconClient::timestamp_of_lsn(&self.storcon, tenant, timeline, lsn).await
     }
 
     async fn detach_ancestor(
@@ -1127,7 +1167,7 @@ impl Storage for StorconClient {
         tenant: &NeonId,
         timeline: &NeonId,
     ) -> Result<(), StorconError> {
-        StorconClient::detach_ancestor(self, tenant, timeline).await
+        StorconClient::detach_ancestor(&self.storcon, tenant, timeline).await
     }
 
     async fn patch_tenant_config(
@@ -1135,18 +1175,18 @@ impl Storage for StorconClient {
         tenant: &NeonId,
         pitr_interval: Duration,
     ) -> Result<(), StorconError> {
-        StorconClient::patch_tenant_config(self, tenant, pitr_interval).await
+        StorconClient::patch_tenant_config(&self.storcon, tenant, pitr_interval).await
     }
 
     async fn tenant_pitr_interval(
         &self,
         tenant: &NeonId,
     ) -> Result<Option<Duration>, StorconError> {
-        StorconClient::tenant_pitr_interval(self, tenant).await
+        StorconClient::tenant_pitr_interval(&self.storcon, tenant).await
     }
 
     async fn list_timelines(&self, tenant: &NeonId) -> Result<Vec<NeonId>, StorconError> {
-        StorconClient::list_timelines(self, tenant).await
+        StorconClient::list_timelines(&self.storcon, tenant).await
     }
 }
 

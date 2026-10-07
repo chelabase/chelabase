@@ -257,6 +257,7 @@ impl H {
                         claims,
                         databases: None,
                         project_id: Some(self.project),
+                        role_oid: None,
                     }),
                 },
             )
@@ -280,6 +281,7 @@ impl H {
                         claims,
                         databases: None,
                         project_id: Some(self.project),
+                        role_oid: None,
                     }),
                 },
             )

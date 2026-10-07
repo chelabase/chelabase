@@ -383,6 +383,24 @@ async fn active_safekeepers_skips_the_rest() {
 }
 
 #[tokio::test]
+async fn active_safekeeper_ids_filters_like_active_safekeepers() {
+    let body = r#"[{"id":1,"host":"safekeeper1","port":5454,"http_port":7676,"scheduling_policy":"Active"},
+            {"id":2,"host":"safekeeper2","port":5454,"http_port":7676,"scheduling_policy":"Pause"},
+            {"id":3,"host":"safekeeper3","port":5454,"http_port":7676,"scheduling_policy":"Active"}]"#;
+    let m = mock(vec![(200, body), (200, body)]).await;
+    let client = StorconClient::new(&m.base, 0);
+    assert_eq!(client.active_safekeeper_ids().await.unwrap(), vec![1, 3]);
+    assert_eq!(
+        client.active_safekeepers().await.unwrap(),
+        vec![
+            "safekeeper1:5454".to_string(),
+            "safekeeper3:5454".to_string()
+        ]
+    );
+    assert_eq!(m.seen()[0].path, "/control/v1/safekeeper");
+}
+
+#[tokio::test]
 async fn describe_tenant_parses_shards() {
     let m = mock(vec![(
         200,

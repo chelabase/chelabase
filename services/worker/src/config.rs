@@ -7,22 +7,28 @@ use anyhow::{Context, anyhow};
 
 use chelabase_metadata::MetadataClient;
 use chelabase_neon::proxy_cache::ProxyCache;
+use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::{ComputeSettings, DockerBackend, StorconClient};
 use chelabase_secrets::SecretKey;
 use chelabase_types::mode::Mode;
 use chelabase_types::role_settings::RoleSettings;
 
 use crate::Worker;
-use crate::ports::HttpPusher;
+use crate::ports::{HttpPusher, RealStorage};
+use crate::safekeepers::SafekeeperSet;
 
 /// The worker over the real metadata database, storage controller, Docker, Valkey and
 /// compute_ctl.
-pub type RealWorker = Worker<MetadataClient, StorconClient, DockerBackend, ProxyCache, HttpPusher>;
+pub type RealWorker = Worker<MetadataClient, RealStorage, DockerBackend, ProxyCache, HttpPusher>;
 
 /// No secrets in here, so `Debug` is safe.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub storcon_url: String,
+    /// `CHELABASE_SAFEKEEPER_HTTP`: where to reach each safekeeper's HTTP API, by the id the
+    /// storage controller knows it by (`id=url`, comma separated; default
+    /// `1=http://127.0.0.1:7676`, the Compose safekeeper).
+    pub safekeeper_http: Vec<(u64, reqwest::Url)>,
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
     pub control_plane_uri: String,
@@ -78,6 +84,7 @@ impl WorkerConfig {
         let roles = RoleSettings::from_lookup(mode, &get).map_err(|e| anyhow!(e))?;
         let config = Self {
             storcon_url: or_default("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
+            safekeeper_http: safekeeper_http(non_blank(&get, "CHELABASE_SAFEKEEPER_HTTP"))?,
             compute_jwt_dir: PathBuf::from(or_default("CHELABASE_COMPUTE_JWT_DIR", ".chelabase/neon")),
             compute_network: or_default("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
             control_plane_uri: or_default(
@@ -106,6 +113,32 @@ impl WorkerConfig {
     pub fn owner_superuser(&self) -> bool {
         self.owner_superuser_requested && self.mode == Mode::SelfHosted
     }
+}
+
+/// `CHELABASE_SAFEKEEPER_HTTP`: `id=url` entries, comma separated, each id once and each URL
+/// plain `http://` or `https://`.
+fn safekeeper_http(value: Option<String>) -> anyhow::Result<Vec<(u64, reqwest::Url)>> {
+    const NAME: &str = "CHELABASE_SAFEKEEPER_HTTP";
+    let value = value.unwrap_or_else(|| "1=http://127.0.0.1:7676".to_string());
+    let mut out: Vec<(u64, reqwest::Url)> = Vec::new();
+    for entry in value.split(',').map(str::trim) {
+        let bad = |why: &str| {
+            anyhow!(
+                "{NAME}={value:?}: {entry:?} {why}; expected id=url, e.g. 1=http://127.0.0.1:7676"
+            )
+        };
+        let (id, url) = entry.split_once('=').ok_or_else(|| bad("has no '='"))?;
+        let id: u64 = id.trim().parse().map_err(|_| bad("has no numeric id"))?;
+        let url: reqwest::Url = url.trim().parse().map_err(|_| bad("has no valid URL"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+            return Err(bad("needs an http(s) URL with a host"));
+        }
+        if out.iter().any(|(seen, _)| *seen == id) {
+            return Err(bad("repeats an id"));
+        }
+        out.push((id, url));
+    }
+    Ok(out)
 }
 
 /// `CHELABASE_APP_USERS_RECONCILE_SECS`: whole seconds from 30 to 86,400; 300 when unset.
@@ -191,7 +224,17 @@ pub fn build(
         .context("building the compute_ctl HTTP client")?;
     Ok(Worker {
         metadata,
-        storage: StorconClient::new(&config.storcon_url, 0).with_timeout(Duration::from_secs(10)),
+        storage: RealStorage {
+            storcon: StorconClient::new(&config.storcon_url, 0)
+                .with_timeout(Duration::from_secs(10)),
+            safekeepers: SafekeeperSet::new(
+                config
+                    .safekeeper_http
+                    .iter()
+                    .map(|(id, url)| (*id, SafekeeperClient::new(url.clone())))
+                    .collect(),
+            ),
+        },
         computes: DockerBackend::connect(ComputeSettings {
             image: config.compute_image.clone(),
             network: config.compute_network.clone(),
@@ -244,6 +287,52 @@ mod tests {
         assert_eq!(c.mode, Mode::SelfHosted);
         assert!(!c.owner_superuser_requested);
         assert!(!c.owner_superuser());
+    }
+
+    #[test]
+    fn safekeeper_http_default() {
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert_eq!(
+            c.safekeeper_http,
+            vec![(1, "http://127.0.0.1:7676".parse().unwrap())]
+        );
+    }
+
+    #[test]
+    fn safekeeper_http_parses_list() {
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            (
+                "CHELABASE_SAFEKEEPER_HTTP",
+                " 1=http://10.0.0.1:7676, 2=http://sk2:7676/ ",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.safekeeper_http,
+            vec![
+                (1, "http://10.0.0.1:7676".parse().unwrap()),
+                (2, "http://sk2:7676/".parse().unwrap())
+            ]
+        );
+    }
+
+    #[test]
+    fn safekeeper_http_rejects_garbage() {
+        for bad in [
+            "http://127.0.0.1:7676",
+            "x=http://a:1",
+            "1=not a url",
+            "1=",
+            "1=http://a:1,1=http://b:1",
+            "1=ftp://a:1",
+        ] {
+            let err =
+                WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_SAFEKEEPER_HTTP", bad)]))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("CHELABASE_SAFEKEEPER_HTTP"), "{bad}: {err}");
+        }
     }
 
     #[test]

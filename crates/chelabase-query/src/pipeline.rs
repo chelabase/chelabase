@@ -690,6 +690,7 @@ mod tests {
             RunAs::Role {
                 role: "anon",
                 claims: &CLAIMS,
+                oid: None,
             },
             budget,
         )

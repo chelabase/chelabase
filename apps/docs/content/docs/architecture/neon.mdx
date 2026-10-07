@@ -49,8 +49,11 @@ Valkey is what makes query cancel work through the proxy, and it carries the cac
 | Mailpit | 8025 | Local email inbox (verification codes, resets) |
 | Neon storage controller | 1234 | Tenants and timelines |
 | Neon pageserver | 9898 | Pageserver HTTP API |
+| Neon safekeeper | 7676 | Safekeeper HTTP API (loopback) |
 | Neon proxy | 4432, 4444 | Postgres wire; WebSocket and SQL over HTTP |
 | Valkey | 6379 | Proxy cache invalidation and query cancel |
+
+The storage APIs (storcon `:1234`, pageserver `:9898`, safekeeper `:7676`) are unauthenticated on loopback, so any local user or process can delete or inspect data. Platform mode will need authentication on them; it isn't built yet.
 
 Copy [`infra/compose/.env.example`](https://github.com/chelabase/chelabase/blob/main/infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer the values in `.chelabase/zitadel/demo.env` after bootstrap.
 
