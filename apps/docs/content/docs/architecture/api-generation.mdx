@@ -50,10 +50,9 @@ just api-gen
 This command:
 
 - rewrites the OpenAPI documents with `CHELABASE_BLESS=1` on the document tests;
-- runs orval 8 to regenerate the TypeScript clients;
-- syncs the Scalar API reference bundle with `just scalar-sync`.
+- runs orval 8 to regenerate the TypeScript clients.
 
-Commit the result. `just check` fails if the documents, the generated code or the Scalar bundle are out of date.
+Commit the result. `just check` fails if the documents or the generated code are out of date.
 
 ## Generated clients
 
@@ -80,14 +79,6 @@ The data API keeps its own codes and extra fields (`detail`, `hint`, `sqlstate`)
 
 ## API reference UI
 
-Scalar provides a self-hosted API reference at `GET /v1/docs` behind the gateway. It is public: the orchestrator serves the page and `/v1/docs/scalar.js` (the embedded bundle), and the page reads `GET /v1/openapi.json`. Studio has an **API** page (`/app/api`, linked next to Sign out) that renders the same document, with "Try it out" sending the signed-in user's token automatically.
+Studio has an **API** page (`/app/api`, linked next to Sign out) that renders the Management document with "Try it out", sending the signed-in user's token automatically. The docs site has the reference pages for all three APIs. The orchestrator serves no page of its own; `GET /v1/openapi.json` stays public behind the gateway, so any tool can load the document.
 
-Scalar is configured never to contact scalar.com: telemetry off, default fonts off, no request proxy (`proxyUrl` is the empty string, because leaving it unset falls back to a scalar.com proxy), external URLs empty, agent and MCP off, developer tools never.
-
-Scalar is versioned through pnpm pinning: `@scalar/api-reference` at the repository root and `@scalar/api-reference-react` in Studio, both exact. To update it:
-
-1. Bump both with pnpm (the minimum release age applies).
-2. Run `just scalar-sync` to copy `dist/browser/standalone.js` into `services/orchestrator/assets/scalar/` with a `VERSION` file.
-3. Commit.
-
-The orchestrator embeds Scalar at compile time, so Rust builds need no Node.
+Studio's page uses `@scalar/api-reference-react`, pinned exactly in Studio and configured never to contact scalar.com: telemetry off, default fonts off, no request proxy, external URLs empty, agent and MCP off, developer tools never. Update it with pnpm (the minimum release age applies).

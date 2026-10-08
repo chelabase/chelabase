@@ -3,7 +3,7 @@ import { ApiReferenceReact, type AnyApiReferenceConfiguration } from "@scalar/ap
 // this page is mounted: Scalar's stylesheet has `body` and `:root` rules that
 // must not outlive the page and restyle the rest of Studio.
 import scalarCss from "@scalar/api-reference-react/style.css?inline";
-import lagoonCss from "./api-reference.css?inline";
+import lagoonCss from "@chelabase/lagoon/scalar.css?inline";
 import { useEffect, useMemo, type CSSProperties } from "react";
 import managementDocument from "../../../../openapi/management.json";
 import { useAccessToken } from "@/lib/access-token";
@@ -51,11 +51,11 @@ export default function ApiReference() {
   return (
     <>
       <style>{scalarCss}</style>
-      {/* The lagoon palette over Scalar's dark theme, scoped to .studio-api (see the file). */}
+      {/* The lagoon palette over Scalar's dark theme, scoped to .lagoon-scalar (@chelabase/lagoon/scalar.css). */}
       <style>{lagoonCss}</style>
       {/* The shell's sticky header is 52px: Scalar's own sticky sidebar sits under it. */}
       <div
-        className="studio-api"
+        className="lagoon-scalar"
         style={{ "--scalar-custom-header-height": "52px" } as CSSProperties}
       >
         <ApiReferenceReact configuration={configuration} />

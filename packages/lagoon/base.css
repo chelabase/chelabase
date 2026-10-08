@@ -1,0 +1,16 @@
+* {
+  box-sizing: border-box;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--chalk);
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: var(--sand);
+  color: var(--ink);
+}

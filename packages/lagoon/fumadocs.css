@@ -1,0 +1,142 @@
+/*
+ * Fumadocs in the lagoon palette. Import last, after fumadocs-ui's preset.css and the twoslash and
+ * openapi presets, and without fumadocs-ui's colour themes (neutral.css and the like): this file
+ * declares every `--color-fd-*` colour itself. Unlayered, so it wins over Fumadocs' layered rules.
+ *
+ * One Meaning: sand = action, selection and focus (primary, ring), coral = hazard, seafoam = yes.
+ * Hairline Not Shadow. Dark only.
+ */
+
+/* The colour map. `@theme` (emitted on `:root`) also makes Tailwind generate the `*-fd-*`
+   utilities; `.dark` repeats it so no Fumadocs `.dark` default can win. */
+@theme {
+  --color-fd-background: var(--ink);
+  --color-fd-foreground: var(--chalk);
+  --color-fd-muted: var(--deep);
+  --color-fd-muted-foreground: var(--chalk-dim);
+  --color-fd-popover: var(--deep);
+  --color-fd-popover-foreground: var(--chalk);
+  --color-fd-card: var(--deep);
+  --color-fd-card-foreground: var(--chalk);
+  --color-fd-border: var(--line);
+  --color-fd-primary: var(--sand);
+  --color-fd-primary-foreground: var(--ink);
+  --color-fd-secondary: var(--channel);
+  --color-fd-secondary-foreground: var(--chalk);
+  --color-fd-accent: var(--channel);
+  --color-fd-accent-foreground: var(--chalk);
+  --color-fd-ring: var(--sand);
+  --color-fd-overlay: color-mix(in srgb, var(--ink) 60%, transparent);
+}
+
+.dark {
+  --color-fd-background: var(--ink);
+  --color-fd-foreground: var(--chalk);
+  --color-fd-muted: var(--deep);
+  --color-fd-muted-foreground: var(--chalk-dim);
+  --color-fd-popover: var(--deep);
+  --color-fd-popover-foreground: var(--chalk);
+  --color-fd-card: var(--deep);
+  --color-fd-card-foreground: var(--chalk);
+  --color-fd-border: var(--line);
+  --color-fd-primary: var(--sand);
+  --color-fd-primary-foreground: var(--ink);
+  --color-fd-secondary: var(--channel);
+  --color-fd-secondary-foreground: var(--chalk);
+  --color-fd-accent: var(--channel);
+  --color-fd-accent-foreground: var(--chalk);
+  --color-fd-ring: var(--sand);
+  --color-fd-overlay: color-mix(in srgb, var(--ink) 60%, transparent);
+}
+
+/* Callouts and diffs by the one-meaning rule: coral = hazard (error, removed lines), seafoam = yes
+   (success, added lines), sand = attention (warning), chalk-dim = a neutral note (info, idea).
+   Declared here, so fumadocs-ui's default-colors.css is not needed. */
+@theme static {
+  --color-fd-info: var(--chalk-dim);
+  --color-fd-warning: var(--sand);
+  --color-fd-error: var(--coral);
+  --color-fd-success: var(--seafoam);
+  --color-fd-idea: var(--chalk-dim);
+  --color-fd-diff-remove: color-mix(in srgb, var(--coral) 12%, transparent);
+  --color-fd-diff-remove-symbol: var(--coral);
+  --color-fd-diff-add: color-mix(in srgb, var(--seafoam) 10%, transparent);
+  --color-fd-diff-add-symbol: var(--seafoam);
+}
+
+/* The radius scale: Fumadocs' larger radii (cards, code blocks, dialogs) fold into the lagoon
+   radius; sm, md and lg come from tailwind.css. */
+@theme inline {
+  --radius-xl: var(--radius);
+  --radius-2xl: var(--radius);
+}
+
+/* Hairline, not shadow: popovers, menus, selects and the search dialog, which all carry `.border`
+   (fumadocs-ui ui/popover.js and dialog/search.js, fumadocs-openapi popover.js and select.js).
+   Popover-coloured surfaces without a full border keep theirs. */
+.bg-fd-popover.border,
+.bg-fd-popover\/60.border,
+.bg-fd-popover\/80.border {
+  border: 1px solid var(--line);
+  box-shadow: none;
+}
+
+/* Code blocks on deep, with a hairline and no shadow. */
+figure.shiki,
+pre {
+  background-color: var(--deep);
+}
+
+figure.shiki {
+  box-shadow: none;
+}
+
+/* Fonts (D8: the stacks come from tokens.css through Tailwind's --font-*). */
+/* Every heading of the page (title, prose and operation sections); `.not-prose` headings are
+   component internals (the response accordions' triggers). */
+#nd-page :is(h1, h2, h3, h4, h5, h6):not(.not-prose) {
+  font-family: var(--font-serif);
+  font-weight: 700;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-mono);
+}
+
+/* OpenAPI method badges in Studio's tones, wherever they show (operation pages, sidebars, footer
+   cards). fumadocs-openapi's Badge (shared-api badge.js) is `font-mono font-medium` plus
+   `dark:text-<colour>-400` by fixed colour names: green GET, blue POST, yellow PUT, orange PATCH,
+   red DELETE. The remap sits on the badge itself, so nothing else using Tailwind's palette (the
+   playground's errors, required markers) changes.
+   Other badges share the signature: the operation heading's "Deprecated" (yellow, `not-prose`) would
+   turn PUT-lilac, so it is sand (D11: attention), below; a deprecated parameter or auth entry
+   (red, no `not-prose`) stays coral. HEAD, OPTIONS and TRACE badges are painted green by
+   fumadocs-openapi, so they take the GET tone (Studio uses chalk-dim); no such operation exists
+   today. */
+.font-mono.font-medium.dark\:text-green-400 {
+  --color-green-400: var(--method-get);
+}
+
+.font-mono.font-medium.dark\:text-blue-400 {
+  --color-blue-400: var(--seafoam);
+}
+
+.font-mono.font-medium.dark\:text-yellow-400 {
+  --color-yellow-400: var(--method-put);
+}
+
+.font-mono.font-medium.dark\:text-orange-400 {
+  --color-orange-400: var(--method-patch);
+}
+
+.font-mono.font-medium.dark\:text-red-400 {
+  --color-red-400: var(--coral);
+}
+
+/* After the yellow remap above, with higher specificity: the heading's "Deprecated" is sand. */
+.not-prose.font-mono.font-medium.dark\:text-yellow-400 {
+  --color-yellow-400: var(--sand);
+}

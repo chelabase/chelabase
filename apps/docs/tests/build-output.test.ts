@@ -39,6 +39,46 @@ function indexPages(dir: string): string[] {
   return walk(root).filter((file) => file.endsWith('/index.html'));
 }
 
+const HTTP_METHODS = ['GET', 'PUT', 'POST', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH', 'TRACE'];
+
+function classesOf(tag: string): string[] {
+  return /\sclass="([^"]*)"/.exec(tag)?.[1]?.split(/\s+/) ?? [];
+}
+
+/** Every rendered element carrying fumadocs-openapi's Badge signature, with its text and colour.
+ *  Only real attributes (`class="…"`); the serialized page tree in scripts escapes its quotes. */
+function badges(html: string): { text: string; colour: string }[] {
+  const out: { text: string; colour: string }[] = [];
+  for (const m of html.matchAll(/<[a-z][a-z0-9]*\s[^>]*>([^<]*)/g)) {
+    const classes = classesOf(m[0]);
+    const colour = classes
+      .map((c) => /^dark:text-(green|blue|yellow|orange|red)-400$/.exec(c)?.[1])
+      .find(Boolean);
+    if (colour && classes.includes('font-mono') && classes.includes('font-medium')) {
+      out.push({ text: m[1]!.trim(), colour });
+    }
+  }
+  return out;
+}
+
+/** The badges of the serialized page tree (the sidebar the client renders), whose markup is
+ *  escaped as `\x3Cspan class=\"…\">GET\x3C/span>`. */
+function treeBadges(html: string): { text: string; colour: string }[] {
+  const out: { text: string; colour: string }[] = [];
+  for (const m of html.matchAll(/\\x3Cspan class=\\"([^"\\]*)\\">([^\\]*)\\x3C\/span>/g)) {
+    const tag = `<span class="${m[1]}">`;
+    out.push(...badges(`${tag}${m[2]}`));
+  }
+  return out;
+}
+
+/** The sidebar of a page (`aside#nd-sidebar`). */
+function sidebarOf(html: string): string {
+  const start = html.indexOf('<aside id="nd-sidebar"');
+  if (start < 0) throw new Error('no #nd-sidebar');
+  return html.slice(start, html.indexOf('</aside>', start));
+}
+
 describe('the built docs site', () => {
   beforeAll(() => {
     if (!existsSync(dist)) {
@@ -162,6 +202,114 @@ describe('the built docs site', () => {
     expect(api, 'a runQuery page').toBeDefined();
     expect(title(relative(dist, api!))).toMatch(/^.+ · Chelabase$/);
     expect(title(relative(dist, api!))).not.toBe('Chelabase');
+  });
+
+  it('html_is_dark_without_javascript', () => {
+    // No light flash on a static host: the class is in the prerendered HTML, not set by a script.
+    for (const page of ['docs/index.html', 'docs/reference/data/runQuery/index.html']) {
+      const html = /<html[^>]*>/.exec(read(page))?.[0];
+      expect(html, page).toMatch(/\sclass="([^"]*\s)?dark(\s[^"]*)?"/);
+    }
+  });
+
+  it('lagoon_tokens_reach_the_css', () => {
+    const assets = join(dist, 'assets');
+    const sheets = readdirSync(assets)
+      .filter((name) => name.endsWith('.css'))
+      .map((name) => readFileSync(join(assets, name), 'utf8'));
+    expect(sheets.length).toBeGreaterThan(0);
+    expect(sheets.some((css) => css.includes('--ink:#0b1c1f'))).toBe(true);
+    expect(sheets.some((css) => css.includes('--color-fd-background:var(--ink)'))).toBe(true);
+  });
+
+  it('no_theme_toggle', () => {
+    // fumadocs-ui's ThemeSwitch (layouts/shared/slots/theme-switch.js) renders a button with
+    // aria-label "Toggle Theme" and a data-theme-toggle attribute. Positive control: both strings
+    // are still in the installed source, so their absence below is meaningful.
+    const source = readFileSync(
+      join(docsRoot, 'node_modules/fumadocs-ui/dist/layouts/shared/slots/theme-switch.js'),
+      'utf8',
+    );
+    expect(source).toContain('Toggle Theme');
+    expect(source).toContain('data-theme-toggle');
+    for (const page of ['docs/index.html', 'docs/reference/data/runQuery/index.html']) {
+      const html = read(page);
+      expect(html, page).not.toContain('aria-label="Toggle Theme"');
+      expect(html, page).not.toContain('data-theme-toggle');
+    }
+  });
+
+  it('root_redirects_to_docs', () => {
+    // A static host has no server redirect: the prerendered page must carry the meta refresh.
+    const html = read('index.html');
+    expect(html).toMatch(/<meta[^>]*http-equiv="refresh"[^>]*content="0; url=\/docs"/);
+    // No canonical link until the docs host is decided (spec D4): a relative one is wrong.
+    expect(html).not.toMatch(/rel="canonical"/);
+  });
+
+  it('badge_signature_is_on_operation_and_sidebar_badges', () => {
+    // packages/lagoon/fumadocs.css remaps the badge tones on `.font-mono.font-medium.dark\:text-
+    // <colour>-400`, fumadocs-openapi's Badge. If Fumadocs changes those classes, this fails.
+    const operationHtml = read('docs/reference/data/runQuery/index.html');
+    // The operation's own badge, and the open folder of its sidebar.
+    expect(badges(operationHtml).map((b) => b.text)).toContain('POST');
+    expect(badges(sidebarOf(operationHtml)).map((b) => b.text)).toEqual(
+      expect.arrayContaining(['POST', 'GET']),
+    );
+    // A content page in the reference tab: the footer card to the neighbouring operation is
+    // rendered; its sidebar folders are collapsed in the HTML and rendered by the client from the
+    // serialized page tree, which carries the same Badge markup.
+    const contentHtml = read('docs/reference/errors/index.html');
+    expect(badges(contentHtml).length).toBeGreaterThan(0);
+    const tree = treeBadges(contentHtml);
+    for (const method of ['GET', 'POST', 'PATCH', 'PUT', 'DELETE']) {
+      expect(tree.map((b) => b.text), method).toContain(method);
+    }
+    // Each method has its own colour, so each remap reaches its method.
+    const colourOf = Object.fromEntries(tree.map((b) => [b.text, b.colour]));
+    expect(colourOf).toMatchObject({
+      GET: 'green',
+      POST: 'blue',
+      PUT: 'yellow',
+      PATCH: 'orange',
+      DELETE: 'red',
+    });
+  });
+
+  it('badge_signature_is_only_on_badges', () => {
+    const pages = walk(dist).filter((file) => file.endsWith('.html'));
+    expect(pages.length).toBeGreaterThan(1);
+    const offenders = pages.flatMap((file) => {
+      const html = readFileSync(file, 'utf8');
+      return [...badges(html), ...treeBadges(html)]
+        .filter((b) => !HTTP_METHODS.includes(b.text))
+        .map((b) => `${relative(dist, file)}: ${JSON.stringify(b.text)}`);
+    });
+    expect(
+      offenders,
+      'a non-method Badge (e.g. Deprecated) carries the method signature: decide its colour in packages/lagoon/fumadocs.css',
+    ).toEqual([]);
+  });
+
+  it('page_headings_are_inside_nd_page_and_not_not_prose', () => {
+    // fumadocs.css sets Spectral 700 on `#nd-page :is(h1, …, h6):not(.not-prose)`. The title and
+    // section headings of an operation page and a content page must match that selector.
+    for (const page of ['docs/reference/data/runQuery/index.html', 'docs/using/quickstart/index.html']) {
+      const html = read(page);
+      const start = html.indexOf('<article id="nd-page"');
+      expect(start, page).toBeGreaterThan(-1);
+      const end = html.indexOf('</article>', start);
+      const headings = [...html.matchAll(/<h([12])[^>]*>/g)];
+      expect(headings.length, page).toBeGreaterThan(1);
+      for (const h of headings) {
+        expect(h.index! > start && h.index! < end, `${page}: ${h[0]}`).toBe(true);
+        expect(classesOf(h[0]), `${page}: ${h[0]}`).not.toContain('not-prose');
+      }
+    }
+    const operation = read('docs/reference/data/runQuery/index.html');
+    for (const id of ['authorization', 'request-body', 'response-body']) {
+      expect(operation, id).toMatch(new RegExp(`<h2 id="${id}"`));
+    }
   });
 
   it('data_reference_pages_have_flat_urls', () => {

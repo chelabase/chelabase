@@ -1,26 +1,22 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
-import { HomeLayout } from 'fumadocs-ui/layouts/home';
-import { baseOptions } from '@/lib/layout.shared';
 
+// No home page: `/` sends readers to the docs. The prerendered page carries a meta refresh, which
+// works on a static host with no server redirect. No `beforeLoad` redirect: the prerender follows
+// redirects and would write the /docs page into index.html without the meta refresh.
 export const Route = createFileRoute('/')({
+  head: () => ({
+    // No canonical link until the docs host is decided (spec D4).
+    meta: [{ httpEquiv: 'refresh', content: '0; url=/docs' }],
+  }),
   component: Home,
 });
 
 function Home() {
   return (
-    <HomeLayout {...baseOptions()}>
-      <div className="flex flex-col items-center justify-center text-center flex-1">
-        <h1 className="font-medium text-xl mb-4">Chelabase documentation</h1>
-        <Link
-          to="/docs/$"
-          params={{
-            _splat: '',
-          }}
-          className="px-3 py-2 rounded-lg bg-fd-primary text-fd-primary-foreground font-medium text-sm mx-auto"
-        >
-          Open the docs
-        </Link>
-      </div>
-    </HomeLayout>
+    <main className="flex flex-1 items-center justify-center p-8">
+      <Link to="/docs/$" params={{ _splat: '' }} className="text-fd-primary underline">
+        Go to the documentation
+      </Link>
+    </main>
   );
 }

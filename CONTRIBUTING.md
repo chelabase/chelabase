@@ -53,7 +53,7 @@ Run `just` to list them all.
 | `just create-db-demo [name]` | Authenticated `POST /v1/databases` through the gateway (:8000); `name` defaults to `demo1` |
 | `just sweep-dbs` | Dev reset: remove every worker-provisioned container and data volume, every Neon compute, and (with deps up) the storage-controller tenants and all metadata rows for databases, branches and endpoints |
 | `just cleanup` | Fresh start: stops the dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps and sweeps old builds. Keeps the keys and the seeded tenant. Asks first |
-| `just check` | Rust check, the OpenAPI freshness checks (`just api-gen` if they fail), the Scalar bundle check, and typecheck plus tests for the TypeScript packages; it also typechecks, builds and tests the docs site |
+| `just check` | Rust check, the OpenAPI freshness checks (`just api-gen` if they fail), and typecheck plus tests for the TypeScript packages; it also typechecks, builds and tests the docs site |
 | `just test` | Rust tests with nextest, then doctests |
 | `just api-gen` | Regenerate `openapi/*.json` and the generated clients. Never edit those by hand |
 | `just docs` | The docs site on http://localhost:3001 (needs no stack) |

@@ -5,8 +5,5 @@
   "scripts": {
     "studio:dev": "pnpm --filter @chelabase/studio dev",
     "studio:build": "pnpm --filter @chelabase/studio build"
-  },
-  "devDependencies": {
-    "@scalar/api-reference": "1.72.2"
   }
 }

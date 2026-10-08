@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { render } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AccessTokenContext } from "@/lib/access-token";
@@ -75,32 +74,12 @@ describe("ApiReference", () => {
 
   it("themes Scalar onto the lagoon tokens, scoped to the page wrapper", () => {
     const { container } = render(wrap("t"));
-    const wrapper = container.querySelector(".studio-api");
+    const wrapper = container.querySelector(".lagoon-scalar");
     expect(wrapper).not.toBeNull();
     expect(wrapper!.querySelector('[data-testid="scalar"]')).not.toBeNull();
-    // Both stylesheets render as <style> next to the wrapper (vitest inlines CSS as "", so the
-    // override's text is read from its file).
+    // Both stylesheets render as <style> next to the wrapper. The skin itself and its scoping
+    // are tested in packages/lagoon.
     expect(container.querySelectorAll("style")).toHaveLength(2);
-    const css = readFileSync("src/components/api-reference.css", "utf8");
-    expect(css).toContain("--scalar-background-1: var(--ink)");
-    expect(css).toContain("--scalar-color-accent: var(--sand)");
-    expect(css).toContain("--scalar-color-red: var(--coral)");
-    expect(css).toContain("--scalar-font: var(--font-sans)");
-    // Every rule of the override is under .studio-api, or Scalar's teleported popovers
-    // (`body > .scalar-app`); its selectors never start elsewhere.
-    const selectors = css
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .split("{")
-      .slice(0, -1)
-      .map((chunk) => chunk.split("}").pop()!.trim());
-    expect(selectors.length).toBeGreaterThan(0);
-    for (const selector of selectors) {
-      for (const part of selector.split(",")) {
-        const p = part.trim();
-        expect(p.startsWith(".studio-api") || p === "body > .scalar-app").toBe(true);
-      }
-    }
-    expect(css).toContain("body > .scalar-app");
   });
 
   it("removes the color-mode classes Scalar leaves on document.body when unmounted", () => {

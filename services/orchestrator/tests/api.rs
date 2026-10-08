@@ -1906,53 +1906,12 @@ async fn openapi_json_route_serves_the_document() {
 }
 
 #[tokio::test]
-async fn docs_page_configures_scalar_offline() {
+async fn docs_page_is_gone() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let resp = reqwest::get(format!("{}/v1/docs", app.base)).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
-    let html = resp.text().await.unwrap();
-    assert!(html.contains("Chelabase Management API"), "{html}");
-    // The script URL carries the first 12 hex of the bundle's sha256 (from VERSION), so a
-    // Scalar upgrade is never served stale from the day-long cache.
-    let version = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/scalar/VERSION")).unwrap();
-    let sha = version.lines().nth(1).unwrap().strip_prefix("sha256 ").unwrap();
-    assert!(html.contains(&format!("src=\"/v1/docs/scalar.js?v={}\"", &sha[..12])), "{html}");
-    assert!(html.contains("url: \"/v1/openapi.json\""), "{html}");
-    assert!(html.contains("telemetry: false"), "{html}");
-    assert!(html.contains("withDefaultFonts: false"), "{html}");
-    assert!(html.contains("authentication: { preferredSecurityScheme: \"bearer\" }"), "{html}");
-    // Omitting these leaves Scalar's scalar.com defaults active, so they are set to "".
-    assert!(html.contains("proxyUrl: \"\""), "{html}");
-    assert!(html.contains("showDeveloperTools: \"never\""), "{html}");
-    assert!(html.contains("agent: { disabled: true }"), "{html}");
-    assert!(html.contains("mcp: { disabled: true }"), "{html}");
-    for key in ["dashboardUrl", "registryUrl", "proxyUrl", "apiBaseUrl"] {
-        assert!(html.contains(&format!("{key}: \"\"")), "{key} in {html}");
+    for path in ["/v1/docs", "/v1/docs/scalar.js", "/v1/docs/nope.js"] {
+        let resp = reqwest::get(format!("{}{path}", app.base)).await.unwrap();
+        assert_eq!(resp.status(), 404, "{path}");
     }
-    for host in ["cdn.jsdelivr.net", "scalar.com", "unpkg.com"] {
-        assert!(!html.contains(host), "{host} in {html}");
-    }
-}
-
-#[tokio::test]
-async fn scalar_bundle_matches_version_file() {
-    use sha2::{Digest, Sha256};
-    let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let resp = reqwest::get(format!("{}/v1/docs/scalar.js?v=abc", app.base)).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["content-type"], "application/javascript; charset=utf-8");
-    assert_eq!(resp.headers()["cache-control"], "public, max-age=86400");
-    let bytes = resp.bytes().await.unwrap();
-    let version = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/scalar/VERSION")).unwrap();
-    let mut lines = version.lines();
-    assert!(lines.next().unwrap().starts_with("@scalar/api-reference "));
-    let expected = lines.next().unwrap().strip_prefix("sha256 ").unwrap();
-    assert_eq!(hex::encode(Sha256::digest(&bytes)), expected);
-    let missing = reqwest::get(format!("{}/v1/docs/nope.js", app.base)).await.unwrap();
-    assert_eq!(missing.status(), 404);
-    let body: serde_json::Value = missing.json().await.unwrap();
-    assert_eq!(code_of(&body), "not_found");
 }
 
 #[tokio::test]

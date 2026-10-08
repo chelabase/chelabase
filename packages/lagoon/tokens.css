@@ -1,0 +1,49 @@
+/* The lagoon: fonts and design tokens. The single source for every app (D8). */
+@import "@fontsource/spectral/400.css";
+@import "@fontsource/spectral/400-italic.css";
+@import "@fontsource/spectral/600.css";
+@import "@fontsource/spectral/700.css";
+@import "@fontsource-variable/atkinson-hyperlegible-next";
+@import "@fontsource-variable/jetbrains-mono";
+
+:root {
+  color-scheme: dark;
+
+  /* Lagoon palette (same values as the landing page). */
+  --ink: #0b1c1f;
+  --deep: #0f2a2d;
+  --channel: #14363a;
+  --shallows: #163d3e; /* reserved: unused in Studio, shared with the landing page */
+  --sand: #f2c7a3;
+  --sand-lit: #f7d6b9; /* primary button hover, as on the landing */
+  --seafoam: #9fd4c6;
+  --coral: #eda6aa;
+  --palm: #a9c89a;
+  --chalk: #e6ede7;
+  --chalk-dim: #aebfc0;
+  --line: rgb(230 237 231 / 0.16);
+  --line-strong: rgb(230 237 231 / 0.34);
+  /* Control borders need 3:1 (WCAG 1.4.11): chalk at 40% clears it on ink, deep and channel. */
+  --input: rgb(230 237 231 / 0.4);
+  /* The claw mark. */
+  --shell: #f2936e;
+  --shell-dark: #b85a3e;
+  --shell-light: #f8b896;
+  --tip: #fde3cf;
+
+  /* HTTP method tones: each method its own hue, as API docs conventionally do. POST (green, also
+     2xx) = seafoam and DELETE (red, also errors) = coral keep their lagoon meanings (yes, hazard).
+     GET, PUT and PATCH get method-only tones that mean nothing else. Every tone is >= 5.4:1 on
+     ink, deep and channel, and on its 10% badge tint. */
+  --method-get: #9cc8ea;
+  --method-put: #c4b6ec;
+  --method-patch: #e3d58c;
+
+  --radius: 0.5rem;
+
+  /* Font stacks. Tailwind's --font-* are mapped onto these in tailwind.css; never define
+     --font-* here (a self-referencing --font-sans would be a cycle). */
+  --lagoon-font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif;
+  --lagoon-font-serif: Spectral, "Iowan Old Style", Georgia, serif;
+  --lagoon-font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+}

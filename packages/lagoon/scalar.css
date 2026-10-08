@@ -1,6 +1,6 @@
 /*
  * Scalar in the lagoon palette. Rendered in a <style> after Scalar's own CSS, only while the API
- * page is mounted, and every rule is scoped to `.studio-api` (the page wrapper): nothing global.
+ * page is mounted, and every rule is scoped to `.lagoon-scalar` (the page wrapper): nothing global.
  *
  * Scalar declares its colours inside `@layer scalar-base` on `.dark-mode` (set on <body>), so any
  * unlayered rule wins whatever the specificity. The derived variables (sidebar, tooltip, alert,
@@ -9,8 +9,8 @@
  * One Meaning: coral = hazard (red, danger, alert), seafoam = yes (green), sand = action, selection
  * and focus only (accent, button), palm = reserved. Hairline Not Shadow.
  */
-.studio-api,
-.studio-api .dark-mode,
+.lagoon-scalar,
+.lagoon-scalar .dark-mode,
 /* Scalar teleports its dropdowns and popovers to <body> (`body > .scalar-app`), outside the wrapper.
    Still page-scoped: this <style> unmounts with the API page. */
 body > .scalar-app {
@@ -40,10 +40,7 @@ body > .scalar-app {
      PUT and PATCH get method-only tones that mean nothing else in Studio. Scalar also paints 3xx
      with yellow and "required" with orange, so those take the PATCH and PUT tones. OPTIONS
      (purple) is chalk-dim like HEAD and TRACE. Sand stays action/selection/focus only, palm
-     reserved. Every tone is >= 5.6:1 on ink, deep and channel, and on its 10% badge tint. */
-  --method-get: #9cc8ea;
-  --method-put: #c4b6ec;
-  --method-patch: #e3d58c;
+     reserved. Every tone is >= 5.4:1 on ink, deep and channel, and on its 10% badge tint. */
   --scalar-color-red: var(--coral);
   --scalar-color-green: var(--seafoam);
   --scalar-color-blue: var(--method-get);

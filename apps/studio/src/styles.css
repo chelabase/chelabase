@@ -1,7 +1,7 @@
 @import "tailwindcss";
-@import "@fontsource-variable/atkinson-hyperlegible-next";
-@import "@fontsource/spectral/700.css";
-@import "@fontsource-variable/jetbrains-mono";
+@import "@chelabase/lagoon/tokens.css";
+@import "@chelabase/lagoon/base.css";
+@import "@chelabase/lagoon/tailwind.css";
 
 /* Studio is always dark (D4): make `dark:` always apply, not only under prefers-color-scheme. */
 @custom-variant dark (&:where(:root, :root *));
@@ -17,52 +17,10 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-destructive: var(--destructive);
   --color-border: var(--border);
-  --color-input: var(--input);
   --color-ring: var(--ring);
-  --color-ink: var(--ink);
-  --color-deep: var(--deep);
-  --color-channel: var(--channel);
-  --color-sand: var(--sand);
-  --color-sand-lit: var(--sand-lit);
-  --color-seafoam: var(--seafoam);
-  --color-coral: var(--coral);
-  --color-palm: var(--palm);
-  --color-chalk: var(--chalk);
-  --color-chalk-dim: var(--chalk-dim);
-  --color-line: var(--line);
-  --color-line-strong: var(--line-strong);
-  --font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif;
-  --font-serif: Spectral, "Iowan Old Style", Georgia, serif;
-  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
-  --ease-lagoon: cubic-bezier(0.16, 1, 0.3, 1);
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
 }
 
 :root {
-  color-scheme: dark;
-
-  /* Lagoon palette (same values as the landing page). */
-  --ink: #0b1c1f;
-  --deep: #0f2a2d;
-  --channel: #14363a;
-  --shallows: #163d3e; /* reserved: unused in Studio, shared with the landing page */
-  --sand: #f2c7a3;
-  --sand-lit: #f7d6b9; /* primary button hover, as on the landing */
-  --seafoam: #9fd4c6;
-  --coral: #eda6aa;
-  --palm: #a9c89a;
-  --chalk: #e6ede7;
-  --chalk-dim: #aebfc0;
-  --line: rgb(230 237 231 / 0.16);
-  --line-strong: rgb(230 237 231 / 0.34);
-  /* The claw mark. */
-  --shell: #f2936e;
-  --shell-dark: #b85a3e;
-  --shell-light: #f8b896;
-  --tip: #fde3cf;
-
   /* shadcn semantic tokens, remapped onto the lagoon. */
   --background: var(--ink);
   --foreground: var(--chalk);
@@ -74,35 +32,13 @@
   --muted-foreground: var(--chalk-dim);
   --destructive: var(--coral);
   --border: var(--line);
-  /* Control borders need 3:1 (WCAG 1.4.11): chalk at 40% clears it on ink, deep and channel. */
-  --input: rgb(230 237 231 / 0.4);
   --ring: var(--sand);
-  --radius: 0.5rem;
-}
-
-* {
-  box-sizing: border-box;
 }
 
 html,
 body,
 #app {
   min-height: 100%;
-}
-
-body {
-  margin: 0;
-  background: var(--background);
-  color: var(--foreground);
-}
-
-::selection {
-  background: var(--sand);
-  color: var(--ink);
-}
-
-* {
-  scrollbar-color: var(--line-strong) transparent;
 }
 
 /* App shell hooks (rail, wordmark) */

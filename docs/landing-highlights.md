@@ -7,7 +7,43 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Neon fork round 2 (2026-10-07, in progress)
+## Docs in the lagoon style (2026-10-08, in progress: built on `docs-lagoon`, not merged)
+
+Spec `docs/superpowers/specs/2026-10-07-css-design.md`; plan `docs/superpowers/plans/2026-10-08-docs-lagoon.md` (on the branch).
+
+### One look across Studio and the docs
+
+- **Problem:** the docs site used Fumadocs' stock neutral theme with light/dark switching, while Studio and its API page use the lagoon palette; method colours differed between the two.
+- **What we built:** one workspace package (`@chelabase/lagoon`) holds the palette, fonts, the Tailwind preset and the Scalar and Fumadocs skins; Studio and the docs import it. The docs are dark only, every HTTP method badge has the same tone as on Studio's API page, and callouts follow the same colour meanings (coral = hazard, seafoam = yes, sand = attention).
+- **What it unlocks:** the landing page joins the same package next, so all three surfaces share one source of colour and type.
+- **Evidence:** package tests pin every token against Studio's previous values and check contrast (text and method tones ≥ 4.5:1 on ink, deep and channel; tones ≥ 5.4:1 on their 10% badge tint); a test fails if any app declares its own fonts; Studio's built CSS compared against `main`: no custom property changed, only three Spectral faces added; docs build-output tests (dark without JavaScript, badge tones on every badge and nothing else).
+
+## Step 6g: three-way schema merge (2026-10-08, shipped)
+
+Merged into `main` 2026-10-08. Spec `docs/superpowers/specs/2026-10-06-schema-merge-design.md`; plan and full history `docs/superpowers/plans/2026-10-06-schema-merge.md`.
+
+### Merge schema changes between live Postgres branches, like git
+
+- **Problem:** branching a database is easy; getting a branch's schema changes back into main is not. Other tools reset the branch from its parent (overwriting it), show a two-way diff, or merge migration files in git; the only three-way schema merge with conflict detection we found (PlanetScale deploy requests) is MySQL only (roadmap research, 2026-10-06).
+- **What we built:** a three-way merge of the live catalogs (base = the branch point, ours = the parent now, theirs = the branch now) for tables, columns, constraints, indexes, enums, sequences, RLS, policies, grants and roles, in both directions (merge into the parent, update from the parent). Conflicts are flagged per object like git, with keep main / take branch / your own SQL. Renames are followed by Postgres object identity (OID, attnum for columns), not guessed from names. Main's data stays canonical: only schema moves.
+- **What it unlocks:** schema work on a branch with real data, then a reviewed, conflict-checked merge into production, without hand-written migrations.
+- **Evidence:** `merge_live` (26 live scenarios on the Neon stack: merges both ways, conflicts, renames, restores before and after a merge, bases behind GC) passes 26/26; `just merge-e2e` passes; the schema crate's analysis and planner unit tests.
+
+### Every merge is rehearsed on a throwaway copy first
+
+- **Problem:** a schema migration that works on a dev database can still fail or do something else on production's actual schema.
+- **What we built:** each merge is first applied to a throwaway branch of the target, and the result is checked against the expected merged schema; the apply refuses if the target changed since (a digest guard inside the transaction). The apply is one transaction with a lock timeout, then a resumable online phase (`CREATE INDEX CONCURRENTLY`, `NOT VALID` + `VALIDATE`). A half-applied merge holds both branches until it is retried or abandoned, and Abandon lists exactly what was left behind.
+- **What it unlocks:** applying schema changes to production with a dress rehearsal on its real schema, and a clear recovery path if something stops halfway.
+- **Evidence:** an exhaustive state-machine test over 16 merge states × 9 actions and × reset/restore/delete on both branches, plus its live SQL counterpart (`merge_state_sql_matches_the_table`, `every_branch_path_follows_the_hold_table`); live `a_failed_online_merge_holds_its_target_and_abandon_lists_leftovers`, `recovery_reads_the_marker`.
+
+### Restore stays an undo, even across merges
+
+- **Problem:** after restoring a branch, a later merge has to compare against the true common ancestor, or it re-applies or loses changes.
+- **What we built:** each branch stores a base snapshot when it is created or reset, with a history of bases across restores, and a fallback that reads the branch point from storage (fork round 2's reads at kept LSNs) when the snapshot is missing.
+- **What it unlocks:** restore as the undo for a merge on any branch, at any depth.
+- **Evidence:** live `restore_before_a_keep_merge_uses_the_older_base`, `a_restored_branch_reads_its_base_until_the_backup_is_deleted`, `a_branch_point_behind_gc_is_read_on_the_parent`, `a_grandchild_branch_point_behind_gc_is_read_on_its_parent`.
+
+## Neon fork round 2 (2026-10-07, shipped 2026-10-08)
 
 Branch `neon-fork-round-2`; fork branch `round-2` on `chelabase/neon`. Spec `docs/superpowers/specs/2026-10-07-neon-fork-round-2-design.md`.
 

@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
+    "@chelabase/lagoon": "workspace:*",
     "@chelabase/management-client": "workspace:*",
     "@codemirror/autocomplete": "6.20.3",
     "@codemirror/commands": "6.11.1",
@@ -25,9 +26,6 @@
     "@codemirror/search": "6.7.2",
     "@codemirror/state": "6.7.6",
     "@codemirror/view": "6.43.13",
-    "@fontsource-variable/atkinson-hyperlegible-next": "^5.3.0",
-    "@fontsource-variable/jetbrains-mono": "^5.3.0",
-    "@fontsource/spectral": "^5.3.0",
     "@postgres-language-server/wasm": "0.26.0",
     "@scalar/api-reference-react": "0.9.75",
     "@tailwindcss/vite": "^4.3.3",

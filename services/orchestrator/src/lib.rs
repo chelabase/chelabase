@@ -42,7 +42,6 @@ mod data_api_databases;
 mod app_user_admin;
 mod app_users;
 mod data_keys;
-mod docs;
 pub mod internal;
 mod merges;
 mod openapi;
@@ -1793,7 +1792,7 @@ where
     let (router, _) = api_router().split_for_parts();
     router
         .route(routes::HEALTH.path, get(health))
-        .merge(docs::router())
+        .merge(openapi::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

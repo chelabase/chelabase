@@ -10,6 +10,9 @@ tasks:
   build:
     command: "pnpm"
     args: ["build"]
+    inputs:
+      - "**/*"
+      - "/packages/lagoon/**/*"
   typecheck:
     command: "pnpm"
     args: ["typecheck"]

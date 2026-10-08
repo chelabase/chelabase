@@ -24,12 +24,17 @@ export const Route = createRootRoute({
 
 function RootComponent() {
   return (
-    <html lang="en" suppressHydrationWarning>
+    // Dark only (no light palette yet): `dark` is in the prerendered HTML, so a static host shows
+    // no light flash before the scripts run.
+    <html lang="en" className="dark" suppressHydrationWarning>
       <head>
         <HeadContent />
       </head>
       <body className="flex flex-col min-h-screen">
-        <RootProvider search={{ SearchDialog }}>
+        <RootProvider
+          search={{ SearchDialog }}
+          theme={{ forcedTheme: 'dark', defaultTheme: 'dark', enableSystem: false, hotKey: false }}
+        >
           <Outlet />
         </RootProvider>
         <Scripts />

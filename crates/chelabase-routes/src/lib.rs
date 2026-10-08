@@ -120,12 +120,6 @@ pub mod orchestrator {
         },
     };
 
-    /// Interactive API docs (Scalar). Not part of the OpenAPI document.
-    pub const API_DOCS: Endpoint = public_get("orchestrator.api_docs", "/v1/docs");
-
-    /// The embedded Scalar bundle the docs page loads (self-hosted, no CDN).
-    pub const API_DOCS_SCRIPT: Endpoint = public_get("orchestrator.api_docs_script", "/v1/docs/scalar.js");
-
     /// The Management API's OpenAPI document.
     pub const OPENAPI_JSON: Endpoint = public_get("orchestrator.openapi_json", "/v1/openapi.json");
 
@@ -736,8 +730,6 @@ pub mod auth {
 /// Every public endpoint the gateway exposes.
 pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::HEALTH,
-    orchestrator::API_DOCS,
-    orchestrator::API_DOCS_SCRIPT,
     orchestrator::OPENAPI_JSON,
     orchestrator::CREATE_DATABASE,
     orchestrator::GET_DATABASE,
@@ -902,12 +894,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn api_docs_paths_are_unrouted() {
+        for path in ["/v1/docs", "/v1/docs/scalar.js"] {
+            assert_eq!(match_endpoint(Scope::Api, "GET", path), Match::NotFound, "{path}");
+        }
+    }
+
+    #[test]
     fn docs_routes_are_public() {
-        for (path, name) in [
-            ("/v1/docs", "orchestrator.api_docs"),
-            ("/v1/docs/scalar.js", "orchestrator.api_docs_script"),
-            ("/v1/openapi.json", "orchestrator.openapi_json"),
-        ] {
+        for (path, name) in [("/v1/openapi.json", "orchestrator.openapi_json")] {
             match match_endpoint(Scope::Api, "GET", path) {
                 Match::Found(ep) => {
                     assert_eq!(ep.name, name);

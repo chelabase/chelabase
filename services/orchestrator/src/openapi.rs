@@ -8,6 +8,34 @@ use utoipa::openapi::{InfoBuilder, LicenseBuilder};
 
 use super::*;
 
+/// The document, serialized once.
+static DOCUMENT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    serde_json::to_string(&openapi()).expect("the document serializes")
+});
+
+/// `GET /v1/openapi.json`: public, a plain route (so not in the document itself).
+pub(crate) fn router<S>() -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    axum::Router::new().route(
+        chelabase_routes::orchestrator::OPENAPI_JSON.path,
+        axum::routing::get(openapi_json),
+    )
+}
+
+async fn openapi_json() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        DOCUMENT.as_str(),
+    )
+        .into_response()
+}
+
 /// The Management API's OpenAPI document.
 pub fn openapi() -> OpenApi {
     let (_, mut doc) = api_router::<Doc, Doc>().split_for_parts();
@@ -581,8 +609,6 @@ mod tests {
                     && !matches!(
                         e.name,
                         "orchestrator.health"
-                            | "orchestrator.api_docs"
-                            | "orchestrator.api_docs_script"
                             | "orchestrator.openapi_json"
                     )
             })

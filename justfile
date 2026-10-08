@@ -479,11 +479,6 @@ api-gen:
     CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest document_is_current
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
-    just scalar-sync
-
-# Copy the pnpm-installed Scalar bundle to the orchestrator's assets (pnpm is the single source of the version)
-scalar-sync:
-    scripts/scalar.sh sync
 
 check:
     cargo check --workspace
@@ -492,13 +487,14 @@ check:
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
     test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
-    scripts/scalar.sh check
     pnpm --filter @chelabase/management-client typecheck
     pnpm --filter @chelabase/management-client test
     pnpm --filter @chelabase/studio typecheck
     pnpm --filter @chelabase/studio test
     pnpm --filter @chelabase/client typecheck
     pnpm --filter @chelabase/client test
+    pnpm --filter @chelabase/lagoon typecheck
+    pnpm --filter @chelabase/lagoon test
     pnpm --filter @chelabase/docs typecheck
     pnpm --filter @chelabase/docs build
     pnpm --filter @chelabase/docs test

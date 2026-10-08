@@ -1,0 +1,28 @@
+/* Tailwind v4 preset: import after `@import "tailwindcss"` and tokens.css. */
+@theme inline {
+  --color-ink: var(--ink);
+  --color-deep: var(--deep);
+  --color-channel: var(--channel);
+  --color-shallows: var(--shallows);
+  --color-sand: var(--sand);
+  --color-sand-lit: var(--sand-lit);
+  --color-seafoam: var(--seafoam);
+  --color-coral: var(--coral);
+  --color-palm: var(--palm);
+  --color-chalk: var(--chalk);
+  --color-chalk-dim: var(--chalk-dim);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-input: var(--input);
+  --ease-lagoon: cubic-bezier(0.16, 1, 0.3, 1);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+}
+
+/* Not inline: Tailwind emits --font-* on :root, so `var(--font-sans)` works in plain CSS too. */
+@theme {
+  --font-sans: var(--lagoon-font-sans);
+  --font-serif: var(--lagoon-font-serif);
+  --font-mono: var(--lagoon-font-mono);
+}
