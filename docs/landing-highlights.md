@@ -7,9 +7,20 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Docs in the lagoon style (2026-10-08, in progress: built on `docs-lagoon`, not merged)
+## Landing split (2026-10-08, in progress)
 
-Spec `docs/superpowers/specs/2026-10-07-css-design.md`; plan `docs/superpowers/plans/2026-10-08-docs-lagoon.md` (on the branch).
+Branch `landing-split`, at the end-of-step pause. Spec `docs/superpowers/specs/2026-10-08-landing-split-design.md`; plan `docs/superpowers/plans/2026-10-08-landing-split.md` (both on the branch).
+
+### The landing page as its own static app on the shared lagoon
+
+- **Problem:** the landing page lived in Studio (on an unmerged branch), with its own copy of the palette and fonts, and Studio and the landing each had a copy of the crab marks. Self-hosted must never ship marketing pages.
+- **What we built:** `apps/landing`, a prerendered TanStack Start app (static HTML, no stack needed), rewritten on Tailwind with every colour, font and the crab marks coming from `@chelabase/lagoon`. Its buttons link to Studio, where `/?signup` goes straight to account creation. The hero now ends with "staging merged into main" on every screen size, and the comparison has a PlanetScale column (not surveyed yet).
+- **What it unlocks:** the polish, audit and mobile passes run on the final layout; the landing can be hosted anywhere static, separately from self-hosted Studio.
+- **Evidence:** a Playwright pixel check at 1440, 1024 and 390 px matched the Tailwind rewrite against screenshots of the verbatim port (≤ 954 differing pixels, antialiasing only); tests fail if the app writes a colour literal or redeclares a lagoon token; build tests check the prerendered HTML (dark, copy, Studio links, short-screen CSS); Studio's sign-up redirect fires once, never after an error, and replaces the history entry.
+
+## Docs in the lagoon style (2026-10-08, shipped)
+
+Merged into `main` 2026-10-08. Spec `docs/superpowers/specs/2026-10-07-css-design.md`; plan `docs/superpowers/plans/2026-10-08-docs-lagoon.md`.
 
 ### One look across Studio and the docs
 

@@ -1,0 +1,32 @@
+language: "typescript"
+
+tasks:
+  dev:
+    command: "pnpm"
+    args: ["dev"]
+    options:
+      persistent: true
+      cache: false
+  build:
+    command: "pnpm"
+    args: ["build"]
+    inputs:
+      - "src/**/*"
+      - "vite.config.ts"
+      - "/packages/lagoon/**/*"
+    outputs:
+      - "dist"
+  typecheck:
+    command: "pnpm"
+    args: ["typecheck"]
+    inputs:
+      - "**/*"
+      - "/packages/lagoon/src/**/*"
+  test:
+    command: "pnpm"
+    args: ["test"]
+    inputs:
+      - "**/*"
+      - "/packages/lagoon/src/**/*"
+    deps:
+      - "~:build"

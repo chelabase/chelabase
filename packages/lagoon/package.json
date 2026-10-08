@@ -2,14 +2,18 @@
   "name": "@chelabase/lagoon",
   "version": "0.1.0",
   "private": true,
-  "description": "The lagoon design tokens, fonts, Tailwind preset, Scalar skin and Fumadocs theme shared by Studio and the docs site",
+  "description": "The lagoon design tokens, fonts, Tailwind preset, Scalar skin, Fumadocs theme and React crab marks shared by Studio, the docs site and the landing page",
   "type": "module",
   "exports": {
     "./tokens.css": "./tokens.css",
     "./base.css": "./base.css",
     "./tailwind.css": "./tailwind.css",
     "./scalar.css": "./scalar.css",
-    "./fumadocs.css": "./fumadocs.css"
+    "./fumadocs.css": "./fumadocs.css",
+    "./crab-marks": "./src/crab-marks.tsx"
+  },
+  "peerDependencies": {
+    "react": "^19.3.0"
   },
   "sideEffects": [
     "*.css"
@@ -25,6 +29,10 @@
   },
   "devDependencies": {
     "@types/node": "^24.19.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.2"
   }

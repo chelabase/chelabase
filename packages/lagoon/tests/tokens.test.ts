@@ -57,4 +57,29 @@ describe("lagoon tokens", () => {
     expect(tw.get("--color-input")).toBe("var(--input)");
     expect(tw.get("--ease-lagoon")).toBe("cubic-bezier(0.16, 1, 0.3, 1)");
   });
+
+  // D7: the landing's colours are all lagoon tokens, and the preset maps them to utilities.
+  test("preset_maps_the_landing_colours", () => {
+    const landing: Record<string, string> = {
+      "--shell": "#f2936e",
+      "--shell-dark": "#b85a3e",
+      "--shell-light": "#f8b896",
+      "--tip": "#fde3cf",
+      "--wet-sand": "#dcae8a",
+      "--ink-lit": "#18333a",
+    };
+    const tw = customProperties(readCss("tailwind.css"));
+    for (const [name, value] of Object.entries(landing)) {
+      expect(props.get(name), name).toBe(value);
+      expect(tw.get(`--color-${name.slice(2)}`), `--color-${name.slice(2)}`).toBe(`var(${name})`);
+    }
+  });
+
+  test("tailwind_preset_scans_the_components", () => {
+    expect(readCss("tailwind.css")).toContain('@source "./src";');
+  });
+
+  test("claw_eye_token", () => {
+    expect(props.get("--claw-eye")).toBe("#fff6ee");
+  });
 });

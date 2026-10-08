@@ -238,6 +238,14 @@ studio:
 docs:
     pnpm --filter @chelabase/docs dev
 
+# The landing page (apps/landing) on http://localhost:3002; needs no stack
+landing:
+    pnpm --filter @chelabase/landing dev
+
+# Pixel check of the landing page against committed baselines; `--update-snapshots` re-records; not part of just check
+landing-visual *args:
+    pnpm --filter @chelabase/landing build && pnpm --filter @chelabase/landing visual {{args}}
+
 # --- Detached full stack ---
 
 # Start deps + control-plane apps + Studio in background; print seed info
@@ -498,6 +506,9 @@ check:
     pnpm --filter @chelabase/docs typecheck
     pnpm --filter @chelabase/docs build
     pnpm --filter @chelabase/docs test
+    pnpm --filter @chelabase/landing typecheck
+    pnpm --filter @chelabase/landing build
+    pnpm --filter @chelabase/landing test
 
 # Rust tests (nextest, one process per test) plus doctests, which nextest does not run.
 # The ignored live tests stay on `cargo test ... -- --ignored` (see neon-test-live).

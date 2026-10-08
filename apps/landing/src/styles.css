@@ -1,0 +1,15 @@
+@import 'tailwindcss';
+@import '@chelabase/lagoon/tokens.css';
+@import '@chelabase/lagoon/base.css';
+@import '@chelabase/lagoon/tailwind.css';
+@import './landing.css';
+
+/* Short screens (a laptop with browser chrome): the hero tightens its copy so the shore keeps its room. */
+@custom-variant short (@media (max-height: 780px));
+
+/* The landing's layout scale; every colour is a lagoon token. */
+@theme {
+  --container-landing: 1240px;
+  --spacing-gutter: 24px;
+  --spacing-section: 104px;
+}

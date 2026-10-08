@@ -44,7 +44,7 @@ Chelabase's designs are its own. It never mirrors Supabase (PostgREST URL gramma
 - Voice: plain and terse, like the repo's docs.
 - No logo, favicon or brand marks exist yet. The Spectral "Chelabase" wordmark on the landing page is provisional.
 - Default theme: **dark**. Light mode may come later; dark is the default experience (user, 2026-10-06).
-- Visual world: tropical coastal (crabs, beach, palm trees) rendered as an abstract dusk lagoon, not clip-art. Colour is pastel roles (sand peach, seafoam, coral blush, palm green) on a deep lagoon-teal dark. Never neon glow, purple SaaS, or cream-and-terracotta editorial. The landing page draws this world as a nautical chart (see DESIGN.md); later Studio work inherits the palette and dark default.
+- Visual world: tropical coastal (crabs, beach, palm trees) rendered as an abstract dusk lagoon, not clip-art. Colour is pastel roles (sand peach, seafoam, coral blush, palm green) on a deep lagoon-teal dark. Never neon glow, purple SaaS, or cream-and-terracotta editorial. The landing page draws this world as a nautical chart; later Studio work inherits the palette and dark default.
 
 ## Evidence on Hand
 

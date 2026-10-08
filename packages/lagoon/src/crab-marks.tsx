@@ -3,7 +3,7 @@ import type { ElementType } from "react";
 /** The Chelabase claw: an open coral chela drawn as the letter C (pincers opening right). 130-unit box.
  *  Its seams and rim are drawn in --claw-gap, the colour of the ground it sits on (ink by default),
  *  so they read as gaps and the claw looks the same on every background. */
-export function ClawPaths() {
+function ClawPaths() {
   return (
     <g stroke="var(--claw-gap, var(--ink))" strokeWidth={3.5} strokeLinejoin="round" strokeLinecap="round">
       <path d="M30 94 C 24 102 18 110 12 116 C 8 112 6 108 8 104 C 14 98 18 92 22 86 Z" fill="var(--shell-dark)" />
@@ -30,8 +30,8 @@ export function ClawPaths() {
 function FloatingEyes() {
   return (
     <g stroke="var(--claw-gap, var(--ink))" strokeWidth={3}>
-      <ellipse cx="18" cy="-2" rx="7" ry="8" fill="#fff6ee" />
-      <ellipse cx="42" cy="-6" rx="7" ry="8" fill="#fff6ee" />
+      <ellipse cx="18" cy="-2" rx="7" ry="8" fill="var(--claw-eye)" />
+      <ellipse cx="42" cy="-6" rx="7" ry="8" fill="var(--claw-eye)" />
       <circle cx="19.8" cy="-0.4" r="3.4" fill="var(--ink)" stroke="none" />
       <circle cx="43.8" cy="-4.4" r="3.4" fill="var(--ink)" stroke="none" />
     </g>
@@ -48,13 +48,23 @@ export function ClawMark({ size = 48, className }: { size?: number; className?: 
   );
 }
 
+interface WordmarkProps {
+  as?: ElementType;
+  /** The mark's font size (and anything else on the outer element). */
+  className?: string;
+  /** Optical nudges of the drawn mark, e.g. settling it onto a row's centre line. */
+  visualClassName?: string;
+  /** The claw's height, relative to the font size. */
+  clawClassName?: string;
+}
+
 /** "Chelabase", set as the claw C plus "helabase". Screen readers hear the whole name. Provisional mark. */
-export function Wordmark({ as: Tag = "span", className }: { as?: ElementType; className?: string }) {
+export function Wordmark({ as: Tag = "span", className = "", visualClassName = "", clawClassName = "h-[1.32em]" }: WordmarkProps) {
   return (
-    <Tag className={`wordmark ${className ?? ""}`}>
+    <Tag className={`font-serif font-bold tracking-[-0.02em] leading-none text-chalk ${className}`}>
       <span className="sr-only">Chelabase</span>
-      <span className="wordmark__visual" aria-hidden="true">
-        <ClawMark className="wordmark__claw" />
+      <span className={`inline-flex items-end ${visualClassName}`} aria-hidden="true">
+        <ClawMark className={`w-auto -mr-[0.14em] ${clawClassName}`} />
         <span>helabase</span>
       </span>
     </Tag>
@@ -98,8 +108,8 @@ export function CrabFigure() {
       <g stroke="var(--ink)" strokeWidth={3.5} strokeLinejoin="round" strokeLinecap="round">
         <path d="M108 96 L102 70 M132 96 L138 70" fill="none" strokeWidth={9} />
         <path d="M108 96 L102 70 M132 96 L138 70" fill="none" stroke="var(--shell)" strokeWidth={4} />
-        <ellipse cx="102" cy="64" rx="7.5" ry="9" fill="#fff6ee" />
-        <ellipse cx="138" cy="64" rx="7.5" ry="9" fill="#fff6ee" />
+        <ellipse cx="102" cy="64" rx="7.5" ry="9" fill="var(--claw-eye)" />
+        <ellipse cx="138" cy="64" rx="7.5" ry="9" fill="var(--claw-eye)" />
         <circle cx="103.5" cy="65" r="3.6" fill="var(--ink)" stroke="none" />
         <circle cx="136.5" cy="65" r="3.6" fill="var(--ink)" stroke="none" />
         <path d="M78 122 C 78 100 96 90 120 90 C 144 90 162 100 162 122 C 162 136 146 146 120 146 C 94 146 78 136 78 122 Z" fill="var(--shell)" />

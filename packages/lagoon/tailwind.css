@@ -1,4 +1,7 @@
 /* Tailwind v4 preset: import after `@import "tailwindcss"` and tokens.css. */
+/* The components in src/ use utilities; scan them in every app that imports the preset. */
+@source "./src";
+
 @theme inline {
   --color-ink: var(--ink);
   --color-deep: var(--deep);
@@ -14,6 +17,12 @@
   --color-line: var(--line);
   --color-line-strong: var(--line-strong);
   --color-input: var(--input);
+  --color-shell: var(--shell);
+  --color-shell-dark: var(--shell-dark);
+  --color-shell-light: var(--shell-light);
+  --color-tip: var(--tip);
+  --color-wet-sand: var(--wet-sand);
+  --color-ink-lit: var(--ink-lit);
   --ease-lagoon: cubic-bezier(0.16, 1, 0.3, 1);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);

@@ -1,0 +1,7 @@
+dist/
+.tanstack/
+.output/
+node_modules/
+.impeccable/review/
+test-results/
+playwright-report/

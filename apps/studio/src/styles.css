@@ -45,22 +45,6 @@ body,
 .app-rail {
   --claw-gap: var(--deep);
 }
-.app-rail .wordmark {
-  font-family: var(--font-serif);
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  line-height: 1;
-  color: var(--chalk);
-}
-.app-rail .wordmark__visual {
-  display: inline-flex;
-  align-items: flex-end;
-}
-.app-rail .wordmark__claw {
-  width: auto;
-  height: 1.32em;
-  margin-right: -0.14em;
-}
 @media (prefers-reduced-motion: reduce) {
   .app-rail,
   .app-rail * {

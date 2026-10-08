@@ -16,3 +16,6 @@ tasks:
   typecheck:
     command: "pnpm"
     args: ["typecheck"]
+    inputs:
+      - "**/*"
+      - "/packages/lagoon/src/**/*"

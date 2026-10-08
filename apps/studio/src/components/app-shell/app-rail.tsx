@@ -10,7 +10,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import { ClawMark, Wordmark } from "@/components/landing/crab-marks";
+import { ClawMark, Wordmark } from "@chelabase/lagoon/crab-marks";
 import type { RailBehaviour } from "@/lib/rail-preference";
 import { cn } from "@/lib/utils";
 import { RailBehaviourMenu } from "./rail-behaviour-menu";

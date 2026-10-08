@@ -21,6 +21,8 @@
   --palm: #a9c89a;
   --chalk: #e6ede7;
   --chalk-dim: #aebfc0;
+  --wet-sand: #dcae8a; /* sand the tide has just left: the landing's crab trails */
+  --ink-lit: #18333a; /* sand-plate hover on an ink-on-sand band, as on the landing */
   --line: rgb(230 237 231 / 0.16);
   --line-strong: rgb(230 237 231 / 0.34);
   /* Control borders need 3:1 (WCAG 1.4.11): chalk at 40% clears it on ink, deep and channel. */
@@ -30,6 +32,7 @@
   --shell-dark: #b85a3e;
   --shell-light: #f8b896;
   --tip: #fde3cf;
+  --claw-eye: #fff6ee; /* the crab's eye whites */
 
   /* HTTP method tones: each method its own hue, as API docs conventionally do. POST (green, also
      2xx) = seafoam and DELETE (red, also errors) = coral keep their lagoon meanings (yes, hazard).
