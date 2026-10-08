@@ -72,6 +72,21 @@ pub enum ErrorCode {
     SavedQueryNameTaken,
     SavedQueryConflict,
     SavedQueryCap,
+    MergeConflictsOpen,
+    MergeDropsUnacknowledged,
+    MergeNotRehearsed,
+    MergeStale,
+    MergeBusy,
+    MergeOpenExists,
+    MergeBaseUnavailable,
+    MergeVersionConflict,
+    MergeConfirmRequired,
+    BranchMergeBusy,
+    /// A role attribute outside the allowed set (U2).
+    RoleAttributeNotAllowed,
+    /// A membership in a role the API may not grant: Chelabase's own roles, the owner, `pg_…`,
+    /// a role that doesn't exist or one the owner can't administer.
+    RoleMembershipNotAllowed,
 }
 
 impl ErrorCode {
@@ -140,6 +155,18 @@ impl ErrorCode {
             Self::SavedQueryNameTaken => "saved_query_name_taken",
             Self::SavedQueryConflict => "saved_query_conflict",
             Self::SavedQueryCap => "saved_query_cap",
+            Self::MergeConflictsOpen => "merge_conflicts_open",
+            Self::MergeDropsUnacknowledged => "merge_drops_unacknowledged",
+            Self::MergeNotRehearsed => "merge_not_rehearsed",
+            Self::MergeStale => "merge_stale",
+            Self::MergeBusy => "merge_busy",
+            Self::MergeOpenExists => "merge_open_exists",
+            Self::MergeBaseUnavailable => "merge_base_unavailable",
+            Self::MergeVersionConflict => "merge_version_conflict",
+            Self::MergeConfirmRequired => "merge_confirm_required",
+            Self::BranchMergeBusy => "branch_merge_busy",
+            Self::RoleAttributeNotAllowed => "role_attribute_not_allowed",
+            Self::RoleMembershipNotAllowed => "role_membership_not_allowed",
         }
     }
 }
@@ -242,7 +269,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 63] = [
+    const ALL: [(ErrorCode, &str); 75] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -306,6 +333,18 @@ mod tests {
         (ErrorCode::SavedQueryNameTaken, "saved_query_name_taken"),
         (ErrorCode::SavedQueryConflict, "saved_query_conflict"),
         (ErrorCode::SavedQueryCap, "saved_query_cap"),
+        (ErrorCode::MergeConflictsOpen, "merge_conflicts_open"),
+        (ErrorCode::MergeDropsUnacknowledged, "merge_drops_unacknowledged"),
+        (ErrorCode::MergeNotRehearsed, "merge_not_rehearsed"),
+        (ErrorCode::MergeStale, "merge_stale"),
+        (ErrorCode::MergeBusy, "merge_busy"),
+        (ErrorCode::MergeOpenExists, "merge_open_exists"),
+        (ErrorCode::MergeBaseUnavailable, "merge_base_unavailable"),
+        (ErrorCode::MergeVersionConflict, "merge_version_conflict"),
+        (ErrorCode::MergeConfirmRequired, "merge_confirm_required"),
+        (ErrorCode::BranchMergeBusy, "branch_merge_busy"),
+        (ErrorCode::RoleAttributeNotAllowed, "role_attribute_not_allowed"),
+        (ErrorCode::RoleMembershipNotAllowed, "role_membership_not_allowed"),
     ];
 
     #[test]

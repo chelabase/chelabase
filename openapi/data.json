@@ -58,7 +58,7 @@
             }
           },
           "403": {
-            "description": "`permission_denied`, `role_not_allowed`: Postgres refused the role (`permission_denied`), or the secret key's role can bypass row-level security (`role_not_allowed`)",
+            "description": "`permission_denied`, `role_not_allowed`: Postgres refused the role (`permission_denied`), or the secret key's role is owner-level or has system privileges: superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of a superuser role, `neon_superuser` or a system role (`role_not_allowed`; BYPASSRLS alone is allowed)",
             "content": {
               "application/json": {
                 "schema": {
@@ -210,7 +210,7 @@
             }
           },
           "403": {
-            "description": "`role_not_allowed`: the key's role can bypass row-level security",
+            "description": "`role_not_allowed`: the role is owner-level or has system privileges: superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of a superuser role, `neon_superuser` or a system role (BYPASSRLS alone is allowed)",
             "content": {
               "application/json": {
                 "schema": {

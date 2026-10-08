@@ -12,8 +12,14 @@ use chelabase_metadata::{
     CreateBranchOutcome, DataApiSettings, DataKeyRecord, DatabaseRecord, DatabaseSettings,
     DatabaseStatus, ENDPOINT_LOCK_TIMEOUT, EndpointState, InsertRoleOutcome, LiveBranch,
     LiveDatabase, MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewBranch, NewDataKey,
-    NewEndpoint, ObservedDatabase, ResyncApplied, ResyncWrite, RoleCopy, RoleLevel, RoleOrigin,
-    SealedChange,
+    NewEndpoint, NewStaticEndpoint, ObservedDatabase, ResyncApplied, ResyncWrite, RoleCopy,
+    RoleLevel, RoleOrigin, SchemaBase, SealedChange,
+};
+use chelabase_metadata::{
+    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
+};
+use chelabase_metadata::{
+    BranchBusy, ClaimOutcome, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch,
 };
 use chelabase_neon::backend::fake::FakeBackend;
 pub use chelabase_neon::backend::fake::Journal;
@@ -90,6 +96,28 @@ pub struct FakeLogin {
     pub login: bool,
     pub level: RoleLevel,
     pub api_owner_level: bool,
+    pub attributes: RoleAttributes,
+    /// E32: an API create or PATCH not yet confirmed (see `RoleCopy::attributes_pending`).
+    pub attributes_pending: bool,
+    /// The API write that set `attributes_pending` (`attributes_change_id`).
+    pub attributes_change_id: Option<uuid::Uuid>,
+}
+
+impl FakeLogin {
+    /// A row with the default attributes.
+    pub fn new(origin: RoleOrigin, password_enc: Option<&str>, pending: bool) -> Self {
+        Self {
+            origin,
+            password_enc: password_enc.map(str::to_string),
+            pending,
+            login: true,
+            level: RoleLevel::Plain,
+            api_owner_level: false,
+            attributes: RoleAttributes::default(),
+            attributes_pending: false,
+            attributes_change_id: None,
+        }
+    }
 }
 
 impl FakeEndpoint {
@@ -141,6 +169,9 @@ pub struct FakeState {
     pub deleting_before_set_ready: bool,
     /// The Nth `get_branch` call (1-based) of that branch first begins its delete.
     pub deleting_on_get_branch: Option<(BranchId, u32)>,
+    /// `(branch, n, timeline)`: the branch's `n`th `get_branch` (absolute count) first moves
+    /// it to `timeline`, like a switch landing meanwhile.
+    pub timeline_moves_on_get_branch: Option<(BranchId, u32, String)>,
     /// Seconds since a branch's row last changed (0 when absent).
     pub branch_ages: HashMap<BranchId, i64>,
     /// `(method, branch)`: that branch's delete begins just before the named write runs, as
@@ -170,6 +201,10 @@ pub struct FakeState {
     /// `delete_role_copy` finds the row already gone (removed meanwhile, say by a forwarded
     /// `DROP ROLE`).
     pub role_row_vanishes: bool,
+    /// The next `confirm_role` finds the version moved (a receiver write meanwhile).
+    pub confirm_version_moves: bool,
+    /// The next `rename_role_copy` finds no endpoint (deleted or switched meanwhile).
+    pub rename_endpoint_vanishes: bool,
     /// The next N `create_endpoint_for_branch` calls first flip the parent's `protected`, as
     /// a user toggling Protect between the read and the insert (C8).
     pub protection_flips: u32,
@@ -181,6 +216,20 @@ pub struct FakeState {
     /// before it.
     pub auth_sync_racer: Option<(String, String)>,
     pub app_sessions: Vec<AppSession>,
+    /// The schema merge base history, oldest first (E18); ids increase with each append.
+    pub schema_bases: Vec<SchemaBase>,
+    /// `branch_restores`: `(branch, restored timeline, from timeline, at)` (T14 I1).
+    pub restores: Vec<(BranchId, String, String, String)>,
+    /// Seconds since an endpoint row was created (0 when absent).
+    pub endpoint_ages: HashMap<String, i64>,
+    /// Schema merges (step 6g T8a) and their log, oldest event first.
+    pub merges: HashMap<uuid::Uuid, MergeRecord>,
+    pub merge_events: Vec<MergeEvent>,
+    /// Runs once, just before the next `set_merge_status`: a write landing while a job ran (a
+    /// cancel, say).
+    pub before_merge_write: Option<StateHook>,
+    /// `merges.handed_back_at` (T14 M10).
+    pub handed_back: HashMap<uuid::Uuid, DateTime<Utc>>,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -190,6 +239,13 @@ impl FakeState {
     pub fn delete_at_get_branch(&mut self, id: BranchId, n: u32) {
         let seen = self.get_branch_calls.get(&id).copied().unwrap_or(0);
         self.deleting_on_get_branch = Some((id, seen + n));
+    }
+
+    /// Moves `id` to `timeline` at its `n`th `get_branch` (1-based) counted from now, before
+    /// that call answers.
+    pub fn move_timeline_at_get_branch(&mut self, id: BranchId, n: u32, timeline: &str) {
+        let seen = self.get_branch_calls.get(&id).copied().unwrap_or(0);
+        self.timeline_moves_on_get_branch = Some((id, seen + n, timeline.to_string()));
     }
 
     /// What `begin_delete` does: the database and its live branches to `deleting`.
@@ -227,6 +283,32 @@ impl FakeState {
             }
         }
         moved
+    }
+
+    /// What keeps `branch` from being reset, restored or deleted (`branch_busy`'s SQL): a merge
+    /// other than `except` holding it as source or target (oldest first), else a live rehearsal
+    /// branch of it.
+    fn merge_busy(&self, branch: BranchId, except: Option<uuid::Uuid>) -> Option<BranchBusy> {
+        let mut holding: Vec<&MergeRecord> = self
+            .merges
+            .values()
+            .filter(|m| {
+                (m.source_branch_id == branch.as_uuid() || m.target_branch_id == branch.as_uuid())
+                    && m.state().holds_branches()
+                    && Some(m.id) != except
+            })
+            .collect();
+        holding.sort_by_key(|m| (m.created_at, m.id));
+        if let Some(m) = holding.first() {
+            return Some(BranchBusy::Merge(m.id));
+        }
+        sorted(self.branches.values().filter(|b| {
+            b.parent_branch_id == Some(branch)
+                && b.kind == BranchKind::Rehearsal
+                && b.status != BranchStatus::Deleted
+        }))
+        .first()
+        .map(|b| BranchBusy::Rehearsal(b.id))
     }
 
     /// `begin_branch_delete`'s guard: while the branch is live, its own live `normal`
@@ -295,6 +377,56 @@ impl FakeState {
     fn move_endpoint(&mut self, endpoint_id: Option<&str>, timeline_id: &str) {
         if let Some(ep) = endpoint_id.and_then(|ep| self.endpoints.get_mut(ep)) {
             ep.endpoint.timeline_id = timeline_id.to_string();
+        }
+    }
+
+    /// The restore switch's base copies (E18, T14 I1), as the metadata makes them: the link
+    /// (`to` restored from `from` at `at`) is recorded; then per database, the newest entry on
+    /// `from` at or before `at`, else the walk goes on through `from`'s own restore link at the
+    /// earlier of the point and that link's, at any depth; the pick is appended at (`to`, `at`).
+    fn copy_bases_for_restore(&mut self, branch: BranchId, from: &str, at: &str, to: &str) {
+        let lsn = |l: &str| l.parse::<chelabase_neon::Lsn>().expect("an LSN");
+        if !self.restores.iter().any(|(b, t, _, _)| *b == branch && t == to) {
+            self.restores
+                .push((branch, to.to_string(), from.to_string(), at.to_string()));
+        }
+        // The walk: (timeline, point), shallowest first.
+        let mut walk = vec![(from.to_string(), lsn(at))];
+        while walk.len() < 10_000 {
+            let (timeline, point) = walk.last().cloned().unwrap();
+            let Some((_, _, prev, prev_at)) = self
+                .restores
+                .iter()
+                .find(|(b, t, _, _)| *b == branch && *t == timeline)
+            else {
+                break;
+            };
+            walk.push((prev.clone(), point.min(lsn(prev_at))));
+        }
+        let mut picked: Vec<SchemaBase> = Vec::new();
+        for (timeline, point) in &walk {
+            for b in self.schema_bases.iter().rev() {
+                let on_point = b.branch_id == branch
+                    && b.branch_timeline_id.as_deref() == Some(timeline.as_str())
+                    && b.branch_lsn
+                        .as_deref()
+                        .and_then(|l| l.parse::<chelabase_neon::Lsn>().ok())
+                        .is_some_and(|l| l <= *point);
+                if on_point && !picked.iter().any(|p| p.database_name == b.database_name) {
+                    picked.push(b.clone());
+                }
+            }
+        }
+        picked.sort_by(|a, b| a.database_name.cmp(&b.database_name));
+        let last = self.schema_bases.iter().map(|b| b.id).max().unwrap_or(0);
+        for (id, copy) in (last + 1..).zip(picked) {
+            self.schema_bases.push(SchemaBase {
+                id,
+                branch_timeline_id: Some(to.to_string()),
+                branch_lsn: Some(at.to_string()),
+                recorded_at: Utc::now(),
+                ..copy
+            });
         }
     }
 
@@ -535,6 +667,55 @@ impl FakeMetadata {
         ids
     }
 
+    /// A merge of `db`'s database `app` from `source` into `target`, in `status`, as the API
+    /// leaves it (claimed when it's a working status), with the default options.
+    pub fn insert_merge(
+        &self,
+        db: DatabaseId,
+        source: BranchId,
+        target: BranchId,
+        direction: chelabase_metadata::MergeDirection,
+        status: MergeStatus,
+    ) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let row = MergeRecord {
+            id,
+            database_id: db.as_uuid(),
+            source_branch_id: source.as_uuid(),
+            target_branch_id: target.as_uuid(),
+            direction,
+            database_name: "app".to_string(),
+            status,
+            failed_phase: None,
+            version: 1,
+            base_fingerprint: None,
+            source_fingerprint: None,
+            target_fingerprint: None,
+            analysis: None,
+            resolutions: serde_json::json!([]),
+            user_steps: serde_json::json!([]),
+            acknowledgements: serde_json::json!([]),
+            options: serde_json::json!({ "lock_timeout_ms": 5000, "after": "keep" }),
+            plan: None,
+            rehearsal: None,
+            result: None,
+            rebaselined: false,
+            error: None,
+            claimed_at: status.is_working().then_some(now),
+            created_by: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        self.state().merges.insert(id, row);
+        id
+    }
+
+    /// The merge's row; panics when there's none.
+    pub fn merge_row(&self, id: uuid::Uuid) -> MergeRecord {
+        self.state().merges.get(&id).cloned().expect("the merge")
+    }
+
     fn write(&self, method: &'static str) -> Result<MutexGuard<'_, FakeState>, MetadataError> {
         record(&self.journal, format!("metadata.{method}"));
         let mut state = self.read(method)?;
@@ -590,6 +771,12 @@ impl WorkerMetadata for FakeMetadata {
         let calls = *calls;
         if state.deleting_on_get_branch == Some((id, calls)) {
             state.begin_branch_delete(id);
+        }
+        if let Some((branch, n, timeline)) = state.timeline_moves_on_get_branch.clone()
+            && (branch, n) == (id, calls)
+            && let Some(b) = state.branches.get_mut(&id)
+        {
+            b.timeline_id = Some(timeline);
         }
         Ok(state.branches.get(&id).cloned())
     }
@@ -674,6 +861,8 @@ impl WorkerMetadata for FakeMetadata {
                     tenant_id: ep.tenant_id.to_string(),
                     timeline_id: ep.timeline_id.to_string(),
                     compute_token_sha256: ep.compute_token_sha256.to_string(),
+                    routable: ep.routable,
+                    static_lsn: ep.static_lsn.map(str::to_string),
                 },
                 roles: std::iter::once(NeonRole {
                     name: ep.owner_role.to_string(),
@@ -703,6 +892,9 @@ impl WorkerMetadata for FakeMetadata {
                             login: l.login,
                             level: l.level,
                             api_owner_level: l.api_owner_level,
+                            attributes: l.attributes.clone(),
+                            attributes_pending: false,
+                            attributes_change_id: None,
                         };
                         (l.name.to_string(), login)
                     })
@@ -827,6 +1019,145 @@ impl WorkerMetadata for FakeMetadata {
         Ok(())
     }
 
+    async fn create_static_endpoint(&self, ep: &NewStaticEndpoint<'_>) -> Result<(), MetadataError> {
+        record(
+            &self.journal,
+            format!(
+                "metadata.create_static_endpoint {} {} at {}",
+                ep.id, ep.timeline_id, ep.static_lsn
+            ),
+        );
+        let mut state = self.read("create_static_endpoint")?;
+        state.endpoints.insert(
+            ep.id.to_string(),
+            FakeEndpoint {
+                endpoint: NeonEndpoint {
+                    id: ep.id.to_string(),
+                    tenant_id: ep.tenant_id.to_string(),
+                    timeline_id: ep.timeline_id.to_string(),
+                    compute_token_sha256: ep.compute_token_sha256.to_string(),
+                    routable: false,
+                    static_lsn: Some(ep.static_lsn.to_string()),
+                },
+                roles: Vec::new(),
+                databases: Vec::new(),
+                needs_reconfigure: false,
+                roles_version: 0,
+                logins: HashMap::new(),
+                branch_databases: Vec::new(),
+                compute_settings_version: 0,
+                unreadable: HashSet::new(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn schema_base(
+        &self,
+        branch: BranchId,
+        database_name: &str,
+    ) -> Result<Option<SchemaBase>, MetadataError> {
+        let state = self.read("schema_base")?;
+        Ok(state
+            .schema_bases
+            .iter()
+            .rev()
+            .find(|b| b.branch_id == branch && b.database_name == database_name)
+            .cloned())
+    }
+
+    async fn append_schema_base(&self, base: &SchemaBase) -> Result<i64, MetadataError> {
+        record(
+            &self.journal,
+            format!(
+                "metadata.append_schema_base {} {} {}",
+                base.branch_id,
+                base.database_name,
+                base.source.as_str()
+            ),
+        );
+        let mut state = self.read("append_schema_base")?;
+        let state = &mut *state;
+        let id = state.schema_bases.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+        state.schema_bases.push(SchemaBase {
+            id,
+            taken_at: Utc::now(),
+            recorded_at: Utc::now(),
+            ..base.clone()
+        });
+        // T14 M7: an older entry superseded on its timeline by one recorded more than the
+        // database's history window ago drops its model.
+        let window = state
+            .branches
+            .get(&base.branch_id)
+            .and_then(|b| state.databases.get(&b.database_id))
+            .map(|d| d.history_window);
+        if let Some(window) = window {
+            let cutoff = Utc::now()
+                - chrono::Duration::from_std(window).unwrap_or(chrono::Duration::MAX);
+            let same = |a: &SchemaBase, b: &SchemaBase| {
+                a.branch_id == b.branch_id
+                    && a.database_name == b.database_name
+                    && a.branch_timeline_id == b.branch_timeline_id
+            };
+            let superseded: Vec<i64> = state
+                .schema_bases
+                .iter()
+                .filter(|e| e.branch_id == base.branch_id && e.database_name == base.database_name)
+                .filter(|e| {
+                    state
+                        .schema_bases
+                        .iter()
+                        .any(|f| same(e, f) && f.id > e.id && f.recorded_at < cutoff)
+                })
+                .map(|e| e.id)
+                .collect();
+            for e in state
+                .schema_bases
+                .iter_mut()
+                .filter(|e| superseded.contains(&e.id))
+            {
+                e.model = None;
+                e.model_version = None;
+                e.server_major = None;
+            }
+        }
+        Ok(id)
+    }
+
+    async fn update_schema_base(&self, base: &SchemaBase) -> Result<bool, MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.update_schema_base {}", base.id),
+        );
+        let mut state = self.read("update_schema_base")?;
+        let Some(entry) = state.schema_bases.iter_mut().find(|b| b.id == base.id) else {
+            return Ok(false);
+        };
+        entry.model = base.model.clone();
+        entry.model_version = base.model_version;
+        entry.server_major = base.server_major;
+        entry.identity_map = base.identity_map.clone();
+        Ok(true)
+    }
+
+    async fn prune_schema_bases(
+        &self,
+        branch: BranchId,
+        keep: &[String],
+    ) -> Result<u64, MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.prune_schema_bases {branch} keeping {keep:?}"),
+        );
+        let mut state = self.read("prune_schema_bases")?;
+        let before = state.schema_bases.len();
+        state
+            .schema_bases
+            .retain(|b| b.branch_id != branch || keep.contains(&b.database_name));
+        Ok((before - state.schema_bases.len()) as u64)
+    }
+
     async fn delete_endpoint(&self, endpoint_id: &str) -> Result<(), MetadataError> {
         let mut state = self.write("delete_endpoint")?;
         state.endpoints.remove(endpoint_id);
@@ -890,10 +1221,7 @@ impl WorkerMetadata for FakeMetadata {
     async fn insert_api_role(
         &self,
         endpoint_id: &str,
-        name: &str,
-        owner_level: bool,
-        verifier: &str,
-        password_enc: &str,
+        role: &NewApiRole<'_>,
         cap: u32,
     ) -> Result<InsertRoleOutcome, MetadataError> {
         let mut state = self.write("insert_api_role")?;
@@ -904,27 +1232,180 @@ impl WorkerMetadata for FakeMetadata {
         if ep.copy_count() >= usize::try_from(cap).unwrap_or(usize::MAX) {
             return Ok(InsertRoleOutcome::CapReached);
         }
+        let name = role.name;
         if ep.roles.iter().any(|r| r.name == name) || ep.logins.contains_key(name) {
             return Ok(InsertRoleOutcome::Exists);
         }
-        ep.set_verifier(name, Some(verifier));
+        ep.set_verifier(name, role.verifier);
         ep.logins.insert(
             name.to_string(),
             FakeLogin {
                 origin: RoleOrigin::Api,
-                password_enc: Some(password_enc.to_string()),
+                password_enc: role.password_enc.map(str::to_string),
                 pending: true,
-                login: true,
-                level: if owner_level {
+                login: role.login,
+                level: if role.owner_level {
                     RoleLevel::OwnerLevel
                 } else {
                     RoleLevel::Plain
                 },
-                api_owner_level: owner_level,
+                api_owner_level: role.owner_level,
+                attributes: role.attributes.clone(),
+                attributes_pending: true,
+                attributes_change_id: Some(role.change_id),
             },
         );
         ep.roles_version += 1;
         Ok(InsertRoleOutcome::Inserted)
+    }
+
+    async fn update_api_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        change: &ApiRoleChange,
+        cap: u32,
+    ) -> Result<RoleWriteOutcome, MetadataError> {
+        let mut state = self.write("update_api_role")?;
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Ok(RoleWriteOutcome::NotFound);
+        };
+        if !ep
+            .logins
+            .get(name)
+            .is_some_and(|l| l.origin == RoleOrigin::Api)
+        {
+            return Ok(RoleWriteOutcome::NotFound);
+        }
+        if matches!(change.secret, SecretChange::Set(..))
+            && ep.verifier(name).is_none()
+            && ep.copy_count() >= usize::try_from(cap).unwrap_or(usize::MAX)
+        {
+            return Ok(RoleWriteOutcome::CapReached);
+        }
+        let row = ep.logins.get_mut(name).expect("checked above");
+        row.api_owner_level = change.owner_level;
+        row.level = if change.owner_level {
+            RoleLevel::OwnerLevel
+        } else {
+            RoleLevel::Plain
+        };
+        row.login = change.login;
+        row.attributes = change.attributes.clone();
+        row.pending = true;
+        row.attributes_pending = true;
+        row.attributes_change_id = Some(change.change_id);
+        match &change.secret {
+            SecretChange::Keep => {}
+            SecretChange::Clear => {
+                row.password_enc = None;
+                ep.set_verifier(name, None);
+                ep.unreadable.remove(name);
+            }
+            SecretChange::Set(verifier, sealed) => {
+                row.password_enc = Some(sealed.clone());
+                ep.set_verifier(name, Some(verifier));
+                ep.unreadable.remove(name);
+            }
+        }
+        ep.roles_version += 1;
+        Ok(RoleWriteOutcome::Done)
+    }
+
+    async fn store_role_secret(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        verifier: &str,
+        password_enc: &str,
+        cap: u32,
+    ) -> Result<RoleWriteOutcome, MetadataError> {
+        let mut state = self.write("store_role_secret")?;
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Ok(RoleWriteOutcome::NotFound);
+        };
+        if ep.roles.first().is_some_and(|o| o.name == name) {
+            return Ok(RoleWriteOutcome::NotFound);
+        }
+        if ep.verifier(name).is_none()
+            && ep.copy_count() >= usize::try_from(cap).unwrap_or(usize::MAX)
+        {
+            return Ok(RoleWriteOutcome::CapReached);
+        }
+        let row = ep
+            .logins
+            .entry(name.to_string())
+            .or_insert_with(|| FakeLogin::new(RoleOrigin::Sql, None, true));
+        row.password_enc = Some(password_enc.to_string());
+        row.login = true;
+        row.pending = true;
+        ep.set_verifier(name, Some(verifier));
+        ep.unreadable.remove(name);
+        ep.roles_version += 1;
+        Ok(RoleWriteOutcome::Done)
+    }
+
+    async fn rename_role_copy(
+        &self,
+        endpoint_id: &str,
+        branch: BranchId,
+        old: &str,
+        new: &str,
+        resealed: Option<&str>,
+        unreadable: Option<bool>,
+    ) -> Result<RenameCopyOutcome, MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.rename_role_copy {endpoint_id} {old} -> {new}"),
+        );
+        let mut state = self.write("rename_role_copy")?;
+        let state = &mut *state;
+        if std::mem::take(&mut state.rename_endpoint_vanishes) {
+            return Ok(RenameCopyOutcome::NotFound);
+        }
+        let keys_taken = state.live_keys(branch).any(|k| {
+            k.kind == DataKeyKind::Secret && k.role == new
+        });
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Ok(RenameCopyOutcome::NotFound);
+        };
+        if keys_taken || ep.logins.contains_key(new) || ep.roles.iter().any(|r| r.name == new) {
+            return Ok(RenameCopyOutcome::Taken);
+        }
+        let owner = ep.roles.first().map(|r| r.name.clone());
+        let row = if owner.as_deref() == Some(old) {
+            None
+        } else {
+            ep.logins.remove(old)
+        };
+        let moved = row.is_some();
+        let was_unreadable = ep.unreadable.remove(old);
+        if let Some(mut row) = row {
+            let verifier = ep.verifier(old);
+            ep.set_verifier(old, None);
+            let mark = match unreadable {
+                Some(flag) => flag,
+                None => was_unreadable || (row.password_enc.is_some() && resealed.is_none()),
+            };
+            if mark {
+                ep.unreadable.insert(new.to_string());
+            }
+            row.password_enc = resealed.map(str::to_string);
+            ep.set_verifier(new, verifier.as_deref());
+            ep.logins.insert(new.to_string(), row);
+        }
+        ep.roles_version += 1;
+        for key in state
+            .data_keys
+            .iter_mut()
+            .filter(|k| k.branch_id == branch && k.role == old)
+        {
+            key.role = new.to_string();
+        }
+        Ok(RenameCopyOutcome::Renamed {
+            row: moved,
+            was_unreadable,
+        })
     }
 
     async fn replace_role_secret(
@@ -953,11 +1434,22 @@ impl WorkerMetadata for FakeMetadata {
         endpoint_id: &str,
         name: &str,
         version: i64,
+        attributes_change: Option<uuid::Uuid>,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("confirm_role")?;
+        let moves = std::mem::take(&mut state.confirm_version_moves);
         let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
             return Ok(false);
         };
+        if moves {
+            // A receiver write landed between the apply and the confirm.
+            ep.roles_version += 1;
+        }
+        if let (Some(change), Some(login)) = (attributes_change, ep.logins.get_mut(name))
+            && login.attributes_change_id == Some(change)
+        {
+            login.attributes_pending = false;
+        }
         if ep.roles_version != version {
             return Ok(false);
         }
@@ -1033,6 +1525,9 @@ impl WorkerMetadata for FakeMetadata {
                 login: up.login,
                 level: up.level,
                 api_owner_level: false,
+                attributes: up.attributes.clone(),
+                attributes_pending: false,
+                attributes_change_id: None,
             });
             row.password_enc = match &up.password_enc {
                 SealedChange::Keep => row.password_enc,
@@ -1042,6 +1537,13 @@ impl WorkerMetadata for FakeMetadata {
             row.login = up.login;
             row.level = up.level;
             row.pending = up.pending;
+            row.attributes = up.attributes.clone();
+            row.attributes_pending = false;
+            if row.origin == RoleOrigin::Api
+                && let Some(owner_level) = up.api_owner_level
+            {
+                row.api_owner_level = owner_level;
+            }
             if before_verifier != up.verifier || matches!(up.password_enc, SealedChange::Set(_)) {
                 ep.unreadable.remove(&up.name);
             }
@@ -1189,6 +1691,13 @@ impl WorkerMetadata for FakeMetadata {
                     branch_status: branch.map(|b| b.status),
                     needs_reconfigure: ep.needs_reconfigure,
                     compute_settings_version: ep.compute_settings_version,
+                    routable: ep.endpoint.routable,
+                    static_lsn: ep.endpoint.static_lsn.clone(),
+                    age_secs: state
+                        .endpoint_ages
+                        .get(&ep.endpoint.id)
+                        .copied()
+                        .unwrap_or(0),
                 }
             })
             .collect();
@@ -1240,8 +1749,15 @@ impl WorkerMetadata for FakeMetadata {
     async fn begin_branch_delete(
         &self,
         id: BranchId,
+        except: Option<uuid::Uuid>,
     ) -> Result<BranchDeleteOutcome, MetadataError> {
         let mut state = self.write("begin_branch_delete")?;
+        // T14 F3 (I1): a merge holding the live branch refuses it.
+        if state.branches.get(&id).is_some_and(|b| branch_live(b.status))
+            && let Some(busy) = state.merge_busy(id, except)
+        {
+            return Ok(BranchDeleteOutcome::MergeBusy(busy));
+        }
         if let Some(refused) = state.children_blocking_delete(id) {
             return Ok(refused);
         }
@@ -1257,6 +1773,33 @@ impl WorkerMetadata for FakeMetadata {
             BranchDeleteOutcome::Started
         } else {
             BranchDeleteOutcome::NotMoved
+        })
+    }
+
+    async fn claim_branch_for_switch(
+        &self,
+        id: BranchId,
+        allow_protected: bool,
+        except: Option<uuid::Uuid>,
+    ) -> Result<ClaimOutcome, MetadataError> {
+        let mut state = self.write("claim_branch_for_switch")?;
+        let ready = state
+            .branches
+            .get(&id)
+            .is_some_and(|b| b.status == BranchStatus::Ready);
+        if ready && let Some(busy) = state.merge_busy(id, except) {
+            return Ok(ClaimOutcome::MergeBusy(busy));
+        }
+        Ok(match state.branches.get_mut(&id) {
+            Some(b) if b.status == BranchStatus::Ready && b.protected && !allow_protected => {
+                ClaimOutcome::Protected
+            }
+            Some(b) if b.status == BranchStatus::Ready => {
+                b.status = BranchStatus::Resetting;
+                b.error = None;
+                ClaimOutcome::Claimed
+            }
+            _ => ClaimOutcome::NotReady,
         })
     }
 
@@ -1299,6 +1842,7 @@ impl WorkerMetadata for FakeMetadata {
         id: BranchId,
         expected_pending: &str,
         history_start: Option<DateTime<Utc>>,
+        branched_at_lsn: &str,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("switch_to_pending_timeline")?;
         let (endpoint_id, timeline_id) = match state.branches.get_mut(&id) {
@@ -1310,6 +1854,7 @@ impl WorkerMetadata for FakeMetadata {
                 b.timeline_id = b.pending_timeline_id.take();
                 b.pending_timeline_at = None;
                 b.history_start = Some(history_start.unwrap_or_else(chrono::Utc::now));
+                b.branched_at_lsn = Some(branched_at_lsn.to_string());
                 (b.endpoint_id.clone(), b.timeline_id.clone().unwrap())
             }
             _ => return Ok(false),
@@ -1324,6 +1869,7 @@ impl WorkerMetadata for FakeMetadata {
         expected_pending: &str,
         backup: BranchId,
         backup_name: &str,
+        restore_lsn: &str,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("switch_to_restored_timeline")?;
         let Some(b) = state.branches.get(&id).cloned() else {
@@ -1369,6 +1915,9 @@ impl WorkerMetadata for FakeMetadata {
         branch.pending_timeline_at = None;
         let timeline_id = branch.timeline_id.clone().unwrap();
         state.move_endpoint(b.endpoint_id.as_deref(), &timeline_id);
+        if let Some(old) = b.timeline_id.as_deref() {
+            state.copy_bases_for_restore(id, old, restore_lsn, &timeline_id);
+        }
         Ok(true)
     }
 
@@ -1521,6 +2070,8 @@ impl WorkerMetadata for FakeMetadata {
                 revoked_at: None,
                 databases: k.databases.clone(),
                 role_oid: k.role_oid,
+                role_timeline: k.role_timeline.clone(),
+                role_bypass_rls: k.role_bypass_rls,
             })
             .collect())
     }
@@ -2009,6 +2560,327 @@ impl WorkerMetadata for FakeMetadata {
             .retain(|s| !(s.revoked_at.is_some_and(|r| r < cutoff) || s.expires_at < cutoff));
         Ok((before - state.app_sessions.len()) as u64)
     }
+
+    async fn merge(&self, id: uuid::Uuid) -> Result<Option<MergeRecord>, MetadataError> {
+        Ok(self.read("merge")?.merges.get(&id).cloned())
+    }
+
+    async fn set_merge_status(
+        &self,
+        id: uuid::Uuid,
+        from: &[MergeStatus],
+        to: MergeStatus,
+        patch: MergeStatusPatch,
+    ) -> Result<bool, MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.set_merge_status {id} {}", to.as_str()),
+        );
+        let mut state = self.read("set_merge_status")?;
+        if let Some(hook) = state.before_merge_write.take() {
+            hook(&mut state);
+        }
+        let Some(current) = state.merges.get(&id) else {
+            return Ok(false);
+        };
+        let guarded = from.contains(&current.status)
+            && patch
+                .guard_failed_phase
+                .as_ref()
+                .is_none_or(|p| &current.failed_phase == p)
+            && patch.guard_version.is_none_or(|v| current.version == v)
+            && patch.guard_result.as_ref().is_none_or(|r| &current.result == r);
+        if !guarded {
+            return Ok(false);
+        }
+        if patch.guard_branches_ready {
+            let ready = |b: uuid::Uuid| {
+                state
+                    .branches
+                    .get(&BranchId::from(b))
+                    .is_some_and(|b| b.status == BranchStatus::Ready)
+            };
+            if !ready(current.source_branch_id) || !ready(current.target_branch_id) {
+                return Ok(false);
+            }
+        }
+        // `merges_one_applying`: one merge changing (or half changed) a target at a time.
+        let failed_phase = patch
+            .failed_phase
+            .clone()
+            .unwrap_or_else(|| current.failed_phase.clone());
+        if chelabase_metadata::MergeState::of(to, failed_phase.as_deref()).is_applying() {
+            let target = current.target_branch_id;
+            if state
+                .merges
+                .values()
+                .any(|m| m.id != id && m.target_branch_id == target && m.state().is_applying())
+            {
+                return Err(MetadataError::Config(
+                    "duplicate key value violates unique constraint \"merges_one_applying\"".into(),
+                ));
+            }
+        }
+        if patch.log_status {
+            let n = state.merge_events.len() as i64 + 1;
+            let mut e = MergeEvent::new(id, "status");
+            e.id = n;
+            e.detail = Some(serde_json::json!({ "to": to.as_str() }));
+            state.merge_events.push(e);
+        }
+        let m = state.merges.get_mut(&id).expect("checked above");
+        m.status = to;
+        m.updated_at = Utc::now();
+        m.claimed_at = to.is_working().then(Utc::now);
+        if patch.analysis.is_some() || patch.plan.is_some() {
+            m.version += 1;
+        }
+        let json = |v: serde_json::Value| (!v.is_null()).then_some(v);
+        if let Some(v) = patch.analysis {
+            m.analysis = json(v);
+        }
+        if let Some(v) = patch.plan {
+            m.plan = json(v);
+        }
+        if let Some(v) = patch.resolutions {
+            m.resolutions = v;
+        }
+        if let Some(v) = patch.rehearsal {
+            m.rehearsal = Some(v);
+        }
+        if let Some(v) = patch.result {
+            m.result = Some(v);
+        }
+        if let Some(v) = patch.error {
+            m.error = v;
+        }
+        if let Some(v) = patch.failed_phase {
+            m.failed_phase = v;
+        }
+        if let Some(v) = patch.base_fingerprint {
+            m.base_fingerprint = Some(v);
+        }
+        if let Some(v) = patch.source_fingerprint {
+            m.source_fingerprint = Some(v);
+        }
+        if let Some(v) = patch.target_fingerprint {
+            m.target_fingerprint = Some(v);
+        }
+        if let Some(v) = patch.rebaselined {
+            m.rebaselined = v;
+        }
+        if let Some(v) = patch.options {
+            m.options = v;
+        }
+        Ok(true)
+    }
+
+    async fn touch_merge_claim(
+        &self,
+        id: uuid::Uuid,
+        status: MergeStatus,
+    ) -> Result<bool, MetadataError> {
+        record(&self.journal, format!("metadata.touch_merge_claim {id}"));
+        let mut state = self.read("touch_merge_claim")?;
+        Ok(match state.merges.get_mut(&id) {
+            Some(m) if m.status == status => {
+                m.claimed_at = Some(Utc::now());
+                true
+            }
+            _ => false,
+        })
+    }
+
+    async fn append_merge_event(&self, event: &MergeEvent) -> Result<(), MetadataError> {
+        record(
+            &self.journal,
+            format!(
+                "metadata.append_merge_event {} {} {} {}",
+                event.kind,
+                event.phase.as_deref().unwrap_or("-"),
+                event.step_id.as_deref().unwrap_or("-"),
+                event.outcome.as_deref().unwrap_or("-")
+            ),
+        );
+        let mut state = self.read("append_merge_event")?;
+        let id = state.merge_events.len() as i64 + 1;
+        state.merge_events.push(MergeEvent {
+            id,
+            at: Utc::now(),
+            ..event.clone()
+        });
+        Ok(())
+    }
+
+    async fn merge_events(&self, id: uuid::Uuid) -> Result<Vec<MergeEvent>, MetadataError> {
+        Ok(self
+            .read("merge_events")?
+            .merge_events
+            .iter()
+            .filter(|e| e.merge_id == id)
+            .cloned()
+            .collect())
+    }
+
+    async fn create_rehearsal_branch(
+        &self,
+        database_id: DatabaseId,
+        parent: BranchId,
+        name: &str,
+    ) -> Result<BranchRecord, MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.create_rehearsal_branch {name}"),
+        );
+        let mut state = self.read("create_rehearsal_branch")?;
+        let parent_ready = state
+            .branches
+            .get(&parent)
+            .is_some_and(|p| p.database_id == database_id && p.status == BranchStatus::Ready);
+        if !parent_ready {
+            return Err(MetadataError::Conflict);
+        }
+        if state.name_taken(database_id, name) {
+            return Err(MetadataError::BranchNameTaken(name.to_string()));
+        }
+        let now = Utc::now();
+        let row = BranchRecord {
+            id: BranchId::new(),
+            database_id,
+            name: name.to_string(),
+            parent_branch_id: Some(parent),
+            kind: BranchKind::Rehearsal,
+            status: BranchStatus::Pending,
+            timeline_id: None,
+            pending_timeline_id: None,
+            pending_timeline_at: None,
+            superseded_timeline_id: None,
+            endpoint_id: None,
+            owner_password_enc: None,
+            branched_at_time: None,
+            branched_at_lsn: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            history_start: None,
+            authenticator_password_enc: None,
+            protected: false,
+        };
+        state.branches.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    async fn stale_merge_claims(
+        &self,
+        older_than: Duration,
+        rehand_after: Duration,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        let state = self.read("stale_merge_claims")?;
+        let now = Utc::now();
+        let cutoff = now - older_than;
+        let mut rows: Vec<MergeRecord> = state
+            .merges
+            .values()
+            .filter(|m| {
+                let claimed = m.claimed_at.unwrap_or(m.updated_at);
+                m.status.is_working()
+                    && claimed < cutoff
+                    && state
+                        .handed_back
+                        .get(&m.id)
+                        .is_none_or(|at| *at < claimed || *at < now - rehand_after)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|m| (m.created_at, m.id));
+        Ok(rows)
+    }
+
+    async fn stale_finish_requests(
+        &self,
+        older_than: Duration,
+        rehand_after: Duration,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        let state = self.read("stale_finish_requests")?;
+        let now = Utc::now();
+        let mut rows: Vec<MergeRecord> = state
+            .merges
+            .values()
+            .filter(|m| {
+                let waits = m.result.as_ref().is_some_and(|r| {
+                    r["after"]["requested"] == serde_json::json!(true)
+                        || r["after"]["started"] == serde_json::json!(true)
+                });
+                m.status == MergeStatus::AppliedWithDrift
+                    && waits
+                    && m.updated_at < now - older_than
+                    && state
+                        .handed_back
+                        .get(&m.id)
+                        .is_none_or(|at| *at < m.updated_at || *at < now - rehand_after)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|m| (m.created_at, m.id));
+        Ok(rows)
+    }
+
+    async fn mark_merge_handed_back(
+        &self,
+        id: uuid::Uuid,
+        status: MergeStatus,
+    ) -> Result<bool, MetadataError> {
+        record(&self.journal, format!("metadata.mark_merge_handed_back {id}"));
+        let mut state = self.read("mark_merge_handed_back")?;
+        if state.merges.get(&id).is_none_or(|m| m.status != status) {
+            return Ok(false);
+        }
+        state.handed_back.insert(id, Utc::now());
+        Ok(true)
+    }
+
+    async fn cancel_drafts_for_branch(&self, branch: BranchId) -> Result<u64, MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.cancel_drafts_for_branch {branch}"),
+        );
+        let mut state = self.read("cancel_drafts_for_branch")?;
+        let mut n = 0;
+        for m in state.merges.values_mut() {
+            if (m.source_branch_id == branch.as_uuid() || m.target_branch_id == branch.as_uuid())
+                && matches!(
+                    m.status,
+                    MergeStatus::Computing | MergeStatus::Draft | MergeStatus::Rehearsed
+                )
+            {
+                m.status = MergeStatus::Cancelled;
+                m.claimed_at = None;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn list_merges(
+        &self,
+        database_id: DatabaseId,
+        branch: Option<BranchId>,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        let state = self.read("list_merges")?;
+        let mut rows: Vec<MergeRecord> = state
+            .merges
+            .values()
+            .filter(|m| m.database_id == database_id.as_uuid())
+            .filter(|m| {
+                branch.is_none_or(|b| {
+                    m.source_branch_id == b.as_uuid() || m.target_branch_id == b.as_uuid()
+                })
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|m| (std::cmp::Reverse(m.created_at), m.id));
+        Ok(rows)
+    }
 }
 
 /// Oldest first, like the real queries.
@@ -2024,7 +2896,9 @@ fn fake_copies(ep: &FakeEndpoint) -> Vec<RoleCopy> {
         level: RoleLevel::OwnerLevel,
         api_owner_level: false,
         pending: false,
+        attributes_pending: false,
         created_at: at,
+        attributes: RoleAttributes::default(),
     });
     let mut rest: Vec<RoleCopy> = ep
         .logins
@@ -2038,7 +2912,9 @@ fn fake_copies(ep: &FakeEndpoint) -> Vec<RoleCopy> {
             level: l.level,
             api_owner_level: l.api_owner_level,
             pending: l.pending,
+            attributes_pending: l.attributes_pending,
             created_at: at,
+            attributes: l.attributes.clone(),
         })
         .collect();
     rest.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2101,10 +2977,14 @@ pub struct FakeStorage {
     pub on_create_tenant: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once, at the start of the next `create_branch_timeline`.
     pub on_create_branch_timeline: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The next `create_branch_timeline` waits this long first (a slow storage controller).
+    pub create_branch_delay: Mutex<Option<Duration>>,
     /// What `lsn_by_timestamp` answers; `None` answers `present` at the timeline's head.
     pub lsn_at: Mutex<Option<LsnAtTime>>,
     /// What `timestamp_of_lsn` answers.
     pub timestamp_at: Mutex<Option<DateTime<Utc>>>,
+    /// Each timeline's GC cutoff, once set (none otherwise).
+    pub gc_cutoffs: Mutex<HashMap<NeonId, Lsn>>,
     pub journal: Journal,
 }
 
@@ -2270,6 +3150,10 @@ impl Storage for FakeStorage {
         if let Some(hook) = hook {
             hook();
         }
+        let delay = lock(&self.create_branch_delay).take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.call(
             "create_branch_timeline",
             format!("{timeline} from {parent} at {lsn}"),
@@ -2339,6 +3223,28 @@ impl Storage for FakeStorage {
             Some(t) => Ok(t.ancestor.as_ref().map(|(_, lsn)| *lsn)),
             None => Err(Self::not_found(format!("timeline {timeline}"))),
         }
+    }
+
+    async fn ancestor(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<Option<(NeonId, Lsn)>, StorconError> {
+        self.check("ancestor")?;
+        match lock(&self.timelines).get(&(tenant.clone(), timeline.clone())) {
+            Some(t) => Ok(t.ancestor.clone()),
+            None => Err(Self::not_found(format!("timeline {timeline}"))),
+        }
+    }
+
+    async fn gc_cutoff(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<Option<Lsn>, StorconError> {
+        self.check("gc_cutoff")?;
+        self.head(tenant, timeline)?;
+        Ok(lock(&self.gc_cutoffs).get(timeline).copied())
     }
 
     async fn lsn_by_timestamp(
@@ -2525,8 +3431,10 @@ pub fn worker() -> (FakeWorker, Journal) {
             detach_delay: Mutex::default(),
             on_create_tenant: Mutex::default(),
             on_create_branch_timeline: Mutex::default(),
+            create_branch_delay: Mutex::default(),
             lsn_at: Mutex::default(),
             timestamp_at: Mutex::default(),
+            gc_cutoffs: Mutex::default(),
             journal: journal.clone(),
         },
         computes: FakeBackend::with_journal(journal.clone()),
@@ -2558,6 +3466,9 @@ pub fn worker() -> (FakeWorker, Journal) {
         zitadel: None,
         app_users_reconcile_every: Duration::from_secs(300),
         remove_orphans: true,
+        merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
+        merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
+        resync_requests: Default::default(),
     };
     (worker, journal)
 }
@@ -2622,6 +3533,7 @@ pub fn restored_by_hand(w: &FakeWorker, branch: BranchId, backup_name: &str) -> 
         restored.as_str(),
         backup,
         backup_name,
+        "0/1",
     ))
     .expect("the fake never waits");
     assert!(switched.unwrap(), "switched");

@@ -24,6 +24,8 @@ export interface CodeEditorProps {
   extensions: Extension[];
   onChange: (doc: string) => void;
   onRun: () => void;
+  /** The editor's accessible name (default "SQL editor"); set once, at creation. */
+  label?: string;
 }
 
 const setError = StateEffect.define<number | null>();
@@ -70,7 +72,7 @@ const theme = EditorView.theme(
 );
 
 /** CodeMirror 6 used directly (no React wrapper). `extensions` may change over the editor's life. */
-export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function CodeEditor({ initialDoc, extensions, onChange, onRun }, ref) {
+export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function CodeEditor({ initialDoc, extensions, onChange, onRun, label = "SQL editor" }, ref) {
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const language = useRef(new Compartment());
@@ -99,7 +101,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
           errorField,
           theme,
           language.current.of(extensions),
-          EditorView.contentAttributes.of({ "aria-label": "SQL editor" }),
+          EditorView.contentAttributes.of({ "aria-label": label }),
           EditorView.updateListener.of((u) => u.docChanged && onChangeRef.current(u.state.doc.toString())),
         ],
       }),

@@ -1,0 +1,169 @@
+---
+title: "The schema merge engine"
+description: "How a schema merge matches objects by OID, stores bases, applies the three-way rules, plans its phases and recovers from a crash."
+---
+
+A schema merge moves schema changes between a branch and its parent with a three-way comparison. For how to use it, see [Merging schema between branches](/docs/using/merging-schema). This page covers how it works.
+
+The pieces:
+
+- **`crates/chelabase-schema`** is a pure Rust crate: it reads one database's catalog into a model, compares three models, builds the merged model, plans it in phases, exports it as SQL and compares the result for drift. It has no HTTP and no metadata access.
+- **The orchestrator** (`services/orchestrator/src/merges.rs`) owns the routes. It checks every refusal, moves the merge row to its working status with one guarded write and publishes a job.
+- **The worker** runs the jobs (`chelabase.merge`): `compute`, `rehearse`, `apply`, `resume`, `cancel` and `finish`. It reads schemas, runs the phases and writes the results.
+
+Every merge is one stored row with a log of its state changes and step results.
+
+## The model
+
+The catalog reader runs as the platform's admin in one `REPEATABLE READ READ ONLY` transaction with `search_path = pg_catalog`. It uses `pg_get_*def`, `pg_get_expr` and `format_type`, so expressions come back as Postgres's normalized text and compare stably. It accepts only Postgres 17, and a model carries a `model_version`; a stored snapshot of another version, or another server major, is never trusted.
+
+The model covers schemas, tables, columns, constraints, indexes, enums, sequences, policies, grants, default privileges and roles. Everything else the reader finds (views, functions, triggers, partitions, extensions and the rest) goes into a list of **reported** objects: kept so the preview can show source-side changes and find merged objects that depend on them, never dropped and never applied.
+
+Each model has a **fingerprint**, a SHA-256 of its normalized form. The merge stores the base's, the source's and the target's.
+
+### What the reader leaves out
+
+The exclusions are computed inside the catalog SQL and listed in `crates/chelabase-schema/src/exclusions.rs`, which a worker test checks against the worker's own constants:
+
+- schemas `chelabase` and `chelabase_merge`, and Postgres's own;
+- objects that belong to an extension (`pg_depend` type `e`);
+- the app users table's managed columns, guard triggers, own-row policies, email index, and its grants to `authenticated` and `chelabase_auth_sync`;
+- the roles `authenticator`, `anon`, `authenticated`, `chelabase_admin`, `chelabase_auth_sync`, `cloud_admin`, `neon_superuser`, every other `chelabase_*` role and every `pg_*` role (memberships in them stay on the member);
+- the data API's default privileges (E16): its per-schema grants to `anon` and `authenticated` by the owner, and its one database-wide row, matched by shape: the owner's function-default row (`defaclnamespace = 0`, object type `f`) whose ACL is exactly the owner's own `EXECUTE`. A row of any other shape, a user's revoke for another role or with another grant included, stays in the model. `exclusions.rs` names the shape and a catalog test pins it.
+
+Leftovers of an interrupted merge (a `chelabase_merge_nn_…` check, a `chelabase_merge_ix_…` index) are reported as such and never read as user changes. Tables that inherit from another (`INHERITS`) are reported too, with their parent link, and the planner doesn't touch them.
+
+## Identity
+
+Objects that existed at the base are matched by **catalog class and OID** (a column by its table's OID and its `attnum`; an enum value by its own OID). A rename or a `SET SCHEMA` is then a change of name, not a drop and a create, so it merges without losing data.
+
+OIDs can't be assumed to agree between two branches, because each timeline hands out OIDs from the same counter after the branch point: a new table on one side can have the OID of an unrelated new table on the other. So:
+
+- the **identity map** is stored apart from the model, and it is full: for every base object it records the OID on the parent side and on the branch side (or none where the object doesn't exist). It survives a model upgrade;
+- an object with no pair in the map is newer than the base, and is matched by qualified name;
+- a drop and re-create under one name has a new OID, so it reads as a drop plus a create, with a data-loss flag.
+
+After a merge creates objects on the target, the worker reads the target, finds them by name and records their OIDs in the map.
+
+## Bases
+
+A **base** is a stored model plus the identity map and a live location (a timeline id and an LSN). It is written:
+
+- when a branch is created: after the branch's compute is ready and bootstrapped, before it is marked ready, for every database on it (exactly the parent's at the branch point). A failed read doesn't fail the create; it leaves the base without a model, and the live fallback covers it later;
+- when a branch is reset to its parent: from the parent's head, and `branched_at_lsn` moves to the reset point;
+- when a merge or update finishes with the `keep` choice: the base becomes the source's schema at the moment the merge read it, which is git's merge base.
+
+Bases are a **history**. Each entry is appended and records the branch's own timeline and LSN from which it became valid, and the newest is the current one. A restore to LSN X on timeline T appends a copy of the newest entry on T at or before X, positioned at the new timeline's start. So restoring a branch to before a merge with `keep` makes the next merge compare against the ancestor that was true then. Entries go with the branch.
+
+### The live fallback
+
+When there's no usable base (none stored, or another model version), the worker starts a **static compute**: a read-only Postgres in Neon's static mode, pinned to the recorded timeline and LSN. It has its own endpoint record, marked unroutable, so the proxy never connects clients to it. The worker reads the model, stores it as the new snapshot and removes the compute and the record, also on error. Reconcile removes leftovers older than 10 minutes.
+
+The pageserver refuses to read below a timeline's applied GC cutoff, except at a point it retains: a child's branch point (kept on the parent's timeline while the child exists) or a leased LSN. The worker checks the cutoff first. Inside the history window (7 days by default) it reads the recorded location as is. Behind the cutoff, a location at its timeline's branch point (a create or reset base) is read on the ancestor timeline at that point, which retains it; any other point (a `keep` merge's base, recorded on the source's timeline) or a timeline that's gone is unavailable, and no compute is started. The merge then offers **re-baseline**: it uses the target's current schema as the base, an empty identity map (everything is matched by name) and a two-way diff.
+
+## The three-way rules
+
+Let B be the base, S the source now and T the target now, and `diff(B,S)` and `diff(B,T)` their changes, one entry per sub-object: create, drop or alter (a name change is an alter).
+
+| diff(B,S) | diff(B,T) | Result |
+|---|---|---|
+| changed | unchanged | apply |
+| unchanged | changed | nothing (`target_only`) |
+| the same change | the same change | nothing (`overlap`) |
+| changed | changed differently | `edit` conflict |
+| dropped | altered, or the reverse | `drop_vs_edit` conflict |
+| created | created under the same name, different definition | `create_collision` conflict |
+| adds columns to a table | adds columns to the same table | `column_order` conflict |
+
+Details the rules settle:
+
+- One item per sub-object: a schema, table, column, constraint, index, policy, enum (with its values), sequence, role (with its memberships), default-privilege row, and one per grant. An enum value dropped or reordered on the source is an `edit` conflict that "take source" can't resolve, since Postgres can add and rename enum values but not drop or reorder them; values added on both sides conflict too.
+- A schema or table dropped on one side while the other changes it, or anything in it, is one `drop_vs_edit` conflict over the whole subtree.
+- New columns from the source get the attnums after the target table's last one. Postgres can't reorder columns without a rebuild, so a column order conflict offers "target's columns first" or own SQL.
+- Flags are set on the change from the target's version to the source's: a drop, or a type change not on the safe widening list, is data loss. A role created with or gaining `BYPASSRLS`, or created as or turned into an owner-level role (E28), is a security change. A role rename is a breaking change (E29a). Both, like data loss, need an acknowledgement.
+
+### The integrity check
+
+The merged model `M = T + applied changes + resolutions` must have every reference resolve: parents, a constraint's columns, the columns an index, policy or generated expression names, owners, memberships and enum column types. Each failure is a **dependency conflict** naming both items. Two refinements:
+
+- an item whose missing references are all decided by one other conflict joins that conflict instead of getting its own;
+- an object taken from the source whose definition text names something the merged model calls differently (the target renamed it) is a dependency conflict too. The engine never rewrites definition text, so the answer is "keep target" or own SQL.
+
+A reference to an object outside the model, such as an excluded role or schema, always resolves. The rehearsal is the final check for what the engine can't see.
+
+## The plan
+
+The plan is the two-way diff from the target to `M`, through the identity map, as an ordered list of steps. Each step has a stable id, a kind (`generated`, `user` or `own_sql`), a phase, its SQL, the items it implements and flags (data loss, table rewrite, security, locks taken).
+
+Order: renames first; then drops in reverse dependency order (a policy before the column it uses); then schemas, enums, sequences, tables, columns, primary keys, unique and check constraints, foreign keys, indexes, row-level-security flags, policies, grants and default privileges. Own SQL goes at the place of its conflict's object kind; user steps go right after their anchor.
+
+The planner also simulates the target's default privileges: when the merged model creates a table or sequence, the grants the target's defaults would add are in the expected model, so they don't show up as drift.
+
+User statements and own SQL are classified with Postgres's parser (`pg_query`). Transaction control, role and database DDL, `ALTER SYSTEM` and `VACUUM` are refused; concurrent index statements go to phase 2; an enum `ADD VALUE` to phase 1a; everything else to phase 1. A statement that would land in an earlier phase than the step it follows is refused, not moved, since moving a transactional statement out of the transaction changes what it does.
+
+### Phases
+
+- **Phase 0, roles.** Renames, creates and updates roles through the same roles path the API uses (so the caps, reserved names, membership rules and protected-branch rules apply, and a role that can log in gets a new generated password). Passwords are never copied. A source role renamed on the source (found by its OID, E29) is renamed first, in an order where each new name is free, through the control plane: the stored row, the login copy and the data API's secret keys move with it, and the rename is flagged breaking (E29a). Swapped or colliding renames are refused as unplannable. The owner role is never planned, and the role changes the roles path can't make (`CREATEDB`, `CREATEROLE`, `REPLICATION` alone, comments, membership grantors and options, memberships in reserved roles) are reported "apply by hand" with the target's value kept (E30). An already stored role whose row is settled and equal is skipped; a row left `pending` by an earlier attempt is driven again; a settled row with other attributes fails the phase. In a rehearsal, phase 0 runs the same membership and administer checks, then creates roles directly as `NOLOGIN`, with no password and no metadata, and renames by SQL. Role drops are reported, never run.
+- **Phase 1a, enum values.** An `ALTER TYPE … ADD VALUE` whose label a later phase 1 statement uses can't share the transaction that adds it, so such values are added first, each committed on its own with the merge's `lock_timeout` (E19). All of an enum's values go together, so a value placed next to another finds it. Harmless if phase 1 then fails.
+- **Phase 1, one transaction.** `BEGIN`, `SET LOCAL lock_timeout` (default 5 s) and `statement_timeout = '15min'`, a guard, the steps, the marker insert, `COMMIT`, run with `ON_ERROR_STOP` so any error rolls everything back. The script records the line each of its own parts starts at (the guard, each step, the marker, the commit), and a failure is blamed on the part that holds the line psql reports. A user statement that mentions `-- step` or raises the guard's message can't steer the blame or pass for a stale target, and a failure at the marker or the commit isn't pinned on the last step.
+- **Phase 2, online.** One statement per call, with `statement_timeout = 0` and no transaction block. A step that takes a lock that blocks reads or writes while it queues (`ACCESS EXCLUSIVE` or `SHARE ROW EXCLUSIVE`: `SET NOT NULL`, the check's drop, the online foreign key, `ADD CONSTRAINT … USING INDEX`) first sets the merge's `lock_timeout` (E19), so it fails and can be retried instead of freezing the table's traffic; concurrent builds and validations wait as long as they need. For tables that existed on the target before the merge: `CREATE INDEX CONCURRENTLY`; a replacement index built under the temporary name `chelabase_merge_ix_<n>_<merge id>`, the old one dropped concurrently, then renamed; foreign keys and checks added `NOT VALID` in phase 1 and then validated; a unique constraint as a concurrent unique index followed by `ADD CONSTRAINT … USING INDEX`; a new `NOT NULL` as a `CHECK (col IS NOT NULL) NOT VALID` (named `chelabase_merge_nn_<attnum>_<table oid>`), validated, then `SET NOT NULL` (no scan, because the valid check proves it), then the check dropped. New tables get everything in phase 1.
+
+Each phase 2 step carries a check that says whether it is already done (an index exists on its table and is valid; a constraint is validated; a column is `NOT NULL`). A step without one is idempotent by its SQL (`IF EXISTS`, `IF NOT EXISTS`). Your own concurrent statements are held to the same rule: a concurrent index must be named and schema-qualified so a resume can check it, `DROP INDEX CONCURRENTLY` needs `IF EXISTS`, and `ALTER TYPE … ADD VALUE` needs `IF NOT EXISTS`, or the step is refused.
+
+### The stale guard
+
+Two checks compare the target with the target as the merge was **computed** (not as a rehearsal saw it), and either ends the merge `stale` with the plan's transaction not applied.
+
+- **The pre-check**, in the worker before phase 0 changes anything: the digest below, then a fingerprint of the full model, roles and enum values included. A role or enum-value change on the target, which the digest leaves out, is caught here. The fingerprint is taken with the plan's own role and enum changes projected out (only the roles the plan creates, the attributes it patches and the labels it adds), so a retry after phases 0 and 1a ran doesn't read its own work as a change; a step the engine can't parse counts as stale, never as a match.
+- **Phase 1's guard**, the transaction's first statement: it compares the **digest** of the target's catalog with the stored one and raises a distinct error if they differ. The transaction rolls back and the merge ends `stale`. The digest is an `md5` over raw catalog columns and node trees (OIDs included, never `pg_get_*def` text) of schemas, tables, sequences, indexes, their columns, defaults, constraints, enum types, policies, ACLs, default privileges, comments (policy comments included) and sequence ownership. It leaves out roles and enum values, because phases 0 and 1a change those before the guard. It is the backstop for a change between the pre-check and the commit.
+
+The apply request itself doesn't read the target: it refuses only a merge whose status is already `stale`. A rehearsal that hits the guard ends `stale`, not `draft`.
+
+## Who runs what
+
+All merge SQL, the phases, user steps and own SQL, runs as the branch's **owner** role (`postgres`), over a connection to `127.0.0.1` inside the compute, never as a superuser with a role switch. So a user step can't do more than the owner could. Only three things run as the platform's admin (`cloud_admin`): the catalog and digest reads, and the set-up of the recovery marker.
+
+The marker's set-up runs as a superuser on names a tenant could create first, so it pins `search_path` to `pg_catalog, pg_temp`, qualifies every type and function, and raises when an existing `chelabase_merge` schema or `applied` table isn't owned by the admin, isn't a plain table or has triggers or rules. The check runs before and after the `CREATE … IF NOT EXISTS`. The owner gets `USAGE` on the schema and `SELECT, INSERT` (no update or delete) on the table, so phase 1 can write its marker inside its own transaction. The owner could forge a marker, which only harms their own merge, and the drift check after apply would flag it.
+
+## The state machine
+
+```
+computing → draft → rehearsing → rehearsed → applying → online → finishing → done
+                ↑________ any edit _______|
+failed (with its phase) · stale · cancelled · applied_with_drift
+```
+
+- An edit of resolutions, steps or the lock timeout in `draft` or `rehearsed` returns the merge to `draft` through `computing`, one statement that saves the edit, bumps `version` and moves the status, so of two saves of one version only one wins and only the winner publishes the job. A save of only acknowledgements and `options.after` (E34) keeps the status and the rehearsal, and so does an empty save. `rehearse` and `apply` take the `version` the client saw and refuse a different one, so a rehearsed merge that was saved in between isn't applied as something else.
+- Stale: the pre-check or phase 1's guard found the target changed since the merge was computed (above). Recompute makes a new draft that keeps the choices still relevant.
+- **Open** is every state except `done`, `applied_with_drift`, `stale`, `cancelled` and a `failed` outside the online phase; **applying** is `applying`, `online`, `finishing` and `failed` in `online`. At most one open merge per source, target and Postgres database, and at most one applying merge per target. Both are unique indexes over those predicates, so a race gets the same 409 as the pre-check.
+- **Holding** is `rehearsing`, `applying`, `online`, `finishing` and `failed` in `online`, plus a live rehearsal child of a branch. Every path that moves a branch out of `ready` toward reset, restore or delete (the API routes, the worker's jobs, the after-merge reset and delete) checks under the branch's row lock that no holding merge has it as source or target, so a merge that claims a branch after a branch operation checked it can't slip by. The after-merge reset and delete of the finishing merge itself are excepted.
+- Actions by state: edit `draft` and `rehearsed`; rehearse `draft`; apply `rehearsed`; recompute `draft`, `stale` and `failed` outside the online phase; retry `failed` in `roles`, `enum_add`, `tx` (the apply again, from the start) or `online` (the online steps); cancel `computing`, `draft`, `rehearsing`, `rehearsed`; abandon `failed` in `online` (becomes `cancelled`, with the leftovers listed); finish `applied_with_drift`. A table in the orchestrator's tests lists all sixteen states (the status, and for `failed` its phase) against every action.
+- A merge `failed` in `online` is **half applied**: its transaction is on the target, so the target's reset, restore and delete are refused, no other merge starts on the pair or applies to the target, and recompute is refused. Retry reads the marker first and, when the transaction is gone (a reset or restore), or the target is gone, ends the merge `failed` with no phase (`merge_target_changed`, `merge_target_gone`) instead of running phase 2 on a timeline where phase 1 never happened. Deleting the whole database or project still deletes the held branches; the merge then ends `merge_target_gone`.
+
+## Rehearsal
+
+The rehearsal makes a branch of kind `rehearsal` from the target's head: real data, so failing constraints show. It is named `_rehearsal-<merge id, 8 hex>` (a leading underscore is invalid for user branch names), isn't counted toward the branch cap, is hidden from the branch list, and its endpoint is unroutable: rehearsal branches copy the target's role verifiers, so without that they could be reached through the proxy. All phases run on it, including phase 2. The worker then reads its schema, compares it with `M` (own SQL is compared with what it produced), records per-step timings and deletes the branch, always. A failure returns the merge to `draft` with the failing step and the Postgres error.
+
+A rehearsal branch is a child timeline of the target, so reset, restore and delete of the target are refused while it exists, including the moments after a cancel before its teardown ends (409 `branch_merge_busy` with `error.rehearsal_branch_id`). If the teardown fails, the rehearsal stays until reconcile removes it, up to 30 minutes later. A rehearsal that ends with differences is `rehearsed` with the differences shown; one that hits the stale guard ends `stale`. The rehearsal's branch gets no public data API key.
+
+An open DDL transaction on the target blocks every merge DDL statement, in the rehearsal as in the apply: the data API's event trigger updates one row of `chelabase.schema_version` per DDL change, and the open transaction holds that row's lock. The merge's `lock_timeout` ends the wait with a failure.
+
+## Recovery
+
+- **Phase 1 exactly once.** After a crash, the worker first cancels the merge's running statements by `application_name` (`chelabase-merge-<merge id>`) and waits until they're gone; it fails closed, so while any still run it decides nothing and the job is redelivered. Then the `chelabase_merge.applied` marker decides. Present: the transaction committed, go on to phase 2. Absent and the current attempt (the events since the merge last moved to `applying`, which the API logs with each apply and retry) had run no step: the apply simply runs. Absent and it had: back to `rehearsed` with "interrupted before the plan's transaction committed; roles and enum values it made before that stay on the target", because phases 0 and 1a may have run.
+- **A phase 1 that committed and lost its answer** (the exec died after `COMMIT`, or the admin timeout fired as it returned) is recognised the same way: after any phase 1 failure that isn't the stale guard, the worker reads the marker and goes on to phase 2 when it is there. A Retry reads the marker before anything else, so a committed transaction is never called stale.
+- **Phase 0 is idempotent:** a role already in place with the same spec is skipped, and a rename an earlier attempt finished is skipped.
+- **Phase 2 resumes from the log:** results of each step are in the merge log, and a retry continues after the last good step; an invalid index is dropped concurrently and rebuilt. A step that runs past its timeout has its backend cancelled by `application_name`, since the psql process in the compute outlives the timeout. Before it resumes, it checks the marker and the target (above).
+- **Reconcile** deletes `rehearsal` branches older than 30 minutes (a younger one is left to its job, whatever its status), deletes static base computes older than 10 minutes, and hands back merges and after-merge choices whose job was lost:
+  - a merge in a working status whose claim has been silent for three minutes (three claim refreshes) gets a `Resume`;
+  - an after-merge choice that `finishMerge` requested and nothing started for 10 minutes gets its `Finish` job again, so `requested: true` can't stay forever;
+  - each hand-back is recorded with its time, and a merge isn't handed back again for 30 minutes unless a worker has claimed it since, so a job queued behind a long one doesn't pile up duplicates. A failed publish records nothing and is tried at the next pass.
+
+A job redelivers when its worker crashed; the claim is kept alive while it runs. Merge jobs run one at a time, like branch jobs, so a long rehearsal delays other merges on the same machine.
+
+## Decisions behind the shape
+
+- **The marker lives in its own schema, `chelabase_merge`,** not in `chelabase`. The data API's bootstrap quarantines any extra relation in `chelabase`, and `chelabase` exists only where the data API was set up.
+- **Merge SQL runs as the owner, over a connection to `127.0.0.1` in the compute,** rather than as a superuser that switches role. The compute trusts those connections, so no password is needed. A compute image that drops local trust would need the sealed-password path instead.
+- **Timeouts are explicit.** Phase 1 has a lock timeout (5 s by default, per merge) and a 15 minute statement timeout. Phase 1a values and the phase 2 steps that take a blocking lock use the same lock timeout; every phase 2 step has no statement timeout inside Postgres and a long one outside it (6 hours). A step that times out is cancelled by `application_name`, fails the merge as `online` and can be retried.
+- **Rehearsal and static endpoints are unroutable,** recorded with a `routable` flag and a `static_lsn` on the endpoint, so the proxy's lookups skip them.

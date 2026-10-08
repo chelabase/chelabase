@@ -63,6 +63,17 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         endpoint_id: &str,
         role: &str,
     ) -> impl Future<Output = Result<Option<Option<String>>, MetadataError>> + Send;
+    /// [`NeonMetadataPort::neon_endpoint`] for the proxy: an unroutable endpoint is `None`.
+    fn routable_endpoint(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<NeonEndpoint>, MetadataError>> + Send;
+    /// [`NeonMetadataPort::neon_role_secret`] for the proxy: an unroutable endpoint is `None`.
+    fn routable_role_secret(
+        &self,
+        endpoint_id: &str,
+        role: &str,
+    ) -> impl Future<Output = Result<Option<Option<String>>, MetadataError>> + Send;
     fn neon_roles(
         &self,
         endpoint_id: &str,
@@ -191,6 +202,16 @@ impl NeonMetadataPort for MetadataClient {
         role: &str,
     ) -> Result<Option<Option<String>>, MetadataError> {
         MetadataClient::neon_role_secret(self, endpoint_id, role).await
+    }
+    async fn routable_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
+        MetadataClient::routable_endpoint(self, id).await
+    }
+    async fn routable_role_secret(
+        &self,
+        endpoint_id: &str,
+        role: &str,
+    ) -> Result<Option<Option<String>>, MetadataError> {
+        MetadataClient::routable_role_secret(self, endpoint_id, role).await
     }
     async fn neon_roles(&self, endpoint_id: &str) -> Result<Vec<NeonRole>, MetadataError> {
         MetadataClient::neon_roles(self, endpoint_id).await

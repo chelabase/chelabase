@@ -31,6 +31,10 @@ pub struct NeonEndpoint {
     pub tenant_id: String,
     pub timeline_id: String,
     pub compute_token_sha256: String,
+    /// False for rehearsal and static endpoints: the proxy never routes to them.
+    pub routable: bool,
+    /// The LSN a static (read-only, pinned) compute serves; `None` for a primary.
+    pub static_lsn: Option<String>,
 }
 
 /// Everything `create_endpoint_for_branch` writes.
@@ -46,6 +50,22 @@ pub struct NewEndpoint<'a> {
     /// Role copies written with the endpoint (a branch copy's), in the same transaction. The
     /// main database's `branch_databases` row is written with them.
     pub role_copies: &'a [NewRoleCopy<'a>],
+    /// `false` for a rehearsal or static endpoint (never routed by the proxy).
+    pub routable: bool,
+    /// `Some("X/Y")` for a static compute pinned at that LSN.
+    pub static_lsn: Option<&'a str>,
+}
+
+/// A static compute's endpoint (step 6g, a base read at its recorded location): unroutable,
+/// pinned at `static_lsn`, linked to no branch, with no roles or databases (the compute only
+/// reads its catalog as `cloud_admin`). Reconcile removes one older than 10 minutes (R3).
+#[derive(Debug, Clone, Copy)]
+pub struct NewStaticEndpoint<'a> {
+    pub id: &'a str,
+    pub tenant_id: &'a str,
+    pub timeline_id: &'a str,
+    pub compute_token_sha256: &'a str,
+    pub static_lsn: &'a str,
 }
 
 /// A non-owner `neon_roles` row to insert with a new endpoint.
@@ -61,6 +81,7 @@ pub struct NewRoleCopy<'a> {
     pub level: RoleLevel,
     pub api_owner_level: bool,
     pub pending: bool,
+    pub attributes: &'a RoleAttributes,
 }
 
 /// How [`MetadataClient::insert_api_role`] ended.
@@ -103,8 +124,9 @@ impl RoleOrigin {
     }
 }
 
-/// What a role may do: `OwnerLevel` is the wide definition (superuser, CREATEROLE, CREATEDB,
-/// BYPASSRLS, REPLICATION, or `neon_superuser` at any depth).
+/// What a role may do: `OwnerLevel` is superuser, CREATEROLE, CREATEDB, REPLICATION, or
+/// `neon_superuser` at any depth (E33; BYPASSRLS alone is an attribute, not owner level: a
+/// secret key may use such a role).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -130,6 +152,78 @@ impl RoleLevel {
     }
 }
 
+/// A role's attributes beyond LOGIN and owner-level (U2), and its memberships. For an `api`
+/// row they're what the control plane wants; for an `sql` row, what the catalog last showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAttributes {
+    pub inherit: bool,
+    /// `-1`: no limit.
+    pub connection_limit: i32,
+    pub valid_until: Option<DateTime<Utc>>,
+    /// BYPASSRLS on its own (an owner-level role has it through the owner's attributes).
+    pub bypass_rls: bool,
+    /// The roles it's a direct member of (`neon_superuser` excluded), sorted.
+    pub member_of: Vec<String>,
+}
+
+impl Default for RoleAttributes {
+    fn default() -> Self {
+        Self {
+            inherit: true,
+            connection_limit: -1,
+            valid_until: None,
+            bypass_rls: false,
+            member_of: Vec::new(),
+        }
+    }
+}
+
+/// A new `api` row ([`MetadataClient::insert_api_role_with`]). A NOLOGIN role has neither a
+/// verifier nor a sealed password.
+#[derive(Debug, Clone, Copy)]
+pub struct NewApiRole<'a> {
+    pub name: &'a str,
+    pub owner_level: bool,
+    pub login: bool,
+    pub attributes: &'a RoleAttributes,
+    pub verifier: Option<&'a str>,
+    pub password_enc: Option<&'a str>,
+    /// Names this write's wanted state (`attributes_change_id`): its confirm clears
+    /// `attributes_pending` by it.
+    pub change_id: uuid::Uuid,
+}
+
+/// What [`MetadataClient::update_api_role`] does to the row's secrets.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SecretChange {
+    Keep,
+    /// Turned NOLOGIN: no verifier and no sealed password.
+    Clear,
+    /// Turned LOGIN: `(verifier, sealed password)`.
+    Set(String, String),
+}
+
+impl std::fmt::Debug for SecretChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => f.write_str("Keep"),
+            Self::Clear => f.write_str("Clear"),
+            Self::Set(..) => f.write_str("Set(<redacted>)"),
+        }
+    }
+}
+
+/// An `api` row's new wanted state ([`MetadataClient::update_api_role`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRoleChange {
+    pub owner_level: bool,
+    pub login: bool,
+    pub attributes: RoleAttributes,
+    pub secret: SecretChange,
+    /// Names this change (`attributes_change_id`): its confirm clears `attributes_pending` by it.
+    pub change_id: uuid::Uuid,
+}
+
 /// Where a role's password stands, as Studio shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +238,8 @@ pub enum PasswordState {
     /// Made by Chelabase, but the sealed password was dropped (it didn't open under the key in
     /// use); a new password can be set.
     Unreadable,
+    /// A NOLOGIN role made through the API: it has no password.
+    None,
 }
 
 /// One `neon_roles` row with its secrets. Debug redacts the verifier and the sealed password.
@@ -159,7 +255,12 @@ pub struct RoleCopy {
     /// Only for `Api` rows: re-create with `neon_superuser`.
     pub api_owner_level: bool,
     pub pending: bool,
+    /// Only for `Api` rows (E32): an API create or PATCH wrote the wanted LOGIN, owner level,
+    /// attributes and memberships, and the compute hasn't confirmed them yet. Only then does the
+    /// resync drive them onto the compute; otherwise it records the catalog's.
+    pub attributes_pending: bool,
     pub created_at: DateTime<Utc>,
+    pub attributes: RoleAttributes,
 }
 
 impl std::fmt::Debug for RoleCopy {
@@ -174,7 +275,9 @@ impl std::fmt::Debug for RoleCopy {
             .field("level", &self.level)
             .field("api_owner_level", &self.api_owner_level)
             .field("pending", &self.pending)
+            .field("attributes_pending", &self.attributes_pending)
             .field("created_at", &self.created_at)
+            .field("attributes", &self.attributes)
             .finish()
     }
 }
@@ -190,6 +293,7 @@ pub struct RoleRow {
     /// Written but not yet applied to the compute.
     pub pending: bool,
     pub created_at: DateTime<Utc>,
+    pub attributes: RoleAttributes,
 }
 
 /// Where a `branch_databases` row came from.
@@ -307,9 +411,9 @@ pub struct ObservedDatabase {
     pub system: bool,
 }
 
-/// Insert-or-update one row. `origin` is used only on insert; an existing row keeps its origin
-/// (and its `api_owner_level`). `verifier: None` stores NULL (MD5). Debug redacts the
-/// verifier.
+/// Insert-or-update one row. `origin` is used only on insert; an existing row keeps its origin.
+/// `verifier: None` stores NULL (MD5). The row's `attributes_pending` becomes false (the
+/// resync applied or recorded them). Debug redacts the verifier.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CopyUpsert {
     pub name: String,
@@ -319,6 +423,12 @@ pub struct CopyUpsert {
     pub login: bool,
     pub level: RoleLevel,
     pub pending: bool,
+    /// Written on insert and update: the wanted ones for an `api` row whose change was
+    /// pending, the observed ones otherwise (E32).
+    pub attributes: RoleAttributes,
+    /// An `api` row's `api_owner_level` as the catalog shows it (E32); `None` keeps the row's.
+    /// Ignored for other rows.
+    pub api_owner_level: Option<bool>,
 }
 
 impl std::fmt::Debug for CopyUpsert {
@@ -331,8 +441,35 @@ impl std::fmt::Debug for CopyUpsert {
             .field("login", &self.login)
             .field("level", &self.level)
             .field("pending", &self.pending)
+            .field("attributes", &self.attributes)
+            .field("api_owner_level", &self.api_owner_level)
             .finish()
     }
+}
+
+/// What an `api` row's write or a SQL role's new password did ([`MetadataClient::update_api_role`],
+/// [`MetadataClient::store_role_secret`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleWriteOutcome {
+    Done,
+    /// No such row (or the owner's name).
+    NotFound,
+    /// The write would give a row without a verifier one while the endpoint already has `cap`
+    /// copies: nothing was written.
+    CapReached,
+}
+
+/// How [`MetadataClient::rename_role_copy`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameCopyOutcome {
+    /// The row (`row: true`) and the branch's data keys moved to the new name; a role without
+    /// a row moves only its keys. `was_unreadable`: the row's `password_unreadable` before the
+    /// move (a move back passes it to restore it).
+    Renamed { row: bool, was_unreadable: bool },
+    /// The new name has a row, or live secret keys of a role dropped earlier: nothing moved.
+    Taken,
+    /// No such endpoint: nothing moved.
+    NotFound,
 }
 
 /// What an upsert does to a row's sealed password.
@@ -372,52 +509,43 @@ pub struct EndpointState {
     pub needs_reconfigure: bool,
     /// The compute settings version its compute was last created with (0 before step 6a).
     pub compute_settings_version: i32,
+    /// False for rehearsal and static endpoints.
+    pub routable: bool,
+    /// Set on a static compute's endpoint (step 6g).
+    pub static_lsn: Option<String>,
+    /// Seconds since the row was created.
+    pub age_secs: i64,
 }
 
 /// `roles_version` and a left-joined owner's name and verifier.
 type VersionedRoleRow = (i64, Option<String>, Option<String>);
 
-/// `list_roles`' row: name, origin, level, login, no verifier, sealed, pending, created, owner sealed.
-type RoleRowTuple = (String, String, String, bool, bool, bool, bool, DateTime<Utc>, bool, bool);
+/// The attribute columns of a row (`inherit`, `connection_limit`, `valid_until`, `bypass_rls`,
+/// `member_of`); every query that reads a [`RoleCopy`] or a [`RoleRow`] selects them.
+fn attributes_from_row(row: &sqlx::postgres::PgRow) -> Result<RoleAttributes, MetadataError> {
+    Ok(RoleAttributes {
+        inherit: row.try_get("inherit")?,
+        connection_limit: row.try_get("connection_limit")?,
+        valid_until: row.try_get("valid_until")?,
+        bypass_rls: row.try_get("bypass_rls")?,
+        member_of: row.try_get("member_of")?,
+    })
+}
 
-/// `roles_version` and a left-joined row's columns, as [`copy_from_tuple`] reads them.
-type VersionedCopyRow = (
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<bool>,
-    Option<String>,
-    Option<bool>,
-    Option<bool>,
-    Option<DateTime<Utc>>,
-);
-
-type RoleCopyTuple = (
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    bool,
-    String,
-    bool,
-    bool,
-    DateTime<Utc>,
-);
-
-pub(crate) fn copy_from_tuple(t: RoleCopyTuple) -> Result<RoleCopy, MetadataError> {
-    let (name, origin, scram_verifier, password_enc, login, level, api_owner_level, pending, created_at) = t;
+/// A `role_copies` row (the left join's columns).
+pub(crate) fn copy_from_row(row: &sqlx::postgres::PgRow) -> Result<RoleCopy, MetadataError> {
     Ok(RoleCopy {
-        name,
-        origin: RoleOrigin::parse(&origin)?,
-        scram_verifier,
-        password_enc,
-        login,
-        level: RoleLevel::parse(&level)?,
-        api_owner_level,
-        pending,
-        created_at,
+        name: row.try_get("name")?,
+        origin: RoleOrigin::parse(row.try_get("origin")?)?,
+        scram_verifier: row.try_get("scram_verifier")?,
+        password_enc: row.try_get("password_enc")?,
+        login: row.try_get("login")?,
+        level: RoleLevel::parse(row.try_get("level")?)?,
+        api_owner_level: row.try_get("api_owner_level")?,
+        pending: row.try_get("pending")?,
+        attributes_pending: row.try_get("attributes_pending")?,
+        created_at: row.try_get("created_at")?,
+        attributes: attributes_from_row(row)?,
     })
 }
 
@@ -453,6 +581,13 @@ mod tests {
     }
 
     #[test]
+    fn role_attributes_default_is_a_plain_role() {
+        let a = RoleAttributes::default();
+        assert!(a.inherit && !a.bypass_rls);
+        assert_eq!((a.connection_limit, a.valid_until, a.member_of.len()), (-1, None, 0));
+    }
+
+    #[test]
     fn debug_redacts_role_copy() {
         let copy = RoleCopy {
             name: "app".into(),
@@ -463,7 +598,9 @@ mod tests {
             level: RoleLevel::Plain,
             api_owner_level: false,
             pending: true,
+            attributes_pending: false,
             created_at: Utc::now(),
+            attributes: RoleAttributes::default(),
         };
         let shown = format!("{copy:?}");
         assert!(shown.contains("app") && shown.contains("<redacted>"), "{shown}");
@@ -484,6 +621,8 @@ mod tests {
             login: true,
             level: RoleLevel::Plain,
             pending: false,
+            attributes: RoleAttributes::default(),
+            api_owner_level: None,
         };
         let write = ResyncWrite { upserts: vec![up.clone()], removals: vec![], databases: vec![] };
         for shown in [format!("{up:?}"), format!("{write:?}")] {
@@ -502,37 +641,78 @@ pub struct NeonDatabase {
 }
 
 impl MetadataClient {
+    /// The endpoint, routable or not (a merge's rehearsal and a static base read are
+    /// unroutable, P4). Anything serving the proxy uses [`MetadataClient::routable_endpoint`].
     pub async fn neon_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
-        let row: Option<(String, String, String, String)> = sqlx::query_as(
-            "SELECT id, tenant_id, timeline_id, compute_token_sha256 FROM neon_endpoints WHERE id = $1",
+        self.endpoint_row(id, false).await
+    }
+
+    /// [`MetadataClient::neon_endpoint`] for the proxy: an unroutable endpoint is `None`.
+    pub async fn routable_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
+        self.endpoint_row(id, true).await
+    }
+
+    async fn endpoint_row(
+        &self,
+        id: &str,
+        routable_only: bool,
+    ) -> Result<Option<NeonEndpoint>, MetadataError> {
+        let row: Option<(String, String, String, String, bool, Option<String>)> = sqlx::query_as(
+            "SELECT id, tenant_id, timeline_id, compute_token_sha256, routable, static_lsn
+             FROM neon_endpoints WHERE id = $1 AND (routable OR NOT $2)",
         )
         .bind(id)
+        .bind(routable_only)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(
-            |(id, tenant_id, timeline_id, compute_token_sha256)| NeonEndpoint {
-                id,
-                tenant_id,
-                timeline_id,
-                compute_token_sha256,
+            |(id, tenant_id, timeline_id, compute_token_sha256, routable, static_lsn)| {
+                NeonEndpoint {
+                    id,
+                    tenant_id,
+                    timeline_id,
+                    compute_token_sha256,
+                    routable,
+                    static_lsn,
+                }
             },
         ))
     }
 
     /// `None` for an unknown endpoint; `Some(None)` for a known endpoint without that role, or
-    /// whose row has no SCRAM verifier (an MD5 role).
+    /// whose row has no SCRAM verifier (an MD5 role). Routable or not: anything serving the
+    /// proxy uses [`MetadataClient::routable_role_secret`] (P4).
     pub async fn neon_role_secret(
         &self,
         endpoint_id: &str,
         role: &str,
     ) -> Result<Option<Option<String>>, MetadataError> {
+        self.role_secret_row(endpoint_id, role, false).await
+    }
+
+    /// [`MetadataClient::neon_role_secret`] for the proxy: an unroutable endpoint is `None`.
+    pub async fn routable_role_secret(
+        &self,
+        endpoint_id: &str,
+        role: &str,
+    ) -> Result<Option<Option<String>>, MetadataError> {
+        self.role_secret_row(endpoint_id, role, true).await
+    }
+
+    async fn role_secret_row(
+        &self,
+        endpoint_id: &str,
+        role: &str,
+        routable_only: bool,
+    ) -> Result<Option<Option<String>>, MetadataError> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT r.scram_verifier FROM neon_endpoints e
              LEFT JOIN neon_roles r ON r.endpoint_id = e.id AND r.name = $2
-             WHERE e.id = $1",
+             WHERE e.id = $1 AND (e.routable OR NOT $3)",
         )
         .bind(endpoint_id)
         .bind(role)
+        .bind(routable_only)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(verifier,)| verifier))
@@ -573,12 +753,13 @@ impl MetadataClient {
 
     /// Owner first, then by name (`COLLATE "C"`).
     pub async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
-        let rows: Vec<RoleRowTuple> = sqlx::query_as(
-            "SELECT r.name, r.origin, r.level, r.login, r.scram_verifier IS NULL,
-                    r.password_enc IS NOT NULL, r.pending, r.created_at,
+        let rows = sqlx::query(
+            "SELECT r.name, r.origin, r.level, r.login, r.scram_verifier IS NULL AS md5,
+                    r.password_enc IS NOT NULL AS sealed, r.pending, r.created_at,
                     r.password_unreadable,
                     coalesce((SELECT b.owner_password_enc IS NOT NULL FROM branches b
-                              WHERE b.endpoint_id = r.endpoint_id LIMIT 1), false)
+                              WHERE b.endpoint_id = r.endpoint_id LIMIT 1), false) AS owner_sealed,
+                    r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of
              FROM neon_roles r
              WHERE r.endpoint_id = $1
              ORDER BY (r.origin <> 'owner'), r.name COLLATE \"C\"",
@@ -586,29 +767,37 @@ impl MetadataClient {
         .bind(endpoint_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(
-                |(name, origin, level, login, md5, sealed, pending, created_at, unreadable, owner_sealed)| {
-                    let origin = RoleOrigin::parse(&origin)?;
-                    let password = match origin {
-                        RoleOrigin::Owner if owner_sealed => PasswordState::Generated,
-                        RoleOrigin::Owner => PasswordState::SetInSql,
-                        _ if md5 => PasswordState::Md5Unusable,
-                        _ if unreadable => PasswordState::Unreadable,
-                        _ if sealed => PasswordState::Generated,
-                        _ => PasswordState::SetInSql,
-                    };
-                    Ok(RoleRow {
-                        name,
-                        origin,
-                        level: RoleLevel::parse(&level)?,
-                        login,
-                        password,
-                        pending,
-                        created_at,
-                    })
-                },
-            )
+        rows.iter()
+            .map(|row| {
+                let origin = RoleOrigin::parse(row.try_get("origin")?)?;
+                let (md5, sealed, unreadable, owner_sealed): (bool, bool, bool, bool) = (
+                    row.try_get("md5")?,
+                    row.try_get("sealed")?,
+                    row.try_get("password_unreadable")?,
+                    row.try_get("owner_sealed")?,
+                );
+                let login: bool = row.try_get("login")?;
+                let password = match origin {
+                    RoleOrigin::Owner if owner_sealed => PasswordState::Generated,
+                    RoleOrigin::Owner => PasswordState::SetInSql,
+                    // A NOLOGIN role made through the API has no password at all.
+                    RoleOrigin::Api if !login && md5 && !sealed => PasswordState::None,
+                    _ if md5 => PasswordState::Md5Unusable,
+                    _ if unreadable => PasswordState::Unreadable,
+                    _ if sealed => PasswordState::Generated,
+                    _ => PasswordState::SetInSql,
+                };
+                Ok(RoleRow {
+                    name: row.try_get("name")?,
+                    origin,
+                    level: RoleLevel::parse(row.try_get("level")?)?,
+                    login,
+                    password,
+                    pending: row.try_get("pending")?,
+                    created_at: row.try_get("created_at")?,
+                    attributes: attributes_from_row(row)?,
+                })
+            })
             .collect()
     }
 
@@ -618,9 +807,10 @@ impl MetadataClient {
         &self,
         endpoint_id: &str,
     ) -> Result<(Vec<RoleCopy>, i64), MetadataError> {
-        let rows: Vec<VersionedCopyRow> = sqlx::query_as(
+        let rows = sqlx::query(
             "SELECT e.roles_version, r.name, r.origin, r.scram_verifier, r.password_enc, r.login,
-                    r.level, r.api_owner_level, r.pending, r.created_at
+                    r.level, r.api_owner_level, r.pending, r.attributes_pending, r.created_at,
+                    r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of
              FROM neon_endpoints e
              LEFT JOIN neon_roles r ON r.endpoint_id = e.id
              WHERE e.id = $1
@@ -629,15 +819,17 @@ impl MetadataClient {
         .bind(endpoint_id)
         .fetch_all(&self.pool)
         .await?;
-        let version = rows.first().map_or(0, |r| r.0);
-        let copies = rows
-            .into_iter()
-            .filter_map(|(_, name, origin, verifier, sealed, login, level, api, pending, created)| {
-                Some(copy_from_tuple((
-                    name?, origin?, verifier, sealed, login?, level?, api?, pending?, created?,
-                )))
-            })
-            .collect::<Result<_, _>>()?;
+        let version = match rows.first() {
+            Some(row) => row.try_get("roles_version")?,
+            None => 0,
+        };
+        let mut copies = Vec::new();
+        for row in &rows {
+            // The left join's empty side: an endpoint without rows.
+            if row.try_get::<Option<String>, _>("name")?.is_some() {
+                copies.push(copy_from_row(row)?);
+            }
+        }
         Ok((copies, version))
     }
 
@@ -946,6 +1138,27 @@ impl MetadataClient {
         }
     }
 
+    /// Records a static compute's endpoint ([`NewStaticEndpoint`]): `routable = false`,
+    /// `static_lsn` set, no branch, roles or databases.
+    pub async fn create_static_endpoint(
+        &self,
+        ep: &NewStaticEndpoint<'_>,
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "INSERT INTO neon_endpoints
+                 (id, tenant_id, timeline_id, compute_token_sha256, routable, static_lsn)
+             VALUES ($1, $2, $3, $4, false, $5)",
+        )
+        .bind(ep.id)
+        .bind(ep.tenant_id)
+        .bind(ep.timeline_id)
+        .bind(ep.compute_token_sha256)
+        .bind(ep.static_lsn)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Roles and databases cascade; branches.endpoint_id becomes NULL. Missing is fine.
     pub async fn delete_endpoint(&self, endpoint_id: &str) -> Result<(), MetadataError> {
         sqlx::query("DELETE FROM neon_endpoints WHERE id = $1")
@@ -1002,7 +1215,8 @@ impl MetadataClient {
     /// API create: one transaction that locks the endpoint row (`FOR UPDATE`, which serializes
     /// the writers of its roles), counts its copies (rows of origin `sql` or `api` with a
     /// verifier; at `cap` or more is `CapReached`), and inserts an `api` row with
-    /// `pending = true` and the level from `owner_level` (a name already there is `Exists`).
+    /// `pending = true`, `attributes_pending = true` (E32: its wanted state is driven until the
+    /// compute confirms it) and the level from `owner_level` (a name already there is `Exists`).
     /// Then `roles_version += 1` (no reconfigure: the spec lists only the owner). An unknown endpoint is a
     /// `RowNotFound` database error.
     pub async fn insert_api_role(
@@ -1014,6 +1228,28 @@ impl MetadataClient {
         password_enc: &str,
         cap: u32,
     ) -> Result<InsertRoleOutcome, MetadataError> {
+        let attributes = RoleAttributes::default();
+        let role = NewApiRole {
+            name,
+            owner_level,
+            login: true,
+            attributes: &attributes,
+            verifier: Some(verifier),
+            password_enc: Some(password_enc),
+            change_id: uuid::Uuid::new_v4(),
+        };
+        self.insert_api_role_with(endpoint_id, &role, cap).await
+    }
+
+    /// [`Self::insert_api_role`] for any role of U1: LOGIN or not (a NOLOGIN role has no
+    /// verifier and no sealed password), with its attributes and memberships. The cap counts
+    /// rows with a verifier, so a NOLOGIN role is refused only when the cap is already passed.
+    pub async fn insert_api_role_with(
+        &self,
+        endpoint_id: &str,
+        role: &NewApiRole<'_>,
+        cap: u32,
+    ) -> Result<InsertRoleOutcome, MetadataError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query_scalar::<_, String>("SELECT id FROM neon_endpoints WHERE id = $1 FOR UPDATE")
             .bind(endpoint_id)
@@ -1022,20 +1258,30 @@ impl MetadataClient {
         if copy_count(&mut tx, endpoint_id).await? >= i64::from(cap) {
             return Ok(InsertRoleOutcome::CapReached);
         }
-        let level = if owner_level { RoleLevel::OwnerLevel } else { RoleLevel::Plain };
+        let level = if role.owner_level { RoleLevel::OwnerLevel } else { RoleLevel::Plain };
+        let a = role.attributes;
         let inserted = sqlx::query(
             "INSERT INTO neon_roles
                  (endpoint_id, name, scram_verifier, origin, level, api_owner_level, password_enc,
-                  pending, password_unreadable)
-             VALUES ($1, $2, $3, 'api', $4, $5, $6, true, false)
+                  pending, attributes_pending, password_unreadable, login, inherit,
+                  connection_limit, valid_until, bypass_rls, member_of, attributes_change_id)
+             VALUES ($1, $2, $3, 'api', $4, $5, $6, true, true, false, $7, $8, $9, $10, $11, $12,
+                     $13)
              ON CONFLICT DO NOTHING",
         )
         .bind(endpoint_id)
-        .bind(name)
-        .bind(verifier)
+        .bind(role.name)
+        .bind(role.verifier)
         .bind(level.as_str())
-        .bind(owner_level)
-        .bind(password_enc)
+        .bind(role.owner_level)
+        .bind(role.password_enc)
+        .bind(role.login)
+        .bind(a.inherit)
+        .bind(a.connection_limit)
+        .bind(a.valid_until)
+        .bind(a.bypass_rls)
+        .bind(&a.member_of)
+        .bind(role.change_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1045,6 +1291,139 @@ impl MetadataClient {
         bump_roles_version_only(&mut tx, endpoint_id).await?;
         tx.commit().await?;
         Ok(InsertRoleOutcome::Inserted)
+    }
+
+    /// One transaction: an `api` row's new wanted state (level, LOGIN, attributes, memberships
+    /// and, per `change.secret`, its verifier and sealed password), `pending = true`,
+    /// `attributes_pending = true`, `roles_version += 1` (no reconfigure: the spec lists only
+    /// the owner). `NotFound` when the endpoint has no `api` row of that name. Giving a row
+    /// without a verifier one (LOGIN turned on) is `CapReached` when the endpoint already has
+    /// `cap` copies, counted under the endpoint's lock like [`Self::insert_api_role_with`].
+    pub async fn update_api_role(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        change: &ApiRoleChange,
+        cap: u32,
+    ) -> Result<RoleWriteOutcome, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        if !lock_endpoint_row(&mut tx, endpoint_id).await? {
+            return Ok(RoleWriteOutcome::NotFound);
+        }
+        let current: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT scram_verifier FROM neon_roles
+             WHERE endpoint_id = $1 AND name = $2 AND origin = 'api'",
+        )
+        .bind(endpoint_id)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(verifier_now) = current else {
+            return Ok(RoleWriteOutcome::NotFound);
+        };
+        if matches!(change.secret, SecretChange::Set(..))
+            && verifier_now.is_none()
+            && copy_count(&mut tx, endpoint_id).await? >= i64::from(cap)
+        {
+            return Ok(RoleWriteOutcome::CapReached);
+        }
+        let (mode, verifier, sealed) = match &change.secret {
+            SecretChange::Keep => (0_i32, None, None),
+            SecretChange::Clear => (1, None, None),
+            SecretChange::Set(verifier, sealed) => (2, Some(verifier.as_str()), Some(sealed.as_str())),
+        };
+        let level = if change.owner_level { RoleLevel::OwnerLevel } else { RoleLevel::Plain };
+        let a = &change.attributes;
+        let updated = sqlx::query(
+            "UPDATE neon_roles SET
+                 api_owner_level = $3, level = $4, login = $5, inherit = $6,
+                 connection_limit = $7, valid_until = $8, bypass_rls = $9, member_of = $10,
+                 scram_verifier = CASE $11::int WHEN 0 THEN scram_verifier ELSE $12 END,
+                 password_enc = CASE $11::int WHEN 0 THEN password_enc ELSE $13 END,
+                 password_unreadable = CASE $11::int WHEN 0 THEN password_unreadable ELSE false END,
+                 pending = true, attributes_pending = true, attributes_change_id = $14
+             WHERE endpoint_id = $1 AND name = $2 AND origin = 'api'",
+        )
+        .bind(endpoint_id)
+        .bind(name)
+        .bind(change.owner_level)
+        .bind(level.as_str())
+        .bind(change.login)
+        .bind(a.inherit)
+        .bind(a.connection_limit)
+        .bind(a.valid_until)
+        .bind(a.bypass_rls)
+        .bind(&a.member_of)
+        .bind(mode)
+        .bind(verifier)
+        .bind(sealed)
+        .bind(change.change_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Ok(RoleWriteOutcome::NotFound);
+        }
+        bump_roles_version_only(&mut tx, endpoint_id).await?;
+        tx.commit().await?;
+        Ok(RoleWriteOutcome::Done)
+    }
+
+    /// One transaction: a role made in SQL that was just given a password through the API
+    /// (an update turning it LOGIN): its row, inserted as `sql` when it has none, gets the
+    /// verifier and the sealed password, `pending = true`; `roles_version += 1`. `NotFound`
+    /// only for the owner's name or an unknown endpoint. A role without a verifier yet (no row,
+    /// or an MD5 one) is `CapReached` when the endpoint already has `cap` copies, counted under
+    /// the endpoint's lock.
+    pub async fn store_role_secret(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+        verifier: &str,
+        password_enc: &str,
+        cap: u32,
+    ) -> Result<RoleWriteOutcome, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        if !lock_endpoint_row(&mut tx, endpoint_id).await? {
+            return Ok(RoleWriteOutcome::NotFound);
+        }
+        let current: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT origin, scram_verifier FROM neon_roles WHERE endpoint_id = $1 AND name = $2",
+        )
+        .bind(endpoint_id)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let counted = match &current {
+            Some((origin, _)) if origin == "owner" => return Ok(RoleWriteOutcome::NotFound),
+            Some((_, verifier)) => verifier.is_some(),
+            None => false,
+        };
+        if !counted && copy_count(&mut tx, endpoint_id).await? >= i64::from(cap) {
+            return Ok(RoleWriteOutcome::CapReached);
+        }
+        let stored = sqlx::query(
+            "INSERT INTO neon_roles AS r
+                 (endpoint_id, name, scram_verifier, origin, password_enc, login, pending)
+             VALUES ($1, $2, $3, 'sql', $4, true, true)
+             ON CONFLICT (endpoint_id, name) DO UPDATE SET
+                 scram_verifier = EXCLUDED.scram_verifier, password_enc = EXCLUDED.password_enc,
+                 login = true, pending = true, password_unreadable = false
+             WHERE r.origin <> 'owner'",
+        )
+        .bind(endpoint_id)
+        .bind(name)
+        .bind(verifier)
+        .bind(password_enc)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if stored != 1 {
+            return Ok(RoleWriteOutcome::NotFound);
+        }
+        bump_roles_version_only(&mut tx, endpoint_id).await?;
+        tx.commit().await?;
+        Ok(RoleWriteOutcome::Done)
     }
 
     /// One transaction: the verifier and sealed password of any non-owner row, `pending = true`,
@@ -1081,14 +1460,20 @@ impl MetadataClient {
         Ok(true)
     }
 
-    /// Clears `pending` of one row, only while `roles_version` still equals `version` (what the
-    /// caller read before applying). True when cleared. The endpoint row is locked first, like
-    /// every writer, so a write in flight is waited for and then seen.
+    /// Confirms one row's applied write. `attributes_pending` is cleared when `attributes_change`
+    /// names the row's current `attributes_change_id` (the API write just applied), whatever
+    /// `roles_version` says: another write (a forwarded DDL) bumping it meanwhile doesn't make
+    /// this change stale, while a newer API change keeps its own flag. `pending` (the password
+    /// and existence) is cleared only while `roles_version` still equals `version` (what the
+    /// caller read before applying). True when `pending` was cleared; false tells the caller to
+    /// ask for a resync. The endpoint row is locked first, like every writer, so a write in
+    /// flight is waited for and then seen.
     pub async fn confirm_role(
         &self,
         endpoint_id: &str,
         name: &str,
         version: i64,
+        attributes_change: Option<uuid::Uuid>,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
         let current: Option<i64> = sqlx::query_scalar(
@@ -1097,7 +1482,20 @@ impl MetadataClient {
         .bind(endpoint_id)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some(change) = attributes_change {
+            sqlx::query(
+                "UPDATE neon_roles SET attributes_pending = false
+                 WHERE endpoint_id = $1 AND name = $2 AND attributes_pending
+                   AND attributes_change_id = $3",
+            )
+            .bind(endpoint_id)
+            .bind(name)
+            .bind(change)
+            .execute(&mut *tx)
+            .await?;
+        }
         if current != Some(version) {
+            tx.commit().await?;
             return Ok(false);
         }
         let cleared = sqlx::query(
@@ -1156,6 +1554,82 @@ impl MetadataClient {
         Ok(true)
     }
 
+    /// One transaction (E29, a role renamed through the control plane with forwarding off, so
+    /// the DDL receiver never sees it): locks the endpoint row; `Taken` (nothing written) when
+    /// `new` has a row or names live secret keys of `branch` (a role dropped earlier whose keys
+    /// aren't revoked yet); otherwise the non-owner row of `old`, if any, takes the name `new`
+    /// (keeping its origin, level, attributes and verifier) with `resealed` as its sealed
+    /// password, and every data key of `branch` with role `old`, live or revoked, follows. A
+    /// key keeps its role OID and timeline (a rename keeps the OID). `password_unreadable`
+    /// becomes `unreadable` when given (a move back restores the flag the forward move
+    /// reported); otherwise a row that had a sealed password and gets `None` is marked
+    /// unreadable, and any other keeps its flag. `roles_version += 1`. An unknown endpoint is
+    /// `NotFound`.
+    pub async fn rename_role_copy(
+        &self,
+        endpoint_id: &str,
+        branch: BranchId,
+        old: &str,
+        new: &str,
+        resealed: Option<&str>,
+        unreadable: Option<bool>,
+    ) -> Result<RenameCopyOutcome, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        if !lock_endpoint_row(&mut tx, endpoint_id).await? {
+            return Ok(RenameCopyOutcome::NotFound);
+        }
+        let taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM neon_roles WHERE endpoint_id = $1 AND name = $2)
+                 OR EXISTS (SELECT 1 FROM data_api_keys
+                            WHERE branch_id = $3 AND role = $2 AND kind = 'secret'
+                              AND revoked_at IS NULL)",
+        )
+        .bind(endpoint_id)
+        .bind(new)
+        .bind(branch.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        if taken {
+            return Ok(RenameCopyOutcome::Taken);
+        }
+        let was_unreadable: Option<bool> = sqlx::query_scalar(
+            "SELECT password_unreadable FROM neon_roles
+             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
+        )
+        .bind(endpoint_id)
+        .bind(old)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let moved = sqlx::query(
+            "UPDATE neon_roles SET name = $3, password_enc = $4,
+                 password_unreadable = CASE WHEN $5::bool IS NOT NULL THEN $5::bool
+                                            WHEN password_enc IS NOT NULL AND $4::text IS NULL
+                                            THEN true
+                                            ELSE password_unreadable END
+             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
+        )
+        .bind(endpoint_id)
+        .bind(old)
+        .bind(new)
+        .bind(resealed)
+        .bind(unreadable)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        sqlx::query("UPDATE data_api_keys SET role = $3 WHERE branch_id = $1 AND role = $2")
+            .bind(branch.as_uuid())
+            .bind(old)
+            .bind(new)
+            .execute(&mut *tx)
+            .await?;
+        bump_roles_version_only(&mut tx, endpoint_id).await?;
+        tx.commit().await?;
+        Ok(RenameCopyOutcome::Renamed {
+            row: moved == 1,
+            was_unreadable: was_unreadable.unwrap_or(false),
+        })
+    }
+
     /// Lifts both resync guards of the endpoint: every role's `forwarded_at` and the endpoint's
     /// `dbs_forwarded_at` become NULL (the catalog was replaced, so nothing in flight is
     /// pending). Locks the endpoint row first, as the other writers do.
@@ -1202,9 +1676,12 @@ impl MetadataClient {
     /// `read_version` nothing is written (`VersionMoved`). Otherwise applies `write`. For a
     /// row whose `forwarded_at` is under 10 s old (a DDL the receiver answered whose commit the
     /// catalog read may not have seen) the verifier, sealed password and login are kept and
-    /// the row isn't removed; `level` and `pending` still update. The owner's row is never
-    /// touched. It sets the
-    /// branch's `branch_databases` to exactly `write.databases`. A database's origin is
+    /// the row isn't removed; `level`, `pending` and the attributes (`inherit`,
+    /// `connection_limit`, `valid_until`, `bypass_rls`, `member_of`) still update. Every
+    /// upserted row's `attributes_pending` is cleared, and an `api` row takes the upsert's
+    /// `api_owner_level` when it carries one (E32: the catalog's). The owner's row is never
+    /// touched. It sets the branch's `branch_databases` to exactly
+    /// `write.databases`. A database's origin is
     /// `system` when observed as system, `main` for the recorded main database's name
     /// (`neon_databases`), `sql` otherwise. `roles_version += 1` when anything changed (the
     /// compute needs no reconfigure for this). An unknown endpoint is a `RowNotFound` error.
@@ -1232,13 +1709,17 @@ impl MetadataClient {
                 SealedChange::Clear => (1, None),
                 SealedChange::Set(sealed) => (2, Some(sealed.as_str())),
             };
+            let a = &up.attributes;
             // The guard holds back only what the receiver owns (verifier, sealed password,
-            // login); `level` and `pending` come from the catalog and always update.
+            // login); `level`, `pending` and the attributes come from the catalog and always
+            // update.
             let held = "(r.forwarded_at IS NOT NULL AND r.forwarded_at > now() - interval '10 seconds')";
             let sql = format!(
                 "INSERT INTO neon_roles AS r
-                     (endpoint_id, name, scram_verifier, origin, password_enc, login, level, pending)
-                 VALUES ($1, $2, $3, $4, CASE WHEN $7::int = 2 THEN $8 ELSE NULL END, $5, $6, $9)
+                     (endpoint_id, name, scram_verifier, origin, password_enc, login, level, pending,
+                      inherit, connection_limit, valid_until, bypass_rls, member_of)
+                 VALUES ($1, $2, $3, $4, CASE WHEN $7::int = 2 THEN $8 ELSE NULL END, $5, $6, $9,
+                         $10, $11, $12, $13, $14)
                  ON CONFLICT (endpoint_id, name) DO UPDATE SET
                      scram_verifier = CASE WHEN {held} THEN r.scram_verifier
                                            ELSE EXCLUDED.scram_verifier END,
@@ -1248,6 +1729,14 @@ impl MetadataClient {
                      login = CASE WHEN {held} THEN r.login ELSE EXCLUDED.login END,
                      level = EXCLUDED.level,
                      pending = EXCLUDED.pending,
+                     inherit = EXCLUDED.inherit,
+                     connection_limit = EXCLUDED.connection_limit,
+                     valid_until = EXCLUDED.valid_until,
+                     bypass_rls = EXCLUDED.bypass_rls,
+                     member_of = EXCLUDED.member_of,
+                     attributes_pending = false,
+                     api_owner_level = CASE WHEN r.origin = 'api' AND $15::bool IS NOT NULL
+                                            THEN $15 ELSE r.api_owner_level END,
                      password_unreadable = CASE WHEN NOT {held}
                                                   AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
                                                        OR $7::int <> 0)
@@ -1255,6 +1744,14 @@ impl MetadataClient {
                  WHERE r.origin <> 'owner'
                    AND (r.level IS DISTINCT FROM EXCLUDED.level
                         OR r.pending IS DISTINCT FROM EXCLUDED.pending
+                        OR r.attributes_pending
+                        OR (r.origin = 'api' AND $15::bool IS NOT NULL
+                            AND r.api_owner_level IS DISTINCT FROM $15::bool)
+                        OR r.inherit IS DISTINCT FROM EXCLUDED.inherit
+                        OR r.connection_limit IS DISTINCT FROM EXCLUDED.connection_limit
+                        OR r.valid_until IS DISTINCT FROM EXCLUDED.valid_until
+                        OR r.bypass_rls IS DISTINCT FROM EXCLUDED.bypass_rls
+                        OR r.member_of IS DISTINCT FROM EXCLUDED.member_of
                         OR (NOT {held}
                             AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
                                  OR r.login IS DISTINCT FROM EXCLUDED.login
@@ -1274,6 +1771,12 @@ impl MetadataClient {
                 .bind(mode)
                 .bind(sealed)
                 .bind(up.pending)
+                .bind(a.inherit)
+                .bind(a.connection_limit)
+                .bind(a.valid_until)
+                .bind(a.bypass_rls)
+                .bind(&a.member_of)
+                .bind(up.api_owner_level)
                 .fetch_optional(&mut *tx)
                 .await?;
             changed.extend(name);
@@ -1354,6 +1857,8 @@ impl MetadataClient {
     pub async fn list_endpoints_for_reconcile(&self) -> Result<Vec<EndpointState>, MetadataError> {
         let rows = sqlx::query(
             "SELECT e.id, e.tenant_id, e.needs_reconfigure, e.compute_settings_version,
+                    e.routable, e.static_lsn,
+                    EXTRACT(EPOCH FROM now() - e.created_at)::bigint AS age_secs,
                     b.id AS branch_id, b.status
              FROM neon_endpoints e
              LEFT JOIN branches b ON b.endpoint_id = e.id
@@ -1371,6 +1876,9 @@ impl MetadataClient {
                     branch_status: status.as_deref().map(BranchStatus::parse).transpose()?,
                     needs_reconfigure: r.get("needs_reconfigure"),
                     compute_settings_version: r.get("compute_settings_version"),
+                    routable: r.get("routable"),
+                    static_lsn: r.get("static_lsn"),
+                    age_secs: r.get("age_secs"),
                 })
             })
             .collect()

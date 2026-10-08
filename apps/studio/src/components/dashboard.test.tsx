@@ -19,7 +19,7 @@ const bound: Me = {
         slug: "default",
         name: "Default",
         status: "active",
-        databases: [{ database_id: "d1", name: "web1", status: "ready", host: "127.0.0.1", port: 49153, branch_count: 1 }],
+        databases: [{ database_id: "d1", name: "web1", postgres_database: "web1", status: "ready", host: "127.0.0.1", port: 49153, branch_count: 1 }],
       },
     ],
   },

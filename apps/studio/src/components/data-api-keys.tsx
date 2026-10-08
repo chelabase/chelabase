@@ -10,6 +10,7 @@ import {
   type DataKey,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { OWNER_LEVEL_TRAITS } from "@/lib/console";
 import { errorText } from "@/lib/errors";
 import { CopyButton } from "./copy-button";
 import { DatabaseSelector, KeyDatabases, selectionReason } from "./data-api-databases";
@@ -118,8 +119,16 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
                         Blocked
                       </span>
                       <span className="text-xs text-muted-foreground">
-                        the role {k.role} can bypass row-level security
+                        the role {k.role} is owner-level ({OWNER_LEVEL_TRAITS})
                       </span>
+                    </span>
+                  )}
+                  {k.bypasses_rls && !k.role_blocked && (
+                    <span className="mt-0.5 flex flex-col gap-0.5">
+                      <span className="w-fit rounded-full border border-destructive px-2 py-0.5 text-xs text-destructive">
+                        Bypasses RLS
+                      </span>
+                      <span className="text-xs text-muted-foreground">it reads and writes past row-level security</span>
                     </span>
                   )}
                 </td>

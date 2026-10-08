@@ -25,6 +25,8 @@ pub const SCHEMA_CHECKS_PER_PASS: usize = 20;
 /// (the orchestrator's publish has no reply, so a lost one would leave it there). Longer than
 /// [`crate::data_api::ENABLE_DEADLINE`], so a slow enable isn't started twice.
 pub const ENABLING_RETRY_SECS: u64 = 150;
+/// R3: a rehearsal branch older than this whose merge isn't rehearsing is torn down.
+pub const STALE_REHEARSAL_SECS: i64 = 30 * 60;
 
 /// One observation. Taken in the order computes, tenants, databases, endpoints: rows are
 /// written before their compute or tenant exists, so a fresh resource never looks orphaned.
@@ -95,6 +97,12 @@ pub enum Action {
     RemoveCompute(String),
     /// An endpoint row whose branch is failed or deleted: a teardown that failed.
     RetryTeardown(String),
+    /// A static compute's endpoint (a base read, step 6g) older than
+    /// [`crate::schema_base::STALE_STATIC_COMPUTE_SECS`]: its compute and row go (R3).
+    RemoveStaticCompute(String),
+    /// A merge's rehearsal branch (step 6g) unchanged for [`STALE_REHEARSAL_SECS`]: torn down
+    /// unless its merge is still rehearsing (R3).
+    RemoveRehearsal(BranchId),
     /// A ready database's tenant has no `pitr_interval`, or not its `history_window`.
     PatchHistoryWindow(DatabaseId),
     /// A branch a restore failed while its detach was unresolved: it keeps its timeline,
@@ -127,11 +135,13 @@ impl Action {
             Action::Resync(..) => 10,
             Action::RemoveCompute(_) => 11,
             Action::RetryTeardown(_) => 12,
-            Action::PatchHistoryWindow(_) => 13,
-            Action::ReportStuckRestore(_) => 14,
-            Action::ReportUnknownTenant(_) => 15,
-            Action::ReportUnknownTimeline(..) => 16,
-            Action::ReportEndpointWithoutDatabase(_) => 17,
+            Action::RemoveStaticCompute(_) => 13,
+            Action::RemoveRehearsal(_) => 14,
+            Action::PatchHistoryWindow(_) => 15,
+            Action::ReportStuckRestore(_) => 16,
+            Action::ReportUnknownTenant(_) => 17,
+            Action::ReportUnknownTimeline(..) => 18,
+            Action::ReportEndpointWithoutDatabase(_) => 19,
         }
     }
 
@@ -142,6 +152,7 @@ impl Action {
             }
             Action::FailStaleBranch(id)
             | Action::RetryBranchDelete(id)
+            | Action::RemoveRehearsal(id)
             | Action::FinishSwitch(id)
             | Action::ReportStuckRestore(id)
             | Action::BootstrapDataApi { branch_id: id, .. } => id.to_string(),
@@ -153,6 +164,7 @@ impl Action {
             | Action::ApplyPending(s)
             | Action::RemoveCompute(s)
             | Action::RetryTeardown(s)
+            | Action::RemoveStaticCompute(s)
             | Action::ReportUnknownTenant(s)
             | Action::ReportEndpointWithoutDatabase(s) => s.clone(),
         }
@@ -198,6 +210,14 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
         .map(|d| d.id)
         .collect();
     for b in &s.branches {
+        // A rehearsal outlives its job only when the job crashed or its teardown failed. Until
+        // it's old it's its job's, whatever its status (T14 M7): never a normal branch's rules.
+        if b.kind == BranchKind::Rehearsal {
+            if b.status != BranchStatus::Deleting && b.age_secs > STALE_REHEARSAL_SECS {
+                actions.push(Action::RemoveRehearsal(b.id));
+            }
+            continue;
+        }
         // Main's provisioning and deletion are its database's (the rows above).
         let is_main = b.id == BranchId::from(b.database_id);
         match b.status {
@@ -274,6 +294,14 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
         .collect();
     for ep in &s.endpoints {
         if ep.branch_id.is_some_and(|b| kept.contains(&b)) {
+            continue;
+        }
+        // A base read's static compute (step 6g) is linked to no branch; one still reading is
+        // left alone (R3).
+        if ep.branch_id.is_none() && !ep.routable && ep.static_lsn.is_some() {
+            if ep.age_secs > crate::schema_base::STALE_STATIC_COMPUTE_SECS {
+                actions.push(Action::RemoveStaticCompute(ep.id.clone()));
+            }
             continue;
         }
         match ep.branch_status {
@@ -370,6 +398,71 @@ pub fn should_abort_provision(status: DatabaseStatus) -> bool {
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
 {
+    /// R3: hands merge jobs back through `publish`: a `Resume` for each merge in a working
+    /// status whose claim went silent for [`crate::merge::STALE_MERGE_CLAIM`] (its worker
+    /// crashed, or its job was lost), and a `Finish` for each after-merge choice still waiting
+    /// [`crate::merge::STALE_FINISH_REQUEST`] after its last write (its job was lost, T14 M8).
+    /// Each one published is then recorded as handed back (T14 F3 M3: a failed publish records
+    /// nothing, so the next pass tries again), and isn't handed back again while nothing ran it
+    /// since, for [`crate::merge::REHAND_AFTER`] (T14 M10, F3 M2): a job queued behind a long one
+    /// (one merge job at a time, P11) isn't duplicated every period. Returns the jobs published.
+    /// A metadata failure is logged and hands back nothing more.
+    pub async fn hand_back_merges<F, Fut>(&self, mut publish: F) -> Vec<chelabase_nats::MergeJob>
+    where
+        F: FnMut(chelabase_nats::MergeJob) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        use chelabase_nats::{MergeAfter, MergeJob};
+        let mut due: Vec<(MergeJob, chelabase_metadata::MergeStatus)> = Vec::new();
+        match self
+            .metadata
+            .stale_merge_claims(crate::merge::STALE_MERGE_CLAIM, crate::merge::REHAND_AFTER)
+            .await
+        {
+            Ok(stale) => {
+                for m in stale {
+                    info!(merge_id = %m.id, status = m.status.as_str(), "handing a silent merge back");
+                    due.push((MergeJob::Resume { merge_id: m.id }, m.status));
+                }
+            }
+            Err(e) => warn!("listing silent merges: {e}"),
+        }
+        match self
+            .metadata
+            .stale_finish_requests(crate::merge::STALE_FINISH_REQUEST, crate::merge::REHAND_AFTER)
+            .await
+        {
+            Ok(lost) => {
+                for m in lost {
+                    let after = match m.result.as_ref().and_then(|r| r["after"]["choice"].as_str()) {
+                        Some("reset") => MergeAfter::Reset,
+                        Some("delete") => MergeAfter::Delete,
+                        _ => MergeAfter::Keep,
+                    };
+                    info!(merge_id = %m.id, "publishing a lost after-merge choice again");
+                    due.push((MergeJob::Finish { merge_id: m.id, after }, m.status));
+                }
+            }
+            Err(e) => warn!("listing lost after-merge choices: {e}"),
+        }
+        let mut published = Vec::new();
+        for (job, status) in due {
+            let (MergeJob::Resume { merge_id: id } | MergeJob::Finish { merge_id: id, .. }) = job
+            else {
+                continue;
+            };
+            if let Err(e) = publish(job.clone()).await {
+                warn!(merge_id = %id, job = ?job, "re-queueing a merge job: {e}");
+                continue;
+            }
+            if let Err(e) = self.metadata.mark_merge_handed_back(id, status).await {
+                warn!(merge_id = %id, "recording a hand-back: {e}");
+            }
+            published.push(job);
+        }
+        published
+    }
+
     /// One reconcile pass. `Err` only when observing fails; each action's error is logged
     /// and the next action still runs.
     ///
@@ -597,6 +690,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
             }
             Action::FailStaleBranch(id) => self.fail_stale_branch(*id).await,
+            Action::RemoveRehearsal(id) => self.remove_stale_rehearsal(*id).await,
             Action::RetryDelete(id) => self.handle_delete(*id).await,
             // Refused (the refusal recorded, the branch left as it is) while it has children.
             Action::RetryBranchDelete(id) => self.handle_branch_delete(*id).await,
@@ -647,6 +741,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(|e| format!("removing compute: {e:#}")),
             Action::RetryTeardown(ep) => self.retry_teardown(ep).await,
+            Action::RemoveStaticCompute(ep) => self.remove_static_compute(ep).await,
             Action::PatchHistoryWindow(db) => self.handle_database_settings(*db).await,
             Action::ReportUnknownTimeline(tenant, timeline) => {
                 warn!(
@@ -686,6 +781,36 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 Ok(())
             }
         }
+    }
+
+    /// R3: tears down an old rehearsal branch unless its merge (the one its name is for, a merge
+    /// of its parent) is still rehearsing.
+    async fn remove_stale_rehearsal(&self, id: BranchId) -> Result<(), String> {
+        let Some(b) = self
+            .metadata
+            .get_branch(id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+        if b.kind != BranchKind::Rehearsal || b.status == BranchStatus::Deleted {
+            return Ok(());
+        }
+        let merges = self
+            .metadata
+            .list_merges(b.database_id, b.parent_branch_id)
+            .await
+            .map_err(|e| format!("listing the merges: {e}"))?;
+        let running = merges.iter().any(|m| {
+            m.status == chelabase_metadata::MergeStatus::Rehearsing
+                && crate::merge::rehearsal_name(m.id) == b.name
+        });
+        if running {
+            return Ok(());
+        }
+        info!(branch_id = %id, name = %b.name, "removing an old rehearsal");
+        self.teardown_rehearsal(id).await
     }
 
     /// Fails a branch that's still stale when written (a job may have picked it up since the
@@ -759,6 +884,7 @@ mod tests {
         ready_database, worker,
     };
     use crate::provision::sha256_hex;
+    use crate::roles::RoleSpec;
 
     const EP: &str = "ep-0123456789ab";
     const EP2: &str = "ep-ba9876543210";
@@ -791,6 +917,9 @@ mod tests {
             branch_status: db.map(|d| BranchStatus::from(d.status)),
             needs_reconfigure,
             compute_settings_version: crate::COMPUTE_SETTINGS_VERSION,
+            routable: true,
+            static_lsn: None,
+            age_secs: 3600,
         }
     }
 
@@ -847,6 +976,9 @@ mod tests {
             branch_status: Some(status),
             needs_reconfigure: false,
             compute_settings_version: crate::COMPUTE_SETTINGS_VERSION,
+            routable: true,
+            static_lsn: None,
+            age_secs,
         });
         s.computes.insert(EP3.to_string());
         timelines(&mut s).insert(DEV_TL.to_string());
@@ -862,6 +994,23 @@ mod tests {
     /// `TENANT`'s timelines.
     fn timelines(s: &mut Snapshot) -> &mut HashSet<String> {
         s.tenant_timelines.get_mut(TENANT).unwrap()
+    }
+
+    // T14 M7: a rehearsal branch is its merge job's until it's old; the normal branch rules
+    // (fail a stale provision, retry a delete) never touch a young one.
+    #[test]
+    fn a_young_rehearsal_is_left_to_its_job() {
+        for status in [BranchStatus::Pending, BranchStatus::Provisioning, BranchStatus::Deleting] {
+            let (mut s, dev) = with_dev(status, STALE_PROVISION_SECS + STALE_DELETE_SECS + 1);
+            let b = branch_mut(&mut s, dev);
+            b.kind = BranchKind::Rehearsal;
+            b.age_secs = STALE_REHEARSAL_SECS - 1;
+            assert!(
+                !plan(&s).iter().any(|a| matches!(a, Action::FailStaleBranch(id) | Action::RetryBranchDelete(id) | Action::RemoveRehearsal(id) if *id == dev)),
+                "{status:?}: {:?}",
+                plan(&s)
+            );
+        }
     }
 
     #[test]
@@ -938,6 +1087,36 @@ mod tests {
         assert_eq!(
             plan(&s),
             [Action::ReportEndpointWithoutDatabase(EP.to_string())]
+        );
+    }
+
+    /// A base read's static compute (step 6g): unroutable, pinned, linked to no branch.
+    fn static_endpoint(id: &str, age_secs: i64) -> EndpointState {
+        EndpointState {
+            routable: false,
+            static_lsn: Some("0/2000000".to_string()),
+            age_secs,
+            ..endpoint(id, None, false)
+        }
+    }
+
+    // R3: one still reading is left alone, and it's no stray endpoint either.
+    #[test]
+    fn static_computes_are_removed_after_ten_minutes() {
+        use crate::schema_base::STALE_STATIC_COMPUTE_SECS;
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        s.endpoints.push(static_endpoint(EP2, STALE_STATIC_COMPUTE_SECS));
+        s.computes.insert(EP2.to_string());
+        assert!(plan(&s).is_empty(), "{:?}", plan(&s));
+
+        s.endpoints[1].age_secs = STALE_STATIC_COMPUTE_SECS + 1;
+        assert_eq!(plan(&s), [Action::RemoveStaticCompute(EP2.to_string())]);
+
+        // An unroutable endpoint that isn't pinned isn't a static compute's.
+        s.endpoints[1].static_lsn = None;
+        assert_eq!(
+            plan(&s),
+            [Action::ReportEndpointWithoutDatabase(EP2.to_string())]
         );
     }
 
@@ -1176,6 +1355,9 @@ mod tests {
             branch_status: Some(BranchStatus::Ready),
             needs_reconfigure: true,
             compute_settings_version: crate::COMPUTE_SETTINGS_VERSION,
+            routable: true,
+            static_lsn: None,
+            age_secs: 3600,
         });
         s.computes.remove(EP);
         let planned = plan(&s);
@@ -1397,6 +1579,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_removes_a_stale_static_compute() {
+        use crate::schema_base::STALE_STATIC_COMPUTE_SECS;
+        let (w, journal) = worker();
+        let (id, _ep) = provision(&w, &journal).await;
+        let tenant = w.metadata.database(id).neon_tenant_id.unwrap();
+        let timeline = w.metadata.main(id).timeline_id.unwrap();
+        for (ep, age) in [
+            ("ep-0000000000a1", STALE_STATIC_COMPUTE_SECS + 1),
+            ("ep-0000000000a2", 5),
+        ] {
+            w.metadata
+                .create_static_endpoint(&chelabase_metadata::NewStaticEndpoint {
+                    id: ep,
+                    tenant_id: &tenant,
+                    timeline_id: &timeline,
+                    compute_token_sha256: "aa",
+                    static_lsn: "0/2000000",
+                })
+                .await
+                .unwrap();
+            w.computes.insert(ep);
+            w.metadata.state().endpoint_ages.insert(ep.to_string(), age);
+        }
+        journal.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(
+            pos(&journal, "compute.delete ep-0000000000a1")
+                < pos(&journal, "metadata.delete_endpoint")
+        );
+        assert!(!w.metadata.state().endpoints.contains_key("ep-0000000000a1"));
+        assert!(!w.computes.list().await.unwrap().contains(&"ep-0000000000a1".to_string()));
+        // The one still reading stays.
+        assert!(w.metadata.state().endpoints.contains_key("ep-0000000000a2"));
+        assert!(w.computes.list().await.unwrap().contains(&"ep-0000000000a2".to_string()));
+        assert!(position(&journal, "compute.delete ep-0000000000a2").is_none());
+
+        // A compute that can't be removed keeps its row: the next pass tries again.
+        w.metadata
+            .state()
+            .endpoint_ages
+            .insert("ep-0000000000a2".to_string(), STALE_STATIC_COMPUTE_SECS + 1);
+        *w.computes.fail_delete.lock().unwrap() = Some("docker is down".into());
+        w.reconcile_once().await.unwrap();
+        assert!(w.metadata.state().endpoints.contains_key("ep-0000000000a2"));
+    }
+
+    /// The jobs a reconcile pass hands back, every publish succeeding.
+    async fn resumed(w: &crate::fakes::FakeWorker) -> Vec<chelabase_nats::MergeJob> {
+        w.hand_back_merges(|_| async { Ok(()) }).await
+    }
+
+    // T14 F3 fix round (M3): a hand-back is recorded only once its job is published: one whose
+    // publish failed is handed back on the next pass, not after the re-hand window.
+    #[tokio::test]
+    async fn a_failed_publish_isnt_recorded_as_a_hand_back() {
+        use chelabase_metadata::{MergeDirection, MergeStatus};
+        let (w, journal) = worker();
+        let (id, _ep) = provision(&w, &journal).await;
+        let main = w.metadata.main(id).id;
+        let silent = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::Online);
+        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        {
+            let mut state = w.metadata.state();
+            let row = state.merges.get_mut(&silent).unwrap();
+            row.claimed_at = Some(long_ago);
+            row.updated_at = long_ago;
+        }
+        let failed = w.hand_back_merges(|_| async { Err("nats is down".to_string()) }).await;
+        assert!(failed.is_empty());
+        assert!(!w.metadata.state().handed_back.contains_key(&silent));
+        assert_eq!(resumed(&w).await, [chelabase_nats::MergeJob::Resume { merge_id: silent }]);
+        assert!(w.metadata.state().handed_back.contains_key(&silent));
+        assert!(resumed(&w).await.is_empty(), "recorded once published");
+    }
+
+    // R3: merges whose worker went silent are handed back as `Resume` jobs, each once per
+    // stale period (the claim is refreshed when it's handed back).
+    #[tokio::test]
+    async fn reconcile_requeues_silent_merges() {
+        use chelabase_metadata::{MergeDirection, MergeStatus};
+        let (w, journal) = worker();
+        let (id, _ep) = provision(&w, &journal).await;
+        let main = w.metadata.main(id).id;
+        let merge = |status| w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, status);
+        let silent = merge(MergeStatus::Online);
+        let busy = merge(MergeStatus::Applying);
+        let idle = merge(MergeStatus::Draft);
+        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        for m in [silent, idle] {
+            let mut state = w.metadata.state();
+            let row = state.merges.get_mut(&m).unwrap();
+            row.claimed_at = row.status.is_working().then_some(long_ago);
+            row.updated_at = long_ago;
+        }
+
+        let resume = |id| chelabase_nats::MergeJob::Resume { merge_id: id };
+        assert_eq!(resumed(&w).await, [resume(silent)]);
+        assert_eq!(resumed(&w).await, [], "handed back once");
+        let _ = busy;
+    }
+
+    // T14 M10: a merge handed back isn't handed back again while its Resume waits (no worker
+    // claimed it since), until the re-hand window; once a worker claims it, it can be again.
+    #[tokio::test]
+    async fn a_handed_back_merge_waits_for_its_job() {
+        use chelabase_metadata::{MergeDirection, MergeStatus};
+        let (w, journal) = worker();
+        let (id, _ep) = provision(&w, &journal).await;
+        let main = w.metadata.main(id).id;
+        let silent = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::Online);
+        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let age = |w: &crate::fakes::FakeWorker, at| {
+            let mut state = w.metadata.state();
+            let row = state.merges.get_mut(&silent).unwrap();
+            row.claimed_at = Some(at);
+            row.updated_at = at;
+        };
+        age(&w, long_ago);
+        assert_eq!(resumed(&w).await.len(), 1);
+        // The claim stays as old (the job waits behind a long one): not handed back again.
+        assert!(resumed(&w).await.is_empty());
+        assert_eq!(w.metadata.merge_row(silent).claimed_at, Some(long_ago), "the claim isn't touched");
+        // A worker claimed it after the hand-back, then went silent again: handed back.
+        w.metadata.state().handed_back.insert(silent, chrono::Utc::now() - chrono::Duration::seconds(1000));
+        age(&w, chrono::Utc::now() - chrono::Duration::seconds(600));
+        assert_eq!(resumed(&w).await.len(), 1);
+        // The window passed with no claim: handed back (the job was lost).
+        w.metadata.state().handed_back.insert(silent, chrono::Utc::now() - chrono::Duration::seconds(3600));
+        age(&w, long_ago);
+        assert_eq!(resumed(&w).await.len(), 1);
+    }
+
+    // T14 M8: a requested after-merge choice whose Finish job was lost is published again.
+    #[tokio::test]
+    async fn a_lost_finish_job_is_published_again() {
+        use chelabase_metadata::{MergeDirection, MergeStatus};
+        let (w, journal) = worker();
+        let (id, _ep) = provision(&w, &journal).await;
+        let main = w.metadata.main(id).id;
+        let m = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::AppliedWithDrift);
+        {
+            let mut state = w.metadata.state();
+            let row = state.merges.get_mut(&m).unwrap();
+            row.result = Some(serde_json::json!({ "after": { "choice": "reset", "requested": true } }));
+            row.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        }
+        assert_eq!(
+            resumed(&w).await,
+            [chelabase_nats::MergeJob::Finish { merge_id: m, after: chelabase_nats::MergeAfter::Reset }]
+        );
+        assert!(resumed(&w).await.is_empty(), "once per period");
+    }
+
+    /// A merge applied with drift whose `result.after` is `after`, last written an hour ago.
+    async fn drifted_with_after(w: &crate::fakes::FakeWorker, journal: &crate::fakes::Journal, after: serde_json::Value) -> uuid::Uuid {
+        use chelabase_metadata::{MergeDirection, MergeStatus};
+        let (id, _ep) = provision(w, journal).await;
+        let main = w.metadata.main(id).id;
+        let m = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::AppliedWithDrift);
+        let mut state = w.metadata.state();
+        let row = state.merges.get_mut(&m).unwrap();
+        row.result = Some(serde_json::json!({ "after": after }));
+        row.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        m
+    }
+
+    // T14 F3 fix round (M1): a Finish lost after its run recorded `started` (the worker went away
+    // before the outcome, and the job wasn't redelivered) is published again too.
+    #[tokio::test]
+    async fn a_finish_lost_after_it_started_is_published_again() {
+        let (w, journal) = worker();
+        let m = drifted_with_after(&w, &journal, serde_json::json!({ "choice": "delete", "started": true, "timeline": null })).await;
+        assert_eq!(
+            resumed(&w).await,
+            [chelabase_nats::MergeJob::Finish { merge_id: m, after: chelabase_nats::MergeAfter::Delete }]
+        );
+    }
+
+    // T14 F3 fix round (M2): a lost Finish is re-published at most once per re-hand window while
+    // nothing ran it (its job may wait behind a long one), as a silent merge's Resume is.
+    #[tokio::test]
+    async fn a_lost_finish_is_handed_back_once_per_rehand_window() {
+        let (w, journal) = worker();
+        let m = drifted_with_after(&w, &journal, serde_json::json!({ "choice": "reset", "requested": true })).await;
+        let ago = |secs| chrono::Utc::now() - chrono::Duration::seconds(secs);
+        w.metadata.state().handed_back.insert(m, ago(15 * 60));
+        assert!(resumed(&w).await.is_empty(), "handed back 15 minutes ago");
+        w.metadata.state().handed_back.insert(m, ago(31 * 60));
+        assert_eq!(resumed(&w).await.len(), 1, "the window passed");
+    }
+
+    // R3: a rehearsal branch older than 30 minutes whose merge isn't rehearsing is torn down; one
+    // still rehearsing, or younger, stays.
+    #[tokio::test]
+    async fn reconcile_deletes_old_rehearsals() {
+        use chelabase_metadata::{MergeDirection, MergeStatus};
+        let (w, journal) = worker();
+        let (id, _ep) = provision(&w, &journal).await;
+        let main = w.metadata.main(id).id;
+        let merge = |status| w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, status);
+        let cancelled = merge(MergeStatus::Cancelled);
+        let running = merge(MergeStatus::Rehearsing);
+        let mut made = Vec::new();
+        for (m, age) in [
+            (cancelled, STALE_REHEARSAL_SECS + 1),
+            (running, STALE_REHEARSAL_SECS + 1),
+            (merge(MergeStatus::Draft), 60),
+        ] {
+            let name = format!("_rehearsal-{}", &m.simple().to_string()[..8]);
+            let b = w
+                .metadata
+                .create_rehearsal_branch(id, main, &name)
+                .await
+                .unwrap();
+            w.handle_branch_create(b.id, None).await.unwrap();
+            w.metadata.state().branch_ages.insert(b.id, age);
+            made.push(b.id);
+        }
+        let old_ep = w.metadata.branch(made[0]).endpoint_id.unwrap();
+
+        w.reconcile_once().await.unwrap();
+
+        let status = |b| w.metadata.branch(b).status;
+        assert_eq!(status(made[0]), BranchStatus::Deleted);
+        assert_eq!(status(made[1]), BranchStatus::Ready, "its merge is rehearsing");
+        assert_eq!(status(made[2]), BranchStatus::Ready, "younger than 30 minutes");
+        assert!(!w.metadata.state().endpoints.contains_key(&old_ep));
+        assert!(!w.computes.list().await.unwrap().contains(&old_ep));
+    }
+
+    #[tokio::test]
     async fn reconcile_recreates_a_missing_compute_with_a_fresh_token() {
         let (w, journal) = worker();
         let (_id, ep) = provision(&w, &journal).await;
@@ -1460,7 +1875,7 @@ mod tests {
         assert!(
             position(
                 &journal,
-                &format!("compute.sql {ep} app SELECT to_regclass")
+                &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT to_regclass")
             )
             .is_some()
         );
@@ -1476,7 +1891,7 @@ mod tests {
         w.reconcile_once().await.unwrap();
         let checked = pos(
             &journal,
-            &format!("compute.sql {ep} app SELECT to_regclass"),
+            &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT to_regclass"),
         );
         assert!(checked < pos(&journal, &format!("compute.sql {ep} app BEGIN;")));
     }
@@ -1488,7 +1903,7 @@ mod tests {
         let (a_db, a_ep) = provision(&w, &journal).await;
         let (_b_db, b_ep) = provision(&w, &journal).await;
         assert_eq!(
-            w.create_role(BranchId::from(a_db), "app", false).await,
+            w.create_role(BranchId::from(a_db), &RoleSpec::login("app", false)).await,
             crate::roles::RoleOutcome::Ok
         );
         w.computes
@@ -1864,7 +2279,7 @@ mod tests {
                 .clone();
             let new = crash_before_switch(&w, &d);
             let switched = futures_util::FutureExt::now_or_never(
-                w.metadata.switch_to_pending_timeline(d.dev, &new, None),
+                w.metadata.switch_to_pending_timeline(d.dev, &new, None, "0/1"),
             )
             .expect("the fake never waits");
             assert!(switched.unwrap());
@@ -1929,7 +2344,7 @@ mod tests {
         let d = dev_setup(&w, &journal).await;
         let new = crash_before_switch(&w, &d);
         let switched = futures_util::FutureExt::now_or_never(
-            w.metadata.switch_to_pending_timeline(d.dev, &new, None),
+            w.metadata.switch_to_pending_timeline(d.dev, &new, None, "0/1"),
         )
         .expect("the fake never waits");
         assert!(switched.unwrap());
@@ -2432,7 +2847,7 @@ mod tests {
         ));
         w.computes.answer("to_regclass('chelabase.schema_version')", "t\n");
         // The resync in the same passes sees both databases.
-        let d = |name: &str| format!("d|{}||{}|f||\n", hex::encode(name), hex::encode("postgres"));
+        let d = |name: &str| format!("d|{}||{}|f|||||||\n", hex::encode(name), hex::encode("postgres"));
         w.computes.answer("FROM pg_authid", &[d("app"), d("analytics")].concat());
 
         // Seen just now: not yet.
@@ -2473,7 +2888,7 @@ mod tests {
 
         w.reconcile_once().await.unwrap();
 
-        let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SELECT to_regclass")).is_some();
+        let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SET search_path = pg_catalog, pg_temp; SELECT to_regclass")).is_some();
         assert!(checked("app") && checked("healthy") && checked("broken") && !checked("off"));
         // Each database is checked against its own default schema.
         let check_in = |db: &str| {
@@ -2525,6 +2940,8 @@ mod tests {
             sealed: None,
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         });
         w.computes.answer("pg_has_role", "ok 16384\n");
         w.computes.answer_in("app", "to_regclass('chelabase.schema_version')", "f\n");

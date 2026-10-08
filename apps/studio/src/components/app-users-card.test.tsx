@@ -11,8 +11,8 @@ const project: ProjectInfo = {
   created_at: "2026-10-03T10:00:00Z", updated_at: "2026-10-03T10:00:00Z",
 };
 const dbs: DatabaseSummary[] = [
-  { database_id: "d1", name: "web1", status: "ready", host: null, port: null, branch_count: 1 },
-  { database_id: "d2", name: "booting", status: "provisioning", host: null, port: null, branch_count: 1 },
+  { database_id: "d1", name: "web1", postgres_database: "web1", status: "ready", host: null, port: null, branch_count: 1 },
+  { database_id: "d2", name: "booting", postgres_database: "booting", status: "provisioning", host: null, port: null, branch_count: 1 },
 ];
 const settings = (over: Partial<AppUsersSettings> = {}): AppUsersSettings => ({
   database_id: "d1", pg_database: "postgres", schema: "public", table: "users", email_verification: false,

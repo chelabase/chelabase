@@ -23,6 +23,7 @@ pub mod data_api;
 pub mod delete;
 #[cfg(test)]
 mod fakes;
+pub mod merge;
 pub mod names;
 pub mod point;
 pub mod project_delete;
@@ -31,8 +32,10 @@ pub mod provision;
 pub mod reconcile;
 pub mod reset;
 pub mod resync;
+pub mod role_sessions;
 pub mod roles;
 pub mod safekeepers;
+pub mod schema_base;
 pub mod settings;
 
 /// The role that owns every database, and whose password is revealed.
@@ -80,4 +83,12 @@ pub struct Worker<M, S, C, N, P> {
     /// `CHELABASE_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
     /// endpoint row records (off: they're logged and kept).
     pub remove_orphans: bool,
+    /// How long a merge's phase 1 transaction (and each phase 1a step) may take before its
+    /// backend is cancelled (P3: 16 min, above the script's own 15 min `statement_timeout`).
+    pub merge_tx_timeout: Duration,
+    /// How long one phase 2 step (a concurrent index build, a validation) may take before its
+    /// backend is cancelled (P3: 6 h).
+    pub merge_online_step_timeout: Duration,
+    /// Branch resync requests (`chelabase.resync.branch`), connected by the process.
+    pub resync_requests: resync::ResyncRequests,
 }

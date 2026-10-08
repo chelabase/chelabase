@@ -117,7 +117,7 @@ describe("consoleErrorText", () => {
   it("has plain text for role, availability and unknown codes", () => {
     const e = (code: string, message = "") => new ApiError(400, code as never, message);
     const ctx = { role: "anon", op: "select" as const };
-    expect(consoleErrorText(e("role_refused"), ctx)).toMatch(/bypass row-level security/);
+    expect(consoleErrorText(e("role_refused"), ctx)).toMatch(/owner-level/);
     expect(consoleErrorText(e("role_not_allowed"), ctx)).toMatch(/isn't allowed/);
     expect(consoleErrorText(e("data_api_disabled"), ctx)).toMatch(/isn't enabled/);
     expect(consoleErrorText(e("mystery"), ctx)).toBe("Something went wrong (mystery)");
@@ -133,7 +133,7 @@ describe("consoleErrorText", () => {
     );
     expect(consoleErrorText(err(409, "data_api_disabled"), { role: null, op: "select" })).toMatch(/isn't enabled/);
     expect(consoleErrorText(err(404, "unknown_table"), { role: null, op: "select" })).toMatch(/table or view/);
-    expect(consoleErrorText(err(403, "role_refused"), { role: "admin", op: "select" })).toMatch(/bypass row-level security/);
+    expect(consoleErrorText(err(403, "role_refused"), { role: "admin", op: "select" })).toMatch(/owner-level/);
     expect(consoleErrorText(err(409, "conflict", "duplicate key"), { role: null, op: "insert" })).toMatch(/duplicate key/);
     expect(consoleErrorText(err(500, "weird", "kept"), { role: null, op: "select" })).toBe("kept");
   });

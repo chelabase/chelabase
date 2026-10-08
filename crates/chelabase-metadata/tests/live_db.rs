@@ -17,7 +17,12 @@ use chelabase_metadata::{
     BeginEnable, BeginProjectDelete, NewAppSession, NewProjectAuth, OnDelete, ProjectStatus, RefreshNext,
     RefreshOutcome, RenameProject, AppUsersStatus,
     SAVED_QUERY_CAP, SavedQuery, SavedQueryPatch, SavedQueryWrite,
+    BaseSource, BranchBusy, MergeCreate, MergeDirection, MergeDraftPatch, MergeEvent, MergeState, MergeStatus, MergeStatusPatch,
+    MergeWrite, NewMerge, NewStaticEndpoint, SchemaBase,
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
+};
+use chelabase_metadata::{
+    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
 };
 use chelabase_types::data_key::{self, DataKeyKind};
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
@@ -182,6 +187,8 @@ fn new_endpoint<'a>(id: &'a str, tenant: &'a str, timeline: &'a str) -> NewEndpo
         owner_verifier: "SCRAM-SHA-256$v1",
         database_name: "db",
         role_copies: &[],
+        routable: true,
+        static_lsn: None,
     }
 }
 
@@ -953,7 +960,7 @@ async fn backups_do_not_count_as_children_or_toward_the_cap() {
     let pending = start_reset(&client, dev).await;
     let backup = BranchId::new();
     assert!(client
-        .switch_to_restored_timeline(dev, &pending, backup, "dev-before-restore-20260930T120000Z")
+        .switch_to_restored_timeline(dev, &pending, backup, "dev-before-restore-20260930T120000Z", "0/1")
         .await
         .unwrap());
 
@@ -986,18 +993,18 @@ async fn switch_to_pending_timeline_moves_endpoint_and_records_superseded() {
     // Ready, not resetting: refused, nothing moves.
     let pending = hex32();
     assert!(client.set_pending_timeline(main, Some(&pending)).await.unwrap());
-    let while_ready = client.switch_to_pending_timeline(main, &pending, None).await.unwrap();
+    let while_ready = client.switch_to_pending_timeline(main, &pending, None, "0/1").await.unwrap();
     let untouched = main_branch(&client, id).await;
 
     assert!(client
         .set_branch_status(main, &[BranchStatus::Ready], BranchStatus::Resetting)
         .await
         .unwrap());
-    let switched = client.switch_to_pending_timeline(main, &pending, None).await.unwrap();
+    let switched = client.switch_to_pending_timeline(main, &pending, None, "0/1").await.unwrap();
     let after = main_branch(&client, id).await;
     let endpoint = client.neon_endpoint(&ep).await.unwrap().unwrap();
     // Nothing pending any more: a second switch is refused.
-    let again = client.switch_to_pending_timeline(main, &pending, None).await.unwrap();
+    let again = client.switch_to_pending_timeline(main, &pending, None, "0/1").await.unwrap();
     client.clear_superseded_timeline(main).await.unwrap();
     let cleared = main_branch(&client, id).await;
 
@@ -1006,7 +1013,7 @@ async fn switch_to_pending_timeline_moves_endpoint_and_records_superseded() {
     let gone_pending = start_reset(&client, main_of(gone)).await;
     assert!(begin_delete(&client, gone).await);
     let while_deleting = client
-        .switch_to_pending_timeline(main_of(gone), &gone_pending, None)
+        .switch_to_pending_timeline(main_of(gone), &gone_pending, None, "0/1")
         .await
         .unwrap();
     cleanup(&client, id).await;
@@ -1039,7 +1046,7 @@ async fn switch_to_restored_timeline_inserts_the_backup_atomically() {
     // Not resetting: refused, no backup.
     let refused_backup = BranchId::new();
     let refused = client
-        .switch_to_restored_timeline(main, &hex32(), refused_backup, "main-before-restore-20260930T110000Z")
+        .switch_to_restored_timeline(main, &hex32(), refused_backup, "main-before-restore-20260930T110000Z", "0/1")
         .await
         .unwrap();
     let no_backup = client.get_branch(refused_backup).await.unwrap();
@@ -1047,7 +1054,7 @@ async fn switch_to_restored_timeline_inserts_the_backup_atomically() {
     let pending = start_reset(&client, main).await;
     let backup = BranchId::new();
     let name = "main-before-restore-20260930T120000Z";
-    let switched = client.switch_to_restored_timeline(main, &pending, backup, name).await.unwrap();
+    let switched = client.switch_to_restored_timeline(main, &pending, backup, name, "0/1").await.unwrap();
     let after = main_branch(&client, id).await;
     let backup_row = branch(&client, backup).await;
     let endpoint = client.neon_endpoint(&ep).await.unwrap().unwrap();
@@ -1056,7 +1063,7 @@ async fn switch_to_restored_timeline_inserts_the_backup_atomically() {
     let second = hex32();
     assert!(client.set_pending_timeline(main, Some(&second)).await.unwrap());
     let before_failed = main_branch(&client, id).await;
-    let failed = client.switch_to_restored_timeline(main, &second, BranchId::new(), name).await;
+    let failed = client.switch_to_restored_timeline(main, &second, BranchId::new(), name, "0/1").await;
     let after_failed = main_branch(&client, id).await;
     let endpoint_after_failed = client.neon_endpoint(&ep).await.unwrap().unwrap();
     let backups = client.live_backups_of(main).await.unwrap();
@@ -1099,17 +1106,17 @@ async fn a_switch_expecting_another_pending_timeline_changes_nothing() {
     let endpoint_before = client.neon_endpoint(&ep).await.unwrap().unwrap();
 
     let mine = hex32();
-    let reset = client.switch_to_pending_timeline(main, &mine, None).await.unwrap();
+    let reset = client.switch_to_pending_timeline(main, &mine, None, "0/1").await.unwrap();
     let backup = BranchId::new();
     let restored = client
-        .switch_to_restored_timeline(main, &mine, backup, "main-before-restore-20260930T130000Z")
+        .switch_to_restored_timeline(main, &mine, backup, "main-before-restore-20260930T130000Z", "0/1")
         .await
         .unwrap();
     let after = main_branch(&client, id).await;
     let endpoint_after = client.neon_endpoint(&ep).await.unwrap().unwrap();
     let no_backup = client.get_branch(backup).await.unwrap();
     // The run that owns it still can.
-    let owner = client.switch_to_pending_timeline(main, &theirs, None).await.unwrap();
+    let owner = client.switch_to_pending_timeline(main, &theirs, None, "0/1").await.unwrap();
     cleanup(&client, id).await;
 
     assert!(!reset);
@@ -1150,7 +1157,7 @@ async fn begin_branch_delete_takes_backups_along() {
     let pending = start_reset(&client, dev).await;
     let backup = BranchId::new();
     assert!(client
-        .switch_to_restored_timeline(dev, &pending, backup, "dev-before-restore-20260930T120000Z")
+        .switch_to_restored_timeline(dev, &pending, backup, "dev-before-restore-20260930T120000Z", "0/1")
         .await
         .unwrap());
     assert!(client
@@ -1857,7 +1864,7 @@ async fn branch_with_backup(client: &MetadataClient) -> (DatabaseId, BranchId, B
     let pending = start_reset(client, dev).await;
     let backup = BranchId::new();
     assert!(client
-        .switch_to_restored_timeline(dev, &pending, backup, "dev-before-restore-20260930T120000Z")
+        .switch_to_restored_timeline(dev, &pending, backup, "dev-before-restore-20260930T120000Z", "0/1")
         .await
         .unwrap());
     assert!(client
@@ -2094,7 +2101,7 @@ async fn history_start_is_set_when_ready_and_follows_the_timeline() {
     let pending = start_reset(&client, b.id).await;
     let backup = BranchId::new();
     assert!(client
-        .switch_to_restored_timeline(b.id, &pending, backup, "dev-before-restore-20260930T120000Z")
+        .switch_to_restored_timeline(b.id, &pending, backup, "dev-before-restore-20260930T120000Z", "0/1")
         .await
         .unwrap());
     let (dev_restored, backup_row) = (branch(&client, b.id).await, branch(&client, backup).await);
@@ -2106,7 +2113,7 @@ async fn history_start_is_set_when_ready_and_follows_the_timeline() {
     let pending = start_reset(&client, b.id).await;
     let before: chrono::DateTime<chrono::Utc> =
         sqlx::query_scalar("SELECT now()").fetch_one(client.pool()).await.unwrap();
-    assert!(client.switch_to_pending_timeline(b.id, &pending, None).await.unwrap());
+    assert!(client.switch_to_pending_timeline(b.id, &pending, None, "0/1").await.unwrap());
     let dev_reset = branch(&client, b.id).await;
     cleanup(&client, id).await;
 
@@ -2358,6 +2365,8 @@ fn new_key(branch: BranchId, kind: DataKeyKind, role: &str, name: &str) -> (NewD
             sealed,
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         },
         generated.key,
     )
@@ -2369,6 +2378,34 @@ async fn last_used(client: &MetadataClient, key: uuid::Uuid) -> Option<chrono::D
         .fetch_one(client.pool())
         .await
         .unwrap()
+}
+
+/// M11 (step 6g T13): a merge's rehearsal is built like a branch, so its data API bootstrap
+/// gives it a public key; the gateway's lookup must never resolve it (found live: the gateway
+/// served a `_rehearsal-*` branch with it).
+#[tokio::test]
+#[ignore]
+async fn a_rehearsal_branchs_key_is_not_looked_up() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let rehearsal = client
+        .create_rehearsal_branch(id, main_of(id), "_rehearsal-0badc0de", "live_db")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE branches SET status = 'ready' WHERE id = $1")
+        .bind(rehearsal.id.as_uuid())
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let (key, _) = new_key(rehearsal.id, DataKeyKind::Public, "anon", "public");
+    client.insert_data_key(&key).await.unwrap();
+    let (main_key, _) = new_key(main_of(id), DataKeyKind::Secret, "authenticated", "backend");
+    client.insert_data_key(&main_key).await.unwrap();
+    let found = client.lookup_data_key(&key.sha256).await.unwrap();
+    let main_found = client.lookup_data_key(&main_key.sha256).await.unwrap();
+    cleanup(&client, id).await;
+    assert!(found.is_none(), "the rehearsal's key was looked up: {found:?}");
+    assert!(main_found.is_some(), "a normal branch's key still is");
 }
 
 #[tokio::test]
@@ -2771,6 +2808,8 @@ fn upsert(name: &str, origin: RoleOrigin, verifier: &str) -> CopyUpsert {
         login: true,
         level: RoleLevel::Plain,
         pending: false,
+        attributes: RoleAttributes::default(),
+        api_owner_level: None,
     }
 }
 
@@ -3003,6 +3042,83 @@ async fn list_roles_password_states() {
     assert_eq!(states(&set_owner), with_owner(PasswordState::SetInSql));
 }
 
+// U1: a NOLOGIN api row has no secrets and shows `none`; an update stores the wanted state
+// (pending, version bumped), and turning LOGIN on stores the new secrets.
+#[tokio::test]
+#[ignore]
+async fn api_role_attributes_insert_and_update() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let group = RoleAttributes {
+        inherit: false,
+        connection_limit: 3,
+        valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
+        bypass_rls: true,
+        member_of: vec![],
+    };
+    let role = NewApiRole {
+        name: "readers",
+        owner_level: false,
+        login: false,
+        attributes: &group,
+        verifier: None,
+        password_enc: None,
+        change_id: uuid::Uuid::new_v4(),
+    };
+    let inserted = client.insert_api_role_with(&ep, &role, 10).await.unwrap();
+    let rows = client.list_roles(&ep).await.unwrap();
+    let (_, before) = client.role_copies(&ep).await.unwrap();
+    let member = RoleAttributes { member_of: vec!["readers".into()], ..RoleAttributes::default() };
+    let change = ApiRoleChange {
+        owner_level: false,
+        login: true,
+        attributes: member.clone(),
+        secret: SecretChange::Set("SCRAM-SHA-256$n".into(), "v1:n".into()),
+        change_id: uuid::Uuid::new_v4(),
+    };
+    let updated = client.update_api_role(&ep, "readers", &change, 10).await.unwrap();
+    let missing = client.update_api_role(&ep, "ghost", &change, 10).await.unwrap();
+    let (copies, after) = client.role_copies(&ep).await.unwrap();
+    let sealed = client.role_password(&ep, "readers").await.unwrap();
+    let cleared = ApiRoleChange { login: false, secret: SecretChange::Clear, ..change.clone() };
+    client.update_api_role(&ep, "readers", &cleared, 10).await.unwrap();
+    let (cleared_copies, _) = client.role_copies(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(inserted, InsertRoleOutcome::Inserted);
+    let row = rows.iter().find(|r| r.name == "readers").unwrap();
+    assert_eq!((row.login, row.password, row.attributes.clone()), (false, PasswordState::None, group));
+    assert_eq!((updated, missing), (RoleWriteOutcome::Done, RoleWriteOutcome::NotFound));
+    assert_eq!(after, before + 1);
+    let copy = copies.iter().find(|c| c.name == "readers").unwrap();
+    assert_eq!(copy.attributes, member);
+    assert!(copy.login && copy.pending);
+    assert_eq!(copy.scram_verifier.as_deref(), Some("SCRAM-SHA-256$n"));
+    assert_eq!(sealed.as_deref(), Some("v1:n"));
+    let copy = cleared_copies.iter().find(|c| c.name == "readers").unwrap();
+    assert_eq!((copy.login, copy.scram_verifier.as_deref(), copy.password_enc.as_deref()), (false, None, None));
+}
+
+// An SQL role turned LOGIN through the API: its row is made (or replaced) as `sql`, with
+// the sealed password; the owner's row is never touched.
+#[tokio::test]
+#[ignore]
+async fn store_role_secret_inserts_or_replaces_sql_rows() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let fresh = client.store_role_secret(&ep, "made_in_sql", "SCRAM-SHA-256$a", "v1:a", 10).await.unwrap();
+    let again = client.store_role_secret(&ep, "made_in_sql", "SCRAM-SHA-256$b", "v1:b", 10).await.unwrap();
+    let owner = client.store_role_secret(&ep, "postgres", "SCRAM-SHA-256$x", "v1:x", 10).await.unwrap();
+    let (copies, _) = client.role_copies(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!((fresh, again, owner), (RoleWriteOutcome::Done, RoleWriteOutcome::Done, RoleWriteOutcome::NotFound));
+    let copy = copies.iter().find(|c| c.name == "made_in_sql").unwrap();
+    assert_eq!((copy.origin, copy.login, copy.pending), (RoleOrigin::Sql, true, true));
+    assert_eq!(copy.scram_verifier.as_deref(), Some("SCRAM-SHA-256$b"));
+    assert_eq!(copy.password_enc.as_deref(), Some("v1:b"));
+    let owner_row = copies.iter().find(|c| c.name == "postgres").unwrap();
+    assert_ne!(owner_row.scram_verifier.as_deref(), Some("SCRAM-SHA-256$x"));
+}
+
 #[tokio::test]
 #[ignore]
 async fn list_roles_owner_first_then_c_collation() {
@@ -3096,9 +3212,9 @@ async fn confirm_and_replace_secret_and_delete_copy() {
     let (_, v) = client.role_copies(&ep).await.unwrap();
 
     // A stale version confirms nothing; the current one clears just that row.
-    let stale = client.confirm_role(&ep, "app", v - 1).await.unwrap();
+    let stale = client.confirm_role(&ep, "app", v - 1, None).await.unwrap();
     let pending_after_stale = client.list_roles(&ep).await.unwrap().iter().filter(|r| r.pending).count();
-    let confirmed = client.confirm_role(&ep, "app", v).await.unwrap();
+    let confirmed = client.confirm_role(&ep, "app", v, None).await.unwrap();
     let pending_after = client.list_roles(&ep).await.unwrap().iter().filter(|r| r.pending).count();
 
     // Reset of an MD5 row gives it a verifier and a sealed password; the owner's row is left alone.
@@ -3198,7 +3314,7 @@ async fn resync_skips_recently_forwarded_rows() {
 }
 
 // The 10 s guard covers what the receiver owns (verifier, sealed password, login); the
-// catalog-owned `level` and `pending` of a row stamped a moment ago still update.
+// catalog-owned `level`, `pending` and attributes of a row stamped a moment ago still update.
 #[tokio::test]
 #[ignore]
 async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
@@ -3218,6 +3334,15 @@ async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
     row.level = RoleLevel::OwnerLevel;
     row.pending = false;
     row.login = true;
+    row.password_enc = SealedChange::Set("v1:catalog".into());
+    let wanted = RoleAttributes {
+        inherit: false,
+        connection_limit: 5,
+        valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
+        bypass_rls: true,
+        member_of: vec!["grp".into()],
+    };
+    row.attributes = wanted.clone();
     let write = ResyncWrite {
         upserts: vec![row],
         removals: vec![],
@@ -3232,6 +3357,8 @@ async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
     assert!(!app.pending, "pending follows the catalog");
     assert_eq!(app.scram_verifier.as_deref(), Some("SCRAM-SHA-256$forwarded"));
     assert!(!app.login, "the forwarded login is kept");
+    assert_eq!(app.password_enc, None, "the forwarded sealed password is kept");
+    assert_eq!(app.attributes, wanted, "inherit, connection_limit, valid_until, bypass_rls and member_of follow the catalog");
 }
 
 #[tokio::test]
@@ -3680,11 +3807,19 @@ async fn branch_copy_writes_role_copies_and_main_database() {
     let id = insert_pending(&client).await;
     let ep = ep_id();
     let (tenant, timeline) = (hex32(), hex32());
+    let plain = RoleAttributes::default();
+    let group = RoleAttributes {
+        inherit: false,
+        connection_limit: 3,
+        valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
+        bypass_rls: true,
+        member_of: vec!["readers".into()],
+    };
     let copies = [
-        NewRoleCopy { name: "reader", origin: RoleOrigin::Api, verifier: Some("SCRAM-SHA-256$r"), password_enc: Some("v1:reader"), login: true, level: RoleLevel::Plain, api_owner_level: false, pending: true },
-        NewRoleCopy { name: "writer", origin: RoleOrigin::Api, verifier: Some("SCRAM-SHA-256$w"), password_enc: Some("v1:writer"), login: true, level: RoleLevel::OwnerLevel, api_owner_level: true, pending: true },
-        NewRoleCopy { name: "My Role", origin: RoleOrigin::Sql, verifier: Some("SCRAM-SHA-256$s"), password_enc: None, login: false, level: RoleLevel::OwnerLevel, api_owner_level: false, pending: false },
-        NewRoleCopy { name: "legacy", origin: RoleOrigin::Sql, verifier: None, password_enc: None, login: true, level: RoleLevel::Plain, api_owner_level: false, pending: false },
+        NewRoleCopy { name: "reader", origin: RoleOrigin::Api, verifier: Some("SCRAM-SHA-256$r"), password_enc: Some("v1:reader"), login: true, level: RoleLevel::Plain, api_owner_level: false, pending: true, attributes: &plain },
+        NewRoleCopy { name: "writer", origin: RoleOrigin::Api, verifier: Some("SCRAM-SHA-256$w"), password_enc: Some("v1:writer"), login: true, level: RoleLevel::OwnerLevel, api_owner_level: true, pending: true, attributes: &group },
+        NewRoleCopy { name: "My Role", origin: RoleOrigin::Sql, verifier: Some("SCRAM-SHA-256$s"), password_enc: None, login: false, level: RoleLevel::OwnerLevel, api_owner_level: false, pending: false, attributes: &plain },
+        NewRoleCopy { name: "legacy", origin: RoleOrigin::Sql, verifier: None, password_enc: None, login: true, level: RoleLevel::Plain, api_owner_level: false, pending: false, attributes: &plain },
     ];
     let mut new = new_endpoint(&ep, &tenant, &timeline);
     new.role_copies = &copies;
@@ -3707,6 +3842,10 @@ async fn branch_copy_writes_role_copies_and_main_database() {
         ]
     );
     assert!(all.iter().find(|c| c.name == "writer").unwrap().api_owner_level);
+    // A child's copies keep the parent's attributes, so its resync restores nothing.
+    assert_eq!(all.iter().find(|c| c.name == "writer").unwrap().attributes, group);
+    assert_eq!(rows.iter().find(|r| r.name == "writer").unwrap().attributes, group);
+    assert_eq!(all.iter().find(|c| c.name == "reader").unwrap().attributes, plain);
     assert_eq!(all.iter().find(|c| c.name == "legacy").unwrap().scram_verifier, None);
     assert_eq!(dbs, vec![("db".to_string(), "postgres".to_string(), DatabaseOrigin::Main)]);
     assert_eq!(reader.as_deref(), Some("v1:reader"));
@@ -5402,6 +5541,1111 @@ async fn saved_queries_cascade_with_their_database() {
     assert_eq!(left, 0);
 }
 
+// --- Step 6g: schema merges -------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn rehearsal_kind_round_trips_and_is_not_counted() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let name = "_rehearsal-0a1b2c3d";
+
+    let rehearsal = client.create_rehearsal_branch(db, main, name, "tester").await.unwrap();
+    let read_back = branch(&client, rehearsal.id).await;
+    let name_taken = client.create_rehearsal_branch(db, main, name, "tester").await;
+    // Only main counts; a normal branch is still allowed up to the cap.
+    let counts = client
+        .main_branches_with_counts(TenantId(DEMO_TENANT_ID))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(b, _)| b.id == main)
+        .map(|(_, n)| n);
+    let children: Vec<BranchId> = client.live_children(main).await.unwrap().iter().map(|b| b.id).collect();
+    let dev = new_branch(db, "dev", main);
+    let dev_created = client.create_branch(&dev).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!((rehearsal.kind, rehearsal.status), (BranchKind::Rehearsal, BranchStatus::Pending));
+    assert_eq!(rehearsal.parent_branch_id, Some(main));
+    assert_eq!(read_back, rehearsal);
+    assert!(matches!(name_taken, Err(MetadataError::BranchNameTaken(n)) if n == name));
+    assert_eq!(counts, Some(1));
+    assert!(children.is_empty());
+    assert_eq!(dev_created, CreateBranchOutcome::Created);
+    assert_eq!(BranchKind::parse("rehearsal").unwrap().as_str(), "rehearsal");
+}
+
+#[tokio::test]
+#[ignore]
+async fn branched_at_lsn_updates_with_the_switch() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let main = main_of(id);
+    let pending = start_reset(&client, main).await;
+    let before = main_branch(&client, id).await;
+
+    let switched = client.switch_to_pending_timeline(main, &pending, None, "0/2A2B3C").await.unwrap();
+    let after = main_branch(&client, id).await;
+    cleanup(&client, id).await;
+
+    assert!(switched);
+    assert_ne!(before.branched_at_lsn.as_deref(), Some("0/2A2B3C"));
+    assert_eq!(after.branched_at_lsn.as_deref(), Some("0/2A2B3C"));
+}
+
+fn base(branch: BranchId, source: BaseSource, model: Option<serde_json::Value>) -> SchemaBase {
+    let timeline = hex32();
+    let mut b = base_at(branch, "app", source, &timeline, "0/1");
+    b.model_version = model.as_ref().map(|_| 1);
+    b.server_major = model.as_ref().map(|_| 17);
+    b.model = model;
+    b
+}
+
+/// A location-only base of `db`, read at and valid from (`timeline`, `lsn`).
+fn base_at(branch: BranchId, db: &str, source: BaseSource, timeline: &str, lsn: &str) -> SchemaBase {
+    SchemaBase {
+        id: 0,
+        branch_id: branch,
+        database_name: db.into(),
+        model: None,
+        model_version: None,
+        server_major: None,
+        source,
+        timeline_id: Some(timeline.into()),
+        lsn: Some(lsn.into()),
+        branch_timeline_id: Some(timeline.into()),
+        branch_lsn: Some(lsn.into()),
+        identity_map: serde_json::json!({"pairs": []}),
+        taken_at: chrono::Utc::now(),
+        recorded_at: chrono::Utc::now(),
+    }
+}
+
+async fn base_entries(client: &MetadataClient, branch: BranchId) -> Vec<(i64, String, String)> {
+    sqlx::query_as("SELECT id, database_name, source FROM branch_schema_bases WHERE branch_id = $1 ORDER BY id")
+        .bind(branch.as_uuid())
+        .fetch_all(client.pool())
+        .await
+        .unwrap()
+}
+
+// E18: bases are a history; the current one is the newest entry.
+#[tokio::test]
+#[ignore]
+async fn schema_base_history_appends_and_current_is_newest() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+
+    let none_yet = client.schema_base(main, "app").await.unwrap();
+    let first = base(main, BaseSource::Create, None);
+    let first_id = client.append_schema_base(&first).await.unwrap();
+    let unfilled = client.schema_base(main, "app").await.unwrap().unwrap();
+    let second = base(main, BaseSource::Merge, Some(serde_json::json!({"tables": ["t"]})));
+    let second_id = client.append_schema_base(&second).await.unwrap();
+    let current = client.schema_base(main, "app").await.unwrap().unwrap();
+    // The live fallback fills an entry in place: the first one stays first, the current one
+    // stays current.
+    let model = serde_json::json!({"tables": []});
+    let fill = SchemaBase {
+        model: Some(model.clone()),
+        model_version: Some(1),
+        server_major: Some(17),
+        identity_map: serde_json::json!({"pairs": [1]}),
+        ..unfilled.clone()
+    };
+    let filled = client.update_schema_base(&fill).await.unwrap();
+    let missing = client.update_schema_base(&SchemaBase { id: -1, ..fill.clone() }).await.unwrap();
+    let still_current = client.schema_base(main, "app").await.unwrap().unwrap();
+    let first_after = client
+        .schema_base_at(main, "app", first.branch_timeline_id.as_deref().unwrap(), "0/1")
+        .await
+        .unwrap()
+        .unwrap();
+    // Entries of a database the branch no longer has go when the base is next recorded.
+    client.append_schema_base(&base_at(main, "gone", BaseSource::Create, &hex32(), "0/1")).await.unwrap();
+    let before_prune = base_entries(&client, main).await;
+    let pruned = client.prune_schema_bases(main, &["app".to_string()]).await.unwrap();
+    let after_prune = base_entries(&client, main).await;
+    cleanup(&client, db).await;
+
+    assert!(none_yet.is_none());
+    assert!(first_id < second_id, "{first_id} {second_id}");
+    assert_eq!((unfilled.id, unfilled.source, unfilled.model.clone()), (first_id, BaseSource::Create, None));
+    assert_eq!(unfilled.timeline_id, first.timeline_id);
+    assert_eq!(unfilled.branch_timeline_id, first.branch_timeline_id);
+    assert_eq!(unfilled.branch_lsn.as_deref(), Some("0/1"));
+    assert_eq!(unfilled.identity_map, serde_json::json!({"pairs": []}));
+    assert_eq!((current.id, current.source), (second_id, BaseSource::Merge));
+    assert_eq!(current.model, Some(serde_json::json!({"tables": ["t"]})));
+    assert!(filled);
+    assert!(!missing);
+    assert_eq!(still_current.id, second_id);
+    assert_eq!(first_after.id, first_id);
+    assert_eq!((first_after.model, first_after.model_version, first_after.server_major), (Some(model), Some(1), Some(17)));
+    assert_eq!(first_after.identity_map, serde_json::json!({"pairs": [1]}));
+    assert_eq!(first_after.source, BaseSource::Create, "a fill changes the model and map only");
+    assert_eq!(before_prune.len(), 3);
+    assert_eq!(pruned, 1);
+    assert_eq!(
+        after_prune,
+        vec![(first_id, "app".to_string(), "create".to_string()), (second_id, "app".to_string(), "merge".to_string())]
+    );
+}
+
+// E18: the history migration, applied byte for byte to T5's table shape in a scratch schema.
+#[tokio::test]
+#[ignore]
+async fn migration_keeps_existing_bases_as_first_entries() {
+    let pool = raw_pool().await;
+    let schema = format!("t7b_migration_{}", hex32());
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}; SET search_path TO {schema};")))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    // `branch_schema_bases` as 20261010000001 created it, and a stub of `branches`.
+    sqlx::raw_sql(
+        "CREATE TABLE branches (id uuid PRIMARY KEY, timeline_id text NULL, branched_at_lsn text NULL);
+         CREATE TABLE branch_schema_bases (
+             branch_id      uuid NOT NULL REFERENCES branches (id) ON DELETE CASCADE,
+             database_name  text NOT NULL,
+             model          jsonb NULL,
+             model_version  integer NULL,
+             server_major   integer NULL,
+             source         text NOT NULL CHECK (source IN ('create', 'reset', 'merge', 'update', 'rebaseline')),
+             timeline_id    text NULL,
+             lsn            text NULL,
+             identity_map   jsonb NOT NULL DEFAULT '{\"pairs\":[]}',
+             taken_at       timestamptz NOT NULL DEFAULT now(),
+             PRIMARY KEY (branch_id, database_name)
+         );",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let (dev, main) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO branches VALUES ($1, 'tdev', '0/2000000'), ($2, 'tmain', NULL)")
+        .bind(dev)
+        .bind(main)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO branch_schema_bases (branch_id, database_name, model, source, timeline_id, lsn)
+         VALUES ($1, 'app', '{\"t\":1}', 'create', 'tread', '0/1000000'),
+                ($1, 'shop', NULL, 'reset', 'tread', '0/1000000'),
+                ($2, 'app', NULL, 'rebaseline', NULL, NULL)",
+    )
+    .bind(dev)
+    .bind(main)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(include_str!("../migrations/20261010000004_schema_base_history.sql"))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    type Row = (i64, uuid::Uuid, String, String, Option<String>, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, branch_id, database_name, source, timeline_id, lsn, branch_timeline_id, branch_lsn
+         FROM branch_schema_bases ORDER BY id",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    // A history: a second entry for the same (branch, database) is allowed now.
+    let appended: i64 = sqlx::query_scalar(
+        "INSERT INTO branch_schema_bases (branch_id, database_name, source, timeline_id, lsn, branch_timeline_id, branch_lsn)
+         VALUES ($1, 'app', 'merge', 'tdev', '0/3000000', 'tdev', '0/3000000') RETURNING id",
+    )
+    .bind(dev)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    let bad_lsn = sqlx::query(
+        "INSERT INTO branch_schema_bases (branch_id, database_name, source, branch_timeline_id, branch_lsn)
+         VALUES ($1, 'app', 'merge', 'tdev', 'not an lsn')",
+    )
+    .bind(dev)
+    .execute(&mut *conn)
+    .await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET search_path TO public; DROP SCHEMA {schema} CASCADE;")))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let s = |v: &str| Some(v.to_string());
+    let shape: Vec<_> = rows.iter().map(|r| (r.1, r.2.clone(), r.3.clone(), r.4.clone(), r.5.clone(), r.6.clone(), r.7.clone())).collect();
+    assert_eq!(
+        shape,
+        vec![
+            (dev, "app".to_string(), "create".to_string(), s("tread"), s("0/1000000"), s("tdev"), s("0/2000000")),
+            (dev, "shop".to_string(), "reset".to_string(), s("tread"), s("0/1000000"), s("tdev"), s("0/2000000")),
+            (main, "app".to_string(), "rebaseline".to_string(), None, None, s("tmain"), None),
+        ]
+    );
+    assert!(rows.windows(2).all(|w| w[0].0 < w[1].0), "ids in the old rows' order");
+    assert!(appended > rows[2].0);
+    assert!(bad_lsn.is_err(), "branch_lsn must be an LSN");
+}
+
+// E18: a restore picks the newest entry on its timeline at or before its point, comparing LSNs
+// as LSNs (0/A000 < 0/10000, though not as text).
+#[tokio::test]
+#[ignore]
+async fn schema_base_at_or_before_picks_the_right_entry() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let (t, u) = (hex32(), hex32());
+    let create = client.append_schema_base(&base_at(main, "app", BaseSource::Create, &t, "0/9000")).await.unwrap();
+    let merge = client.append_schema_base(&base_at(main, "app", BaseSource::Merge, &t, "0/10000")).await.unwrap();
+    // Newer by insertion, on another timeline and another database: never picked for (t, app).
+    client.append_schema_base(&base_at(main, "app", BaseSource::Reset, &u, "0/1")).await.unwrap();
+    client.append_schema_base(&base_at(main, "shop", BaseSource::Create, &t, "0/1")).await.unwrap();
+
+    let mut picked = Vec::new();
+    for lsn in ["0/8FFF", "0/9000", "0/A000", "0/10000", "1/0"] {
+        picked.push(client.schema_base_at(main, "app", &t, lsn).await.unwrap().map(|b| b.id));
+    }
+    let [before_any, at_create, between, at_merge, later] = picked[..] else { unreachable!() };
+    let other_timeline = client.schema_base_at(main, "app", &hex32(), "1/0").await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!(before_any, None);
+    assert_eq!(at_create, Some(create));
+    assert_eq!(between, Some(create), "0/A000 is before 0/10000");
+    assert_eq!(at_merge, Some(merge));
+    assert_eq!(later, Some(merge));
+    assert!(other_timeline.is_none());
+}
+
+// E18: the restore's switch appends, per database, a copy of the newest entry on the old
+// timeline at or before the restore point, positioned at the restored timeline's start.
+#[tokio::test]
+#[ignore]
+async fn restore_switch_copies_the_base_at_or_before_the_point() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let dev = ready_branch(&client, db, "dev", main_of(db)).await;
+    let old = branch(&client, dev).await.timeline_id.unwrap();
+    let mut create = base_at(dev, "app", BaseSource::Create, &old, "0/9000");
+    create.model = Some(serde_json::json!({"tables": ["before"]}));
+    create.identity_map = serde_json::json!({"pairs": [7]});
+    let create_id = client.append_schema_base(&create).await.unwrap();
+    client.append_schema_base(&base_at(dev, "app", BaseSource::Merge, &old, "0/10000")).await.unwrap();
+    client.append_schema_base(&base_at(dev, "shop", BaseSource::Create, &old, "0/9000")).await.unwrap();
+    // Only after the point: nothing to copy for it.
+    client.append_schema_base(&base_at(dev, "late", BaseSource::Create, &old, "0/20000")).await.unwrap();
+    let original = client.schema_base_at(dev, "app", &old, "0/9000").await.unwrap().unwrap();
+
+    let pending = start_reset(&client, dev).await;
+    let backup = BranchId::new();
+    let switched = client
+        .switch_to_restored_timeline(dev, &pending, backup, "dev-before-restore-20260930T120000Z", "0/A000")
+        .await
+        .unwrap();
+    let app = client.schema_base(dev, "app").await.unwrap().unwrap();
+    let shop = client.schema_base(dev, "shop").await.unwrap().unwrap();
+    let late = client.schema_base(dev, "late").await.unwrap().unwrap();
+    let entries = base_entries(&client, dev).await;
+    cleanup(&client, db).await;
+
+    assert!(switched);
+    assert!(app.id > create_id);
+    assert_eq!(app.source, BaseSource::Create, "the copy keeps the original's source");
+    assert_eq!((app.branch_timeline_id.as_deref(), app.branch_lsn.as_deref()), (Some(pending.as_str()), Some("0/A000")));
+    assert_eq!((app.timeline_id.as_deref(), app.lsn.as_deref()), (Some(old.as_str()), Some("0/9000")), "its location");
+    assert_eq!(app.model, original.model);
+    assert_eq!(app.identity_map, original.identity_map);
+    assert_eq!(app.taken_at, original.taken_at);
+    assert_eq!(shop.branch_timeline_id.as_deref(), Some(pending.as_str()));
+    assert_eq!(late.branch_timeline_id.as_deref(), Some(old.as_str()), "nothing appended");
+    assert_eq!(entries.len(), 6);
+}
+
+fn new_merge(db: DatabaseId, source: BranchId, target: BranchId, name: &str) -> NewMerge {
+    NewMerge {
+        id: uuid::Uuid::new_v4(),
+        database_id: db,
+        source_branch_id: source,
+        target_branch_id: target,
+        direction: MergeDirection::IntoParent,
+        database_name: name.into(),
+        options: None,
+        created_by: "tester".into(),
+    }
+}
+
+async fn created_merge(client: &MetadataClient, m: &NewMerge) -> chelabase_metadata::MergeRecord {
+    match client.create_merge(m).await.unwrap() {
+        MergeCreate::Created(r) => r,
+        other => panic!("expected Created, got {other:?}"),
+    }
+}
+
+/// Moves a merge through `statuses`, each from the one before.
+async fn walk_merge(client: &MetadataClient, id: uuid::Uuid, from: MergeStatus, statuses: &[MergeStatus]) {
+    let mut prev = from;
+    for to in statuses {
+        assert!(client.set_merge_status(id, &[prev], *to, MergeStatusPatch::default()).await.unwrap(), "{prev:?} -> {to:?}");
+        prev = *to;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn one_open_merge_per_pair() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+
+    let first = new_merge(db, dev, main, "app");
+    let created = created_merge(&client, &first).await;
+    let second = client.create_merge(&new_merge(db, dev, main, "app")).await.unwrap();
+    let other_db = client.create_merge(&new_merge(db, dev, main, "other")).await.unwrap();
+    assert!(client.set_merge_status(first.id, &[MergeStatus::Computing], MergeStatus::Cancelled, MergeStatusPatch::default()).await.unwrap());
+    let after_cancel = client.create_merge(&new_merge(db, dev, main, "app")).await.unwrap();
+    let listed = client.list_merges(db, Some(dev)).await.unwrap();
+    let listed_other = client.list_merges(db, Some(BranchId::new())).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!((created.status, created.version), (MergeStatus::Computing, 1));
+    assert_eq!(created.options, serde_json::json!({"lock_timeout_ms": 5000, "after": "keep"}));
+    assert_eq!(second, MergeCreate::OpenExists(first.id));
+    assert!(matches!(other_db, MergeCreate::Created(_)));
+    assert!(matches!(after_cancel, MergeCreate::Created(_)));
+    assert_eq!(listed.len(), 3);
+    assert!(listed_other.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn one_applying_merge_per_target() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let dev2 = ready_branch(&client, db, "dev2", main).await;
+
+    let a = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    let b = created_merge(&client, &new_merge(db, dev2, main, "app")).await;
+    walk_merge(
+        &client,
+        a.id,
+        MergeStatus::Computing,
+        &[MergeStatus::Draft, MergeStatus::Rehearsing, MergeStatus::Rehearsed, MergeStatus::Applying],
+    )
+    .await;
+    walk_merge(&client, b.id, MergeStatus::Computing, &[MergeStatus::Draft, MergeStatus::Rehearsing, MergeStatus::Rehearsed]).await;
+    let second_applying = client
+        .set_merge_status(b.id, &[MergeStatus::Rehearsed], MergeStatus::Applying, MergeStatusPatch::default())
+        .await;
+    let blocked_create = client.create_merge(&new_merge(db, dev2, main, "again")).await.unwrap();
+    // The first one finishes: the target is free again.
+    walk_merge(&client, a.id, MergeStatus::Applying, &[MergeStatus::Online, MergeStatus::Finishing, MergeStatus::Done]).await;
+    let b_applies = client
+        .set_merge_status(b.id, &[MergeStatus::Rehearsed], MergeStatus::Applying, MergeStatusPatch::default())
+        .await
+        .unwrap();
+    cleanup(&client, db).await;
+
+    assert!(second_applying.is_err(), "merges_one_applying refuses a second applying merge");
+    assert_eq!(blocked_create, MergeCreate::ApplyingExists(a.id));
+    assert!(b_applies);
+}
+
+#[tokio::test]
+#[ignore]
+async fn draft_update_checks_version() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+
+    let computing = client
+        .update_merge_draft(m.id, 1, &MergeDraftPatch::default())
+        .await
+        .unwrap();
+    walk_merge(&client, m.id, MergeStatus::Computing, &[MergeStatus::Draft]).await;
+    let patch = MergeDraftPatch {
+        resolutions: Some(serde_json::json!([{"item": "t", "take": "source"}])),
+        ..Default::default()
+    };
+    let saved = client.update_merge_draft(m.id, 1, &patch).await.unwrap();
+    let stale = client.update_merge_draft(m.id, 1, &MergeDraftPatch::default()).await.unwrap();
+    let missing = client.update_merge_draft(uuid::Uuid::new_v4(), 1, &patch).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!(computing, MergeWrite::NotEditable(MergeStatus::Computing));
+    let MergeWrite::Saved(saved) = saved else { panic!("{saved:?}") };
+    assert_eq!(saved.version, 2);
+    assert_eq!(saved.resolutions, serde_json::json!([{"item": "t", "take": "source"}]));
+    assert_eq!(saved.user_steps, serde_json::json!([]));
+    assert_eq!(stale, MergeWrite::Stale(saved));
+    assert_eq!(missing, MergeWrite::NotFound);
+}
+
+#[tokio::test]
+#[ignore]
+async fn saving_a_rehearsed_merge_returns_it_to_draft() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    walk_merge(&client, m.id, MergeStatus::Computing, &[MergeStatus::Draft, MergeStatus::Rehearsing]).await;
+    let patch = MergeStatusPatch { rehearsal: Some(serde_json::json!({"ok": true})), ..Default::default() };
+    assert!(client.set_merge_status(m.id, &[MergeStatus::Rehearsing], MergeStatus::Rehearsed, patch).await.unwrap());
+    let rehearsed = client.merge(m.id).await.unwrap().unwrap();
+
+    let saved = client
+        .update_merge_draft(
+            m.id,
+            rehearsed.version,
+            &MergeDraftPatch { user_steps: Some(serde_json::json!(["SELECT 1"])), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!((rehearsed.status, rehearsed.rehearsal.is_some()), (MergeStatus::Rehearsed, true));
+    let MergeWrite::Saved(saved) = saved else { panic!("{saved:?}") };
+    assert_eq!(saved.status, MergeStatus::Draft);
+    assert_eq!(saved.rehearsal, None);
+    assert_eq!(saved.user_steps, serde_json::json!(["SELECT 1"]));
+}
+
+#[tokio::test]
+#[ignore]
+async fn saving_with_start_compute_moves_to_computing_in_one_statement() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    walk_merge(&client, m.id, MergeStatus::Computing, &[MergeStatus::Draft, MergeStatus::Rehearsing]).await;
+    let patch = MergeStatusPatch { rehearsal: Some(serde_json::json!({"ok": true})), ..Default::default() };
+    assert!(client.set_merge_status(m.id, &[MergeStatus::Rehearsing], MergeStatus::Rehearsed, patch).await.unwrap());
+    let rehearsed = client.merge(m.id).await.unwrap().unwrap();
+
+    let save = MergeDraftPatch {
+        user_steps: Some(serde_json::json!([])),
+        start_compute: true,
+        ..Default::default()
+    };
+    let first = client.update_merge_draft(m.id, rehearsed.version, &save).await.unwrap();
+    // A second save of the same version loses. The status check comes first, so it reports
+    // `NotEditable(Computing)` (the row is no longer a draft), not `Stale`.
+    let second = client.update_merge_draft(m.id, rehearsed.version, &save).await.unwrap();
+    // The status is now computing: even the current version can't be saved over a running compute.
+    let third = client.update_merge_draft(m.id, rehearsed.version + 1, &save).await.unwrap();
+    cleanup(&client, db).await;
+
+    let MergeWrite::Saved(first) = first else { panic!("{first:?}") };
+    assert_eq!(first.status, MergeStatus::Computing);
+    assert_eq!(first.rehearsal, None);
+    assert!(first.claimed_at.is_some(), "the compute is claimed from the save");
+    assert_eq!(first.version, rehearsed.version + 1);
+    assert_eq!(second, MergeWrite::NotEditable(MergeStatus::Computing));
+    assert_eq!(third, MergeWrite::NotEditable(MergeStatus::Computing));
+}
+
+#[tokio::test]
+#[ignore]
+async fn status_transition_is_guarded() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+
+    let wrong_from = client.set_merge_status(m.id, &[MergeStatus::Draft], MergeStatus::Rehearsing, MergeStatusPatch::default()).await.unwrap();
+    let unchanged = client.merge(m.id).await.unwrap().unwrap();
+    let touched = client.touch_merge_claim(m.id, MergeStatus::Computing).await.unwrap();
+    let touched_wrong = client.touch_merge_claim(m.id, MergeStatus::Draft).await.unwrap();
+    let stale = client.stale_merge_claims(std::time::Duration::from_secs(3600), std::time::Duration::ZERO).await.unwrap();
+    let stale_now = client.stale_merge_claims(std::time::Duration::ZERO, std::time::Duration::ZERO).await.unwrap();
+    let patch = MergeStatusPatch {
+        analysis: Some(serde_json::json!({"conflicts": []})),
+        base_fingerprint: Some("b".into()),
+        source_fingerprint: Some("s".into()),
+        target_fingerprint: Some("t".into()),
+        ..Default::default()
+    };
+    let moved = client.set_merge_status(m.id, &[MergeStatus::Computing, MergeStatus::Draft], MergeStatus::Draft, patch).await.unwrap();
+    let draft = client.merge(m.id).await.unwrap().unwrap();
+    let again = client.set_merge_status(m.id, &[MergeStatus::Computing], MergeStatus::Draft, MergeStatusPatch::default()).await.unwrap();
+    let failed = MergeStatusPatch {
+        error: Some(Some("boom".into())),
+        failed_phase: Some(Some("phase1".into())),
+        ..Default::default()
+    };
+    assert!(client.set_merge_status(m.id, &[MergeStatus::Draft], MergeStatus::Failed, failed).await.unwrap());
+    let failed_row = client.merge(m.id).await.unwrap().unwrap();
+    let unknown = client.set_merge_status(uuid::Uuid::new_v4(), &[MergeStatus::Computing], MergeStatus::Draft, MergeStatusPatch::default()).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert!(!wrong_from);
+    assert_eq!(unchanged.status, MergeStatus::Computing);
+    assert!(unchanged.claimed_at.is_some());
+    assert!(touched && !touched_wrong);
+    assert!(stale.is_empty());
+    assert!(stale_now.iter().any(|r| r.id == m.id));
+    assert!(moved);
+    assert_eq!(draft.status, MergeStatus::Draft);
+    assert_eq!((draft.version, draft.claimed_at), (2, None), "analysis bumps the version; a draft isn't claimed");
+    assert_eq!(draft.analysis, Some(serde_json::json!({"conflicts": []})));
+    assert_eq!(
+        (draft.base_fingerprint.as_deref(), draft.source_fingerprint.as_deref(), draft.target_fingerprint.as_deref()),
+        (Some("b"), Some("s"), Some("t"))
+    );
+    assert!(!again);
+    assert_eq!((failed_row.status, failed_row.error.as_deref(), failed_row.failed_phase.as_deref()), (MergeStatus::Failed, Some("boom"), Some("phase1")));
+    assert!(!unknown);
+}
+
+// T8a: a recompute writes the resolutions it kept, and a JSON null clears the analysis and the
+// plan (SQL NULL, not a jsonb `null`).
+#[tokio::test]
+#[ignore]
+async fn status_patch_writes_resolutions_and_null_clears() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+
+    let kept = serde_json::json!([{"conflict": "c1", "choice": "keep_target"}]);
+    let first = MergeStatusPatch {
+        analysis: Some(serde_json::json!({"conflicts": []})),
+        plan: Some(serde_json::json!({"steps": [], "target_digest": "d"})),
+        resolutions: Some(kept.clone()),
+        ..Default::default()
+    };
+    assert!(client.set_merge_status(m.id, &[MergeStatus::Computing], MergeStatus::Computing, first).await.unwrap());
+    let written = client.merge(m.id).await.unwrap().unwrap();
+    let cleared = MergeStatusPatch {
+        analysis: Some(serde_json::Value::Null),
+        plan: Some(serde_json::Value::Null),
+        ..Default::default()
+    };
+    assert!(client.set_merge_status(m.id, &[MergeStatus::Computing], MergeStatus::Draft, cleared).await.unwrap());
+    let after = client.merge(m.id).await.unwrap().unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!(written.resolutions, kept);
+    assert!(written.plan.is_some() && written.analysis.is_some());
+    assert_eq!((after.analysis, after.plan), (None, None));
+    assert_eq!(after.resolutions, kept, "untouched without a value");
+}
+
+#[tokio::test]
+#[ignore]
+async fn cancel_drafts_for_branch_leaves_applying_alone() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let dev2 = ready_branch(&client, db, "dev2", main).await;
+    let draft = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    walk_merge(&client, draft.id, MergeStatus::Computing, &[MergeStatus::Draft]).await;
+    let applying = created_merge(&client, &new_merge(db, dev2, main, "app")).await;
+    walk_merge(
+        &client,
+        applying.id,
+        MergeStatus::Computing,
+        &[MergeStatus::Draft, MergeStatus::Rehearsing, MergeStatus::Rehearsed, MergeStatus::Applying],
+    )
+    .await;
+
+    let cancelled = client.cancel_drafts_for_branch(main).await.unwrap();
+    let draft_after = client.merge(draft.id).await.unwrap().unwrap();
+    let applying_after = client.merge(applying.id).await.unwrap().unwrap();
+    let nothing_left = client.cancel_drafts_for_branch(main).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!(cancelled, 1);
+    assert_eq!(draft_after.status, MergeStatus::Cancelled);
+    assert_eq!(applying_after.status, MergeStatus::Applying);
+    assert_eq!(nothing_left, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn busy_merge_is_found_for_source_and_target() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let other = ready_branch(&client, db, "other", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    walk_merge(&client, m.id, MergeStatus::Computing, &[MergeStatus::Draft]).await;
+
+    let idle = (
+        client.branch_has_busy_merge(dev).await.unwrap(),
+        client.branch_has_busy_merge(main).await.unwrap(),
+    );
+    walk_merge(&client, m.id, MergeStatus::Draft, &[MergeStatus::Rehearsing]).await;
+    let rehearsing = (
+        client.branch_has_busy_merge(dev).await.unwrap(),
+        client.branch_has_busy_merge(main).await.unwrap(),
+        client.branch_has_busy_merge(other).await.unwrap(),
+    );
+    walk_merge(&client, m.id, MergeStatus::Rehearsing, &[MergeStatus::Rehearsed, MergeStatus::Applying]).await;
+    let applying = client.branch_has_busy_merge(main).await.unwrap();
+    walk_merge(&client, m.id, MergeStatus::Applying, &[MergeStatus::Online, MergeStatus::Finishing, MergeStatus::Done]).await;
+    let done = client.branch_has_busy_merge(main).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!(idle, (None, None));
+    assert_eq!(rehearsing, (Some(BranchBusy::Merge(m.id)), Some(BranchBusy::Merge(m.id)), None));
+    assert_eq!(applying, Some(BranchBusy::Merge(m.id)));
+    assert_eq!(done, None);
+}
+
+/// Puts merge `id` in `state` (from any status), as the worker and the API leave it.
+async fn put_merge_in(client: &MetadataClient, id: uuid::Uuid, state: MergeState) {
+    let patch = MergeStatusPatch {
+        failed_phase: Some(state.failed_phase.map(str::to_string)),
+        ..Default::default()
+    };
+    assert!(client.set_merge_status(id, &MergeStatus::ALL, state.status, patch).await.unwrap(), "{state:?}");
+}
+
+// T14 F3 (E27): the SQL of the unique indexes, the create's checks and the busy check say what
+// `MergeState` says, in every state.
+#[tokio::test]
+#[ignore]
+async fn merge_state_sql_matches_the_table() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let dev2 = ready_branch(&client, db, "dev2", main).await;
+    let mut seen = Vec::new();
+    for state in MergeState::all() {
+        let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+        put_merge_in(&client, m.id, state).await;
+        let busy = (
+            client.branch_has_busy_merge(dev).await.unwrap(),
+            client.branch_has_busy_merge(main).await.unwrap(),
+        );
+        let same_pair = client.create_merge(&new_merge(db, dev, main, "app")).await.unwrap();
+        let other_source = client.create_merge(&new_merge(db, dev2, main, "app")).await.unwrap();
+        seen.push((state, busy, same_pair.clone(), other_source.clone()));
+        // Out of the way for the next state.
+        for created in [same_pair, other_source] {
+            if let MergeCreate::Created(r) = created {
+                put_merge_in(&client, r.id, MergeState::of(MergeStatus::Cancelled, None)).await;
+            }
+        }
+        put_merge_in(&client, m.id, MergeState::of(MergeStatus::Cancelled, None)).await;
+    }
+    cleanup(&client, db).await;
+
+    for (state, (dev_busy, main_busy), same_pair, other_source) in seen {
+        let held = state.holds_branches().then_some(());
+        assert_eq!(dev_busy.map(|_| ()), held, "{state:?} source");
+        assert_eq!(main_busy.map(|_| ()), held, "{state:?} target");
+        let expect_pair = if state.is_applying() {
+            "applying"
+        } else if state.is_open() {
+            "open"
+        } else {
+            "created"
+        };
+        let got = |c: &MergeCreate| match c {
+            MergeCreate::ApplyingExists(_) => "applying",
+            MergeCreate::OpenExists(_) => "open",
+            MergeCreate::Created(_) => "created",
+        };
+        assert_eq!(got(&same_pair), expect_pair, "{state:?} same pair");
+        let expect_other = if state.is_applying() { "applying" } else { "created" };
+        assert_eq!(got(&other_source), expect_other, "{state:?} another merge into the target");
+    }
+}
+
+// T14 F3 (I4, M12): the claim refuses a branch a merge holds, or one with a live rehearsal
+// branch, under the branch's row lock; nothing is written.
+#[tokio::test]
+#[ignore]
+async fn claim_refuses_a_branch_a_merge_holds() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    put_merge_in(&client, m.id, MergeState::of(MergeStatus::Failed, Some("online"))).await;
+    let held = client.claim_branch_for_switch(dev, false).await.unwrap();
+    let dev_after = client.get_branch(dev).await.unwrap().unwrap().status;
+    put_merge_in(&client, m.id, MergeState::of(MergeStatus::Cancelled, None)).await;
+    let rehearsal = client.create_rehearsal_branch(db, dev, "_rehearsal-0badc0de", "tester").await.unwrap();
+    let with_rehearsal = client.claim_branch_for_switch(dev, false).await.unwrap();
+    client.mark_branch_deleted(rehearsal.id).await.unwrap();
+    let free = client.claim_branch_for_switch(dev, false).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!(held, ClaimOutcome::MergeBusy(BranchBusy::Merge(m.id)));
+    assert_eq!(dev_after, BranchStatus::Ready, "nothing written");
+    assert_eq!(with_rehearsal, ClaimOutcome::MergeBusy(BranchBusy::Rehearsal(rehearsal.id)));
+    assert_eq!(free, ClaimOutcome::Claimed);
+}
+
+// T14 F3: the status write's guards (failed phase, version, both branches ready) and its log line
+// in the same transaction (I2).
+#[tokio::test]
+#[ignore]
+async fn status_write_guards_and_logs() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    put_merge_in(&client, m.id, MergeState::of(MergeStatus::Failed, Some("tx"))).await;
+    let to_applying = |phase: &str| MergeStatusPatch {
+        guard_failed_phase: Some(Some(phase.to_string())),
+        guard_branches_ready: true,
+        log_status: true,
+        ..Default::default()
+    };
+    let wrong_phase = client.set_merge_status(m.id, &[MergeStatus::Failed], MergeStatus::Applying, to_applying("online")).await.unwrap();
+    client.set_branch_status(dev, &[BranchStatus::Ready], BranchStatus::Resetting).await.unwrap();
+    let not_ready = client.set_merge_status(m.id, &[MergeStatus::Failed], MergeStatus::Applying, to_applying("tx")).await.unwrap();
+    client.set_branch_status(dev, &[BranchStatus::Resetting], BranchStatus::Ready).await.unwrap();
+    let events_before = client.merge_events(m.id).await.unwrap().len();
+    let moved = client.set_merge_status(m.id, &[MergeStatus::Failed], MergeStatus::Applying, to_applying("tx")).await.unwrap();
+    let events = client.merge_events(m.id).await.unwrap();
+    let version = client.merge(m.id).await.unwrap().unwrap().version;
+    put_merge_in(&client, m.id, MergeState::of(MergeStatus::Draft, None)).await;
+    let stale_version = MergeStatusPatch { guard_version: Some(version + 1), ..Default::default() };
+    let wrong_version = client.set_merge_status(m.id, &[MergeStatus::Draft], MergeStatus::Rehearsing, stale_version).await.unwrap();
+    let right_version = MergeStatusPatch { guard_version: Some(version), ..Default::default() };
+    let right = client.set_merge_status(m.id, &[MergeStatus::Draft], MergeStatus::Rehearsing, right_version).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert!(!wrong_phase && !not_ready && moved);
+    assert_eq!(events_before, 0, "a refused write logs nothing");
+    assert_eq!(events.len(), 1);
+    assert_eq!((events[0].kind.as_str(), events[0].detail.clone()), ("status", Some(serde_json::json!({"to": "applying"}))));
+    assert!(!wrong_version && right);
+}
+
+// T14 M10, M8: a merge handed back isn't handed back again while its job may be queued; a lost
+// Finish request is found.
+#[tokio::test]
+#[ignore]
+async fn hand_backs_wait_for_their_job() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    let hour = std::time::Duration::from_secs(3600);
+    let zero = std::time::Duration::ZERO;
+    let stale = client.stale_merge_claims(zero, hour).await.unwrap();
+    let marked = client.mark_merge_handed_back(m.id, MergeStatus::Computing).await.unwrap();
+    let after_hand_back = client.stale_merge_claims(zero, hour).await.unwrap();
+    let after_window = client.stale_merge_claims(zero, zero).await.unwrap();
+    // The worker claims it again: it can be handed back once more when it goes silent.
+    assert!(client.touch_merge_claim(m.id, MergeStatus::Computing).await.unwrap());
+    let after_claim = client.stale_merge_claims(zero, hour).await.unwrap();
+    let requested = MergeStatusPatch {
+        result: Some(serde_json::json!({"after": {"choice": "keep", "requested": true}})),
+        ..Default::default()
+    };
+    assert!(client.set_merge_status(m.id, &MergeStatus::ALL, MergeStatus::AppliedWithDrift, requested).await.unwrap());
+    let lost = client.stale_finish_requests(zero, hour).await.unwrap();
+    let recent = client.stale_finish_requests(hour, hour).await.unwrap();
+    // T14 F3 M2: handed back, it waits out the window (unless written since).
+    assert!(client.mark_merge_handed_back(m.id, MergeStatus::AppliedWithDrift).await.unwrap());
+    let finish_handed_back = client.stale_finish_requests(zero, hour).await.unwrap();
+    let finish_after_window = client.stale_finish_requests(zero, zero).await.unwrap();
+    // T14 F3 M1: a run that recorded `started` and went away is found too.
+    let started = MergeStatusPatch {
+        result: Some(serde_json::json!({"after": {"choice": "reset", "started": true, "timeline": null}})),
+        ..Default::default()
+    };
+    assert!(client.set_merge_status(m.id, &[MergeStatus::AppliedWithDrift], MergeStatus::AppliedWithDrift, started).await.unwrap());
+    let lost_started = client.stale_finish_requests(zero, hour).await.unwrap();
+    cleanup(&client, db).await;
+
+    let has = |rows: &[chelabase_metadata::MergeRecord]| rows.iter().any(|r| r.id == m.id);
+    assert!(has(&stale) && marked);
+    assert!(!has(&after_hand_back), "handed back within the window");
+    assert!(has(&after_window));
+    assert!(has(&after_claim));
+    assert!(has(&lost) && !has(&recent));
+    assert!(!has(&finish_handed_back) && has(&finish_after_window));
+    assert!(has(&lost_started), "a write since the hand-back re-arms it");
+}
+
+// T14 F3 fix round (I1, the hold invariant on every path): the claim (reset, restore, the
+// worker's after-merge reset) and the delete's begin (the API's, the worker's delete job and its
+// after-merge delete) refuse a branch a merge holds as its source or its target, in exactly the
+// states that hold, under the branch's row lock with nothing written; a merge named as the one
+// that doesn't count (the finishing merge's own hold) never refuses.
+#[tokio::test]
+#[ignore]
+async fn every_branch_path_follows_the_hold_table() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let mut seen = Vec::new();
+    for (i, state) in MergeState::all().into_iter().enumerate() {
+        for dev_is_source in [true, false] {
+            let dev = ready_branch(&client, db, &format!("d{i}{dev_is_source}"), main).await;
+            let m = if dev_is_source {
+                new_merge(db, dev, main, "app")
+            } else {
+                NewMerge { direction: MergeDirection::FromParent, ..new_merge(db, main, dev, "app") }
+            };
+            let m = created_merge(&client, &m).await;
+            put_merge_in(&client, m.id, state).await;
+            let claim = client.claim_branch_for_switch(dev, false).await.unwrap();
+            client.set_branch_status(dev, &[BranchStatus::Resetting], BranchStatus::Ready).await.unwrap();
+            let claim_except = client.claim_branch_for_switch_except(dev, false, Some(m.id)).await.unwrap();
+            client.set_branch_status(dev, &[BranchStatus::Resetting], BranchStatus::Ready).await.unwrap();
+            let delete = client.begin_branch_delete(dev).await.unwrap();
+            let status_after = client.get_branch(dev).await.unwrap().unwrap().status;
+            let delete_except = if delete == BranchDeleteOutcome::Started {
+                // Already moved: the next call has nothing left to move.
+                BranchDeleteOutcome::Started
+            } else {
+                client.begin_branch_delete_except(dev, Some(m.id)).await.unwrap()
+            };
+            seen.push((state, dev_is_source, m.id, claim, claim_except, delete, status_after, delete_except));
+            put_merge_in(&client, m.id, MergeState::of(MergeStatus::Cancelled, None)).await;
+            client.mark_branch_deleted(dev).await.unwrap();
+        }
+    }
+    cleanup(&client, db).await;
+
+    for (state, dev_is_source, id, claim, claim_except, delete, status_after, delete_except) in seen {
+        let at = format!("{state:?} dev_is_source={dev_is_source}");
+        if state.holds_branches() {
+            assert_eq!(claim, ClaimOutcome::MergeBusy(BranchBusy::Merge(id)), "{at}");
+            assert_eq!(delete, BranchDeleteOutcome::MergeBusy(BranchBusy::Merge(id)), "{at}");
+            assert_eq!(status_after, BranchStatus::Ready, "{at}: nothing written");
+        } else {
+            assert_eq!(claim, ClaimOutcome::Claimed, "{at}");
+            assert_eq!(delete, BranchDeleteOutcome::Started, "{at}");
+        }
+        assert_eq!(claim_except, ClaimOutcome::Claimed, "{at}: its own hold");
+        assert_eq!(delete_except, BranchDeleteOutcome::Started, "{at}: its own hold");
+    }
+}
+
+// E34: a save of acknowledgements or the after-merge choice keeps a rehearsed merge rehearsed.
+#[tokio::test]
+#[ignore]
+async fn a_keep_plan_save_keeps_the_rehearsal() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    let patch = MergeStatusPatch { rehearsal: Some(serde_json::json!({"ok": true})), ..Default::default() };
+    assert!(client.set_merge_status(m.id, &MergeStatus::ALL, MergeStatus::Rehearsed, patch).await.unwrap());
+    let rehearsed = client.merge(m.id).await.unwrap().unwrap();
+    let save = MergeDraftPatch {
+        acknowledgements: Some(serde_json::json!(["x"])),
+        keep_plan: true,
+        ..Default::default()
+    };
+    let saved = client.update_merge_draft(m.id, rehearsed.version, &save).await.unwrap();
+    cleanup(&client, db).await;
+
+    let MergeWrite::Saved(saved) = saved else { panic!("{saved:?}") };
+    assert_eq!(saved.status, MergeStatus::Rehearsed);
+    assert_eq!(saved.rehearsal, Some(serde_json::json!({"ok": true})));
+    assert_eq!(saved.acknowledgements, serde_json::json!(["x"]));
+    assert_eq!(saved.version, rehearsed.version + 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn merge_events_in_order() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+
+    let mut status = MergeEvent::new(m.id, "status");
+    status.detail = Some(serde_json::json!({"to": "draft"}));
+    let mut step = MergeEvent::new(m.id, "step");
+    step.step_id = Some("s1".into());
+    step.phase = Some("phase1".into());
+    step.outcome = Some("ok".into());
+    step.duration_ms = Some(42);
+    let note = MergeEvent::new(m.id, "note");
+    for e in [&status, &step, &note] {
+        client.append_merge_event(e).await.unwrap();
+    }
+    let events = client.merge_events(m.id).await.unwrap();
+    let none = client.merge_events(uuid::Uuid::new_v4()).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert_eq!(events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["status", "step", "note"]);
+    assert!(events.windows(2).all(|w| w[0].id < w[1].id));
+    assert_eq!(events[0].detail, status.detail);
+    assert_eq!(
+        (events[1].step_id.as_deref(), events[1].phase.as_deref(), events[1].outcome.as_deref(), events[1].duration_ms),
+        (Some("s1"), Some("phase1"), Some("ok"), Some(42))
+    );
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn deleting_a_branch_cascades_its_bases() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let dev = ready_branch(&client, db, "dev", main).await;
+    client.append_schema_base(&base(dev, BaseSource::Create, None)).await.unwrap();
+    client.append_schema_base(&base(main, BaseSource::Create, None)).await.unwrap();
+    let m = created_merge(&client, &new_merge(db, dev, main, "app")).await;
+    client.append_merge_event(&MergeEvent::new(m.id, "note")).await.unwrap();
+
+    sqlx::query("DELETE FROM branches WHERE id = $1").bind(dev.as_uuid()).execute(client.pool()).await.unwrap();
+    let dev_base = client.schema_base(dev, "app").await.unwrap();
+    let main_base = client.schema_base(main, "app").await.unwrap();
+    let merge = client.merge(m.id).await.unwrap();
+    let events = client.merge_events(m.id).await.unwrap();
+    cleanup(&client, db).await;
+
+    assert!(dev_base.is_none());
+    assert!(main_base.is_some(), "the parent's base stays");
+    assert!(merge.is_none(), "a merge of a deleted branch goes with it");
+    assert!(events.is_empty());
+}
+
+// E1/P4: rehearsal and static endpoints are unroutable; the proxy lookups skip them.
+#[tokio::test]
+#[ignore]
+async fn routable_lookup_skips_unroutable_endpoints() {
+    let client = client().await;
+    let id = insert_pending(&client).await;
+    let ep = link_endpoint(&client, id).await;
+
+    let found = client.routable_endpoint(&ep).await.unwrap();
+    let secret = client.routable_role_secret(&ep, "postgres").await.unwrap();
+    assert_eq!(found.as_ref().map(|e| (e.routable, e.static_lsn.clone())), Some((true, None)));
+    assert_eq!(secret, Some(Some("SCRAM-SHA-256$v1".to_string())));
+
+    sqlx::query("UPDATE neon_endpoints SET routable = false WHERE id = $1")
+        .bind(&ep)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let found_after = client.routable_endpoint(&ep).await.unwrap();
+    let secret_after = client.routable_role_secret(&ep, "postgres").await.unwrap();
+    let plain = client.neon_endpoint(&ep).await.unwrap().unwrap();
+
+    // An endpoint created unroutable and pinned records both columns.
+    let id2 = insert_pending(&client).await;
+    let ep2 = ep_id();
+    let (tenant, timeline) = (hex32(), hex32());
+    let mut new = new_endpoint(&ep2, &tenant, &timeline);
+    new.routable = false;
+    new.static_lsn = Some("0/16B3748");
+    assert!(client.create_endpoint_for_branch(main_of(id2), &timeline, &new, false).await.unwrap());
+    let pinned = client.neon_endpoint(&ep2).await.unwrap().unwrap();
+    let pinned_routable = client.routable_endpoint(&ep2).await.unwrap();
+
+    cleanup(&client, id).await;
+    cleanup(&client, id2).await;
+    assert_eq!(found_after, None);
+    assert_eq!(secret_after, None);
+    assert!(!plain.routable, "the plain lookup still sees it");
+    assert!(!pinned.routable);
+    assert_eq!(pinned.static_lsn.as_deref(), Some("0/16B3748"));
+    assert_eq!(pinned_routable, None);
+}
+
+// T7: a base's static compute gets an unroutable, pinned endpoint row linked to no branch, and
+// reconcile sees how old it is (R3).
+#[tokio::test]
+#[ignore]
+async fn static_endpoint_is_unroutable_and_reconcile_sees_its_age() {
+    let client = client().await;
+    let (id, linked) = ready_database(&client).await;
+    let ep = ep_id();
+    let (tenant, timeline) = (hex32(), hex32());
+    client
+        .create_static_endpoint(&NewStaticEndpoint {
+            id: &ep,
+            tenant_id: &tenant,
+            timeline_id: &timeline,
+            compute_token_sha256: "aa",
+            static_lsn: "0/2000000",
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE neon_endpoints SET created_at = now() - interval '11 minutes' WHERE id = $1")
+        .bind(&ep)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let found = client.neon_endpoint(&ep).await.unwrap();
+    let routed = client.routable_endpoint(&ep).await.unwrap();
+    let roles = client.neon_roles(&ep).await.unwrap();
+    let all = client.list_endpoints_for_reconcile().await.unwrap();
+    let find = |id: &str| all.iter().find(|e| e.id == id).cloned().unwrap();
+    let (fixed, normal) = (find(&ep), find(&linked));
+    client.delete_endpoint(&ep).await.unwrap();
+    let gone = client.neon_endpoint(&ep).await.unwrap();
+    cleanup(&client, id).await;
+
+    let found = found.unwrap();
+    assert!(!found.routable);
+    assert_eq!(found.static_lsn.as_deref(), Some("0/2000000"));
+    assert_eq!(found.timeline_id, timeline);
+    assert_eq!(routed, None);
+    assert!(roles.is_empty());
+    assert_eq!(fixed.branch_id, None);
+    assert!(!fixed.routable);
+    assert_eq!(fixed.static_lsn.as_deref(), Some("0/2000000"));
+    assert!(fixed.age_secs >= 600, "{}", fixed.age_secs);
+    assert!(normal.routable);
+    assert_eq!(normal.static_lsn, None);
+    assert!(normal.age_secs < 600, "{}", normal.age_secs);
+    assert_eq!(gone, None);
+}
+
 // ---- secret keys vs role DROP / recreate (T13h) ----
 
 /// How long a call that must be waiting on the endpoint lock is given to finish (it must not).
@@ -5420,6 +6664,50 @@ async fn key_rows(client: &MetadataClient, branch: BranchId, role: &str) -> i64 
 fn bound_key(branch: BranchId, role: &str, name: &str, oid: Option<i64>) -> NewDataKey {
     let (key, _) = new_key(branch, DataKeyKind::Secret, role, name);
     NewDataKey { role_oid: oid, ..key }
+}
+
+/// A secret key bound to role OID `oid` read on `timeline` (E26).
+fn bound_on(branch: BranchId, role: &str, name: &str, oid: i64, timeline: &str) -> NewDataKey {
+    NewDataKey { role_timeline: Some(timeline.into()), ..bound_key(branch, role, name, Some(oid)) }
+}
+
+const TL1: &str = "11111111111111111111111111111111";
+const TL2: &str = "22222222222222222222222222222222";
+
+// E26: a secret key stores the timeline its OID was read on; it round-trips through the list,
+// carries over a rotation on the same timeline, and is re-stamped by a rotation checked on
+// another timeline under the same name (refused under another name). The column's CHECK
+// refuses a timeline without an OID.
+#[tokio::test]
+#[ignore]
+async fn secret_key_role_timeline_round_trips() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let key = bound_on(branch, "app", "tl", 16390, TL1);
+    let created = client.create_secret_key(&key).await;
+    let listed = client.list_data_keys(branch).await.unwrap();
+    let same = bound_on(branch, "app", "tl", 16390, TL1);
+    let rotated = client.rotate_secret_key(branch, key.id, &same).await;
+    let switched = bound_on(branch, "app", "tl", 16390, TL2);
+    let restamped = client.rotate_secret_key(branch, same.id, &switched).await;
+    let other_name = bound_on(branch, "x", "tl", 16390, TL1);
+    let refused = client.rotate_secret_key(branch, switched.id, &other_name).await;
+    let after = client.list_data_keys(branch).await.unwrap();
+    let orphan = NewDataKey { role_timeline: Some(TL1.into()), ..bound_key(branch, "app", "orphan", None) };
+    let check = client.create_secret_key(&orphan).await;
+    cleanup(&client, id).await;
+    assert!(created.is_ok(), "{created:?}");
+    let identity = |keys: &[chelabase_metadata::DataKeyRecord], id| {
+        keys.iter().find(|k| k.id == id).map(|k| (k.role_oid, k.role_timeline.clone()))
+    };
+    assert_eq!(identity(&listed, key.id), Some((Some(16390), Some(TL1.to_string()))));
+    assert!(matches!(rotated, Ok(true)), "{rotated:?}");
+    assert!(matches!(restamped, Ok(true)), "{restamped:?}");
+    assert!(matches!(&refused, Err(MetadataError::RoleRecreated(r)) if r == "app"), "{refused:?}");
+    assert_eq!(identity(&after, switched.id), Some((Some(16390), Some(TL2.to_string()))));
+    assert!(check.is_err(), "a timeline without an OID: {check:?}");
 }
 
 // C1: the worker checks the role on the compute; the store needs no `neon_roles` row (a
@@ -5510,10 +6798,13 @@ async fn fix_key_roles_applies_each_repair_conditionally() {
     let (id, _) = ready_database(&client).await;
     let branch = main_of(id);
     let dead = bound_key(branch, "gone", "dead", Some(16385));
-    let moved = bound_key(branch, "old_name", "moved", Some(16390));
+    let moved = bound_on(branch, "old_name", "moved", 16390, TL1);
     let legacy = bound_key(branch, "app", "legacy", None);
     let stale = bound_key(branch, "app", "stale", Some(16384));
-    for key in [&dead, &moved, &legacy, &stale] {
+    let elsewhere = bound_on(branch, "other", "elsewhere", 16391, TL2);
+    let unstamped = bound_key(branch, "kept", "unstamped", Some(16392));
+    let restamp_stale = bound_on(branch, "kept2", "restamp_stale", 16393, TL1);
+    for key in [&dead, &moved, &legacy, &stale, &elsewhere, &unstamped, &restamp_stale] {
         client.create_secret_key(key).await.unwrap();
     }
     let changed = client
@@ -5521,22 +6812,31 @@ async fn fix_key_roles_applies_each_repair_conditionally() {
             branch,
             &[
                 KeyRoleFix::Revoke { id: dead.id, role: "gone".into(), oid: Some(16385) },
-                KeyRoleFix::Follow { id: moved.id, from: "old_name".into(), to: "renamed".into(), oid: 16390 },
-                KeyRoleFix::Backfill { id: legacy.id, role: "app".into(), oid: 16384 },
+                KeyRoleFix::Follow { id: moved.id, from: "old_name".into(), to: "renamed".into(), oid: 16390, timeline: TL1.into() },
+                KeyRoleFix::Backfill { id: legacy.id, role: "app".into(), oid: 16384, timeline: TL1.into() },
                 // Seen with another OID than the row has now: left alone.
                 KeyRoleFix::Revoke { id: stale.id, role: "app".into(), oid: Some(1) },
+                // E26: a Follow never applies to a row bound on another timeline.
+                KeyRoleFix::Follow { id: elsewhere.id, from: "other".into(), to: "x".into(), oid: 16391, timeline: TL1.into() },
+                KeyRoleFix::Restamp { id: unstamped.id, role: "kept".into(), oid: 16392, from: None, timeline: TL1.into() },
+                // Seen with another timeline than the row has now: left alone.
+                KeyRoleFix::Restamp { id: restamp_stale.id, role: "kept2".into(), oid: 16393, from: Some(TL2.into()), timeline: TL1.into() },
             ],
         )
         .await
         .unwrap();
     let keys = client.list_data_keys(branch).await.unwrap();
     cleanup(&client, id).await;
-    assert_eq!(changed, 3);
+    assert_eq!(changed, 4);
     let find = |id| keys.iter().find(|k| k.id == id);
     assert!(find(dead.id).is_none(), "revoked");
     assert_eq!(find(moved.id).unwrap().role, "renamed");
     assert_eq!(find(legacy.id).unwrap().role_oid, Some(16384));
+    assert_eq!(find(legacy.id).unwrap().role_timeline.as_deref(), Some(TL1), "a backfill stamps the timeline");
     assert!(find(stale.id).is_some(), "a repair that no longer matches is skipped");
+    assert_eq!(find(elsewhere.id).unwrap().role, "other", "not followed across timelines");
+    assert_eq!(find(unstamped.id).unwrap().role_timeline.as_deref(), Some(TL1), "re-stamped");
+    assert_eq!(find(restamp_stale.id).unwrap().role_timeline.as_deref(), Some(TL1), "left as it was");
 }
 
 #[tokio::test]
@@ -5754,4 +7054,379 @@ async fn ddl_rowless_swap_moves_each_roles_keys() {
             .unwrap();
     cleanup(&client, id).await;
     assert_eq!(roles, [("key-a".to_string(), "b".to_string()), ("key-b".to_string(), "a".to_string())]);
+}
+
+// --- T14 fix batch F2 ---------------------------------------------------------------------
+
+/// Restores `dev` (ready) to `at` on its current timeline; returns the restored timeline.
+async fn restore_once(client: &MetadataClient, dev: BranchId, at: &str) -> String {
+    let pending = start_reset(client, dev).await;
+    let backup_name = format!("dev-before-restore-{}", &hex32()[..8]);
+    let switched = client
+        .switch_to_restored_timeline(dev, &pending, BranchId::new(), &backup_name, at)
+        .await
+        .unwrap();
+    assert!(switched);
+    assert!(client.set_branch_status(dev, &[BranchStatus::Resetting], BranchStatus::Ready).await.unwrap());
+    pending
+}
+
+// T14 I1: a restore to a point before an earlier restore's walks the restore chain back, at any
+// depth, to the timeline whose base was current there, also through a timeline that got no
+// copy (its first entry is after the point).
+#[tokio::test]
+#[ignore]
+async fn a_second_restore_before_the_first_walks_the_restore_chain() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let dev = ready_branch(&client, db, "dev", main_of(db)).await;
+    let t0 = branch(&client, dev).await.timeline_id.unwrap();
+    let mut create = base_at(dev, "app", BaseSource::Create, &t0, "0/1000");
+    create.model = Some(serde_json::json!({"tables": ["t0"]}));
+    let create_id = client.append_schema_base(&create).await.unwrap();
+    client.append_schema_base(&base_at(dev, "app", BaseSource::Merge, &t0, "0/6000")).await.unwrap();
+
+    // t0 -> t1 at 0/5000: the create's entry is copied onto t1 at 0/5000.
+    let t1 = restore_once(&client, dev, "0/5000").await;
+    let on_t1 = client.schema_base(dev, "app").await.unwrap().unwrap();
+    // t1 -> t2 at 0/3000, before t1's first entry: walks to t0 at 0/3000.
+    let t2 = restore_once(&client, dev, "0/3000").await;
+    let on_t2 = client.schema_base(dev, "app").await.unwrap().unwrap();
+    // t2 -> t3 at 0/2000: t2's copy is at 0/3000, so on to t1 at 0/2000 (none), then t0.
+    let t3 = restore_once(&client, dev, "0/2000").await;
+    let on_t3 = client.schema_base(dev, "app").await.unwrap().unwrap();
+    // t3 -> t4 at 0/800: before every entry anywhere: no copy.
+    let t4 = restore_once(&client, dev, "0/800").await;
+    let on_t4 = client.schema_base(dev, "app").await.unwrap().unwrap();
+    let links: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT timeline_id, from_timeline_id, at_lsn FROM branch_restores
+         WHERE branch_id = $1 ORDER BY created_at, timeline_id",
+    )
+    .bind(dev.as_uuid())
+    .fetch_all(client.pool())
+    .await
+    .unwrap();
+    cleanup(&client, db).await;
+
+    let located = |b: &SchemaBase| {
+        (b.branch_timeline_id.clone().unwrap(), b.branch_lsn.clone().unwrap(), b.timeline_id.clone(), b.lsn.clone())
+    };
+    assert_eq!(located(&on_t1), (t1.clone(), "0/5000".into(), Some(t0.clone()), Some("0/1000".into())));
+    assert_eq!(located(&on_t2), (t2.clone(), "0/3000".into(), Some(t0.clone()), Some("0/1000".into())));
+    assert_eq!(located(&on_t3), (t3.clone(), "0/2000".into(), Some(t0.clone()), Some("0/1000".into())));
+    for b in [&on_t1, &on_t2, &on_t3] {
+        assert_eq!(b.model, create.model, "the create's model, copied");
+        assert_eq!(b.source, BaseSource::Create);
+        assert!(b.id > create_id);
+    }
+    assert_eq!(on_t4.branch_timeline_id.as_deref(), Some(t3.as_str()), "nothing at or before 0/800: no copy");
+    assert_eq!(
+        links,
+        vec![
+            (t1.clone(), t0.clone(), "0/5000".into()),
+            (t2.clone(), t1.clone(), "0/3000".into()),
+            (t3.clone(), t2.clone(), "0/2000".into()),
+            (t4, t3, "0/800".into()),
+        ]
+    );
+}
+
+// T14 M7: appending drops the model of an entry superseded on its own timeline by one recorded
+// more than the history window ago; the entry stays, with its location and map. Other
+// timelines, databases and recent supersessions keep theirs.
+#[tokio::test]
+#[ignore]
+async fn superseded_bases_drop_their_model_after_the_window() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (db, _ep) = ready_database(&client).await;
+    let main = main_of(db);
+    let (t, u) = (hex32(), hex32());
+    let with_model = |db_name: &str, timeline: &str, lsn: &str| {
+        let mut b = base_at(main, db_name, BaseSource::Merge, timeline, lsn);
+        b.model = Some(serde_json::json!({"at": lsn}));
+        b.model_version = Some(1);
+        b.server_major = Some(17);
+        b.identity_map = serde_json::json!({"pairs": [1]});
+        b
+    };
+    let old = client.append_schema_base(&with_model("app", &t, "0/1000")).await.unwrap();
+    let superseding = client.append_schema_base(&with_model("app", &t, "0/2000")).await.unwrap();
+    let other_db = client.append_schema_base(&with_model("shop", &t, "0/1000")).await.unwrap();
+    let other_timeline = client.append_schema_base(&with_model("app", &u, "0/1000")).await.unwrap();
+    // The superseding entry was recorded eight days ago (the window is seven).
+    sqlx::query("UPDATE branch_schema_bases SET recorded_at = now() - interval '8 days' WHERE id = $1")
+        .bind(superseding)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let recent = client.append_schema_base(&with_model("app", &t, "0/3000")).await.unwrap();
+    let rows: Vec<(i64, Option<serde_json::Value>, Option<i32>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, model, model_version, identity_map FROM branch_schema_bases WHERE branch_id = $1 ORDER BY id",
+    )
+    .bind(main.as_uuid())
+    .fetch_all(client.pool())
+    .await
+    .unwrap();
+    cleanup(&client, db).await;
+
+    let has_model = |id: i64| rows.iter().find(|r| r.0 == id).map(|r| r.1.is_some() && r.2.is_some()).unwrap();
+    assert!(!has_model(old), "superseded on its timeline by an entry older than the window");
+    assert_eq!(rows.iter().find(|r| r.0 == old).unwrap().3, serde_json::json!({"pairs": [1]}), "the map stays");
+    assert!(has_model(superseding), "superseded only by a recent entry");
+    assert!(has_model(other_db) && has_model(other_timeline) && has_model(recent));
+}
+
+// T14 I2: turning LOGIN on (a row without a verifier gets one) counts against the cap in the
+// same transaction, for an API row's PATCH and for an SQL role's new password; a row that
+// already has a verifier isn't counted again.
+#[tokio::test]
+#[ignore]
+async fn login_on_respects_the_cap() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let plain = RoleAttributes::default();
+    let nologin = |name| NewApiRole { name, owner_level: false, login: false, attributes: &plain, verifier: None, password_enc: None, change_id: uuid::Uuid::new_v4() };
+    client.insert_api_role(&ep, "a1", false, "SCRAM-SHA-256$a", "v1:a", 2).await.unwrap();
+    client.insert_api_role_with(&ep, &nologin("g1"), 2).await.unwrap();
+    client.insert_api_role_with(&ep, &nologin("g2"), 2).await.unwrap();
+    let on = ApiRoleChange {
+        owner_level: false,
+        login: true,
+        attributes: plain.clone(),
+        secret: SecretChange::Set("SCRAM-SHA-256$n".into(), "v1:n".into()),
+        change_id: uuid::Uuid::new_v4(),
+    };
+    let first = client.update_api_role(&ep, "g1", &on, 2).await.unwrap();
+    let second = client.update_api_role(&ep, "g2", &on, 2).await.unwrap();
+    // A row that has a verifier: no new copy, never refused.
+    let again = client.update_api_role(&ep, "a1", &on, 2).await.unwrap();
+    let sql_role = client.store_role_secret(&ep, "made_in_sql", "SCRAM-SHA-256$s", "v1:s", 2).await.unwrap();
+    // An SQL row with a verifier already counts: replacing its password is fine.
+    seed_copy(&client, &ep, "counted", "sql", Some(SQL_VERIFIER), None).await;
+    let replaced = client.store_role_secret(&ep, "counted", "SCRAM-SHA-256$t", "v1:t", 2).await.unwrap();
+    let rows = client.list_roles(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(first, RoleWriteOutcome::Done);
+    assert_eq!(second, RoleWriteOutcome::CapReached);
+    assert_eq!(again, RoleWriteOutcome::Done);
+    assert_eq!(sql_role, RoleWriteOutcome::CapReached);
+    assert_eq!(replaced, RoleWriteOutcome::Done);
+    let g2 = rows.iter().find(|r| r.name == "g2").unwrap();
+    assert!(!g2.login, "nothing written at the cap");
+    assert!(!rows.iter().any(|r| r.name == "made_in_sql"));
+}
+
+// T14 E32: an API create or PATCH marks the row's attributes pending; a confirm or a resync
+// write clears it; a reset (`pending` alone) doesn't set it. Rows from before the column start
+// false. The resync records an API row's owner level when asked; `None` keeps it.
+#[tokio::test]
+#[ignore]
+async fn attributes_pending_follows_api_writes() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    seed_copy(&client, &ep, "legacy", "api", Some(SQL_VERIFIER), None).await;
+    let plain = RoleAttributes::default();
+    let created = uuid::Uuid::new_v4();
+    let app = NewApiRole {
+        name: "app",
+        owner_level: false,
+        login: true,
+        attributes: &plain,
+        verifier: Some("SCRAM-SHA-256$a"),
+        password_enc: Some("v1:a"),
+        change_id: created,
+    };
+    client.insert_api_role_with(&ep, &app, 10).await.unwrap();
+    let state = |client: MetadataClient, ep: String| async move {
+        let (copies, v) = client.role_copies(&ep).await.unwrap();
+        let of = |n: &str| copies.iter().find(|c| c.name == n).map(|c| (c.pending, c.attributes_pending, c.api_owner_level)).unwrap();
+        (of("app"), of("legacy"), v)
+    };
+    let (inserted, legacy, v) = state(client.clone(), ep.clone()).await;
+    let confirmed = client.confirm_role(&ep, "app", v, Some(created)).await.unwrap();
+    let (after_confirm, _, _) = state(client.clone(), ep.clone()).await;
+    client.replace_role_secret(&ep, "app", "SCRAM-SHA-256$b", "v1:b").await.unwrap();
+    let (after_reset, _, _) = state(client.clone(), ep.clone()).await;
+    let change = ApiRoleChange { owner_level: false, login: true, attributes: RoleAttributes::default(), secret: SecretChange::Keep, change_id: uuid::Uuid::new_v4() };
+    client.update_api_role(&ep, "app", &change, 10).await.unwrap();
+    let (after_patch, _, v) = state(client.clone(), ep.clone()).await;
+    let mut recorded = upsert("app", RoleOrigin::Api, "SCRAM-SHA-256$b");
+    recorded.api_owner_level = Some(true);
+    recorded.level = RoleLevel::OwnerLevel;
+    let mut kept = upsert("legacy", RoleOrigin::Api, SQL_VERIFIER);
+    kept.api_owner_level = None;
+    let write = ResyncWrite { upserts: vec![recorded, kept], removals: vec![], databases: vec![observed("db", "postgres", false)] };
+    client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let (after_resync, legacy_after, _) = state(client.clone(), ep.clone()).await;
+    cleanup(&client, id).await;
+    assert_eq!(inserted, (true, true, false));
+    assert_eq!(legacy, (false, false, false), "an existing row starts false");
+    assert!(confirmed);
+    assert_eq!(after_confirm, (false, false, false));
+    assert_eq!(after_reset, (true, false, false), "a reset leaves the attributes alone");
+    assert_eq!(after_patch, (true, true, false));
+    assert_eq!(after_resync, (false, false, true), "the resync recorded the catalog's owner level");
+    assert_eq!(legacy_after, (false, false, false), "None keeps the row's owner level");
+}
+
+// F2 fix round I-1: a confirm clears `attributes_pending` by the change's id even when the
+// version moved (a receiver write meanwhile); `pending` keeps the version guard. A confirm
+// carrying an older change's id leaves a newer change pending.
+#[tokio::test]
+#[ignore]
+async fn confirm_clears_attributes_by_change_id() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let plain = RoleAttributes::default();
+    let first = uuid::Uuid::new_v4();
+    let role = NewApiRole { name: "app", owner_level: false, login: false, attributes: &plain, verifier: None, password_enc: None, change_id: first };
+    client.insert_api_role_with(&ep, &role, 10).await.unwrap();
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let first_version = v;
+    // A receiver write lands between the apply and the confirm.
+    seed_copy(&client, &ep, "other", "sql", Some(SQL_VERIFIER), None).await;
+    sqlx::query("UPDATE neon_endpoints SET roles_version = roles_version + 1 WHERE id = $1")
+        .bind(&ep)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    let cleared = client.confirm_role(&ep, "app", v, Some(first)).await.unwrap();
+    let flags = |client: MetadataClient, ep: String| async move {
+        let (copies, _) = client.role_copies(&ep).await.unwrap();
+        let app = copies.into_iter().find(|c| c.name == "app").unwrap();
+        (app.pending, app.attributes_pending)
+    };
+    let after_lost = flags(client.clone(), ep.clone()).await;
+    // A newer change, then a confirm of the older one.
+    let second = uuid::Uuid::new_v4();
+    let change = ApiRoleChange { owner_level: false, login: false, attributes: plain.clone(), secret: SecretChange::Keep, change_id: second };
+    client.update_api_role(&ep, "app", &change, 10).await.unwrap();
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    // The stale confirm carries what its own (older) write read: the first version and id.
+    client.confirm_role(&ep, "app", first_version, Some(first)).await.unwrap();
+    let after_stale = flags(client.clone(), ep.clone()).await;
+    let confirmed = client.confirm_role(&ep, "app", v, Some(second)).await.unwrap();
+    let after_confirm = flags(client.clone(), ep.clone()).await;
+    cleanup(&client, id).await;
+    assert!(!cleared, "pending isn't cleared past a version bump");
+    assert_eq!(after_lost, (true, false), "attributes cleared by id");
+    assert_eq!(after_stale, (true, true), "an older version leaves pending, an older id leaves the attributes pending");
+    assert!(confirmed);
+    assert_eq!(after_confirm, (false, false));
+}
+
+// F2 fix round M7: only a secret key can be marked as bypassing RLS.
+#[tokio::test]
+#[ignore]
+async fn only_a_secret_key_bypasses_rls() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (public, _) = new_key(branch, DataKeyKind::Public, "anon", "pub2");
+    let stored = client.insert_data_key(&public).await;
+    let marked = sqlx::query("UPDATE data_api_keys SET role_bypass_rls = true WHERE branch_id = $1 AND kind = 'public'")
+        .bind(branch.as_uuid())
+        .execute(client.pool())
+        .await;
+    cleanup(&client, id).await;
+    let _ = stored;
+    assert!(marked.is_err(), "the CHECK refuses a public key marked");
+}
+
+// T14 E33: a secret key stores whether its role has BYPASSRLS; the list returns it, a rotation
+// takes the new check's answer, and the resync's fix updates it only while the OID matches.
+#[tokio::test]
+#[ignore]
+async fn secret_key_bypass_rls_round_trips_and_is_fixed_by_oid() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let key = NewDataKey { role_bypass_rls: true, ..bound_on(branch, "svc", "svc", 16390, TL1) };
+    client.create_secret_key(&key).await.unwrap();
+    let listed = client.list_data_keys(branch).await.unwrap();
+    let plain = bound_on(branch, "svc", "svc", 16390, TL1);
+    client.rotate_secret_key(branch, key.id, &plain).await.unwrap();
+    let rotated = client.list_data_keys(branch).await.unwrap();
+    let stale = client
+        .fix_key_roles(branch, &[KeyRoleFix::Bypass { id: plain.id, oid: 1, bypass_rls: true }])
+        .await
+        .unwrap();
+    let fixed = client
+        .fix_key_roles(branch, &[KeyRoleFix::Bypass { id: plain.id, oid: 16390, bypass_rls: true }])
+        .await
+        .unwrap();
+    let after = client.list_data_keys(branch).await.unwrap();
+    // A public key never bypasses, whatever is asked.
+    let (public, _) = new_key(branch, DataKeyKind::Public, "anon", "pub");
+    let public = NewDataKey { role_bypass_rls: true, ..public };
+    let public_stored = client.insert_data_key(&public).await;
+    let keys = client.list_data_keys(branch).await.unwrap();
+    cleanup(&client, id).await;
+    let flag = |keys: &[chelabase_metadata::DataKeyRecord], id| keys.iter().find(|k| k.id == id).map(|k| k.role_bypass_rls);
+    assert_eq!(flag(&listed, key.id), Some(true));
+    assert_eq!(flag(&rotated, plain.id), Some(false), "the rotation's check decides");
+    assert_eq!((stale, fixed), (0, 1));
+    assert_eq!(flag(&after, plain.id), Some(true));
+    if public_stored.is_ok() {
+        assert_eq!(flag(&keys, public.id), Some(false));
+    }
+}
+
+// T14 E29: a control-plane rename moves the row (resealed) and every key of the old name;
+// a taken name (a row, or live keys of a dropped role) moves nothing; a role without a row
+// moves its keys only.
+#[tokio::test]
+#[ignore]
+async fn rename_role_copy_moves_the_row_and_keys() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    client.insert_api_role(&ep, "app", false, "SCRAM-SHA-256$a", "v1:app", 10).await.unwrap();
+    client.insert_api_role(&ep, "other", false, "SCRAM-SHA-256$o", "v1:o", 10).await.unwrap();
+    let app_key = bound_on(branch, "app", "app-key", 16390, TL1);
+    let rowless_key = bound_on(branch, "group", "group-key", 16391, TL1);
+    let dead_key = bound_on(branch, "ghost", "ghost-key", 16392, TL1);
+    for key in [&app_key, &rowless_key, &dead_key] {
+        client.create_secret_key(key).await.unwrap();
+    }
+    let v = version(&client, &ep).await;
+    let onto_row = client.rename_role_copy(&ep, branch, "app", "other", Some("v1:x"), None).await.unwrap();
+    let onto_keys = client.rename_role_copy(&ep, branch, "app", "ghost", Some("v1:x"), None).await.unwrap();
+    let renamed = client.rename_role_copy(&ep, branch, "app", "app2", Some("v1:app2"), None).await.unwrap();
+    let after = version(&client, &ep).await;
+    let rowless = client.rename_role_copy(&ep, branch, "group", "group2", None, None).await.unwrap();
+    let unknown = client.rename_role_copy("ep-unknown", branch, "group2", "group3", None, None).await.unwrap();
+    // M4: a move that couldn't reseal marks the row; moving it back restores the flag.
+    let lost = client.rename_role_copy(&ep, branch, "other", "other2", None, None).await.unwrap();
+    let marked = client.list_roles(&ep).await.unwrap().into_iter().find(|r| r.name == "other2").unwrap().password;
+    let back = client.rename_role_copy(&ep, branch, "other2", "other", Some("v1:o"), Some(false)).await.unwrap();
+    let restored = client.list_roles(&ep).await.unwrap().into_iter().find(|r| r.name == "other").unwrap().password;
+    let (copies, _) = client.role_copies(&ep).await.unwrap();
+    let keys = client.list_data_keys(branch).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(unknown, RenameCopyOutcome::NotFound, "an unknown endpoint isn't a taken name");
+    assert_eq!(lost, RenameCopyOutcome::Renamed { row: true, was_unreadable: false });
+    assert_eq!(marked, PasswordState::Unreadable);
+    assert_eq!(back, RenameCopyOutcome::Renamed { row: true, was_unreadable: true });
+    assert_eq!(restored, PasswordState::Generated);
+    assert_eq!((onto_row, onto_keys), (RenameCopyOutcome::Taken, RenameCopyOutcome::Taken));
+    assert_eq!(renamed, RenameCopyOutcome::Renamed { row: true, was_unreadable: false });
+    assert_eq!(rowless, RenameCopyOutcome::Renamed { row: false, was_unreadable: false });
+    assert_eq!(after, v + 1);
+    let app2 = copies.iter().find(|c| c.name == "app2").unwrap();
+    assert_eq!((app2.origin, app2.scram_verifier.as_deref(), app2.password_enc.as_deref()), (RoleOrigin::Api, Some("SCRAM-SHA-256$a"), Some("v1:app2")));
+    assert!(!copies.iter().any(|c| c.name == "app"));
+    let role_of = |id| keys.iter().find(|k| k.id == id).map(|k| (k.role.clone(), k.role_oid, k.role_timeline.clone()));
+    assert_eq!(role_of(app_key.id), Some(("app2".into(), Some(16390), Some(TL1.into()))), "OID and timeline kept");
+    assert_eq!(role_of(rowless_key.id), Some(("group2".into(), Some(16391), Some(TL1.into()))));
+    assert_eq!(role_of(dead_key.id).map(|r| r.0), Some("ghost".into()));
 }

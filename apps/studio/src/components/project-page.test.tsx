@@ -8,7 +8,7 @@ import { fakeFetch, jsonResponse, sequence, type FakeHandler } from "@/test/fake
 import { renderWithRouter } from "@/test/render-router";
 import { ProjectPage, type ProjectPageProps, type ProjectTab } from "./project-page";
 
-const database = { database_id: "d1", name: "web1", status: "ready", host: "127.0.0.1", port: 49153, branch_count: 1 } as const;
+const database = { database_id: "d1", name: "web1", postgres_database: "web1", status: "ready", host: "127.0.0.1", port: 49153, branch_count: 1 } as const;
 const me: Me = {
   user: { sub: "u1", org_id: "org-1" },
   tenant: {
@@ -146,6 +146,47 @@ describe("ProjectPage", () => {
     expect(fetch.calls.map((r) => new URL(r.url).pathname)).toContain("/v1/databases/d1/branches");
     await userEvent.click(screen.getByRole("button", { name: "Branches" }));
     expect(screen.queryByText("0 of 5 branches")).toBeNull();
+  });
+
+  it("opens a branch's connection panel for a role from the link's params", async () => {
+    const { fetch } = setup(
+      {
+        "GET /v1/databases/d1/merges": () => jsonResponse([]),
+        "GET /v1/databases/d1/branches/b-main/roles": () => jsonResponse([]),
+        "GET /v1/databases/d1/branches/b-main/databases": () => jsonResponse([]),
+        "GET /v1/databases/d1/branches/b-main/connection": (req) =>
+          jsonResponse({
+            host: "ep-x.localtest.me", port: 4432, database: "web1", user: new URL(req.url).searchParams.get("role"),
+            password: "pw-reporter", password_state: "generated", ca_file: null, http_url: "https://ep-x.localtest.me",
+            uri: "postgres://reporter:pw-reporter@ep-x.localtest.me:4432/web1",
+          }),
+      },
+      { focus: { databaseId: "d1", branchId: "b-main", role: "reporter" } },
+    );
+    // The database's branches are open, and the branch's connection shows the role (password masked).
+    expect(await screen.findByText("reporter")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Branches" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByText("pw-reporter")).toBeNull();
+    const call = fetch.calls.find((r) => new URL(r.url).pathname.endsWith("/connection"))!;
+    expect(new URL(call.url).searchParams.get("role")).toBe("reporter");
+  });
+
+  it("opens the merges of a database", async () => {
+    setup({
+      "GET /v1/databases/d1/merges": () =>
+        jsonResponse([
+          {
+            id: "m1", source_branch_id: "b-dev", target_branch_id: "b-main", direction: "into_parent", database: "web1",
+            status: "draft", failed_phase: null, version: 1, rebaselined: false, error: null, created_by: "u1",
+            created_at: "2026-10-06T10:00:00Z", updated_at: "2026-10-06T10:00:00Z",
+          },
+        ]),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Merges" }));
+    const link = await screen.findByRole("link", { name: /into main/ });
+    expect(link).toHaveAttribute("href", "/app/projects/p1/databases/d1/merges/m1");
+    await userEvent.click(screen.getByRole("button", { name: "Merges" }));
+    expect(screen.queryByRole("table", { name: "Merges" })).toBeNull();
   });
 
   it("opens the Data API view of a database, switching with Branches", async () => {

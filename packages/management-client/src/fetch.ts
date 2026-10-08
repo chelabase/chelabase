@@ -1,5 +1,5 @@
 import { ApiError } from "./error";
-import { getConsoleQueryUrl } from "./generated/endpoints";
+import { getConsoleQueryUrl, getExportMergePlanUrl } from "./generated/endpoints";
 import type { ConsoleRequest } from "./generated/model";
 import type { ErrorCode } from "./generated/model/errorCode";
 
@@ -84,8 +84,12 @@ function send<T>(path: string, options: RequestInit, parse?: (text: string) => u
   return requestJson<T>(fetchImpl, `${config.baseUrl}${path}`, { ...options, headers }, config.onUnauthorized, parse);
 }
 
+/** Answers that are text, not JSON: the merge plan's SQL. */
+const TEXT_ANSWER = /\/plan\.sql$/;
+
 /** Orval mutator for the Management API. */
-export const customFetch = async <T>(url: string, options: RequestInit): Promise<T> => send<T>(url, options);
+export const customFetch = async <T>(url: string, options: RequestInit): Promise<T> =>
+  send<T>(url, options, TEXT_ANSWER.test(url) ? (text) => text : undefined);
 
 type Reviver = (this: unknown, key: string, value: unknown, context?: { source?: string }) => unknown;
 
@@ -114,6 +118,10 @@ export const consoleQueryExact = async (
   branchId: string,
   request: ConsoleRequest,
 ): Promise<unknown> => send<unknown>(getConsoleQueryUrl(id, branchId), { method: "POST", body: JSON.stringify(request) }, parseExact);
+
+/** A merge's plan as SQL text (the generated `exportMergePlan` returns the same). */
+export const fetchMergePlanSql = async (id: string, mergeId: string): Promise<string> =>
+  send<string>(getExportMergePlanUrl(id, mergeId), { method: "GET" }, (text) => text);
 
 /**
  * POSTs `body` as JSON and returns the response body stream (for NDJSON endpoints).

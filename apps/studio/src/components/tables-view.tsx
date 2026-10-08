@@ -138,7 +138,11 @@ export function TablesView({ databaseId }: TablesViewProps) {
             <option value="authenticated">authenticated</option>
             {roleRows.map((r) => (
               <option key={r.name} value={r.name} disabled={r.level === "owner_level"}>
-                {r.level === "owner_level" ? `${r.name} (can bypass row-level security, so it can't be used)` : r.name}
+                {r.level === "owner_level"
+                  ? `${r.name} (owner-level, so it can't be used)`
+                  : r.bypass_rls
+                    ? `${r.name} (bypasses row-level security)`
+                    : r.name}
               </option>
             ))}
           </select>
@@ -148,6 +152,11 @@ export function TablesView({ databaseId }: TablesViewProps) {
       {role === "" && (
         <p className="rounded-lg border border-destructive/40 p-2 text-sm">
           Viewing as owner: row-level security is bypassed, and edits apply to every row.
+        </p>
+      )}
+      {role !== "" && roleRows.find((r) => r.name === role)?.bypass_rls && (
+        <p className="rounded-lg border border-destructive/40 p-2 text-sm">
+          Viewing as {role}: it has BYPASSRLS, so row-level security is bypassed, and edits apply to every row.
         </p>
       )}
       {error && (

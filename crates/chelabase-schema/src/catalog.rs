@@ -1,0 +1,961 @@
+//! The catalog reader (T2): one SQL script that returns the database's catalog as one JSON
+//! document, and its parser into a normalized [`SchemaModel`].
+
+use serde::Deserialize;
+
+use crate::error::SchemaError;
+use crate::model::*;
+
+/// `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL search_path = pg_catalog;
+/// SET LOCAL DateStyle/TimeZone; DO <users table lookup>; SELECT <one json document>; COMMIT;`:
+/// exactly one line of JSON on psql's `-X -q -A -t` stdout (every other statement prints
+/// nothing under `-q`). Run as one simple query, the SELECT's single value is the document.
+///
+/// The P6 exclusions ([`crate::exclusions`]) are applied inside the SQL. The `DO` block reads the
+/// users table named in `chelabase.app_users_table` only when that table exists (one SELECT
+/// can't name a table that may be missing) and passes its OID on in a transaction-local
+/// setting; it writes nothing, so it runs in the read-only transaction.
+pub const CATALOG_SQL: &str = include_str!("catalog_sql.sql");
+
+/// [`CATALOG_SQL`]'s filter on the data API's per-schema default-privilege grants to `anon` and
+/// `authenticated` (P6), on the owner's rows only (T14 M5: a user's own `FOR ROLE other … TO
+/// authenticated` row stays).
+const DATA_API_DEFAULT_ACL_FILTER: &str = "WHERE NOT (d.defaclnamespace <> 0 AND dr.rolname = 'postgres'\n                       AND coalesce(ge.rolname, '') IN ('anon', 'authenticated'))";
+
+/// [`CATALOG_SQL`] keeping the data API's per-schema default-privilege rows: the `default_acl`
+/// model [`crate::compare::expected_model`] simulates new objects' grants with (P7). The tables a
+/// merge creates in a served schema get those grants, so the drift check must expect them. Only
+/// its `default_privileges` are used.
+pub fn default_acl_sql() -> String {
+    CATALOG_SQL.replacen(DATA_API_DEFAULT_ACL_FILTER, "", 1)
+}
+
+/// Parses [`CATALOG_SQL`]'s output; refuses a server major other than
+/// [`crate::SUPPORTED_SERVER_MAJOR`]; normalizes and sorts.
+pub fn parse_catalog(json: &str) -> Result<SchemaModel, SchemaError> {
+    let version: RawVersion = serde_json::from_str(json).map_err(parse_error)?;
+    let major = version.server_version_num / 10000;
+    if major != crate::SUPPORTED_SERVER_MAJOR {
+        return Err(SchemaError::UnsupportedServer(major));
+    }
+    let raw: RawCatalog = serde_json::from_str(json).map_err(parse_error)?;
+    let mut m = SchemaModel::empty(major);
+    m.schemas = raw
+        .schemas
+        .into_iter()
+        .map(|s| {
+            Ok(Schema {
+                oid: s.oid,
+                name: s.name,
+                owner: s.owner,
+                comment: s.comment,
+                grants: grants(s.acl)?,
+            })
+        })
+        .collect::<Result<_, SchemaError>>()?;
+    m.tables = raw
+        .tables
+        .into_iter()
+        .map(table)
+        .collect::<Result<_, _>>()?;
+    m.enums = raw.enums;
+    m.sequences = raw
+        .sequences
+        .into_iter()
+        .map(|s| {
+            Ok(Sequence {
+                oid: s.oid,
+                schema: s.schema,
+                name: s.name,
+                owner: s.owner,
+                comment: s.comment,
+                params: s.params,
+                owned_by: s.owned_by,
+                grants: grants(s.acl)?,
+            })
+        })
+        .collect::<Result<_, SchemaError>>()?;
+    m.roles = raw.roles;
+    m.default_privileges = raw
+        .default_privileges
+        .into_iter()
+        .map(|d| {
+            Ok(DefaultPrivilege {
+                oid: d.oid,
+                role: d.role,
+                schema: d.schema,
+                object_type: match d.object_type.as_str() {
+                    "r" => DefaultPrivilegeObject::Tables,
+                    "S" => DefaultPrivilegeObject::Sequences,
+                    "f" => DefaultPrivilegeObject::Functions,
+                    "T" => DefaultPrivilegeObject::Types,
+                    "n" => DefaultPrivilegeObject::Schemas,
+                    other => return Err(unknown("defaclobjtype", other)),
+                },
+                grants: grants(d.acl)?,
+            })
+        })
+        .collect::<Result<_, SchemaError>>()?;
+    m.reported = raw
+        .reported
+        .into_iter()
+        .map(|r| Reported {
+            kind: reported_kind(r.kind),
+            oid: r.oid,
+            schema: r.schema,
+            name: r.name,
+            parent: r.parent,
+            arguments: r.arguments,
+            definition: r.definition,
+        })
+        .collect();
+    m.normalize();
+    Ok(m)
+}
+
+fn parse_error(e: serde_json::Error) -> SchemaError {
+    SchemaError::Parse(e.to_string())
+}
+
+fn unknown(what: &str, value: &str) -> SchemaError {
+    SchemaError::UnknownCatalogValue {
+        what: what.to_string(),
+        value: value.to_string(),
+    }
+}
+
+fn reported_kind(kind: String) -> ReportedKind {
+    match kind.as_str() {
+        "view" => ReportedKind::View,
+        "materialized_view" => ReportedKind::MaterializedView,
+        "function" => ReportedKind::Function,
+        "procedure" => ReportedKind::Procedure,
+        "trigger" => ReportedKind::Trigger,
+        "partitioned_table" => ReportedKind::PartitionedTable,
+        "partition" => ReportedKind::Partition,
+        "inherited_table" => ReportedKind::InheritedTable,
+        "foreign_table" => ReportedKind::ForeignTable,
+        "domain" => ReportedKind::Domain,
+        "composite_type" => ReportedKind::CompositeType,
+        "extension" => ReportedKind::Extension,
+        "rule" => ReportedKind::Rule,
+        "cast" => ReportedKind::Cast,
+        "operator" => ReportedKind::Operator,
+        "publication" => ReportedKind::Publication,
+        "event_trigger" => ReportedKind::EventTrigger,
+        "merge_leftover" => ReportedKind::MergeLeftover,
+        _ => ReportedKind::Other(kind),
+    }
+}
+
+fn grants(acl: Vec<RawGrant>) -> Result<Vec<Grant>, SchemaError> {
+    acl.into_iter()
+        .map(|g| {
+            Ok(Grant {
+                grantor: g.grantor,
+                grantee: role_ref(g.grantee)?,
+                privilege: g.privilege,
+                grantable: g.grantable,
+            })
+        })
+        .collect()
+}
+
+/// OID 0 is `PUBLIC` (`aclexplode`'s grantee, `polroles = {0}`).
+fn role_ref(r: RawRoleRef) -> Result<RoleRef, SchemaError> {
+    match (r.oid, r.name) {
+        (Oid(0), _) => Ok(RoleRef::Public),
+        (oid, Some(name)) => Ok(RoleRef::Role { oid, name }),
+        (oid, None) => Err(SchemaError::Parse(format!("role {} has no name", oid.0))),
+    }
+}
+
+fn table(t: RawTable) -> Result<Table, SchemaError> {
+    let unlogged = match t.persistence.as_str() {
+        "p" => false,
+        "u" => true,
+        other => return Err(unknown("relpersistence", other)),
+    };
+    Ok(Table {
+        oid: t.oid,
+        schema: t.schema,
+        name: t.name,
+        owner: t.owner,
+        comment: t.comment,
+        rls_enabled: t.rls_enabled,
+        rls_forced: t.rls_forced,
+        unlogged,
+        options: t.options,
+        columns: t
+            .columns
+            .into_iter()
+            .map(column)
+            .collect::<Result<_, _>>()?,
+        constraints: t
+            .constraints
+            .into_iter()
+            .map(constraint)
+            .collect::<Result<_, _>>()?,
+        indexes: t.indexes.into_iter().map(index).collect::<Result<_, _>>()?,
+        policies: t
+            .policies
+            .into_iter()
+            .map(policy)
+            .collect::<Result<_, _>>()?,
+        grants: grants(t.acl)?,
+    })
+}
+
+fn column(c: RawColumn) -> Result<Column, SchemaError> {
+    // A generated column's expression is its pg_attrdef row, not a default.
+    let (default, generated) = match c.generated.as_str() {
+        "" => (c.default_expr, None),
+        "s" => (None, c.default_expr),
+        other => return Err(unknown("attgenerated", other)),
+    };
+    let generation = match c.identity.as_str() {
+        "" => None,
+        "a" => Some(IdentityGeneration::Always),
+        "d" => Some(IdentityGeneration::ByDefault),
+        other => return Err(unknown("attidentity", other)),
+    };
+    let identity = match (generation, c.identity_sequence) {
+        (None, _) => None,
+        (Some(generation), Some(seq)) => Some(Identity {
+            generation,
+            sequence_oid: seq.oid,
+            sequence_name: seq.name,
+            params: seq.params,
+            grants: grants(seq.acl)?,
+        }),
+        (Some(_), None) => {
+            return Err(SchemaError::Parse(format!(
+                "identity column {} has no sequence",
+                c.name
+            )));
+        }
+    };
+    Ok(Column {
+        attnum: c.attnum,
+        name: c.name,
+        data_type: c.data_type,
+        type_oid: c.type_oid,
+        collation: c.collation,
+        default,
+        not_null: c.not_null,
+        identity,
+        generated,
+        comment: c.comment,
+        grants: grants(c.acl)?,
+    })
+}
+
+fn constraint(k: RawConstraint) -> Result<Constraint, SchemaError> {
+    let kind = match k.contype.as_str() {
+        "p" => ConstraintKind::PrimaryKey,
+        "u" => ConstraintKind::Unique,
+        "f" => ConstraintKind::ForeignKey,
+        "c" => ConstraintKind::Check,
+        "x" => ConstraintKind::Exclusion,
+        other => return Err(unknown("contype", other)),
+    };
+    Ok(Constraint {
+        oid: k.oid,
+        name: k.name,
+        kind,
+        definition: k.definition,
+        columns: k.columns,
+        references: k.references,
+        deferrable: k.deferrable,
+        initially_deferred: k.initially_deferred,
+        validated: k.validated,
+    })
+}
+
+fn index(i: RawIndex) -> Result<Index, SchemaError> {
+    let keys = index_keys(&i.definition).ok_or_else(|| {
+        SchemaError::Parse(format!("unreadable index definition: {}", i.definition))
+    })?;
+    if keys.len() != i.key_count {
+        return Err(SchemaError::Parse(format!(
+            "index {} has {} key columns, its definition {}",
+            i.name,
+            i.key_count,
+            keys.len()
+        )));
+    }
+    Ok(Index {
+        oid: i.oid,
+        name: i.name,
+        method: i.method,
+        unique: i.unique,
+        nulls_not_distinct: i.nulls_not_distinct,
+        keys,
+        include: i.include,
+        predicate: i.predicate,
+        options: i.options,
+        valid: i.valid,
+        comment: i.comment,
+    })
+}
+
+fn policy(p: RawPolicy) -> Result<Policy, SchemaError> {
+    let command = match p.command.as_str() {
+        "*" => PolicyCommand::All,
+        "r" => PolicyCommand::Select,
+        "a" => PolicyCommand::Insert,
+        "w" => PolicyCommand::Update,
+        "d" => PolicyCommand::Delete,
+        other => return Err(unknown("polcmd", other)),
+    };
+    Ok(Policy {
+        oid: p.oid,
+        name: p.name,
+        command,
+        permissive: p.permissive,
+        roles: p
+            .roles
+            .into_iter()
+            .map(role_ref)
+            .collect::<Result<_, _>>()?,
+        using: p.using,
+        with_check: p.with_check,
+        comment: p.comment,
+    })
+}
+
+/// The key columns and expressions of `pg_get_indexdef(oid, 0, true)`, each as printed (with
+/// collation, operator class and ordering): the first parenthesized list outside quotes, split
+/// at its top-level commas. The index's and table's names come before it, so they're dropped.
+fn index_keys(def: &str) -> Option<Vec<String>> {
+    let mut keys = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut in_ident = false;
+    let mut in_literal = false;
+    for ch in def.chars() {
+        if in_ident {
+            in_ident = ch != '"';
+        } else if in_literal {
+            in_literal = ch != '\'';
+        } else {
+            match ch {
+                '"' => in_ident = true,
+                '\'' => in_literal = true,
+                '(' => {
+                    depth += 1;
+                    if depth == 1 {
+                        continue;
+                    }
+                }
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        keys.push(current.trim().to_string());
+                        return Some(keys);
+                    }
+                }
+                ',' if depth == 1 => {
+                    keys.push(std::mem::take(&mut current).trim().to_string());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if depth >= 1 {
+            current.push(ch);
+        }
+    }
+    None
+}
+
+// The document CATALOG_SQL prints. Codes stay raw ("char" values) so unknown ones are errors.
+
+#[derive(Deserialize)]
+struct RawVersion {
+    server_version_num: u32,
+}
+
+#[derive(Deserialize)]
+struct RawCatalog {
+    schemas: Vec<RawSchema>,
+    tables: Vec<RawTable>,
+    enums: Vec<EnumType>,
+    sequences: Vec<RawSequence>,
+    roles: Vec<Role>,
+    default_privileges: Vec<RawDefaultPrivilege>,
+    reported: Vec<RawReported>,
+}
+
+#[derive(Deserialize)]
+struct RawRoleRef {
+    oid: Oid,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawGrant {
+    grantor: NamedRole,
+    grantee: RawRoleRef,
+    privilege: String,
+    grantable: bool,
+}
+
+#[derive(Deserialize)]
+struct RawSchema {
+    oid: Oid,
+    name: String,
+    owner: NamedRole,
+    comment: Option<String>,
+    acl: Vec<RawGrant>,
+}
+
+#[derive(Deserialize)]
+struct RawTable {
+    oid: Oid,
+    schema: String,
+    name: String,
+    owner: NamedRole,
+    comment: Option<String>,
+    rls_enabled: bool,
+    rls_forced: bool,
+    persistence: String,
+    options: Vec<String>,
+    acl: Vec<RawGrant>,
+    columns: Vec<RawColumn>,
+    constraints: Vec<RawConstraint>,
+    indexes: Vec<RawIndex>,
+    policies: Vec<RawPolicy>,
+}
+
+#[derive(Deserialize)]
+struct RawColumn {
+    attnum: i16,
+    name: String,
+    data_type: String,
+    type_oid: Oid,
+    collation: Option<String>,
+    default_expr: Option<String>,
+    generated: String,
+    identity: String,
+    not_null: bool,
+    identity_sequence: Option<RawIdentitySequence>,
+    comment: Option<String>,
+    acl: Vec<RawGrant>,
+}
+
+#[derive(Deserialize)]
+struct RawIdentitySequence {
+    oid: Oid,
+    name: String,
+    params: SequenceParams,
+    acl: Vec<RawGrant>,
+}
+
+#[derive(Deserialize)]
+struct RawConstraint {
+    oid: Oid,
+    name: String,
+    contype: String,
+    definition: String,
+    columns: Vec<i16>,
+    references: Option<ForeignKeyTarget>,
+    deferrable: bool,
+    initially_deferred: bool,
+    validated: bool,
+}
+
+#[derive(Deserialize)]
+struct RawIndex {
+    oid: Oid,
+    name: String,
+    method: String,
+    unique: bool,
+    nulls_not_distinct: bool,
+    definition: String,
+    key_count: usize,
+    include: Vec<String>,
+    predicate: Option<String>,
+    options: Vec<String>,
+    valid: bool,
+    comment: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPolicy {
+    oid: Oid,
+    name: String,
+    command: String,
+    permissive: bool,
+    roles: Vec<RawRoleRef>,
+    using: Option<String>,
+    with_check: Option<String>,
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawSequence {
+    oid: Oid,
+    schema: String,
+    name: String,
+    owner: NamedRole,
+    comment: Option<String>,
+    params: SequenceParams,
+    owned_by: Option<OwnedBy>,
+    acl: Vec<RawGrant>,
+}
+
+#[derive(Deserialize)]
+struct RawDefaultPrivilege {
+    oid: Oid,
+    role: NamedRole,
+    schema: Option<String>,
+    object_type: String,
+    acl: Vec<RawGrant>,
+}
+
+#[derive(Deserialize)]
+struct RawReported {
+    kind: String,
+    oid: Oid,
+    schema: Option<String>,
+    name: String,
+    parent: Option<String>,
+    arguments: Option<String>,
+    definition: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exclusions;
+    use serde_json::{Value, json};
+
+    fn role(oid: u32, name: &str) -> Value {
+        json!({ "oid": oid, "name": name })
+    }
+
+    fn grant(grantee: u32, grantee_name: Option<&str>, privilege: &str) -> Value {
+        json!({
+            "grantor": role(10, "postgres"),
+            "grantee": { "oid": grantee, "name": grantee_name },
+            "privilege": privilege,
+            "grantable": false,
+        })
+    }
+
+    fn column(attnum: i16, name: &str) -> Value {
+        json!({
+            "attnum": attnum, "name": name, "data_type": "integer", "type_oid": 23,
+            "collation": null, "default_expr": null, "generated": "", "identity": "",
+            "identity_sequence": null, "not_null": false, "comment": null, "acl": [],
+        })
+    }
+
+    /// A raw document as [`CATALOG_SQL`] prints it, with its unordered lists out of order.
+    fn document(server_version_num: u32) -> Value {
+        let mut id = column(1, "id");
+        id["identity"] = json!("a");
+        id["not_null"] = json!(true);
+        id["identity_sequence"] = json!({
+            "oid": 16419, "name": "Order_id_seq",
+            "params": { "data_type": "bigint", "start": 100, "increment": 5, "min": 1,
+                        "max": i64::MAX, "cache": 3, "cycle": false },
+            "acl": [grant(16400, Some("app"), "USAGE"), grant(0, None, "SELECT")],
+        });
+        let mut doubled = column(3, "doubled");
+        doubled["generated"] = json!("s");
+        doubled["default_expr"] = json!("(id * 2)");
+        let mut status = column(2, "status");
+        status["acl"] = json!([
+            grant(16400, Some("app"), "UPDATE"),
+            grant(16400, Some("app"), "SELECT")
+        ]);
+        json!({
+            "server_version_num": server_version_num,
+            "schemas": [
+                { "oid": 2200, "name": "public", "owner": role(10, "postgres"), "comment": null,
+                  "acl": [grant(10, Some("postgres"), "USAGE"), grant(0, None, "USAGE")] },
+                { "oid": 16390, "name": "Billing", "owner": role(10, "postgres"), "comment": "money",
+                  "acl": [] },
+            ],
+            "tables": [{
+                "oid": 16420, "schema": "Billing", "name": "Order", "owner": role(10, "postgres"),
+                "comment": null, "rls_enabled": true, "rls_forced": false, "persistence": "u",
+                "options": ["fillfactor=70", "autovacuum_enabled=false"],
+                "acl": [grant(16400, Some("app"), "SELECT"), grant(0, None, "INSERT")],
+                "columns": [doubled, status, id],
+                "constraints": [
+                    { "oid": 16431, "name": "order_pkey", "contype": "p",
+                      "definition": "PRIMARY KEY (id)", "columns": [1], "references": null,
+                      "deferrable": false, "initially_deferred": false, "validated": true },
+                    { "oid": 16430, "name": "fk", "contype": "f",
+                      "definition": "FOREIGN KEY (status) REFERENCES t(id) NOT VALID",
+                      "columns": [2],
+                      "references": { "table_oid": 16500, "schema": "public", "table": "t",
+                                      "columns": [1] },
+                      "deferrable": false, "initially_deferred": false, "validated": false },
+                ],
+                "indexes": [{
+                    "oid": 16440, "name": "ix(\"odd\")", "method": "btree", "unique": true,
+                    "nulls_not_distinct": false,
+                    "definition": "CREATE UNIQUE INDEX \"ix(\"\"odd\"\")\" ON \"Billing\".\"Order\" USING btree (lower((\"a,b\")::text) DESC, status text_pattern_ops, (id || ',('::text)) INCLUDE (id) WHERE id > 0",
+                    "key_count": 3, "include": ["id"], "predicate": "id > 0",
+                    "options": ["fillfactor=80", "deduplicate_items=off"], "valid": false,
+                    "comment": null,
+                }],
+                "policies": [{
+                    "oid": 16450, "name": "own rows", "command": "w", "permissive": false,
+                    "roles": [role(16400, "app"), { "oid": 0, "name": null }],
+                    "using": "(id = 1)", "with_check": "(id = 2)",
+                }],
+            }],
+            "enums": [{
+                "oid": 16391, "schema": "Billing", "name": "status", "owner": role(10, "postgres"),
+                "comment": null,
+                "labels": [{ "oid": 16393, "label": "new" }, { "oid": 16392, "label": "gone" }],
+            }],
+            "sequences": [{
+                "oid": 16460, "schema": "public", "name": "tickets", "owner": role(10, "postgres"),
+                "comment": null,
+                "params": { "data_type": "integer", "start": 7, "increment": 1, "min": 1,
+                            "max": 2147483647, "cache": 1, "cycle": true },
+                "owned_by": { "table_oid": 16420, "schema": "Billing", "table": "Order",
+                              "attnum": 1, "column": "id" },
+                "acl": [grant(16400, Some("app"), "USAGE"), grant(10, Some("postgres"), "SELECT")],
+            }],
+            "roles": [
+                { "oid": 16400, "name": "app", "login": true, "inherit": false,
+                  "connection_limit": 5, "valid_until": "2030-01-01 00:00:00+00",
+                  "bypass_rls": true,
+                  "member_of": [
+                      { "role": role(16401, "readers"), "grantor": role(10, "postgres"),
+                        "admin": true, "inherit": false, "set": true },
+                      { "role": role(16399, "neon_superuser"), "grantor": role(10, "postgres"),
+                        "admin": false, "inherit": true, "set": true },
+                  ],
+                  "other_attributes": ["CREATEROLE", "CREATEDB"], "comment": null },
+                { "oid": 16401, "name": "Readers", "login": false, "inherit": true,
+                  "connection_limit": -1, "valid_until": null, "bypass_rls": false,
+                  "member_of": [], "other_attributes": [], "comment": "readers" },
+            ],
+            "default_privileges": [
+                { "oid": 16471, "role": role(10, "postgres"), "schema": null, "object_type": "S",
+                  "acl": [grant(16400, Some("app"), "USAGE")] },
+                { "oid": 16470, "role": role(10, "postgres"), "schema": "Billing",
+                  "object_type": "r", "acl": [grant(16401, Some("Readers"), "SELECT")] },
+            ],
+            "reported": [
+                { "kind": "view", "oid": 16600, "schema": "public", "name": "v", "parent": null,
+                  "arguments": null, "definition": " SELECT 1;" },
+                { "kind": "aggregate", "oid": 16601, "schema": "public", "name": "agg",
+                  "parent": null, "arguments": "integer", "definition": null },
+                { "kind": "merge_leftover", "oid": 16602, "schema": "Billing",
+                  "name": "chelabase_merge_nn_2_16420", "parent": "Order", "arguments": null,
+                  "definition": "CHECK (status IS NOT NULL) NOT VALID" },
+                { "kind": "function", "oid": 16603, "schema": "Billing", "name": "f",
+                  "parent": null, "arguments": "a integer", "definition": "CREATE FUNCTION …" },
+            ],
+        })
+    }
+
+    #[test]
+    fn parse_refuses_pg16() {
+        let doc = document(160004).to_string();
+        assert_eq!(parse_catalog(&doc), Err(SchemaError::UnsupportedServer(16)));
+        // The version is checked before anything else is read.
+        assert_eq!(
+            parse_catalog(r#"{"server_version_num": 180001}"#),
+            Err(SchemaError::UnsupportedServer(18))
+        );
+    }
+
+    #[test]
+    fn parse_sorts_and_normalizes() {
+        let m = parse_catalog(&document(170005).to_string()).unwrap();
+        assert_eq!(m.model_version, crate::MODEL_VERSION);
+        assert_eq!(m.server_major, 17);
+
+        // Schemas sorted by name (byte order), grants PUBLIC first.
+        let names: Vec<&str> = m.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Billing", "public"]);
+        assert_eq!(m.schemas[1].grants[0].grantee, RoleRef::Public);
+
+        let t = &m.tables[0];
+        assert!(t.unlogged);
+        assert_eq!(t.options, ["autovacuum_enabled=false", "fillfactor=70"]);
+        assert_eq!(t.grants[0].grantee, RoleRef::Public);
+        assert_eq!(t.grants[0].privilege, "INSERT");
+
+        // Columns by attnum; codes mapped.
+        let attnums: Vec<i16> = t.columns.iter().map(|c| c.attnum).collect();
+        assert_eq!(attnums, [1, 2, 3]);
+        let id = t.columns[0].identity.as_ref().expect("identity");
+        assert_eq!(id.generation, IdentityGeneration::Always);
+        assert_eq!(id.sequence_oid, Oid(16419));
+        assert_eq!(id.sequence_name, "Order_id_seq");
+        assert_eq!(
+            (id.params.start, id.params.increment, id.params.cache),
+            (100, 5, 3)
+        );
+        assert_eq!(id.grants[0].grantee, RoleRef::Public);
+        assert_eq!(t.columns[1].identity, None);
+        assert_eq!(t.columns[1].grants[0].privilege, "SELECT");
+        assert_eq!(t.columns[2].generated.as_deref(), Some("(id * 2)"));
+        assert_eq!(t.columns[2].default, None);
+
+        let kinds: Vec<(&str, ConstraintKind, bool)> = t
+            .constraints
+            .iter()
+            .map(|c| (c.name.as_str(), c.kind, c.validated))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("fk", ConstraintKind::ForeignKey, false),
+                ("order_pkey", ConstraintKind::PrimaryKey, true)
+            ]
+        );
+        assert_eq!(t.constraints[0].references.as_ref().unwrap().table, "t");
+
+        // The index's keys come out of its definition without its name.
+        let ix = &t.indexes[0];
+        assert_eq!(ix.name, "ix(\"odd\")");
+        assert_eq!(
+            ix.keys,
+            [
+                "lower((\"a,b\")::text) DESC",
+                "status text_pattern_ops",
+                "(id || ',('::text)"
+            ]
+        );
+        assert_eq!(ix.include, ["id"]);
+        assert_eq!(ix.predicate.as_deref(), Some("id > 0"));
+        assert_eq!(ix.options, ["deduplicate_items=off", "fillfactor=80"]);
+        assert!(!ix.valid);
+
+        let p = &t.policies[0];
+        assert_eq!(p.command, PolicyCommand::Update);
+        assert!(!p.permissive);
+        assert_eq!(p.roles[0], RoleRef::Public);
+        assert_eq!(
+            p.roles[1],
+            RoleRef::Role {
+                oid: Oid(16400),
+                name: "app".into()
+            }
+        );
+
+        // Enum labels keep their catalog order.
+        let labels: Vec<&str> = m.enums[0].labels.iter().map(|l| l.label.as_str()).collect();
+        assert_eq!(labels, ["new", "gone"]);
+
+        let seq = &m.sequences[0];
+        assert_eq!(seq.owned_by.as_ref().unwrap().column, "id");
+        // Grants by grantee name: "app" before "postgres".
+        let privileges: Vec<&str> = seq.grants.iter().map(|g| g.privilege.as_str()).collect();
+        assert_eq!(privileges, ["USAGE", "SELECT"]);
+
+        let roles: Vec<&str> = m.roles.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(roles, ["Readers", "app"]);
+        let app = &m.roles[1];
+        assert!(app.owner_level());
+        assert_eq!(app.member_of[0].role.name, "neon_superuser");
+        assert_eq!(app.other_attributes, ["CREATEDB", "CREATEROLE"]);
+
+        let dp: Vec<(Option<&str>, DefaultPrivilegeObject)> = m
+            .default_privileges
+            .iter()
+            .map(|d| (d.schema.as_deref(), d.object_type))
+            .collect();
+        assert_eq!(
+            dp,
+            [
+                (None, DefaultPrivilegeObject::Sequences),
+                (Some("Billing"), DefaultPrivilegeObject::Tables)
+            ]
+        );
+
+        let reported: Vec<(&str, ReportedKind)> = m
+            .reported
+            .iter()
+            .map(|r| (r.name.as_str(), r.kind.clone()))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                ("chelabase_merge_nn_2_16420", ReportedKind::MergeLeftover),
+                ("f", ReportedKind::Function),
+                ("agg", ReportedKind::Other("aggregate".into())),
+                ("v", ReportedKind::View),
+            ]
+        );
+
+        // Already normalized: normalizing again changes nothing.
+        let mut again = m.clone();
+        again.normalize();
+        assert_eq!(again, m);
+    }
+
+    #[test]
+    fn unknown_attgenerated_is_an_error() {
+        let mut doc = document(170005);
+        doc["tables"][0]["columns"][0]["generated"] = json!("v");
+        assert_eq!(
+            parse_catalog(&doc.to_string()),
+            Err(SchemaError::UnknownCatalogValue {
+                what: "attgenerated".into(),
+                value: "v".into()
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_codes_are_errors() {
+        for (pointer, what, value) in [
+            ("/tables/0/constraints/0/contype", "contype", "n"),
+            ("/tables/0/policies/0/command", "polcmd", "z"),
+            ("/tables/0/persistence", "relpersistence", "t"),
+            ("/tables/0/columns/0/identity", "attidentity", "x"),
+            ("/default_privileges/0/object_type", "defaclobjtype", "L"),
+        ] {
+            let mut doc = document(170005);
+            *doc.pointer_mut(pointer).unwrap() = json!(value);
+            assert_eq!(
+                parse_catalog(&doc.to_string()),
+                Err(SchemaError::UnknownCatalogValue {
+                    what: what.into(),
+                    value: value.into()
+                }),
+                "{pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_documents_are_parse_errors() {
+        assert!(matches!(
+            parse_catalog("not json"),
+            Err(SchemaError::Parse(_))
+        ));
+        let mut doc = document(170005);
+        doc["tables"][0]["indexes"][0]["key_count"] = json!(2);
+        assert!(matches!(
+            parse_catalog(&doc.to_string()),
+            Err(SchemaError::Parse(_))
+        ));
+    }
+
+    /// The script is valid SQL to Postgres's own parser (a live read checks the rest).
+    #[test]
+    fn catalog_sql_parses() {
+        let parsed = pg_query::parse(CATALOG_SQL).expect("CATALOG_SQL parses");
+        // BEGIN, 3 × SET, DO, SELECT, COMMIT.
+        assert_eq!(parsed.protobuf.stmts.len(), 7);
+    }
+
+    /// P7: the default-ACL read keeps the data API's per-schema rows the model excludes, and is
+    /// otherwise the catalog read.
+    #[test]
+    fn default_acl_sql_keeps_the_data_api_rows() {
+        let sql = default_acl_sql();
+        assert_ne!(sql, CATALOG_SQL, "the filter was found and removed");
+        assert!(!sql.contains("IN ('anon', 'authenticated')"), "{sql}");
+        assert!(CATALOG_SQL.contains("IN ('anon', 'authenticated')"));
+        let parsed = pg_query::parse(&sql).expect("the default-ACL read parses");
+        assert_eq!(parsed.protobuf.stmts.len(), 7);
+        assert!(sql.starts_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"));
+    }
+
+    /// T14 M5: the data API's per-schema filter only hides the owner's rows, in both reads.
+    #[test]
+    fn data_api_filter_is_only_for_the_owners_rows() {
+        assert!(DATA_API_DEFAULT_ACL_FILTER.contains("dr.rolname = 'postgres'"));
+        assert!(CATALOG_SQL.contains(DATA_API_DEFAULT_ACL_FILTER));
+        // E16's row is excluded from both reads (functions aren't simulated, P7).
+        assert!(default_acl_sql().contains(exclusions::DATA_API_FUNCTIONS_DEFAULT_ACL));
+    }
+
+    /// T14 minor 14: policies carry their comment.
+    #[test]
+    fn policy_comments_are_read() {
+        assert!(CATALOG_SQL.contains("'comment', obj_description(p.oid, 'pg_policy')"));
+    }
+
+    /// T14 M6: a table that INHERITS from another is its own reported kind.
+    #[test]
+    fn inherited_tables_are_a_reported_kind() {
+        assert_eq!(
+            reported_kind("inherited_table".to_string()),
+            ReportedKind::InheritedTable
+        );
+    }
+
+    #[test]
+    fn index_keys_skip_names_and_split_at_top_level_commas() {
+        assert_eq!(
+            index_keys("CREATE INDEX \"a (b\" ON public.\"t,(\" USING gin (x, (f(y, 'a,)')))"),
+            Some(vec!["x".to_string(), "(f(y, 'a,)'))".to_string()])
+        );
+        assert_eq!(index_keys("CREATE INDEX i ON t USING btree"), None);
+    }
+
+    /// The exclusion lists the SQL hard-codes are the ones in [`exclusions`].
+    #[test]
+    fn catalog_sql_names_every_exclusion() {
+        let quoted = |s: &str| format!("'{s}'");
+        let mut names: Vec<String> = Vec::new();
+        names.extend(exclusions::EXCLUDED_SCHEMAS.iter().map(|s| quoted(s)));
+        names.extend(exclusions::RESERVED_ROLES.iter().map(|s| quoted(s)));
+        names.extend(exclusions::USERS_MANAGED_COLUMNS.iter().map(|s| quoted(s)));
+        names.extend(exclusions::USERS_GUARD_TRIGGERS.iter().map(|s| quoted(s)));
+        names.extend(exclusions::USERS_POLICIES.iter().map(|s| quoted(s)));
+        names.extend(exclusions::USERS_GRANTEES.iter().map(|s| quoted(s)));
+        names.extend(
+            exclusions::DATA_API_DEFAULT_GRANTEES
+                .iter()
+                .map(|s| quoted(s)),
+        );
+        names.push(quoted(exclusions::USERS_EMAIL_INDEX));
+        names.push(quoted(exclusions::APP_USERS_CONFIG_TABLE));
+        for prefix in exclusions::EXCLUDED_SCHEMA_PREFIXES {
+            names.push(format!("'{}%'", prefix.replace('_', "\\_")));
+        }
+        names.push(format!(
+            "'{}%'",
+            exclusions::RESERVED_ROLE_PREFIX.replace('_', "\\_")
+        ));
+        names.push(format!(
+            "lower(r.rolname) LIKE '{}%'",
+            exclusions::CHELABASE_ROLE_PREFIX.replace('_', "\\_")
+        ));
+        // E16, and M5: the data API's per-schema filter only for the owner's rows.
+        names.push(exclusions::DATA_API_FUNCTIONS_DEFAULT_ACL.to_string());
+        names.push(format!(
+            "dr.rolname = '{}'",
+            exclusions::DATA_API_DEFAULT_ACL_ROLE
+        ));
+        // M6: tables that INHERIT are reported, not read as tables.
+        names.push("'inherited_table'".to_string());
+        names.push(format!(
+            "'{}%'",
+            exclusions::MERGE_NOT_NULL_CHECK_PREFIX.replace('_', "\\_")
+        ));
+        names.push(format!(
+            "'{}%'",
+            exclusions::MERGE_INDEX_PREFIX.replace('_', "\\_")
+        ));
+        for name in names {
+            assert!(CATALOG_SQL.contains(&name), "CATALOG_SQL lacks {name}");
+        }
+        assert!(CATALOG_SQL.starts_with(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL search_path = pg_catalog;\n"
+        ));
+        assert!(CATALOG_SQL.trim_end().ends_with("COMMIT;"));
+        assert!(
+            !CATALOG_SQL.contains("pg_authid "),
+            "roles come from pg_roles"
+        );
+    }
+}

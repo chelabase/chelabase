@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Branch } from "@chelabase/management-client";
+import { summaryOf } from "@/test/merge-fixtures";
 import {
   actionReasons,
   buildTree,
+  holdingMergeFor,
+  openMergeFor,
   parseSettings,
   pointToUtc,
   restoreBounds,
@@ -99,6 +102,51 @@ describe("actionReasons", () => {
     expect(r.connect).toBe("branch is not ready (it is provisioning)");
     expect(r.resetToParent).toBe("branch is not ready (it is provisioning)");
     expect(r.restore).toBe("branch is not ready (it is provisioning)");
+  });
+});
+
+describe("merges and the branch actions", () => {
+  const main = branch({ name: "main" });
+  const dev = branch({ name: "dev", parent_branch_id: main.id });
+  const pair = { source_branch_id: dev.id, target_branch_id: main.id, direction: "into_parent" as const };
+
+  it("looks for the open merge of one Postgres database only (the API's rule is per database)", () => {
+    const other = summaryOf({ ...pair, database: "analytics", status: "draft" });
+    expect(openMergeFor(dev, "into_parent", [other], "web1")).toBeNull();
+    expect(actionReasons(dev, [main, dev], [other], "web1").mergeInto).toBeNull();
+    const same = summaryOf({ ...pair, database: "web1", status: "draft" });
+    expect(openMergeFor(dev, "into_parent", [same], "web1")).toBe(same);
+    expect(actionReasons(dev, [main, dev], [same], "web1").mergeInto).toBe("a merge into main is already open");
+  });
+
+  it("keeps a merge failed half applied open for its pair (E27)", () => {
+    const half = summaryOf({ ...pair, status: "failed", failed_phase: "online" });
+    expect(openMergeFor(dev, "into_parent", [half], "web1")).toBe(half);
+    const failed = summaryOf({ ...pair, status: "failed", failed_phase: "tx" });
+    expect(openMergeFor(dev, "into_parent", [failed], "web1")).toBeNull();
+  });
+
+  it("refuses reset, restore and delete of a branch a merge holds, and says which merge", () => {
+    for (const status of ["rehearsing", "applying", "online", "finishing"] as const) {
+      const m = summaryOf({ ...pair, status });
+      const r = actionReasons(dev, [main, dev], [m], "web1");
+      const want = "a merge is rehearsing or applying on this branch";
+      expect([r.resetToParent, r.restore, r.delete], status).toEqual([want, want, want]);
+      // The target is held too (main's own reasons come first where it has any: it has a child).
+      expect(holdingMergeFor(main, [m])).toBe(m);
+      expect(holdingMergeFor(dev, [m])).toBe(m);
+    }
+    const half = summaryOf({ ...pair, status: "failed", failed_phase: "online" });
+    expect(actionReasons(dev, [main, dev], [half], "web1").resetToParent).toBe(
+      "a merge failed half applied on this branch: retry it or abandon it",
+    );
+  });
+
+  it("lets a draft or rehearsed merge be, since it holds nothing", () => {
+    for (const status of ["draft", "rehearsed", "computing"] as const) {
+      const r = actionReasons(dev, [main, dev], [summaryOf({ ...pair, status })], "web1");
+      expect([r.resetToParent, r.restore, r.delete]).toEqual([null, null, null]);
+    }
   });
 });
 

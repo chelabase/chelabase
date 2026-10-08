@@ -612,6 +612,10 @@ console-e2e: _live-check
 sql-editor-e2e: _live-check
     scripts/sql-editor-e2e.sh
 
+# Live schema merge (step 6g) through the API: a branch and main both change, one conflict resolved, rehearse, a protected main needs confirm, apply, main checked with psql (needs just dev)
+merge-e2e: _live-check
+    scripts/merge-e2e.sh
+
 # Live login roles story: create a plain role, connect, back a secret key, refused delete, reset,
 # revoke, delete (needs just deps-up and just dev)
 role-e2e: _live-check

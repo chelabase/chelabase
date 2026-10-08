@@ -16,6 +16,7 @@ members = [
     "crates/chelabase-secrets",
     "crates/chelabase-neon",
     "crates/chelabase-query",
+    "crates/chelabase-schema",
     "crates/chelabase-zitadel",
 ]
 
@@ -34,6 +35,7 @@ chelabase-routes = { path = "crates/chelabase-routes" }
 chelabase-secrets = { path = "crates/chelabase-secrets" }
 chelabase-neon = { path = "crates/chelabase-neon" }
 chelabase-query = { path = "crates/chelabase-query" }
+chelabase-schema = { path = "crates/chelabase-schema" }
 chelabase-zitadel = { path = "crates/chelabase-zitadel" }
 
 axum = "0.8.9"
@@ -50,7 +52,7 @@ thiserror = "2.0.21"
 anyhow = "1.0.104"
 # TLS on aws-lc-rs like everything else, so a `sslmode=verify-full` URL works once the
 # servers have certificates.
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "tls-rustls-aws-lc-rs"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "tls-rustls-aws-lc-rs"] }
 # Defaults off: they select ring for TLS and pull in KV, object store, websockets and the
 # service API, none of which we use.
 async-nats = { version = "0.50.0", default-features = false, features = ["jetstream", "aws-lc-rs", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }

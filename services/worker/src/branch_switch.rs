@@ -11,8 +11,9 @@
 
 use chelabase_metadata::{BranchKind, BranchRecord, BranchStatus, MetadataError};
 use chelabase_nats::PointInTime;
-use chelabase_neon::{ComputeBackend, NeonId, StorconError};
+use chelabase_neon::{ComputeBackend, Lsn, NeonId, StorconError};
 use chelabase_types::BranchId;
+use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
 use crate::branch_create::deleted;
@@ -31,6 +32,16 @@ pub const BACKUP_REFUSAL: &str =
 
 /// How long after a restore records its pending timeline an unresolved detach is retried
 /// before the branch fails: twice the detach's own timeout.
+///
+/// One detach copies every ancestor level, at any depth. Before copying it waits for each
+/// ancestor's ingested WAL to reach its child's branch point, about 30 s per level at most,
+/// one level after another, and answers 503 when one still lags: that's retried like a
+/// timeout. So one attempt can spend up to 30 s × depth waiting, but the ancestors catch up
+/// in parallel, and a retry waits only for those still behind. The bound is on wall time
+/// since the pending timeline was recorded, not on attempts, so it needs no depth term. One
+/// attempt is cut at [`chelabase_neon::storcon::DETACH_TIMEOUT`] (600 s, 20 lagging levels
+/// at 30 s each) and then retried; the 20 minutes are the total across attempts. Ancestors
+/// still behind after that mean a stuck pageserver, and the restore fails with the cause.
 pub const STUCK_DETACH_SECS: i64 = 2 * chelabase_neon::storcon::DETACH_TIMEOUT.as_secs() as i64;
 
 /// Recorded when reconcile puts a branch back on its old timeline after an attempt that left
@@ -68,8 +79,9 @@ struct Undo {
 enum Resume {
     /// Nothing left (or it was dropped): resolve, create and detach.
     Fresh,
-    /// The timeline an earlier attempt made (branched at the LSN), now detached: switch to it.
-    Adopt(NeonId),
+    /// The timeline an earlier attempt made, branched at the LSN (read before its detach), now
+    /// detached: switch to it.
+    Adopt(NeonId, Lsn),
     /// The state of the pending timeline (`pending`) is unknown: hand the job back.
     Retry { err: String, pending: String },
     /// Nothing more to do here (handled, or another run owns it).
@@ -83,6 +95,16 @@ enum Detached {
     Retry(String),
     /// Refused, with nothing running: safe to undo.
     Refused(String),
+}
+
+/// What reconcile finds of a pending timeline before it drops one (T14 M9).
+enum PendingState {
+    /// Detached, gone, or a reset's (hanging off the parent's timeline): safe to drop.
+    Droppable,
+    /// A restore's, still attached to the branch's timeline: a detach may be running on it.
+    Detaching(String),
+    /// Its state can't be read: left for the next pass.
+    Unknown(String),
 }
 
 /// What became of a pending timeline a run set out to drop.
@@ -105,7 +127,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// [`Self::handle_branch_reset_to_parent`] as delivery `attempt`.
-    pub(crate) async fn branch_reset_attempt(
+    pub(crate) fn branch_reset_attempt(
+        &self,
+        branch_id: BranchId,
+        attempt: Attempt,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(self.branch_reset_attempt_inner(branch_id, attempt))
+    }
+
+    async fn branch_reset_attempt_inner(
         &self,
         branch_id: BranchId,
         attempt: Attempt,
@@ -167,7 +197,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         match self
             .metadata
-            .switch_to_pending_timeline(branch_id, pending.as_str(), history_start)
+            .switch_to_pending_timeline(
+                branch_id,
+                pending.as_str(),
+                history_start,
+                &lsn.to_string(),
+            )
             .await
         {
             Ok(true) => {}
@@ -221,8 +256,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return self.finish_restore(&target).await;
         }
         let mut undo = Undo::default();
-        let pending = match self.resume_restore(&branch, &target, &mut undo).await? {
-            Resume::Adopt(pending) => pending,
+        // The point the restored timeline was branched at (step 6g: the bases current there
+        // are copied with the switch).
+        let (pending, restore_lsn) = match self.resume_restore(&branch, &target, &mut undo).await? {
+            Resume::Adopt(pending, lsn) => (pending, lsn),
             Resume::Retry { err, pending } => {
                 return self.detach_unresolved(&target, &pending, err).await;
             }
@@ -235,6 +272,21 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     Ok(lsn) => lsn,
                     Err(f) => return self.failed_before_switch(&target, &undo, f, attempt).await,
                 };
+                // T14 M8: the branch's history begins at its branch point; before it lies the
+                // parent's older state.
+                if let Some(start) = branch
+                    .branched_at_lsn
+                    .as_deref()
+                    .and_then(|l| l.parse::<Lsn>().ok())
+                    && lsn < start
+                {
+                    let f = StepFailure::permanent(format!(
+                        "resolving the point: the LSN {lsn} is before {}'s history begins (its \
+                         branch point, {start})",
+                        branch.name
+                    ));
+                    return self.failed_before_switch(&target, &undo, f, attempt).await;
+                }
                 let Some(pending) = self.record_pending(&target).await? else {
                     return Ok(());
                 };
@@ -258,7 +310,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         return self.undo_before_switch(&target, &undo, err).await;
                     }
                 }
-                pending
+                (pending, lsn)
             }
         };
         if let Err(err) = self.stop_compute(&target, &mut undo).await {
@@ -271,6 +323,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 pending.as_str(),
                 backup_id,
                 backup_name,
+                &restore_lsn.to_string(),
             )
             .await
         {
@@ -301,7 +354,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// [`Self::recreate_compute`]; with [`Catalog::Replaced`] (after a reset or restore's
     /// switch), the resync first lifts the forwarded guards (C3).
-    pub(crate) async fn recreate_compute_with(
+    pub(crate) fn recreate_compute_with<'a>(
+        &'a self,
+        branch: BranchId,
+        ep: &'a str,
+        catalog: Catalog,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(self.recreate_compute_inner(branch, ep, catalog))
+    }
+
+    async fn recreate_compute_inner(
         &self,
         branch: BranchId,
         ep: &str,
@@ -430,6 +492,23 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let mut failure = None;
         let mut dropped_pending = false;
         if let Some(pending) = branch.pending_timeline_id.as_deref() {
+            // T14 M9: a restore's timeline still attached to the branch's may have a detach
+            // running on it (its job lost or slow): it isn't deleted while that's possible.
+            // The job's own bound, plus one more detach attempt: a detach started just before
+            // the bound runs up to `DETACH_TIMEOUT` past it.
+            let bound = STUCK_DETACH_SECS + chelabase_neon::storcon::DETACH_TIMEOUT.as_secs() as i64;
+            let young = branch
+                .pending_timeline_at
+                .is_some_and(|at| chrono::Utc::now() - at < chrono::Duration::seconds(bound));
+            match self.restore_maybe_detaching(&target, pending).await {
+                PendingState::Unknown(err) => return self.still_resetting(id, err).await,
+                PendingState::Detaching(err) if young => {
+                    return self.still_resetting(id, err).await;
+                }
+                // Past that, any detach has ended: the last one could start no later than
+                // `STUCK_DETACH_SECS`, and each is cut at `DETACH_TIMEOUT`.
+                PendingState::Detaching(_) | PendingState::Droppable => {}
+            }
             match self.drop_pending(id, &target.tenant, pending).await? {
                 Dropped::Yes => dropped_pending = true,
                 Dropped::NotOurs => {
@@ -476,6 +555,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .clear_superseded_timeline(id)
                 .await
                 .map_err(|e| e.to_string())?;
+            // Only a reset leaves a superseded timeline: its new branch point is the base
+            // (step 6g), as `finish_reset` records it.
+            if !dropped_pending {
+                self.record_reset_bases(id, &target.ep).await;
+            }
         }
         if !dropped_pending {
             // The switch happened (or never started): the flow is done, its old error with it.
@@ -498,6 +582,26 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             self.gone_meanwhile(&target).await?;
         }
         Ok(())
+    }
+
+    /// Whether `pending` may still have a detach running on it.
+    async fn restore_maybe_detaching(&self, target: &Target, pending: &str) -> PendingState {
+        let Ok(timeline) = pending.parse::<NeonId>() else {
+            return PendingState::Droppable;
+        };
+        match self.storage.ancestor(&target.tenant, &timeline).await {
+            Ok(Some((parent, _))) if parent == target.timeline => PendingState::Detaching(format!(
+                "detaching: the restored timeline {pending} is still attached; a detach may \
+                 still be running on it"
+            )),
+            Ok(_) => PendingState::Droppable,
+            Err(StorconError::Rejected { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                PendingState::Droppable
+            }
+            Err(e) => PendingState::Unknown(format!("reading the pending timeline {pending}: {e:#}")),
+        }
     }
 
     /// Records `err` on a branch reconcile leaves `resetting`, and returns it for the log.
@@ -661,13 +765,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Err(_) => None,
         };
         match state {
-            Some((timeline, Ok(Some(_)))) => {
+            Some((timeline, Ok(Some(lsn)))) => {
                 info!(branch_id = %target.id, %timeline, "finishing the detach of the timeline an earlier attempt made");
                 undo.pending = Some(timeline.clone());
                 // That attempt may have stopped the compute too.
                 undo.compute_stopped = true;
                 match self.detach(target, &timeline, false).await? {
-                    Detached::Yes => Ok(Resume::Adopt(timeline)),
+                    Detached::Yes => Ok(Resume::Adopt(timeline, lsn)),
                     Detached::Retry(err) => Ok(Resume::Retry {
                         err,
                         pending: leftover.to_string(),
@@ -986,7 +1090,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Steps 7-9 of reset: the compute on the new timeline, then the old timeline goes.
-    async fn finish_reset(&self, target: &Target, superseded: &NeonId) -> Result<(), String> {
+    fn finish_reset<'a>(
+        &'a self,
+        target: &'a Target,
+        superseded: &'a NeonId,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(self.finish_reset_inner(target, superseded))
+    }
+
+    async fn finish_reset_inner(&self, target: &Target, superseded: &NeonId) -> Result<(), String> {
         if let Err(err) = self
             .recreate_compute_with(target.id, &target.ep, Catalog::Replaced)
             .await
@@ -996,6 +1108,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if self.gone_meanwhile(target).await? {
             return Ok(());
         }
+        // Step 6g: the parent's head is the branch's new base (also on a resumed run).
+        self.record_reset_bases(target.id, &target.ep).await;
         if let Err(e) = self
             .storage
             .delete_timeline(&target.tenant, superseded)
@@ -1238,7 +1352,7 @@ mod tests {
     async fn run(w: &FakeWorker, flow: Flow, id: BranchId) -> Result<(), String> {
         match flow {
             Flow::Reset => reset(w, id).await,
-            Flow::Restore => restore(w, id, at_lsn("0/1000000")).await,
+            Flow::Restore => restore(w, id, at_lsn("0/2000000")).await,
         }
     }
 
@@ -1263,6 +1377,8 @@ mod tests {
         assert_eq!(dev.timeline_id.as_deref(), Some(new.as_str()));
         assert_eq!(dev.pending_timeline_id, None);
         assert_eq!(dev.superseded_timeline_id, None);
+        // The reset's branch point is recorded with the switch (a merge's base location).
+        assert_eq!(dev.branched_at_lsn.as_deref(), Some("0/3000000"));
         assert_eq!(endpoint_timeline(&w, &s.dev_ep), new);
         let main_tl: NeonId = s.main_timeline.parse().unwrap();
         assert_eq!(
@@ -1301,6 +1417,74 @@ mod tests {
         assert!(w.storage.timeline(&s.tenant, &s.main_timeline).is_some());
     }
 
+    // E26: a reset or restore brings a catalog whose OID counter diverged at the branch
+    // point. The resync at the end of the switch judges the keys on the new timeline: a key
+    // whose OID another role holds there is revoked (never moved to that role), one whose OID
+    // still carries its name is kept and stamped with the new timeline.
+    #[tokio::test]
+    async fn a_switch_judges_secret_keys_on_the_new_timeline() {
+        use chelabase_metadata::KeyRoleFix;
+        for flow in [Flow::Reset, Flow::Restore] {
+            let (w, journal) = worker();
+            let s = setup(&w, &journal).await;
+            let key = |role: &str, oid: i64| chelabase_metadata::NewDataKey {
+                id: uuid::Uuid::new_v4(),
+                branch_id: s.dev,
+                kind: chelabase_types::data_key::DataKeyKind::Secret,
+                role: role.into(),
+                name: format!("{role}-key"),
+                prefix: "chk_sec_xxxx".into(),
+                sha256: [0; 32],
+                sealed: None,
+                databases: None,
+                role_oid: Some(oid),
+                role_timeline: Some(s.dev_timeline.clone()),
+                role_bypass_rls: false,
+            };
+            let (app, kept) = (key("app", 16390), key("keep", 16384));
+            w.metadata.state().data_keys.extend([app.clone(), kept.clone()]);
+            // The new timeline's catalog: `x` holds the OID `app` had.
+            w.computes.answer(
+                "chelabase: key roles",
+                &format!("16384 {}\n16390 {}\n", hex::encode("keep"), hex::encode("x")),
+            );
+            claim(&w, s.dev);
+
+            run(&w, flow, s.dev).await.unwrap();
+
+            let dev = w.metadata.branch(s.dev);
+            assert_eq!(dev.status, BranchStatus::Ready, "{flow:?}: {:?}", dev.error);
+            let new = dev.timeline_id.unwrap();
+            assert_ne!(new, s.dev_timeline, "{flow:?}");
+            let fixes: Vec<KeyRoleFix> = w
+                .metadata
+                .state()
+                .key_fixes
+                .iter()
+                .filter(|(b, _)| *b == s.dev)
+                .flat_map(|(_, f)| f.clone())
+                .collect();
+            assert_eq!(
+                fixes,
+                vec![
+                    KeyRoleFix::Revoke { id: app.id, role: "app".into(), oid: Some(16390) },
+                    KeyRoleFix::Restamp {
+                        id: kept.id,
+                        role: "keep".into(),
+                        oid: 16384,
+                        from: Some(s.dev_timeline.clone()),
+                        timeline: new,
+                    },
+                ],
+                "{flow:?}"
+            );
+            assert!(
+                !fixes.iter().any(|f| matches!(f, KeyRoleFix::Follow { .. })),
+                "{flow:?}: never followed across a switch"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn restore_journal_order() {
         let (w, journal) = worker();
@@ -1308,7 +1492,7 @@ mod tests {
         claim(&w, s.dev);
         let backup = BranchId::new();
 
-        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/1000000"))
+        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/2000000"))
             .await
             .unwrap();
 
@@ -1333,7 +1517,7 @@ mod tests {
             pos(
                 &journal,
                 &format!(
-                    "storage.create_branch_timeline {new} from {} at 0/1000000",
+                    "storage.create_branch_timeline {new} from {} at 0/2000000",
                     s.dev_timeline
                 ),
             ),
@@ -1485,7 +1669,7 @@ mod tests {
         claim(&w, s.dev);
         let backup = BranchId::new();
 
-        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/1000000"))
+        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/2000000"))
             .await
             .unwrap();
 
@@ -1510,12 +1694,12 @@ mod tests {
             .history_start = Some(old);
         claim(&w, s.dev);
         *w.storage.detach.lock().unwrap() = crate::fakes::FakeDetach::TimesOut;
-        restore(&w, s.dev, at_lsn("0/1000000")).await.unwrap_err();
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
         *w.storage.detach.lock().unwrap() = crate::fakes::FakeDetach::Works;
         let commit: chrono::DateTime<chrono::Utc> = "2026-09-29T10:00:00Z".parse().unwrap();
         *w.storage.timestamp_at.lock().unwrap() = Some(commit);
 
-        restore(&w, s.dev, at_lsn("0/1000000")).await.unwrap();
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap();
 
         let dev = w.metadata.branch(s.dev);
         assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
@@ -1603,7 +1787,7 @@ mod tests {
         claim(&w, s.dev);
         let backup = BranchId::new();
 
-        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/1000000"))
+        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/2000000"))
             .await
             .unwrap();
 
@@ -1623,7 +1807,7 @@ mod tests {
             s.dev,
             BranchId::new(),
             "dev-before-restore-20260930T120500Z",
-            at_lsn("0/1000000"),
+            at_lsn("0/2000000"),
         )
         .await
         .unwrap();
@@ -1678,7 +1862,7 @@ mod tests {
         reset(&w, backup).await.unwrap();
         assert_eq!(w.metadata.branch(backup).status, BranchStatus::Ready);
         claim(&w, backup);
-        restore(&w, backup, at_lsn("0/1000000")).await.unwrap();
+        restore(&w, backup, at_lsn("0/2000000")).await.unwrap();
         let b = w.metadata.branch(backup);
         assert_eq!(b.status, BranchStatus::Ready);
         assert_eq!(
@@ -1775,7 +1959,7 @@ mod tests {
                 Flow::Restore,
                 "create timeline",
                 |w, _| *w.storage.fail.lock().unwrap() = Some("create_branch_timeline"),
-                "0/1000000",
+                "0/2000000",
                 "creating timeline: ",
                 false,
             ),
@@ -1784,7 +1968,7 @@ mod tests {
                 Flow::Restore,
                 "detach",
                 |w, _| *w.storage.reject.lock().unwrap() = Some("detach_ancestor"),
-                "0/1000000",
+                "0/2000000",
                 "detaching: storage controller rejected the request (400",
                 false,
             ),
@@ -1792,7 +1976,7 @@ mod tests {
                 Flow::Restore,
                 "remove compute",
                 |w, _| *w.computes.fail_delete.lock().unwrap() = Some("docker down".into()),
-                "0/1000000",
+                "0/2000000",
                 "removing compute: docker down",
                 false,
             ),
@@ -1802,7 +1986,7 @@ mod tests {
                 |w, s| {
                     pending_branch(w, s.db, BACKUP_NAME, s.main);
                 },
-                "0/1000000",
+                "0/2000000",
                 "switching timeline: a live branch named \"dev-before-restore-20260930T120000Z\" \
                  already exists",
                 true,
@@ -1970,7 +2154,7 @@ mod tests {
                 match flow {
                     Flow::Reset => reset(&w, s.dev).await,
                     Flow::Restore => {
-                        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/1000000"))
+                        w.handle_branch_restore(s.dev, backup, BACKUP_NAME, at_lsn("0/2000000"))
                             .await
                     }
                 }
@@ -2369,7 +2553,7 @@ mod tests {
         // the restart.
         w.metadata.state().delete_at_get_branch(s.dev, 2);
 
-        restore(&w, s.dev, at_lsn("0/1000000")).await.unwrap();
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap();
 
         assert!(has(&journal, &format!("compute.delete {}", s.dev_ep)));
         assert!(!has(&journal, "compute.create"), "{:?}", entries(&journal));
@@ -2389,7 +2573,7 @@ mod tests {
         claim(&w, s.dev);
         *w.storage.fail.lock().unwrap() = Some("delete_timeline");
 
-        restore(&w, s.dev, at_lsn("0/1000000")).await.unwrap();
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap();
 
         let pending = created_timeline(&journal);
         let dev = w.metadata.branch(s.dev);
@@ -2548,7 +2732,7 @@ mod tests {
         for delivery in 1..=3 {
             // Each attempt records its own cause, not a leftover one.
             w.metadata.state().branches.get_mut(&s.dev).unwrap().error = None;
-            let err = restore(&w, s.dev, at_lsn("0/1000000"))
+            let err = restore(&w, s.dev, at_lsn("0/2000000"))
                 .await
                 .expect_err("handed back");
             assert!(err.starts_with("detaching: "), "{delivery}: {err}");
@@ -2564,7 +2748,7 @@ mod tests {
     async fn a_detach_stuck_past_the_bound_fails_the_branch_and_deletes_nothing() {
         let (w, journal) = worker();
         let s = stuck_restore(&w, &journal).await;
-        restore(&w, s.dev, at_lsn("0/1000000")).await.unwrap_err();
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
         let pending = w.metadata.branch(s.dev).pending_timeline_id.unwrap();
         // Recorded just inside the bound: still retried.
         let bound = chrono::Duration::seconds(STUCK_DETACH_SECS);
@@ -2577,11 +2761,11 @@ mod tests {
                 .pending_timeline_at = Some(chrono::Utc::now() - ago);
         };
         recorded(bound - chrono::Duration::seconds(30));
-        restore(&w, s.dev, at_lsn("0/1000000")).await.unwrap_err();
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
         assert_eq!(w.metadata.branch(s.dev).status, BranchStatus::Resetting);
 
         recorded(bound + chrono::Duration::seconds(1));
-        restore(&w, s.dev, at_lsn("0/1000000"))
+        restore(&w, s.dev, at_lsn("0/2000000"))
             .await
             .expect("given up: the job is acked");
 
@@ -2602,8 +2786,93 @@ mod tests {
         assert!(backups_of(&w, s.dev).is_empty());
         // A later delivery of the same job is stale.
         journal.lock().unwrap().clear();
-        restore(&w, s.dev, at_lsn("0/1000000")).await.unwrap();
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap();
         assert!(entries(&journal).iter().all(|e| e.starts_with("metadata.")));
+    }
+
+    /// T14 M8: a branch's history begins at its branch point. A restore to an earlier LSN (or
+    /// a time that resolves to one) would bring back the parent's older state, so it's refused
+    /// before anything is made; main has no branch point and no such bound.
+    #[tokio::test]
+    async fn a_restore_before_the_branch_point_is_refused() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        assert_eq!(w.metadata.branch(s.dev).branched_at_lsn.as_deref(), Some("0/2000000"));
+        claim(&w, s.dev);
+
+        restore(&w, s.dev, at_lsn("0/1FFFFFF")).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready);
+        assert_eq!(
+            dev.error.as_deref(),
+            Some(
+                "resolving the point: the LSN 0/1FFFFFF is before dev's history begins (its \
+                 branch point, 0/2000000)"
+            )
+        );
+        assert_eq!(dev.timeline_id.as_deref(), Some(s.dev_timeline.as_str()));
+        assert!(!has(&journal, "storage.create_branch_timeline"));
+
+        // At the branch point itself: fine.
+        journal.lock().unwrap().clear();
+        w.metadata.state().branches.get_mut(&s.dev).unwrap().error = None;
+        claim(&w, s.dev);
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap();
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!((dev.status, dev.error), (BranchStatus::Ready, None));
+        assert!(has(&journal, "storage.create_branch_timeline"));
+    }
+
+    /// T14 M9: a restore's pending timeline still attached to the branch's timeline may have a
+    /// detach running on it. Reconcile (the job lost, the branch stale) doesn't delete it
+    /// while it's younger than the detach bound: the branch stays resetting. Past the bound
+    /// any detach has ended, and it's dropped as before (the branch back on its timeline).
+    #[tokio::test]
+    async fn reconcile_leaves_a_restores_detaching_timeline_alone() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        claim(&w, s.dev);
+        *w.storage.detach.lock().unwrap() = crate::fakes::FakeDetach::TimesOut;
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
+        let pending = w.metadata.branch(s.dev).pending_timeline_id.unwrap();
+        let stale = |w: &FakeWorker| {
+            w.metadata.state().branch_ages.insert(s.dev, STALE_PROVISION_SECS + 1);
+        };
+        stale(&w);
+        journal.lock().unwrap().clear();
+
+        let _ = w.finish_switch(s.dev).await;
+
+        assert!(!has(&journal, "storage.delete_timeline"), "{:?}", entries(&journal));
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Resetting);
+        assert_eq!(dev.pending_timeline_id.as_deref(), Some(pending.as_str()));
+        assert!(w.storage.timeline(&s.tenant, &pending).is_some());
+
+        assert!(dev.error.as_deref().is_some_and(|e| e.contains("still attached")), "{:?}", dev.error);
+
+        // Just past the job's bound a detach started at the end may still run: left alone.
+        let recorded = |w: &FakeWorker, secs: i64| {
+            w.metadata.state().branches.get_mut(&s.dev).unwrap().pending_timeline_at =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(secs));
+        };
+        recorded(&w, STUCK_DETACH_SECS + 1);
+        stale(&w);
+        let _ = w.finish_switch(s.dev).await;
+        assert!(!has(&journal, "storage.delete_timeline"), "{:?}", entries(&journal));
+        assert_eq!(w.metadata.branch(s.dev).status, BranchStatus::Resetting);
+
+        // Past it plus one detach's timeout: dropped, the branch back on its own timeline.
+        let detach = chelabase_neon::storcon::DETACH_TIMEOUT.as_secs() as i64;
+        recorded(&w, STUCK_DETACH_SECS + detach + 1);
+        stale(&w);
+        w.finish_switch(s.dev).await.unwrap();
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready);
+        assert_eq!(dev.pending_timeline_id, None);
+        assert_eq!(dev.timeline_id.as_deref(), Some(s.dev_timeline.as_str()));
+        assert!(has(&journal, &format!("storage.delete_timeline {pending}")), "{:?}", entries(&journal));
     }
 
     #[tokio::test]

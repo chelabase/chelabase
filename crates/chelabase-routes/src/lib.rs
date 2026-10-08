@@ -392,6 +392,62 @@ pub mod orchestrator {
         "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
     );
 
+    /// Schema merges between a branch and its parent (step 6g).
+    pub const CREATE_MERGE: Endpoint = key_endpoint(
+        "orchestrator.create_merge",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/merges",
+    );
+    pub const LIST_MERGES: Endpoint =
+        key_endpoint("orchestrator.list_merges", Method::Get, "/v1/databases/{id}/merges");
+    pub const GET_MERGE: Endpoint =
+        key_endpoint("orchestrator.get_merge", Method::Get, "/v1/databases/{id}/merges/{merge_id}");
+    pub const UPDATE_MERGE: Endpoint = key_endpoint(
+        "orchestrator.update_merge",
+        Method::Patch,
+        "/v1/databases/{id}/merges/{merge_id}",
+    );
+    pub const REHEARSE_MERGE: Endpoint = key_endpoint(
+        "orchestrator.rehearse_merge",
+        Method::Post,
+        "/v1/databases/{id}/merges/{merge_id}/rehearse",
+    );
+    pub const APPLY_MERGE: Endpoint = key_endpoint(
+        "orchestrator.apply_merge",
+        Method::Post,
+        "/v1/databases/{id}/merges/{merge_id}/apply",
+    );
+    pub const RECOMPUTE_MERGE: Endpoint = key_endpoint(
+        "orchestrator.recompute_merge",
+        Method::Post,
+        "/v1/databases/{id}/merges/{merge_id}/recompute",
+    );
+    pub const RETRY_MERGE: Endpoint = key_endpoint(
+        "orchestrator.retry_merge",
+        Method::Post,
+        "/v1/databases/{id}/merges/{merge_id}/retry",
+    );
+    pub const CANCEL_MERGE: Endpoint = key_endpoint(
+        "orchestrator.cancel_merge",
+        Method::Post,
+        "/v1/databases/{id}/merges/{merge_id}/cancel",
+    );
+    pub const ABANDON_MERGE: Endpoint = key_endpoint(
+        "orchestrator.abandon_merge",
+        Method::Post,
+        "/v1/databases/{id}/merges/{merge_id}/abandon",
+    );
+    pub const FINISH_MERGE: Endpoint = key_endpoint(
+        "orchestrator.finish_merge",
+        Method::Post,
+        "/v1/databases/{id}/merges/{merge_id}/finish",
+    );
+    pub const EXPORT_MERGE_PLAN: Endpoint = key_endpoint(
+        "orchestrator.export_merge_plan",
+        Method::Get,
+        "/v1/databases/{id}/merges/{merge_id}/plan.sql",
+    );
+
     /// Studio's console: one data API request on the branch, as the owner or a named role.
     pub const CONSOLE_QUERY: Endpoint = key_endpoint(
         "orchestrator.console_query",
@@ -475,6 +531,21 @@ pub mod orchestrator {
         "orchestrator.delete_role",
         Method::Delete,
         "/v1/databases/{id}/branches/{branch_id}/roles/{role}",
+    );
+
+    /// Changes a role's LOGIN, owner-level, attributes or memberships (step 6g, U1).
+    pub const UPDATE_ROLE: Endpoint = key_endpoint(
+        "orchestrator.update_role",
+        Method::Patch,
+        "/v1/databases/{id}/branches/{branch_id}/roles/{role}",
+    );
+
+    /// A role's live sessions on the branch's compute (step 6g, E29a): a read that never
+    /// starts the compute.
+    pub const LIST_ROLE_SESSIONS: Endpoint = key_endpoint(
+        "orchestrator.list_role_sessions",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions",
     );
 
     /// The tenant's projects.
@@ -695,6 +766,18 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::UPDATE_KEY,
     orchestrator::CONSOLE_QUERY,
     orchestrator::CONSOLE_SCHEMA,
+    orchestrator::CREATE_MERGE,
+    orchestrator::LIST_MERGES,
+    orchestrator::GET_MERGE,
+    orchestrator::UPDATE_MERGE,
+    orchestrator::REHEARSE_MERGE,
+    orchestrator::APPLY_MERGE,
+    orchestrator::RECOMPUTE_MERGE,
+    orchestrator::RETRY_MERGE,
+    orchestrator::CANCEL_MERGE,
+    orchestrator::ABANDON_MERGE,
+    orchestrator::FINISH_MERGE,
+    orchestrator::EXPORT_MERGE_PLAN,
     orchestrator::LIST_SAVED_QUERIES,
     orchestrator::CREATE_SAVED_QUERY,
     orchestrator::GET_SAVED_QUERY,
@@ -707,6 +790,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::CREATE_ROLE,
     orchestrator::RESET_ROLE,
     orchestrator::DELETE_ROLE,
+    orchestrator::UPDATE_ROLE,
+    orchestrator::LIST_ROLE_SESSIONS,
     orchestrator::LIST_PROJECTS,
     orchestrator::CREATE_PROJECT,
     orchestrator::GET_PROJECT,
@@ -963,6 +1048,43 @@ mod tests {
     }
 
     #[test]
+    fn merge_endpoints_route_and_are_management_auth_with_studio_cors() {
+        let db = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11";
+        let merge = format!("{db}/merges/3b1f6a2e-0d8f-4c52-9a51-6c0f1c2e2f7e");
+        assert_eq!(found("POST", &format!("{BRANCH}/merges")), "orchestrator.create_merge");
+        assert_eq!(found("GET", &format!("{db}/merges")), "orchestrator.list_merges");
+        assert_eq!(found("GET", &merge), "orchestrator.get_merge");
+        assert_eq!(found("PATCH", &merge), "orchestrator.update_merge");
+        assert_eq!(found("POST", &format!("{merge}/rehearse")), "orchestrator.rehearse_merge");
+        assert_eq!(found("POST", &format!("{merge}/apply")), "orchestrator.apply_merge");
+        assert_eq!(found("POST", &format!("{merge}/recompute")), "orchestrator.recompute_merge");
+        assert_eq!(found("POST", &format!("{merge}/retry")), "orchestrator.retry_merge");
+        assert_eq!(found("POST", &format!("{merge}/cancel")), "orchestrator.cancel_merge");
+        assert_eq!(found("POST", &format!("{merge}/finish")), "orchestrator.finish_merge");
+        assert_eq!(found("GET", &format!("{merge}/plan.sql")), "orchestrator.export_merge_plan");
+        for name in [
+            "finish_merge",
+            "create_merge",
+            "list_merges",
+            "get_merge",
+            "update_merge",
+            "rehearse_merge",
+            "apply_merge",
+            "recompute_merge",
+            "retry_merge",
+            "cancel_merge",
+            "export_merge_plan",
+        ] {
+            let ep = ENDPOINTS
+                .iter()
+                .find(|e| e.name == format!("orchestrator.{name}"))
+                .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
+            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!(ep.service, Service::Orchestrator, "{name}");
+        }
+    }
+
+    #[test]
     fn branch_endpoints_route_with_two_path_params() {
         assert_eq!(found("GET", BRANCHES), "orchestrator.list_branches");
         assert_eq!(found("POST", BRANCHES), "orchestrator.create_branch");
@@ -988,11 +1110,23 @@ mod tests {
         assert_eq!(found("GET", &roles), "orchestrator.list_roles");
         assert_eq!(found("POST", &roles), "orchestrator.create_role");
         assert_eq!(found("DELETE", &format!("{roles}/app")), "orchestrator.delete_role");
+        assert_eq!(found("PATCH", &format!("{roles}/app")), "orchestrator.update_role");
         assert_eq!(
             found("POST", &format!("{roles}/app/reset-password")),
             "orchestrator.reset_role_password"
         );
-        for name in ["list_roles", "create_role", "reset_role_password", "delete_role"] {
+        assert_eq!(
+            found("GET", &format!("{roles}/app/sessions")),
+            "orchestrator.list_role_sessions"
+        );
+        for name in [
+            "list_roles",
+            "create_role",
+            "reset_role_password",
+            "delete_role",
+            "update_role",
+            "list_role_sessions",
+        ] {
             let ep = ENDPOINTS
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))

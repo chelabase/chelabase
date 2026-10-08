@@ -28,6 +28,7 @@ import type {
   AppUserPage,
   AppUserSession,
   AppUsersSettings,
+  ApplyRequest,
   Branch,
   BranchDatabaseView,
   BranchRole,
@@ -39,6 +40,7 @@ import type {
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
   CreateKeyRequest,
+  CreateMergeRequest,
   CreateProjectRequest,
   CreateRoleRequest,
   CreateSavedQueryRequest,
@@ -50,18 +52,26 @@ import type {
   DeleteProjectRequest,
   DisableDataApiParams,
   ErrorEnvelope,
+  FinishRequest,
   GetBranchConnectionParams,
   GetConsoleSchemaParams,
   GetDataApiSchemaParams,
   GetSqlSchema200,
   GetSqlSchemaParams,
   ListAppUsersParams,
+  ListMergesParams,
   Me,
+  Merge,
+  MergeDetail,
+  MergeSummary,
   OperationAccepted,
   ProjectInfo,
   PutAppUsersRequest,
+  RecomputeRequest,
+  RehearseRequest,
   RestoreAccepted,
   RestoreRequest,
+  RoleSessions,
   RunSqlRequest,
   SavedQuery,
   SavedQuerySummary,
@@ -69,8 +79,10 @@ import type {
   UpdateBranchRequest,
   UpdateDatabaseRequest,
   UpdateKeyRequest,
+  UpdateMergeRequest,
   UpdatePgDatabaseRequest,
   UpdateProjectRequest,
+  UpdateRoleRequest,
   UpdateSavedQueryRequest
 } from './model';
 
@@ -946,7 +958,7 @@ export const getConsoleQueryUrl = (id: string,
 }
 
 /**
- * Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and can't bypass row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.
+ * Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and isn't owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a member of `neon_superuser`); a role with BYPASSRLS passes, and the console then reads and writes past row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.
  * @summary Run a data API request from the console
  */
 export const consoleQuery = async (id: string,
@@ -1046,7 +1058,7 @@ export const getGetConsoleSchemaUrl = (id: string,
 }
 
 /**
- * What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and can't bypass row-level security).
+ * What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and isn't owner-level; BYPASSRLS is allowed).
  * @summary The schema the console can show, as the owner or a role
  */
 export const getConsoleSchema = async (id: string,
@@ -1837,6 +1849,98 @@ export const useRotateKey = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getRotateKeyMutationOptions(options), queryClient);
     }
 
+export const getCreateMergeUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/merges`
+}
+
+/**
+ * `into_parent` merges the branch's schema changes into its parent; `from_parent` brings the parent's changes into the branch. Both branches must be ready and `normal`; main has no parent. The merge starts as `computing`: the worker reads both schemas and the branch point and fills in the analysis and the plan (poll `getMerge` until it is a `draft`). `database` is the Postgres database to merge (the branch's main one when omitted). One merge per pair and Postgres database can be open at a time.
+ * @summary Start a schema merge between a branch and its parent
+ */
+export const createMerge = async (id: string,
+    branchId: string,
+    createMergeRequest: CreateMergeRequest, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<MergeSummary>(getCreateMergeUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createMergeRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateMergeMutationKey = () => ['createMerge'] as const;
+
+export const getCreateMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createMerge>>, TError,CreateMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createMerge>>, TError,CreateMergeMutationVariables, TContext> => {
+
+const mutationKey = getCreateMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createMerge>>, CreateMergeMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  createMerge(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateMergeMutationResult = NonNullable<Awaited<ReturnType<typeof createMerge>>>
+    export type CreateMergeMutationBody = CreateMergeRequest
+    export type CreateMergeMutationError = ErrorType<ErrorEnvelope>
+    export type CreateMergeMutationVariables = {id: string;branchId: string;data: CreateMergeRequest}
+
+    /**
+ * @summary Start a schema merge between a branch and its parent
+ */
+export const useCreateMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createMerge>>, TError,CreateMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createMerge>>,
+        TError,
+        CreateMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateMergeMutationOptions(options), queryClient);
+    }
+
 export const getUpdatePgDatabaseUrl = (id: string,
     branchId: string,
     name: string,) => {
@@ -2461,8 +2565,8 @@ export const getCreateRoleUrl = (id: string,
 }
 
 /**
- * Creates a login role with a generated password and answers with the role. `owner_level` gives it the owner's attributes (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION) and makes it a member of `neon_superuser`. The password isn't in the answer: read it with the connection details and `role`. A role the compute couldn't take yet is `pending` and applied later.
- * @summary Create a login role
+ * Creates a role and answers with it. A LOGIN role (the default) gets a generated password; `login: false` makes a NOLOGIN role (a group) with none. `owner_level` gives it the owner's attributes (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION) and makes it a member of `neon_superuser`. `inherit`, `connection_limit`, `valid_until`, `bypass_rls` and `member_of` set the other allowed attributes and memberships; nothing else can be set. The password isn't in the answer: read it with the connection details and `role`. A role the compute couldn't take yet is `pending` and applied later.
+ * @summary Create a role
  */
 export const createRole = async (id: string,
     branchId: string,
@@ -2530,7 +2634,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type CreateRoleMutationVariables = {id: string;branchId: string;data: CreateRoleRequest}
 
     /**
- * @summary Create a login role
+ * @summary Create a role
  */
 export const useCreateRole = <TError = ErrorType<ErrorEnvelope>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createRole>>, TError,CreateRoleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
@@ -2622,6 +2726,100 @@ export const useDeleteRole = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getDeleteRoleMutationOptions(options), queryClient);
     }
 
+export const getUpdateRoleUrl = (id: string,
+    branchId: string,
+    role: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}`
+}
+
+/**
+ * Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.
+ * @summary Change a role
+ */
+export const updateRole = async (id: string,
+    branchId: string,
+    role: string,
+    updateRoleRequest: UpdateRoleRequest, options?: Parameters<typeof customFetch>[1]): Promise<BranchRole> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<BranchRole>(getUpdateRoleUrl(id,branchId,role),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateRoleRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateRoleMutationKey = () => ['updateRole'] as const;
+
+export const getUpdateRoleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateRole>>, TError,UpdateRoleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateRole>>, TError,UpdateRoleMutationVariables, TContext> => {
+
+const mutationKey = getUpdateRoleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateRole>>, UpdateRoleMutationVariables> = (props) => {
+          const {id,branchId,role,data} = props ?? {};
+
+          return  updateRole(id,branchId,role,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateRoleMutationResult = NonNullable<Awaited<ReturnType<typeof updateRole>>>
+    export type UpdateRoleMutationBody = UpdateRoleRequest
+    export type UpdateRoleMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateRoleMutationVariables = {id: string;branchId: string;role: string;data: UpdateRoleRequest}
+
+    /**
+ * @summary Change a role
+ */
+export const useUpdateRole = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateRole>>, TError,UpdateRoleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateRole>>,
+        TError,
+        UpdateRoleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateRoleMutationOptions(options), queryClient);
+    }
+
 export const getResetRolePasswordUrl = (id: string,
     branchId: string,
     role: string,) => {
@@ -2700,6 +2898,124 @@ export const useResetRolePassword = <TError = ErrorType<ErrorEnvelope>,
       > => {
       return useMutation(getResetRolePasswordMutationOptions(options), queryClient);
     }
+
+export const getListRoleSessionsUrl = (id: string,
+    branchId: string,
+    role: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}/sessions`
+}
+
+/**
+ * The sessions open as the role on the branch's compute right now: the count, and each client's address, `application_name` and start time, oldest first. A read only: when the compute isn't running, the answer is `compute_running: false` with no sessions, and the compute isn't started. Clients that aren't connected at this moment aren't listed. A name with no role has no sessions.
+ * @summary List a role's live sessions
+ */
+export const listRoleSessions = async (id: string,
+    branchId: string,
+    role: string, options?: Parameters<typeof customFetch>[1]): Promise<RoleSessions> => {
+
+  return customFetch<RoleSessions>(getListRoleSessionsUrl(id,branchId,role),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListRoleSessionsQueryKey = (id: string,
+    branchId: string,
+    role: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/roles/${role}/sessions`
+    ] as const;
+    }
+
+
+export const getListRoleSessionsQueryOptions = <TData = Awaited<ReturnType<typeof listRoleSessions>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    role: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoleSessions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListRoleSessionsQueryKey(id,branchId,role);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listRoleSessions>>> = ({ signal }) => listRoleSessions(id,branchId,role, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && role !== null && role !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listRoleSessions>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListRoleSessionsQueryResult = NonNullable<Awaited<ReturnType<typeof listRoleSessions>>>
+export type ListRoleSessionsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListRoleSessions<TData = Awaited<ReturnType<typeof listRoleSessions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoleSessions>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listRoleSessions>>,
+          TError,
+          Awaited<ReturnType<typeof listRoleSessions>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListRoleSessions<TData = Awaited<ReturnType<typeof listRoleSessions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoleSessions>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listRoleSessions>>,
+          TError,
+          Awaited<ReturnType<typeof listRoleSessions>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListRoleSessions<TData = Awaited<ReturnType<typeof listRoleSessions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoleSessions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a role's live sessions
+ */
+
+export function useListRoleSessions<TData = Awaited<ReturnType<typeof listRoleSessions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listRoleSessions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListRoleSessionsQueryOptions(id,branchId,role,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
 
 export const getRunSqlUrl = (id: string,
     branchId: string,) => {
@@ -3098,6 +3414,1034 @@ export function useGetDatabaseConnection<TData = Awaited<ReturnType<typeof getDa
 
 
 
+
+export const getListMergesUrl = (id: string,
+    params?: ListMergesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/merges?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/merges`
+}
+
+/**
+ * History and open merges, newest first, without their analysis and plan (read one with `getMerge`).
+ * @summary List a database's merges
+ */
+export const listMerges = async (id: string,
+    params?: ListMergesParams, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary[]> => {
+
+  return customFetch<MergeSummary[]>(getListMergesUrl(id,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListMergesQueryKey = (id: string,
+    params?: ListMergesParams,) => {
+    return [
+    `/v1/databases/${id}/merges`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getListMergesQueryOptions = <TData = Awaited<ReturnType<typeof listMerges>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    params?: ListMergesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMerges>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListMergesQueryKey(id,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listMerges>>> = ({ signal }) => listMerges(id,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listMerges>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListMergesQueryResult = NonNullable<Awaited<ReturnType<typeof listMerges>>>
+export type ListMergesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListMerges<TData = Awaited<ReturnType<typeof listMerges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params: undefined |  ListMergesParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMerges>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMerges>>,
+          TError,
+          Awaited<ReturnType<typeof listMerges>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMerges<TData = Awaited<ReturnType<typeof listMerges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params?: ListMergesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMerges>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMerges>>,
+          TError,
+          Awaited<ReturnType<typeof listMerges>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMerges<TData = Awaited<ReturnType<typeof listMerges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params?: ListMergesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMerges>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a database's merges
+ */
+
+export function useListMerges<TData = Awaited<ReturnType<typeof listMerges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params?: ListMergesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMerges>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListMergesQueryOptions(id,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getGetMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}`
+}
+
+/**
+ * The merge with its analysis (every changed object, the conflicts with base, target and source side by side), the plan, the last rehearsal, the result and the log. Poll it while the status is `computing`, `rehearsing`, `applying`, `online` or `finishing`, and while a requested after-merge choice is pending (`result.after.requested` or `started`).
+ * @summary Read a merge
+ */
+export const getMerge = async (id: string,
+    mergeId: string, options?: Parameters<typeof customFetch>[1]): Promise<MergeDetail> => {
+
+  return customFetch<MergeDetail>(getGetMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetMergeQueryKey = (id: string,
+    mergeId: string,) => {
+    return [
+    `/v1/databases/${id}/merges/${mergeId}`
+    ] as const;
+    }
+
+
+export const getGetMergeQueryOptions = <TData = Awaited<ReturnType<typeof getMerge>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getMerge>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetMergeQueryKey(id,mergeId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getMerge>>> = ({ signal }) => getMerge(id,mergeId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && mergeId !== null && mergeId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getMerge>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetMergeQueryResult = NonNullable<Awaited<ReturnType<typeof getMerge>>>
+export type GetMergeQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetMerge<TData = Awaited<ReturnType<typeof getMerge>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getMerge>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getMerge>>,
+          TError,
+          Awaited<ReturnType<typeof getMerge>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetMerge<TData = Awaited<ReturnType<typeof getMerge>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getMerge>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getMerge>>,
+          TError,
+          Awaited<ReturnType<typeof getMerge>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetMerge<TData = Awaited<ReturnType<typeof getMerge>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getMerge>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Read a merge
+ */
+
+export function useGetMerge<TData = Awaited<ReturnType<typeof getMerge>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getMerge>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetMergeQueryOptions(id,mergeId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getUpdateMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}`
+}
+
+/**
+ * Saves the resolutions, own steps, acknowledgements and options of a `draft` or `rehearsed` merge. A save of only `acknowledgements` and `options.after` keeps the merge as it is (a rehearsed merge stays rehearsed). Any other save (resolutions, steps, `options.lock_timeout_ms`) moves it to `computing` (a rehearsed one loses its rehearsal): the worker recomputes the analysis and the plan from what was saved, keeping a resolution whose conflict is unchanged, and returns it to `draft`. `version` must be the one you last read.
+ * @summary Edit a draft merge
+ */
+export const updateMerge = async (id: string,
+    mergeId: string,
+    updateMergeRequest: UpdateMergeRequest, options?: Parameters<typeof customFetch>[1]): Promise<Merge> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Merge>(getUpdateMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateMergeRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateMergeMutationKey = () => ['updateMerge'] as const;
+
+export const getUpdateMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateMerge>>, TError,UpdateMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateMerge>>, TError,UpdateMergeMutationVariables, TContext> => {
+
+const mutationKey = getUpdateMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateMerge>>, UpdateMergeMutationVariables> = (props) => {
+          const {id,mergeId,data} = props ?? {};
+
+          return  updateMerge(id,mergeId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateMergeMutationResult = NonNullable<Awaited<ReturnType<typeof updateMerge>>>
+    export type UpdateMergeMutationBody = UpdateMergeRequest
+    export type UpdateMergeMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateMergeMutationVariables = {id: string;mergeId: string;data: UpdateMergeRequest}
+
+    /**
+ * @summary Edit a draft merge
+ */
+export const useUpdateMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateMerge>>, TError,UpdateMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateMerge>>,
+        TError,
+        UpdateMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateMergeMutationOptions(options), queryClient);
+    }
+
+export const getAbandonMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/abandon`
+}
+
+/**
+ * For a merge `failed` in the `online` phase: its transaction is on the target, its online steps didn't all run, and it holds both branches until it is retried to the end or abandoned. Abandoning makes it `cancelled` and frees the branches. Nothing on the target is undone: `result.leftovers` lists what the merge left there that the online phase didn't finish, each `{kind, schema, table, name}`: `not_valid_constraint` (a constraint added `NOT VALID`, never validated; it still checks new rows); `not_null_check` (a temporary `chelabase_merge_nn_*` check that wasn't dropped); `invalid_index` (the index the online phase was building, or dropping concurrently, when it stopped: Postgres may have left it INVALID, unused by queries but still updated by writes; it may also not be there); `unattached_index` (a valid index the merge built that its next step didn't put into place: a temporary `chelabase_merge_ix_*` index not renamed over the one it replaces, or a unique constraint's index not attached to its constraint; nothing uses it, and it costs on every write). Validate, attach or drop them by hand (`DROP INDEX CONCURRENTLY IF EXISTS` for an index).
+ * @summary Give up a merge that failed half applied
+ */
+export const abandonMerge = async (id: string,
+    mergeId: string, options?: Parameters<typeof customFetch>[1]): Promise<Merge> => {
+
+  return customFetch<Merge>(getAbandonMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getAbandonMergeMutationKey = () => ['abandonMerge'] as const;
+
+export const getAbandonMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof abandonMerge>>, TError,AbandonMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof abandonMerge>>, TError,AbandonMergeMutationVariables, TContext> => {
+
+const mutationKey = getAbandonMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof abandonMerge>>, AbandonMergeMutationVariables> = (props) => {
+          const {id,mergeId} = props ?? {};
+
+          return  abandonMerge(id,mergeId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AbandonMergeMutationResult = NonNullable<Awaited<ReturnType<typeof abandonMerge>>>
+
+    export type AbandonMergeMutationError = ErrorType<ErrorEnvelope>
+    export type AbandonMergeMutationVariables = {id: string;mergeId: string}
+
+    /**
+ * @summary Give up a merge that failed half applied
+ */
+export const useAbandonMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof abandonMerge>>, TError,AbandonMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof abandonMerge>>,
+        TError,
+        AbandonMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAbandonMergeMutationOptions(options), queryClient);
+    }
+
+export const getApplyMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/apply`
+}
+
+/**
+ * Refuses, in this order: a merge that isn't `rehearsed` (`merge_not_rehearsed`, or `merge_stale` for a stale one); a `version` that isn't the merge's (`merge_version_conflict`: a save of acknowledgements or the after-merge choice keeps a merge rehearsed, so send the version you last saw to apply what you saw); conflicts without a resolution (`merge_conflicts_open`); data-loss, security (BYPASSRLS, owner-level) or breaking (a role rename) steps without an acknowledgement (`merge_drops_unacknowledged`); a protected target without `confirm: true` (`merge_confirm_required`); another merge applying to the target, or failed half applied on it (`merge_busy`). The worker then runs the plan (`applying`, then `online` for the concurrent index and validation steps, then `finishing`). The request doesn't read the target: before the plan's transaction the worker compares the target with the schema the plan was computed from, and if it changed, ends the merge `stale` without applying the transaction.
+ * @summary Apply a rehearsed merge to its target
+ */
+export const applyMerge = async (id: string,
+    mergeId: string,
+    applyRequest: ApplyRequest, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<MergeSummary>(getApplyMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(applyRequest)
+  }
+);}
+
+
+
+
+
+export const getApplyMergeMutationKey = () => ['applyMerge'] as const;
+
+export const getApplyMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof applyMerge>>, TError,ApplyMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof applyMerge>>, TError,ApplyMergeMutationVariables, TContext> => {
+
+const mutationKey = getApplyMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof applyMerge>>, ApplyMergeMutationVariables> = (props) => {
+          const {id,mergeId,data} = props ?? {};
+
+          return  applyMerge(id,mergeId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ApplyMergeMutationResult = NonNullable<Awaited<ReturnType<typeof applyMerge>>>
+    export type ApplyMergeMutationBody = ApplyRequest
+    export type ApplyMergeMutationError = ErrorType<ErrorEnvelope>
+    export type ApplyMergeMutationVariables = {id: string;mergeId: string;data: ApplyRequest}
+
+    /**
+ * @summary Apply a rehearsed merge to its target
+ */
+export const useApplyMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof applyMerge>>, TError,ApplyMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof applyMerge>>,
+        TError,
+        ApplyMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getApplyMergeMutationOptions(options), queryClient);
+    }
+
+export const getCancelMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/cancel`
+}
+
+/**
+ * Stops a merge that isn't changing the target: `computing`, `draft`, `rehearsing` (the worker deletes the rehearsal branch; until it is gone the target's reset, restore and delete answer `branch_merge_busy` with `error.rehearsal_branch_id`) or `rehearsed`. An applying merge can't be cancelled, and a merge failed in `online` is abandoned instead.
+ * @summary Cancel a merge
+ */
+export const cancelMerge = async (id: string,
+    mergeId: string, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary> => {
+
+  return customFetch<MergeSummary>(getCancelMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getCancelMergeMutationKey = () => ['cancelMerge'] as const;
+
+export const getCancelMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof cancelMerge>>, TError,CancelMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof cancelMerge>>, TError,CancelMergeMutationVariables, TContext> => {
+
+const mutationKey = getCancelMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof cancelMerge>>, CancelMergeMutationVariables> = (props) => {
+          const {id,mergeId} = props ?? {};
+
+          return  cancelMerge(id,mergeId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CancelMergeMutationResult = NonNullable<Awaited<ReturnType<typeof cancelMerge>>>
+
+    export type CancelMergeMutationError = ErrorType<ErrorEnvelope>
+    export type CancelMergeMutationVariables = {id: string;mergeId: string}
+
+    /**
+ * @summary Cancel a merge
+ */
+export const useCancelMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof cancelMerge>>, TError,CancelMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof cancelMerge>>,
+        TError,
+        CancelMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCancelMergeMutationOptions(options), queryClient);
+    }
+
+export const getFinishMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/finish`
+}
+
+/**
+ * A merge whose target doesn't read back as merged ends `applied_with_drift` without running its after-merge choice (`result.after.skipped`). Once you've looked at the drift, this runs it: `keep` (the merge becomes the branch's base, if the source is still the schema that was merged; otherwise `result.after.base` is `not_advanced`), `reset` or `delete` of the source branch, with their usual refusals recorded in `result.after`. Only once per merge; an update from the parent only keeps. The merge stays `applied_with_drift`; `result.after` holds `requested: true` until the worker records the outcome.
+ * @summary Run the after-merge choice of a merge applied with drift
+ */
+export const finishMerge = async (id: string,
+    mergeId: string,
+    finishRequest: FinishRequest, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<MergeSummary>(getFinishMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(finishRequest)
+  }
+);}
+
+
+
+
+
+export const getFinishMergeMutationKey = () => ['finishMerge'] as const;
+
+export const getFinishMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof finishMerge>>, TError,FinishMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof finishMerge>>, TError,FinishMergeMutationVariables, TContext> => {
+
+const mutationKey = getFinishMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof finishMerge>>, FinishMergeMutationVariables> = (props) => {
+          const {id,mergeId,data} = props ?? {};
+
+          return  finishMerge(id,mergeId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type FinishMergeMutationResult = NonNullable<Awaited<ReturnType<typeof finishMerge>>>
+    export type FinishMergeMutationBody = FinishRequest
+    export type FinishMergeMutationError = ErrorType<ErrorEnvelope>
+    export type FinishMergeMutationVariables = {id: string;mergeId: string;data: FinishRequest}
+
+    /**
+ * @summary Run the after-merge choice of a merge applied with drift
+ */
+export const useFinishMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof finishMerge>>, TError,FinishMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof finishMerge>>,
+        TError,
+        FinishMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getFinishMergeMutationOptions(options), queryClient);
+    }
+
+export const getExportMergePlanUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/plan.sql`
+}
+
+/**
+ * The final plan as a `.sql` file: phase headers as comments, the plan's transaction in `BEGIN`/`COMMIT` starting with `SET LOCAL lock_timeout` and `statement_timeout` from the merge's options (its stale guard and recovery marker are left out), the online phase marked "run outside a transaction", roles as comments (never passwords). Never cached.
+ * @summary Export a merge's plan as SQL
+ */
+export const exportMergePlan = async (id: string,
+    mergeId: string, options?: Parameters<typeof customFetch>[1]): Promise<string> => {
+
+  return customFetch<string>(getExportMergePlanUrl(id,mergeId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getExportMergePlanQueryKey = (id: string,
+    mergeId: string,) => {
+    return [
+    `/v1/databases/${id}/merges/${mergeId}/plan.sql`
+    ] as const;
+    }
+
+
+export const getExportMergePlanQueryOptions = <TData = Awaited<ReturnType<typeof exportMergePlan>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof exportMergePlan>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getExportMergePlanQueryKey(id,mergeId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof exportMergePlan>>> = ({ signal }) => exportMergePlan(id,mergeId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && mergeId !== null && mergeId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof exportMergePlan>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ExportMergePlanQueryResult = NonNullable<Awaited<ReturnType<typeof exportMergePlan>>>
+export type ExportMergePlanQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useExportMergePlan<TData = Awaited<ReturnType<typeof exportMergePlan>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof exportMergePlan>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof exportMergePlan>>,
+          TError,
+          Awaited<ReturnType<typeof exportMergePlan>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useExportMergePlan<TData = Awaited<ReturnType<typeof exportMergePlan>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof exportMergePlan>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof exportMergePlan>>,
+          TError,
+          Awaited<ReturnType<typeof exportMergePlan>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useExportMergePlan<TData = Awaited<ReturnType<typeof exportMergePlan>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof exportMergePlan>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Export a merge's plan as SQL
+ */
+
+export function useExportMergePlan<TData = Awaited<ReturnType<typeof exportMergePlan>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    mergeId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof exportMergePlan>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getExportMergePlanQueryOptions(id,mergeId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getRecomputeMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/recompute`
+}
+
+/**
+ * From `draft`, `stale` or `failed` (not a failure in the online phase: retry that one). The worker reads both schemas again and returns a new draft that keeps the resolutions whose conflicts are unchanged. `rebaseline: true` uses the target's current schema as the base when the real one is gone (`merge_base_unavailable` in `error`): every difference then counts as a source change, so the target's own recent changes show as things to undo.
+ * @summary Recompute a merge from the schemas as they are now
+ */
+export const recomputeMerge = async (id: string,
+    mergeId: string,
+    recomputeRequest: RecomputeRequest, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<MergeSummary>(getRecomputeMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(recomputeRequest)
+  }
+);}
+
+
+
+
+
+export const getRecomputeMergeMutationKey = () => ['recomputeMerge'] as const;
+
+export const getRecomputeMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof recomputeMerge>>, TError,RecomputeMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof recomputeMerge>>, TError,RecomputeMergeMutationVariables, TContext> => {
+
+const mutationKey = getRecomputeMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof recomputeMerge>>, RecomputeMergeMutationVariables> = (props) => {
+          const {id,mergeId,data} = props ?? {};
+
+          return  recomputeMerge(id,mergeId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RecomputeMergeMutationResult = NonNullable<Awaited<ReturnType<typeof recomputeMerge>>>
+    export type RecomputeMergeMutationBody = RecomputeRequest
+    export type RecomputeMergeMutationError = ErrorType<ErrorEnvelope>
+    export type RecomputeMergeMutationVariables = {id: string;mergeId: string;data: RecomputeRequest}
+
+    /**
+ * @summary Recompute a merge from the schemas as they are now
+ */
+export const useRecomputeMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof recomputeMerge>>, TError,RecomputeMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof recomputeMerge>>,
+        TError,
+        RecomputeMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRecomputeMergeMutationOptions(options), queryClient);
+    }
+
+export const getRehearseMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/rehearse`
+}
+
+/**
+ * Runs the plan on a throwaway branch of the target (real data, so a failing constraint shows) and compares the result with the merged schema. Needs a `draft` with a plan and no open conflicts. Success makes the merge `rehearsed`; a failure returns it to `draft` with the failing step and the Postgres error in `rehearsal`. Send the `version` you last saw: the rehearsal then runs that draft.
+ * @summary Rehearse a draft merge
+ */
+export const rehearseMerge = async (id: string,
+    mergeId: string,
+    rehearseRequest: RehearseRequest, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<MergeSummary>(getRehearseMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(rehearseRequest)
+  }
+);}
+
+
+
+
+
+export const getRehearseMergeMutationKey = () => ['rehearseMerge'] as const;
+
+export const getRehearseMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rehearseMerge>>, TError,RehearseMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof rehearseMerge>>, TError,RehearseMergeMutationVariables, TContext> => {
+
+const mutationKey = getRehearseMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof rehearseMerge>>, RehearseMergeMutationVariables> = (props) => {
+          const {id,mergeId,data} = props ?? {};
+
+          return  rehearseMerge(id,mergeId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RehearseMergeMutationResult = NonNullable<Awaited<ReturnType<typeof rehearseMerge>>>
+    export type RehearseMergeMutationBody = RehearseRequest
+    export type RehearseMergeMutationError = ErrorType<ErrorEnvelope>
+    export type RehearseMergeMutationVariables = {id: string;mergeId: string;data: RehearseRequest}
+
+    /**
+ * @summary Rehearse a draft merge
+ */
+export const useRehearseMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rehearseMerge>>, TError,RehearseMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof rehearseMerge>>,
+        TError,
+        RehearseMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRehearseMergeMutationOptions(options), queryClient);
+    }
+
+export const getRetryMergeUrl = (id: string,
+    mergeId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/merges/${encodeURIComponent(String(mergeId))}/retry`
+}
+
+/**
+ * For a `failed` merge whose `failed_phase` is `roles`, `enum_add`, `tx` or `online`. Failed in `online`: the plan's transaction is committed and the target changed; only the online steps (concurrent indexes, constraint validation) are left, and the worker continues where it stopped (a valid index is skipped, an invalid one is dropped and rebuilt); the merge is `online` again. If the plan's transaction is no longer on the target, or the target is gone, the merge fails for good. Failed before (`roles`, `enum_add`, `tx`): the worker first checks whether the plan's transaction committed after all (its answer may have been lost); if it did, it goes on to the online steps; if not, the apply runs again from the start, with its checks (a target that changed since the merge was computed makes it `stale`; roles and enum values the first attempt made stay); the merge is `applying` again.
+ * @summary Retry a merge that failed while applying
+ */
+export const retryMerge = async (id: string,
+    mergeId: string, options?: Parameters<typeof customFetch>[1]): Promise<MergeSummary> => {
+
+  return customFetch<MergeSummary>(getRetryMergeUrl(id,mergeId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getRetryMergeMutationKey = () => ['retryMerge'] as const;
+
+export const getRetryMergeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof retryMerge>>, TError,RetryMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof retryMerge>>, TError,RetryMergeMutationVariables, TContext> => {
+
+const mutationKey = getRetryMergeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof retryMerge>>, RetryMergeMutationVariables> = (props) => {
+          const {id,mergeId} = props ?? {};
+
+          return  retryMerge(id,mergeId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RetryMergeMutationResult = NonNullable<Awaited<ReturnType<typeof retryMerge>>>
+
+    export type RetryMergeMutationError = ErrorType<ErrorEnvelope>
+    export type RetryMergeMutationVariables = {id: string;mergeId: string}
+
+    /**
+ * @summary Retry a merge that failed while applying
+ */
+export const useRetryMerge = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof retryMerge>>, TError,RetryMergeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof retryMerge>>,
+        TError,
+        RetryMergeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRetryMergeMutationOptions(options), queryClient);
+    }
 
 export const getResetDatabasePasswordUrl = (id: string,) => {
 

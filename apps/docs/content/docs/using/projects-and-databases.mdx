@@ -33,6 +33,8 @@ Clients connect through Neon's proxy, never straight to a compute:
 
 Use `sslrootcert=.chelabase/neon/proxy-ca.crt`; if `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`. The ports can be changed with `CHELABASE_PROXY_PG_PORT` and `CHELABASE_PROXY_HTTP_PORT`.
 
+The main Postgres database is named after the database, with every character outside `[A-Za-z0-9_]` turned into `_`: "web-1 prod" gets `web_1_prod`. A database's `postgres_database` (in `GET /v1/databases/{id}`, and in each project's `databases` in `GET /v1/me`) gives that name; schema merges and the SQL tools name the Postgres database, not the display name.
+
 Every database has the data API roles `anon` (`NOLOGIN`), `authenticated` (`NOLOGIN`) and `authenticator` (`LOGIN NOINHERIT`, with its own encrypted password per branch). Main is itself a branch, created when the database is provisioned; see [Branches](/docs/using/branches).
 
 ## Connection details

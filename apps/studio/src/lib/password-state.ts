@@ -6,4 +6,5 @@ export const PASSWORD_STATE_TEXT: Record<PasswordState, string> = {
   set_in_sql: "Password set in SQL — reset to get a revealable one",
   md5_unusable: "MD5 password: can't log in through Chelabase; reset it",
   unreadable: "Stored password can't be read; reset it.",
+  none: "No password (NOLOGIN)",
 };

@@ -10,7 +10,7 @@ use chelabase_types::BranchId;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::neon::{RoleCopy, copy_from_tuple};
+use crate::neon::{RoleCopy, copy_from_row};
 use crate::{DatabaseOrigin, MetadataClient, MetadataError};
 
 /// Postgres' `lock_not_available`: the `lock_timeout` ran out.
@@ -123,16 +123,18 @@ impl DdlTx {
 
     /// Any row of the endpoint (the owner's included), with its secrets.
     pub async fn role(&mut self, name: &str) -> Result<Option<RoleCopy>, MetadataError> {
-        let row = sqlx::query_as(
-            "SELECT name, origin, scram_verifier, password_enc, login, level, api_owner_level,
-                    pending, created_at
-             FROM neon_roles WHERE endpoint_id = $1 AND name = $2",
+        let row = sqlx::query(
+            "SELECT r.name, r.origin, r.scram_verifier, r.password_enc, r.login, r.level,
+                    r.api_owner_level, r.pending, r.attributes_pending, r.created_at, r.inherit,
+                    r.connection_limit,
+                    r.valid_until, r.bypass_rls, r.member_of
+             FROM neon_roles r WHERE r.endpoint_id = $1 AND r.name = $2",
         )
         .bind(&self.endpoint_id)
         .bind(name)
         .fetch_optional(&mut *self.tx)
         .await?;
-        row.map(copy_from_tuple).transpose()
+        row.as_ref().map(copy_from_row).transpose()
     }
 
     /// Rows of origin `sql` or `api` with a verifier: what the role cap counts (R5).

@@ -10,11 +10,13 @@ import {
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
+import type { ConnectionFocus } from "@/lib/project-search";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";
 import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
 import { DatabaseDataApi } from "./database-data-api";
+import { MergesList } from "./merges/merges-list";
 import { ProjectSettings } from "./project-settings";
 import { TablesView } from "./tables-view";
 import { UsersTab } from "./users-tab";
@@ -34,9 +36,11 @@ export interface ProjectPageProps {
   onTabChange: (tab: ProjectTab) => void;
   /** The project doesn't exist (any more): go back to the dashboard. */
   onGone: () => void;
+  /** A branch's connection details to open on load (from the URL; a merge's created roles link here). */
+  focus?: ConnectionFocus | null;
 }
 
-export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onGone }: ProjectPageProps) {
+export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onGone, focus = null }: ProjectPageProps) {
   // The project itself (status, error, app users), followed while it is being deleted.
   const project = useGetProject(projectId, {
     query: { refetchInterval: pollWhile<ProjectInfo>((p) => p.status === "deleting") },
@@ -128,7 +132,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
                   Couldn't load your databases: {errorText(me.error)}
                 </p>
               ) : null}
-              <DatabasesTable databases={databases} apiUrl={apiUrl} />
+              <DatabasesTable projectId={projectId} databases={databases} apiUrl={apiUrl} focus={focus} />
             </fieldset>
           ) : tab === "users" && usersEnabled ? (
             <fieldset disabled={project.data.status === "deleting"} className="m-0 min-w-0 border-0 p-0">
@@ -162,10 +166,23 @@ function TabButton({ active, onClick, children }: { active: boolean; onClick: ()
   );
 }
 
-type DatabaseView = "branches" | "data-api" | "tables" | "sql";
+type DatabaseView = "branches" | "merges" | "data-api" | "tables" | "sql";
 
-function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; apiUrl: string }) {
-  const [open, setOpen] = useState<{ id: string; view: DatabaseView } | null>(null);
+function DatabasesTable({
+  projectId,
+  databases,
+  apiUrl,
+  focus,
+}: {
+  projectId: string;
+  databases: DatabaseSummary[];
+  apiUrl: string;
+  focus: ConnectionFocus | null;
+}) {
+  // A focused branch opens its database's branches; read once, on the first render.
+  const [open, setOpen] = useState<{ id: string; view: DatabaseView } | null>(() =>
+    focus ? { id: focus.databaseId, view: "branches" } : null,
+  );
   const toggle = (id: string, view: DatabaseView) =>
     setOpen(open?.id === id && open.view === view ? null : { id, view });
   if (databases.length === 0) {
@@ -204,6 +221,15 @@ function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; a
                     size="sm"
                     variant="outline"
                     disabled={db.status !== "ready"}
+                    aria-expanded={open?.id === db.database_id && open.view === "merges"}
+                    onClick={() => toggle(db.database_id, "merges")}
+                  >
+                    Merges
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={db.status !== "ready"}
                     aria-expanded={open?.id === db.database_id && open.view === "data-api"}
                     onClick={() => toggle(db.database_id, "data-api")}
                   >
@@ -234,7 +260,13 @@ function DatabasesTable({ databases, apiUrl }: { databases: DatabaseSummary[]; a
               <tr className="border-b last:border-0">
                 <td colSpan={4}>
                   {open.view === "branches" ? (
-                    <DatabaseBranches database={db} />
+                    <DatabaseBranches
+                      projectId={projectId}
+                      database={db}
+                      focus={focus?.databaseId === db.database_id ? focus : null}
+                    />
+                  ) : open.view === "merges" ? (
+                    <MergesList projectId={projectId} databaseId={db.database_id} />
                   ) : open.view === "tables" ? (
                     <TablesView databaseId={db.database_id} />
                   ) : open.view === "sql" ? (

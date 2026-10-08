@@ -2,14 +2,16 @@ use axum::{Json, Router, routing::get};
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
-    DataApiDatabaseRequest, GrantDataRoleRequest, NatsConfig, RESET_NOT_APPLIED,
-    ResetPasswordReply, ResetPasswordRequest, ResyncBranchRequest, RoleReply,
+    DataApiDatabaseRequest, GrantDataRoleRequest, JobEnvelope, NatsConfig,
+    RESET_NOT_APPLIED, ResetPasswordReply, ResetPasswordRequest, ResyncBranchRequest, RoleReply,
+    RoleRequest, RoleSessionsReply, SUBJECT_ROLE_SESSIONS,
     SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
     SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_GRANT_DATA_ROLE_TO_OWNER,
     SUBJECT_RESET_PASSWORD, SUBJECT_RESYNC_BRANCH, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE,
-    SUBJECT_ROLE_RESET, connect, ensure_control_stream, run_app_users_consumer,
-    run_app_users_sync_consumer, run_branch_consumer, run_delete_consumer,
-    run_project_delete_consumer, run_provision_consumer, run_settings_consumer,
+    SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE, connect, ensure_control_stream, publish_merge,
+    run_app_users_consumer, run_app_users_sync_consumer, run_branch_consumer,
+    run_delete_consumer, run_merge_consumer, run_project_delete_consumer,
+    run_provision_consumer, run_settings_consumer,
 };
 use chelabase_secrets::{SecretKey, key_check_value, verify_key_check};
 use chelabase_types::mode::Mode;
@@ -56,6 +58,12 @@ async fn main() -> anyhow::Result<()> {
     ensure_secrets_key(&metadata, &key).await?;
 
     let worker = Arc::new(build(&config, metadata, key)?);
+    worker.resync_requests.connect(nats.clone());
+    // E33a: the secret keys' BYPASSRLS marks, right from the start.
+    tokio::spawn({
+        let worker = worker.clone();
+        async move { worker.sync_key_marks_at_start().await }
+    });
     if config.owner_superuser_requested && config.mode == Mode::Platform {
         warn!("CHELABASE_DB_OWNER_SUPERUSER is ignored in platform mode");
     }
@@ -82,11 +90,12 @@ async fn main() -> anyhow::Result<()> {
     for subject in [SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_REBOOTSTRAP] {
         tokio::spawn(serve_data_api_rpc(worker.clone(), nats.clone(), subject));
     }
-    for subject in [SUBJECT_ROLE_CREATE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_DELETE] {
+    for subject in [SUBJECT_ROLE_CREATE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_UPDATE] {
         tokio::spawn(serve_role_rpc(worker.clone(), nats.clone(), subject));
     }
+    tokio::spawn(serve_role_sessions(worker.clone(), nats.clone()));
     tokio::spawn(serve_resync_branch(worker.clone(), nats.clone()));
-    tokio::spawn(reconcile_loop(worker.clone()));
+    tokio::spawn(reconcile_loop(worker.clone(), js.clone()));
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
     if worker.zitadel.is_none() {
@@ -162,6 +171,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // P11: one merge job at a time, like the branch consumer.
+    let merge_worker = worker.clone();
+    let merge_js = js.clone();
+    tokio::spawn(async move {
+        let result = run_merge_consumer(merge_js, move |job, attempt| {
+            let worker = merge_worker.clone();
+            async move { worker.handle_merge_job(job.payload, Attempt(attempt)).await }
+        })
+        .await;
+        if let Err(err) = result {
+            warn!("merge consumer exited: {err}");
+        }
+    });
+
     let settings_worker = worker.clone();
     let settings_js = js.clone();
     tokio::spawn(async move {
@@ -175,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("worker consuming provision, delete, branch, settings, project delete and app users jobs");
+    info!("worker consuming provision, delete, branch, merge, settings, project delete and app users jobs");
     run_provision_consumer(js, move |job| {
         let worker = worker.clone();
         async move {
@@ -283,7 +306,7 @@ async fn serve_reset_password(worker: Arc<RealWorker>, client: async_nats::Clien
 
 // --- Reconcile ---------------------------------------------------------------
 
-async fn reconcile_loop(worker: Arc<RealWorker>) {
+async fn reconcile_loop(worker: Arc<RealWorker>, js: async_nats::jetstream::Context) {
     // First pass after one period, so queued jobs are picked up (and their rows
     // refreshed) before reconcile judges anything stale.
     let mut every = tokio::time::interval_at(
@@ -295,6 +318,21 @@ async fn reconcile_loop(worker: Arc<RealWorker>) {
         if let Err(err) = worker.reconcile_once().await {
             warn!("reconcile: {err}");
         }
+        // R3: merges whose worker went silent go back to the merge consumer (P11: one job at
+        // a time there), as `Resume`; lost after-merge choices as `Finish` (T14 M8). A hand-back
+        // is recorded only once published (T14 F3 M3).
+        worker
+            .hand_back_merges(|payload| {
+                let js = js.clone();
+                async move {
+                    let job = JobEnvelope {
+                        job_id: uuid::Uuid::new_v4(),
+                        payload,
+                    };
+                    publish_merge(&js, &job).await.map_err(|e| e.to_string())
+                }
+            })
+            .await;
     }
 }
 
@@ -612,6 +650,45 @@ async fn serve_role_rpc(
                 let body = serde_json::to_vec(&reply).unwrap_or_default();
                 if let Err(err) = client.publish(reply_to, body.into()).await {
                     warn!(subject, "role reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+/// Serves the role-sessions read (E29a) in the reset queue group; a request that doesn't
+/// decode, or outlasts [`ROLE_DEADLINE`], answers `failed`.
+async fn serve_role_sessions(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_ROLE_SESSIONS, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("role-sessions subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_ROLE_SESSIONS, "serving role-sessions requests");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply = match serde_json::from_slice::<RoleRequest>(&message.payload) {
+                Ok(request) => {
+                    tokio::time::timeout(ROLE_DEADLINE, worker.role_sessions_reply(&request))
+                        .await
+                        .unwrap_or_else(|_| {
+                            warn!(branch_id = %request.branch_id, "role sessions timed out");
+                            RoleSessionsReply::failed("timed out")
+                        })
+                }
+                Err(err) => RoleSessionsReply::failed(format!("bad request: {err}")),
+            };
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("role-sessions reply failed: {err}");
                 }
             }
         });

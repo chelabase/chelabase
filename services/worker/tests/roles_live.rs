@@ -34,7 +34,7 @@ use chelabase_types::{BranchId, DatabaseId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use worker::config::RealWorker;
-use worker::roles::RoleOutcome;
+use worker::roles::{RoleOutcome, RolePatch, RoleSpec};
 
 mod common;
 use common::{cleanup, setup, workspace_root};
@@ -145,7 +145,7 @@ impl Fx {
 
     async fn create(&self, branch: BranchId, name: &str, owner_level: bool) {
         let started = Instant::now();
-        let outcome = self.worker.create_role(branch, name, owner_level).await;
+        let outcome = self.worker.create_role(branch, &RoleSpec::login(name, owner_level)).await;
         println!("create {name} took {:?}", started.elapsed());
         assert_eq!(outcome, RoleOutcome::Ok, "create_role {name}");
     }
@@ -1715,14 +1715,33 @@ async fn owner_level_by_sql_blocks_the_key() {
         )
         .await
         .expect("make them owner-level");
-        for (r, _, key) in &keys {
+        // E33: BYPASSRLS alone is allowed; the other two are owner-level now.
+        let (bypass, owner_level) = keys.split_at(1);
+        for (r, _, key) in owner_level {
             let body = wait_for_data_status(key, "notes", 403, Duration::from_secs(35)).await;
             assert_eq!(body["error"]["code"], "role_not_allowed", "{r}: {body}");
             println!("{r}: 403 after {:?}", changed.elapsed());
         }
+        let (_, bypass_id, bypass_key) = &bypass[0];
+        let body = wait_for_data_status(bypass_key, "notes", 200, Duration::from_secs(5)).await;
+        assert_eq!(body, json!([{ "id": 1, "body": "n" }]));
+        // The key list marks the BYPASSRLS key once the resync has read it.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (status, listed) = api("GET", &format!("{}/keys", fx.branch_path(fx.main)), None).await;
+            assert_eq!(status, 200, "{listed}");
+            let key = listed.as_array().unwrap().iter().find(|k| k["id"] == json!(bypass_id)).cloned().unwrap();
+            if key["bypasses_rls"] == true || Instant::now() >= deadline {
+                assert_eq!(key["bypasses_rls"], true, "{key}");
+                assert_eq!(key["role_blocked"], false, "{key}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         // listRoles' level comes from the resync (these ALTERs forward nothing to record):
         // reconcile's next pass, every 30 s.
-        for (r, id, _) in &keys {
+        assert_eq!(fx.listed_role("by_bypassrls").await["level"], "plain");
+        for (r, id, _) in owner_level {
             let deadline = Instant::now() + Duration::from_secs(60);
             let row = loop {
                 let row = fx.listed_role(r).await;
@@ -2274,6 +2293,418 @@ async fn restore_before_the_role_brings_it_back() {
         );
         fx.assert_plain(&fx.ep, "app").await;
         assert_logs_in(&fx.ep, &fx.database, "app", &pw).await;
+    })
+    .await;
+}
+
+// U1: a NOLOGIN group role with attributes, made by admin_sql (never in the spec), and a
+// LOGIN member of it; an update drops the membership and LOGIN; the resync keeps both
+// NOLOGIN roles and restores the group's attributes after drift in SQL.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn nologin_group_role_and_membership_on_a_real_compute() {
+    live(|fx| async move {
+        const ATTRS: &str = "SELECT rolcanlogin::text || ',' || rolinherit::text || ',' || \
+            rolconnlimit || ',' || rolbypassrls::text || ',' || (rolpassword IS NULL)::text || \
+            ',' || coalesce(extract(epoch FROM rolvaliduntil)::bigint::text, '-') \
+            FROM pg_authid WHERE rolname = 'readers';";
+        const MEMBERS: &str = "SELECT count(*) FROM pg_auth_members \
+            WHERE roleid = 'readers'::regrole AND member = 'app'::regrole;";
+        let group = RoleSpec {
+            login: false,
+            inherit: false,
+            connection_limit: 3,
+            valid_until: chrono::DateTime::from_timestamp(1_900_000_000, 0),
+            bypass_rls: true,
+            ..RoleSpec::login("readers", false)
+        };
+        assert_eq!(fx.worker.create_role(fx.main, &group).await, RoleOutcome::Ok);
+        assert_eq!(fx.value(&fx.ep, ATTRS).await, "false,false,3,true,true,1900000000");
+        assert_eq!(fx.metadata.role_password(&fx.ep, "readers").await.unwrap(), None);
+
+        let member = RoleSpec {
+            member_of: vec!["readers".into()],
+            ..RoleSpec::login("app", false)
+        };
+        assert_eq!(fx.worker.create_role(fx.main, &member).await, RoleOutcome::Ok);
+        assert_eq!(fx.value(&fx.ep, MEMBERS).await, "1");
+        let pw = fx.password(fx.main, "app").await;
+        assert_logs_in(&fx.ep, &fx.database, "app", &pw).await;
+
+        // Chelabase's own roles are never a membership target.
+        let reserved = RoleSpec {
+            member_of: vec!["authenticated".into()],
+            ..RoleSpec::login("sneaky", false)
+        };
+        assert!(matches!(
+            fx.worker.create_role(fx.main, &reserved).await,
+            RoleOutcome::Refused("role_membership_not_allowed", _)
+        ));
+        assert_eq!(fx.role_count(&fx.ep, "sneaky").await, "0");
+
+        // The update: no membership, no LOGIN, no password.
+        let patch = RolePatch {
+            member_of: Some(vec![]),
+            login: Some(false),
+            ..RolePatch::default()
+        };
+        assert_eq!(fx.worker.update_role(fx.main, "app", &patch).await, RoleOutcome::Ok);
+        assert_eq!(fx.value(&fx.ep, MEMBERS).await, "0");
+        assert_eq!(
+            fx.value(&fx.ep, "SELECT rolcanlogin::text || ',' || (rolpassword IS NULL)::text FROM pg_authid WHERE rolname = 'app';").await,
+            "false,true"
+        );
+        assert_refused(&fx.ep, &fx.database, "app", &pw).await;
+
+        // E32: changes in SQL stick, for an API-made role too: the resync records them (and
+        // keeps both roles) instead of setting them back.
+        fx.sql("ALTER ROLE readers LOGIN INHERIT CONNECTION LIMIT -1 NOBYPASSRLS;").await;
+        fx.worker.resync(fx.main).await.unwrap();
+        assert_eq!(fx.value(&fx.ep, ATTRS).await, "true,true,-1,false,true,1900000000");
+        assert_eq!(fx.role_count(&fx.ep, "app").await, "1");
+        let copies = fx.copies(&fx.ep).await;
+        assert!(copies.contains(&("readers".to_string(), RoleOrigin::Api)), "{copies:?}");
+        assert!(copies.contains(&("app".to_string(), RoleOrigin::Api)), "{copies:?}");
+        let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+        let readers = rows.iter().find(|r| r.name == "readers").unwrap();
+        assert!(readers.login, "recorded");
+        assert_eq!(
+            (readers.attributes.inherit, readers.attributes.connection_limit, readers.attributes.bypass_rls),
+            (true, -1, false),
+            "recorded"
+        );
+        assert!(!readers.attributes_pending);
+        // A later PATCH starts from there: only what it names changes.
+        let limit = RolePatch { connection_limit: Some(2), ..RolePatch::default() };
+        assert_eq!(fx.worker.update_role(fx.main, "readers", &limit).await, RoleOutcome::Ok);
+        assert_eq!(fx.value(&fx.ep, ATTRS).await, "true,true,2,false,true,1900000000");
+
+        // Fix round 1: a role made in SQL by cloud_admin (the owner has no ADMIN on it) is
+        // someone else's: the PATCH doesn't find it and changes nothing.
+        fx.sql("CREATE ROLE theirs NOLOGIN;").await;
+        let bypass = RolePatch {
+            bypass_rls: Some(true),
+            ..RolePatch::default()
+        };
+        assert_eq!(fx.worker.update_role(fx.main, "theirs", &bypass).await, RoleOutcome::NotFound);
+        assert_eq!(
+            fx.value(&fx.ep, "SELECT rolbypassrls::text FROM pg_authid WHERE rolname = 'theirs';").await,
+            "false"
+        );
+        // One the owner made is the owner's to change.
+        fx.owner_ok("CREATE ROLE mine NOLOGIN;").await;
+        assert_eq!(fx.worker.update_role(fx.main, "mine", &bypass).await, RoleOutcome::Ok);
+
+        // A group the owner administers but that reaches a reserved role, two levels down, is
+        // never a membership target.
+        fx.owner_ok("CREATE ROLE mid NOLOGIN; CREATE ROLE outer_g NOLOGIN; GRANT mid TO outer_g;")
+            .await;
+        fx.sql("GRANT authenticated TO mid;").await;
+        let join = RolePatch {
+            member_of: Some(vec!["outer_g".into()]),
+            ..RolePatch::default()
+        };
+        assert!(matches!(
+            fx.worker.update_role(fx.main, "app", &join).await,
+            RoleOutcome::Refused("role_membership_not_allowed", _)
+        ));
+        assert_eq!(
+            fx.value(&fx.ep, "SELECT count(*) FROM pg_auth_members WHERE member = 'app'::regrole;").await,
+            "0"
+        );
+        // Once the reach is gone, the same group is fine.
+        fx.sql("REVOKE authenticated FROM mid;").await;
+        assert_eq!(fx.worker.update_role(fx.main, "app", &join).await, RoleOutcome::Ok);
+    })
+    .await;
+}
+
+impl Fx {
+    /// Creates the NOLOGIN role `name` on `ep` (as cloud_admin, forwarding off) with the first
+    /// OID at or past `target` the compute hands out: placeholder roles take the OIDs before
+    /// it and are dropped again. The role's OID.
+    async fn role_at_oid(&self, ep: &str, name: &str, target: i64) -> i64 {
+        self.sql_in(
+            ep,
+            "postgres",
+            &format!(
+                "DO $do$
+                 DECLARE i int := 0; o oid;
+                 BEGIN
+                   LOOP
+                     i := i + 1;
+                     EXECUTE format('CREATE ROLE %I NOLOGIN', 'oid_filler_' || i);
+                     SELECT oid INTO o FROM pg_roles WHERE rolname = 'oid_filler_' || i;
+                     EXIT WHEN o >= {target} OR i >= 20000;
+                   END LOOP;
+                   EXECUTE format('ALTER ROLE %I RENAME TO %I', 'oid_filler_' || i, {name});
+                   FOR j IN 1 .. i - 1 LOOP
+                     EXECUTE format('DROP ROLE %I', 'oid_filler_' || j);
+                   END LOOP;
+                 END
+                 $do$;",
+                name = literal(name),
+            ),
+        )
+        .await;
+        self.value(ep, &format!("SELECT oid FROM pg_roles WHERE rolname = {};", literal(name)))
+            .await
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}'s OID on {ep}: {e}"))
+    }
+
+    /// A secret key on `role` of `branch` through the API; its id.
+    async fn secret_key_on(&self, branch: BranchId, name: &str, role: &str) -> String {
+        let (status, body) = api(
+            "POST",
+            &format!("{}/keys", self.branch_path(branch)),
+            Some(json!({ "name": name, "role": role })),
+        )
+        .await;
+        assert_eq!(status, 201, "create key {name} on {role}: {body}");
+        body["id"].as_str().unwrap().to_string()
+    }
+
+    /// `(role, role_oid, role_timeline, revoked)` of the key `id`.
+    async fn key_row(&self, id: &str) -> (String, Option<i64>, Option<String>, bool) {
+        sqlx::query_as(
+            "SELECT role, role_oid, role_timeline, revoked_at IS NOT NULL
+             FROM data_api_keys WHERE id = $1::uuid",
+        )
+        .bind(id)
+        .fetch_one(self.metadata.pool())
+        .await
+        .unwrap()
+    }
+}
+
+// E26: a secret key is bound to its role's OID on a timeline. The source `dev` makes `app`
+// (OID A) with a key; the parent reaches A with a different role `x`. After `dev` is reset onto
+// the parent, `x` holds A on dev: the key is revoked, never moved to `x`. A key on `shared`
+// (made before the branch, the same OID and name on both timelines) is kept and stamped with
+// the new timeline.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn reset_does_not_move_a_key_to_a_reused_oid() {
+    live(|fx| async move {
+        fx.sql("CREATE ROLE shared NOLOGIN;").await;
+        let (dev, dev_ep) = fx.child("dev").await;
+        // `app` on dev at an OID main hasn't reached yet, then `x` on main at that OID.
+        let main_next = fx.role_at_oid(&fx.ep, "probe", 0).await;
+        let app_oid = fx.role_at_oid(&dev_ep, "app", main_next + 1).await;
+        let x_oid = fx.role_at_oid(&fx.ep, "x", app_oid).await;
+        assert_eq!(x_oid, app_oid, "main's x must take dev's app's OID for this test");
+
+        let app_key = fx.secret_key_on(dev, "app-key", "app").await;
+        let shared_key = fx.secret_key_on(dev, "shared-key", "shared").await;
+        let before = fx.metadata.get_branch(dev).await.unwrap().unwrap().timeline_id;
+        let shared_oid: i64 = fx
+            .value(&dev_ep, "SELECT oid FROM pg_roles WHERE rolname = 'shared';")
+            .await
+            .parse()
+            .unwrap();
+        assert_eq!(
+            fx.key_row(&app_key).await,
+            ("app".to_string(), Some(app_oid), before.clone(), false),
+            "bound to app's OID on dev's timeline"
+        );
+
+        let moved = fx
+            .metadata
+            .set_branch_status(dev, &[BranchStatus::Ready], BranchStatus::Resetting)
+            .await
+            .unwrap();
+        assert!(moved, "dev was not ready");
+        fx.worker
+            .handle_branch_job(BranchJob::ResetToParent { branch_id: dev })
+            .await
+            .expect("reset job");
+        let after = fx.metadata.get_branch(dev).await.unwrap().unwrap();
+        assert_eq!(after.status, BranchStatus::Ready, "{:?}", after.error);
+        assert_ne!(after.timeline_id, before, "a new timeline");
+        let dev_ep = after.endpoint_id.clone().expect("dev's endpoint");
+        assert_eq!(
+            fx.value(&dev_ep, "SELECT oid FROM pg_roles WHERE rolname = 'x';").await,
+            app_oid.to_string(),
+            "x holds app's old OID on dev now"
+        );
+        assert_eq!(fx.role_count(&dev_ep, "app").await, "0");
+
+        assert_eq!(
+            fx.key_row(&app_key).await,
+            ("app".to_string(), Some(app_oid), before.clone(), true),
+            "revoked, never moved to x"
+        );
+        assert_eq!(
+            fx.key_row(&shared_key).await,
+            ("shared".to_string(), Some(shared_oid), after.timeline_id.clone(), false),
+            "kept under its name, stamped with the new timeline"
+        );
+    })
+    .await;
+}
+
+// T14 E29: a rename through the control plane (a merge's phase 0 calls it): the role in SQL
+// with forwarding off, its row resealed under the new name (the password logs in, the old name
+// doesn't), and its key following with its OID (still served).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn rename_role_through_the_control_plane() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        fx.owner_ok("CREATE TABLE notes (id int); INSERT INTO notes VALUES (1); GRANT SELECT ON notes TO app")
+            .await;
+        let password = fx.password(fx.main, "app").await;
+        let (key_id, key) = fx.secret_key("app-key", "app").await;
+        wait_for_data_status(&key, "notes", 200, Duration::from_secs(30)).await;
+        let oid = fx.value(&fx.ep, "SELECT oid FROM pg_roles WHERE rolname = 'app';").await;
+
+        assert_eq!(fx.worker.rename_role(fx.main, "app", "app_v2").await, RoleOutcome::Ok);
+
+        assert_eq!(fx.role_count(&fx.ep, "app").await, "0");
+        assert_eq!(fx.value(&fx.ep, "SELECT oid FROM pg_roles WHERE rolname = 'app_v2';").await, oid);
+        assert_eq!(fx.password(fx.main, "app_v2").await, password, "resealed under the new name");
+        assert_logs_in(&fx.ep, &fx.database, "app_v2", &password).await;
+        assert_refused(&fx.ep, &fx.database, "app", &password).await;
+        let copies = fx.copies(&fx.ep).await;
+        assert!(copies.contains(&("app_v2".to_string(), RoleOrigin::Api)), "{copies:?}");
+        let role: String = sqlx::query_scalar("SELECT role FROM data_api_keys WHERE id = $1::uuid")
+            .bind(&key_id)
+            .fetch_one(fx.metadata.pool())
+            .await
+            .unwrap();
+        assert_eq!(role, "app_v2");
+        wait_for_data_status(&key, "notes", 200, Duration::from_secs(35)).await;
+        // A taken or reserved name is refused, and nothing moves.
+        fx.owner_ok("CREATE ROLE taken NOLOGIN").await;
+        assert!(matches!(
+            fx.worker.rename_role(fx.main, "app_v2", "taken").await,
+            RoleOutcome::Refused("role_exists", _)
+        ));
+        assert!(matches!(
+            fx.worker.rename_role(fx.main, "app_v2", "anon").await,
+            RoleOutcome::Refused("reserved_role_name", _)
+        ));
+        assert_eq!(fx.role_count(&fx.ep, "app_v2").await, "1");
+    })
+    .await;
+}
+
+// T14 E32, the upgrade: an API-made role given a group and attributes in SQL (as a migration
+// would) keeps them through the resync, which records them; nothing is revoked.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn sql_changes_to_an_api_role_stick_through_the_resync() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        fx.owner_ok("CREATE ROLE readers NOLOGIN; GRANT readers TO app; ALTER ROLE app NOINHERIT CONNECTION LIMIT 4")
+            .await;
+        fx.worker.resync(fx.main).await.unwrap();
+        assert_eq!(
+            fx.value(&fx.ep, "SELECT count(*) FROM pg_auth_members WHERE member = 'app'::regrole AND roleid = 'readers'::regrole;").await,
+            "1",
+            "the membership stays"
+        );
+        assert_eq!(
+            fx.value(&fx.ep, "SELECT rolinherit::text || ',' || rolconnlimit FROM pg_roles WHERE rolname = 'app';").await,
+            "false,4"
+        );
+        let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+        let app = rows.iter().find(|r| r.name == "app").unwrap();
+        assert_eq!(app.origin, RoleOrigin::Api);
+        assert_eq!(
+            (app.attributes.inherit, app.attributes.connection_limit, app.attributes.member_of.clone()),
+            (false, 4, vec!["readers".to_string()]),
+            "recorded"
+        );
+    })
+    .await;
+}
+
+// T14 I2: turning LOGIN on counts toward the login-role cap, in the same transaction as the
+// write (the worker's cap is 50 in the dev stack: a branch near it is built with SQL roles).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn turning_login_on_respects_the_cap() {
+    live(|fx| async move {
+        let cap = fx.worker.roles.role_cap;
+        let group = RoleSpec { login: false, ..RoleSpec::login("grp", false) };
+        assert_eq!(fx.worker.create_role(fx.main, &group).await, RoleOutcome::Ok);
+        // Fill the cap with SQL login roles (recorded by the resync).
+        let mut script = String::new();
+        for i in 0..cap {
+            script.push_str(&format!("CREATE ROLE filler_{i} LOGIN PASSWORD 'filler-{i}-pass-123';\n"));
+        }
+        psql_script(&fx.ep, &fx.database, "postgres", &fx.owner_password, &script)
+            .await
+            .expect("fill the cap");
+        fx.worker.resync(fx.main).await.unwrap();
+        let on = RolePatch { login: Some(true), ..RolePatch::default() };
+        assert!(matches!(
+            fx.worker.update_role(fx.main, "grp", &on).await,
+            RoleOutcome::Refused("role_cap_reached", _)
+        ));
+        assert_eq!(
+            fx.value(&fx.ep, "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'grp';").await,
+            "false"
+        );
+    })
+    .await;
+}
+
+/// E29a: a role's live sessions, read by the worker over the admin path and served by
+/// `listRoleSessions`: the count, the client address, `application_name` and start time.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn role_sessions_lists_the_live_connections() {
+    live(|fx| async move {
+        fx.create(fx.main, "sess_app", false).await;
+        let password = fx.password(fx.main, "sess_app").await;
+        let ask = chelabase_nats::RoleRequest { branch_id: fx.main, name: "sess_app".into() };
+
+        let none = fx.worker.role_sessions_reply(&ask).await;
+        assert!(none.ok && none.compute_running, "{none:?}");
+        assert!(none.sessions.is_empty(), "{none:?}");
+
+        // One session held open as the role, with an application name.
+        let mut held = psql_command(&fx.ep, &fx.database, "sess_app", &password, "SELECT pg_sleep(60)");
+        held.env("PGAPPNAME", "sessions-live");
+        let mut child = held.spawn().expect("spawn psql");
+        let started = Instant::now();
+        let reply = loop {
+            let reply = fx.worker.role_sessions_reply(&ask).await;
+            if !reply.sessions.is_empty() || started.elapsed() > Duration::from_secs(20) {
+                break reply;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert!(reply.ok && reply.compute_running, "{reply:?}");
+        assert_eq!(reply.sessions.len(), 1, "{reply:?}");
+        assert_eq!(reply.sessions[0].application_name, "sessions-live");
+        assert!(reply.sessions[0].client_addr.is_some(), "the proxy connects over TCP: {reply:?}");
+
+        let (status, body) = api(
+            "GET",
+            &format!("{}/roles/sess_app/sessions", fx.branch_path(fx.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["compute_running"], true, "{body}");
+        assert_eq!(body["count"], 1, "{body}");
+        assert_eq!(body["sessions"][0]["application_name"], "sessions-live", "{body}");
+
+        // Another role's sessions aren't counted.
+        let (status, body) = api(
+            "GET",
+            &format!("{}/roles/nobody_here/sessions", fx.branch_path(fx.main)),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["count"], 0, "{body}");
+
+        child.kill().await.ok();
     })
     .await;
 }

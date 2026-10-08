@@ -19,6 +19,40 @@ pub struct DatabaseSpec {
     pub owner: String,
 }
 
+/// The compute's mode, as the fork's `compute_api::spec::ComputeMode` (externally tagged;
+/// the LSN is its `X/Y` text): a read-write primary, or a read-only node pinned at an LSN.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ComputeMode {
+    #[default]
+    Primary,
+    Static {
+        lsn: String,
+    },
+}
+
+impl ComputeMode {
+    /// A stored endpoint's mode: static when it has a pinned LSN, which must be Postgres's
+    /// `X/Y` (hex) form, as compute_ctl reads it; anything else is an error (T14 apply minor
+    /// 21), never passed on.
+    pub fn from_static_lsn(static_lsn: Option<&str>) -> anyhow::Result<Self> {
+        let Some(lsn) = static_lsn else {
+            return Ok(Self::Primary);
+        };
+        lsn.parse::<crate::Lsn>()
+            .map_err(|e| anyhow::anyhow!("the endpoint's static LSN: {e}"))?;
+        Ok(Self::Static {
+            lsn: lsn.to_string(),
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Primary => json!("Primary"),
+            Self::Static { lsn } => json!({ "Static": lsn }),
+        }
+    }
+}
+
 pub struct SpecInputs<'a> {
     /// Our endpoint id; compute_ctl uses it as the cluster id and name.
     pub endpoint_id: &'a str,
@@ -34,6 +68,7 @@ pub struct SpecInputs<'a> {
     pub jwks: Value,
     /// URL to the Chelabase console (neon.console_url setting if Some).
     pub console_url: Option<String>,
+    pub mode: ComputeMode,
 }
 
 /// Where an attached tenant lives; `StorconClient` in production, a fake in tests.
@@ -59,6 +94,7 @@ pub struct Endpoint<'a> {
     pub id: &'a str,
     pub tenant_id: &'a str,
     pub timeline_id: &'a str,
+    pub mode: ComputeMode,
 }
 
 /// [`endpoint_config`] for an endpoint's rows as chelabase-metadata stores them.
@@ -77,6 +113,7 @@ pub async fn stored_endpoint_config(
             id: &endpoint.id,
             tenant_id: &endpoint.tenant_id,
             timeline_id: &endpoint.timeline_id,
+            mode: ComputeMode::from_static_lsn(endpoint.static_lsn.as_deref())?,
         },
         roles
             .into_iter()
@@ -121,6 +158,7 @@ pub async fn endpoint_config(
         databases,
         jwks,
         console_url,
+        mode: endpoint.mode,
     }))
 }
 
@@ -184,6 +222,7 @@ pub fn config_response(inputs: &SpecInputs<'_>) -> Value {
             "timeline_id": inputs.timeline_id,
             "pageserver_connstring": inputs.pageserver_connstring,
             "safekeeper_connstrings": inputs.safekeeper_connstrings,
+            "mode": inputs.mode.to_json(),
             "cluster": {
                 "cluster_id": inputs.endpoint_id,
                 "name": inputs.endpoint_id,
@@ -223,6 +262,7 @@ mod tests {
             }],
             jwks: json!({ "keys": [{ "kid": "k" }] }),
             console_url: None,
+            mode: ComputeMode::Primary,
         });
         assert_eq!(v["status"], "attached");
         assert_eq!(v["spec"]["tenant_id"], "00000000000000000000000000000001");
@@ -277,6 +317,7 @@ mod tests {
             id: "ep-a",
             tenant_id,
             timeline_id: TIMELINE,
+            mode: ComputeMode::Primary,
         }
     }
 
@@ -360,6 +401,7 @@ mod tests {
             databases: vec![],
             jwks: json!({}),
             console_url: None,
+            mode: ComputeMode::Primary,
         });
         let roles = v["spec"]["cluster"]["roles"].as_array().unwrap();
 
@@ -394,6 +436,7 @@ mod tests {
             databases: vec![],
             jwks: json!({}),
             console_url: Some("http://localhost:3000".into()),
+            mode: ComputeMode::Primary,
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting = settings.iter().find(|s| s["name"] == "neon.console_url");
@@ -411,6 +454,7 @@ mod tests {
             databases: vec![],
             jwks: json!({}),
             console_url: None,
+            mode: ComputeMode::Primary,
         });
         let settings2 = v2["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting2 = settings2.iter().find(|s| s["name"] == "neon.console_url");
@@ -432,6 +476,7 @@ mod tests {
             databases: vec![],
             jwks: json!({}),
             console_url: None,
+            mode: ComputeMode::Primary,
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let grant_setting = settings.iter().find(|s| s["name"] == "createrole_self_grant");
@@ -453,6 +498,7 @@ mod tests {
             databases,
             jwks: json!({}),
             console_url: None,
+            mode: ComputeMode::Primary,
         };
         let protected = |v: &Value| {
             v["spec"]["cluster"]["settings"]
@@ -487,5 +533,70 @@ mod tests {
 
         let url_trailing = ddl_url("http://control-plane:8083/", "ep-xyz");
         assert_eq!(url_trailing, "http://control-plane:8083/compute/api/v2/computes/ep-xyz/ddl");
+    }
+
+    #[test]
+    fn static_mode_serializes_like_the_fork() {
+        // The fork's `ComputeMode` is externally tagged and its `Lsn` serializes as "X/Y"
+        // (libs/compute_api/src/spec.rs, libs/utils/src/lsn.rs).
+        assert_eq!(
+            ComputeMode::Static {
+                lsn: "0/16B3748".into()
+            }
+            .to_json(),
+            json!({ "Static": "0/16B3748" })
+        );
+        assert_eq!(ComputeMode::Primary.to_json(), json!("Primary"));
+        assert_eq!(
+            ComputeMode::from_static_lsn(Some("0/16B3748")).unwrap(),
+            ComputeMode::Static {
+                lsn: "0/16B3748".into()
+            }
+        );
+        assert_eq!(ComputeMode::from_static_lsn(None).unwrap(), ComputeMode::Primary);
+    }
+
+    // T14 apply minor 21: a stored static LSN that isn't `X/Y` never reaches compute_ctl.
+    #[test]
+    fn a_static_lsn_must_be_x_slash_y() {
+        for bad in ["", "16B3748", "0/16B3748/1", "0/xyz", "0/16B3748 "] {
+            assert!(ComputeMode::from_static_lsn(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn primary_spec_unchanged() {
+        let tenant = NeonId::from(Uuid::from_u128(1));
+        let timeline = NeonId::from(Uuid::from_u128(2));
+        let v = config_response(&SpecInputs {
+            endpoint_id: "ep-a",
+            tenant_id: &tenant,
+            timeline_id: &timeline,
+            pageserver_connstring: "postgresql://no_user@ps:6400".into(),
+            safekeeper_connstrings: vec![],
+            roles: vec![],
+            databases: vec![],
+            jwks: json!({}),
+            console_url: None,
+            mode: ComputeMode::Primary,
+        });
+        // Primary is the fork's default: the only addition to the old spec is `mode`.
+        assert_eq!(v["spec"]["mode"], "Primary");
+        let mut keys: Vec<&str> = v["spec"].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "cluster",
+                "delta_operations",
+                "format_version",
+                "mode",
+                "pageserver_connstring",
+                "safekeeper_connstrings",
+                "suspend_timeout_seconds",
+                "tenant_id",
+                "timeline_id"
+            ]
+        );
     }
 }

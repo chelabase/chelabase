@@ -31,6 +31,8 @@ async fn endpoint(client: &MetadataClient) -> NeonEndpoint {
         tenant_id: hex32(),
         timeline_id: hex32(),
         compute_token_sha256: "ab".repeat(32),
+        routable: true,
+        static_lsn: None,
     };
     let pool = client.pool();
     sqlx::query("INSERT INTO neon_endpoints (id, tenant_id, timeline_id, compute_token_sha256) VALUES ($1, $2, $3, $4)")

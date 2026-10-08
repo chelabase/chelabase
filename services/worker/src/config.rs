@@ -17,6 +17,9 @@ use crate::Worker;
 use crate::ports::{HttpPusher, RealStorage};
 use crate::safekeepers::SafekeeperSet;
 
+/// How often a running job refreshes its claim (branch jobs and merges).
+pub const DEFAULT_CLAIM_REFRESH: Duration = Duration::from_secs(60);
+
 /// The worker over the real metadata database, storage controller, Docker, Valkey and
 /// compute_ctl.
 pub type RealWorker = Worker<MetadataClient, RealStorage, DockerBackend, ProxyCache, HttpPusher>;
@@ -247,13 +250,16 @@ pub fn build(
         roles: config.roles,
         control_plane_uri: config.control_plane_uri.clone(),
         ready_poll: Duration::from_millis(500),
-        ready_timeout: Duration::from_secs(60),
-        claim_refresh: Duration::from_secs(60),
+        ready_timeout: crate::provision::READY_TIMEOUT,
+        claim_refresh: DEFAULT_CLAIM_REFRESH,
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
         zitadel: zitadel_client(config),
         app_users_reconcile_every: config.app_users_reconcile_every,
         remove_orphans: config.remove_orphans,
+        merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
+        merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
+        resync_requests: Default::default(),
     })
 }
 

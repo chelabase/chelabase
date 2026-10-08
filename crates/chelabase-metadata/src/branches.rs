@@ -83,6 +83,9 @@ pub enum BranchKind {
     Normal,
     /// Made by a restore: the timeline the branch had before. No endpoint, no compute.
     Backup,
+    /// A throwaway child of a merge's target, where its plan is rehearsed. Hidden from
+    /// listings, not counted against `max_branches`, never routable.
+    Rehearsal,
 }
 
 impl BranchKind {
@@ -90,6 +93,7 @@ impl BranchKind {
         match self {
             Self::Normal => "normal",
             Self::Backup => "backup",
+            Self::Rehearsal => "rehearsal",
         }
     }
 
@@ -97,6 +101,7 @@ impl BranchKind {
         match value {
             "normal" => Ok(Self::Normal),
             "backup" => Ok(Self::Backup),
+            "rehearsal" => Ok(Self::Rehearsal),
             other => Err(MetadataError::InvalidBranchKind(other.to_string())),
         }
     }
@@ -176,6 +181,9 @@ pub enum ClaimOutcome {
     NotReady,
     /// The branch is ready but protected, and the caller doesn't allow that.
     Protected,
+    /// A merge holds the branch, or a rehearsal of it is still there (T14 F3, checked under
+    /// the branch's row lock); nothing written.
+    MergeBusy(crate::merges::BranchBusy),
 }
 
 /// Outcome of [`MetadataClient::begin_branch_delete`].
@@ -196,6 +204,24 @@ pub enum BranchDeleteOutcome {
     /// Refused, nothing written: the branch is protected (a flag set after the caller's own
     /// check).
     Protected,
+    /// Refused, nothing written: a merge holds the branch, or a rehearsal of it is still there
+    /// (T14 F3, checked under the branch's row lock).
+    MergeBusy(crate::merges::BranchBusy),
+}
+
+/// Why a merge keeps `branch_name` from being reset, restored or deleted, for a refusal the
+/// worker records (the API answers `branch_merge_busy` with the ids instead).
+pub fn merge_busy_refusal(branch_name: &str, busy: crate::merges::BranchBusy) -> String {
+    match busy {
+        crate::merges::BranchBusy::Merge(id) => format!(
+            "merge {id} holds {branch_name}: it is rehearsing or applying, or failed half applied \
+             (retry or abandon it)"
+        ),
+        crate::merges::BranchBusy::Rehearsal(id) => format!(
+            "a merge's rehearsal of {branch_name} (branch {id}) is still being removed; try again \
+             in a few minutes"
+        ),
+    }
 }
 
 impl BranchDeleteOutcome {
@@ -204,6 +230,12 @@ impl BranchDeleteOutcome {
         if *self == Self::Protected {
             return Some(format!(
                 "cannot delete {branch_name}: it is protected; unprotect it first"
+            ));
+        }
+        if let Self::MergeBusy(busy) = self {
+            return Some(format!(
+                "cannot delete {branch_name}: {}",
+                merge_busy_refusal(branch_name, *busy)
             ));
         }
         let Self::HasChildren { backup, children } = self else {
@@ -404,6 +436,53 @@ impl MetadataClient {
         Ok(CreateBranchOutcome::Created)
     }
 
+    /// Inserts a rehearsal branch (kind `rehearsal`, status `pending`) under `parent`, which
+    /// must be a ready branch of the database (else `Conflict`). It doesn't count against `max_branches` and
+    /// skips the cap check. A live branch of that name already → `BranchNameTaken`.
+    pub async fn create_rehearsal_branch(
+        &self,
+        database_id: DatabaseId,
+        parent: BranchId,
+        name: &str,
+        created_by: &str,
+    ) -> Result<BranchRecord, MetadataError> {
+        let _ = created_by; // `branches` has no author column; the merge row records its creator.
+        let mut tx = self.pool.begin().await?;
+        // The same lock as create_branch: a concurrent delete of the parent waits for this insert.
+        let parent_ready: Option<bool> = sqlx::query_scalar(
+            "SELECT status = 'ready' FROM branches
+             WHERE id = $1 AND database_id = $2
+             FOR SHARE",
+        )
+        .bind(parent.as_uuid())
+        .bind(database_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if parent_ready != Some(true) {
+            return Err(MetadataError::Conflict);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO branches (id, database_id, name, parent_branch_id, kind, status)
+             VALUES ($1, $2, $3, $4, 'rehearsal', 'pending')
+             RETURNING *",
+        )
+        .bind(BranchId::new().as_uuid())
+        .bind(database_id.as_uuid())
+        .bind(name)
+        .bind(parent.as_uuid())
+        .fetch_one(&mut *tx)
+        .await;
+        let row = match inserted {
+            Ok(row) => row,
+            Err(sqlx::Error::Database(err)) if err.constraint() == Some("branches_live_name") => {
+                return Err(MetadataError::BranchNameTaken(name.to_string()));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        tx.commit().await?;
+        branch_from_row(&row)
+    }
+
     /// Main of every database of the tenant that isn't deleted, with the database's live
     /// `normal` branch count (main included; backups and deleted branches excluded). One
     /// query for the landing page. Databases without a main row (none should exist) are absent.
@@ -480,15 +559,43 @@ impl MetadataClient {
         id: BranchId,
         allow_protected: bool,
     ) -> Result<ClaimOutcome, MetadataError> {
+        self.claim_branch_for_switch_except(id, allow_protected, None)
+            .await
+    }
+
+    /// [`Self::claim_branch_for_switch`] where merge `except` doesn't hold the branch: the
+    /// worker's after-merge reset of a merge's source, which that merge (`finishing`) holds
+    /// itself (T14 F3, I1).
+    pub async fn claim_branch_for_switch_except(
+        &self,
+        id: BranchId,
+        allow_protected: bool,
+        except: Option<Uuid>,
+    ) -> Result<ClaimOutcome, MetadataError> {
+        // The branch's row lock first, then the merges (T14 M12): a merge moving to a status
+        // that holds the branch takes a share lock on this row, so either it committed before
+        // the check below (seen) or it waits and then finds the branch no longer ready.
+        let mut tx = self.pool.begin().await?;
+        let locked: Option<String> =
+            sqlx::query_scalar("SELECT status FROM branches WHERE id = $1 FOR UPDATE")
+                .bind(id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.as_deref() == Some("ready")
+            && let Some(busy) = crate::merges::branch_busy(&mut *tx, id, except).await?
+        {
+            return Ok(ClaimOutcome::MergeBusy(busy));
+        }
         let updated = sqlx::query(
             "UPDATE branches SET status = 'resetting', error = NULL, updated_at = now()
              WHERE id = $1 AND status = 'ready' AND ($2 OR NOT protected)",
         )
         .bind(id.as_uuid())
         .bind(allow_protected)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        tx.commit().await?;
         if updated == 1 {
             return Ok(ClaimOutcome::Claimed);
         }
@@ -561,10 +668,20 @@ impl MetadataClient {
 
     /// → deleting unless already deleting or deleted; also the branch's live backups. Refused
     /// (nothing written) while the branch or one of its live backups has live `normal`
-    /// children.
+    /// children, or while a merge holds the live branch (T14 F3: checked under its row lock).
     pub async fn begin_branch_delete(
         &self,
         id: BranchId,
+    ) -> Result<BranchDeleteOutcome, MetadataError> {
+        self.begin_branch_delete_except(id, None).await
+    }
+
+    /// [`Self::begin_branch_delete`] where merge `except` doesn't hold the branch: the worker's
+    /// after-merge delete of a merge's source, which that merge holds itself (T14 F3, I1).
+    pub async fn begin_branch_delete_except(
+        &self,
+        id: BranchId,
+        except: Option<Uuid>,
     ) -> Result<BranchDeleteOutcome, MetadataError> {
         let mut tx = self.pool.begin().await?;
         // The database row first (the lock order above): begin_delete takes it, then every
@@ -579,13 +696,20 @@ impl MetadataClient {
         .await?;
         // Children only arrive through create_branch, which takes the database row first: the
         // check below can't go stale before the commit. An already-deleting branch passed it.
-        let live: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM branches
-                            WHERE id = $1 AND status NOT IN ('deleting', 'deleted'))",
+        // The branch's own row lock (after the database's, the order above), then the merges:
+        // a merge moving to a status that holds the branch takes a share lock on this row, so
+        // either it committed before the busy check (seen) or it waits and then finds the
+        // branch deleting (T14 M12, F3 I1).
+        let live: bool = sqlx::query_scalar::<_, bool>(
+            "SELECT status NOT IN ('deleting', 'deleted') FROM branches WHERE id = $1 FOR UPDATE",
         )
         .bind(id.as_uuid())
-        .fetch_one(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if live && let Some(busy) = crate::merges::branch_busy(&mut *tx, id, except).await? {
+            return Ok(BranchDeleteOutcome::MergeBusy(busy));
+        }
         if live {
             let blocked: Vec<(bool, String, String)> = sqlx::query_as(
                 "SELECT p.id = $1, p.name, c.name
@@ -707,13 +831,16 @@ impl MetadataClient {
             return Err(MetadataError::ParentProtectionChanged);
         }
         sqlx::query(
-            "INSERT INTO neon_endpoints (id, tenant_id, timeline_id, compute_token_sha256)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO neon_endpoints
+                 (id, tenant_id, timeline_id, compute_token_sha256, routable, static_lsn)
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(ep.id)
         .bind(ep.tenant_id)
         .bind(ep.timeline_id)
         .bind(ep.compute_token_sha256)
+        .bind(ep.routable)
+        .bind(ep.static_lsn)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -729,8 +856,9 @@ impl MetadataClient {
             sqlx::query(
                 "INSERT INTO neon_roles
                      (endpoint_id, name, scram_verifier, origin, password_enc, login, level,
-                      api_owner_level, pending)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                      api_owner_level, pending, inherit, connection_limit, valid_until,
+                      bypass_rls, member_of)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             )
             .bind(ep.id)
             .bind(copy.name)
@@ -741,6 +869,11 @@ impl MetadataClient {
             .bind(copy.level.as_str())
             .bind(copy.api_owner_level)
             .bind(copy.pending)
+            .bind(copy.attributes.inherit)
+            .bind(copy.attributes.connection_limit)
+            .bind(copy.attributes.valid_until)
+            .bind(copy.attributes.bypass_rls)
+            .bind(&copy.attributes.member_of)
             .execute(&mut *tx)
             .await?;
         }
@@ -877,7 +1010,9 @@ impl MetadataClient {
 
     /// One transaction (reset): branch.timeline_id and its endpoint's timeline_id := pending;
     /// superseded := old; pending := NULL; history_start := `history_start` (now when `None`:
-    /// the new timeline starts at the parent's head). Only while resetting and while the pending
+    /// the new timeline starts at the parent's head); branched_at_lsn := `branched_at_lsn`
+    /// (the LSN of the parent the new timeline starts at; it is the base location of the
+    /// branch's schema). Only while resetting and while the pending
     /// timeline is `expected_pending` (the one the caller created). False otherwise, with
     /// nothing written.
     pub async fn switch_to_pending_timeline(
@@ -885,6 +1020,7 @@ impl MetadataClient {
         id: BranchId,
         expected_pending: &str,
         history_start: Option<DateTime<Utc>>,
+        branched_at_lsn: &str,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
         lock_database_of_branch(&mut tx, id).await?;
@@ -892,13 +1028,14 @@ impl MetadataClient {
             "UPDATE branches
              SET superseded_timeline_id = timeline_id, timeline_id = pending_timeline_id,
                  pending_timeline_id = NULL, pending_timeline_at = NULL,
-                 history_start = COALESCE($3, now()), updated_at = now()
+                 history_start = COALESCE($3, now()), branched_at_lsn = $4, updated_at = now()
              WHERE id = $1 AND status = 'resetting' AND pending_timeline_id = $2
              RETURNING endpoint_id, timeline_id",
         )
         .bind(id.as_uuid())
         .bind(expected_pending)
         .bind(history_start)
+        .bind(branched_at_lsn)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((endpoint_id, timeline_id)) = switched else {
@@ -916,12 +1053,18 @@ impl MetadataClient {
     /// while resetting and while the pending timeline is `expected_pending` (the one the
     /// caller created); false otherwise. [`MetadataError::BranchNameTaken`] (nothing written)
     /// when a live branch already has `backup_name`.
+    ///
+    /// Step 6g (E18): in the same transaction, the branch's schema bases that were current on
+    /// the old timeline at `restore_lsn` (the point the restored timeline was branched at) are
+    /// appended again, positioned at the restored timeline's start, so they're current after
+    /// the switch.
     pub async fn switch_to_restored_timeline(
         &self,
         id: BranchId,
         expected_pending: &str,
         backup: BranchId,
         backup_name: &str,
+        restore_lsn: &str,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
         lock_database_of_branch(&mut tx, id).await?;
@@ -946,7 +1089,7 @@ impl MetadataClient {
         .bind(database_id)
         .bind(backup_name)
         .bind(id.as_uuid())
-        .bind(old_timeline)
+        .bind(&old_timeline)
         .bind(old_history_start)
         .execute(&mut *tx)
         .await
@@ -968,6 +1111,16 @@ impl MetadataClient {
         .fetch_one(&mut *tx)
         .await?;
         move_endpoint(&mut tx, endpoint_id.as_deref(), &timeline_id).await?;
+        if let Some(old_timeline) = old_timeline.as_deref() {
+            crate::schema_bases::copy_bases_for_restore(
+                &mut tx,
+                id,
+                old_timeline,
+                restore_lsn,
+                &timeline_id,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(true)
     }

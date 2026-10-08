@@ -1,0 +1,449 @@
+---
+title: Merging schema between branches
+description: Move schema changes between a branch and its parent with a three-way merge, resolve conflicts, rehearse on real data, apply, and recover when a step fails.
+---
+
+A merge moves **schema** changes between a branch and its parent. Data never moves: main keeps its rows, and a branch keeps its own. The merge compares three versions of the schema, so it can tell what you changed on the branch from what changed on the parent in the meantime:
+
+- the **base**: the schema at the branch point, or at the last merge;
+- the **source**: where the changes come from;
+- the **target**: what receives them.
+
+There are two directions:
+
+- **Merge into parent** (`into_parent`): the branch is the source and its parent the target.
+- **Update from parent** (`from_parent`): the parent is the source and the branch the target.
+
+Both branches must be `ready` and normal (a restore backup can't be merged), and the branch needs a parent: main can't start a merge. A merge covers one Postgres database; by default the branch's main one.
+
+For how it works inside, see [The schema merge engine](/docs/architecture/schema-merge).
+
+## What a merge moves
+
+| Moved | Notes |
+|---|---|
+| Schemas | owner, comment |
+| Tables | owner, comment, row-level security enabled and forced |
+| Columns | type, collation, default, `NOT NULL`, identity, generated expression, comment |
+| Constraints | primary key, unique, foreign key, check, exclusion; `NOT VALID` state |
+| Indexes | method, keys or expressions, `INCLUDE`, predicate, uniqueness |
+| Enums | values and their order |
+| Sequences | standalone, owned by a column, and identity ones, with their parameters |
+| Policies | command, permissive or restrictive, roles, `USING`, `WITH CHECK`, comment |
+| Grants | on schemas, tables, columns and sequences, and default privileges |
+| Roles | created and renamed; the attributes and memberships Chelabase's [roles path](/docs/using/login-roles) can set. Never passwords. See [Roles](#roles) |
+
+**Reported, not merged.** The merge lists these as changed on the source, "apply by hand": views, materialized views, functions, procedures, triggers, domains, composite types, partitioned tables and partitions, tables that inherit from another (`INHERITS`), foreign tables, extensions, rules, casts, operators, publications and user event triggers. When something the merge does move depends on one of them (a column default or a policy that calls a function only the source has), the preview says so, and the rehearsal fails on that step with Postgres's error rather than applying half.
+
+## The flow
+
+```
+computing → draft → rehearsing → rehearsed → applying → online → finishing → done
+```
+
+Saving resolutions, own steps or the lock timeout to a `draft` or `rehearsed` merge returns it to `computing`, and then `draft`: the plan is built again and a rehearsal has to be redone. Saving only **acknowledgements** or the **after-merge choice** (`options.after`) changes neither the plan nor what the rehearsal ran, so it keeps the merge as it is: a `rehearsed` merge stays `rehearsed`. A save with nothing in it changes nothing.
+
+The ending states besides `done` are `applied_with_drift`, `failed`, `stale` and `cancelled`. A merge `failed` in its online phase isn't over: it holds its branches until you [retry it to the end or abandon it](#when-a-step-fails).
+
+| Request | What it does |
+|---|---|
+| `POST /v1/databases/{id}/branches/{branch_id}/merges` | Starts a merge for the branch and its parent. |
+| `GET /v1/databases/{id}/merges?branch=` | The database's merges, newest first; `branch` keeps those where it is the source or the target. |
+| `GET /v1/databases/{id}/merges/{merge_id}` | The merge, its analysis, plan, rehearsal, result and log. |
+| `PATCH /v1/databases/{id}/merges/{merge_id}` | Saves resolutions, own steps, acknowledgements and options. |
+| `POST …/rehearse` | Runs the plan on a throwaway copy of the target. |
+| `POST …/apply` | Applies a rehearsed merge. |
+| `POST …/recompute` | Reads both schemas again; with `rebaseline`, uses the target as the base. |
+| `POST …/retry` | Runs the apply again after a failure: from the start, or the online steps only. |
+| `POST …/abandon` | Gives up a merge that failed in its online phase and lists what it left. |
+| `POST …/finish` | Runs the after-merge choice a merge applied with drift skipped. |
+| `POST …/cancel` | Stops a merge that isn't changing the target. |
+| `GET …/plan.sql` | The final plan as a `.sql` file. |
+
+### Start a merge
+
+```json
+POST /v1/databases/{id}/branches/{branch_id}/merges
+{ "direction": "into_parent" }
+```
+
+`database` is optional and names the Postgres database; it must exist on both branches (the system `postgres` database can't be merged). The answer is `202` with the merge as `computing`:
+
+```json
+{
+  "id": "7b0f…",
+  "source_branch_id": "…",
+  "target_branch_id": "…",
+  "direction": "into_parent",
+  "database": "app",
+  "status": "computing",
+  "failed_phase": null,
+  "version": 1,
+  "rebaselined": false,
+  "error": null,
+  "created_by": "…",
+  "created_at": "…",
+  "updated_at": "…"
+}
+```
+
+Poll `GET …/merges/{merge_id}` until the status is `draft`. Only one merge per pair of branches and Postgres database can be open at a time: a second start answers 409 `merge_open_exists` with the open merge's id in `error.merge_id`. A merge failed in its online phase counts as open. Only one merge at a time can be changing a given target branch (applying, online, finishing, or failed half applied).
+
+`version` changes with every draft save and every recompute. Send the one you last read when you edit, rehearse or apply.
+
+## Changes and conflicts
+
+The merge's `analysis` lists every sub-object changed on either side (a schema, table, column, constraint, index, policy, grant, enum, sequence, role or default-privilege entry) with its outcome:
+
+| Source | Target | Outcome |
+|---|---|---|
+| changed | unchanged | `apply`: the change goes into the plan |
+| unchanged | changed | `target_only`: nothing to do |
+| the same change | the same change | `overlap`: nothing to do |
+| changed | changed differently | `conflict` |
+
+A conflict is anything one side can't take without the other losing something. Each carries its `kind`, and the object as the base, target and source have it, side by side:
+
+| Kind | When |
+|---|---|
+| `edit` | The same sub-object changed differently on both sides. |
+| `drop_vs_edit` | One side dropped an object (or a schema or table) that the other changed, or changed something inside. |
+| `create_collision` | Both sides created an object under one name with different definitions. |
+| `column_order` | Both sides added columns to one table. Postgres can't reorder columns without rebuilding the table. |
+| `dependency` | Something the merge would apply refers to an object that won't exist (a foreign key to a column the target dropped, a policy naming a role that won't exist), or its definition names something the target renamed. The conflict lists both items. |
+
+The same change on both sides isn't a conflict. Conflicts are per sub-object, not per property.
+
+**A rename the merge applies to an object the target has changed.** The source renames a column, and the target, meanwhile, adds an index on it. That isn't a conflict: Postgres rewrites the index's text when the rename applies. The merge can't know the new text beforehand, so it checks such an object against what the rehearsal produced, as it does for [own SQL](#own-sql-and-steps), and not against the merged text. Until a rehearsal has run, it counts them as produced, and they aren't reported as drift.
+
+### Resolve a conflict
+
+Every conflict needs one resolution before the merge can be rehearsed. Save them with the draft:
+
+```json
+PATCH /v1/databases/{id}/merges/{merge_id}
+{
+  "version": 3,
+  "resolutions": [
+    { "conflict": "<conflict id>", "choice": "keep_target" },
+    { "conflict": "<conflict id>", "choice": "take_source" },
+    { "conflict": "<conflict id>", "choice": { "own_sql": "ALTER TABLE …" } }
+  ]
+}
+```
+
+| Choice | What the plan does |
+|---|---|
+| `keep_target` | The item stays as the target has it; nothing goes into the plan. |
+| `take_source` | The plan moves the target's version to the source's. Data loss is flagged. |
+| `own_sql` | Your SQL replaces the item in the plan. |
+| `target_columns_first` | Only for `column_order`: the target's columns first, then the source's. |
+
+A `column_order` conflict takes only `target_columns_first` or `own_sql`. Fields you leave out of a `PATCH` stay as they are. A save of resolutions moves the merge to `computing`; the worker recomputes the analysis and the plan, keeping a resolution whose conflict is unchanged and dropping one whose conflict changed kind or content, so a stored choice can't change meaning. A choice the engine refuses (own SQL that is empty, say) is dropped too, and the merge's `error` starts with `merge_resolution_refused:` and names each one; its conflict is open again. A stale `version` answers 409 `merge_version_conflict` with the current merge in `error.current`.
+
+### Acknowledge what is risky
+
+A plan step that can lose data (a dropped table or column, a type change that rewrites values to something narrower) needs an acknowledgement before apply, conflict or not. So does a step that gives a role `BYPASSRLS`, since that role skips row-level security, and a step that creates a role as, or turns it into, an **owner-level** role (one that can create roles or databases, replicate, or belongs to `neon_superuser`), which reaches even more. And so does a step that **breaks clients**: a [role rename](#roles), after which anything that connects as the old name fails to authenticate. Acknowledge by the item's id:
+
+```json
+{ "version": 4, "acknowledgements": ["column:16421:3"] }
+```
+
+A step that has no item of its own is acknowledged by its step id. Widening a column (`varchar(n)` to a longer `varchar` or `text`, `smallint` to `integer` to `bigint`, `numeric(p,s)` to a larger precision, `real` to `double precision`) isn't data loss; other type changes are.
+
+Acknowledgements are saved without leaving `rehearsed`: you can rehearse first, read the result, then acknowledge.
+
+## Roles
+
+Roles are per branch, so a merge handles them through the same path as the roles API, which keeps the caps, the reserved names and the protected-branch rules. It is phase 0 of the apply.
+
+- **Created roles.** A role the source added is created on the target. If it can log in it gets a new generated password, which you read from the branch's connection details (`result.created_roles` names them); a group gets none. Passwords are never copied.
+- **Updated roles.** The attributes and memberships the roles API can set (`LOGIN`, `INHERIT`, `CONNECTION LIMIT`, `VALID UNTIL`, `BYPASSRLS`, owner-level, `member_of`) are updated. A `member_of` list never revokes a membership in a `pg_*` role or one of Chelabase's own groups.
+- **Renamed roles.** A role the source renamed (the same role, matched by identity, under a new name) is renamed on the target through the control plane, first of all in phase 0. Its stored row, its login copy and its data API secret keys move with it, so the keys keep working. Grants, owners and policies that name it follow Postgres's own rename. Because anything that connects as the old name fails to authenticate once the rename lands, the step is flagged as breaking and needs an acknowledgement. Studio shows the secret keys that use the role, and the sessions connected to the target as it right now ([live sessions](/docs/using/login-roles#live-sessions)); a client that isn't connected at that moment isn't listed, so change every connection string that names the old name. A rename onto a name another target role keeps, or two roles that swap names, is refused as unplannable: rename them on the target first.
+- **Never dropped.** A role the source dropped is reported, not dropped.
+- **Apply by hand.** Role changes the roles path can't make are listed under "Not merged" as "apply by hand", and the target keeps its own values, without counting as drift: `CREATEDB`, `CREATEROLE` and `REPLICATION` on their own, role comments, who granted a membership and with which options, memberships in `pg_*` or Chelabase's own roles, and anything about the branch's owner role `postgres` (its attributes and its memberships are never merged).
+
+The rehearsal makes the same checks the real phase 0 does (memberships the roles path would refuse fail the rehearsal), but creates its roles directly as `NOLOGIN` on its throwaway branch.
+
+## Own SQL and steps
+
+You can put your own SQL into the plan in two ways: as the `own_sql` choice of a conflict, or as a **step** you place anywhere in the plan, for a backfill, say:
+
+```json
+{
+  "version": 5,
+  "steps": [
+    {
+      "id": "backfill-region",
+      "after": null,
+      "sql": "UPDATE orders SET region = 'eu' WHERE region IS NULL"
+    }
+  ],
+  "options": { "lock_timeout_ms": 5000, "after": "keep" }
+}
+```
+
+`after` is the id of the step it follows (a generated one from the plan, or another of yours); `null` puts it at the start of its phase. A step with several statements becomes one plan step per statement. Step ids are yours, up to 256 bytes, and unique; at most 200 steps, 100,000 bytes of SQL each. An id can't contain `:`, `.` or a control character, and `phase1` is reserved (all three answer 422): the engine uses them to name its own steps.
+
+The merge reads each statement and puts it in the phase it needs:
+
+- `CREATE INDEX CONCURRENTLY` and its like go to the online phase;
+- `ALTER TYPE … ADD VALUE` goes to the enum phase;
+- everything else goes into the transaction.
+
+It refuses transaction control (`BEGIN`, `COMMIT`), role and database DDL (`CREATE ROLE`, `GRANT role TO role`, `CREATE DATABASE` and the like), `ALTER SYSTEM` and `VACUUM`. To create a role, change the roles API first. A statement that would run before the step it follows (a transaction statement placed after an online one) is refused rather than moved, because moving it out of the transaction would change what it does. Statements that a retry would run again must be safe to: a concurrent index must be named and schema-qualified, `DROP INDEX CONCURRENTLY` needs `IF EXISTS`, and `ALTER TYPE … ADD VALUE` needs `IF NOT EXISTS`. The merge's `error` lists each refused statement as `step <id>: <reason>`.
+
+After the rehearsal, the preview shows what your SQL actually produced, so you can confirm it, and the checks compare against that result, not against the model.
+
+All merge SQL runs as the branch's **owner** role, never as a superuser, so your SQL can't do more than the owner could.
+
+## Rehearse
+
+```
+POST /v1/databases/{id}/merges/{merge_id}/rehearse
+{ "version": 7 }
+```
+
+Needs a `draft` with a plan and no open conflicts. Send the `version` you last read: the rehearsal then runs that draft, and 409 `merge_version_conflict` says someone saved since. The merge makes a throwaway branch of the target (real data, so a constraint your data breaks shows up), runs every phase on it, reads the resulting schema and compares it with the merged schema the plan was built to produce. The throwaway branch never counts toward `max_branches`, doesn't appear in the branch list, can't be connected to through the proxy, and is deleted when the rehearsal ends.
+
+- **Success:** the merge is `rehearsed`, and `rehearsal` holds per-step timings and the outcome of each own-SQL step.
+- **Differences:** the merge is still `rehearsed` when the result differs from the merged schema, and `rehearsal.drift` lists the differences. Read them before you apply: apply doesn't stop you.
+- **Failure:** the merge returns to `draft`, and `rehearsal` names the failing step and carries Postgres's error. Fix it, usually with a step or a resolution, and rehearse again. A `NOT NULL` that fails on main's existing rows is the usual case; a backfill step before it fixes it.
+- **Stale:** the target's schema changed since the plan was computed, so the plan's guard stops the rehearsal. The merge ends `stale`: recompute it.
+
+The rehearsal records how long each step took. It doesn't record lock waits.
+
+The plan can't see every dependency between objects; the rehearsal does, because Postgres refuses the step. The usual cases: a foreign key the merge leaves alone that depends on a unique constraint it changes, and an invalid index on the target that a new index of the same name collides with.
+
+While the throwaway branch exists it is a child of the target, so reset, restore and delete of the target are refused (409 `branch_merge_busy`, with `error.rehearsal_branch_id`). Cancelling a rehearsing merge, or a rehearsal that ends, removes it within moments. If removing it fails, the worker's reconcile removes a rehearsal branch older than 30 minutes, so the target can be blocked for up to that long.
+
+## Apply
+
+```json
+POST /v1/databases/{id}/merges/{merge_id}/apply
+{ "confirm": true, "version": 7 }
+```
+
+The body is optional. Send `version` (the one you last read) to apply what you saw: a save since, such as a new after-merge choice, keeps a merge rehearsed, so only the version tells the apply that something changed. Apply refuses, in this order:
+
+1. the merge isn't `rehearsed`: 409 `merge_not_rehearsed` (for a stale one, `merge_stale`);
+2. the `version` isn't the merge's: `merge_version_conflict`;
+3. a conflict has no resolution: `merge_conflicts_open`;
+4. a data-loss, security or breaking step has no acknowledgement: `merge_drops_unacknowledged`;
+5. the target is [protected](/docs/using/branches#protected-branches) and the body lacks `confirm: true`: `merge_confirm_required`;
+6. another merge is changing the target, or is failed half applied on it: `merge_busy`, with that merge's id in `error.merge_id`.
+
+A branch that isn't ready answers `branch_not_ready`. Apply answers `202` and the merge runs in phases:
+
+| Phase | Where | What |
+|---|---|---|
+| 0, roles | the roles API | Renames, creates and updates roles (see [Roles](#roles)). A role already in place with the same spec is skipped; one an earlier attempt left half done is driven again. |
+| 1a, enum values | its own committed transaction | An enum value the plan adds and uses later in the same plan. It waits for its lock at most `lock_timeout`. Harmless if phase 1 then fails. |
+| 1, the plan | one transaction | All the generated and own steps, with `lock_timeout` (default 5 s, `options.lock_timeout_ms` from 100 ms to 10 min) and a 15 minute `statement_timeout`. All or nothing. |
+| 2, online | one statement at a time | The work that mustn't hold long locks, for tables that existed on the target before the merge. |
+
+### The stale check
+
+The plan records the target as it was when the merge was computed (a digest of its catalog, and a fingerprint of its schema that includes roles and enum values). Before phase 0 changes anything, the worker reads the target again. If it differs, the merge ends `stale` and the plan's transaction is not applied, and `POST …/recompute` makes a new draft that keeps the choices still relevant. A change to a role or an enum value on the target is caught here too, not only a table change.
+
+Phase 1 begins with the same check on the digest, as a guard in its own transaction: if someone changed the target between the pre-check and phase 1, the transaction rolls back and the merge ends `stale`. The guard is the backstop; the pre-check comes first.
+
+If you apply after a retry, roles and enum values an earlier attempt made are already on the target, and the worker's text for a stale merge says the plan's transaction wasn't applied rather than that nothing was.
+
+A transaction left open on the target blocks the merge: the data API records every DDL change in one row of `chelabase.schema_version`, and an open DDL transaction (a migration paused after `BEGIN`) holds that row's lock, so each merge DDL statement waits behind it. Phase 1 gives up after `lock_timeout` and rolls back; commit or roll back the open transaction, then retry.
+
+### Phase 2
+
+Phase 2 does, for tables that already existed:
+
+- a new index: `CREATE INDEX CONCURRENTLY`;
+- a changed index: a replacement built concurrently under a temporary name, the old one dropped concurrently, then renamed;
+- a new foreign key or check: added `NOT VALID` in phase 1, then `VALIDATE CONSTRAINT`;
+- a new unique constraint: a concurrent unique index, then `ADD CONSTRAINT … USING INDEX`;
+- a new `NOT NULL`: a `CHECK (col IS NOT NULL) NOT VALID` in phase 1, validated here, then `SET NOT NULL` (no table scan, because the check proves it), then the check dropped.
+
+New tables get everything in phase 1.
+
+Concurrent builds and validations wait for their locks as long as it takes. A step that takes a lock which blocks reads or writes while it queues (`SET NOT NULL`, dropping the check, the online foreign key, `ADD CONSTRAINT … USING INDEX`) waits at most `lock_timeout`, like phases 1 and 1a; if it times out the step fails and the merge is `failed` in `online`, and a retry runs it again.
+
+## When a step fails
+
+The merge's `failed_phase` says where it stopped: `roles`, `enum_add`, `tx` or `online`. `error` carries Postgres's text.
+
+| Failed in | What is on the target | What to do |
+|---|---|---|
+| `roles` | Some of phase 0's roles. | **Retry**, or recompute. |
+| `enum_add` | Phase 0's roles and some enum values. | **Retry**, or recompute. |
+| `tx` | Roles and enum values from before it; the plan's transaction rolled back. | **Retry**, or recompute. |
+| `online` | The plan's transaction is committed; some online steps are not. | **Retry**, or **abandon**. |
+
+### Retry
+
+```
+POST /v1/databases/{id}/merges/{merge_id}/retry
+```
+
+For a `failed` merge in any of those four phases.
+
+- **Failed before the transaction (`roles`, `enum_add`, `tx`).** The worker first checks whether the plan's transaction committed after all (its answer may have been lost): if it did, the merge goes on to the online steps. If not, the apply runs again from the start, with all its checks: a target that changed meanwhile makes the merge `stale`. Roles and enum values the first attempt made stay on the target, and the retry finds them instead of making them twice; `result.created_roles` keeps listing every role the merge created. The merge is `applying` again. A transaction whose outcome couldn't be read (the target wasn't reachable) stays `failed` in `tx` with a note that Retry checks first.
+- **Failed in `online`.** The plan's transaction is committed and the target already changed. The worker continues where it stopped: a valid index is skipped, an invalid one is dropped and rebuilt, a validated constraint is skipped. The merge is `online` again. A `NOT VALID` constraint holds for new rows meanwhile.
+
+A merge failed in `online` is **half applied**, and recompute is refused: a new plan would run its phase 1 on top of the old. A recompute of a merge that has been applied checks for the marker first, so a merge whose transaction's outcome was never read can't slip through: if the transaction is there after all, the merge becomes `failed` in `online` with `merge_half_applied:` in its `error`, and isn't planned again. Before it runs, a retry checks that the plan's transaction is still on the target. If a reset or restore removed it, the merge ends `failed` with no phase and `merge_target_changed:` in its `error`: nothing more is applied, and you can recompute. If the target is gone, it ends `failed` with `merge_target_gone:`.
+
+### A half applied merge holds its branches
+
+While a merge is `failed` in `online`, it holds its source and target like a running merge:
+
+- reset, restore and delete of either answer 409 `branch_merge_busy`;
+- no other merge can start on the same pair, or change the same target (`merge_open_exists`, `merge_busy`).
+
+You free them by retrying to the end, or by abandoning. Deleting the whole database or project is still allowed while a merge holds a branch; a merge that still has work to do then ends `failed` with `merge_target_gone:`.
+
+### Abandon
+
+```
+POST /v1/databases/{id}/merges/{merge_id}/abandon
+```
+
+Only for a merge `failed` in `online`. It becomes `cancelled`, with no failed phase, and both branches are free again. **Nothing on the target is undone**: the plan's transaction stays, and so does what the online steps left half done. `result.leftovers` lists it, each as `{kind, schema, table, name}`:
+
+| `kind` | What it is | Put it right |
+|---|---|---|
+| `not_valid_constraint` | A constraint added `NOT VALID` and never validated. It still checks new rows. | `ALTER TABLE … VALIDATE CONSTRAINT …`, or drop it. |
+| `not_null_check` | A temporary `chelabase_merge_nn_*` check standing in for a `NOT NULL`. It wasn't dropped. | Drop it, or validate it and `SET NOT NULL` first. |
+| `invalid_index` | The index the online phase was building, or dropping concurrently, when it stopped. Postgres may have left it `INVALID`: queries don't use it but writes still update it. It may also be gone. | `DROP INDEX CONCURRENTLY IF EXISTS …`, then rebuild if you want it. |
+| `unattached_index` | A valid index the merge built that its next step didn't put into place: a temporary `chelabase_merge_ix_*` index not renamed over the one it replaces, or a unique constraint's index not attached. Nothing uses it, and it costs on every write. | Attach it, or `DROP INDEX CONCURRENTLY IF EXISTS …`. |
+
+Studio shows the list under Finish with the SQL for each.
+
+### Recovery from a crash
+
+An apply that dies partway recovers by itself, and never runs phase 1 twice. First the worker cancels any statement of the merge still running in the compute (by its `application_name`) and waits until they are gone; while they still run it decides nothing and tries again later. Then a marker written inside phase 1's transaction says whether it committed:
+
+- present: the merge goes on to the online phase;
+- absent, and nothing of this attempt had started: the apply simply runs;
+- absent, and the attempt had started: the merge goes back to `rehearsed` with `error` "interrupted before the plan's transaction committed; roles and enum values it made before that stay on the target". Phase 0 or 1a may have run, so the target is not untouched.
+
+A merge whose worker went silent for three minutes is handed back to a worker. It isn't handed back again for 30 minutes unless a worker has claimed it since, so a merge waiting behind a long job doesn't pile up duplicates.
+
+### Error texts
+
+The merge's `error` starts with a code when the worker knows what happened:
+
+| Starts with | Where | Means |
+|---|---|---|
+| `merge_base_unavailable: ` | `draft` | The branch point's schema can't be read; the text after it says why. [Re-baseline](#the-base-and-re-baseline) or recompute. |
+| `merge_resolution_refused: ` | `draft` | A saved choice was refused; its conflict is open again. |
+| `merge_stale: ` | `stale` | A schema changed since the merge was computed: the rehearsal's guard or the apply's check found it. |
+| `merge_target_changed: ` | `failed`, no phase | The plan's transaction is no longer on the target. |
+| `merge_target_gone: ` | `failed`, no phase | The target no longer exists. |
+| `merge_half_applied: ` | `failed`, `online` | A recompute found the plan's transaction on the target. |
+| `interrupted before the plan's transaction committed` | `rehearsed` | A crash or restart interrupted the apply. Studio: "The apply was interrupted." |
+| `the rehearsal failed at step <id>: ` | `draft` | A step failed on the throwaway branch; Postgres's text follows. `rehearsal` names the step, and Studio shows it in the Rehearsal section only. |
+| `the rehearsal: ` | `draft` | The rehearsal ran, but its result couldn't be read or stored; the text says why. Studio: "The rehearsal ran, but its result couldn't be read." Rehearse again. |
+| `creating the rehearsal: ` | `draft` | The throwaway branch couldn't be made; the text says why. Studio: "The rehearsal couldn't run." |
+| `branch_not_ready: ` | `draft` or `rehearsed` | A branch of the merge wasn't ready (resetting, restoring, gone, or without a compute) when the rehearsal started, or, on a `rehearsed` merge, when the apply started. Studio: "The rehearsal couldn't run." on a draft, "The apply didn't start." on a rehearsed merge. |
+| `a previous rehearsal couldn't be removed: ` | `draft` | An earlier rehearsal's branch is still there. Studio: "The rehearsal couldn't run." |
+| `merge_conflicts_open: ` | `draft` or `rehearsed` | A conflict had no resolution when the rehearsal or apply started (a save landed in between). Studio, on a draft: "The rehearsal couldn't run." On a rehearsed merge: "The apply didn't start." |
+| `merge_drops_unacknowledged: ` | `rehearsed` | A flagged step had no acknowledgement when the apply started (a save landed in between). Studio: "The apply didn't start." |
+
+Anything else is Postgres's own text (`step <id>: …`), or, on a draft, the planner's own lines from the last compute.
+
+## After apply
+
+The merge reads the target and compares it with the merged schema. A difference makes the status `applied_with_drift`, with the difference in `result.drift`; objects your own SQL produced are listed apart, as produced, not as drift. Otherwise it finishes with the **after-merge choice** from `options.after` (into the parent only; an update from the parent always keeps):
+
+| `after` | What happens to the source branch |
+|---|---|
+| `keep` (default) | Kept; the merge becomes its new base, if the source is still the schema that was merged. If the source changed since the merge was computed, the base isn't advanced (`result.after.base` is `not_advanced`), so its newer changes show up in the next merge. |
+| `reset` | Reset to its parent, like [reset to parent](/docs/using/branches#reset-to-parent). |
+| `delete` | Deleted. The usual refusal (for example, the branch has child branches) is recorded as a sentence in `result.after.refused` and the merge is still `done`. |
+
+`result.after` records what happened: `base` (`recorded`, `not_advanced` or `not_recorded`) for a keep; `outcome` (`done`, or `started` for a reset whose branch is still switching) for a reset or delete; `refused` for a refusal; `started: true`, with `timeline`, while a reset or delete runs. A reset or delete records that it started before it acts, so a crash never runs it twice.
+
+`result` lists the roles the merge created, each with the branch it was created on. Read a role's password from that branch's connection details with `role`, as for any [login role](/docs/using/login-roles).
+
+### Finish a merge applied with drift
+
+A merge whose target doesn't read back as merged skips its after-merge choice, so the source and its base stay as they were (`result.after.skipped`). Look at the drift, and if the merge still stands, run the choice:
+
+```json
+POST /v1/databases/{id}/merges/{merge_id}/finish
+{ "after": "keep" }
+```
+
+`after` is `keep`, `reset` or `delete`; an update from the parent only keeps. It answers `202` and the merge stays `applied_with_drift` while `result.after` holds `requested: true`, then `started: true` for a reset or delete, until the worker records the outcome. It works once per merge; a second request answers 409 `conflict`. If the worker's job is lost, reconcile publishes it again after 10 minutes.
+
+## Export
+
+`GET /v1/databases/{id}/merges/{merge_id}/plan.sql` returns the final plan as a `merge-<id>.sql` attachment. It has a comment header per phase; phase 1 is wrapped in `BEGIN` and `COMMIT` and starts with `SET LOCAL lock_timeout` and `statement_timeout` from the merge's options, with a comment that the stale guard and the recovery marker are left out; phase 2 statements are marked "run each statement outside a transaction"; roles appear only as comments, never with passwords. Flags (data loss, table rewrite, security) are noted on each step. It answers 409 `conflict` while the merge has no plan yet. Run it by hand if you'd rather apply a merge your own way.
+
+## What a merge ignores
+
+Some objects are Chelabase's own, or are kept in line by it. A merge never moves them, even when you change them by hand, and never reports them as differences.
+
+- **Chelabase's schemas:** `chelabase` (the data API's) and `chelabase_merge` (the merge's own recovery marker), along with Postgres's `pg_catalog`, `information_schema` and `pg_toast`.
+- **The app users table's managed parts:**
+  - the columns Chelabase owns (`id`, `email`, `email_verified`, `created_at`, `deleted_at`);
+  - the guard triggers and the two own-row policies (`chelabase_users_select_own`, `chelabase_users_update_own`);
+  - the email index (`chelabase_users_email_key`);
+  - the table's grants to `authenticated` and `chelabase_auth_sync`.
+
+  Columns you add to the users table do merge.
+- **Chelabase's roles:** `authenticator`, `anon`, `authenticated`, every `chelabase_*` role, `cloud_admin`, `neon_superuser`, and every `pg_*` role. A role's membership in one of them (for example owner-level, which is membership of `neon_superuser`) stays on the member.
+- **Extension members.** The extension itself is reported; what it installs isn't.
+- **The data API's default privileges.** These are the per-schema defaults that grant new tables in a served schema to `anon` and `authenticated`, and one database-wide row: the owner's `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`, which the data API writes. Each branch with the data API on already has them, so merging them would only show a difference between a branch that has the data API on and one that doesn't. The exclusion is exact: the database-wide function row of the owner whose privileges are the owner's own `EXECUTE`, and per-schema grants to `anon` and `authenticated` by the owner. A default privilege of yours for another role, or with another grant, merges as usual.
+- **Role changes the roles path can't make,** and the owner role's own attributes: reported as "apply by hand" (see [Roles](#roles)).
+- **Leftovers of an interrupted merge:** a `chelabase_merge_nn_…` check or a `chelabase_merge_ix_…` index is reported as a leftover, never read as your change.
+
+If you write one of these by hand, for example you add a policy named `chelabase_users_select_own` or grant `anon` default privileges in a served schema yourself, you won't see it merged. It stays on the branch where you wrote it.
+
+## The base, and re-baseline
+
+The base is stored when a branch is created, reset, or merged with `keep`. It is the schema as the source and target agreed at that moment, and it is what lets a rename on one side show as a rename and not as a drop plus a create.
+
+Bases are kept as a history, not one row, and each is tied to the branch's own position in time. Restoring a branch to before a merge therefore makes the next merge compare against the ancestor that was true then. A restore to a point before an earlier restore's point finds the right ancestor too, however many restores deep.
+
+When a branch has no stored base (the read at create failed, the stored one is from an older model version, or the branch predates merging), the merge reads one live from the recorded point in history. Within the branch's [history window](/docs/using/branches#limits-and-settings), 7 days by default, every point can be read. Outside it, a branch point (where the branch was created or last reset) can still be read, because the storage layer keeps it while the timeline it was recorded on exists. That is the branch's own timeline, or, after a restore, the old timeline its backup holds, so it lasts until the backup is deleted. Only when the point is gone (a base recorded by a merge with `keep` and now outside the window, or recorded on a timeline that no longer exists, such as a deleted backup's) does the merge stay a `draft` with no analysis and an `error` that starts with `merge_base_unavailable: `, followed by the reason (the stored base is from another model version, or the branch point is outside the window, for example). It then offers **re-baseline**:
+
+```json
+POST /v1/databases/{id}/merges/{merge_id}/recompute
+{ "rebaseline": true }
+```
+
+Re-baseline uses the target's current schema as the base. That is a **two-way diff**: every difference between the two branches counts as a source change, so the target's own recent changes show as things to undo, and a rename shows as a drop plus a create. The merge is marked `rebaselined`. The drop acknowledgements guard against losing something by accident, so read the plan before you acknowledge it.
+
+## While a merge runs
+
+These hold a branch, and refuse reset, restore and delete of the source and the target with 409 `branch_merge_busy` (the merge's id in `error.merge_id`):
+
+- a merge that is `rehearsing`, `applying`, `online` or `finishing`;
+- a merge `failed` in `online`, until it is retried to the end or abandoned;
+- a rehearsal's throwaway branch, while it exists (`error.rehearsal_branch_id`).
+
+Everything else leaves the branches alone:
+
+- A `draft` or `rehearsed` merge doesn't hold the branches: you can keep working on them, and a changed schema just makes the merge stale on apply.
+- Deleting a branch cancels its drafts. An after-merge `delete` cancels the deleted source's other drafts too.
+- Deleting the whole database or project is allowed whatever merges hold; a merge still needing its target then ends `failed` with `merge_target_gone:`.
+
+`POST …/cancel` stops a merge in `computing`, `draft`, `rehearsing` or `rehearsed`; a rehearsing merge's throwaway branch is deleted. An applying merge can't be cancelled; a merge failed in `online` is [abandoned](#abandon) instead.
+
+## In Studio
+
+Open a database's **Branches** and pick a branch with a parent. **Merge into** *parent* and **Update from** *parent* start a merge and open its page; each is disabled with its reason when the branch isn't ready, the parent isn't ready, the pair already has an open merge for this database (with a link to it), or the branch is a restore backup. Reset, restore and delete show a link to the merge that holds the branch. The database's **Merges** view lists every merge, newest first, with its status.
+
+A merge's page has one section for each step, top to bottom:
+
+- **Changes:** every changed object by type, with its outcome and badges for data loss and security. Open one to see base, target and source side by side. "Not merged" lists what the merge only reports.
+- **Conflicts:** a choice for each (keep, take, or write your own SQL in an editor that knows the target's schema). **Save choices** recomputes the plan.
+- **Plan:** the steps by phase, with their locks and flags, and a checkbox to acknowledge each risky one. A role rename shows the secret keys that use the role and the sessions connected to the target as it right now. Add, move or delete steps of your own, and set the lock timeout. Saving only acknowledgements keeps the rehearsal.
+- **Rehearsal:** run it, then read its timings, the failing step with Postgres's error, and what your own SQL produced.
+- **Apply:** the button names why it is disabled. A protected target asks for a confirm. Progress shows the transaction as done once it commits, then the online steps one by one. A failed merge shows **Retry the apply** (failed before the transaction) or **Retry the online steps** and **Abandon the merge** (failed in the online phase).
+- **Finish:** the after-merge choice and the roles created (each links to its connection details); differences after the apply; what an abandoned merge left, with SQL for each; **Run the after-merge choice** for a drifted merge; **Download the plan (.sql)**.
+
+The page polls while a worker holds the merge, and while a requested after-merge choice is pending. Unsaved edits in one section stay when another section is saved, and the step SQL you are writing stays when the Plan section saves its acknowledgements or lock timeout. If someone else saves first, the page loads their version and says so.
+
+## Errors
+
+The merge codes are in the [error reference](/docs/reference/errors#schema-merges).

@@ -2,7 +2,7 @@
 //! controller, a compute, and the data API roles and bootstrap inside it.
 
 use chelabase_metadata::{DatabaseStatus, NewEndpoint};
-use chelabase_neon::{ComputeBackend, NeonId};
+use chelabase_neon::{ComputeBackend, ComputeStatus, NeonId};
 use chelabase_secrets::{Purpose, seal_credential};
 use chelabase_types::{BranchId, DatabaseId};
 use sha2::{Digest, Sha256};
@@ -14,12 +14,16 @@ use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::reconcile::should_abort_provision;
 use crate::{OWNER_ROLE, Worker, credentials};
 
+/// How long a new compute may take to answer (the worker's `ready_timeout` in production).
+pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The idempotent SQL run as cloud_admin in every new database: the data API's roles, and with
 /// `owner_superuser` the owner made SUPERUSER. compute_ctl never drops roles it doesn't know,
-/// so these survive later reconfigures.
+/// so these survive later reconfigures. The search path is pinned first: on a branch's copy
+/// the owner may have set the database's `search_path` and created operators.
 pub fn bootstrap_sql(owner_superuser: bool) -> String {
     let mut sql = String::from(
-        "DO $$
+        "SET search_path = pg_catalog, pg_temp; DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
     CREATE ROLE anon NOLOGIN;
@@ -182,6 +186,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             owner_verifier: &verifier,
             database_name: &rec.database_name,
             role_copies: &[],
+            routable: true,
+            static_lsn: None,
         };
         match self
             .metadata
@@ -266,17 +272,36 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         Ok(Built::Compute)
     }
 
-    /// Step 5: the compute has applied its spec once the new database answers.
+    /// Step 5: the compute has applied its spec once the new database answers. A compute
+    /// whose container exited (or is gone) never will: that ends the wait at once (T14 M5),
+    /// rather than at the deadline.
     pub(crate) async fn wait_until_ready(&self, ep: &str, database_name: &str) -> Result<(), String> {
         let deadline = Instant::now() + self.ready_timeout;
         loop {
-            match self.computes.admin_sql(ep, database_name, "SELECT 1").await {
+            let err = match self.computes.admin_sql(ep, database_name, "SELECT 1").await {
                 Ok(_) => return Ok(()),
-                Err(err) if Instant::now() >= deadline => {
-                    return Err(format!("waiting for the compute: {err:#}"));
+                Err(err) => err,
+            };
+            match self.computes.status(ep).await {
+                Ok(None) => {
+                    return Err(format!(
+                        "waiting for the compute: its container no longer exists: {err:#}"
+                    ));
                 }
-                Err(_) => tokio::time::sleep(self.ready_poll).await,
+                Ok(Some(ComputeStatus::NotRunning(state)))
+                    if matches!(state.as_str(), "exited" | "dead") =>
+                {
+                    return Err(format!(
+                        "waiting for the compute: its container {state}: {err:#}"
+                    ));
+                }
+                // Running, starting, or unknown: keep polling until the deadline.
+                _ => {}
             }
+            if Instant::now() >= deadline {
+                return Err(format!("waiting for the compute: {err:#}"));
+            }
+            tokio::time::sleep(self.ready_poll).await;
         }
     }
 
@@ -388,6 +413,8 @@ mod tests {
     use chelabase_metadata::DatabaseStatus;
     use chelabase_secrets::{Purpose, open_credential};
 
+    use std::time::Duration;
+
     use super::*;
     use crate::fakes::{FakeWorker, Journal, STORAGE_CAUSE, entries, position, worker};
 
@@ -404,6 +431,43 @@ mod tests {
         let id = w.metadata.insert_database(name, DatabaseStatus::Pending);
         w.handle_provision(id, name).await.unwrap();
         id
+    }
+
+    /// T14 M5: a compute that exited (or vanished) is waited for no longer; one still starting
+    /// is polled until the deadline.
+    #[tokio::test]
+    async fn waiting_for_a_compute_that_exited_stops_at_once() {
+        let (mut w, journal) = worker();
+        w.ready_timeout = Duration::from_millis(200);
+        w.computes.create("ep-exited", "t").await.unwrap();
+        w.computes.fail_when("SELECT 1");
+        let attempts = |journal: &Journal| {
+            entries(journal)
+                .iter()
+                .filter(|e| e.contains(" app SELECT 1"))
+                .count()
+        };
+
+        // Still running: polled until the deadline.
+        let err = w.wait_until_ready("ep-exited", "app").await.unwrap_err();
+        assert!(err.contains("injected failure"), "{err}");
+        assert!(attempts(&journal) > 1, "{:?}", entries(&journal));
+
+        // Exited: one attempt, and the error says so.
+        journal.lock().unwrap().clear();
+        w.computes.set_running("ep-exited", false);
+        let started = Instant::now();
+        let err = w.wait_until_ready("ep-exited", "app").await.unwrap_err();
+        assert!(err.contains("exited"), "{err}");
+        assert_eq!(attempts(&journal), 1);
+        assert!(started.elapsed() < Duration::from_millis(150));
+
+        // Gone: the same.
+        journal.lock().unwrap().clear();
+        w.computes.remove("ep-exited");
+        let err = w.wait_until_ready("ep-exited", "app").await.unwrap_err();
+        assert!(err.contains("no longer exists"), "{err}");
+        assert_eq!(attempts(&journal), 1);
     }
 
     #[test]
@@ -428,7 +492,9 @@ mod tests {
 
     #[test]
     fn bootstrap_sql_is_exact() {
-        let expected = "DO $$
+        // Fix round 1 (I3): on a branch copy the owner may have set the database's
+        // search_path and created operators; the superuser session searches only pg_catalog.
+        let expected = "SET search_path = pg_catalog, pg_temp; DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
     CREATE ROLE anon NOLOGIN;
@@ -486,7 +552,7 @@ GRANT anon, authenticated TO authenticator;
         let sql = w.computes.sql.lock().unwrap().clone();
         let bootstrap = sql
             .iter()
-            .find(|(e, d, s)| e == &ep && d == "web_1_prod" && s.starts_with("DO $$"))
+            .find(|(e, d, s)| e == &ep && d == "web_1_prod" && s.starts_with("SET search_path = pg_catalog, pg_temp; DO $$"))
             .expect("bootstrap ran on the new database");
         assert!(bootstrap.2.contains("CREATE ROLE anon NOLOGIN"));
         assert!(!bootstrap.2.contains("SUPERUSER"));
@@ -507,7 +573,7 @@ GRANT anon, authenticated TO authenticator;
             pos(&journal, "storage.create_timeline"),
             pos(&journal, "compute.create"),
             pos(&journal, &format!("compute.sql {ep} web_1_prod SELECT 1")),
-            pos(&journal, &format!("compute.sql {ep} web_1_prod DO $$")),
+            pos(&journal, &format!("compute.sql {ep} web_1_prod SET search_path = pg_catalog, pg_temp; DO $$")),
             pos(&journal, "metadata.set_compute_settings_version"),
             pos(&journal, "metadata.set_branch_ready"),
         ];
@@ -521,7 +587,7 @@ GRANT anon, authenticated TO authenticator;
         let (w, journal) = worker();
         let line = |name: &str, owner: &str, system: bool| {
             format!(
-                "d|{}||{}|{}||\n",
+                "d|{}||{}|{}|||||||\n",
                 hex::encode(name),
                 hex::encode(owner),
                 if system { "t" } else { "f" }

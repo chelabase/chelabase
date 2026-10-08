@@ -64,6 +64,26 @@ These come from the management API, the login API (the dashboard sign-in and app
 | 409 | `credentials_unavailable` | The branch has no endpoint, or its owner credentials are missing. |
 | 500 | `credentials_unavailable` | Stored credentials can't be opened with the current secrets key. |
 | 409 | `owner_password_unknown` | The owner's password was set in SQL; reset it first. |
+| 409 | `branch_merge_busy` | A schema merge holds this branch as its source or target (it is rehearsing, applying, finishing, or failed half applied in its online phase), or a rehearsal's throwaway branch still hangs off it, so reset, restore and delete are refused. `error.merge_id` names the merge; `error.rehearsal_branch_id` names the throwaway branch. |
+
+### Schema merges
+
+Merge routes also answer the general codes above: `not_found` for an unknown merge (or another tenant's, or one of another database), `branch_not_ready` on a start, rehearse, apply and retry (a branch of the merge isn't ready), `backup_branch` and `invalid_request` on a start (a step id with `:`, `.`, a control character or `phase1` is a 422 `invalid_request` on a save), and `conflict` with 409 when the merge is in a state that can't take the request (for example editing a merge that is applying, or exporting a plan before there is one). See [Merging schema between branches](/docs/using/merging-schema).
+
+| Status | Code | Meaning |
+|---|---|---|
+| 409 | `merge_open_exists` | The branch and its parent already have an open merge for this Postgres database. Raised on start, and on recompute when a newer open merge exists. `error.merge_id` names it. |
+| 409 | `merge_busy` | Another merge is changing the target branch: applying, online, finishing, or failed half applied on it (`error.merge_id`). Raised on start, apply and retry. A start also answers it, with `Retry-After: 1`, when the pair's open merge finished a moment earlier: try again. |
+| 409 | `merge_version_conflict` | `version` in a save, a rehearse or an apply isn't the merge's. `error.current` carries the current merge. |
+| 409 | `merge_not_rehearsed` | Apply needs a `rehearsed` merge, and this one is in another state, or changed while the request ran. |
+| 409 | `merge_stale` | The merge is stale: a schema changed since the merge was computed (found by the rehearsal, or by the apply's check of the target). Recompute it. |
+| 409 | `merge_conflicts_open` | A conflict has no resolution; the message lists their ids. Raised on rehearse and apply. |
+| 409 | `merge_drops_unacknowledged` | A step that loses data, gives a role `BYPASSRLS` or owner-level, or renames a role, has no acknowledgement; the message lists the items. |
+| 409 | `merge_confirm_required` | The target is protected, and apply needs `confirm: true`. |
+| 409 | `branch_merge_busy` | See [Branches](#branches). |
+| none | `merge_base_unavailable` | Not an HTTP error. It is the start of the `error` of a merge left as a `draft` with no analysis because its base can't be read (outside the history window and not a branch point the storage layer keeps, or stored by another model version): the text is `merge_base_unavailable: ` followed by the reason. Recompute with `rebaseline: true`. |
+
+A merge that fails while running (`failed`, `stale`) shows its reason in the merge's own `error` and `failed_phase`, not as an HTTP error. The worker starts the `error` with a code where it knows the cause: `merge_stale:` (the target changed; nothing of the plan's transaction was applied), `merge_target_changed:` and `merge_target_gone:` (the plan's transaction is no longer on the target, or the target is gone: `failed` with no phase), `merge_half_applied:` (a recompute found the plan's transaction on the target: `failed` in `online`), and `merge_resolution_refused:` (a saved choice was refused: a `draft`). An apply interrupted before its transaction committed returns to `rehearsed` with an `error` that starts "interrupted before the plan's transaction committed". [Merging schema](/docs/using/merging-schema#error-texts) lists them.
 
 ### Login roles and data API keys
 
@@ -74,8 +94,10 @@ These come from the management API, the login API (the dashboard sign-in and app
 | 409 | `role_in_use` | Data API keys still use the role. `error.keys` lists them as `{id, name}`. |
 | 422 | `invalid_role_name` | The name is empty, too long (over 63 bytes), has a NUL byte, or doesn't fit the naming rules. |
 | 422 | `reserved_role_name` | The name is reserved, or the role is the owner, which can't be deleted. |
+| 422 | `role_attribute_not_allowed` | An attribute the roles API doesn't take: a connection limit under -1. Other attributes outside the allowed set (LOGIN, owner-level, INHERIT, CONNECTION LIMIT, VALID UNTIL, BYPASSRLS, memberships) are refused as `invalid_request` unknown fields. |
+| 422 | `role_membership_not_allowed` | A membership in a role Chelabase keeps for itself (the owner, `authenticator`, `anon`, `authenticated`, `neon_superuser`, `cloud_admin`, `chelabase_…`, `pg_…`), in the role itself, in a role that doesn't exist or the owner can't administer, or in a group that is itself a member of one of those, at any depth. |
 | 403 | `role_refused` | The worker refused the role (on the SQL editor and console routes). |
-| 422 | `role_refused` | The worker refused the role when a key is created (it doesn't exist, or it can bypass row-level security; the message says which). |
+| 422 | `role_refused` | The worker refused the role when a key is created (it doesn't exist, or it's owner-level: superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION` or a `neon_superuser` member; the message says which). `BYPASSRLS` alone is allowed. |
 | 500 | `role_privilege_mismatch` | The role's privileges in the database don't match what Chelabase recorded. |
 | 409 | `public_key_exists` | The branch already has a public key. |
 | 409 | `public_key_not_revocable` | A public key can only be rotated. |
@@ -158,7 +180,7 @@ The data API (`POST /data/v1/query`, `GET /data/v1/schema`) answers with:
 | 401 | `user_token_expired` | The `Chelabase-User` token has expired. |
 | 401 | `user_session_revoked` | The user's session was revoked. |
 | 403 | `permission_denied` | Postgres refused the role (42501). |
-| 403 | `role_not_allowed` | A secret key's role can bypass row-level security. Make the role plain, or use another role. |
+| 403 | `role_not_allowed` | A secret key's role is owner-level or has system privileges: superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin` or the `pg_*_server_*` roles: what key creation refuses. Take those away, or use another role (`BYPASSRLS` alone is allowed). |
 | 404 | `unknown_table` | A table or view that doesn't exist or that the key's role can't reach. |
 | 404 | `unknown_function` | A function that doesn't exist, can't be called through the API, or that the key's role can't execute. |
 | 404 | `unknown_database` | The database doesn't exist, isn't served, or isn't on the key's allow-list. One text for all three, so a key can't discover database names. |

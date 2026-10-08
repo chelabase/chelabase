@@ -3,8 +3,11 @@ import {
   getListBranchesQueryKey,
   type Branch,
   type DatabaseSettings,
+  type Direction,
+  type MergeSummary,
 } from "@chelabase/management-client";
 import type { QueryClient } from "@tanstack/react-query";
+import { holdsBranches, isMergeOpen } from "@/lib/merges";
 import { TRANSITIONAL } from "@/lib/query";
 
 export const BACKUP_CONNECT_REASON = "restore backup: create a branch from it to connect";
@@ -63,10 +66,60 @@ export function liveNormalChildren(branch: Branch, all: Branch[]): Branch[] {
 
 export const PROTECTED_REASON = "Unprotect the branch first";
 
-export type ActionKey = "connect" | "resetPassword" | "resetToParent" | "restore" | "delete";
+export type ActionKey = "connect" | "resetPassword" | "resetToParent" | "restore" | "delete" | "mergeInto" | "updateFrom";
 
-/** Why each action is unavailable (null when it is available). */
-export function actionReasons(branch: Branch, all: Branch[]): Record<ActionKey, string | null> {
+/**
+ * The open merge of `branch` with its parent in `direction`, if there is one. The API's rule is
+ * one open merge per pair and Postgres database, so with `database` (the Postgres name,
+ * `DatabaseSummary.postgres_database`, never the display name) only that database's merges count
+ * (a merge of another database doesn't block).
+ */
+export function openMergeFor(
+  branch: Branch,
+  direction: Direction,
+  openMerges: MergeSummary[],
+  database?: string,
+): MergeSummary | null {
+  const parent = branch.parent_branch_id;
+  if (parent === null) return null;
+  const [source, target] = direction === "into_parent" ? [branch.id, parent] : [parent, branch.id];
+  return (
+    openMerges.find(
+      (m) =>
+        m.source_branch_id === source &&
+        m.target_branch_id === target &&
+        (database === undefined || m.database === database) &&
+        isMergeOpen(m),
+    ) ?? null
+  );
+}
+
+/** A merge that holds `branch` (source or target): reset, restore and delete are refused while it does (E27). */
+export function holdingMergeFor(branch: Branch, merges: MergeSummary[]): MergeSummary | null {
+  return merges.find((m) => holdsBranches(m) && (m.source_branch_id === branch.id || m.target_branch_id === branch.id)) ?? null;
+}
+
+const HELD_REASON = "a merge is rehearsing or applying on this branch";
+const HALF_APPLIED_REASON = "a merge failed half applied on this branch: retry it or abandon it";
+
+/** Why a held branch can't be reset, restored or deleted; null when no merge holds it. */
+export function heldReason(branch: Branch, merges: MergeSummary[]): string | null {
+  const held = holdingMergeFor(branch, merges);
+  if (held === null) return null;
+  return held.status === "failed" ? HALF_APPLIED_REASON : HELD_REASON;
+}
+
+/**
+ * Why each action is unavailable (null when it is available). `openMerges` are the database's
+ * merges: an open one between the branch and its parent (in `database`, when given) blocks
+ * starting another that way, and one that holds the branch blocks reset, restore and delete.
+ */
+export function actionReasons(
+  branch: Branch,
+  all: Branch[],
+  openMerges: MergeSummary[] = [],
+  database?: string,
+): Record<ActionKey, string | null> {
   const isMain = branch.kind === "normal" && branch.parent_branch_id === null;
   const kids = liveNormalChildren(branch, all);
   const childReason = kids.length > 0 ? `has child branches: ${kids.map((k) => k.name).join(", ")}` : null;
@@ -75,8 +128,27 @@ export function actionReasons(branch: Branch, all: Branch[]): Record<ActionKey, 
   const unprotect = branch.protected ? PROTECTED_REASON : null;
 
   const connect = backup ? BACKUP_CONNECT_REASON : notReady;
-  const rewrite = backup ? "a restore backup can't be rewritten; create a branch from it" : (notReady ?? childReason);
+  const held = heldReason(branch, openMerges);
+  const rewrite = backup ? "a restore backup can't be rewritten; create a branch from it" : (notReady ?? childReason ?? held);
+  const parent = all.find((b) => b.id === branch.parent_branch_id) ?? null;
+  const parentName = parent?.name ?? "the parent";
+  const parentNotReady = parent && parent.status !== "ready" ? `parent ${parent.name} is not ready (it is ${parent.status})` : null;
+  const mergeBase =
+    branch.kind !== "normal"
+      ? "a restore backup can't be merged; create a branch from it"
+      : branch.parent_branch_id === null
+        ? "main has no parent to merge with"
+        : (notReady ?? parentNotReady);
+  const mergeReason = (direction: Direction) =>
+    mergeBase ??
+    (openMergeFor(branch, direction, openMerges, database)
+      ? direction === "into_parent"
+        ? `a merge into ${parentName} is already open`
+        : `an update from ${parentName} is already open`
+      : null);
   return {
+    mergeInto: mergeReason("into_parent"),
+    updateFrom: mergeReason("from_parent"),
     connect,
     resetPassword: connect,
     resetToParent: isMain ? "main can't be reset to a parent" : (unprotect ?? rewrite),
@@ -85,7 +157,7 @@ export function actionReasons(branch: Branch, all: Branch[]): Record<ActionKey, 
       ? "main can't be deleted; delete the database instead"
       : branch.status === "deleting"
         ? "branch is already being deleted"
-        : (unprotect ?? childReason),
+        : (unprotect ?? childReason ?? held),
   };
 }
 

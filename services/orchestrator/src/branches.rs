@@ -28,7 +28,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    AppState, ApiBytes, AuthPrincipal, BACKUP_REFUSAL, ConnectionDetails, JobPort, MetadataPort, OperationAccepted,
+    merges, AppState, ApiBytes, AuthPrincipal, BACKUP_REFUSAL, ConnectionDetails, JobPort, MetadataPort, OperationAccepted,
     load_owned, proxy_address, reset_branch_password, reveal,
 };
 
@@ -268,6 +268,40 @@ impl AtBody {
     }
 }
 
+/// An `X/Y` LSN as a number, to compare.
+fn lsn_value(lsn: &str) -> Option<u64> {
+    let (hi, lo) = lsn.split_once('/')?;
+    Some((u64::from_str_radix(hi, 16).ok()? << 32) | u64::from_str_radix(lo, 16).ok()?)
+}
+
+/// T14 M8: a restore point within the branch's own history: not before its branch point (an
+/// LSN) or its `history_start` (a time). Before them lies the parent's older state. The worker
+/// checks the resolved point again.
+fn within_history(branch: &BranchRecord, at: &PointInTime) -> Result<(), String> {
+    match at {
+        PointInTime::Lsn(lsn) => {
+            let start = branch.branched_at_lsn.as_deref();
+            match (lsn_value(lsn), start.and_then(lsn_value)) {
+                (Some(point), Some(begins)) if point < begins => Err(format!(
+                    "the LSN {lsn} is before {}'s history begins (its branch point, {})",
+                    branch.name,
+                    start.unwrap_or_default()
+                )),
+                _ => Ok(()),
+            }
+        }
+        PointInTime::Timestamp(time) => match branch.history_start {
+            Some(begins) if *time < begins => Err(format!(
+                "the time {} is before {}'s history begins ({})",
+                time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                branch.name,
+                begins.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            )),
+            _ => Ok(()),
+        },
+    }
+}
+
 /// Postgres text form: two hex numbers of up to 8 digits around a slash.
 fn valid_lsn(lsn: &str) -> bool {
     let part = |p: &str| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_hexdigit());
@@ -286,8 +320,11 @@ where
     J: JobPort,
 {
     match state.metadata.get_branch(BranchId(id)).await {
+        // A rehearsal is the merge worker's throwaway: no route sees it (P14).
         Ok(Some(b))
-            if b.database_id == database.database_id && b.status != BranchStatus::Deleted =>
+            if b.database_id == database.database_id
+                && b.status != BranchStatus::Deleted
+                && b.kind != BranchKind::Rehearsal =>
         {
             Ok(b)
         }
@@ -330,7 +367,9 @@ where
         Err(resp) => return resp.into_response(),
     };
     match state.metadata.list_branches(record.database_id).await {
-        Ok(branches) => {
+        Ok(mut branches) => {
+            // Rehearsal branches are the merge worker's (the worker lists them itself).
+            branches.retain(|b| b.kind != BranchKind::Rehearsal);
             let with_main = branches_with_main_database(&state, &branches).await;
             let views: Vec<Branch> = branches
                 .into_iter()
@@ -637,6 +676,8 @@ where
     match moved {
         ClaimOutcome::Claimed => {}
         ClaimOutcome::Protected => return Err(protected_refusal()),
+        // T14 M12: a merge that took the branch after the caller's pre-check.
+        ClaimOutcome::MergeBusy(busy) => return Err(merges::merge_busy_refusal(busy)),
         ClaimOutcome::NotReady => {
             return Err(conflict(
                 ErrorCode::BranchNotReady,
@@ -712,7 +753,7 @@ fn check_rewritable(branch: &BranchRecord) -> Result<(), ApiError> {
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_protected`: the branch is protected, unprotect it first", body = ErrorEnvelope),
+        (status = 409, description = "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_protected`: the branch is protected, unprotect it first; `branch_merge_busy`: a merge holds the branch as its source or target, rehearsing, applying or failed half applied (`error.merge_id`: wait for it, or retry or abandon it), or a merge's rehearsal of the branch is still being removed (`error.rehearsal_branch_id`: try again in a few minutes)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
     ),
@@ -742,6 +783,9 @@ where
         .into_response();
     }
     if let Err(resp) = check_rewritable(&branch) {
+        return resp.into_response();
+    }
+    if let Err(resp) = merges::refuse_if_merge_busy(&state, branch.id).await {
         return resp.into_response();
     }
     if let Err(resp) = claim(&state, &branch, "reset", false).await {
@@ -806,9 +850,9 @@ fn backup_name(name: &str, now: DateTime<Utc>) -> String {
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches", body = ErrorEnvelope),
+        (status = 409, description = "`backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_merge_busy`: a merge holds the branch as its source or target, rehearsing, applying or failed half applied (`error.merge_id`: wait for it, or retry or abandon it), or a merge's rehearsal of the branch is still being removed (`error.rehearsal_branch_id`: try again in a few minutes)", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the point in time is invalid", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, the point in time is invalid, or it's before the branch's history begins (its branch point, or its `history_start`)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached", body = ErrorEnvelope),
     ),
@@ -842,6 +886,12 @@ where
         Ok(at) => at,
         Err(message) => return unprocessable(&message).into_response(),
     };
+    if let Err(message) = within_history(&branch, &at) {
+        return unprocessable(&message).into_response();
+    }
+    if let Err(resp) = merges::refuse_if_merge_busy(&state, branch.id).await {
+        return resp.into_response();
+    }
     if let Err(resp) = claim(&state, &branch, "restore", true).await {
         return resp.into_response();
     }
@@ -886,7 +936,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches; `branch_protected`: the branch is protected, unprotect it first", body = ErrorEnvelope),
+        (status = 409, description = "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches; `branch_protected`: the branch is protected, unprotect it first; `branch_merge_busy`: a merge holds the branch as its source or target, rehearsing, applying or failed half applied (`error.merge_id`: wait for it, or retry or abandon it), or a merge's rehearsal of the branch is still being removed (`error.rehearsal_branch_id`: try again in a few minutes)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -917,6 +967,9 @@ where
     if branch.status == BranchStatus::Deleting {
         return conflict(ErrorCode::AlreadyDeleting, "branch is already being deleted")
             .into_response();
+    }
+    if let Err(resp) = merges::refuse_if_merge_busy(&state, branch.id).await {
+        return resp.into_response();
     }
     let claimed = branch.status == BranchStatus::Ready;
     if claimed {
@@ -971,6 +1024,14 @@ where
             let message = refused.refusal(&branch.name).unwrap_or_default();
             return conflict(ErrorCode::HasChildren, message).into_response();
         }
+        // T14 F3 (I1): a merge that took the branch after the pre-check, found under its row
+        // lock (a branch that isn't ready has no claim to catch it).
+        Ok(BranchDeleteOutcome::MergeBusy(busy)) => {
+            if claimed {
+                release(&state, branch.id).await;
+            }
+            return merges::merge_busy_refusal(busy).into_response();
+        }
         Err(err) => {
             error!("begin branch delete: {err}");
             if claimed {
@@ -979,6 +1040,7 @@ where
             return ApiError::internal().into_response();
         }
     }
+    merges::cancel_drafts(&state, branch.id).await;
     let job = JobEnvelope {
         job_id: Uuid::new_v4(),
         payload: BranchJob::Delete {

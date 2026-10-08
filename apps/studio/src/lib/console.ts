@@ -1,5 +1,8 @@
 import { ApiError, type ColumnDesc } from "@chelabase/management-client";
 
+/** What makes a role owner-level, as every owner-level text in Studio lists it. */
+export const OWNER_LEVEL_TRAITS = "superuser, CREATEROLE, CREATEDB, REPLICATION or a member of neon_superuser";
+
 /** Rows per page (P12). */
 export const PAGE_SIZE = 50;
 
@@ -203,7 +206,7 @@ function describe(err: unknown, ctx: { role: string | null; op: ConsoleOp }): st
     case "owner_password_unknown":
       return "The owner password isn't known to Chelabase (it was set in SQL); reset it to continue.";
     case "role_refused":
-      return `${who} can bypass row-level security, so the console won't run as it.`;
+      return `${who} can't be used here: it doesn't exist, or it is owner-level (${OWNER_LEVEL_TRAITS}), so the console won't run as it.`;
     case "role_not_allowed":
       return `${who} isn't allowed to use this database.`;
     case "unknown_table":

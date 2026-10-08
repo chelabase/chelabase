@@ -11,6 +11,36 @@ Each branch has its own roles. You can create them three ways, and they all end 
 
 Projects run their own migrations and setup scripts through Chelabase's proxy. `CREATE ROLE … LOGIN PASSWORD`, `ALTER ROLE … PASSWORD`, `ALTER ROLE … RENAME`, `DROP ROLE`, `GRANT role TO role` and `CREATE DATABASE` all work when run as the owner.
 
+## Attributes, groups and memberships through the API
+
+`POST …/roles` takes these fields besides `name` and `owner_level`:
+
+| Field | Default | What it does |
+|---|---|---|
+| `login` | `true` | `false` makes a `NOLOGIN` role, a group, with no password. |
+| `inherit` | `true` | `INHERIT` or `NOINHERIT`. |
+| `connection_limit` | `-1` | `-1` is no limit; lower values are refused with `role_attribute_not_allowed`. |
+| `valid_until` | never | When the password stops working (RFC 3339). |
+| `bypass_rls` | `false` | `BYPASSRLS`: the role ignores row-level security. |
+| `member_of` | none | Roles it becomes a member of. |
+
+Nothing else can be set; any other field is refused as an unknown field (`invalid_request`). A group role doesn't count toward the login-role cap.
+
+`PATCH /v1/databases/{id}/branches/{branch_id}/roles/{role}` changes a role: `owner_level`, `login`, `inherit`, `connection_limit`, `valid_until` (`null` clears it), `bypass_rls` and `member_of`. Fields you leave out stay as they are (as SQL last left them: see [SQL controls every role](#sql-controls-every-role)), and `member_of` replaces the list of the role's other memberships (memberships in `pg_*` roles and Chelabase's own groups stay). Turning `login` on generates a password, which you read with the connection details and `role`; turning it off drops the password. Turning `login` on counts toward the login-role cap: at the cap it's refused with `role_cap_reached` (409). The answer never contains a password.
+
+PATCH reaches only roles made through the API, and roles made in SQL by the owner (the owner administers them). A role another role made in SQL answers `not_found`, and the owner, the reserved roles and any `chelabase_…` role answer `reserved_role_name`.
+
+### Memberships
+
+A membership is refused with `role_membership_not_allowed` when its target is:
+
+- one of Chelabase's own roles: `authenticator`, `anon`, `authenticated`, any `chelabase_…` role;
+- `neon_superuser` (owner-level is the only way in: set `owner_level`), `cloud_admin`, any `pg_…` role or the owner;
+- the role itself, a role that doesn't exist, or one the owner can't administer;
+- a group that is itself a member of one of those, at any depth, since joining it would reach them indirectly.
+
+A connection limit under `-1` is refused with `role_attribute_not_allowed`. Both codes are in the [error reference](/docs/reference/errors#login-roles-and-data-api-keys). A [schema merge](/docs/using/merging-schema) creates and updates roles through this same path, so the same rules apply to it.
+
 ## What works in SQL
 
 - `CREATE ROLE <name> LOGIN PASSWORD <secret>`: the role can log in through the proxy. The password may be plain or a pre-hashed SCRAM verifier (see the password rules); an MD5 one is refused.
@@ -44,14 +74,25 @@ Projects run their own migrations and setup scripts through Chelabase's proxy. `
 
 The system `postgres` database is listed in Studio and the connection picker, and isn't counted in the database cap. Dropping the branch's main database is refused (`the branch's main database "<name>" can't be dropped`, also with `IF EXISTS` or `WITH (FORCE)`), and so is renaming it.
 
-An owner-level role made in Studio or through the API keeps the owner's attributes; if any of them is taken away in SQL, the next resync gives it back.
+## SQL controls every role
 
-Other attributes (`CREATEDB`, `CREATEROLE`, `INHERIT`, `REPLICATION`, `BYPASSRLS`, `CONNECTION LIMIT`) and grants take effect in Postgres at once. Chelabase reads them back in a resync that starts about 3 seconds after the statement commits (one resync for a burst of statements), so Studio's role list catches up within seconds; the periodic resync stays as the backstop.
+What you change in SQL sticks, for roles made in SQL and roles made in Studio or through the API alike: `LOGIN`, owner level (the owner's attributes and `neon_superuser`), `INHERIT`, `CONNECTION LIMIT`, `VALID UNTIL`, `BYPASSRLS`, the other attributes and memberships (`GRANT` and `REVOKE`). They take effect in Postgres at once. Chelabase records them in a resync that starts about 3 seconds after the statement commits (one resync for a burst of statements), so Studio's role list catches up within seconds; the periodic resync stays as the backstop. A later `PATCH` starts from the role as SQL left it.
+
+Two things stay Chelabase's for a role made in Studio or through the API:
+
+- **It exists.** A role the compute no longer has (a restore to before you dropped it outside Chelabase's view, say) is made again as it was last recorded. Drop it with `DROP ROLE` or the API, and it's gone.
+- **Its password.** A password set with `ALTER ROLE … PASSWORD` is recorded like any other (and is no longer revealable). One set where Chelabase can't see it is set back to the stored one.
+
+A change made through Studio or the API that the compute didn't confirm (the compute was restarting, say) is retried by the resync until it's applied; until then the stored change is what the next `PATCH` starts from.
+
+## Live sessions
+
+`GET /v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions` lists the sessions open as a role on the branch's compute right now: `count`, and for each session its `client_addr` (`null` for a connection from inside the compute), `application_name` and `backend_start`, oldest first. It only reads: when the compute isn't running, the answer is `compute_running: false` with no sessions, and the compute isn't started. A client that isn't connected at that moment isn't listed. A name with no role has no sessions. Studio shows it on a [schema merge](/docs/using/merging-schema#roles) that renames a role.
 
 ## Resync
 
 - **Database DDL guard:** after any `CREATE DATABASE`, `ALTER DATABASE … RENAME` or `DROP DATABASE`, the resync leaves that branch's databases alone for 10 seconds. A restore or reset to parent clears this guard before the resync runs.
-- **Role repairs:** a failing role repair (create, set password, owner attributes or grant admin) is logged and skipped, and other repairs continue. The resync returns an error naming the failed roles once all repairs are done.
+- **Role repairs:** a failing role repair (create, set password, a change not yet applied, or grant admin) is logged and skipped, and other repairs continue. The resync returns an error naming the failed roles once all repairs are done.
 
 ## When the control plane is down
 

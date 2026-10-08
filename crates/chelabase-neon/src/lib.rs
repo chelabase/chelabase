@@ -15,7 +15,9 @@ pub mod scram;
 pub mod spec;
 pub mod storcon;
 
-pub use backend::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend};
+pub use backend::{
+    ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend, SqlOpts, SqlTimedOut, is_timeout,
+};
 pub use compute::{ComputeLocator, DockerLocator};
 pub use id::NeonId;
 pub use jwt::ComputeSigner;

@@ -64,9 +64,13 @@ struct DataKey {
     last_used_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
-    /// A secret key whose role is owner-level: the data API refuses it. Always false for the
-    /// public key.
+    /// A secret key whose role is owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a
+    /// `neon_superuser` member): the data API refuses it. Always false for the public key.
     role_blocked: bool,
+    /// A secret key whose role has BYPASSRLS: it reads and writes past row-level security
+    /// (allowed; Studio marks the key). As the role was when the key was made or rotated, kept
+    /// up to date by the worker's resync. Always false for the public key.
+    bypasses_rls: bool,
     /// The Postgres databases the key may reach; null is every served database.
     #[schema(required = true)]
     databases: Option<Vec<String>>,
@@ -108,6 +112,7 @@ fn summary(
     };
     Ok(DataKey {
         id: record.id,
+        bypasses_rls: record.kind == DataKeyKind::Secret && record.role_bypass_rls,
         kind: record.kind,
         role: record.role,
         name: record.name,
@@ -121,7 +126,8 @@ fn summary(
 }
 
 /// Builds the row and the plaintext of a new key. Public keys are sealed for display.
-/// `role_oid`: the secret key's role identity from the worker's check.
+/// `identity`: the secret key's role identity from the worker's check, `(pg_roles.oid, the
+/// timeline it was read on, whether the role has BYPASSRLS)`.
 fn new_key(
     secrets: &chelabase_secrets::SecretKey,
     branch: BranchId,
@@ -129,7 +135,7 @@ fn new_key(
     role: &str,
     name: &str,
     databases: Option<Vec<String>>,
-    role_oid: Option<i64>,
+    identity: RoleIdentity,
 ) -> (NewDataKey, String) {
     let generated = data_key::generate(kind);
     let id = Uuid::new_v4();
@@ -146,7 +152,9 @@ fn new_key(
             sha256: generated.sha256,
             sealed,
             databases,
-            role_oid,
+            role_oid: identity.0,
+            role_timeline: identity.1,
+            role_bypass_rls: kind == DataKeyKind::Secret && identity.2,
         },
         generated.key,
     )
@@ -317,12 +325,13 @@ where
     if branch.status != BranchStatus::Ready {
         return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
     }
-    let role_oid = match check_role(&state, branch.id, &role).await {
-        Ok(oid) => oid,
+    let identity = match check_role(&state, branch.id, &role).await {
+        Ok(identity) => identity,
         Err(err) => return err.into_response(),
     };
-    // Bound to the role's OID: a role dropped or recreated after the check leaves a dead key,
-    // never one of another role (see `chelabase_metadata`'s data API docs).
+    // Bound to the role's OID on the timeline the check read it on: a role dropped or
+    // recreated after the check, or a timeline switch, leaves a dead key, never one of another
+    // role (see `chelabase_metadata`'s data API docs).
     let (key, plaintext) = new_key(
         &state.secrets,
         branch.id,
@@ -330,7 +339,7 @@ where
         &role,
         &request.name,
         request.databases,
-        role_oid,
+        identity,
     );
     if let Err(err) = state.metadata.create_secret_key(&key).await {
         return key_write_error("create", err).into_response();
@@ -385,10 +394,10 @@ where
     // role dropped and created again since the old key was made. A refusal may be a rename
     // that landed meanwhile (the key moved with it): the key is read again and its new name
     // checked once.
-    let mut role_oid = None;
+    let mut identity = (None, None, false);
     if old.kind == DataKeyKind::Secret {
-        role_oid = match check_role(&state, branch.id, &old.role).await {
-            Ok(oid) => oid,
+        identity = match check_role(&state, branch.id, &old.role).await {
+            Ok(identity) => identity,
             Err(err) => {
                 let renamed = match find_live_key(&state, branch.id, key_id).await {
                     Ok(Some(now)) if now.role != old.role => now,
@@ -396,12 +405,12 @@ where
                     Ok(None) => return ApiError::not_found("key not found").into_response(),
                     Err(resp) => return resp.into_response(),
                 };
-                let oid = match check_role(&state, branch.id, &renamed.role).await {
-                    Ok(oid) => oid,
+                let identity = match check_role(&state, branch.id, &renamed.role).await {
+                    Ok(identity) => identity,
                     Err(err) => return err.into_response(),
                 };
                 old = renamed;
-                oid
+                identity
             }
         };
     }
@@ -413,7 +422,7 @@ where
         &old.role,
         &old.name,
         old.databases.clone(),
-        role_oid,
+        identity,
     );
     let rotated = match old.kind {
         DataKeyKind::Secret => {
@@ -438,20 +447,29 @@ where
     }
 }
 
+/// A secret key's role identity from the worker's check: `(pg_roles.oid, the timeline it was
+/// read on, whether the role has BYPASSRLS)`; `None`s (and `false`) from a worker that
+/// predates them.
+type RoleIdentity = (Option<i64>, Option<String>, bool);
+
 /// The worker's check that `role` may back a secret key on the branch, on its compute: any
-/// existing role that isn't refused for its attributes, with or without a password. The
-/// role's OID (`None` from a worker that predates it).
+/// existing role that isn't refused for its attributes (owner-level; BYPASSRLS is allowed),
+/// with or without a password. The role's identity.
 async fn check_role<M, J>(
     state: &AppState<M, J>,
     branch: BranchId,
     role: &str,
-) -> Result<Option<i64>, ApiError>
+) -> Result<RoleIdentity, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
     match state.js.check_data_role(branch, role).await {
-        Ok(reply) if reply.ok => Ok(reply.role_oid),
+        Ok(reply) if reply.ok => Ok((
+            reply.role_oid,
+            reply.role_timeline,
+            reply.role_bypass_rls.unwrap_or(false),
+        )),
         Ok(reply) => match (reply.kind.as_deref(), reply.error) {
             (Some("refused"), Some(message)) => {
                 Err(ApiError::new(422, ErrorCode::RoleRefused, message))

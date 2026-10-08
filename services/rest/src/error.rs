@@ -54,13 +54,16 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 
-    /// 403: a secret key whose role can bypass row-level security.
+    /// 403: a secret key whose role is owner-level or has system privileges (E33: BYPASSRLS
+    /// alone is allowed).
     pub fn role_not_allowed(role: &str) -> Self {
         Self::new(
             StatusCode::FORBIDDEN,
             "role_not_allowed",
             format!(
-                "the role `{role}` of this key can bypass row-level security; make it plain or use another role"
+                "the role `{role}` of this key is owner-level or has system privileges \
+                 (superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of neon_superuser or \
+                 a system role); use a role without them (BYPASSRLS is allowed)"
             ),
         )
     }
@@ -185,9 +188,12 @@ mod tests {
         let e = ApiError::role_not_allowed("svc");
         assert_eq!(e.status, StatusCode::FORBIDDEN);
         assert_eq!(e.code, "role_not_allowed");
+        // E33: BYPASSRLS is allowed; owner-level is what's refused.
         assert_eq!(
             e.message,
-            "the role `svc` of this key can bypass row-level security; make it plain or use another role"
+            "the role `svc` of this key is owner-level or has system privileges (superuser, \
+             CREATEROLE, CREATEDB, REPLICATION, or a member of neon_superuser or a system \
+             role); use a role without them (BYPASSRLS is allowed)"
         );
     }
 

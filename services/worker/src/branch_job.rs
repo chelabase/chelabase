@@ -477,6 +477,75 @@ mod tests {
         assert_eq!(w.metadata.branch(dev).status, BranchStatus::Ready);
     }
 
+    /// A grandchild (main → dev → feat) restores with one detach of the restored timeline,
+    /// which copies every ancestor level. While an ancestor's WAL lags, the detach answers 503
+    /// (the pageserver waits about 30 s per level): the pending timeline is kept, and the
+    /// redelivery detaches that same timeline and finishes. The old timelines are never
+    /// detached.
+    #[tokio::test]
+    async fn a_grandchild_restore_takes_one_detach_and_retries_a_503() {
+        let (w, journal) = worker();
+        let db = ready_database(&w).await;
+        let main = w.metadata.main(db).id;
+        let dev = ready_branch(&w, db, "dev", main).await;
+        let feat = ready_branch(&w, db, "feat", dev).await;
+        w.metadata
+            .set_branch_status(feat, &[BranchStatus::Ready], BranchStatus::Resetting)
+            .await
+            .unwrap();
+        let old_timeline = w.metadata.branch(feat).timeline_id.unwrap();
+        let tenant = tenant_of(&w, feat);
+        let dev_timeline: chelabase_neon::NeonId =
+            w.metadata.branch(dev).timeline_id.unwrap().parse().unwrap();
+        let old_ancestor = w.storage.timeline(&tenant, &old_timeline).unwrap().ancestor;
+        let (parent, _) = old_ancestor.clone().expect("feat is dev's child");
+        assert_eq!(parent, dev_timeline);
+        unavailable(&w, "detach_ancestor", 1);
+        journal.lock().unwrap().clear();
+
+        let err = w
+            .handle_branch_job_attempt(restore(feat), Attempt(1))
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("detaching: ") && err.contains(UNAVAILABLE_CAUSE),
+            "{err}"
+        );
+        let b = w.metadata.branch(feat);
+        assert_eq!(b.status, BranchStatus::Resetting);
+        assert_eq!(b.timeline_id.as_deref(), Some(old_timeline.as_str()));
+        let pending = pending_of(&w, feat);
+        assert!(position(&journal, "storage.delete_timeline").is_none());
+
+        w.handle_branch_job_attempt(restore(feat), Attempt(2))
+            .await
+            .unwrap();
+
+        let b = w.metadata.branch(feat);
+        assert_eq!(b.status, BranchStatus::Ready, "{:?}", b.error);
+        assert_eq!(b.timeline_id.as_deref(), Some(pending.as_str()));
+        assert_eq!(
+            w.storage.timeline(&tenant, &pending).unwrap().ancestor,
+            None
+        );
+        let detaches: Vec<String> = entries(&journal)
+            .into_iter()
+            .filter(|e| e.starts_with("storage.detach_ancestor"))
+            .collect();
+        let expected = format!("storage.detach_ancestor {pending}");
+        assert_eq!(
+            detaches,
+            [expected.clone(), expected],
+            "only the restored one"
+        );
+        // The old timeline (now the backup's) still hangs off dev's, at the same point.
+        assert_eq!(
+            w.storage.timeline(&tenant, &old_timeline).unwrap().ancestor,
+            old_ancestor
+        );
+        assert!(position(&journal, "storage.delete_timeline").is_none());
+    }
+
     #[tokio::test]
     async fn a_reset_gives_up_on_its_last_attempt_and_a_4xx_at_once() {
         let reset = |id| BranchJob::ResetToParent { branch_id: id };
@@ -533,7 +602,7 @@ mod tests {
         assert_eq!(w.metadata.branch(id).status, BranchStatus::Ready);
 
         // The API begins the delete before publishing the job.
-        w.metadata.begin_branch_delete(id).await.unwrap();
+        w.metadata.begin_branch_delete(id, None).await.unwrap();
         w.handle_branch_job(BranchJob::Delete { branch_id: id })
             .await
             .unwrap();

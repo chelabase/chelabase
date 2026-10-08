@@ -293,6 +293,18 @@ async fn story(
     );
 
     // 6. Delete everything.
+    delete_everything(worker, metadata, config, id, &tenant).await;
+}
+
+/// Deletes the database, then checks that its computes, endpoint rows and timelines are gone
+/// and its branches deleted, and removes its rows.
+async fn delete_everything(
+    worker: &RealWorker,
+    metadata: &MetadataClient,
+    config: &WorkerConfig,
+    id: DatabaseId,
+    tenant: &NeonId,
+) {
     let branches = metadata.list_branches(id).await.unwrap();
     let endpoints: Vec<String> = branches
         .iter()
@@ -325,7 +337,7 @@ async fn story(
     }
     let storcon = StorconClient::new(&config.storcon_url, 0);
     for timeline in &timelines {
-        match storcon.get_timeline(&tenant, timeline).await {
+        match storcon.get_timeline(tenant, timeline).await {
             Err(StorconError::Rejected { status, .. }) => assert_eq!(status.as_u16(), 404),
             other => panic!("timeline {timeline} still there: {other:?}"),
         }
@@ -334,6 +346,373 @@ async fn story(
         assert_eq!(branch.status, BranchStatus::Deleted, "{}", branch.name);
     }
     sqlx_delete(metadata, id).await.unwrap();
+}
+
+/// Provisions the pending database `id` named `name`; returns its story and tenant.
+async fn provisioned<'a>(
+    worker: &'a RealWorker,
+    metadata: &'a MetadataClient,
+    id: DatabaseId,
+    name: &str,
+) -> (Story<'a>, NeonId) {
+    tokio::time::timeout(Duration::from_secs(90), worker.handle_provision(id, name))
+        .await
+        .expect("provision took over 90 s")
+        .expect("handle_provision");
+    let record = metadata.get_database(id).await.unwrap().unwrap();
+    assert_eq!(record.status, DatabaseStatus::Ready, "{:?}", record.error);
+    let tenant: NeonId = record
+        .neon_tenant_id
+        .as_deref()
+        .expect("tenant")
+        .parse()
+        .unwrap();
+    let story = Story {
+        worker,
+        metadata,
+        db: id,
+        database_name: record.database_name.clone().expect("database name"),
+    };
+    (story, tenant)
+}
+
+/// The ancestor of `timeline` and its point on it (`None` once detached), read from the
+/// storage controller.
+async fn ancestor_of(
+    config: &WorkerConfig,
+    tenant: &NeonId,
+    timeline: &Option<String>,
+) -> Option<(String, Lsn)> {
+    let timeline: NeonId = timeline.as_deref().expect("a timeline").parse().unwrap();
+    let info = StorconClient::new(&config.storcon_url, 0)
+        .get_timeline(tenant, &timeline)
+        .await
+        .expect("timeline");
+    match (info.ancestor_timeline_id, info.ancestor_lsn) {
+        (Some(id), Some(lsn)) => Some((id, lsn)),
+        (None, None) => None,
+        other => panic!("timeline {timeline}: half an ancestor: {other:?}"),
+    }
+}
+
+/// Restores the claimed `branch` to `at` through the job dispatch; returns the backup's id.
+async fn restore(
+    story: &Story<'_>,
+    branch: BranchId,
+    backup_name: &str,
+    at: PointInTime,
+) -> BranchId {
+    story.claim(branch).await;
+    let backup_id = BranchId::new();
+    let started = Instant::now();
+    story
+        .worker
+        .handle_branch_job(BranchJob::Restore {
+            branch_id: branch,
+            backup_id,
+            backup_name: backup_name.to_string(),
+            at,
+        })
+        .await
+        .expect("restore job");
+    println!("restore took {:?}", started.elapsed());
+    backup_id
+}
+
+/// A time with writes 2 s before and after it.
+async fn noted_time() -> chrono::DateTime<chrono::Utc> {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let noted = chrono::Utc::now();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    noted
+}
+
+/// Restoring a child branch: one detach of the restored timeline copies its level and main's
+/// up to dev's branch point (Neon fork round 2, patches 1 and 3).
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn restore_a_child_branch() {
+    let (worker, metadata, config) = setup().await;
+    let worker = Arc::new(worker);
+    let id = DatabaseId::new();
+    let name = format!("live-{}", &id.to_string()[..8]);
+    metadata
+        .insert_database_pending(id, DEMO_TENANT_ID.into(), DEMO_PROJECT_ID.into(), &name)
+        .await
+        .expect("insert pending database");
+
+    let outcome = tokio::spawn({
+        let (worker, metadata, config) = (worker.clone(), metadata.clone(), config.clone());
+        async move { child_story(&worker, &metadata, &config, id, &name).await }
+    })
+    .await;
+    if let Err(panic) = outcome {
+        cleanup(&worker, &metadata, id).await;
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn child_story(
+    worker: &RealWorker,
+    metadata: &MetadataClient,
+    config: &WorkerConfig,
+    id: DatabaseId,
+    name: &str,
+) {
+    // 1. Provision; A on main; dev from main; M on main after dev's branch point.
+    let (story, tenant) = provisioned(worker, metadata, id, name).await;
+    let main_id = BranchId::from(id);
+    let main = story.branch(main_id).await;
+    story
+        .sql(
+            &main,
+            "CREATE TABLE t (v text); INSERT INTO t VALUES ('A');",
+        )
+        .await;
+    let dev_id = story.create("dev", main_id, None).await;
+    let dev = story.branch(dev_id).await;
+    assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+    story.sql(&main, "INSERT INTO t VALUES ('M');").await;
+
+    // 2. D1 on dev; the noted time; D2 on dev.
+    story.sql(&dev, "INSERT INTO t VALUES ('D1');").await;
+    let noted = noted_time().await;
+    story.sql(&dev, "INSERT INTO t VALUES ('D2');").await;
+    assert_eq!(story.rows(&dev).await, "A,D1,D2");
+    let old_timeline = dev.timeline_id.clone();
+    let old_ancestor = ancestor_of(config, &tenant, &old_timeline).await;
+    assert_eq!(
+        old_ancestor.as_ref().map(|(id, _)| id.as_str()),
+        main.timeline_id.as_deref(),
+        "dev starts as a child of main's timeline"
+    );
+
+    // 3. Restore dev to the noted time: A and D1.
+    let backup_name = "dev-before-restore-20261007T120000Z";
+    let backup_id = restore(&story, dev_id, backup_name, PointInTime::Timestamp(noted)).await;
+    let dev = story.branch(dev_id).await;
+    assert_eq!(dev.error, None, "the restore of dev failed");
+    assert_eq!(dev.status, BranchStatus::Ready);
+    assert_ne!(dev.timeline_id, old_timeline, "the timeline didn't change");
+    assert_eq!(dev.parent_branch_id, Some(main_id), "still main's child");
+    assert_eq!(story.rows(&dev).await, "A,D1", "dev after restore");
+    assert_eq!(
+        ancestor_of(config, &tenant, &dev.timeline_id).await,
+        None,
+        "the restored timeline is detached"
+    );
+
+    // 4. The backup: the old timeline, still a child of main's; a branch of it has D2.
+    let backup = story.branch(backup_id).await;
+    assert_eq!(backup.name, backup_name);
+    assert_eq!(backup.status, BranchStatus::Ready, "{:?}", backup.error);
+    assert_eq!(backup.parent_branch_id, Some(dev_id));
+    assert_eq!(backup.endpoint_id, None, "a backup has no compute");
+    assert_eq!(backup.timeline_id, old_timeline);
+    assert_eq!(
+        ancestor_of(config, &tenant, &old_timeline).await,
+        old_ancestor,
+        "only the restored timeline is detached: the old one stays on main's, at its point"
+    );
+    let from_backup_id = story.create("from-backup", backup_id, None).await;
+    let from_backup = story.branch(from_backup_id).await;
+    assert_eq!(
+        from_backup.status,
+        BranchStatus::Ready,
+        "{:?}",
+        from_backup.error
+    );
+    assert_eq!(
+        story.rows(&from_backup).await,
+        "A,D1,D2",
+        "branch of the backup"
+    );
+
+    // 5. Main is untouched, and dev keeps working: a write, and a child branch of its own.
+    let main = story.branch(main_id).await;
+    assert_eq!(main.status, BranchStatus::Ready, "{:?}", main.error);
+    assert_eq!(story.rows(&main).await, "A,M", "main");
+    story.sql(&dev, "INSERT INTO t VALUES ('D3');").await;
+    assert_eq!(story.rows(&dev).await, "A,D1,D3");
+
+    // 5b. T14 M8: a restore of dev to an LSN below its branch point (its restored timeline
+    // carries main's older history) is refused; dev stays as it is. A restore needs a branch
+    // with no live child, so this runs before dev-child exists.
+    let refused_name = "dev-before-restore-20261008T130000Z";
+    let dev_before = story.branch(dev_id).await;
+    let branch_point: Lsn = dev_before
+        .branched_at_lsn
+        .as_deref()
+        .expect("dev's branch point")
+        .parse()
+        .unwrap();
+    let below = Lsn(branch_point.0 - 1).to_string();
+    restore(&story, dev_id, refused_name, PointInTime::Lsn(below)).await;
+    let dev = story.branch(dev_id).await;
+    assert_eq!(dev.status, BranchStatus::Ready);
+    assert!(
+        dev.error
+            .as_deref()
+            .is_some_and(|e| e.contains("is before dev's history begins (its branch point,")),
+        "{:?}",
+        dev.error
+    );
+    assert_eq!(dev.timeline_id, dev_before.timeline_id, "nothing switched");
+    assert_eq!(story.rows(&dev).await, "A,D1,D3");
+
+    let dev_child_id =story.create("dev-child", dev_id, None).await;
+    let dev_child = story.branch(dev_child_id).await;
+    assert_eq!(
+        dev_child.status,
+        BranchStatus::Ready,
+        "{:?}",
+        dev_child.error
+    );
+    assert_eq!(story.rows(&dev_child).await, "A,D1,D3", "dev's child");
+
+    // 6. Delete everything.
+    delete_everything(worker, metadata, config, id, &tenant).await;
+}
+
+/// Restoring a grandchild (main → dev → feat): one detach copies all three levels, each up to
+/// its child's branch point, and feat's own up to the restore point.
+#[tokio::test]
+#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+async fn restore_a_grandchild_branch() {
+    let (worker, metadata, config) = setup().await;
+    let worker = Arc::new(worker);
+    let id = DatabaseId::new();
+    let name = format!("live-{}", &id.to_string()[..8]);
+    metadata
+        .insert_database_pending(id, DEMO_TENANT_ID.into(), DEMO_PROJECT_ID.into(), &name)
+        .await
+        .expect("insert pending database");
+
+    let outcome = tokio::spawn({
+        let (worker, metadata, config) = (worker.clone(), metadata.clone(), config.clone());
+        async move { grandchild_story(&worker, &metadata, &config, id, &name).await }
+    })
+    .await;
+    if let Err(panic) = outcome {
+        cleanup(&worker, &metadata, id).await;
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn grandchild_story(
+    worker: &RealWorker,
+    metadata: &MetadataClient,
+    config: &WorkerConfig,
+    id: DatabaseId,
+    name: &str,
+) {
+    // 1. A on main; dev from main; M on main after dev's branch point.
+    let (story, tenant) = provisioned(worker, metadata, id, name).await;
+    let main_id = BranchId::from(id);
+    let main = story.branch(main_id).await;
+    story
+        .sql(
+            &main,
+            "CREATE TABLE t (v text); INSERT INTO t VALUES ('A');",
+        )
+        .await;
+    let dev_id = story.create("dev", main_id, None).await;
+    let dev = story.branch(dev_id).await;
+    assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+    story.sql(&main, "INSERT INTO t VALUES ('M');").await;
+
+    // 2. D1 on dev; feat from dev; D2 on dev after feat's branch point.
+    story.sql(&dev, "INSERT INTO t VALUES ('D1');").await;
+    let feat_id = story.create("feat", dev_id, None).await;
+    let feat = story.branch(feat_id).await;
+    assert_eq!(feat.status, BranchStatus::Ready, "{:?}", feat.error);
+    story.sql(&dev, "INSERT INTO t VALUES ('D2');").await;
+
+    // 3. F1 on feat; the noted time; F2 on feat.
+    story.sql(&feat, "INSERT INTO t VALUES ('F1');").await;
+    let noted = noted_time().await;
+    story.sql(&feat, "INSERT INTO t VALUES ('F2');").await;
+    assert_eq!(story.rows(&feat).await, "A,D1,F1,F2");
+    let old_timeline = feat.timeline_id.clone();
+    let old_ancestor = ancestor_of(config, &tenant, &old_timeline).await;
+    assert_eq!(
+        old_ancestor.as_ref().map(|(id, _)| id.as_str()),
+        dev.timeline_id.as_deref(),
+        "feat starts as a child of dev's timeline"
+    );
+    let dev_ancestor = ancestor_of(config, &tenant, &dev.timeline_id).await;
+    assert_eq!(
+        dev_ancestor.as_ref().map(|(id, _)| id.as_str()),
+        main.timeline_id.as_deref(),
+        "dev is a child of main's timeline"
+    );
+
+    // 4. Restore feat to the noted time: main's A (not M), dev's D1 (not D2), feat's F1 (not F2).
+    let backup_name = "feat-before-restore-20261008T120000Z";
+    let backup_id = restore(&story, feat_id, backup_name, PointInTime::Timestamp(noted)).await;
+    let feat = story.branch(feat_id).await;
+    assert_eq!(feat.error, None, "the restore of feat failed");
+    assert_eq!(feat.status, BranchStatus::Ready);
+    assert_ne!(feat.timeline_id, old_timeline, "the timeline didn't change");
+    assert_eq!(feat.parent_branch_id, Some(dev_id), "still dev's child");
+    assert_eq!(story.rows(&feat).await, "A,D1,F1", "feat after restore");
+    assert_eq!(
+        ancestor_of(config, &tenant, &feat.timeline_id).await,
+        None,
+        "the restored timeline is detached"
+    );
+
+    // 5. The backup keeps the old timeline (still dev's child); a branch of it has F2.
+    let backup = story.branch(backup_id).await;
+    assert_eq!(backup.name, backup_name);
+    assert_eq!(backup.status, BranchStatus::Ready, "{:?}", backup.error);
+    assert_eq!(backup.parent_branch_id, Some(feat_id));
+    assert_eq!(backup.timeline_id, old_timeline);
+    assert_eq!(
+        ancestor_of(config, &tenant, &old_timeline).await,
+        old_ancestor,
+        "only the restored timeline is detached: the old one stays on dev's, at its point"
+    );
+    assert_eq!(
+        ancestor_of(config, &tenant, &dev.timeline_id).await,
+        dev_ancestor,
+        "dev's timeline is untouched"
+    );
+    let from_backup_id = story.create("from-backup", backup_id, None).await;
+    let from_backup = story.branch(from_backup_id).await;
+    assert_eq!(
+        from_backup.status,
+        BranchStatus::Ready,
+        "{:?}",
+        from_backup.error
+    );
+    assert_eq!(
+        story.rows(&from_backup).await,
+        "A,D1,F1,F2",
+        "branch of the backup"
+    );
+
+    // 6. The ancestors are untouched, and feat keeps working.
+    let main = story.branch(main_id).await;
+    assert_eq!(main.status, BranchStatus::Ready, "{:?}", main.error);
+    assert_eq!(story.rows(&main).await, "A,M", "main");
+    let dev = story.branch(dev_id).await;
+    assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+    assert_eq!(story.rows(&dev).await, "A,D1,D2", "dev");
+    story.sql(&feat, "INSERT INTO t VALUES ('F3');").await;
+    assert_eq!(story.rows(&feat).await, "A,D1,F1,F3");
+    let feat_child_id = story.create("feat-child", feat_id, None).await;
+    let feat_child = story.branch(feat_child_id).await;
+    assert_eq!(
+        feat_child.status,
+        BranchStatus::Ready,
+        "{:?}",
+        feat_child.error
+    );
+    assert_eq!(story.rows(&feat_child).await, "A,D1,F1,F3", "feat's child");
+
+    // 7. Delete everything.
+    delete_everything(worker, metadata, config, id, &tenant).await;
 }
 
 /// Patch 6 (D11): right after the pageserver restarts, its `last_record_lsn` for main can lag

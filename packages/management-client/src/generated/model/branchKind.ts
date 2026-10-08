@@ -11,4 +11,5 @@ export type BranchKind = typeof BranchKind[keyof typeof BranchKind];
 export const BranchKind = {
   normal: 'normal',
   backup: 'backup',
+  rehearsal: 'rehearsal',
 } as const;

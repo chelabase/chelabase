@@ -13,6 +13,7 @@ function detail(status: DatabaseStatus, error: string | null = null): Database {
     project_id: "p1",
     tenant_id: "t1",
     name: "web1",
+    postgres_database: "web1",
     status,
     host: null,
     port: null,

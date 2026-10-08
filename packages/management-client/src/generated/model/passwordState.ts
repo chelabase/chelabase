@@ -16,4 +16,5 @@ export const PasswordState = {
   set_in_sql: 'set_in_sql',
   md5_unusable: 'md5_unusable',
   unreadable: 'unreadable',
+  none: 'none',
 } as const;

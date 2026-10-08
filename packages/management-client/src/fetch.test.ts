@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
-import { configureManagementClient, consoleQueryExact, customFetch, parseExact, streamRequest } from "./fetch";
+import { configureManagementClient, consoleQueryExact, customFetch, fetchMergePlanSql, parseExact, streamRequest } from "./fetch";
+import { exportMergePlan } from "./generated/endpoints";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
   return new Response(body, { status, headers: { "content-type": type } });
@@ -172,5 +173,32 @@ describe("streamRequest", () => {
     expect(h.get("authorization")).toBe("Bearer tok");
     expect(h.get("content-type")).toBe("application/json");
     expect(h.get("accept")).toContain("application/x-ndjson");
+  });
+});
+
+describe("fetchMergePlanSql", () => {
+  it("returns_the_sql_text_unparsed_with_bearer", async () => {
+    const sql = "-- phase 1\nBEGIN;\nCREATE TABLE t (id int);\nCOMMIT;\n";
+    const f = vi.fn(async () => res(sql, 200, "text/plain; charset=utf-8"));
+    setup(f as unknown as typeof fetch);
+    expect(await fetchMergePlanSql("d", "m")).toBe(sql);
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/v1/databases/d/merges/m/plan.sql");
+    expect(init.method).toBe("GET");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer tok");
+  });
+
+  it("the_generated_export_client_returns_the_text_too", async () => {
+    const sql = "-- phase 1\nBEGIN;\nCOMMIT;\n";
+    setup((async () => res(sql, 200, "text/plain; charset=utf-8")) as typeof fetch);
+    expect(await exportMergePlan("d", "m")).toBe(sql);
+    // A JSON answer is still parsed.
+    setup((async () => res('{"a":1}', 200)) as typeof fetch);
+    expect(await customFetch("/v1/x", { method: "GET" })).toEqual({ a: 1 });
+  });
+
+  it("errors_are_api_errors", async () => {
+    setup((async () => res('{"error":{"code":"conflict","message":"the merge has no plan yet"}}', 409)) as typeof fetch);
+    await expect(fetchMergePlanSql("d", "m")).rejects.toMatchObject({ status: 409, code: "conflict" });
   });
 });

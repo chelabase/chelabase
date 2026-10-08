@@ -2322,7 +2322,19 @@
           "schema_too_large",
           "saved_query_name_taken",
           "saved_query_conflict",
-          "saved_query_cap"
+          "saved_query_cap",
+          "merge_conflicts_open",
+          "merge_drops_unacknowledged",
+          "merge_not_rehearsed",
+          "merge_stale",
+          "merge_busy",
+          "merge_open_exists",
+          "merge_base_unavailable",
+          "merge_version_conflict",
+          "merge_confirm_required",
+          "branch_merge_busy",
+          "role_attribute_not_allowed",
+          "role_membership_not_allowed"
         ]
       },
       "ErrorEnvelope": {

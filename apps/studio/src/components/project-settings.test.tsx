@@ -11,8 +11,8 @@ const project: ProjectInfo = {
   created_at: "2026-10-03T10:00:00Z", updated_at: "2026-10-03T10:00:00Z",
 };
 const dbs: DatabaseSummary[] = [
-  { database_id: "d1", name: "web1", status: "ready", host: null, port: null, branch_count: 1 },
-  { database_id: "d2", name: "web2", status: "ready", host: null, port: null, branch_count: 1 },
+  { database_id: "d1", name: "web1", postgres_database: "web1", status: "ready", host: null, port: null, branch_count: 1 },
+  { database_id: "d2", name: "web2", postgres_database: "web2", status: "ready", host: null, port: null, branch_count: 1 },
 ];
 
 function setup(

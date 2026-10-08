@@ -36,6 +36,10 @@ pub const BRANCH_REDELIVERY_DELAY: std::time::Duration = std::time::Duration::fr
 pub const SUBJECT_BRANCH: &str = "chelabase.branch";
 pub const CONSUMER_BRANCH: &str = "chelabase-worker-branch";
 
+/// Durable schema-merge jobs: compute, rehearse, apply, resume and cancel.
+pub const SUBJECT_MERGE: &str = "chelabase.merge";
+pub const CONSUMER_MERGE: &str = "chelabase-worker-merge";
+
 /// Durable database settings jobs: push the history window to the tenant.
 pub const SUBJECT_DATABASE_SETTINGS: &str = "chelabase.database_settings";
 pub const CONSUMER_DATABASE_SETTINGS: &str = "chelabase-worker-settings";
@@ -126,6 +130,46 @@ pub enum PointInTime {
     Lsn(String),
 }
 
+/// A schema-merge job; the merge row says what to do next.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum MergeJob {
+    /// Read the three models and compute the analysis and the plan.
+    Compute { merge_id: Uuid },
+    /// Run the plan on a throwaway branch of the target.
+    Rehearse { merge_id: Uuid },
+    /// Apply the plan to the target.
+    Apply { merge_id: Uuid },
+    /// Continue an interrupted apply (phase 2 and finish).
+    Resume { merge_id: Uuid },
+    /// Stop a running merge and clean up.
+    Cancel { merge_id: Uuid },
+    /// Run the after-merge choice by hand on a merge applied with drift (E21).
+    Finish { merge_id: Uuid, after: MergeAfter },
+}
+
+/// What happens to the source branch after a merge (D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeAfter {
+    /// Kept; the merge becomes its base.
+    Keep,
+    /// Reset to its parent.
+    Reset,
+    /// Deleted.
+    Delete,
+}
+
+impl MergeAfter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Reset => "reset",
+            Self::Delete => "delete",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchJob {
@@ -189,6 +233,10 @@ pub const ROLE_CREATE_NOT_APPLIED: &str = "the role was stored but not yet appli
 /// A role delete's `not_applied`: the role is gone, but the compute's spec doesn't say so yet.
 pub const ROLE_DELETE_NOT_APPLIED: &str =
     "the role was deleted but the change is not yet applied; it will be retried";
+
+/// A role update's `not_applied`: the change is stored, but the compute doesn't have it yet.
+pub const ROLE_UPDATE_NOT_APPLIED: &str =
+    "the role's change was stored but not yet applied; it will be retried";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetPasswordReply {
@@ -257,12 +305,108 @@ pub const SUBJECT_ROLE_CREATE: &str = "chelabase.rpc.roles.create";
 pub const SUBJECT_ROLE_RESET: &str = "chelabase.rpc.roles.reset";
 /// Core request/reply: delete a login role.
 pub const SUBJECT_ROLE_DELETE: &str = "chelabase.rpc.roles.delete";
+/// Core request/reply: change a role's attributes or memberships ([`RoleUpdateRequest`]).
+pub const SUBJECT_ROLE_UPDATE: &str = "chelabase.rpc.roles.update";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn yes() -> bool {
+    true
+}
+
+fn no_connection_limit() -> i32 {
+    -1
+}
+
+/// A field that tells "absent" (`None`) from `null` (`Some(None)`).
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// A role to create (U1, U2). Every field past `owner_level` is optional on the wire, with a
+/// plain LOGIN role's defaults, so older senders still parse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleCreateRequest {
     pub branch_id: BranchId,
     pub name: String,
     pub owner_level: bool,
+    /// A NOLOGIN role has no password.
+    #[serde(default = "yes")]
+    pub login: bool,
+    #[serde(default = "yes")]
+    pub inherit: bool,
+    /// `-1`: no limit.
+    #[serde(default = "no_connection_limit")]
+    pub connection_limit: i32,
+    #[serde(default)]
+    pub valid_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub bypass_rls: bool,
+    /// Roles the new role is made a member of.
+    #[serde(default)]
+    pub member_of: Vec<String>,
+}
+
+impl RoleCreateRequest {
+    /// A LOGIN role with the default attributes.
+    pub fn login(branch_id: BranchId, name: &str, owner_level: bool) -> Self {
+        Self {
+            branch_id,
+            name: name.to_string(),
+            owner_level,
+            login: true,
+            inherit: true,
+            connection_limit: -1,
+            valid_until: None,
+            bypass_rls: false,
+            member_of: Vec::new(),
+        }
+    }
+}
+
+/// A change to a role: `None` leaves a field as it is. `valid_until: Some(None)` (JSON
+/// `null`) clears the expiry; `member_of` is the whole new list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleUpdateRequest {
+    pub branch_id: BranchId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_level: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_limit: Option<i32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "double_option"
+    )]
+    pub valid_until: Option<Option<DateTime<Utc>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_rls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_of: Option<Vec<String>>,
+}
+
+impl RoleUpdateRequest {
+    /// A change that changes nothing yet.
+    pub fn new(branch_id: BranchId, name: &str) -> Self {
+        Self {
+            branch_id,
+            name: name.to_string(),
+            owner_level: None,
+            login: None,
+            inherit: None,
+            connection_limit: None,
+            valid_until: None,
+            bypass_rls: None,
+            member_of: None,
+        }
+    }
 }
 
 /// Reset and delete.
@@ -281,7 +425,8 @@ pub struct KeyRef {
 
 /// The worker's answer. `code` says why when `ok` is false: `invalid_role_name`,
 /// `reserved_role_name`, `role_exists`, `role_cap_reached`, `branch_not_ready`, `not_found`,
-/// `role_in_use` (with `keys`), `role_privilege_mismatch`, `not_applied`, `failed`. `error` is
+/// `role_in_use` (with `keys`), `role_privilege_mismatch`, `role_membership_not_allowed`,
+/// `role_attribute_not_allowed`, `not_applied`, `failed`. `error` is
 /// a message (never a password).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleReply {
@@ -290,6 +435,60 @@ pub struct RoleReply {
     pub error: Option<String>,
     #[serde(default)]
     pub keys: Vec<KeyRef>,
+}
+
+/// Core request/reply: the live sessions of a role on a branch's compute (a [`RoleRequest`]
+/// in, a [`RoleSessionsReply`] out). A read only: a compute that isn't running answers
+/// `compute_running: false` and is never started.
+pub const SUBJECT_ROLE_SESSIONS: &str = "chelabase.rpc.roles.sessions";
+
+/// One live session of a role (a `pg_stat_activity` row).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleSession {
+    /// The client's address; `None` for a local (Unix socket) connection.
+    pub client_addr: Option<String>,
+    pub application_name: String,
+    pub backend_start: DateTime<Utc>,
+}
+
+/// The worker's answer to [`SUBJECT_ROLE_SESSIONS`]. `code` says why when `ok` is false:
+/// `branch_not_ready` or `failed` (`error` is for logs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleSessionsReply {
+    pub ok: bool,
+    pub code: Option<String>,
+    pub error: Option<String>,
+    /// Whether the branch's compute was running; when it wasn't, nothing was read.
+    #[serde(default)]
+    pub compute_running: bool,
+    /// The role's sessions, oldest first.
+    #[serde(default)]
+    pub sessions: Vec<RoleSession>,
+}
+
+impl RoleSessionsReply {
+    /// The sessions read on the running compute.
+    pub fn running(sessions: Vec<RoleSession>) -> Self {
+        Self { ok: true, code: None, error: None, compute_running: true, sessions }
+    }
+
+    /// No compute running: nothing to read, and nothing started.
+    pub fn not_running() -> Self {
+        Self { compute_running: false, ..Self::running(Vec::new()) }
+    }
+
+    pub fn not_ready() -> Self {
+        Self { ok: false, code: Some("branch_not_ready".into()), ..Self::not_running() }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            code: Some("failed".into()),
+            error: Some(message.into()),
+            ..Self::not_running()
+        }
+    }
 }
 
 /// The worker's answer. `kind` says why when `ok` is false: `refused` (the caller's fault;
@@ -305,28 +504,48 @@ pub struct CheckDataRoleReply {
     /// replies and from workers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_oid: Option<i64>,
+    /// The Neon timeline `role_oid` was read on (E26: a key is bound to OID and timeline);
+    /// absent with `role_oid`, and from workers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_timeline: Option<String>,
+    /// E33: whether the checked role has BYPASSRLS (a secret key may use such a role; Studio
+    /// marks the key); absent in other replies and from workers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_bypass_rls: Option<bool>,
 }
 
 impl CheckDataRoleReply {
     pub fn ok() -> Self {
-        Self { ok: true, error: None, kind: None, role_oid: None }
+        Self {
+            ok: true,
+            error: None,
+            kind: None,
+            role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: None,
+        }
     }
 
-    /// A role check that passed: the role's OID.
-    pub fn ok_with_oid(oid: i64) -> Self {
-        Self { role_oid: Some(oid), ..Self::ok() }
+    /// A role check that passed: the role's OID and the timeline it was read on.
+    pub fn ok_with_oid(oid: i64, timeline: &str) -> Self {
+        Self { role_oid: Some(oid), role_timeline: Some(timeline.to_string()), ..Self::ok() }
+    }
+
+    /// This reply, saying whether the checked role has BYPASSRLS (E33).
+    pub fn bypassing_rls(self, bypass_rls: bool) -> Self {
+        Self { role_bypass_rls: Some(bypass_rls), ..self }
     }
 
     pub fn refused(message: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(message.into()), kind: Some("refused".into()), role_oid: None }
+        Self { ok: false, error: Some(message.into()), kind: Some("refused".into()), ..Self::ok() }
     }
 
     pub fn not_ready() -> Self {
-        Self { ok: false, error: Some("not ready".into()), kind: Some("not_ready".into()), role_oid: None }
+        Self { ok: false, error: Some("not ready".into()), kind: Some("not_ready".into()), ..Self::ok() }
     }
 
     pub fn failed(message: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(message.into()), kind: Some("failed".into()), role_oid: None }
+        Self { ok: false, error: Some(message.into()), kind: Some("failed".into()), ..Self::ok() }
     }
 }
 
@@ -378,6 +597,7 @@ pub fn control_subjects() -> Vec<String> {
         SUBJECT_PROJECT_DELETE.to_string(),
         SUBJECT_APP_USERS.to_string(),
         SUBJECT_APP_USERS_SYNC.to_string(),
+        SUBJECT_MERGE.to_string(),
     ]
 }
 
@@ -462,6 +682,19 @@ pub async fn publish_branch(
     Ok(())
 }
 
+pub async fn publish_merge(
+    js: &async_nats::jetstream::Context,
+    job: &JobEnvelope<MergeJob>,
+) -> Result<(), NatsError> {
+    let payload = serde_json::to_vec(job)?;
+    js.publish(SUBJECT_MERGE.to_string(), payload.into())
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?;
+    Ok(())
+}
+
 pub async fn publish_database_settings(
     js: &async_nats::jetstream::Context,
     job: &JobEnvelope<DatabaseSettingsJob>,
@@ -486,6 +719,18 @@ where
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     consume(js, ConsumerSpec::branch(), handler).await
+}
+
+/// Run the merge consumer loop, like [`run_branch_consumer`]: one job at a time.
+pub async fn run_merge_consumer<F, Fut>(
+    js: async_nats::jetstream::Context,
+    handler: F,
+) -> Result<(), NatsError>
+where
+    F: FnMut(JobEnvelope<MergeJob>, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    consume(js, ConsumerSpec::merge(), handler).await
 }
 
 /// Run the settings consumer loop, calling `handler` for each job.
@@ -641,6 +886,14 @@ impl<'a> ConsumerSpec<'a> {
             ..ConsumerSpec::control(CONSUMER_BRANCH, SUBJECT_BRANCH)
         }
     }
+
+    /// The merge consumer: the same spec as the branch consumer's.
+    fn merge() -> ConsumerSpec<'static> {
+        ConsumerSpec {
+            nak_delay: BRANCH_REDELIVERY_DELAY,
+            ..ConsumerSpec::control(CONSUMER_MERGE, SUBJECT_MERGE)
+        }
+    }
 }
 
 /// Pull `subject` with durable consumer `durable`, acking handled jobs and
@@ -769,7 +1022,7 @@ mod tests {
 
     #[test]
     fn role_create_request_uses_owner_level() {
-        let create = RoleCreateRequest { branch_id: BranchId::new(), name: "app".into(), owner_level: true };
+        let create = RoleCreateRequest::login(BranchId::new(), "app", true);
         let json = serde_json::to_value(&create).unwrap();
         assert_eq!(json["owner_level"], true);
         assert!(json.get("privileged").is_none());
@@ -780,7 +1033,7 @@ mod tests {
         assert_eq!(SUBJECT_ROLE_CREATE, "chelabase.rpc.roles.create");
         assert_eq!(SUBJECT_ROLE_RESET, "chelabase.rpc.roles.reset");
         assert_eq!(SUBJECT_ROLE_DELETE, "chelabase.rpc.roles.delete");
-        let create = RoleCreateRequest { branch_id: BranchId::new(), name: "app".into(), owner_level: true };
+        let create = RoleCreateRequest::login(BranchId::new(), "app", true);
         let json = serde_json::to_value(&create).unwrap();
         assert_eq!(json["name"], "app");
         assert_eq!(json["owner_level"], true);
@@ -798,6 +1051,78 @@ mod tests {
         };
         let back: RoleReply = serde_json::from_slice(&serde_json::to_vec(&in_use).unwrap()).unwrap();
         assert_eq!(back, in_use);
+    }
+
+    #[test]
+    fn role_sessions_wire_shapes() {
+        assert_eq!(SUBJECT_ROLE_SESSIONS, "chelabase.rpc.roles.sessions");
+        let session = RoleSession {
+            client_addr: Some("10.0.0.7".into()),
+            application_name: "api".into(),
+            backend_start: "2026-10-08T10:00:00Z".parse().unwrap(),
+        };
+        let running = RoleSessionsReply::running(vec![session.clone()]);
+        assert!(running.ok && running.compute_running);
+        let back: RoleSessionsReply = serde_json::from_slice(&serde_json::to_vec(&running).unwrap()).unwrap();
+        assert_eq!(back, running);
+        let idle = RoleSessionsReply::not_running();
+        assert!(idle.ok && !idle.compute_running && idle.sessions.is_empty());
+        let not_ready = RoleSessionsReply::not_ready();
+        assert_eq!((not_ready.ok, not_ready.code.as_deref()), (false, Some("branch_not_ready")));
+        let failed = RoleSessionsReply::failed("boom");
+        assert_eq!((failed.ok, failed.code.as_deref(), failed.error.as_deref()), (false, Some("failed"), Some("boom")));
+        // A bare failure parses, with no sessions.
+        let bare: RoleSessionsReply = serde_json::from_str(r#"{"ok":false,"code":"failed","error":"x"}"#).unwrap();
+        assert!(!bare.compute_running && bare.sessions.is_empty());
+    }
+
+    #[test]
+    fn role_create_request_attributes_default_to_a_plain_login_role() {
+        let branch = BranchId::new();
+        let old: RoleCreateRequest =
+            serde_json::from_value(serde_json::json!({ "branch_id": branch, "name": "app", "owner_level": false }))
+                .unwrap();
+        assert_eq!(old, RoleCreateRequest::login(branch, "app", false));
+        assert!(old.login && old.inherit && !old.bypass_rls);
+        assert_eq!((old.connection_limit, old.valid_until, old.member_of.len()), (-1, None, 0));
+        let full = RoleCreateRequest {
+            login: false,
+            inherit: false,
+            connection_limit: 3,
+            valid_until: Some(DateTime::<Utc>::UNIX_EPOCH),
+            bypass_rls: true,
+            member_of: vec!["g".into()],
+            ..RoleCreateRequest::login(branch, "r", false)
+        };
+        let back: RoleCreateRequest = serde_json::from_slice(&serde_json::to_vec(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
+    }
+
+    #[test]
+    fn role_update_request_tells_unchanged_from_cleared() {
+        assert_eq!(SUBJECT_ROLE_UPDATE, "chelabase.rpc.roles.update");
+        let branch = BranchId::new();
+        let parse = |v: serde_json::Value| serde_json::from_value::<RoleUpdateRequest>(v).unwrap();
+        let none = parse(serde_json::json!({ "branch_id": branch, "name": "r" }));
+        assert_eq!(none, RoleUpdateRequest::new(branch, "r"));
+        assert_eq!(none.valid_until, None);
+        let cleared = parse(serde_json::json!({ "branch_id": branch, "name": "r", "valid_until": null }));
+        assert_eq!(cleared.valid_until, Some(None));
+        let set = RoleUpdateRequest {
+            owner_level: Some(true),
+            login: Some(false),
+            inherit: Some(false),
+            connection_limit: Some(5),
+            valid_until: Some(Some(DateTime::<Utc>::UNIX_EPOCH)),
+            bypass_rls: Some(true),
+            member_of: Some(vec!["g".into()]),
+            ..RoleUpdateRequest::new(branch, "r")
+        };
+        for request in [none, cleared, set] {
+            let back: RoleUpdateRequest = serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+            assert_eq!(back, request);
+        }
+        assert!(ROLE_UPDATE_NOT_APPLIED.contains("retried"));
     }
 
     #[test]
@@ -861,14 +1186,28 @@ mod tests {
         let old: CheckDataRoleReply = serde_json::from_str(r#"{"ok":false,"error":"x"}"#).unwrap();
         assert_eq!(old.kind, None);
         assert_eq!(old.role_oid, None);
-        // A secret key's check answers the role's OID; replies without one omit it.
-        let with_oid = serde_json::to_value(CheckDataRoleReply::ok_with_oid(16390)).unwrap();
+        assert_eq!(old.role_timeline, None);
+        // A secret key's check answers the role's OID and the timeline it was read on (E26);
+        // replies without them omit them.
+        let with_oid = serde_json::to_value(CheckDataRoleReply::ok_with_oid(16390, "abc")).unwrap();
         assert_eq!(
             with_oid,
-            serde_json::json!({ "ok": true, "error": null, "kind": null, "role_oid": 16390 })
+            serde_json::json!({
+                "ok": true, "error": null, "kind": null, "role_oid": 16390, "role_timeline": "abc"
+            })
         );
         let back: CheckDataRoleReply = serde_json::from_value(with_oid).unwrap();
         assert_eq!(back.role_oid, Some(16390));
+        assert_eq!(back.role_timeline.as_deref(), Some("abc"));
+        assert_eq!(back.role_bypass_rls, None, "omitted by workers that predate E33");
+        // E33: whether the role has BYPASSRLS, when it does or doesn't.
+        let bypass = CheckDataRoleReply::ok_with_oid(16390, "abc").bypassing_rls(true);
+        let json = serde_json::to_value(&bypass).unwrap();
+        assert_eq!(json["role_bypass_rls"], true);
+        let back: CheckDataRoleReply = serde_json::from_value(json).unwrap();
+        assert_eq!(back.role_bypass_rls, Some(true));
+        let plain = CheckDataRoleReply::ok_with_oid(16390, "abc").bypassing_rls(false);
+        assert_eq!(serde_json::to_value(&plain).unwrap()["role_bypass_rls"], false);
     }
 
     /// Opt-in, against the Compose NATS (`just deps-up`): a stream and consumer of their own,
@@ -1001,6 +1340,7 @@ mod tests {
                 SUBJECT_PROJECT_DELETE.to_string(),
                 SUBJECT_APP_USERS.to_string(),
                 SUBJECT_APP_USERS_SYNC.to_string(),
+                SUBJECT_MERGE.to_string(),
             ]
         );
         assert!(missing_subjects(&control_subjects()).is_empty());
@@ -1028,8 +1368,61 @@ mod tests {
                 SUBJECT_PROJECT_DELETE.to_string(),
                 SUBJECT_APP_USERS.to_string(),
                 SUBJECT_APP_USERS_SYNC.to_string(),
+                SUBJECT_MERGE.to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn control_subjects_include_merge() {
+        assert_eq!(SUBJECT_MERGE, "chelabase.merge");
+        assert_eq!(CONSUMER_MERGE, "chelabase-worker-merge");
+        assert!(control_subjects().contains(&SUBJECT_MERGE.to_string()));
+        let spec = ConsumerSpec::merge();
+        assert_eq!((spec.durable, spec.subject), (CONSUMER_MERGE, SUBJECT_MERGE));
+        assert_eq!(spec.ack_wait, ACK_WAIT);
+    }
+
+    #[test]
+    fn merge_job_serde_shape() {
+        let merge_id = uuid::Uuid::new_v4();
+        let json = serde_json::to_value(MergeJob::Apply { merge_id }).unwrap();
+        assert_eq!(json, serde_json::json!({"kind": "apply", "merge_id": merge_id}));
+        for job in [
+            MergeJob::Compute { merge_id },
+            MergeJob::Rehearse { merge_id },
+            MergeJob::Apply { merge_id },
+            MergeJob::Resume { merge_id },
+            MergeJob::Cancel { merge_id },
+        ] {
+            let back: MergeJob = serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
+            assert_eq!(back, job);
+        }
+    }
+
+    // E21: the after-merge choice run by hand on a merge applied with drift.
+    #[test]
+    fn merge_finish_job_serde_shape() {
+        let merge_id = uuid::Uuid::new_v4();
+        let job = MergeJob::Finish {
+            merge_id,
+            after: MergeAfter::Reset,
+        };
+        let json = serde_json::to_value(&job).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "finish", "merge_id": merge_id, "after": "reset"})
+        );
+        let back: MergeJob = serde_json::from_value(json).unwrap();
+        assert_eq!(back, job);
+        for (after, text) in [
+            (MergeAfter::Keep, "keep"),
+            (MergeAfter::Reset, "reset"),
+            (MergeAfter::Delete, "delete"),
+        ] {
+            assert_eq!(after.as_str(), text);
+            assert_eq!(serde_json::to_value(after).unwrap(), serde_json::json!(text));
+        }
     }
 
     #[test]

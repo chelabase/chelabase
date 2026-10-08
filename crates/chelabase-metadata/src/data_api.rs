@@ -10,22 +10,31 @@
 //! # Secret keys and their roles
 //!
 //! **Invariant:** a secret key is bound to its role's identity on the compute
-//! (`pg_roles.oid`, the `role_oid` column), not to the role's name. A key whose OID no longer
-//! exists, or whose name is now held by a different role, is dead: it never runs as anyone.
+//! (`pg_roles.oid`, the `role_oid` column) *on the timeline that OID was read on*
+//! (`role_timeline`, E26), not to the role's name. A key is only ever served as the role it
+//! was bound to: the same OID on the same timeline, or the same OID and the same name after a
+//! timeline switch (a reset, restore or a merge's reset brings a catalog whose OID counter
+//! diverged at the branch point, so the same OID can name another role there). A key whose OID
+//! no longer exists, or whose name is now held by a different role, is dead: it never runs as
+//! anyone.
 //!
 //! How each side keeps it:
 //! - Creation: the worker checks the role on the compute (any role, with or without a
-//!   password, so with or without a `neon_roles` row) and answers its OID;
-//!   [`MetadataClient::create_secret_key`] stores the key with it.
+//!   password, so with or without a `neon_roles` row) and answers its OID and the branch's
+//!   timeline (read before and after the check: a switch in between is "not ready");
+//!   [`MetadataClient::create_secret_key`] stores the key with both.
 //! - Use: rest's preamble sets the role only while the role named `role` has `role_oid`, in
 //!   the same expression as the `SET ROLE` (no window, no cache). A role dropped, or dropped
 //!   and created again, between the check and the store (or at any time later) leaves a key
 //!   that is refused on every request.
-//! - Rotation re-checks the role on the compute; a different OID than the old key's is
+//! - Rotation re-checks the role on the compute ([`rotated_identity`]); a different OID than
+//!   the old key's, or (checked on another timeline) the same OID under another name, is
 //!   [`MetadataError::RoleRecreated`], nothing written. The new key keeps the old key's OID,
 //!   and its role is the old row's current name (read under the lock, so it follows a rename).
-//! - The resync revokes keys whose OID is gone, renames keys whose OID now has another name (a
-//!   rename the receiver didn't see), and fills the OID of keys made before the column existed.
+//! - The resync, on the key's own timeline, revokes keys whose OID is gone, renames keys whose
+//!   OID now has another name (a rename the receiver didn't see); on another timeline it keeps
+//!   (and re-stamps) a key only while its OID carries its name, else revokes it; and it fills
+//!   the OID and timeline of keys made before the column existed.
 //! - The DDL receiver (endpoint row `FOR UPDATE`, key writes take it `FOR SHARE`) refuses a
 //!   DROP or recreate of a role with live keys and moves keys with every rename: the
 //!   friendly path, so a key rarely goes dead in the first place.
@@ -61,6 +70,11 @@ pub struct NewDataKey {
     /// A secret key's role identity (`pg_roles.oid`) from the worker's check; `None` for the
     /// public key.
     pub role_oid: Option<i64>,
+    /// The Neon timeline the check read `role_oid` on (E26); `None` for the public key, or
+    /// from a worker that predates it (the resync then checks the key by name and stamps it).
+    pub role_timeline: Option<String>,
+    /// A secret key's role has BYPASSRLS, as the check read it (E33); false for the public key.
+    pub role_bypass_rls: bool,
 }
 
 impl fmt::Debug for NewDataKey {
@@ -76,6 +90,8 @@ impl fmt::Debug for NewDataKey {
             .field("sealed", &self.sealed.as_ref().map(|_| "<redacted>"))
             .field("databases", &self.databases)
             .field("role_oid", &self.role_oid)
+            .field("role_timeline", &self.role_timeline)
+            .field("role_bypass_rls", &self.role_bypass_rls)
             .finish()
     }
 }
@@ -96,6 +112,12 @@ pub struct DataKeyRecord {
     pub databases: Option<Vec<String>>,
     /// A secret key's role identity; `None` for the public key and keys not backfilled yet.
     pub role_oid: Option<i64>,
+    /// The timeline `role_oid` was read on; `None` without an OID, or for a key made before
+    /// timelines were stored.
+    pub role_timeline: Option<String>,
+    /// A secret key's role has BYPASSRLS (E33): the check's answer at create or rotation,
+    /// kept up to date by the resync by the role's OID. False for the public key.
+    pub role_bypass_rls: bool,
 }
 
 impl fmt::Debug for DataKeyRecord {
@@ -113,6 +135,8 @@ impl fmt::Debug for DataKeyRecord {
             .field("revoked_at", &self.revoked_at)
             .field("databases", &self.databases)
             .field("role_oid", &self.role_oid)
+            .field("role_timeline", &self.role_timeline)
+            .field("role_bypass_rls", &self.role_bypass_rls)
             .finish()
     }
 }
@@ -132,16 +156,24 @@ pub struct DataKeyLookup {
     pub role_oid: Option<i64>,
 }
 
-/// One repair the resync makes to a live secret key from the compute's `pg_roles`. Each is
-/// applied only while the row still looks as the resync saw it.
+/// One repair the resync makes to a live secret key from the compute's `pg_roles` on the
+/// branch's current timeline. Each is applied only while the row still looks as the resync
+/// saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyRoleFix {
-    /// The key's OID is gone, or (no OID yet) its name is: the role is dropped.
+    /// The key's OID is gone, or (no OID yet) its name is: the role is dropped. After a
+    /// timeline switch, also a key whose OID no longer carries its name.
     Revoke { id: Uuid, role: String, oid: Option<i64> },
-    /// The key's OID now has another name (a rename the DDL receiver didn't see).
-    Follow { id: Uuid, from: String, to: String, oid: i64 },
-    /// A key made before OIDs were stored: its name's current OID.
-    Backfill { id: Uuid, role: String, oid: i64 },
+    /// The key's OID now has another name (a rename the DDL receiver didn't see), on the
+    /// timeline the OID was read on (`timeline`): never across a switch.
+    Follow { id: Uuid, from: String, to: String, oid: i64, timeline: String },
+    /// A key made before OIDs were stored: its name's current OID, read on `timeline`.
+    Backfill { id: Uuid, role: String, oid: i64, timeline: String },
+    /// A key whose OID was read on another timeline (`from`; `None`: not recorded) and still
+    /// carries its name on the current one (`timeline`): kept, bound to `timeline` now.
+    Restamp { id: Uuid, role: String, oid: i64, from: Option<String>, timeline: String },
+    /// The key's role (still `oid`) gained or lost BYPASSRLS since it was last read (E33).
+    Bypass { id: Uuid, oid: i64, bypass_rls: bool },
 }
 
 /// A database's data API settings.
@@ -174,7 +206,7 @@ pub struct BranchConnectionRow {
 }
 
 const KEY_COLUMNS: &str = "id, branch_id, kind, role, name, prefix, sealed, created_at, \
-     last_used_at, revoked_at, databases, role_oid";
+     last_used_at, revoked_at, databases, role_oid, role_timeline, role_bypass_rls";
 
 fn parse_kind(value: &str) -> Result<DataKeyKind, MetadataError> {
     DataKeyKind::parse(value)
@@ -195,13 +227,16 @@ fn key_from_row(r: &PgRow) -> Result<DataKeyRecord, MetadataError> {
         revoked_at: r.get("revoked_at"),
         databases: r.get("databases"),
         role_oid: r.get("role_oid"),
+        role_timeline: r.get("role_timeline"),
+        role_bypass_rls: r.get("role_bypass_rls"),
     })
 }
 
 const INSERT_KEY: &str =
     "INSERT INTO data_api_keys
-         (id, branch_id, kind, role, name, prefix, sha256, sealed, databases, role_oid)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+         (id, branch_id, kind, role, name, prefix, sha256, sealed, databases, role_oid,
+          role_timeline, role_bypass_rls)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
 
 /// A second live public key on a branch is a [`MetadataError::Conflict`]; anything else passes.
 fn map_insert_error(err: sqlx::Error) -> MetadataError {
@@ -297,7 +332,9 @@ impl MetadataClient {
         .collect()
     }
 
-    /// The live key with this hash, if its branch isn't deleting or deleted.
+    /// The live key with this hash, if its branch is a `normal` one that isn't deleting or
+    /// deleted. A merge's rehearsal (step 6g) gets a public key from its data API bootstrap,
+    /// like any branch built; the data API never serves it (M11).
     pub async fn lookup_data_key(
         &self,
         sha256: &[u8; 32],
@@ -308,7 +345,7 @@ impl MetadataClient {
              JOIN branches b ON b.id = k.branch_id
              JOIN databases d ON d.id = b.database_id
              WHERE k.sha256 = $1 AND k.revoked_at IS NULL
-               AND b.status NOT IN ('deleting', 'deleted')",
+               AND b.kind = 'normal' AND b.status NOT IN ('deleting', 'deleted')",
         )
         .bind(sha256.as_slice())
         .fetch_optional(&self.pool)
@@ -351,25 +388,48 @@ impl MetadataClient {
                 .bind(branch.as_uuid())
                 .bind(role)
                 .bind(*oid),
-                KeyRoleFix::Follow { id, from, to, oid } => sqlx::query(
+                KeyRoleFix::Follow { id, from, to, oid, timeline } => sqlx::query(
                     "UPDATE data_api_keys SET role = $4
                      WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
-                       AND role = $3 AND role_oid = $5",
+                       AND role = $3 AND role_oid = $5 AND role_timeline = $6",
                 )
                 .bind(*id)
                 .bind(branch.as_uuid())
                 .bind(from)
                 .bind(to)
-                .bind(*oid),
-                KeyRoleFix::Backfill { id, role, oid } => sqlx::query(
-                    "UPDATE data_api_keys SET role_oid = $4
+                .bind(*oid)
+                .bind(timeline),
+                KeyRoleFix::Backfill { id, role, oid, timeline } => sqlx::query(
+                    "UPDATE data_api_keys SET role_oid = $4, role_timeline = $5
                      WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
                        AND role = $3 AND role_oid IS NULL",
                 )
                 .bind(*id)
                 .bind(branch.as_uuid())
                 .bind(role)
-                .bind(*oid),
+                .bind(*oid)
+                .bind(timeline),
+                KeyRoleFix::Restamp { id, role, oid, from, timeline } => sqlx::query(
+                    "UPDATE data_api_keys SET role_timeline = $5
+                     WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
+                       AND role = $3 AND role_oid = $4
+                       AND role_timeline IS NOT DISTINCT FROM $6",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(role)
+                .bind(*oid)
+                .bind(timeline)
+                .bind(from.as_deref()),
+                KeyRoleFix::Bypass { id, oid, bypass_rls } => sqlx::query(
+                    "UPDATE data_api_keys SET role_bypass_rls = $4
+                     WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
+                       AND role_oid = $3 AND role_bypass_rls <> $4",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(*oid)
+                .bind(*bypass_rls),
             };
             changed += query.execute(&mut *tx).await?.rows_affected();
         }
@@ -461,34 +521,36 @@ impl MetadataClient {
         }
         // The new key reaches what the old one did: its list is copied, whatever `new` carries.
         // A secret key's role is the old row's now, under the lock.
-        let revoked: Option<(Option<Vec<String>>, String, Option<i64>)> = sqlx::query_as(
+        type Revoked = (Option<Vec<String>>, String, Option<i64>, Option<String>);
+        let revoked: Option<Revoked> = sqlx::query_as(
             "UPDATE data_api_keys SET revoked_at = now()
              WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
                AND kind = CASE WHEN $3 THEN 'secret' ELSE 'public' END
-             RETURNING databases, role, role_oid",
+             RETURNING databases, role, role_oid, role_timeline",
         )
         .bind(old)
         .bind(branch.as_uuid())
         .bind(secret)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((databases, role, stored_oid)) = revoked else {
+        let Some((databases, role, stored_oid, stored_timeline)) = revoked else {
             return Ok(false);
         };
-        let role_oid = if secret {
-            if let (Some(stored), Some(checked)) = (stored_oid, new.role_oid)
-                && stored != checked
-            {
-                return Err(MetadataError::RoleRecreated(role));
-            }
-            stored_oid.or(new.role_oid)
+        let (role_oid, role_timeline) = if secret {
+            rotated_identity(
+                &role,
+                (stored_oid, stored_timeline),
+                (new.role_oid, new.role_timeline.clone()),
+                &new.role,
+            )?
         } else {
-            None
+            (None, None)
         };
         let new = NewDataKey {
             databases,
             role: if secret { role } else { new.role.clone() },
             role_oid,
+            role_timeline,
             ..new.clone()
         };
         bind_new_key(sqlx::query(INSERT_KEY), &new, branch)
@@ -603,6 +665,36 @@ impl MetadataClient {
     }
 }
 
+/// A rotated secret key's identity `(role_oid, role_timeline)` (E26). `row_role` is the old
+/// row's name under the lock, `stored` its identity, `checked` what the caller's check found
+/// for the name `checked_role`. On the same timeline the OID decides (a rename keeps it); on
+/// another timeline, or with none recorded, the OID must also still carry the old row's name,
+/// and the new key is bound to the check's timeline. A check without an OID or a timeline
+/// (a worker that predates them) keeps the stored identity under the OID rule. Anything else
+/// is [`MetadataError::RoleRecreated`].
+pub fn rotated_identity(
+    row_role: &str,
+    stored: (Option<i64>, Option<String>),
+    checked: (Option<i64>, Option<String>),
+    checked_role: &str,
+) -> Result<(Option<i64>, Option<String>), MetadataError> {
+    let recreated = || MetadataError::RoleRecreated(row_role.to_string());
+    match (stored, checked) {
+        ((None, _), checked) => Ok(checked),
+        (stored, (None, _)) => Ok(stored),
+        ((Some(s), _), (Some(c), _)) if s != c => Err(recreated()),
+        (stored, (Some(_), None)) => Ok(stored),
+        ((Some(s), Some(st)), (Some(_), Some(ct))) if st == ct => Ok((Some(s), Some(st))),
+        ((Some(s), _), (Some(_), Some(ct))) => {
+            if row_role == checked_role {
+                Ok((Some(s), Some(ct)))
+            } else {
+                Err(recreated())
+            }
+        }
+    }
+}
+
 fn bind_new_key<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     key: &'q NewDataKey,
@@ -619,11 +711,48 @@ fn bind_new_key<'q>(
         .bind(key.sealed.as_deref())
         .bind(key.databases.as_deref())
         .bind(key.role_oid)
+        .bind(key.role_timeline.as_deref())
+        .bind(key.kind == DataKeyKind::Secret && key.role_bypass_rls)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // E26: a rotation keeps the old key's identity. Same timeline: the OIDs must match. The
+    // check ran on another timeline (or the old key has none recorded): the OID must match and
+    // still carry the old key's name, and the new key is bound to the check's timeline.
+    #[test]
+    fn a_rotation_keeps_the_identity_only_on_its_timeline_or_under_its_name() {
+        let t1 = Some("t1".to_string());
+        let t2 = Some("t2".to_string());
+        let id = |oid: Option<i64>, t: &Option<String>| (oid, t.clone());
+        // No OID stored: the check's identity.
+        assert_eq!(rotated_identity("app", id(None, &None), id(Some(5), &t1), "app").unwrap(), id(Some(5), &t1));
+        // A check without an OID (an old worker): the stored identity.
+        assert_eq!(rotated_identity("app", id(Some(5), &t1), id(None, &None), "app").unwrap(), id(Some(5), &t1));
+        // Same timeline: the OID decides, whatever the name.
+        assert_eq!(rotated_identity("renamed", id(Some(5), &t1), id(Some(5), &t1), "app").unwrap(), id(Some(5), &t1));
+        assert!(matches!(
+            rotated_identity("app", id(Some(5), &t1), id(Some(6), &t1), "app"),
+            Err(MetadataError::RoleRecreated(r)) if r == "app"
+        ));
+        // Another timeline, or none recorded: the OID and the name, then the check's timeline.
+        assert_eq!(rotated_identity("app", id(Some(5), &t1), id(Some(5), &t2), "app").unwrap(), id(Some(5), &t2));
+        assert_eq!(rotated_identity("app", id(Some(5), &None), id(Some(5), &t2), "app").unwrap(), id(Some(5), &t2));
+        for (row, stored, checked, name) in [
+            ("app", id(Some(5), &t1), id(Some(6), &t2), "app"),
+            ("app", id(Some(5), &t1), id(Some(5), &t2), "x"),
+            ("app", id(Some(5), &None), id(Some(5), &t2), "x"),
+        ] {
+            assert!(
+                matches!(rotated_identity(row, stored.clone(), checked.clone(), name), Err(MetadataError::RoleRecreated(_))),
+                "{row} {stored:?} {checked:?} {name}"
+            );
+        }
+        // A check without a timeline (an old worker) keeps today's OID rule and the stored one.
+        assert_eq!(rotated_identity("app", id(Some(5), &t1), id(Some(5), &None), "app").unwrap(), id(Some(5), &t1));
+    }
 
     #[test]
     fn debug_redacts_the_hash_and_the_sealed_key() {
@@ -638,6 +767,8 @@ mod tests {
             sealed: Some("v1:SECRETSEALED".into()),
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         };
         let shown = format!("{key:?}");
         assert!(
@@ -658,6 +789,8 @@ mod tests {
             revoked_at: None,
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         };
         assert!(!format!("{record:?}").contains("SECRETSEALED"));
     }

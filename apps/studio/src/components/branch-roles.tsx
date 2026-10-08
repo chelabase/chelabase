@@ -33,6 +33,31 @@ const utc = (iso: string) => `${new Date(iso).toISOString().slice(0, 16).replace
 const isKey = (k: unknown): k is RoleInUseKey =>
   typeof k === "object" && k !== null && typeof (k as RoleInUseKey).id === "string" && typeof (k as RoleInUseKey).name === "string";
 
+/**
+ * The attributes beyond login and level, read-only (they're set through the API or a merge):
+ * only those that differ from a new role's defaults are named.
+ */
+function RoleAttributes({ role }: { role: BranchRole }) {
+  const parts: { text: string; hazard?: boolean }[] = [];
+  if (role.bypass_rls) parts.push({ text: "Bypasses RLS", hazard: true });
+  if (role.inherit === false) parts.push({ text: "No inherit" });
+  if (typeof role.connection_limit === "number" && role.connection_limit >= 0) {
+    parts.push({ text: `At most ${role.connection_limit} connection${role.connection_limit === 1 ? "" : "s"}` });
+  }
+  if (role.valid_until) parts.push({ text: `Valid until ${utc(role.valid_until)}` });
+  if (role.member_of?.length) parts.push({ text: `Member of ${role.member_of.join(", ")}` });
+  if (parts.length === 0) return <span className="text-muted-foreground">—</span>;
+  return (
+    <ul className="space-y-0.5 text-xs">
+      {parts.map((p) => (
+        <li key={p.text} className={p.hazard ? "text-destructive" : undefined}>
+          {p.text}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
   const queryClient = useQueryClient();
   const roles = useListRoles(databaseId, branchId, {
@@ -144,6 +169,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
             <th className="py-1 font-medium">Origin</th>
             <th className="py-1 font-medium">Level</th>
             <th className="py-1 font-medium">Login</th>
+            <th className="py-1 font-medium">Attributes</th>
             <th className="py-1 font-medium">Password</th>
             <th className="py-1 font-medium">Created</th>
             <th className="py-1 font-medium">Actions</th>
@@ -163,6 +189,9 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
                 </span>
               </td>
               <td className="py-1">{r.login ? "Yes" : "No"}</td>
+              <td className="py-1">
+                <RoleAttributes role={r} />
+              </td>
               <td className="py-1">
                 <span className={r.password === "generated" ? undefined : "text-xs text-destructive"}>
                   {PASSWORD_STATE_TEXT[r.password]}

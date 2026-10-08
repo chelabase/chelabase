@@ -41,8 +41,15 @@ impl From<reqwest::Error> for StorconError {
 /// The subset of the storage controller's timeline description we use.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TimelineInfo {
+    /// The timeline this one branched from; `None` for a root or a detached timeline.
+    #[serde(default)]
+    pub ancestor_timeline_id: Option<String>,
     pub ancestor_lsn: Option<Lsn>,
     pub last_record_lsn: Lsn,
+    /// How far GC has advanced: the pageserver refuses reads below it (`check_lsn_is_in_scope`).
+    /// `None` when the reply doesn't carry it.
+    #[serde(default)]
+    pub applied_gc_cutoff_lsn: Option<Lsn>,
 }
 
 /// A timeline's head: its `last_record_lsn`, or the safekeepers' commit LSN (read from them

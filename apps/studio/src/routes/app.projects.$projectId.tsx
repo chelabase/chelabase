@@ -1,23 +1,25 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { ProjectPage } from "@/components/project-page";
 import { useAppSession } from "@/lib/app-session";
+import { connectionFocus, parseProjectSearch, type ProjectSearch } from "@/lib/project-search";
 
 export const Route = createFileRoute("/app/projects/$projectId")({
-  validateSearch: (search: Record<string, unknown>): { tab?: "settings" | "users" } =>
-    search.tab === "settings" || search.tab === "users" ? { tab: search.tab } : {},
+  validateSearch: (search: Record<string, unknown>): ProjectSearch => parseProjectSearch(search),
   component: ProjectRoute,
 });
 
 function ProjectRoute() {
   const { apiUrl, onLoaded } = useAppSession();
   const { projectId } = Route.useParams();
-  const { tab } = Route.useSearch();
+  const search = Route.useSearch();
+  const { tab } = search;
   const navigate = useNavigate();
   return (
     <ProjectPage
       projectId={projectId}
       apiUrl={apiUrl}
       onLoaded={onLoaded}
+      focus={connectionFocus(search)}
       tab={tab ?? "databases"}
       onTabChange={(next) =>
         void navigate({

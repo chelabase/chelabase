@@ -5,6 +5,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Roles a secret key's role may not be a member of, at any depth (besides any superuser
+/// role): owner level (`neon_superuser`) and roles that reach the compute itself or
+/// Chelabase's machinery. The worker's create-time check and rest's per-request gate both
+/// refuse exactly these (with superuser, CREATEROLE, CREATEDB and REPLICATION; E33).
+pub const KEY_ROLE_REFUSED_GROUPS: [&str; 5] = [
+    "neon_superuser",
+    "chelabase_admin",
+    "pg_execute_server_program",
+    "pg_read_server_files",
+    "pg_write_server_files",
+];
+
 const PUBLIC_PREFIX: &str = "chk_pub_";
 const SECRET_PREFIX: &str = "chk_sec_";
 const BODY_LEN: usize = 43;

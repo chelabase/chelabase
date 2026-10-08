@@ -5,7 +5,27 @@
  * OpenAPI spec version: 1
  */
 
+/**
+ * A role to create. Only the attributes listed here can be set; any other field is refused.
+ */
 export interface CreateRoleRequest {
+  /** BYPASSRLS: the role ignores row-level security. Default `false`. */
+  bypass_rls?: boolean;
+  /** `-1` (the default) is no limit. */
+  connection_limit?: number;
+  /** INHERIT. Default `true`. */
+  inherit?: boolean;
+  /**
+     * LOGIN, with a generated password. `false` makes a NOLOGIN role (a group) with no
+     * password. Default `true`.
+     */
+  login?: boolean;
+  /**
+     * Roles to make it a member of. Each must exist and be the owner's to grant; never one of
+     * Chelabase's own (`authenticator`, `anon`, `authenticated`, `neon_superuser`,
+     * `chelabase_…`), the owner, a `pg_…` role, or the role itself.
+     */
+  member_of?: string[];
   /** `^[a-z_][a-z0-9_]{0,62}$`, and not a reserved name (`postgres`, `anon`, `pg_…`, …). */
   name: string;
   /**
@@ -13,4 +33,9 @@ export interface CreateRoleRequest {
      * and REPLICATION, and a member of `neon_superuser`. Default `false`.
      */
   owner_level?: boolean;
+  /**
+     * When the password stops working. Default: never.
+     * @nullable
+     */
+  valid_until?: string | null;
 }

@@ -20,6 +20,7 @@ import { Route as VerifyRouteImport } from './routes/verify'
 import { Route as AppIndexRouteImport } from './routes/app.index'
 import { Route as AppApiRouteImport } from './routes/app.api'
 import { Route as AppProjectsProjectIdRouteImport } from './routes/app.projects.$projectId'
+import { Route as AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRouteImport } from './routes/app.projects.$projectId_.databases.$databaseId.merges.$mergeId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -76,6 +77,12 @@ const AppProjectsProjectIdRoute = AppProjectsProjectIdRouteImport.update({
   path: '/projects/$projectId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute =
+  AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRouteImport.update({
+    id: '/projects/$projectId_/databases/$databaseId/merges/$mergeId',
+    path: '/projects/$projectId/databases/$databaseId/merges/$mergeId',
+    getParentRoute: () => AppRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -89,6 +96,7 @@ export interface FileRoutesByFullPath {
   '/app/api': typeof AppApiRoute
   '/app/': typeof AppIndexRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
+  '/app/projects/$projectId/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -101,6 +109,7 @@ export interface FileRoutesByTo {
   '/app/api': typeof AppApiRoute
   '/app': typeof AppIndexRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
+  '/app/projects/$projectId/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -115,6 +124,7 @@ export interface FileRoutesById {
   '/app/api': typeof AppApiRoute
   '/app/': typeof AppIndexRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
+  '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -130,6 +140,7 @@ export interface FileRouteTypes {
     | '/app/api'
     | '/app/'
     | '/app/projects/$projectId'
+    | '/app/projects/$projectId/databases/$databaseId/merges/$mergeId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -142,6 +153,7 @@ export interface FileRouteTypes {
     | '/app/api'
     | '/app'
     | '/app/projects/$projectId'
+    | '/app/projects/$projectId/databases/$databaseId/merges/$mergeId'
   id:
     | '__root__'
     | '/'
@@ -155,6 +167,7 @@ export interface FileRouteTypes {
     | '/app/api'
     | '/app/'
     | '/app/projects/$projectId'
+    | '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -247,6 +260,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppProjectsProjectIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId': {
+      id: '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId'
+      path: '/projects/$projectId/databases/$databaseId/merges/$mergeId'
+      fullPath: '/app/projects/$projectId/databases/$databaseId/merges/$mergeId'
+      preLoaderRoute: typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRouteImport
+      parentRoute: typeof AppRoute
+    }
   }
 }
 
@@ -254,12 +274,15 @@ interface AppRouteChildren {
   AppApiRoute: typeof AppApiRoute
   AppIndexRoute: typeof AppIndexRoute
   AppProjectsProjectIdRoute: typeof AppProjectsProjectIdRoute
+  AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute: typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppApiRoute: AppApiRoute,
   AppIndexRoute: AppIndexRoute,
   AppProjectsProjectIdRoute: AppProjectsProjectIdRoute,
+  AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute:
+    AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

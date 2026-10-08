@@ -6,7 +6,7 @@ import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/tes
 import { renderWithQuery } from "@/test/render";
 import { DatabaseDataApi } from "./database-data-api";
 
-const summary: DatabaseSummary = { database_id: "db", name: "web1", status: "ready", host: "h", port: 4432, branch_count: 2 };
+const summary: DatabaseSummary = { database_id: "db", name: "web1", postgres_database: "web1", status: "ready", host: "h", port: 4432, branch_count: 2 };
 const b = (name: string, over: Partial<Branch> = {}): Branch => ({
   id: `id-${name}`,
   name,

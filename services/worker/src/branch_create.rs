@@ -2,8 +2,8 @@
 //! the data API roles and bootstrap inside it.
 
 use chelabase_metadata::{
-    BranchKind, BranchRecord, BranchStatus, MetadataError, NewEndpoint, NewRoleCopy, RoleLevel,
-    RoleOrigin,
+    BaseSource, BranchKind, BranchRecord, BranchStatus, MetadataError, NewEndpoint, NewRoleCopy,
+    RoleLevel, RoleOrigin,
 };
 use chelabase_nats::PointInTime;
 use chelabase_neon::{ComputeBackend, Lsn, NeonId};
@@ -35,6 +35,9 @@ struct Recorded {
     /// The parent was protected when its copies were read: every role of the child's
     /// catalog with a password gets a fresh one (I3).
     protected: bool,
+    /// A merge's rehearsal (step 6g): unroutable (P4), without the app users machinery (the
+    /// target's copy already has it).
+    rehearsal: bool,
     /// `(name, verifier)` of each copy recorded with a fresh password (a protected parent's).
     fresh: Vec<(String, String)>,
 }
@@ -52,6 +55,8 @@ struct ChildCopy {
     fresh: bool,
     /// The parent's sealed password didn't open: the row is marked unreadable (C4).
     unreadable: bool,
+    /// The parent row's attributes and memberships (U1): the child's catalog has them too.
+    attributes: chelabase_metadata::RoleAttributes,
 }
 
 /// How many times step 3 re-reads the copies and inserts again after the parent's Protect
@@ -107,7 +112,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             warn!(%branch_id, "main is provisioned with its database; dropping create job");
             return Ok(());
         };
-        if branch.kind != BranchKind::Normal {
+        // A merge's rehearsal (step 6g) is built like a branch; a backup is made by a restore.
+        if branch.kind == BranchKind::Backup {
             warn!(%branch_id, "a backup is made by a restore; dropping create job");
             return Ok(());
         }
@@ -155,6 +161,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // Steps 4-7.
         match self.build_branch(&rec, &parent_timeline, lsn).await {
             Ok(Built::Compute(users)) => {
+                // Step 6g: the branch point's schema, while it still equals the parent's (best
+                // effort, R6). Rehearsals are throwaway copies and keep none.
+                if branch.kind == BranchKind::Normal {
+                    self.record_bases(
+                        branch_id,
+                        &rec.endpoint_id,
+                        BaseSource::Create,
+                        rec.timeline.as_str(),
+                        &lsn.to_string(),
+                    )
+                    .await;
+                }
                 self.finish_branch(branch_id, &rec, &parent_timeline, lsn, started)
                     .await?;
                 // The users that changed since the branch point (best effort; the periodic
@@ -264,6 +282,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             database_name: database_name.to_string(),
             password: credentials::generate_password(),
             protected,
+            rehearsal: branch.kind == BranchKind::Rehearsal,
             fresh: copies
                 .iter()
                 .filter(|c| c.fresh)
@@ -283,6 +302,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 level: c.level,
                 api_owner_level: c.api_owner_level,
                 pending: c.fresh,
+                attributes: &c.attributes,
             })
             .collect();
         let endpoint = NewEndpoint {
@@ -294,6 +314,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             owner_verifier: &verifier,
             database_name: &rec.database_name,
             role_copies: &role_copies,
+            // P4: a rehearsal holds the target's role verifiers; the proxy never routes it.
+            routable: !rec.rehearsal,
+            static_lsn: None,
         };
         let recorded = self
             .metadata
@@ -364,6 +387,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     api_owner_level: r.api_owner_level,
                     fresh: false,
                     unreadable: false,
+                    attributes: r.attributes,
                 };
                 if protected && copy.verifier.is_some() {
                     let password = credentials::generate_password();
@@ -486,7 +510,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .map_err(|e| format!("bootstrapping the data API: {e:#}"))?;
         phase_done(ep, "bootstrap_databases", phase);
         // A branch of the auth database gets its own sync password and the users machinery
-        // (it relies on the data API roles just bootstrapped).
+        // (it relies on the data API roles just bootstrapped). A rehearsal is a throwaway
+        // copy of a target that has it already.
+        if rec.rehearsal {
+            return Ok(Built::Compute(None));
+        }
         let users = self
             .bootstrap_users_for(rec.branch, rec.database_id, ep)
             .await
@@ -628,7 +656,7 @@ mod tests {
         ready_database, worker,
     };
     use crate::provision::sha256_hex;
-    use crate::roles::RoleOutcome;
+    use crate::roles::{RoleOutcome, RoleSpec};
 
     fn pos(journal: &Journal, prefix: &str) -> usize {
         position(journal, prefix)
@@ -693,6 +721,39 @@ mod tests {
             .unwrap();
         chelabase_neon::scram::verifier_with_salt(password, &salt, iterations.parse().unwrap())
             == verifier
+    }
+
+    // Step 6g (P4, P14): a merge's rehearsal is built like a branch, but its endpoint is never
+    // routed by the proxy (it carries the target's role verifiers), and it records no base.
+    #[tokio::test]
+    async fn rehearsal_branch_is_built_unroutable() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        let main = w.metadata.main(s.db).id;
+        let rehearsal = w
+            .metadata
+            .create_rehearsal_branch(s.db, main, "_rehearsal-0badc0de")
+            .await
+            .unwrap();
+
+        w.handle_branch_create(rehearsal.id, None).await.unwrap();
+
+        let b = w.metadata.branch(rehearsal.id);
+        assert_eq!(b.status, BranchStatus::Ready, "{:?}", b.error);
+        let ep = b.endpoint_id.expect("an endpoint");
+        assert!(!w.metadata.state().endpoints[&ep].endpoint.routable);
+        assert!(
+            !w.metadata
+                .state()
+                .schema_bases
+                .iter()
+                .any(|base| base.branch_id == rehearsal.id),
+            "a rehearsal keeps no base"
+        );
+        // A normal branch stays routable.
+        w.handle_branch_create(s.dev, None).await.unwrap();
+        let dev_ep = w.metadata.branch(s.dev).endpoint_id.unwrap();
+        assert!(w.metadata.state().endpoints[&dev_ep].endpoint.routable);
     }
 
     #[tokio::test]
@@ -786,7 +847,7 @@ mod tests {
             ),
             pos(&journal, &format!("compute.create {ep}")),
             pos(&journal, &format!("compute.sql {ep} app SELECT 1")),
-            pos(&journal, &format!("compute.sql {ep} app DO $$")),
+            pos(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; DO $$")),
             pos(&journal, "metadata.set_branch_ready"),
         ];
         assert!(order.is_sorted(), "{:?}", entries(&journal));
@@ -1414,6 +1475,9 @@ mod tests {
                 login: true,
                 level: RoleLevel::Plain,
                 api_owner_level: false,
+                attributes: chelabase_metadata::RoleAttributes::default(),
+                attributes_pending: false,
+                attributes_change_id: None,
             },
         );
         endpoint.set_verifier(name, verifier);
@@ -1423,7 +1487,7 @@ mod tests {
     fn r_line(name: &str, password: &str, owner_level: bool) -> String {
         let tf = if owner_level { "t" } else { "f" };
         format!(
-            "r|{}|t|{}|{tf}|t|{tf}\n",
+            "r|{}|t|{}|{tf}|t|{tf}|t|-1||f|\n",
             hex::encode(name),
             hex::encode(password),
         )
@@ -1439,8 +1503,8 @@ mod tests {
     async fn with_login_roles(w: &FakeWorker, journal: &Journal) -> Setup {
         let s = setup(w, journal).await;
         let main = BranchId::from(s.db);
-        assert_eq!(w.create_role(main, "app", false).await, RoleOutcome::Ok);
-        assert_eq!(w.create_role(main, "admin", true).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(main, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(main, &RoleSpec::login("admin", true)).await, RoleOutcome::Ok);
         let sql_verifier = chelabase_neon::scram::verifier("sql-password");
         sql_row(
             w,
@@ -1596,8 +1660,8 @@ mod tests {
             r_line("late", &late, false),
             r_line("md5role", MD5, false),
             r_line("sqlrole", &old("sqlrole"), false),
-            format!("r|{}|f|{}|f|t|f\n", hex::encode("grp"), hex::encode(&group)),
-            format!("r|{}|t||f|t|f\n", hex::encode("nopass")),
+            format!("r|{}|f|{}|f|t|f|t|-1||f|\n", hex::encode("grp"), hex::encode(&group)),
+            format!("r|{}|t||f|t|f|t|-1||f|\n", hex::encode("nopass")),
         ]
         .concat();
         w.computes.answer(CATALOG_READ, &catalog);

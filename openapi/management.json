@@ -766,7 +766,7 @@
             }
           },
           "409": {
-            "description": "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches; `branch_protected`: the branch is protected, unprotect it first",
+            "description": "`main_branch`: main can't be deleted; `already_deleting`: it is already being deleted; `branch_not_ready`: it is busy; `has_children`: it or one of its backups has child branches; `branch_protected`: the branch is protected, unprotect it first; `branch_merge_busy`: a merge holds the branch as its source or target, rehearsing, applying or failed half applied (`error.merge_id`: wait for it, or retry or abandon it), or a merge's rehearsal of the branch is still being removed (`error.rehearsal_branch_id`: try again in a few minutes)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1073,7 +1073,7 @@
           "data-api"
         ],
         "summary": "Run a data API request from the console",
-        "description": "Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and can't bypass row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.",
+        "description": "Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and isn't owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a member of `neon_superuser`); a role with BYPASSRLS passes, and the console then reads and writes past row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.",
         "operationId": "consoleQuery",
         "parameters": [
           {
@@ -1137,7 +1137,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `permission_denied` or `role_not_allowed`",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `permission_denied` or `role_not_allowed`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1240,7 +1240,7 @@
           "data-api"
         ],
         "summary": "The schema the console can show, as the owner or a role",
-        "description": "What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and can't bypass row-level security).",
+        "description": "What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and isn't owner-level; BYPASSRLS is allowed).",
         "operationId": "getConsoleSchema",
         "parameters": [
           {
@@ -1314,7 +1314,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it can bypass row-level security (the message says which); the data API's `role_not_allowed`",
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `role_not_allowed`",
             "content": {
               "application/json": {
                 "schema": {
@@ -2313,6 +2313,155 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/merges": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Start a schema merge between a branch and its parent",
+        "description": "`into_parent` merges the branch's schema changes into its parent; `from_parent` brings the parent's changes into the branch. Both branches must be ready and `normal`; main has no parent. The merge starts as `computing`: the worker reads both schemas and the branch point and fills in the analysis and the plan (poll `getMerge` until it is a `draft`). `database` is the Postgres database to merge (the branch's main one when omitted). One merge per pair and Postgres database can be open at a time.",
+        "operationId": "createMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "The branch that merges with its parent",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMergeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted; the merge is `computing`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup can't be merged; `branch_not_ready`: either branch isn't ready; `merge_open_exists`: the pair has an open merge for this database (`error.merge_id`); `merge_busy`: another merge is applying to the target, or failed half applied on it (`error.merge_id`; retry or abandon that one), or one finished a moment ago (retry)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body is the wrong shape, or the branch is main (no parent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the job queue can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}": {
       "patch": {
         "tags": [
@@ -2989,7 +3138,7 @@
             }
           },
           "409": {
-            "description": "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_protected`: the branch is protected, unprotect it first",
+            "description": "`main_branch`: main has no parent; `backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_protected`: the branch is protected, unprotect it first; `branch_merge_busy`: a merge holds the branch as its source or target, rehearsing, applying or failed half applied (`error.merge_id`: wait for it, or retry or abandon it), or a merge's rehearsal of the branch is still being removed (`error.rehearsal_branch_id`: try again in a few minutes)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3117,7 +3266,7 @@
             }
           },
           "409": {
-            "description": "`backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches",
+            "description": "`backup_branch`: a restore backup can't be rewritten; `branch_not_ready`: the branch isn't ready or is busy; `has_children`: it has child branches; `branch_merge_busy`: a merge holds the branch as its source or target, rehearsing, applying or failed half applied (`error.merge_id`: wait for it, or retry or abandon it), or a merge's rehearsal of the branch is still being removed (`error.rehearsal_branch_id`: try again in a few minutes)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3137,7 +3286,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the point in time is invalid",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, the point in time is invalid, or it's before the branch's history begins (its branch point, or its `history_start`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3289,8 +3438,8 @@
         "tags": [
           "roles"
         ],
-        "summary": "Create a login role",
-        "description": "Creates a login role with a generated password and answers with the role. `owner_level` gives it the owner's attributes (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION) and makes it a member of `neon_superuser`. The password isn't in the answer: read it with the connection details and `role`. A role the compute couldn't take yet is `pending` and applied later.",
+        "summary": "Create a role",
+        "description": "Creates a role and answers with it. A LOGIN role (the default) gets a generated password; `login: false` makes a NOLOGIN role (a group) with none. `owner_level` gives it the owner's attributes (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION) and makes it a member of `neon_superuser`. `inherit`, `connection_limit`, `valid_until`, `bypass_rls` and `member_of` set the other allowed attributes and memberships; nothing else can be set. The password isn't in the answer: read it with the connection details and `role`. A role the compute couldn't take yet is `pending` and applied later.",
         "operationId": "createRole",
         "parameters": [
           {
@@ -3386,7 +3535,7 @@
             }
           },
           "422": {
-            "description": "`invalid_role_name`: the name doesn't fit the rules; `reserved_role_name`: the name is reserved; `invalid_request`: an unknown field (`privileged` is gone, use `owner_level`) or a missing one",
+            "description": "`invalid_role_name`: the name doesn't fit the rules; `reserved_role_name`: the name is reserved; `role_membership_not_allowed`: a membership in a reserved role, the owner, the role itself, a role that doesn't exist or isn't the owner's to grant, or a role that is itself a member (at any depth) of a reserved role; `role_attribute_not_allowed`: a connection limit under -1; `invalid_request`: an unknown field (an attribute that can't be set, or `privileged`: use `owner_level`) or a missing one",
             "content": {
               "application/json": {
                 "schema": {
@@ -3572,6 +3721,162 @@
             "bearer": []
           }
         ]
+      },
+      "patch": {
+        "tags": [
+          "roles"
+        ],
+        "summary": "Change a role",
+        "description": "Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.",
+        "operationId": "updateRole",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "Role name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRoleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The change was made; the role as it is now (no body for a role made in SQL that has no password, which the list doesn't show)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchRole"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't valid JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the role doesn't exist, or the role was made in SQL by a role other than the owner (the owner doesn't administer it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`role_cap_reached`: turning LOGIN on would give the branch more login roles than its maximum; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`reserved_role_name`: the owner, a reserved role or any `chelabase_` role; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `role_membership_not_allowed`: a membership in a reserved role, the owner, the role itself, a role that doesn't exist or isn't the owner's to grant, or a role that is itself a member (at any depth) of a reserved role; `role_attribute_not_allowed`: a connection limit under -1; `invalid_request`: an unknown field (an attribute that can't be set)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: the worker failed to change the role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`not_applied`: the change is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker or database didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/v1/databases/{id}/branches/{branch_id}/roles/{role}/reset-password": {
@@ -3689,6 +3994,154 @@
           },
           "503": {
             "description": "`not_applied`: the new password is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker or database didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions": {
+      "get": {
+        "tags": [
+          "roles"
+        ],
+        "summary": "List a role's live sessions",
+        "description": "The sessions open as the role on the branch's compute right now: the count, and each client's address, `application_name` and start time, oldest first. A read only: when the compute isn't running, the answer is `compute_running: false` with no sessions, and the compute isn't started. Clients that aren't connected at this moment aren't listed. A name with no role has no sessions.",
+        "operationId": "listRoleSessions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "Role name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The role's live sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoleSessions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: the worker couldn't read the sessions; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the worker can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -4234,6 +4687,1400 @@
           },
           "500": {
             "description": "`credentials_unavailable`: the stored credentials can't be opened with the current secrets key; `internal`: unexpected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges": {
+      "get": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "List a database's merges",
+        "description": "History and open merges, newest first, without their analysis and plan (read one with `getMerge`).",
+        "operationId": "listMerges",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "description": "Only the merges where this branch is the source or the target",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The merges, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MergeSummary"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id or `branch` isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}": {
+      "get": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Read a merge",
+        "description": "The merge with its analysis (every changed object, the conflicts with base, target and source side by side), the plan, the last rehearsal, the result and the log. Poll it while the status is `computing`, `rehearsing`, `applying`, `online` or `finishing`, and while a requested after-merge choice is pending (`result.after.requested` or `started`).",
+        "operationId": "getMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The merge and its log",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Edit a draft merge",
+        "description": "Saves the resolutions, own steps, acknowledgements and options of a `draft` or `rehearsed` merge. A save of only `acknowledgements` and `options.after` keeps the merge as it is (a rehearsed merge stays rehearsed). Any other save (resolutions, steps, `options.lock_timeout_ms`) moves it to `computing` (a rehearsed one loses its rehearsal): the worker recomputes the analysis and the plan from what was saved, keeping a resolution whose conflict is unchanged, and returns it to `draft`. `version` must be the one you last read.",
+        "operationId": "updateMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMergeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The merge after the save (`computing`, or as it was for an acknowledgement or after-merge choice)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Merge"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`merge_version_conflict`: `version` is stale (the response carries the merge as `error.current`); `conflict`: the merge isn't a draft or rehearsed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown or missing field, an empty or oversized text, or an option out of range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the job queue can't be reached (the merge is `failed`; recompute it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/abandon": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Give up a merge that failed half applied",
+        "description": "For a merge `failed` in the `online` phase: its transaction is on the target, its online steps didn't all run, and it holds both branches until it is retried to the end or abandoned. Abandoning makes it `cancelled` and frees the branches. Nothing on the target is undone: `result.leftovers` lists what the merge left there that the online phase didn't finish, each `{kind, schema, table, name}`: `not_valid_constraint` (a constraint added `NOT VALID`, never validated; it still checks new rows); `not_null_check` (a temporary `chelabase_merge_nn_*` check that wasn't dropped); `invalid_index` (the index the online phase was building, or dropping concurrently, when it stopped: Postgres may have left it INVALID, unused by queries but still updated by writes; it may also not be there); `unattached_index` (a valid index the merge built that its next step didn't put into place: a temporary `chelabase_merge_ix_*` index not renamed over the one it replaces, or a unique constraint's index not attached to its constraint; nothing uses it, and it costs on every write). Validate, attach or drop them by hand (`DROP INDEX CONCURRENTLY IF EXISTS` for an index).",
+        "operationId": "abandonMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The merge, `cancelled`, with `result.leftovers`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Merge"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the merge didn't fail in the online phase, or changed since it was read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/apply": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Apply a rehearsed merge to its target",
+        "description": "Refuses, in this order: a merge that isn't `rehearsed` (`merge_not_rehearsed`, or `merge_stale` for a stale one); a `version` that isn't the merge's (`merge_version_conflict`: a save of acknowledgements or the after-merge choice keeps a merge rehearsed, so send the version you last saw to apply what you saw); conflicts without a resolution (`merge_conflicts_open`); data-loss, security (BYPASSRLS, owner-level) or breaking (a role rename) steps without an acknowledgement (`merge_drops_unacknowledged`); a protected target without `confirm: true` (`merge_confirm_required`); another merge applying to the target, or failed half applied on it (`merge_busy`). The worker then runs the plan (`applying`, then `online` for the concurrent index and validation steps, then `finishing`). The request doesn't read the target: before the plan's transaction the worker compares the target with the schema the plan was computed from, and if it changed, ends the merge `stale` without applying the transaction.",
+        "operationId": "applyMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Optional; an empty body is `{}`",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted; the merge is `applying`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`merge_not_rehearsed`, `merge_stale`, `merge_version_conflict` (`error.current`), `merge_conflicts_open`, `merge_drops_unacknowledged`, `merge_confirm_required`, `merge_busy` (`error.merge_id`): see the description; `branch_not_ready`: either branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown field, `confirm` isn't a boolean, or `version` isn't an integer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the job queue can't be reached (the merge stays `rehearsed`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/cancel": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Cancel a merge",
+        "description": "Stops a merge that isn't changing the target: `computing`, `draft`, `rehearsing` (the worker deletes the rehearsal branch; until it is gone the target's reset, restore and delete answer `branch_merge_busy` with `error.rehearsal_branch_id`) or `rehearsed`. An applying merge can't be cancelled, and a merge failed in `online` is abandoned instead.",
+        "operationId": "cancelMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted; the merge is `cancelled`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the merge is applying or already finished",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/finish": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Run the after-merge choice of a merge applied with drift",
+        "description": "A merge whose target doesn't read back as merged ends `applied_with_drift` without running its after-merge choice (`result.after.skipped`). Once you've looked at the drift, this runs it: `keep` (the merge becomes the branch's base, if the source is still the schema that was merged; otherwise `result.after.base` is `not_advanced`), `reset` or `delete` of the source branch, with their usual refusals recorded in `result.after`. Only once per merge; an update from the parent only keeps. The merge stays `applied_with_drift`; `result.after` holds `requested: true` until the worker records the outcome.",
+        "operationId": "finishMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The after-merge choice",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinishRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted; the merge stays `applied_with_drift`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the merge isn't `applied_with_drift`, its choice was already run or requested, or it's an update from the parent and the choice isn't `keep`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown field, or `after` is missing or isn't `keep`, `reset` or `delete`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the job queue can't be reached (nothing is recorded)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/plan.sql": {
+      "get": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Export a merge's plan as SQL",
+        "description": "The final plan as a `.sql` file: phase headers as comments, the plan's transaction in `BEGIN`/`COMMIT` starting with `SET LOCAL lock_timeout` and `statement_timeout` from the merge's options (its stale guard and recovery marker are left out), the online phase marked \"run outside a transaction\", roles as comments (never passwords). Never cached.",
+        "operationId": "exportMergePlan",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The plan as SQL, as an attachment named `merge-<id>.sql`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the merge has no plan yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs, or the stored plan can't be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/recompute": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Recompute a merge from the schemas as they are now",
+        "description": "From `draft`, `stale` or `failed` (not a failure in the online phase: retry that one). The worker reads both schemas again and returns a new draft that keeps the resolutions whose conflicts are unchanged. `rebaseline: true` uses the target's current schema as the base when the real one is gone (`merge_base_unavailable` in `error`): every difference then counts as a source change, so the target's own recent changes show as things to undo.",
+        "operationId": "recomputeMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Optional; an empty body is `{}`",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecomputeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted; the merge is `computing`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the merge is in a state that can't be recomputed; `merge_open_exists`: a newer open merge exists for the pair (`error.merge_id`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown field, or `rebaseline` isn't a boolean",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the job queue can't be reached (the merge is `failed`; try again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/rehearse": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Rehearse a draft merge",
+        "description": "Runs the plan on a throwaway branch of the target (real data, so a failing constraint shows) and compares the result with the merged schema. Needs a `draft` with a plan and no open conflicts. Success makes the merge `rehearsed`; a failure returns it to `draft` with the failing step and the Postgres error in `rehearsal`. Send the `version` you last saw: the rehearsal then runs that draft.",
+        "operationId": "rehearseMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Optional; an empty body is `{}`",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RehearseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted; the merge is `rehearsing`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`merge_version_conflict`: `version` isn't the merge's (the response carries the merge as `error.current`); `merge_conflicts_open`: a conflict has no resolution; `branch_not_ready`: either branch isn't ready; `conflict`: the merge isn't a draft, has no plan yet, or changed since it was read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown field, or `version` isn't an integer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the job queue can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/merges/{merge_id}/retry": {
+      "post": {
+        "tags": [
+          "merges"
+        ],
+        "summary": "Retry a merge that failed while applying",
+        "description": "For a `failed` merge whose `failed_phase` is `roles`, `enum_add`, `tx` or `online`. Failed in `online`: the plan's transaction is committed and the target changed; only the online steps (concurrent indexes, constraint validation) are left, and the worker continues where it stopped (a valid index is skipped, an invalid one is dropped and rebuilt); the merge is `online` again. If the plan's transaction is no longer on the target, or the target is gone, the merge fails for good. Failed before (`roles`, `enum_add`, `tx`): the worker first checks whether the plan's transaction committed after all (its answer may have been lost); if it did, it goes on to the online steps; if not, the apply runs again from the start, with its checks (a target that changed since the merge was computed makes it `stale`; roles and enum values the first attempt made stay); the merge is `applying` again.",
+        "operationId": "retryMerge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "merge_id",
+            "in": "path",
+            "description": "Merge id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted; the merge is `online` (after an online failure) or `applying` again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the merge doesn't exist, or belongs to another tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the merge didn't fail while applying; `merge_busy`: another merge is applying to the target, or failed half applied on it (`error.merge_id`); `branch_not_ready`: either branch isn't ready (a retry before the online phase)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the job queue can't be reached (the merge stays `failed`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6978,6 +8825,15 @@
   },
   "components": {
     "schemas": {
+      "AfterMerge": {
+        "type": "string",
+        "description": "What the merge does when it is done with the branch.",
+        "enum": [
+          "keep",
+          "reset",
+          "delete"
+        ]
+      },
       "AppUser": {
         "type": "object",
         "description": "One of a project's users.",
@@ -7144,6 +9000,27 @@
             "type": "string"
           }
         }
+      },
+      "ApplyRequest": {
+        "type": "object",
+        "properties": {
+          "confirm": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Required to merge into a protected branch."
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The `version` you last saw (send it: a save since, such as a new after-merge choice,\nkeeps the merge rehearsed); another one is a 409 `merge_version_conflict`."
+          }
+        },
+        "additionalProperties": false
       },
       "ArgDesc": {
         "type": "object",
@@ -7318,7 +9195,8 @@
         "type": "string",
         "enum": [
           "normal",
-          "backup"
+          "backup",
+          "rehearsal"
         ]
       },
       "BranchRole": {
@@ -7332,7 +9210,11 @@
           "password",
           "blocked_keys",
           "created_at",
-          "pending"
+          "pending",
+          "inherit",
+          "connection_limit",
+          "bypass_rls",
+          "member_of"
         ],
         "properties": {
           "blocked_keys": {
@@ -7342,17 +9224,37 @@
             },
             "description": "Live data API secret keys that name this role while it is owner-level: the keys the\ndata API refuses (empty for a plain role)."
           },
+          "bypass_rls": {
+            "type": "boolean",
+            "description": "BYPASSRLS on its own (an owner-level role has it too, through the owner's attributes)."
+          },
+          "connection_limit": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The most connections the role may hold at once; `-1` is no limit."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
           },
+          "inherit": {
+            "type": "boolean",
+            "description": "INHERIT: the role uses its groups' privileges without `SET ROLE`."
+          },
           "level": {
             "$ref": "#/components/schemas/RoleLevel",
-            "description": "`owner_level`: superuser, CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, or a member of\n`neon_superuser` at any depth. Such a role can't back a data API secret key."
+            "description": "`owner_level`: superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of\n`neon_superuser` at any depth. Such a role can't back a data API secret key. BYPASSRLS\nalone isn't owner-level (see `bypass_rls`)."
           },
           "login": {
             "type": "boolean",
             "description": "Whether the role has the LOGIN attribute."
+          },
+          "member_of": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The roles it's a direct member of, by name (`neon_superuser` isn't listed)."
           },
           "name": {
             "type": "string"
@@ -7368,6 +9270,14 @@
           "pending": {
             "type": "boolean",
             "description": "Written but not yet applied to the compute; applied when the compute next runs."
+          },
+          "valid_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the role's password stops working; `null` is never."
           }
         }
       },
@@ -7382,6 +9292,45 @@
           "deleting",
           "deleted"
         ]
+      },
+      "ChoiceBody": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The item stays out of the plan.",
+            "enum": [
+              "keep_target"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "The plan moves the target's version to the source's (data loss is flagged).",
+            "enum": [
+              "take_source"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "Only for column order conflicts: the target's columns first, then the source's.",
+            "enum": [
+              "target_columns_first"
+            ]
+          },
+          {
+            "type": "object",
+            "description": "Replaces the item in the plan.",
+            "required": [
+              "own_sql"
+            ],
+            "properties": {
+              "own_sql": {
+                "type": "string",
+                "description": "Replaces the item in the plan."
+              }
+            }
+          }
+        ],
+        "description": "How the user settles one conflict."
       },
       "ColumnDesc": {
         "type": "object",
@@ -7625,6 +9574,25 @@
         },
         "additionalProperties": false
       },
+      "CreateMergeRequest": {
+        "type": "object",
+        "required": [
+          "direction"
+        ],
+        "properties": {
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Postgres database to merge; the branch's main one when omitted."
+          },
+          "direction": {
+            "$ref": "#/components/schemas/Direction"
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateProjectRequest": {
         "type": "object",
         "required": [
@@ -7639,10 +9607,35 @@
       },
       "CreateRoleRequest": {
         "type": "object",
+        "description": "A role to create. Only the attributes listed here can be set; any other field is refused.",
         "required": [
           "name"
         ],
         "properties": {
+          "bypass_rls": {
+            "type": "boolean",
+            "description": "BYPASSRLS: the role ignores row-level security. Default `false`."
+          },
+          "connection_limit": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`-1` (the default) is no limit."
+          },
+          "inherit": {
+            "type": "boolean",
+            "description": "INHERIT. Default `true`."
+          },
+          "login": {
+            "type": "boolean",
+            "description": "LOGIN, with a generated password. `false` makes a NOLOGIN role (a group) with no\npassword. Default `true`."
+          },
+          "member_of": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Roles to make it a member of. Each must exist and be the owner's to grant; never one of\nChelabase's own (`authenticator`, `anon`, `authenticated`, `neon_superuser`,\n`chelabase_…`), the owner, a `pg_…` role, or the role itself."
+          },
           "name": {
             "type": "string",
             "description": "`^[a-z_][a-z0-9_]{0,62}$`, and not a reserved name (`postgres`, `anon`, `pg_…`, …)."
@@ -7650,6 +9643,14 @@
           "owner_level": {
             "type": "boolean",
             "description": "Makes the role owner-level, like the branch owner: CREATEROLE, CREATEDB, BYPASSRLS\nand REPLICATION, and a member of `neon_superuser`. Default `false`."
+          },
+          "valid_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the password stops working. Default: never."
           }
         },
         "additionalProperties": false
@@ -7789,9 +9790,14 @@
           "created_at",
           "last_used_at",
           "role_blocked",
+          "bypasses_rls",
           "databases"
         ],
         "properties": {
+          "bypasses_rls": {
+            "type": "boolean",
+            "description": "A secret key whose role has BYPASSRLS: it reads and writes past row-level security\n(allowed; Studio marks the key). As the role was when the key was made or rotated, kept\nup to date by the worker's resync. Always false for the public key."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -7837,7 +9843,7 @@
           },
           "role_blocked": {
             "type": "boolean",
-            "description": "A secret key whose role is owner-level: the data API refuses it. Always false for the\npublic key."
+            "description": "A secret key whose role is owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a\n`neon_superuser` member): the data API refuses it. Always false for the public key."
           }
         }
       },
@@ -7855,6 +9861,7 @@
           "project_id",
           "tenant_id",
           "name",
+          "postgres_database",
           "status",
           "host",
           "port",
@@ -7915,6 +9922,13 @@
             ],
             "format": "int32",
             "minimum": 0
+          },
+          "postgres_database": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The main Postgres database's name: the display name with every character outside\n`[A-Za-z0-9_]` turned into `_` (\"web-1 prod\" is `web_1_prod`). Merges\n(`MergeSummary.database`) and SQL name this one. `null` only for a name Postgres can't use."
           },
           "project_id": {
             "$ref": "#/components/schemas/ProjectId"
@@ -7997,6 +10011,7 @@
         "required": [
           "database_id",
           "name",
+          "postgres_database",
           "status",
           "host",
           "port",
@@ -8028,6 +10043,13 @@
             "format": "int32",
             "minimum": 0
           },
+          "postgres_database": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The main Postgres database's name: the display name with every character outside\n`[A-Za-z0-9_]` turned into `_` (\"web-1 prod\" is `web_1_prod`). Merges\n(`MergeSummary.database`) and SQL name this one. `null` only for a name Postgres can't use."
+          },
           "status": {
             "$ref": "#/components/schemas/DatabaseStatus"
           }
@@ -8044,6 +10066,14 @@
             "description": "The project's slug, typed to confirm."
           }
         }
+      },
+      "Direction": {
+        "type": "string",
+        "description": "Which way a merge goes.",
+        "enum": [
+          "into_parent",
+          "from_parent"
+        ]
       },
       "ErrorBody": {
         "type": "object",
@@ -8127,7 +10157,19 @@
           "schema_too_large",
           "saved_query_name_taken",
           "saved_query_conflict",
-          "saved_query_cap"
+          "saved_query_cap",
+          "merge_conflicts_open",
+          "merge_drops_unacknowledged",
+          "merge_not_rehearsed",
+          "merge_stale",
+          "merge_busy",
+          "merge_open_exists",
+          "merge_base_unavailable",
+          "merge_version_conflict",
+          "merge_confirm_required",
+          "branch_merge_busy",
+          "role_attribute_not_allowed",
+          "role_membership_not_allowed"
         ]
       },
       "ErrorEnvelope": {
@@ -8141,6 +10183,19 @@
             "$ref": "#/components/schemas/ErrorBody"
           }
         }
+      },
+      "FinishRequest": {
+        "type": "object",
+        "description": "The after-merge choice run by hand on a merge applied with drift (E21).",
+        "required": [
+          "after"
+        ],
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/AfterMerge"
+          }
+        },
+        "additionalProperties": false
       },
       "FunctionDesc": {
         "type": "object",
@@ -8198,6 +10253,349 @@
           }
         }
       },
+      "Merge": {
+        "type": "object",
+        "description": "A merge with everything the worker computed and the user chose. `analysis`, `plan`,\n`rehearsal` and `result` are the schema engine's documents, served as stored.",
+        "required": [
+          "id",
+          "source_branch_id",
+          "target_branch_id",
+          "direction",
+          "database",
+          "status",
+          "failed_phase",
+          "version",
+          "rebaselined",
+          "error",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "base_fingerprint",
+          "source_fingerprint",
+          "target_fingerprint",
+          "analysis",
+          "resolutions",
+          "steps",
+          "acknowledgements",
+          "options",
+          "plan",
+          "rehearsal",
+          "result"
+        ],
+        "properties": {
+          "acknowledgements": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ids of the items (or, for a step that has none, of the step) whose data loss or\nsecurity change the user accepts."
+          },
+          "analysis": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Every changed object with its outcome, the conflicts (base, target and source side by\nside) and the reported objects; null while the first compute runs."
+          },
+          "base_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 of each normalized schema the analysis is based on; null until computed."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "direction": {
+            "$ref": "#/components/schemas/Direction"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed_phase": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "options": {
+            "type": "object"
+          },
+          "plan": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The ordered steps by phase (`{steps}`); null until computed, and while conflicts are open."
+          },
+          "rebaselined": {
+            "type": "boolean"
+          },
+          "rehearsal": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Timings, drift and own-SQL outcomes of the last rehearsal; null when there is none."
+          },
+          "resolutions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolutionBody"
+            }
+          },
+          "result": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Created roles, drift and the after-merge outcome; null until the merge finishes. An\nabandoned merge (E27) has `leftovers`: what phase 1 left on the target that phase 2\ndidn't finish (`{kind: not_valid_constraint | not_null_check, schema, table, name}`)."
+          },
+          "source_branch_id": {
+            "$ref": "#/components/schemas/BranchId"
+          },
+          "source_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/MergeState"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserStepBody"
+            }
+          },
+          "target_branch_id": {
+            "$ref": "#/components/schemas/BranchId"
+          },
+          "target_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "MergeDetail": {
+        "type": "object",
+        "description": "A merge and its log, oldest line first.",
+        "required": [
+          "merge",
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MergeLogEntry"
+            }
+          },
+          "merge": {
+            "$ref": "#/components/schemas/Merge"
+          }
+        }
+      },
+      "MergeLogEntry": {
+        "type": "object",
+        "description": "One line of a merge's log.",
+        "required": [
+          "at",
+          "kind",
+          "step_id",
+          "phase",
+          "outcome",
+          "duration_ms",
+          "detail"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "detail": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`status`, `step` or `note`."
+          },
+          "outcome": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ok`, `failed` or `skipped` for a step."
+          },
+          "phase": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "step_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "MergeOptionsBody": {
+        "type": "object",
+        "description": "Both optional; a missing one stays as it is.",
+        "properties": {
+          "after": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AfterMerge",
+                "description": "What happens to the source branch once the merge is done: kept (default), reset to its\nparent or deleted."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lock_timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`SET LOCAL lock_timeout` of the plan's transaction, 100 to 600000 ms.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "MergeState": {
+        "type": "string",
+        "description": "Where a merge is: `computing` (the worker reads the schemas), `draft` (editable),\n`rehearsing`, `rehearsed`, `applying` / `online` / `finishing` (changing the target), and\nthe end states.",
+        "enum": [
+          "computing",
+          "draft",
+          "rehearsing",
+          "rehearsed",
+          "applying",
+          "online",
+          "finishing",
+          "done",
+          "applied_with_drift",
+          "failed",
+          "stale",
+          "cancelled"
+        ]
+      },
+      "MergeSummary": {
+        "type": "object",
+        "description": "A merge without its analysis and plan: what lists and the answers to actions carry.",
+        "required": [
+          "id",
+          "source_branch_id",
+          "target_branch_id",
+          "direction",
+          "database",
+          "status",
+          "failed_phase",
+          "version",
+          "rebaselined",
+          "error",
+          "created_by",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string",
+            "description": "The Postgres database being merged."
+          },
+          "direction": {
+            "$ref": "#/components/schemas/Direction"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed_phase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The phase the merge failed in (`online` can be retried); null otherwise."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "rebaselined": {
+            "type": "boolean",
+            "description": "The base was missing and the target's schema was used instead."
+          },
+          "source_branch_id": {
+            "$ref": "#/components/schemas/BranchId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MergeState"
+          },
+          "target_branch_id": {
+            "$ref": "#/components/schemas/BranchId"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Changes with every draft save and every recompute: send it back with an edit."
+          }
+        }
+      },
       "OnDelete": {
         "type": "string",
         "description": "What deleting an app user does to their row in the users table.",
@@ -8225,7 +10623,8 @@
           "generated",
           "set_in_sql",
           "md5_unusable",
-          "unreadable"
+          "unreadable",
+          "none"
         ]
       },
       "PointInTime": {
@@ -8411,6 +10810,50 @@
         },
         "additionalProperties": false
       },
+      "RecomputeRequest": {
+        "type": "object",
+        "properties": {
+          "rebaseline": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Use the target's current schema as the base (a two-way diff), when the base is gone."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RehearseRequest": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The `version` you last saw; another one is a 409 `merge_version_conflict`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResolutionBody": {
+        "type": "object",
+        "required": [
+          "conflict",
+          "choice"
+        ],
+        "properties": {
+          "choice": {
+            "$ref": "#/components/schemas/ChoiceBody"
+          },
+          "conflict": {
+            "type": "string",
+            "description": "The conflict's id, from the analysis."
+          }
+        },
+        "additionalProperties": false
+      },
       "RestoreAccepted": {
         "type": "object",
         "description": "The 202 body of a restore: the branch is `resetting`, and its previous state is kept as a\nbackup branch.",
@@ -8483,7 +10926,7 @@
       },
       "RoleLevel": {
         "type": "string",
-        "description": "What a role may do: `OwnerLevel` is the wide definition (superuser, CREATEROLE, CREATEDB,\nBYPASSRLS, REPLICATION, or `neon_superuser` at any depth).",
+        "description": "What a role may do: `OwnerLevel` is superuser, CREATEROLE, CREATEDB, REPLICATION, or\n`neon_superuser` at any depth (E33; BYPASSRLS alone is an attribute, not owner level: a\nsecret key may use such a role).",
         "enum": [
           "plain",
           "owner_level"
@@ -8497,6 +10940,60 @@
           "sql",
           "api"
         ]
+      },
+      "RoleSessionView": {
+        "type": "object",
+        "description": "One session open as the role (a `pg_stat_activity` row).",
+        "required": [
+          "client_addr",
+          "application_name",
+          "backend_start"
+        ],
+        "properties": {
+          "application_name": {
+            "type": "string",
+            "description": "The client's `application_name` (empty when it set none)."
+          },
+          "backend_start": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the session started."
+          },
+          "client_addr": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's address; `null` for a connection from inside the compute."
+          }
+        }
+      },
+      "RoleSessions": {
+        "type": "object",
+        "description": "The live sessions of a role on the branch's compute (E29a).",
+        "required": [
+          "compute_running",
+          "count",
+          "sessions"
+        ],
+        "properties": {
+          "compute_running": {
+            "type": "boolean",
+            "description": "Whether the branch's compute is running. When it isn't, nothing was read (the read\nnever starts it): `count` is 0 and `sessions` is empty."
+          },
+          "count": {
+            "type": "integer",
+            "description": "How many sessions are open as the role right now.",
+            "minimum": 0
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RoleSessionView"
+            },
+            "description": "The sessions, oldest first."
+          }
+        }
       },
       "RunSqlRequest": {
         "type": "object",
@@ -8867,6 +11364,58 @@
         },
         "additionalProperties": false
       },
+      "UpdateMergeRequest": {
+        "type": "object",
+        "description": "Every field but `version` is optional; a missing one stays as it is.",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "acknowledgements": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "options": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MergeOptionsBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolutions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ResolutionBody"
+            }
+          },
+          "steps": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/UserStepBody"
+            }
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `version` you last saw; another one is a 409 `merge_version_conflict`."
+          }
+        },
+        "additionalProperties": false
+      },
       "UpdatePgDatabaseRequest": {
         "type": "object",
         "description": "A database's data API settings.",
@@ -8896,6 +11445,65 @@
             "description": "1 to 64 characters. The slug stays."
           }
         }
+      },
+      "UpdateRoleRequest": {
+        "type": "object",
+        "description": "A change to a role: only the fields given change.",
+        "properties": {
+          "bypass_rls": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "connection_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`-1` is no limit."
+          },
+          "inherit": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "login": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Turning LOGIN on generates a password (read it with the connection details and\n`role`); turning it off drops the password."
+          },
+          "member_of": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The new list of the role's other memberships, with the create's rules\n(`pg_*` and Chelabase's own groups stay)."
+          },
+          "owner_level": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Owner-level on (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, `neon_superuser`) or off."
+          },
+          "valid_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "`null` clears the expiry."
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateSavedQueryRequest": {
         "type": "object",
@@ -8933,6 +11541,31 @@
             "type": "integer",
             "format": "int32",
             "description": "The version the client last saw; a mismatch answers 409 `saved_query_conflict`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UserStepBody": {
+        "type": "object",
+        "description": "SQL the user inserts into the plan.",
+        "required": [
+          "id",
+          "sql"
+        ],
+        "properties": {
+          "after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The step it follows (generated or user); null puts it at the start of its phase."
+          },
+          "id": {
+            "type": "string",
+            "description": "The user's own id for the step: without `:`, `.` or control characters, and not\n`phase1` (the plan's own ids and the merge's log use them)."
+          },
+          "sql": {
+            "type": "string"
           }
         },
         "additionalProperties": false

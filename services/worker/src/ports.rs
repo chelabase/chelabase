@@ -5,13 +5,15 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use chelabase_metadata::{
-    AppSession, BranchAuthSync, ProjectAuth, ProjectRecord,
+    AppSession, BranchAuthSync, ClaimOutcome, ProjectAuth, ProjectRecord,
     BranchConnectionRow, BranchDatabase, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
     DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState,
     InsertRoleOutcome, LiveBranch, LiveDatabase, MetadataClient, MetadataError, NeonDatabase,
-    NeonEndpoint, NeonRole, NewDataKey, NewEndpoint, ResyncApplied, ResyncWrite, RoleCopy,
-    ServedDatabase,
+    NeonEndpoint, NeonRole, NewDataKey, NewEndpoint, NewStaticEndpoint, ResyncApplied,
+    ResyncWrite, RoleCopy, SchemaBase, ServedDatabase,
 };
+use chelabase_metadata::{ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleWriteOutcome};
+use chelabase_metadata::{MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch};
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::spec::Placement;
@@ -99,6 +101,36 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// A static compute's endpoint row: unroutable, pinned, linked to no branch (step 6g).
+    fn create_static_endpoint(
+        &self,
+        ep: &NewStaticEndpoint<'_>,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
+    // Schema merge bases (see `chelabase_metadata::schema_bases`).
+
+    fn schema_base(
+        &self,
+        branch: BranchId,
+        database_name: &str,
+    ) -> impl Future<Output = Result<Option<SchemaBase>, MetadataError>> + Send;
+    /// Appends an entry to the branch's base history for one database (it becomes the
+    /// current base); returns its id (E18).
+    fn append_schema_base(
+        &self,
+        base: &SchemaBase,
+    ) -> impl Future<Output = Result<i64, MetadataError>> + Send;
+    /// Fills entry `base.id` in place with its model and identity map; false when it's gone.
+    fn update_schema_base(
+        &self,
+        base: &SchemaBase,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Deletes the branch's base entries of every database not in `keep`.
+    fn prune_schema_bases(
+        &self,
+        branch: BranchId,
+        keep: &[String],
+    ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
     fn replace_owner_secret(
         &self,
         id: BranchId,
@@ -120,12 +152,41 @@ pub trait WorkerMetadata: Send + Sync + 'static {
     fn insert_api_role(
         &self,
         endpoint_id: &str,
+        role: &NewApiRole<'_>,
+        cap: u32,
+    ) -> impl Future<Output = Result<InsertRoleOutcome, MetadataError>> + Send;
+    /// An `api` row's new wanted state, `pending` and `attributes_pending`; `NotFound` when
+    /// there's no such `api` row; `CapReached` when it would give a row without a verifier one
+    /// at `cap` copies. Bumps the version.
+    fn update_api_role(
+        &self,
+        endpoint_id: &str,
         name: &str,
-        owner_level: bool,
+        change: &ApiRoleChange,
+        cap: u32,
+    ) -> impl Future<Output = Result<RoleWriteOutcome, MetadataError>> + Send;
+    /// A role made in SQL given a password through the API: its row (made as `sql` when it
+    /// has none) gets the verifier and sealed password, `pending`; `CapReached` for a role
+    /// without a verifier yet at `cap` copies. Bumps the version.
+    fn store_role_secret(
+        &self,
+        endpoint_id: &str,
+        name: &str,
         verifier: &str,
         password_enc: &str,
         cap: u32,
-    ) -> impl Future<Output = Result<InsertRoleOutcome, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<RoleWriteOutcome, MetadataError>> + Send;
+    /// E29: moves the row of `old` (if any) to `new` with `resealed`, and `branch`'s keys of
+    /// `old` with it; `Taken` when `new` has a row or live secret keys. Bumps the version.
+    fn rename_role_copy(
+        &self,
+        endpoint_id: &str,
+        branch: BranchId,
+        old: &str,
+        new: &str,
+        resealed: Option<&str>,
+        unreadable: Option<bool>,
+    ) -> impl Future<Output = Result<RenameCopyOutcome, MetadataError>> + Send;
     /// Any non-owner row's verifier and sealed password, `pending`; false when there's no
     /// such row. Bumps the version.
     fn replace_role_secret(
@@ -136,11 +197,14 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         password_enc: &str,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     /// Clears one row's `pending` while `roles_version` is still `version`.
+    /// `attributes_change`: the API write's change id, whose `attributes_pending` is cleared
+    /// whatever the version; `pending` only while the version holds (true when cleared).
     fn confirm_role(
         &self,
         endpoint_id: &str,
         name: &str,
         version: i64,
+        attributes_change: Option<Uuid>,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     /// Deletes a non-owner row; false when there was none. Bumps the version.
     fn delete_role_copy(
@@ -218,11 +282,21 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         error: Option<&str>,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     /// → deleting (and the branch's backups); refused while the branch or one of its backups
-    /// has live `normal` children.
+    /// has live `normal` children, or while a merge other than `except` holds the live branch
+    /// (T14 F3, under its row lock).
     fn begin_branch_delete(
         &self,
         id: BranchId,
+        except: Option<Uuid>,
     ) -> impl Future<Output = Result<BranchDeleteOutcome, MetadataError>> + Send;
+    /// ready → resetting, clearing the last error, unless protected (and not `allow_protected`)
+    /// or a merge other than `except` holds the branch (T14 F3, under its row lock).
+    fn claim_branch_for_switch(
+        &self,
+        id: BranchId,
+        allow_protected: bool,
+        except: Option<Uuid>,
+    ) -> impl Future<Output = Result<ClaimOutcome, MetadataError>> + Send;
     fn live_children(
         &self,
         id: BranchId,
@@ -241,13 +315,17 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         id: BranchId,
         expected_pending: &str,
         history_start: Option<DateTime<Utc>>,
+        branched_at_lsn: &str,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// `restore_lsn`: the point on the old timeline the restored one was branched at (its
+    /// schema bases there are appended again, E18).
     fn switch_to_restored_timeline(
         &self,
         id: BranchId,
         expected_pending: &str,
         backup: BranchId,
         backup_name: &str,
+        restore_lsn: &str,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn clear_superseded_timeline(
         &self,
@@ -465,6 +543,79 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         older_than: Duration,
     ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
+
+    // Schema merges (see `chelabase_metadata::merges`; step 6g T8a).
+
+    fn merge(
+        &self,
+        id: Uuid,
+    ) -> impl Future<Output = Result<Option<MergeRecord>, MetadataError>> + Send;
+    /// Guarded on `from`; claims a working status, clears the claim otherwise. A second merge
+    /// of one target entering `applying` is an `Err` (`merges_one_applying`).
+    fn set_merge_status(
+        &self,
+        id: Uuid,
+        from: &[MergeStatus],
+        to: MergeStatus,
+        patch: MergeStatusPatch,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Refreshes the claim of a merge still in `status`; `false` when it moved on.
+    fn touch_merge_claim(
+        &self,
+        id: Uuid,
+        status: MergeStatus,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    fn append_merge_event(
+        &self,
+        event: &MergeEvent,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// The merge's log, oldest first.
+    fn merge_events(
+        &self,
+        id: Uuid,
+    ) -> impl Future<Output = Result<Vec<MergeEvent>, MetadataError>> + Send;
+    /// A rehearsal branch (kind `rehearsal`, `pending`) under `parent`, which must be a ready
+    /// branch of the database (else `Conflict`); a live branch of that name is
+    /// `BranchNameTaken` (step 6g T8b).
+    fn create_rehearsal_branch(
+        &self,
+        database_id: DatabaseId,
+        parent: BranchId,
+        name: &str,
+    ) -> impl Future<Output = Result<BranchRecord, MetadataError>> + Send;
+    /// Merges in a working status whose claim is older than `older_than` (R3), but not one
+    /// handed back since its last claim less than `rehand_after` ago (T14 M10).
+    fn stale_merge_claims(
+        &self,
+        older_than: Duration,
+        rehand_after: Duration,
+    ) -> impl Future<Output = Result<Vec<MergeRecord>, MetadataError>> + Send;
+    /// Merges applied with drift whose after-merge choice waits (requested, or started by a run
+    /// that went away) with no write for more than `older_than`: their `Finish` job was lost
+    /// (T14 M8, F3 M1); not one handed back since its last write less than `rehand_after` ago
+    /// (F3 M2).
+    fn stale_finish_requests(
+        &self,
+        older_than: Duration,
+        rehand_after: Duration,
+    ) -> impl Future<Output = Result<Vec<MergeRecord>, MetadataError>> + Send;
+    /// Records a hand-back (a job re-published) of a merge still in `status`.
+    fn mark_merge_handed_back(
+        &self,
+        id: Uuid,
+        status: MergeStatus,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Cancels the branch's merges nothing runs (`computing`, `draft`, `rehearsed`).
+    fn cancel_drafts_for_branch(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
+    /// The database's merges, newest first; with `branch`, those where it's source or target.
+    fn list_merges(
+        &self,
+        database_id: DatabaseId,
+        branch: Option<BranchId>,
+    ) -> impl Future<Output = Result<Vec<MergeRecord>, MetadataError>> + Send;
 }
 
 // Each method calls the inherent one by its full path: a bare `self.method()` would recurse
@@ -555,6 +706,34 @@ impl WorkerMetadata for MetadataClient {
         MetadataClient::delete_endpoint(self, endpoint_id).await
     }
 
+    async fn create_static_endpoint(&self, ep: &NewStaticEndpoint<'_>) -> Result<(), MetadataError> {
+        MetadataClient::create_static_endpoint(self, ep).await
+    }
+
+    async fn schema_base(
+        &self,
+        branch: BranchId,
+        database_name: &str,
+    ) -> Result<Option<SchemaBase>, MetadataError> {
+        MetadataClient::schema_base(self, branch, database_name).await
+    }
+
+    async fn append_schema_base(&self, base: &SchemaBase) -> Result<i64, MetadataError> {
+        MetadataClient::append_schema_base(self, base).await
+    }
+
+    async fn update_schema_base(&self, base: &SchemaBase) -> Result<bool, MetadataError> {
+        MetadataClient::update_schema_base(self, base).await
+    }
+
+    async fn prune_schema_bases(
+        &self,
+        branch: BranchId,
+        keep: &[String],
+    ) -> Result<u64, MetadataError> {
+        MetadataClient::prune_schema_bases(self, branch, keep).await
+    }
+
     async fn replace_owner_secret(
         &self,
         id: BranchId,
@@ -577,22 +756,45 @@ impl WorkerMetadata for MetadataClient {
     async fn insert_api_role(
         &self,
         endpoint_id: &str,
+        role: &NewApiRole<'_>,
+        cap: u32,
+    ) -> Result<InsertRoleOutcome, MetadataError> {
+        MetadataClient::insert_api_role_with(self, endpoint_id, role, cap).await
+    }
+
+    async fn update_api_role(
+        &self,
+        endpoint_id: &str,
         name: &str,
-        owner_level: bool,
+        change: &ApiRoleChange,
+        cap: u32,
+    ) -> Result<RoleWriteOutcome, MetadataError> {
+        MetadataClient::update_api_role(self, endpoint_id, name, change, cap).await
+    }
+
+    async fn store_role_secret(
+        &self,
+        endpoint_id: &str,
+        name: &str,
         verifier: &str,
         password_enc: &str,
         cap: u32,
-    ) -> Result<InsertRoleOutcome, MetadataError> {
-        MetadataClient::insert_api_role(
-            self,
-            endpoint_id,
-            name,
-            owner_level,
-            verifier,
-            password_enc,
-            cap,
-        )
-        .await
+    ) -> Result<RoleWriteOutcome, MetadataError> {
+        MetadataClient::store_role_secret(self, endpoint_id, name, verifier, password_enc, cap)
+            .await
+    }
+
+    async fn rename_role_copy(
+        &self,
+        endpoint_id: &str,
+        branch: BranchId,
+        old: &str,
+        new: &str,
+        resealed: Option<&str>,
+        unreadable: Option<bool>,
+    ) -> Result<RenameCopyOutcome, MetadataError> {
+        MetadataClient::rename_role_copy(self, endpoint_id, branch, old, new, resealed, unreadable)
+            .await
     }
 
     async fn replace_role_secret(
@@ -610,8 +812,9 @@ impl WorkerMetadata for MetadataClient {
         endpoint_id: &str,
         name: &str,
         version: i64,
+        attributes_change: Option<Uuid>,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::confirm_role(self, endpoint_id, name, version).await
+        MetadataClient::confirm_role(self, endpoint_id, name, version, attributes_change).await
     }
 
     async fn delete_role_copy(&self, endpoint_id: &str, name: &str) -> Result<bool, MetadataError> {
@@ -700,8 +903,18 @@ impl WorkerMetadata for MetadataClient {
     async fn begin_branch_delete(
         &self,
         id: BranchId,
+        except: Option<Uuid>,
     ) -> Result<BranchDeleteOutcome, MetadataError> {
-        MetadataClient::begin_branch_delete(self, id).await
+        MetadataClient::begin_branch_delete_except(self, id, except).await
+    }
+
+    async fn claim_branch_for_switch(
+        &self,
+        id: BranchId,
+        allow_protected: bool,
+        except: Option<Uuid>,
+    ) -> Result<ClaimOutcome, MetadataError> {
+        MetadataClient::claim_branch_for_switch_except(self, id, allow_protected, except).await
     }
 
     async fn live_children(&self, id: BranchId) -> Result<Vec<BranchRecord>, MetadataError> {
@@ -725,8 +938,16 @@ impl WorkerMetadata for MetadataClient {
         id: BranchId,
         expected_pending: &str,
         history_start: Option<DateTime<Utc>>,
+        branched_at_lsn: &str,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::switch_to_pending_timeline(self, id, expected_pending, history_start).await
+        MetadataClient::switch_to_pending_timeline(
+            self,
+            id,
+            expected_pending,
+            history_start,
+            branched_at_lsn,
+        )
+        .await
     }
 
     async fn switch_to_restored_timeline(
@@ -735,9 +956,17 @@ impl WorkerMetadata for MetadataClient {
         expected_pending: &str,
         backup: BranchId,
         backup_name: &str,
+        restore_lsn: &str,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::switch_to_restored_timeline(self, id, expected_pending, backup, backup_name)
-            .await
+        MetadataClient::switch_to_restored_timeline(
+            self,
+            id,
+            expected_pending,
+            backup,
+            backup_name,
+            restore_lsn,
+        )
+        .await
     }
 
     async fn clear_superseded_timeline(&self, id: BranchId) -> Result<(), MetadataError> {
@@ -973,6 +1202,73 @@ impl WorkerMetadata for MetadataClient {
     async fn purge_app_sessions(&self, older_than: Duration) -> Result<u64, MetadataError> {
         MetadataClient::purge_app_sessions(self, older_than).await
     }
+
+    async fn merge(&self, id: Uuid) -> Result<Option<MergeRecord>, MetadataError> {
+        MetadataClient::merge(self, id).await
+    }
+
+    async fn set_merge_status(
+        &self,
+        id: Uuid,
+        from: &[MergeStatus],
+        to: MergeStatus,
+        patch: MergeStatusPatch,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::set_merge_status(self, id, from, to, patch).await
+    }
+
+    async fn touch_merge_claim(&self, id: Uuid, status: MergeStatus) -> Result<bool, MetadataError> {
+        MetadataClient::touch_merge_claim(self, id, status).await
+    }
+
+    async fn append_merge_event(&self, event: &MergeEvent) -> Result<(), MetadataError> {
+        MetadataClient::append_merge_event(self, event).await
+    }
+
+    async fn merge_events(&self, id: Uuid) -> Result<Vec<MergeEvent>, MetadataError> {
+        MetadataClient::merge_events(self, id).await
+    }
+
+    async fn create_rehearsal_branch(
+        &self,
+        database_id: DatabaseId,
+        parent: BranchId,
+        name: &str,
+    ) -> Result<BranchRecord, MetadataError> {
+        MetadataClient::create_rehearsal_branch(self, database_id, parent, name, "worker").await
+    }
+
+    async fn stale_merge_claims(
+        &self,
+        older_than: Duration,
+        rehand_after: Duration,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        MetadataClient::stale_merge_claims(self, older_than, rehand_after).await
+    }
+
+    async fn stale_finish_requests(
+        &self,
+        older_than: Duration,
+        rehand_after: Duration,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        MetadataClient::stale_finish_requests(self, older_than, rehand_after).await
+    }
+
+    async fn mark_merge_handed_back(&self, id: Uuid, status: MergeStatus) -> Result<bool, MetadataError> {
+        MetadataClient::mark_merge_handed_back(self, id, status).await
+    }
+
+    async fn cancel_drafts_for_branch(&self, branch: BranchId) -> Result<u64, MetadataError> {
+        MetadataClient::cancel_drafts_for_branch(self, branch).await
+    }
+
+    async fn list_merges(
+        &self,
+        database_id: DatabaseId,
+        branch: Option<BranchId>,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        MetadataClient::list_merges(self, database_id, branch).await
+    }
 }
 
 /// Tenants and timelines on the storage controller, plus where they're placed.
@@ -1016,6 +1312,20 @@ pub trait Storage: Placement + 'static {
     ) -> impl Future<Output = Result<Lsn, StorconError>> + Send;
     /// Where the timeline starts on its ancestor's; `None` for a timeline without one.
     fn ancestor_lsn(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> impl Future<Output = Result<Option<Lsn>, StorconError>> + Send;
+    /// The timeline's ancestor and where it starts on it; `None` for a timeline without one.
+    fn ancestor(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> impl Future<Output = Result<Option<(NeonId, Lsn)>, StorconError>> + Send;
+    /// How far GC has advanced on the timeline: no compute can read below it, except at a
+    /// point the timeline retains (a child's branch point, or a leased LSN). `None` when the
+    /// storage controller doesn't say.
+    fn gc_cutoff(
         &self,
         tenant: &NeonId,
         timeline: &NeonId,
@@ -1142,6 +1452,33 @@ impl Storage for RealStorage {
         StorconClient::get_timeline(&self.storcon, tenant, timeline)
             .await
             .map(|t| t.ancestor_lsn)
+    }
+
+    async fn ancestor(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<Option<(NeonId, Lsn)>, StorconError> {
+        let info = StorconClient::get_timeline(&self.storcon, tenant, timeline).await?;
+        match (info.ancestor_timeline_id, info.ancestor_lsn) {
+            (Some(id), Some(lsn)) => {
+                let id = id.parse().map_err(|e| {
+                    StorconError::Other(anyhow::anyhow!("timeline {timeline}'s ancestor: {e}"))
+                })?;
+                Ok(Some((id, lsn)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn gc_cutoff(
+        &self,
+        tenant: &NeonId,
+        timeline: &NeonId,
+    ) -> Result<Option<Lsn>, StorconError> {
+        StorconClient::get_timeline(&self.storcon, tenant, timeline)
+            .await
+            .map(|t| t.applied_gc_cutoff_lsn)
     }
 
     async fn lsn_by_timestamp(

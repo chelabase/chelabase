@@ -33,11 +33,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // Normally the API has claimed it already; also takes along a backup made since.
         let outcome = self
             .metadata
-            .begin_branch_delete(branch_id)
+            .begin_branch_delete(branch_id, None)
             .await
             .map_err(|e| e.to_string())?;
-        // Neon can't delete a timeline others branch from: refuse, leaving the branch as it
-        // was (the API refuses first; this is the same guard, taken under the database lock).
+        // Neon can't delete a timeline others branch from, and a merge holding the branch
+        // keeps it (E27): refuse, leaving the branch as it was (the API refuses first; these are
+        // the same guards, taken under the locks).
         if let Some(reason) = outcome.refusal(&branch.name) {
             warn!(%branch_id, "branch delete refused: {reason}");
             return self
@@ -228,7 +229,7 @@ mod tests {
         let (dev_ep, dev_timeline) = (dev.endpoint_id.unwrap(), dev.timeline_id.unwrap());
         // The API claims the branch before publishing the job.
         assert_eq!(
-            futures_util::FutureExt::now_or_never(w.metadata.begin_branch_delete(s.dev))
+            futures_util::FutureExt::now_or_never(w.metadata.begin_branch_delete(s.dev, None))
                 .unwrap()
                 .unwrap(),
             BranchDeleteOutcome::Started
@@ -398,6 +399,42 @@ mod tests {
         assert_eq!(w.storage.timeline_ids(), timelines);
         for entry in ["storage.", "compute.", "metadata.mark_branch_deleted"] {
             assert!(!has(&journal, entry), "{entry}: {:?}", entries(&journal));
+        }
+    }
+
+    // T14 F3 fix round (I1, the hold invariant on every path): the delete job, taking a ready
+    // branch, refuses it while a merge holds it as source or as target, in exactly the states
+    // that hold (E27); nothing is torn down and the branch says which merge.
+    #[tokio::test]
+    async fn the_delete_job_follows_the_hold_table() {
+        use chelabase_metadata::{MergeDirection, MergeState};
+        for state in MergeState::all() {
+            for dev_is_source in [true, false] {
+                let (w, journal) = worker();
+                let s = setup(&w, &journal).await;
+                let main = w.metadata.main(s.db).id;
+                let (source, target, direction) = if dev_is_source {
+                    (s.dev, main, MergeDirection::IntoParent)
+                } else {
+                    (main, s.dev, MergeDirection::FromParent)
+                };
+                let m = w.metadata.insert_merge(s.db, source, target, direction, state.status);
+                w.metadata.state().merges.get_mut(&m).unwrap().failed_phase =
+                    state.failed_phase.map(str::to_string);
+                let ctx = format!("{state:?} dev_is_source={dev_is_source}");
+
+                w.handle_branch_delete(s.dev).await.unwrap();
+
+                let dev = w.metadata.branch(s.dev);
+                if state.holds_branches() {
+                    assert_eq!(dev.status, BranchStatus::Ready, "{ctx}");
+                    let error = dev.error.unwrap_or_default();
+                    assert!(error.contains(&m.to_string()), "{ctx}: {error}");
+                    assert!(!has(&journal, "storage."), "{ctx}: {:?}", entries(&journal));
+                } else {
+                    assert_eq!(dev.status, BranchStatus::Deleted, "{ctx}: {:?}", dev.error);
+                }
+            }
         }
     }
 

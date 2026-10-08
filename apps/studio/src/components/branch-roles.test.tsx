@@ -14,6 +14,11 @@ const role = (over: Partial<BranchRole> & { name: string }): BranchRole => ({
   blocked_keys: [],
   pending: false,
   created_at: "2026-10-01T09:00:00Z",
+  inherit: true,
+  connection_limit: -1,
+  valid_until: null,
+  bypass_rls: false,
+  member_of: [],
   ...over,
 });
 const owner = role({ name: "chelabase_owner", origin: "owner", level: "owner_level" });
@@ -87,6 +92,30 @@ describe("BranchRoles", () => {
     expect(screen.getByRole("columnheader", { name: "Origin" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Login" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Password" })).toBeInTheDocument();
+  });
+
+  it("role_list_shows_new_attributes", async () => {
+    const group = role({ name: "readers", login: false, origin: "sql", password: "none" });
+    const member = role({
+      name: "etl",
+      inherit: false,
+      connection_limit: 5,
+      valid_until: "2030-01-01T00:00:00Z",
+      bypass_rls: true,
+      member_of: ["readers", "writers"],
+    });
+    setup({}, [owner, group, member]);
+    expect(screen.getByRole("columnheader", { name: "Attributes" })).toBeInTheDocument();
+    const m = await rowOf("etl");
+    expect(m.getByText("Bypasses RLS")).toBeInTheDocument();
+    expect(m.getByText("No inherit")).toBeInTheDocument();
+    expect(m.getByText("At most 5 connections")).toBeInTheDocument();
+    expect(m.getByText("Valid until 2030-01-01 00:00 UTC")).toBeInTheDocument();
+    expect(m.getByText("Member of readers, writers")).toBeInTheDocument();
+    // Defaults say nothing; the list stays read-only.
+    const g = await rowOf("^readers");
+    expect(g.queryByText(/Bypasses RLS|No inherit|connections|Valid until|Member of/)).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
   });
 
   it("md5_warning", async () => {

@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ApiError,
@@ -36,6 +36,11 @@ export interface DatabaseActionsProps {
   children?: ReactNode;
   /** Shown right under the row of buttons (the reasons some are off). */
   below?: ReactNode;
+  /**
+   * A branch's connection details to open once, on mount, for this role (null: the owner):
+   * a link (a merge's created role) asked for them. The password stays masked until shown.
+   */
+  openConnection?: { role: string | null };
 }
 
 /** The orchestrator's answer when a reset stored the new password but couldn't apply it yet. */
@@ -51,6 +56,7 @@ export function DatabaseActions({
   describedBy,
   children,
   below,
+  openConnection,
 }: DatabaseActionsProps) {
   const queryClient = useQueryClient();
   const resetDatabasePassword = useResetDatabasePassword();
@@ -139,6 +145,15 @@ export function DatabaseActions({
       setBusy(false);
     }
   }
+
+  // Opened once from a link; later toggles are the user's.
+  const opened = useRef(false);
+  useEffect(() => {
+    if (opened.current || !openConnection || !branch || !canConnect) return;
+    opened.current = true;
+    void reveal(false, false, openConnection.role);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openConnection, branch, canConnect]);
 
   async function reset() {
     setBusy(true);

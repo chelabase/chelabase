@@ -1,17 +1,34 @@
-import type { Branch } from "@chelabase/management-client";
+import type { Branch, MergeSummary } from "@chelabase/management-client";
 import { buildTree } from "@/lib/branches";
+import type { ConnectionFocus } from "@/lib/project-search";
 import { BranchActions } from "./branch-actions";
 
 export interface BranchTreeProps {
+  projectId: string;
   databaseId: string;
   databaseName: string;
+  /** The main Postgres database (`DatabaseSummary.postgres_database`): merges name it. */
+  postgresDatabase?: string | null;
   branches: Branch[];
   historyWindow: number;
+  /** The database's merges (an open one blocks starting another between the same branches). */
+  openMerges?: MergeSummary[];
+  /** A branch whose connection details open on load. */
+  focus?: ConnectionFocus | null;
 }
 
 const utc = (iso: string) => `${new Date(iso).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 
-export function BranchTree({ databaseId, databaseName, branches, historyWindow }: BranchTreeProps) {
+export function BranchTree({
+  projectId,
+  databaseId,
+  databaseName,
+  postgresDatabase = null,
+  branches,
+  historyWindow,
+  openMerges,
+  focus = null,
+}: BranchTreeProps) {
   const rows = buildTree(branches);
   return (
     <table className="w-full text-left text-sm">
@@ -55,8 +72,12 @@ export function BranchTree({ databaseId, databaseName, branches, historyWindow }
               <td className="py-2 font-mono">{branch.host && branch.port ? `${branch.host}:${branch.port}` : "—"}</td>
               <td className="py-2">
                 <BranchActions
+                  projectId={projectId}
+                  openMerges={openMerges}
+                  openConnection={focus?.branchId === branch.id ? { role: focus.role } : undefined}
                   databaseId={databaseId}
                   databaseName={databaseName}
+                  postgresDatabase={postgresDatabase}
                   branch={branch}
                   branches={branches}
                   historyWindow={historyWindow}

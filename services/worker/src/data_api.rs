@@ -48,10 +48,11 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version
 /// statement names while parsing it, so without it every pipelined request falls back to
 /// the sequential path. A default schema that doesn't exist passes: the bootstrap skips it
 /// too. The literal is the quoted identifier (`to_regnamespace` parses identifier syntax).
+/// The search path is pinned first (`cloud_admin` is a superuser; `to_regclass` is unqualified).
 pub fn schema_check_sql(schema: &str) -> String {
     let schema_literal = quote_literal(&quote_ident(schema));
     format!(
-        "{SCHEMA_CHECK_SQL} \
+        "SET search_path = pg_catalog, pg_temp; {SCHEMA_CHECK_SQL} \
      AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n \
        JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) 'authenticator' \
        WHERE n.oid OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace({schema_literal})::pg_catalog.oid \
@@ -440,29 +441,55 @@ pub fn quarantined(output: &str) -> Option<&str> {
         .filter(|l| l.starts_with("chelabase_quarantine_"))
 }
 
-/// Roles a secret key's role must not be a member of, at any depth (besides superusers):
-/// they reach the compute itself or Chelabase's own machinery.
-const SYSTEM_ROLES: &str = "'chelabase_admin', 'pg_execute_server_program', \
-     'pg_read_server_files', 'pg_write_server_files'";
+/// Roles a secret key's role must not be a member of, at any depth (besides superusers and
+/// `neon_superuser`, answered on their own): they reach the compute itself or Chelabase's own
+/// machinery. The shared list rest's per-request gate refuses too.
+fn system_roles() -> String {
+    chelabase_types::data_key::KEY_ROLE_REFUSED_GROUPS
+        .iter()
+        .filter(|g| **g != "neon_superuser")
+        .map(|g| quote_literal(g))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// One row for an existing role: `superuser`, `neon_superuser` (a member, at any depth),
-/// `owner_level` (CREATEROLE, CREATEDB, BYPASSRLS or REPLICATION: with the two before, Q3's
-/// one wide owner-level definition, as rest's `OWNER_LEVEL_SQL`), `system` (a member of a
-/// superuser role or of [`SYSTEM_ROLES`]) or `ok`. No row when it doesn't exist. Membership
-/// goes by oid over `pg_roles`, so a system role missing from the image matches nothing
-/// instead of failing.
+/// `owner_level` (CREATEROLE, CREATEDB or REPLICATION: with the two before, E33's owner-level
+/// definition, as rest's `OWNER_LEVEL_SQL`), `system` (a member of a superuser role or of
+/// [`system_roles`]) or `ok <oid> <t|f>` (the flag: BYPASSRLS, which a key's role may have).
+/// No row when it doesn't exist. Membership goes by oid over `pg_roles`, so a system role
+/// missing from the image matches nothing instead of failing.
 fn role_check_sql(role: &str) -> String {
     format!(
         "SET search_path = pg_catalog, pg_temp; SELECT CASE WHEN r.rolsuper THEN 'superuser' \
          WHEN EXISTS (SELECT FROM pg_roles s WHERE s.rolname = 'neon_superuser' \
          AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'neon_superuser' \
-         WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolbypassrls OR r.rolreplication \
+         WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
          THEN 'owner_level' \
-         WHEN EXISTS (SELECT FROM pg_roles s WHERE (s.rolsuper OR s.rolname IN ({SYSTEM_ROLES})) \
+         WHEN EXISTS (SELECT FROM pg_roles s WHERE (s.rolsuper OR s.rolname IN ({})) \
          AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'system' \
-         ELSE 'ok ' || r.oid::text END FROM pg_roles r WHERE r.rolname = {};",
+         ELSE 'ok ' || r.oid::text || CASE WHEN r.rolbypassrls THEN ' t' ELSE ' f' END END \
+         FROM pg_roles r WHERE r.rolname = {};",
+        system_roles(),
         quote_literal(role)
     )
+}
+
+/// What a refused owner-level role may do instead (E33).
+const OWNER_LEVEL_HINT: &str = "owner-level roles can't back a secret key; use a role without \
+     CREATEROLE, CREATEDB, REPLICATION or neon_superuser: BYPASSRLS is allowed";
+
+/// The `ok` answer of [`role_check_sql`]: `(oid, bypass_rls)`; a line without the flag (an
+/// older check) is `false`.
+fn parse_role_ok(answer: &str) -> Option<(i64, bool)> {
+    let mut fields = answer.strip_prefix("ok ")?.split(' ');
+    let oid = fields.next()?.parse::<i64>().ok().filter(|oid| *oid > 0)?;
+    let bypass = match fields.next() {
+        None | Some("f") => false,
+        Some("t") => true,
+        Some(_) => return None,
+    };
+    fields.next().is_none().then_some((oid, bypass))
 }
 
 /// Roles Chelabase owns; never a secret key's.
@@ -471,8 +498,9 @@ const RESERVED_ROLES: [&str; 3] = [AUTHENTICATOR, "chelabase_admin", crate::app_
 /// What [`Worker::check_data_role`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleCheck {
-    /// Allowed, and granted to `authenticator`: the role's OID (a secret key is bound to it).
-    Ok(i64),
+    /// Allowed, and granted to `authenticator`: the role's OID (a secret key is bound to it)
+    /// and whether it has BYPASSRLS (E33: allowed, and the key is marked).
+    Ok(i64, bool),
     /// The caller's fault (422): the message says why.
     Refused(String),
     /// The branch isn't ready, or its compute can't be reached (409).
@@ -610,20 +638,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         ep: &str,
         database_name: &str,
     ) -> anyhow::Result<()> {
-        let mut roles: Vec<String> = self
+        let mut roles: Vec<(String, Option<i64>)> = self
             .metadata
             .list_data_keys(branch)
             .await
             .context("listing the secret keys")?
             .into_iter()
             .filter(|k| k.kind == DataKeyKind::Secret)
-            .map(|k| k.role)
+            .map(|k| (k.role, k.role_oid))
             .collect();
         roles.sort();
         roles.dedup();
-        for role in roles {
-            match self.check_and_grant(branch, ep, database_name, &role).await {
-                RoleCheck::Ok(_) => {}
+        for (role, role_oid) in roles {
+            match self.check_and_grant(branch, ep, database_name, &role, role_oid).await {
+                RoleCheck::Ok(..) => {}
                 other => {
                     warn!(branch_id = %branch, %role, "not granting a secret key's role to {AUTHENTICATOR}: {other:?}");
                 }
@@ -673,7 +701,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// The branch's public key (role `anon`, name `public`, sealed with AAD = key id), unless
-    /// it has a live one. Losing a race with a concurrent run is fine.
+    /// it has a live one, or it's a merge's rehearsal (never served, so it gets none). Losing a
+    /// race with a concurrent run is fine.
     async fn ensure_public_key(&self, branch: BranchId) -> anyhow::Result<()> {
         if self
             .metadata
@@ -681,6 +710,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .context("checking the public key")?
         {
+            return Ok(());
+        }
+        let kind = self
+            .metadata
+            .get_branch(branch)
+            .await
+            .context("reading the branch")?
+            .map(|b| b.kind);
+        if kind == Some(BranchKind::Rehearsal) {
             return Ok(());
         }
         let generated = data_key::generate(DataKeyKind::Public);
@@ -701,6 +739,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             )),
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         };
         match self.metadata.insert_data_key(&key).await {
             Ok(()) => {
@@ -958,10 +998,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Whether `role` may back a secret key on `branch`: a valid name, not reserved or
-    /// built-in (`pg_*`), existing, not a superuser, without CREATEROLE, CREATEDB, BYPASSRLS
-    /// or REPLICATION, and not a member (at any depth) of a superuser role, `neon_superuser`
-    /// or the other system roles. On success it's granted
-    /// to `authenticator` (`set_config('role', …)` needs the membership).
+    /// built-in (`pg_*`), existing, not a superuser, without CREATEROLE, CREATEDB or
+    /// REPLICATION, and not a member (at any depth) of a superuser role, `neon_superuser` or
+    /// the other system roles. BYPASSRLS is allowed (E33) and reported. On success it's
+    /// granted to `authenticator` (`set_config('role', …)` needs the membership).
     pub async fn check_data_role(&self, branch: BranchId, role: &str) -> RoleCheck {
         if let Some(refusal) = refuse_by_name(role) {
             return refusal;
@@ -979,14 +1019,34 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         else {
             return RoleCheck::NotReady;
         };
-        self.check_and_grant(branch, &ep, &database_name, role)
+        self.check_and_grant(branch, &ep, &database_name, role, None)
             .await
     }
 
-    /// [`Self::check_data_role`] as the RPC's reply.
+    /// [`Self::check_data_role`] as the RPC's reply, with the timeline the OID was read on
+    /// (E26). The branch's timeline is read before and after the check: a switch landing
+    /// between them (the OID may be either timeline's) is not ready. A switch stops the compute
+    /// before it moves the timeline, so a check between two equal readings ran on that one.
     pub async fn check_data_role_reply(&self, request: &CheckDataRoleRequest) -> CheckDataRoleReply {
-        match self.check_data_role(request.branch_id, &request.role).await {
-            RoleCheck::Ok(oid) => CheckDataRoleReply::ok_with_oid(oid),
+        let branch = request.branch_id;
+        let timeline = |b: Option<chelabase_metadata::BranchRecord>| b.and_then(|b| b.timeline_id);
+        let before = match self.metadata.get_branch(branch).await {
+            Ok(b) => timeline(b),
+            Err(e) => return CheckDataRoleReply::failed(format!("reading the branch: {e}")),
+        };
+        match self.check_data_role(branch, &request.role).await {
+            RoleCheck::Ok(oid, bypass_rls) => match self.metadata.get_branch(branch).await {
+                Err(e) => CheckDataRoleReply::failed(format!("reading the branch: {e}")),
+                Ok(after) => match timeline_verdict(before, timeline(after)) {
+                    Ok(timeline) => {
+                        CheckDataRoleReply::ok_with_oid(oid, &timeline).bypassing_rls(bypass_rls)
+                    }
+                    Err(why) => {
+                        warn!(%branch, role = %request.role, "{why}");
+                        CheckDataRoleReply::not_ready()
+                    }
+                },
+            },
             RoleCheck::Refused(message) => CheckDataRoleReply::refused(message),
             RoleCheck::NotReady => CheckDataRoleReply::not_ready(),
             RoleCheck::Failed(message) => CheckDataRoleReply::failed(message),
@@ -1042,6 +1102,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         ep: &str,
         database_name: &str,
         role: &str,
+        expected_oid: Option<i64>,
     ) -> RoleCheck {
         if let Some(refusal) = refuse_by_name(role) {
             return refusal;
@@ -1059,22 +1120,17 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         let refused = |why: &str| RoleCheck::Refused(format!("the role {role} {why}"));
         let answer = answer.trim();
-        // `ok <oid>`: allowed, and the identity the key is bound to.
-        let Some(oid) = answer
-            .strip_prefix("ok ")
-            .and_then(|oid| oid.parse::<i64>().ok())
-            .filter(|oid| *oid > 0)
-        else {
+        // `ok <oid> <t|f>`: allowed, the identity the key is bound to, and BYPASSRLS.
+        let Some((oid, bypass_rls)) = parse_role_ok(answer) else {
             return match answer {
                 "" => refused("does not exist"),
                 "superuser" => refused("is a superuser"),
-                "neon_superuser" => refused(
-                    "is a member of neon_superuser (owner-level roles can't back a secret \
-                     key; use a plain role)",
-                ),
-                "owner_level" => refused(
-                    "is owner-level (owner-level roles can't back a secret key; use a plain role)",
-                ),
+                "neon_superuser" => refused(&format!(
+                    "is a member of neon_superuser ({OWNER_LEVEL_HINT})"
+                )),
+                "owner_level" => refused(&format!(
+                    "has CREATEROLE, CREATEDB or REPLICATION ({OWNER_LEVEL_HINT})"
+                )),
                 "system" => refused("has system privileges"),
                 other => {
                     warn!(branch_id = %branch, "checking role {role}: unexpected answer {other:?}");
@@ -1084,6 +1140,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
             };
         };
+        // A key bound to an OID: only that role may be granted, never another now holding
+        // the name (the grant would outlive the key).
+        if let Some(expected) = expected_oid
+            && expected != oid
+        {
+            return refused("is now a different role than the key was bound to");
+        }
         let grant = format!("GRANT {} TO {AUTHENTICATOR};", quote_ident(role));
         if let Err(e) = self.computes.admin_sql(ep, database_name, &grant).await {
             warn!(branch_id = %branch, endpoint_id = %ep, "granting {role} to {AUTHENTICATOR}: {e:#}");
@@ -1091,8 +1154,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 "granting the role {role} to {AUTHENTICATOR}: {e:#}"
             ));
         }
-        info!(branch_id = %branch, %role, "granted to {AUTHENTICATOR}");
-        RoleCheck::Ok(oid)
+        info!(branch_id = %branch, %role, bypass_rls, "granted to {AUTHENTICATOR}");
+        RoleCheck::Ok(oid, bypass_rls)
+    }
+}
+
+/// The timeline a role check ran on, from the branch's timeline before and after it: the
+/// timeline when both readings agree; otherwise why the check can't be trusted.
+fn timeline_verdict(before: Option<String>, after: Option<String>) -> Result<String, &'static str> {
+    match (before, after) {
+        (None, _) => Err("the branch has no timeline to read"),
+        (Some(before), Some(after)) if before == after => Ok(before),
+        (Some(_), _) => Err("the branch's timeline moved during the role check"),
     }
 }
 
@@ -1698,6 +1771,10 @@ COMMIT;
     #[test]
     fn the_health_check_asks_for_authenticator_usage_on_the_default_schema() {
         let sql = schema_check_sql("my\"schema");
+        // Fix round 1 (I3): the superuser session searches only pg_catalog.
+        let sql = sql
+            .strip_prefix("SET search_path = pg_catalog, pg_temp; ")
+            .unwrap_or_else(|| panic!("the search path is pinned first: {sql}"));
         assert!(sql.starts_with(SCHEMA_CHECK_SQL), "{sql}");
         let rest = &sql[SCHEMA_CHECK_SQL.len()..];
         for part in [
@@ -1762,7 +1839,7 @@ COMMIT;
         let ep = w.metadata.main(id).endpoint_id.unwrap();
         let order = [
             pos(&journal, &format!("compute.sql {ep} app SELECT 1")),
-            pos(&journal, &format!("compute.sql {ep} app DO $$")),
+            pos(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; DO $$")),
             pos(&journal, "metadata.set_authenticator_password"),
             pos(&journal, &format!("compute.sql {ep} app {DATA_API}")),
             pos(&journal, "metadata.insert_data_key"),
@@ -1784,7 +1861,7 @@ COMMIT;
         let ep = dev.endpoint_id.clone().unwrap();
         let order = [
             pos(&journal, &format!("compute.sql {ep} app SELECT 1")),
-            pos(&journal, &format!("compute.sql {ep} app DO $$")),
+            pos(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; DO $$")),
             pos(&journal, &format!("compute.sql {ep} app {DATA_API}")),
             pos(&journal, "metadata.insert_data_key"),
             pos(&journal, "metadata.set_branch_ready"),
@@ -1817,7 +1894,7 @@ COMMIT;
         let order = [
             pos(&journal, &format!("compute.create {ep}")),
             pos(&journal, &format!("compute.sql {ep} app SELECT 1")),
-            pos(&journal, &format!("compute.sql {ep} app DO $$")),
+            pos(&journal, &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; DO $$")),
             pos(&journal, &format!("compute.sql {ep} app {DATA_API}")),
         ];
         assert!(order.is_sorted(), "{:?}", entries(&journal));
@@ -1889,6 +1966,8 @@ COMMIT;
             sealed: None,
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         }
     }
 
@@ -1943,6 +2022,67 @@ COMMIT;
         assert!(position(&journal, "compute.sql").is_some());
     }
 
+    // A switch regrants by name before the key sync: a different role (another OID) now
+    // holding a bound key's name must not get granted to authenticator.
+    #[tokio::test]
+    async fn bootstrap_does_not_regrant_a_role_with_another_oid() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        w.computes.sql.lock().unwrap().clear();
+        let main = w.metadata.main(id);
+        {
+            let mut state = w.metadata.state();
+            let mut moved = secret_key(main.id, "impostor");
+            moved.role_oid = Some(16384);
+            moved.role_timeline = Some("11111111111111111111111111111111".into());
+            state.data_keys.push(moved);
+            let mut same = secret_key(main.id, "same");
+            same.role_oid = Some(16385);
+            same.role_timeline = Some("11111111111111111111111111111111".into());
+            state.data_keys.push(same);
+            // An unbound key (made before E26) is granted by name as before.
+            state.data_keys.push(secret_key(main.id, "unbound"));
+        }
+        w.computes.answer("rolname = 'impostor'", "ok 16999\n");
+        w.computes.answer("rolname = 'same'", "ok 16385\n");
+        w.computes.answer("rolname = 'unbound'", "ok 17000\n");
+
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+
+        let mut granted = grants(&w);
+        granted.sort();
+        assert_eq!(
+            granted,
+            ["GRANT \"same\" TO authenticator;", "GRANT \"unbound\" TO authenticator;"]
+        );
+    }
+
+    // A branch with no timeline to read is not "a timeline that moved": say which.
+    #[tokio::test]
+    async fn check_role_reply_without_a_timeline_is_not_ready_and_says_why() {
+        assert_eq!(timeline_verdict(None, None), Err("the branch has no timeline to read"));
+        assert_eq!(timeline_verdict(None, Some("a".into())), Err("the branch has no timeline to read"));
+        assert_eq!(
+            timeline_verdict(Some("a".into()), Some("b".into())),
+            Err("the branch's timeline moved during the role check")
+        );
+        assert_eq!(
+            timeline_verdict(Some("a".into()), None),
+            Err("the branch's timeline moved during the role check")
+        );
+        assert_eq!(timeline_verdict(Some("a".into()), Some("a".into())), Ok("a".to_string()));
+
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = BranchId::from(id);
+        answer_check(&w, "ok 16390\n");
+        w.metadata.state().branches.get_mut(&main).unwrap().timeline_id = None;
+        let reply = w
+            .check_data_role_reply(&chelabase_nats::CheckDataRoleRequest { branch_id: main, role: "reader".into() })
+            .await;
+        assert_eq!(reply, CheckDataRoleReply::not_ready());
+    }
+
     // --- The secret-key role check ---------------------------------------------------------
 
     /// The check query's answer, as psql prints it.
@@ -1974,7 +2114,8 @@ COMMIT;
                 "owner",
                 "neon_superuser\n",
                 "the role owner is a member of neon_superuser (owner-level roles can't \
-                 back a secret key; use a plain role)",
+                 back a secret key; use a role without CREATEROLE, CREATEDB, REPLICATION or \
+                 neon_superuser: BYPASSRLS is allowed)",
             ),
             (
                 "shell",
@@ -1984,8 +2125,9 @@ COMMIT;
             (
                 "wide",
                 "owner_level\n",
-                "the role wide is owner-level (owner-level roles can't back a secret key; use \
-                 a plain role)",
+                "the role wide has CREATEROLE, CREATEDB or REPLICATION (owner-level roles can't \
+                 back a secret key; use a role without CREATEROLE, CREATEDB, REPLICATION or \
+                 neon_superuser: BYPASSRLS is allowed)",
             ),
         ];
         for (role, stdout, message) in cases {
@@ -2018,18 +2160,72 @@ COMMIT;
     async fn check_role_returns_the_roles_oid() {
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
-        answer_check(&w, "ok 16390\n");
+        answer_check(&w, "ok 16390 f\n");
         let main = BranchId::from(id);
-        assert_eq!(w.check_data_role(main, "reader").await, RoleCheck::Ok(16390));
+        assert_eq!(w.check_data_role(main, "reader").await, RoleCheck::Ok(16390, false));
         let reply = w
             .check_data_role_reply(&chelabase_nats::CheckDataRoleRequest { branch_id: main, role: "reader".into() })
             .await;
-        assert_eq!(reply, CheckDataRoleReply::ok_with_oid(16390));
+        // With the timeline the OID was read on (E26).
+        let timeline = w.metadata.branch(main).timeline_id.unwrap();
+        assert_eq!(reply, CheckDataRoleReply::ok_with_oid(16390, &timeline).bypassing_rls(false));
+        assert_eq!(reply.role_timeline.as_deref(), Some(timeline.as_str()));
+        // A switch landing during the check: the OID may be either timeline's, so not ready.
+        w.metadata.state().move_timeline_at_get_branch(main, 2, "33333333333333333333333333333333");
+        let reply = w
+            .check_data_role_reply(&chelabase_nats::CheckDataRoleRequest { branch_id: main, role: "reader".into() })
+            .await;
+        assert_eq!(reply, CheckDataRoleReply::not_ready());
         assert!(role_check_sql("reader").contains("'ok ' || r.oid::text"));
-        // An `ok` without an OID is an answer it doesn't know.
-        w.computes.answers.lock().unwrap().clear();
-        answer_check(&w, "ok\n");
-        assert!(matches!(w.check_data_role(main, "reader").await, RoleCheck::Failed(_)));
+        // An `ok` without an OID is an answer it doesn't know; so is a flag it doesn't know.
+        for unknown in ["ok\n", "ok 16390 maybe\n", "ok 16390 t x\n"] {
+            w.computes.answers.lock().unwrap().clear();
+            answer_check(&w, unknown);
+            assert!(matches!(w.check_data_role(main, "reader").await, RoleCheck::Failed(_)), "{unknown:?}");
+        }
+    }
+
+    // E33: a role with BYPASSRLS may back a secret key: the check passes, grants it to
+    // `authenticator`, and says so, so the key is marked "bypasses RLS".
+    #[tokio::test]
+    async fn a_bypassrls_role_may_back_a_key_and_is_marked() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = BranchId::from(id);
+        w.computes.sql.lock().unwrap().clear();
+        answer_check(&w, "ok 16390 t\n");
+        assert_eq!(w.check_data_role(main, "service").await, RoleCheck::Ok(16390, true));
+        assert_eq!(grants(&w), ["GRANT \"service\" TO authenticator;"]);
+        let reply = w
+            .check_data_role_reply(&chelabase_nats::CheckDataRoleRequest { branch_id: main, role: "service".into() })
+            .await;
+        assert_eq!(reply.role_bypass_rls, Some(true));
+        assert!(reply.ok);
+    }
+
+    // T14 (state-machine slice M12, in this file): a merge's rehearsal is never served, so
+    // its data API bootstrap makes no public key; a normal branch still gets one.
+    #[tokio::test]
+    async fn a_rehearsal_gets_no_public_key() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        for (name, kind) in [
+            ("_rehearsal-0123abcd", chelabase_metadata::BranchKind::Rehearsal),
+            ("dev", chelabase_metadata::BranchKind::Normal),
+        ] {
+            let branch = crate::fakes::pending_branch(&w, id, name, main.id);
+            w.metadata.state().branches.get_mut(&branch).unwrap().kind = kind;
+            w.handle_branch_create(branch, None).await.unwrap();
+            let b = w.metadata.branch(branch);
+            assert_eq!(b.status, BranchStatus::Ready, "{name}: {:?}", b.error);
+            let keys = w.metadata.list_data_keys(branch).await.unwrap();
+            assert_eq!(
+                keys.iter().any(|k| k.kind == DataKeyKind::Public),
+                kind == chelabase_metadata::BranchKind::Normal,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2042,7 +2238,8 @@ COMMIT;
             w.check_data_role(BranchId::from(id), "admin").await,
             refused(
                 "the role admin is a member of neon_superuser (owner-level roles can't back \
-                 a secret key; use a plain role)"
+                 a secret key; use a role without CREATEROLE, CREATEDB, REPLICATION or \
+                 neon_superuser: BYPASSRLS is allowed)"
             )
         );
     }
@@ -2060,21 +2257,17 @@ COMMIT;
             !sql.contains("pg_has_role(r.oid, 'neon_superuser'"),
             "{sql}"
         );
-        for system in [
-            "s.rolsuper",
-            "'neon_superuser'",
-            "'chelabase_admin'",
-            "'pg_execute_server_program'",
-            "'pg_read_server_files'",
-            "'pg_write_server_files'",
-        ] {
-            assert!(sql.contains(system), "{system} in {sql}");
+        assert!(sql.contains("s.rolsuper"), "{sql}");
+        // The same set rest refuses on every request (F2 fix round M7).
+        for group in chelabase_types::data_key::KEY_ROLE_REFUSED_GROUPS {
+            assert!(sql.contains(&format!("'{group}'")), "{group} in {sql}");
         }
         assert!(sql.contains("WHEN r.rolsuper THEN 'superuser'"), "{sql}");
     }
 
-    // Q3's one wide owner-level definition, as rest's: each attribute on the role itself
-    // makes it owner-level (attributes aren't inherited; neon_superuser counts at any depth).
+    // E33's owner-level definition, as rest's: CREATEROLE, CREATEDB or REPLICATION on the role
+    // itself makes it owner-level (attributes aren't inherited; neon_superuser counts at any
+    // depth). BYPASSRLS doesn't: it's answered with the OID instead.
     #[test]
     fn the_check_sql_refuses_each_owner_level_attribute() {
         let sql = role_check_sql("app");
@@ -2086,14 +2279,14 @@ COMMIT;
             .split_once("THEN 'owner_level'")
             .expect("answered owner_level")
             .0;
-        for attribute in [
-            "r.rolcreaterole",
-            "r.rolcreatedb",
-            "r.rolbypassrls",
-            "r.rolreplication",
-        ] {
+        for attribute in ["r.rolcreaterole", "r.rolcreatedb", "r.rolreplication"] {
             assert!(owner_level.contains(attribute), "{attribute} in {sql}");
         }
+        assert!(!owner_level.contains("rolbypassrls"), "{sql}");
+        assert!(
+            sql.contains("'ok ' || r.oid::text || CASE WHEN r.rolbypassrls THEN ' t' ELSE ' f' END"),
+            "{sql}"
+        );
         // After superuser and neon_superuser, before the system roles.
         let at = |needle: &str| {
             sql.find(needle)
@@ -2230,8 +2423,12 @@ COMMIT;
         let main = BranchId::from(id);
         let ask = |role: &str, branch| CheckDataRoleRequest { branch_id: branch, role: role.into() };
 
-        answer_check(&w, "ok 16384\n");
-        assert_eq!(w.check_data_role_reply(&ask("reporting", main)).await, CheckDataRoleReply::ok_with_oid(16384));
+        answer_check(&w, "ok 16384 f\n");
+        let timeline = w.metadata.branch(main).timeline_id.unwrap();
+        assert_eq!(
+            w.check_data_role_reply(&ask("reporting", main)).await,
+            CheckDataRoleReply::ok_with_oid(16384, &timeline).bypassing_rls(false)
+        );
 
         w.computes.answers.lock().unwrap().clear();
         answer_check(&w, "superuser\n");
@@ -2324,7 +2521,7 @@ COMMIT;
         for good in ["_", "a$1", "Ab_9", longest.as_str()] {
             assert_eq!(
                 w.check_data_role(BranchId::from(id), good).await,
-                RoleCheck::Ok(16384)
+                RoleCheck::Ok(16384, false)
             );
         }
     }
@@ -2338,7 +2535,7 @@ COMMIT;
         for role in ["app_user", "AppUser", "anon", "authenticated"] {
             assert_eq!(
                 w.check_data_role(BranchId::from(id), role).await,
-                RoleCheck::Ok(16384),
+                RoleCheck::Ok(16384, false),
                 "{role}"
             );
         }
@@ -2828,7 +3025,7 @@ END $$;
         add_row(&w, main.id, "analytics", DataApiState::On, "reporting");
         add_row(&w, main.id, "pending", DataApiState::Enabling, "public");
         let d = |name: &str, system: bool| {
-            format!("d|{}||{}|{}||\n", hex::encode(name), hex::encode("postgres"), if system { "t" } else { "f" })
+            format!("d|{}||{}|{}|||||||\n", hex::encode(name), hex::encode("postgres"), if system { "t" } else { "f" })
         };
         let catalog = [d("postgres", true), d("app", false), d("analytics", false), d("pending", false)].concat();
         w.computes.answer("FROM pg_authid", &catalog);

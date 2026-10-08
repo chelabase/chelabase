@@ -17,6 +17,7 @@ path = "src/main.rs"
 chelabase-metadata = { workspace = true }
 chelabase-neon = { workspace = true, features = ["metadata"] }
 chelabase-nats = { workspace = true }
+chelabase-schema = { workspace = true }
 chelabase-types = { workspace = true }
 chelabase-zitadel = { workspace = true }
 axum = { workspace = true }

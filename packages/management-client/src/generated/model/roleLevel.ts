@@ -6,8 +6,9 @@
  */
 
 /**
- * What a role may do: `OwnerLevel` is the wide definition (superuser, CREATEROLE, CREATEDB,
- * BYPASSRLS, REPLICATION, or `neon_superuser` at any depth).
+ * What a role may do: `OwnerLevel` is superuser, CREATEROLE, CREATEDB, REPLICATION, or
+ * `neon_superuser` at any depth (E33; BYPASSRLS alone is an attribute, not owner level: a
+ * secret key may use such a role).
  */
 export type RoleLevel = typeof RoleLevel[keyof typeof RoleLevel];
 

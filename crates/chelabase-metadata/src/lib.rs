@@ -12,9 +12,11 @@ mod app_users;
 mod branches;
 mod data_api;
 mod ddl;
+mod merges;
 mod neon;
 mod projects;
 mod saved_queries;
+mod schema_bases;
 pub use app_users::{
     AppSession, AppUsersStatus, BeginEnable, BranchAuthSync, NewAppSession, NewProjectAuth, OnDelete,
     ProjectAuth, RefreshNext, RefreshOutcome,
@@ -25,20 +27,30 @@ pub use projects::{
 pub use branches::{
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
     CreateBranchOutcome, DatabaseSettings, LiveBranch, NewBranch, SettingsPatch,
+    merge_busy_refusal,
 };
 pub use saved_queries::{
     SAVED_QUERY_CAP, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
 };
 pub use ddl::DdlTx;
+pub use merges::{
+    APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,
+    MergeEvent, MergeRecord, MergeState, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
+    ONLINE_PHASE,
+};
+pub use schema_bases::{BaseSource, SchemaBase};
 pub use data_api::{
     BranchConnectionRow, DataApiSettings, DataKeyLookup, DataKeyRecord, KeyRoleFix, NewDataKey,
-    ServedDatabase,
+    ServedDatabase, rotated_identity,
 };
 pub use neon::{
     BranchDatabase, CopyUpsert, DataApiState, DatabaseOrigin, EnableStart, ENDPOINT_LOCK_TIMEOUT, EndpointLock,
     EndpointState, InsertRoleOutcome, NeonDatabase, NeonEndpoint, NeonRole, NewEndpoint,
-    NewRoleCopy, ObservedDatabase, PasswordState, ResyncApplied, ResyncWrite, RoleCopy,
+    NewRoleCopy, NewStaticEndpoint, ObservedDatabase, PasswordState, ResyncApplied, ResyncWrite, RoleCopy,
     RoleLevel, RoleOrigin, RoleRow, SealedChange,
+};
+pub use neon::{
+    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
 };
 
 /// Fixed seed tenant for local demos (`slug = demo`).
@@ -170,6 +182,14 @@ pub enum MetadataError {
     /// key can't be rotated onto the new role.
     #[error("the role {0} was dropped and created again")]
     RoleRecreated(String),
+}
+
+impl MetadataError {
+    /// Postgres refused the write because the unique index `constraint` would be violated.
+    pub fn is_unique_violation(&self, constraint: &str) -> bool {
+        matches!(self, Self::Database(sqlx::Error::Database(e))
+            if e.is_unique_violation() && e.constraint() == Some(constraint))
+    }
 }
 
 /// How [`MetadataClient::begin_delete`] ended.
@@ -324,6 +344,8 @@ impl MetadataClient {
     }
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
+        // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
+        // this file when adding one (last: 20261012000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,

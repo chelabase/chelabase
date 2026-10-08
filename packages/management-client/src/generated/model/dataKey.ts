@@ -10,6 +10,12 @@ import type { DataKeyKind } from './dataKeyKind.ts';
  * A key as listed: `key` only for the public key.
  */
 export interface DataKey {
+  /**
+     * A secret key whose role has BYPASSRLS: it reads and writes past row-level security
+     * (allowed; Studio marks the key). As the role was when the key was made or rotated, kept
+     * up to date by the worker's resync. Always false for the public key.
+     */
+  bypasses_rls: boolean;
   created_at: string;
   /**
      * The Postgres databases the key may reach; null is every served database.
@@ -26,8 +32,8 @@ export interface DataKey {
   prefix: string;
   role: string;
   /**
-     * A secret key whose role is owner-level: the data API refuses it. Always false for the
-     * public key.
+     * A secret key whose role is owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a
+     * `neon_superuser` member): the data API refuses it. Always false for the public key.
      */
   role_blocked: boolean;
 }

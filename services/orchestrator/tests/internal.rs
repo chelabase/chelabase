@@ -128,7 +128,9 @@ fn copy(name: &str, origin: RoleOrigin, verifier: Option<&str>, sealed: Option<&
         level: RoleLevel::Plain,
         api_owner_level: false,
         pending: false,
+        attributes_pending: false,
         created_at: chrono::Utc::now(),
+        attributes: chelabase_metadata::RoleAttributes::default(),
     }
 }
 
@@ -346,6 +348,8 @@ impl FakeNeon {
             tenant_id: tenant.into(),
             timeline_id: timeline.into(),
             compute_token_sha256: sha256_hex(token),
+            routable: true,
+            static_lsn: None,
         });
         self.roles.lock().unwrap().push((
             id.into(),
@@ -354,6 +358,14 @@ impl FakeNeon {
                 scram_verifier: format!("SCRAM-SHA-256$verifier-of-{id}"),
             },
         ));
+    }
+
+    /// Marks an added endpoint unroutable and/or pinned at an LSN.
+    fn set_routing(&self, id: &str, routable: bool, static_lsn: Option<&str>) {
+        let mut endpoints = self.endpoints.lock().unwrap();
+        let e = endpoints.iter_mut().find(|e| e.id == id).unwrap();
+        e.routable = routable;
+        e.static_lsn = static_lsn.map(str::to_string);
     }
 
     fn break_it(&self) {
@@ -427,6 +439,21 @@ impl NeonMetadataPort for FakeNeon {
             .iter()
             .find(|e| e.id == id)
             .cloned())
+    }
+
+    async fn routable_endpoint(&self, id: &str) -> Result<Option<NeonEndpoint>, MetadataError> {
+        Ok(self.neon_endpoint(id).await?.filter(|e| e.routable))
+    }
+
+    async fn routable_role_secret(
+        &self,
+        endpoint_id: &str,
+        role: &str,
+    ) -> Result<Option<Option<String>>, MetadataError> {
+        if self.routable_endpoint(endpoint_id).await?.is_none() {
+            return Ok(None);
+        }
+        self.neon_role_secret(endpoint_id, role).await
     }
 
     async fn neon_role_secret(
@@ -1210,6 +1237,43 @@ async fn wake_compute_gives_the_running_compute() {
 }
 
 #[tokio::test]
+async fn wake_compute_refuses_unroutable_endpoint() {
+    let neon = FakeNeon::default();
+    neon.add("ep-a", TENANT, TIMELINE);
+    neon.set_routing("ep-a", false, None);
+    let locator = FakeLocator::default();
+    locator.running("ep-a", "172.20.0.9", None);
+    let app = spawn_internal(neon, locator, "http://127.0.0.1:9").await;
+    let (status, body) = app
+        .get(&format!("{WAKE}?endpointish=ep-a"), Some(PROXY_TOKEN))
+        .await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        body["status"]["details"]["error_info"]["reason"],
+        "ENDPOINT_NOT_FOUND"
+    );
+}
+
+#[tokio::test]
+async fn access_control_refuses_unroutable_endpoint() {
+    let neon = FakeNeon::default();
+    neon.add("ep-a", TENANT, TIMELINE);
+    neon.set_routing("ep-a", false, None);
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (status, body) = app
+        .get(
+            &format!("{ACCESS}?endpointish=ep-a&role=app"),
+            Some(PROXY_TOKEN),
+        )
+        .await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        body["status"]["details"]["error_info"]["reason"],
+        "ENDPOINT_NOT_FOUND"
+    );
+}
+
+#[tokio::test]
 async fn a_compute_that_is_not_running_is_retried() {
     let neon = FakeNeon::default();
     neon.add("ep-a", TENANT, TIMELINE);
@@ -1267,6 +1331,20 @@ async fn the_spec_goes_to_the_compute_with_its_token() {
     );
     assert_eq!(body["spec"]["cluster"]["databases"][0]["owner"], "app");
     assert_eq!(body["compute_ctl_config"]["jwks"], app.signer.jwks());
+}
+
+#[tokio::test]
+async fn spec_route_serves_static_mode() {
+    let neon = FakeNeon::default();
+    neon.add("ep-a", TENANT, TIMELINE);
+    neon.add("ep-b", TENANT, TIMELINE);
+    neon.set_routing("ep-a", false, Some("0/16B3748"));
+    let app = spawn_internal(neon, FakeLocator::default(), &storcon(true).await).await;
+    let (status, body) = app.get(&spec_path("ep-a"), Some(COMPUTE_TOKEN)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["spec"]["mode"], json!({ "Static": "0/16B3748" }));
+    let (_, primary) = app.get(&spec_path("ep-b"), Some(COMPUTE_TOKEN)).await;
+    assert_eq!(primary["spec"]["mode"], "Primary");
 }
 
 #[tokio::test]

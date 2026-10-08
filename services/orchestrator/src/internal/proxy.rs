@@ -64,7 +64,7 @@ pub async fn access_control<M: NeonMetadataPort, L: ComputeLocator>(
 ) -> Response {
     match state
         .metadata
-        .neon_role_secret(&q.endpointish, &q.role)
+        .routable_role_secret(&q.endpointish, &q.role)
         .await
     {
         Err(e) => internal(e),
@@ -81,7 +81,7 @@ pub async fn wake_compute<M: NeonMetadataPort, L: ComputeLocator>(
     State(state): State<Arc<InternalState<M, L>>>,
     Query(q): Query<WakeQuery>,
 ) -> Response {
-    let endpoint = match state.metadata.neon_endpoint(&q.endpointish).await {
+    let endpoint = match state.metadata.routable_endpoint(&q.endpointish).await {
         Err(e) => return internal(e),
         Ok(None) => return not_found(&q.endpointish),
         Ok(Some(endpoint)) => endpoint,

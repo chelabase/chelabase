@@ -41,11 +41,15 @@ A storage-controller failure that may pass (a 5xx, no answer or a timeout) is re
 
 Restore also creates a backup branch, `<name>-before-restore-<yyyymmddThhmmssZ>`, that holds the old timeline for recovery. A backup has no compute; to connect to it, create a branch from it. Backup branches never count toward the cap, can't be reset, restored or protected, and are deleted when their branch is deleted.
 
+Restore works the same on main and on a branch of a branch at any depth: the restored timeline gets its own copy of what it reads from every ancestor up to its point, so it no longer depends on them. The backup keeps the old timeline where it was.
+
 A restore right after a storage restart can wait up to 30 seconds per ancestor level in the restore's depth before retrying. A restore that stays stuck fails the branch with a message ending "delete the branch to remove it"; such a branch can only be deleted. A detach that times out is never undone while it may still be running: the job is retried, and the retry finishes the detach. If it is still unresolved 20 minutes after the restore made its timeline, the branch fails with the recorded cause, and nothing is deleted: the branch keeps its old timeline.
 
 ## Delete, and the children rule
 
 Delete, reset-to-parent and restore are refused (`has_children`) while the branch has live normal child branches. Each child's timeline branches from its parent's, and Neon refuses to delete a timeline that others branch from, so the children go first. Backup branches never count as children. Main can't be deleted or reset.
+
+They are also refused (409 `branch_merge_busy`) while a [schema merge](/docs/using/merging-schema#while-a-merge-runs) holds the branch as its source or target: it is rehearsing or applying, or it failed half applied and waits to be retried or abandoned.
 
 ## Passwords on a new branch
 

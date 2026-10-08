@@ -11,14 +11,15 @@ use chelabase_metadata::{
     AppSession, AppUsersStatus, BeginDelete, BeginEnable, BeginProjectDelete, BranchAuthSync, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus, EnableStart,
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
     NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite, SettingsPatch, TenantOverview,
+    MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
 };
 use chelabase_nats::{
-    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, GrantDataRoleRequest,
+    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, MergeJob, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, GrantDataRoleRequest,
     JetStreamContext, JobEnvelope,
     ProjectDeleteJob, ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
-    RoleCreateRequest, RoleReply, RoleRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
+    RoleCreateRequest, RoleReply, RoleRequest, RoleSessionsReply, RoleUpdateRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
     SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_GRANT_DATA_ROLE_TO_OWNER, SUBJECT_RESET_PASSWORD,
-    SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
+    SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_SESSIONS, SUBJECT_ROLE_UPDATE,
 };
 use chelabase_secrets::{open_credential, open_role_password, Purpose, SecretKey};
 use chelabase_types::api_error::{ApiError, ErrorCode};
@@ -43,6 +44,7 @@ mod app_users;
 mod data_keys;
 mod docs;
 pub mod internal;
+mod merges;
 mod openapi;
 pub mod projects;
 mod roles;
@@ -465,6 +467,57 @@ pub trait MetadataPort: Send + Sync + 'static {
         user: &str,
         id: Uuid,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Inserts a `computing` merge, or says which merge is in the way.
+    fn create_merge(
+        &self,
+        merge: &NewMerge,
+    ) -> impl Future<Output = Result<MergeCreate, MetadataError>> + Send;
+
+    fn get_merge(
+        &self,
+        id: Uuid,
+    ) -> impl Future<Output = Result<Option<MergeRecord>, MetadataError>> + Send;
+
+    /// The database's merges, newest first; with `branch`, those where it is source or target.
+    fn list_merges(
+        &self,
+        database_id: DatabaseId,
+        branch: Option<BranchId>,
+    ) -> impl Future<Output = Result<Vec<MergeRecord>, MetadataError>> + Send;
+
+    /// Saves a draft's edits if `expected_version` is current (see `MergeDraftPatch`).
+    fn update_merge_draft(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        patch: &MergeDraftPatch,
+    ) -> impl Future<Output = Result<MergeWrite, MetadataError>> + Send;
+
+    /// Guarded status change; true when it happened.
+    fn set_merge_status(
+        &self,
+        id: Uuid,
+        from: &[MergeStatus],
+        to: MergeStatus,
+        patch: MergeStatusPatch,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    fn merge_events(
+        &self,
+        id: Uuid,
+    ) -> impl Future<Output = Result<Vec<MergeEvent>, MetadataError>> + Send;
+
+    /// Cancels the branch's merges that nothing is running; how many.
+    fn cancel_drafts_for_branch(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
+
+    /// A merge holding the branch as source or target, or a live rehearsal of it (T14 F3).
+    fn branch_has_busy_merge(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Option<chelabase_metadata::BranchBusy>, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -838,6 +891,52 @@ impl MetadataPort for MetadataClient {
     ) -> Result<bool, MetadataError> {
         MetadataClient::delete_saved_query(self, database, user, id).await
     }
+    async fn create_merge(&self, merge: &NewMerge) -> Result<MergeCreate, MetadataError> {
+        MetadataClient::create_merge(self, merge).await
+    }
+
+    async fn get_merge(&self, id: Uuid) -> Result<Option<MergeRecord>, MetadataError> {
+        MetadataClient::merge(self, id).await
+    }
+
+    async fn list_merges(
+        &self,
+        database_id: DatabaseId,
+        branch: Option<BranchId>,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        MetadataClient::list_merges(self, database_id, branch).await
+    }
+
+    async fn update_merge_draft(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        patch: &MergeDraftPatch,
+    ) -> Result<MergeWrite, MetadataError> {
+        MetadataClient::update_merge_draft(self, id, expected_version, patch).await
+    }
+
+    async fn set_merge_status(
+        &self,
+        id: Uuid,
+        from: &[MergeStatus],
+        to: MergeStatus,
+        patch: MergeStatusPatch,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::set_merge_status(self, id, from, to, patch).await
+    }
+
+    async fn merge_events(&self, id: Uuid) -> Result<Vec<MergeEvent>, MetadataError> {
+        MetadataClient::merge_events(self, id).await
+    }
+
+    async fn cancel_drafts_for_branch(&self, branch: BranchId) -> Result<u64, MetadataError> {
+        MetadataClient::cancel_drafts_for_branch(self, branch).await
+    }
+
+    async fn branch_has_busy_merge(&self, branch: BranchId) -> Result<Option<chelabase_metadata::BranchBusy>, MetadataError> {
+        MetadataClient::branch_has_busy_merge(self, branch).await
+    }
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -872,6 +971,11 @@ pub trait JobPort: Send + Sync + 'static {
     fn publish_database_settings(
         &self,
         job: &JobEnvelope<DatabaseSettingsJob>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
+    fn publish_merge(
+        &self,
+        job: &JobEnvelope<MergeJob>,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
     /// Asks the worker whether a secret key may use `role` on the branch (and grants it to
@@ -935,11 +1039,23 @@ pub trait JobPort: Send + Sync + 'static {
         request: RoleRequest,
     ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
 
+    /// Changes a role's LOGIN, owner-level, attributes or memberships.
+    fn update_role(
+        &self,
+        request: RoleUpdateRequest,
+    ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
+
     /// Deletes a login role.
     fn delete_role(
         &self,
         request: RoleRequest,
     ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
+
+    /// Reads a role's live sessions on the branch's compute (E29a); never starts the compute.
+    fn role_sessions(
+        &self,
+        request: RoleRequest,
+    ) -> impl Future<Output = Result<RoleSessionsReply, ResetError>> + Send;
 
     fn publish_project_delete(
         &self,
@@ -1045,6 +1161,12 @@ impl JobPort for NatsPorts {
         job: &JobEnvelope<DatabaseSettingsJob>,
     ) -> Result<(), BoxError> {
         chelabase_nats::publish_database_settings(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
+        chelabase_nats::publish_merge(&self.js, job)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
@@ -1167,8 +1289,30 @@ impl JobPort for NatsPorts {
         role_rpc(&self.client, SUBJECT_ROLE_RESET, &request).await
     }
 
+    async fn update_role(&self, request: RoleUpdateRequest) -> Result<RoleReply, ResetError> {
+        role_rpc(&self.client, SUBJECT_ROLE_UPDATE, &request).await
+    }
+
     async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
         role_rpc(&self.client, SUBJECT_ROLE_DELETE, &request).await
+    }
+
+    async fn role_sessions(&self, request: RoleRequest) -> Result<RoleSessionsReply, ResetError> {
+        use async_nats::RequestErrorKind;
+        let body = serde_json::to_vec(&request).map_err(|e| ResetError::Transport(e.to_string()))?;
+        let request = async_nats::Request::new()
+            .payload(body.into())
+            .timeout(Some(RESET_TIMEOUT));
+        let reply = self
+            .client
+            .send_request(SUBJECT_ROLE_SESSIONS, request)
+            .await
+            .map_err(|e| match e.kind() {
+                RequestErrorKind::TimedOut => ResetError::Timeout,
+                RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
+                _ => ResetError::Transport(e.to_string()),
+            })?;
+        serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
     }
 
     async fn publish_project_delete(&self, job: &JobEnvelope<ProjectDeleteJob>) -> Result<(), BoxError> {
@@ -1422,6 +1566,11 @@ struct Database {
     project_id: ProjectId,
     tenant_id: TenantId,
     name: String,
+    /// The main Postgres database's name: the display name with every character outside
+    /// `[A-Za-z0-9_]` turned into `_` ("web-1 prod" is `web_1_prod`). Merges
+    /// (`MergeSummary.database`) and SQL name this one. `null` only for a name Postgres can't use.
+    #[schema(required = true)]
+    postgres_database: Option<String>,
     status: DatabaseStatus,
     #[schema(required = true)]
     host: Option<String>,
@@ -1454,6 +1603,14 @@ fn proxy_address(
     }
 }
 
+/// The main Postgres database's name: the one the worker recorded, else the name it derives
+/// from the display name (before provisioning records it). `None` when no name is usable.
+fn postgres_database(r: &DatabaseRecord) -> Option<String> {
+    r.database_name
+        .clone()
+        .or_else(|| chelabase_metadata::postgres_database_name(&r.name).ok())
+}
+
 /// Main's endpoint, if main has one.
 fn main_endpoint(main: Option<&BranchRecord>) -> Option<&str> {
     main.and_then(|b| b.endpoint_id.as_deref())
@@ -1481,6 +1638,7 @@ impl Database {
     ) -> Self {
         let (host, port) = proxy_address(r.status, main_endpoint(main), proxy).unzip();
         Self {
+            postgres_database: postgres_database(&r),
             database_id: r.database_id,
             project_id: r.project_id,
             tenant_id: r.tenant_id,
@@ -1534,6 +1692,11 @@ struct Project {
 struct DatabaseSummary {
     database_id: DatabaseId,
     name: String,
+    /// The main Postgres database's name: the display name with every character outside
+    /// `[A-Za-z0-9_]` turned into `_` ("web-1 prod" is `web_1_prod`). Merges
+    /// (`MergeSummary.database`) and SQL name this one. `null` only for a name Postgres can't use.
+    #[schema(required = true)]
+    postgres_database: Option<String>,
     status: DatabaseStatus,
     #[schema(required = true)]
     host: Option<String>,
@@ -1580,6 +1743,7 @@ impl Project {
                     let (host, port) =
                         proxy_address(d.status, main_endpoint(main.map(|m| &m.0)), proxy).unzip();
                     DatabaseSummary {
+                        postgres_database: postgres_database(&d),
                         database_id: d.database_id,
                         name: d.name,
                         status: d.status,
@@ -1609,6 +1773,7 @@ where
         .routes(routes!(reset_password))
         .routes(routes!(me))
         .merge(branches::routes())
+        .merge(merges::routes())
         .merge(data_keys::routes())
         .merge(data_api_databases::routes())
         .merge(console::routes())

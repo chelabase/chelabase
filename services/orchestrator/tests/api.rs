@@ -4,14 +4,15 @@ use chelabase_auth::internal::{
 };
 use chelabase_metadata::{
     BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseOrigin, DataKeyRecord, DatabaseRecord,
-    DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, ProjectStatus, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
+    DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, ProjectStatus, RoleAttributes, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
     TenantOverview,
     AppSession, AppUsersStatus, BeginEnable, BeginProjectDelete, BranchAuthSync, NewProjectAuth, OnDelete, ProjectAuth,
     ProjectRecord, RenameProject, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
+    BranchBusy, MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
 };
 use chelabase_nats::{
-    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
-    ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RESET_NOT_APPLIED,
+    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, MergeJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
+    ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RoleSession, RoleSessionsReply, RoleUpdateRequest, RESET_NOT_APPLIED,
 };
 use chelabase_routes::{Service, ENDPOINTS};
 use chelabase_types::mode::Mode;
@@ -75,6 +76,17 @@ struct FakeMetadata {
     project_auth_batch_reads: Arc<AtomicUsize>,
     /// Saved queries with their (database, user).
     saved_queries: Arc<Mutex<Vec<(uuid::Uuid, String, SavedQuery)>>>,
+    /// Merge rows and their events.
+    merges: Arc<Mutex<Vec<MergeRecord>>>,
+    merge_events: Arc<Mutex<Vec<MergeEvent>>>,
+    /// `create_merge` finds the open merge gone: the insert conflicted, the lookup found nothing.
+    create_merge_conflicts: Arc<Mutex<bool>>,
+    /// `branch_has_busy_merge` finds nothing (a merge takes the branch after the pre-check).
+    busy_precheck_misses: Arc<Mutex<bool>>,
+    /// The next status write finds the version bumped (a save landed in between).
+    bump_merge_version_on_write: Arc<Mutex<bool>>,
+    /// The next status write finds this result (another request landed in between).
+    result_changes_before_write: Arc<Mutex<Option<Value>>>,
 }
 
 /// A database row and its main branch, which holds the endpoint and the sealed password.
@@ -208,6 +220,7 @@ impl FakeMetadata {
             password: PasswordState::Generated,
             created_at: chrono::Utc::now(),
             pending,
+            attributes: RoleAttributes::default(),
         });
     }
 
@@ -481,6 +494,11 @@ impl MetadataPort for FakeMetadata {
         branch_id: BranchId,
         allow_protected: bool,
     ) -> Result<ClaimOutcome, MetadataError> {
+        // T14 M12: the merge check under the claim, as the real one does under the row lock.
+        let ready = self.branches.lock().unwrap().get(&branch_id).is_some_and(|b| b.status == BranchStatus::Ready);
+        if ready && let Some(busy) = self.busy(branch_id) {
+            return Ok(ClaimOutcome::MergeBusy(busy));
+        }
         match self.branches.lock().unwrap().get_mut(&branch_id) {
             Some(b) if b.status == BranchStatus::Ready && b.protected && !allow_protected => {
                 Ok(ClaimOutcome::Protected)
@@ -520,6 +538,17 @@ impl MetadataPort for FakeMetadata {
     }
 
     async fn begin_branch_delete(&self, branch_id: BranchId) -> Result<BranchDeleteOutcome, MetadataError> {
+        // T14 F3 (I1): a merge holding the live branch refuses it, as the real one checks under
+        // the branch's row lock.
+        let live_now = self
+            .branches
+            .lock()
+            .unwrap()
+            .get(&branch_id)
+            .is_some_and(|b| !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted));
+        if live_now && let Some(busy) = self.busy(branch_id) {
+            return Ok(BranchDeleteOutcome::MergeBusy(busy));
+        }
         let mut branches = self.branches.lock().unwrap();
         if *self.protect_on_delete.lock().unwrap() == Some(branch_id) {
             branches.get_mut(&branch_id).unwrap().protected = true;
@@ -634,22 +663,22 @@ impl MetadataPort for FakeMetadata {
         if *self.endpoint_busy.lock().unwrap() {
             return Err(MetadataError::EndpointLockTimeout("ep-test".into()));
         }
-        // As the store: the old key's OID wins; a different checked OID is a recreated role.
+        // As the store: the old key's identity carries over (`rotated_identity`, E26).
         let stored = self
             .keys
             .lock()
             .unwrap()
             .iter()
             .find(|(k, _)| k.id == old && k.branch_id == branch && k.revoked_at.is_none())
-            .map(|(k, _)| (k.role.clone(), k.role_oid));
+            .map(|(k, _)| (k.role.clone(), k.role_oid, k.role_timeline.clone()));
         let mut new = new.clone();
-        if let Some((role, stored)) = stored {
-            if let (Some(stored), Some(checked)) = (stored, new.role_oid)
-                && stored != checked
-            {
-                return Err(MetadataError::RoleRecreated(role));
-            }
-            new.role_oid = stored.or(new.role_oid);
+        if let Some((role, oid, timeline)) = stored {
+            (new.role_oid, new.role_timeline) = chelabase_metadata::rotated_identity(
+                &role,
+                (oid, timeline),
+                (new.role_oid, new.role_timeline.clone()),
+                &new.role,
+            )?;
         }
         self.rotate_data_key(branch, old, &new).await
     }
@@ -1193,6 +1222,197 @@ impl MetadataPort for FakeMetadata {
         rows.retain(|(d, u, q)| !(*d == database && u == user && q.id == id));
         Ok(rows.len() < before)
     }
+    async fn create_merge(&self, m: &NewMerge) -> Result<MergeCreate, MetadataError> {
+        if *self.create_merge_conflicts.lock().unwrap() {
+            return Err(MetadataError::Conflict);
+        }
+        let mut rows = self.merges.lock().unwrap();
+        if let Some(r) = rows.iter().find(|r| r.target_branch_id == m.target_branch_id.as_uuid() && r.state().is_applying()) {
+            return Ok(MergeCreate::ApplyingExists(r.id));
+        }
+        if let Some(r) = rows.iter().find(|r| {
+            r.source_branch_id == m.source_branch_id.as_uuid()
+                && r.target_branch_id == m.target_branch_id.as_uuid()
+                && r.database_name == m.database_name
+                && r.state().is_open()
+        }) {
+            return Ok(MergeCreate::OpenExists(r.id));
+        }
+        let now = chrono::Utc::now();
+        let record = MergeRecord {
+            id: m.id,
+            database_id: m.database_id.as_uuid(),
+            source_branch_id: m.source_branch_id.as_uuid(),
+            target_branch_id: m.target_branch_id.as_uuid(),
+            direction: m.direction,
+            database_name: m.database_name.clone(),
+            status: MergeStatus::Computing,
+            failed_phase: None,
+            version: 1,
+            base_fingerprint: None,
+            source_fingerprint: None,
+            target_fingerprint: None,
+            analysis: None,
+            resolutions: json!([]),
+            user_steps: json!([]),
+            acknowledgements: json!([]),
+            options: m.options.clone().unwrap_or_else(|| json!({"lock_timeout_ms": 5000, "after": "keep"})),
+            plan: None,
+            rehearsal: None,
+            result: None,
+            rebaselined: false,
+            error: None,
+            claimed_at: Some(now),
+            created_by: m.created_by.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+        rows.push(record.clone());
+        Ok(MergeCreate::Created(record))
+    }
+
+    async fn get_merge(&self, id: uuid::Uuid) -> Result<Option<MergeRecord>, MetadataError> {
+        Ok(self.merges.lock().unwrap().iter().find(|r| r.id == id).cloned())
+    }
+
+    async fn list_merges(&self, database_id: DatabaseId, branch: Option<BranchId>) -> Result<Vec<MergeRecord>, MetadataError> {
+        let mut rows: Vec<MergeRecord> = self
+            .merges
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.database_id == database_id.as_uuid()
+                    && branch.is_none_or(|b| r.source_branch_id == b.as_uuid() || r.target_branch_id == b.as_uuid())
+            })
+            .cloned()
+            .collect();
+        rows.reverse();
+        Ok(rows)
+    }
+
+    async fn update_merge_draft(&self, id: uuid::Uuid, expected_version: i64, patch: &MergeDraftPatch) -> Result<MergeWrite, MetadataError> {
+        let mut rows = self.merges.lock().unwrap();
+        let Some(r) = rows.iter_mut().find(|r| r.id == id) else { return Ok(MergeWrite::NotFound) };
+        if !matches!(r.status, MergeStatus::Draft | MergeStatus::Rehearsed) {
+            return Ok(MergeWrite::NotEditable(r.status));
+        }
+        if r.version != expected_version {
+            return Ok(MergeWrite::Stale(r.clone()));
+        }
+        r.version += 1;
+        if r.status == MergeStatus::Rehearsed && (patch.start_compute || !patch.keep_plan) {
+            r.rehearsal = None;
+            r.status = MergeStatus::Draft;
+        }
+        if patch.start_compute {
+            r.status = MergeStatus::Computing;
+            r.claimed_at = Some(chrono::Utc::now());
+        }
+        if let Some(v) = &patch.resolutions { r.resolutions = v.clone(); }
+        if let Some(v) = &patch.user_steps { r.user_steps = v.clone(); }
+        if let Some(v) = &patch.acknowledgements { r.acknowledgements = v.clone(); }
+        if let Some(v) = &patch.options { r.options = v.clone(); }
+        Ok(MergeWrite::Saved(r.clone()))
+    }
+
+    async fn set_merge_status(&self, id: uuid::Uuid, from: &[MergeStatus], to: MergeStatus, patch: MergeStatusPatch) -> Result<bool, MetadataError> {
+        if patch.guard_branches_ready {
+            let Some(m) = self.merges.lock().unwrap().iter().find(|r| r.id == id).cloned() else { return Ok(false) };
+            let branches = self.branches.lock().unwrap();
+            let ready = |b: uuid::Uuid| branches.get(&BranchId(b)).is_some_and(|b| b.status == BranchStatus::Ready);
+            if !ready(m.source_branch_id) || !ready(m.target_branch_id) {
+                return Ok(false);
+            }
+        }
+        let mut rows = self.merges.lock().unwrap();
+        if std::mem::take(&mut *self.bump_merge_version_on_write.lock().unwrap())
+            && let Some(r) = rows.iter_mut().find(|r| r.id == id)
+        {
+            r.version += 1;
+        }
+        if let Some(result) = self.result_changes_before_write.lock().unwrap().take()
+            && let Some(r) = rows.iter_mut().find(|r| r.id == id)
+        {
+            r.result = Some(result);
+        }
+        let Some(r) = rows.iter().position(|r| {
+            r.id == id
+                && from.contains(&r.status)
+                && patch.guard_failed_phase.as_ref().is_none_or(|p| &r.failed_phase == p)
+                && patch.guard_version.is_none_or(|v| r.version == v)
+                && patch.guard_result.as_ref().is_none_or(|v| &r.result == v)
+        }) else {
+            return Ok(false);
+        };
+        // `merges_one_applying`: the state after the write against the others'.
+        let failed_phase = patch.failed_phase.clone().unwrap_or_else(|| rows[r].failed_phase.clone());
+        let after = chelabase_metadata::MergeState::of(to, failed_phase.as_deref());
+        if after.is_applying()
+            && rows.iter().any(|o| o.id != id && o.target_branch_id == rows[r].target_branch_id && o.state().is_applying())
+        {
+            return Err(MetadataError::Conflict);
+        }
+        if patch.log_status {
+            let mut e = MergeEvent::new(id, "status");
+            e.detail = Some(json!({ "to": to.as_str() }));
+            self.merge_events.lock().unwrap().push(e);
+        }
+        let r = &mut rows[r];
+        r.status = to;
+        r.claimed_at = to.is_working().then(chrono::Utc::now);
+        if patch.analysis.is_some() || patch.plan.is_some() { r.version += 1; }
+        if let Some(v) = patch.analysis { r.analysis = Some(v); }
+        if let Some(v) = patch.plan { r.plan = Some(v); }
+        if let Some(v) = patch.rehearsal { r.rehearsal = Some(v); }
+        if let Some(v) = patch.result { r.result = Some(v); }
+        if let Some(v) = patch.error { r.error = v; }
+        if let Some(v) = patch.failed_phase { r.failed_phase = v; }
+        if let Some(v) = patch.rebaselined { r.rebaselined = v; }
+        if let Some(v) = patch.options { r.options = v; }
+        Ok(true)
+    }
+
+    async fn merge_events(&self, id: uuid::Uuid) -> Result<Vec<MergeEvent>, MetadataError> {
+        Ok(self.merge_events.lock().unwrap().iter().filter(|e| e.merge_id == id).cloned().collect())
+    }
+
+    async fn cancel_drafts_for_branch(&self, branch: BranchId) -> Result<u64, MetadataError> {
+        let mut n = 0;
+        for r in self.merges.lock().unwrap().iter_mut() {
+            if (r.source_branch_id == branch.as_uuid() || r.target_branch_id == branch.as_uuid())
+                && matches!(r.status, MergeStatus::Computing | MergeStatus::Draft | MergeStatus::Rehearsed)
+            {
+                r.status = MergeStatus::Cancelled;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn branch_has_busy_merge(&self, branch: BranchId) -> Result<Option<BranchBusy>, MetadataError> {
+        if *self.busy_precheck_misses.lock().unwrap() {
+            return Ok(None);
+        }
+        Ok(self.busy(branch))
+    }
+}
+
+impl FakeMetadata {
+    /// What holds `branch` (as `MetadataClient::branch_has_busy_merge` reads it).
+    fn busy(&self, branch: BranchId) -> Option<BranchBusy> {
+        let merge = self.merges.lock().unwrap().iter().find(|r| {
+            (r.source_branch_id == branch.as_uuid() || r.target_branch_id == branch.as_uuid()) && r.state().holds_branches()
+        }).map(|r| BranchBusy::Merge(r.id));
+        merge.or_else(|| {
+            self.branches
+                .lock()
+                .unwrap()
+                .values()
+                .find(|b| b.parent_branch_id == Some(branch) && b.kind == BranchKind::Rehearsal && b.status != BranchStatus::Deleted)
+                .map(|b| BranchBusy::Rehearsal(b.id))
+        })
+    }
 }
 
 fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataError> {
@@ -1217,6 +1437,8 @@ fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataEr
             revoked_at: None,
             databases: key.databases.clone(),
             role_oid: key.role_oid,
+            role_timeline: key.role_timeline.clone(),
+            role_bypass_rls: key.kind == DataKeyKind::Secret && key.role_bypass_rls,
         },
         key.sha256,
     ));
@@ -1245,6 +1467,9 @@ struct FakeJobs {
     reset: Arc<Mutex<FakeReset>>,
     branch_jobs: Arc<Mutex<Vec<JobEnvelope<BranchJob>>>>,
     settings_jobs: Arc<Mutex<Vec<DatabaseId>>>,
+    merge_jobs: Arc<Mutex<Vec<MergeJob>>>,
+    /// Merge jobs can't be published.
+    fail_merge_publish: Arc<Mutex<bool>>,
     /// Provision jobs can't be published.
     fail_provision_publish: Arc<Mutex<bool>>,
     /// Branch jobs can't be published.
@@ -1261,8 +1486,15 @@ struct FakeJobs {
     role_grant: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
     /// Each login-role RPC as `create:<name>:<privileged>`, `reset:<name>` or `delete:<name>`.
     role_calls: Arc<Mutex<Vec<String>>>,
+    /// Every create request as sent, and every update request.
+    role_creates: Arc<Mutex<Vec<RoleCreateRequest>>>,
+    role_updates: Arc<Mutex<Vec<RoleUpdateRequest>>>,
     /// What the worker answers to the role RPCs; `ok` when unset.
     role_reply: Arc<Mutex<Option<Result<RoleReply, ResetError>>>>,
+    /// (branch, role) of each role-sessions read.
+    session_reads: Arc<Mutex<Vec<(BranchId, String)>>>,
+    /// What the worker answers to a role-sessions read; running with none when unset.
+    sessions_reply: Arc<Mutex<Option<Result<RoleSessionsReply, ResetError>>>>,
     /// Each data API job as `enable:<name>`, `disable:<name>:<remove>` or `rebootstrap:<name>`.
     data_api_calls: Arc<Mutex<Vec<String>>>,
     /// What the worker answers to disable and rebootstrap; `ok` when unset.
@@ -1320,6 +1552,17 @@ impl JobPort for FakeJobs {
         job: &JobEnvelope<DatabaseSettingsJob>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.settings_jobs.lock().unwrap().push(job.payload.database_id);
+        Ok(())
+    }
+
+    async fn publish_merge(
+        &self,
+        job: &JobEnvelope<MergeJob>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if *self.fail_merge_publish.lock().unwrap() {
+            return Err("nats is down".into());
+        }
+        self.merge_jobs.lock().unwrap().push(job.payload.clone());
         Ok(())
     }
 
@@ -1410,6 +1653,13 @@ impl JobPort for FakeJobs {
             .lock()
             .unwrap()
             .push(format!("create:{}:{}", request.name, request.owner_level));
+        self.role_creates.lock().unwrap().push(request);
+        self.role_answer()
+    }
+
+    async fn update_role(&self, request: RoleUpdateRequest) -> Result<RoleReply, ResetError> {
+        self.role_calls.lock().unwrap().push(format!("update:{}", request.name));
+        self.role_updates.lock().unwrap().push(request);
         self.role_answer()
     }
 
@@ -1421,6 +1671,14 @@ impl JobPort for FakeJobs {
     async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
         self.role_calls.lock().unwrap().push(format!("delete:{}", request.name));
         self.role_answer()
+    }
+
+    async fn role_sessions(&self, request: RoleRequest) -> Result<RoleSessionsReply, ResetError> {
+        self.session_reads.lock().unwrap().push((request.branch_id, request.name));
+        match self.sessions_reply.lock().unwrap().clone() {
+            Some(answer) => answer,
+            None => Ok(RoleSessionsReply::running(Vec::new())),
+        }
     }
 
     async fn publish_project_delete(
@@ -3183,6 +3441,41 @@ async fn restore_works_on_main() {
     assert!(body["backup_name"].as_str().unwrap().starts_with("main-before-restore-"));
 }
 
+// T14 M8: a branch's history begins at its branch point (and, by time, at its
+// `history_start`): a restore to before it would bring back the parent's older state, so it's
+// refused at once, before anything changes. At the start itself it's accepted.
+#[tokio::test]
+async fn restore_before_the_branch_history_begins_is_refused() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let start: chrono::DateTime<chrono::Utc> = "2026-09-30T12:00:00Z".parse().unwrap();
+    {
+        let mut branches = t.metadata.branches.lock().unwrap();
+        let b = branches.get_mut(&dev).unwrap();
+        b.branched_at_lsn = Some("0/2000000".into());
+        b.history_start = Some(start);
+    }
+    let path = format!("{}/restore", t.branch(dev));
+    for (at, message) in [
+        (
+            json!({ "lsn": "0/1FFFFFF" }),
+            "the LSN 0/1FFFFFF is before dev's history begins (its branch point, 0/2000000)",
+        ),
+        (
+            json!({ "timestamp": "2026-09-30T11:59:59Z" }),
+            "the time 2026-09-30T11:59:59Z is before dev's history begins (2026-09-30T12:00:00Z)",
+        ),
+    ] {
+        let err = error_of(t.send(Method::POST, &path, Some(json!({ "at": at }))).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{at}");
+        assert_eq!(message_of(&err), message, "{at}");
+    }
+    assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
+    assert!(t.published().is_empty());
+    let ok = t.send(Method::POST, &path, Some(json!({ "at": { "lsn": "0/2000000" } }))).await;
+    assert_eq!(ok.status(), 202);
+}
+
 #[tokio::test]
 async fn restore_refusals() {
     let t = branching().await;
@@ -3424,6 +3717,30 @@ async fn me_and_get_database_show_branch_count_with_one_lookup_for_me() {
     assert_eq!(get["host"], "ep-0123456789ab.localtest.me");
 }
 
+/// Merges name the Postgres database (`MergeSummary.database`), which differs from the
+/// display name whenever sanitizing changes it: both views carry the Postgres name.
+#[tokio::test]
+async fn me_and_get_database_show_the_postgres_database_name() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let mut overview = overview_with_database(tenant);
+    overview.projects[0].databases[0].name = "web-1 prod".into();
+    overview.projects[0].databases[0].database_name = None;
+    let id = overview.projects[0].databases[0].database_id;
+    metadata.insert_database(overview.projects[0].databases[0].clone());
+    metadata.set_overview(overview);
+    let app = spawn_app(metadata.clone(), FakeJobs::default()).await;
+
+    let me: Value = get_me(&app, Some(&app.token_for_org("org-1"))).await.json().await.unwrap();
+    let db = &me["tenant"]["projects"][0]["databases"][0];
+    assert_eq!(db["name"], "web-1 prod");
+    assert_eq!(db["postgres_database"], "web_1_prod");
+
+    let get: Value = call(&app, Method::GET, &format!("/v1/databases/{}", id.as_uuid()), "org-1").await.json().await.unwrap();
+    assert_eq!(get["postgres_database"], "web_1_prod");
+}
+
 // ---- data API keys
 
 impl Branching {
@@ -3446,6 +3763,8 @@ impl Branching {
             sealed: Some(seal_credential(&self.app.key, &id.to_string(), Purpose::DataKey, &generated.key)),
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         };
         insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
         (id, generated.key)
@@ -3465,6 +3784,8 @@ impl Branching {
             sealed: None,
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         };
         insert_key(&mut self.metadata.keys.lock().unwrap(), &new).unwrap();
         (id, generated.key)
@@ -3575,7 +3896,7 @@ async fn create_validates_the_body() {
 async fn secret_keys_store_the_role_oid_the_check_found() {
     let t = branching().await;
     t.seed_public_key(t.main());
-    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16390)));
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16390, "tl1")));
     let created: Value = t
         .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" })))
         .await
@@ -3583,10 +3904,13 @@ async fn secret_keys_store_the_role_oid_the_check_found() {
         .await
         .unwrap();
     let id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
-    let oid_of = |id: uuid::Uuid| {
-        t.metadata.keys.lock().unwrap().iter().find(|(k, _)| k.id == id).unwrap().0.role_oid
+    // E26: bound to the OID and the timeline the check read it on.
+    let identity = |id: uuid::Uuid| {
+        let keys = t.metadata.keys.lock().unwrap();
+        let k = &keys.iter().find(|(k, _)| k.id == id).unwrap().0;
+        (k.role_oid, k.role_timeline.clone())
     };
-    assert_eq!(oid_of(id), Some(16390));
+    assert_eq!(identity(id), (Some(16390), Some("tl1".to_string())));
     let rotated: Value = t
         .send(Method::POST, &format!("{}/{id}/rotate", t.keys(t.main())), None)
         .await
@@ -3594,7 +3918,60 @@ async fn secret_keys_store_the_role_oid_the_check_found() {
         .await
         .unwrap();
     let new_id: uuid::Uuid = rotated["id"].as_str().unwrap().parse().unwrap();
-    assert_eq!(oid_of(new_id), Some(16390), "the rotated key keeps the identity");
+    assert_eq!(identity(new_id), (Some(16390), Some("tl1".to_string())), "the rotated key keeps the identity");
+    // After a switch the same OID still under the key's name: kept, bound to the new timeline.
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16390, "tl2")));
+    let rotated: Value = t
+        .send(Method::POST, &format!("{}/{new_id}/rotate", t.keys(t.main())), None)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let newer: uuid::Uuid = rotated["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(identity(newer), (Some(16390), Some("tl2".to_string())));
+}
+
+// E33: a secret key may use a role with BYPASSRLS; the check says so, the key stores it, and
+// the list marks the key so Studio can show "bypasses RLS". A rotation takes the new check's
+// answer; the public key never bypasses.
+#[tokio::test]
+async fn secret_keys_say_whether_their_role_bypasses_rls() {
+    let t = branching().await;
+    let (public, _) = t.seed_public_key(t.main());
+    *t.jobs.role_check.lock().unwrap() =
+        Some(Ok(CheckDataRoleReply::ok_with_oid(16390, "tl1").bypassing_rls(true)));
+    let created: Value = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "svc", "role": "service" })))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let flag = |list: &[Value], id: &str| list.iter().find(|k| k["id"] == json!(id)).unwrap()["bypasses_rls"].clone();
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(flag(&list, &id), true);
+    assert_eq!(flag(&list, &public.to_string()), false);
+    // The role lost BYPASSRLS since: the rotation's check says so.
+    *t.jobs.role_check.lock().unwrap() =
+        Some(Ok(CheckDataRoleReply::ok_with_oid(16390, "tl1").bypassing_rls(false)));
+    let rotated: Value = t
+        .send(Method::POST, &format!("{}/{id}/rotate", t.keys(t.main())), None)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(flag(&list, rotated["id"].as_str().unwrap()), false);
+    // A worker that predates E33 doesn't say: not marked.
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16391, "tl1")));
+    let old: Value = t
+        .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "old", "role": "other" })))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let list = t.list_keys(t.main()).await;
+    assert_eq!(flag(&list, old["id"].as_str().unwrap()), false);
 }
 
 // The role was dropped and created again under the same name (a new OID): the old key is
@@ -3603,7 +3980,7 @@ async fn secret_keys_store_the_role_oid_the_check_found() {
 async fn rotate_refuses_a_key_whose_role_was_recreated() {
     let t = branching().await;
     t.seed_public_key(t.main());
-    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16390)));
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16390, "tl1")));
     let created: Value = t
         .send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" })))
         .await
@@ -3611,7 +3988,7 @@ async fn rotate_refuses_a_key_whose_role_was_recreated() {
         .await
         .unwrap();
     let id = created["id"].as_str().unwrap().to_string();
-    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16391)));
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::ok_with_oid(16391, "tl1")));
     let resp = t.send(Method::POST, &format!("{}/{id}/rotate", t.keys(t.main())), None).await;
     let body = error_of(resp, 422).await;
     assert_eq!(code_of(&body), "role_refused");
@@ -3732,7 +4109,7 @@ async fn create_maps_check_role_refusal_to_422() {
         (Err(ResetError::Timeout), 504, "timeout", None),
         (Err(ResetError::Transport("no worker listening".into())), 503, "worker_unavailable", None),
         // A reply that says no without saying why is our failure.
-        (Ok(CheckDataRoleReply { ok: false, error: None, kind: None, role_oid: None }), 500, "internal", None),
+        (Ok(CheckDataRoleReply { ok: false, error: None, kind: None, role_oid: None, role_timeline: None, role_bypass_rls: None }), 500, "internal", None),
     ];
     for (answer, status, code, message) in cases {
         *t.jobs.role_check.lock().unwrap() = Some(answer);
@@ -4334,6 +4711,7 @@ fn role_row(name: &str, origin: RoleOrigin, level: RoleLevel, password: Password
         password,
         created_at: chrono::Utc::now(),
         pending: false,
+        attributes: RoleAttributes::default(),
     }
 }
 
@@ -4367,6 +4745,8 @@ async fn list_roles_shapes_and_blocked_keys() {
                 sha256: [id.as_bytes()[0]; 32],
                 databases: None,
                 role_oid: None,
+                role_timeline: None,
+                role_bypass_rls: false,
             },
         )
         .unwrap();
@@ -4464,7 +4844,21 @@ async fn create_role_takes_owner_level_and_refuses_privileged() {
     fields.sort();
     assert_eq!(
         fields,
-        ["blocked_keys", "created_at", "level", "login", "name", "origin", "password", "pending"],
+        [
+            "blocked_keys",
+            "bypass_rls",
+            "connection_limit",
+            "created_at",
+            "inherit",
+            "level",
+            "login",
+            "member_of",
+            "name",
+            "origin",
+            "password",
+            "pending",
+            "valid_until",
+        ],
         "{body}"
     );
     assert_eq!(body["password"], "generated");
@@ -4478,6 +4872,209 @@ async fn create_role_takes_owner_level_and_refuses_privileged() {
     let err = error_of(t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "x", "privileged": true }))).await, 422).await;
     assert_eq!(code_of(&err), "invalid_request");
     assert_eq!(t.jobs.role_calls.lock().unwrap().len(), 1);
+}
+
+// U1: the new fields reach the worker as sent; omitted ones keep a plain LOGIN role's
+// defaults; the answer carries the attributes and never a password.
+#[tokio::test]
+async fn create_role_accepts_new_fields() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    let attributes = RoleAttributes {
+        inherit: false,
+        connection_limit: 3,
+        valid_until: chrono::DateTime::from_timestamp(1_900_000_000, 0),
+        bypass_rls: true,
+        member_of: vec!["readers".into()],
+    };
+    t.metadata.add_role_row(
+        &ep,
+        RoleRow {
+            login: false,
+            attributes: attributes.clone(),
+            ..role_row("grp", RoleOrigin::Api, RoleLevel::Plain, PasswordState::None)
+        },
+    );
+    let resp = t
+        .send(
+            Method::POST,
+            &t.roles(dev),
+            Some(json!({
+                "name": "grp",
+                "login": false,
+                "inherit": false,
+                "connection_limit": 3,
+                "valid_until": "2030-03-17T17:46:40Z",
+                "bypass_rls": true,
+                "member_of": ["readers"],
+            })),
+        )
+        .await;
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["login"], false);
+    assert_eq!(body["password"], "none");
+    assert_eq!(body["inherit"], false);
+    assert_eq!(body["connection_limit"], 3);
+    assert_eq!(body["valid_until"], "2030-03-17T17:46:40Z");
+    assert_eq!(body["bypass_rls"], true);
+    assert_eq!(body["member_of"], json!(["readers"]));
+    let sent = t.jobs.role_creates.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        vec![RoleCreateRequest {
+            login: false,
+            inherit: false,
+            connection_limit: 3,
+            valid_until: attributes.valid_until,
+            bypass_rls: true,
+            member_of: vec!["readers".into()],
+            ..RoleCreateRequest::login(dev, "grp", false)
+        }]
+    );
+
+    // Omitted fields: today's defaults.
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    let resp = t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app" }))).await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(
+        t.jobs.role_creates.lock().unwrap().last().unwrap(),
+        &RoleCreateRequest::login(dev, "app", false)
+    );
+}
+
+// U2: only the allowed attributes can be expressed; anything else is refused before the
+// worker hears of it, as are memberships in Chelabase's own roles.
+#[tokio::test]
+async fn create_role_refuses_unknown_attribute() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    for field in ["superuser", "createrole", "createdb", "replication", "password", "admin_of"] {
+        let err = error_of(
+            t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app", field: true }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&err), "invalid_request", "{field}");
+    }
+    for target in ["authenticated", "anon", "authenticator", "neon_superuser", "chelabase_admin", "pg_monitor", "postgres", "app"] {
+        let err = error_of(
+            t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app", "member_of": [target] }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&err), "role_membership_not_allowed", "{target}");
+    }
+    let err = error_of(
+        t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app", "connection_limit": -2 }))).await,
+        422,
+    )
+    .await;
+    assert_eq!(code_of(&err), "role_attribute_not_allowed");
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+    // The worker's refusal of a target (missing, or not the owner's to grant) maps too.
+    *t.jobs.role_reply.lock().unwrap() = Some(Ok(role_reply("role_membership_not_allowed")));
+    let err = error_of(
+        t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "app", "member_of": ["ghost"] }))).await,
+        422,
+    )
+    .await;
+    assert_eq!(code_of(&err), "role_membership_not_allowed");
+}
+
+// U1: PATCH changes what's given (null clears the expiry), answers 202 with the role, and
+// asks the worker over the update RPC.
+#[tokio::test]
+async fn patch_role_is_202_and_publishes() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    let path = format!("{}/app", t.roles(dev));
+    let resp = t
+        .send(
+            Method::PATCH,
+            &path,
+            Some(json!({ "login": false, "bypass_rls": true, "valid_until": null, "member_of": [] })),
+        )
+        .await;
+    assert_eq!(resp.status(), 202);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "app");
+    assert!(body.get("password").is_some_and(|p| p.is_string()));
+    assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["update:app".to_string()]);
+    assert_eq!(
+        t.jobs.role_updates.lock().unwrap().clone(),
+        vec![RoleUpdateRequest {
+            login: Some(false),
+            bypass_rls: Some(true),
+            valid_until: Some(None),
+            member_of: Some(vec![]),
+            ..RoleUpdateRequest::new(dev, "app")
+        }]
+    );
+    // Unknown fields, the owner, reserved memberships: refused without the worker.
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "superuser": true }))).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    let owner = format!("{}/postgres", t.roles(dev));
+    let err = error_of(t.send(Method::PATCH, &owner, Some(json!({ "inherit": false }))).await, 422).await;
+    assert_eq!(code_of(&err), "reserved_role_name");
+    // Any `chelabase_` role is Chelabase's own, listed reserved or not.
+    for name in ["chelabase_custom", "Chelabase_x"] {
+        let target = format!("{}/{name}", t.roles(dev));
+        let err = error_of(t.send(Method::PATCH, &target, Some(json!({ "inherit": false }))).await, 422).await;
+        assert_eq!(code_of(&err), "reserved_role_name", "{name}");
+    }
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "member_of": ["anon"] }))).await, 422).await;
+    assert_eq!(code_of(&err), "role_membership_not_allowed");
+    assert_eq!(t.jobs.role_calls.lock().unwrap().len(), 1);
+    // The worker's answers map like the other role routes'.
+    *t.jobs.role_reply.lock().unwrap() = Some(Ok(role_reply("not_found")));
+    error_of(t.send(Method::PATCH, &path, Some(json!({ "inherit": false }))).await, 404).await;
+    *t.jobs.role_reply.lock().unwrap() = Some(Ok(role_reply("not_applied")));
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "inherit": false }))).await, 503).await;
+    assert_eq!(code_of(&err), "not_applied");
+    // T14 I2: turning LOGIN on at the branch's cap is refused like a create at the cap.
+    *t.jobs.role_reply.lock().unwrap() = Some(Ok(role_reply("role_cap_reached")));
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "login": true }))).await, 409).await;
+    assert_eq!(code_of(&err), "role_cap_reached");
+}
+
+// P13: the list shows the attributes read-only, and never a password.
+#[tokio::test]
+async fn role_list_shows_attributes_without_password() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role_row(
+        &ep,
+        RoleRow {
+            login: false,
+            attributes: RoleAttributes {
+                inherit: false,
+                connection_limit: 5,
+                valid_until: None,
+                bypass_rls: true,
+                member_of: vec!["a".into(), "b".into()],
+            },
+            ..role_row("grp", RoleOrigin::Api, RoleLevel::Plain, PasswordState::None)
+        },
+    );
+    let body: Value = t.send(Method::GET, &t.roles(dev), None).await.json().await.unwrap();
+    let row = body.as_array().unwrap().iter().find(|r| r["name"] == "grp").unwrap().clone();
+    assert_eq!(row["login"], false);
+    assert_eq!(row["inherit"], false);
+    assert_eq!(row["connection_limit"], 5);
+    assert_eq!(row["valid_until"], Value::Null);
+    assert_eq!(row["bypass_rls"], true);
+    assert_eq!(row["member_of"], json!(["a", "b"]));
+    assert_eq!(row["password"], "none");
+    let owner = body.as_array().unwrap().iter().find(|r| r["name"] == "postgres").unwrap();
+    assert_eq!(owner["inherit"], true);
+    assert_eq!(owner["connection_limit"], -1);
+    let text = body.to_string();
+    assert!(!text.contains("SCRAM") && !text.contains("v1:"), "{text}");
 }
 
 #[tokio::test]
@@ -4675,6 +5272,100 @@ async fn delete_role_204() {
     let resp = t.send(Method::DELETE, &format!("{}/app", t.roles(dev)), None).await;
     assert_eq!(resp.status(), 204);
     assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["delete:app".to_string()]);
+}
+
+// ---- role sessions (E29a)
+
+#[tokio::test]
+async fn role_sessions_lists_the_live_sessions() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    *t.jobs.sessions_reply.lock().unwrap() = Some(Ok(RoleSessionsReply::running(vec![
+        RoleSession {
+            client_addr: Some("10.0.0.7".into()),
+            application_name: "api".into(),
+            backend_start: "2026-10-08T10:00:00Z".parse().unwrap(),
+        },
+        RoleSession { client_addr: None, application_name: String::new(), backend_start: "2026-10-08T11:00:00Z".parse().unwrap() },
+    ])));
+    let resp = t.send(Method::GET, &format!("{}/old_app/sessions", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "compute_running": true,
+            "count": 2,
+            "sessions": [
+                { "client_addr": "10.0.0.7", "application_name": "api", "backend_start": "2026-10-08T10:00:00Z" },
+                { "client_addr": null, "application_name": "", "backend_start": "2026-10-08T11:00:00Z" },
+            ],
+        })
+    );
+    assert_eq!(*t.jobs.session_reads.lock().unwrap(), vec![(dev, "old_app".to_string())]);
+}
+
+#[tokio::test]
+async fn role_sessions_without_a_running_compute_is_not_an_error() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    *t.jobs.sessions_reply.lock().unwrap() = Some(Ok(RoleSessionsReply::not_running()));
+    let resp = t.send(Method::GET, &format!("{}/app/sessions", t.roles(dev)), None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({ "compute_running": false, "count": 0, "sessions": [] }));
+}
+
+#[tokio::test]
+async fn role_sessions_errors() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let path = format!("{}/app/sessions", t.roles(dev));
+    let cases: [(Result<RoleSessionsReply, ResetError>, u16, &str); 4] = [
+        (Ok(RoleSessionsReply::not_ready()), 409, "branch_not_ready"),
+        (Ok(RoleSessionsReply::failed("boom")), 500, "internal"),
+        (Err(ResetError::Timeout), 504, "timeout"),
+        (Err(ResetError::Transport("no worker listening".into())), 503, "worker_unavailable"),
+    ];
+    for (answer, status, code) in cases {
+        *t.jobs.sessions_reply.lock().unwrap() = Some(answer);
+        let err = error_of(t.send(Method::GET, &path, None).await, status).await;
+        assert_eq!(code_of(&err), code);
+        assert!(!message_of(&err).contains("boom"), "worker details stay in the logs");
+    }
+    // Refused before the worker is asked: a name Postgres can't hold, a backup, an unready branch.
+    let reads = t.jobs.session_reads.lock().unwrap().len();
+    let long = "x".repeat(64);
+    let err = error_of(t.send(Method::GET, &format!("{}/{long}/sessions", t.roles(dev)), None).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_role_name");
+    let backup = t.backup(dev);
+    let err = error_of(t.send(Method::GET, &format!("{}/app/sessions", t.roles(backup)), None).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
+    let wip = t.add("wip", dev, BranchKind::Normal, BranchStatus::Pending);
+    let err = error_of(t.send(Method::GET, &format!("{}/app/sessions", t.roles(wip)), None).await, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    let err = error_of(
+        t.send(Method::GET, &format!("{}/app/sessions", t.roles(BranchId::new())), None).await,
+        404,
+    )
+    .await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(t.jobs.session_reads.lock().unwrap().len(), reads);
+}
+
+#[tokio::test]
+async fn role_sessions_of_another_tenant_is_404() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    t.metadata.bind_org("org-2", TenantId::new());
+    let resp = reqwest::Client::new()
+        .get(format!("{}{}/app/sessions", t.app.base, t.roles(dev)))
+        .header(IDENTITY_HEADER, t.app.token_for_org("org-2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(t.jobs.session_reads.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -8087,4 +8778,1322 @@ async fn schema_route_returns_pgls_json() {
     assert!(columns.iter().any(|c| c["table_name"] == "notes" && c["name"] == "body"));
     wait_no_editor_sessions(&scratch).await;
     scratch.drop().await;
+}
+
+// --- Schema merges (step 6g, T10) ------------------------------------------------------------
+
+/// A merge row as the fake stores it, for tests that start from a given state.
+fn merge_row(db: DatabaseId, source: BranchId, target: BranchId, status: MergeStatus) -> MergeRecord {
+    let now = chrono::Utc::now();
+    MergeRecord {
+        id: uuid::Uuid::new_v4(),
+        database_id: db.as_uuid(),
+        source_branch_id: source.as_uuid(),
+        target_branch_id: target.as_uuid(),
+        direction: chelabase_metadata::MergeDirection::IntoParent,
+        database_name: "app".into(),
+        status,
+        failed_phase: None,
+        version: 3,
+        base_fingerprint: None,
+        source_fingerprint: None,
+        target_fingerprint: None,
+        analysis: None,
+        resolutions: json!([]),
+        user_steps: json!([]),
+        acknowledgements: json!([]),
+        options: json!({"lock_timeout_ms": 5000, "after": "keep"}),
+        plan: None,
+        rehearsal: None,
+        result: None,
+        rebaselined: false,
+        error: None,
+        claimed_at: None,
+        created_by: "user-1".into(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+impl Branching {
+    fn merges(&self) -> String {
+        format!("/v1/databases/{}/merges", self.db.as_uuid())
+    }
+
+    fn merge_path(&self, id: uuid::Uuid) -> String {
+        format!("{}/{id}", self.merges())
+    }
+
+    /// A ready `dev` under main, with an `app` database on both.
+    fn mergeable(&self) -> BranchId {
+        let dev = self.ready("dev");
+        self.metadata.add_branch_db(self.main(), "web1", "postgres", DatabaseOrigin::Main);
+        self.metadata.add_branch_db(self.main(), "app", "postgres", DatabaseOrigin::Sql);
+        self.metadata.add_branch_db(dev, "web1", "postgres", DatabaseOrigin::Main);
+        self.metadata.add_branch_db(dev, "app", "postgres", DatabaseOrigin::Sql);
+        dev
+    }
+
+    /// Stores a merge row in `status` (source `dev`, target main) and returns it, changed by `f`.
+    fn seed_merge(&self, dev: BranchId, status: MergeStatus, f: impl FnOnce(&mut MergeRecord)) -> MergeRecord {
+        let mut row = merge_row(self.db, dev, self.main(), status);
+        f(&mut row);
+        self.metadata.merges.lock().unwrap().push(row.clone());
+        row
+    }
+
+    fn merge_state(&self, id: uuid::Uuid) -> MergeRecord {
+        self.metadata.merges.lock().unwrap().iter().find(|r| r.id == id).cloned().expect("merge row")
+    }
+
+    fn set_merge(&self, id: uuid::Uuid, f: impl FnOnce(&mut MergeRecord)) {
+        let mut rows = self.metadata.merges.lock().unwrap();
+        f(rows.iter_mut().find(|r| r.id == id).expect("merge row"));
+    }
+
+    fn merge_jobs(&self) -> Vec<MergeJob> {
+        self.jobs.merge_jobs.lock().unwrap().clone()
+    }
+
+    async fn create_merge(&self, branch: BranchId, body: Value) -> reqwest::Response {
+        self.send(Method::POST, &format!("{}/merges", self.branch(branch)), Some(body)).await
+    }
+}
+
+fn into_parent() -> Value {
+    json!({ "direction": "into_parent", "database": "app" })
+}
+
+#[tokio::test]
+async fn create_merge_is_202_and_publishes_compute() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let resp = t.create_merge(dev, into_parent()).await;
+    assert_eq!(resp.status(), 202);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "computing");
+    assert_eq!(body["direction"], "into_parent");
+    assert_eq!(body["source_branch_id"], json!(dev));
+    assert_eq!(body["target_branch_id"], json!(t.main()));
+    assert_eq!(body["database"], "app");
+    assert_eq!(body["version"], 1);
+    let id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Compute { merge_id: id }]);
+    assert_eq!(t.merge_state(id).created_by, "user-1");
+
+    // From the parent: the parent is the source and the branch receives. The database
+    // defaults to the main one.
+    let second = t.create_merge(dev, json!({ "direction": "from_parent" })).await;
+    assert_eq!(second.status(), 202);
+    let second: Value = second.json().await.unwrap();
+    assert_eq!(second["source_branch_id"], json!(t.main()));
+    assert_eq!(second["target_branch_id"], json!(dev));
+    assert_eq!(second["database"], "web1");
+}
+
+#[tokio::test]
+async fn create_merge_refuses_main_into_parent() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    for direction in ["into_parent", "from_parent"] {
+        let err = error_of(t.create_merge(t.main(), json!({ "direction": direction })).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request");
+        assert!(message_of(&err).contains("main"), "{err}");
+    }
+    // A backup is no merge party; a body of the wrong shape is a 422.
+    let backup = t.backup(dev);
+    let err = error_of(t.create_merge(backup, into_parent()).await, 409).await;
+    assert_eq!(code_of(&err), "backup_branch");
+    let err = error_of(t.create_merge(dev, json!({ "direction": "sideways" })).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    let err = error_of(t.create_merge(dev, json!({ "direction": "into_parent", "extra": 1 })).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    let err = error_of(t.create_merge(dev, json!({ "direction": "into_parent", "database": "nope" })).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert!(t.merge_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn create_merge_refuses_unready_branch() {
+    let t = branching().await;
+    let wip = t.add("wip", t.main(), BranchKind::Normal, BranchStatus::Pending);
+    let err = error_of(t.create_merge(wip, into_parent()).await, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    // A ready branch whose parent isn't ready.
+    let parent = t.add("parent", t.main(), BranchKind::Normal, BranchStatus::Resetting);
+    let kid = t.add("kid", parent, BranchKind::Normal, BranchStatus::Ready);
+    let err = error_of(t.create_merge(kid, into_parent()).await, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    assert!(t.merge_jobs().is_empty());
+    assert!(t.metadata.merges.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn second_open_merge_is_409_with_id() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let first: Value = t.create_merge(dev, into_parent()).await.json().await.unwrap();
+    let err = error_of(t.create_merge(dev, into_parent()).await, 409).await;
+    assert_eq!(code_of(&err), "merge_open_exists");
+    assert_eq!(err["error"]["merge_id"], first["id"]);
+    assert_eq!(t.merge_jobs().len(), 1, "no second job");
+    // Another Postgres database of the pair is its own merge.
+    let other = t.create_merge(dev, json!({ "direction": "into_parent", "database": "web1" })).await;
+    assert_eq!(other.status(), 202);
+}
+
+#[tokio::test]
+async fn create_merge_lost_race_is_a_retryable_409() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    *t.metadata.create_merge_conflicts.lock().unwrap() = true;
+    let resp = t.create_merge(dev, into_parent()).await;
+    assert_eq!(resp.status(), 409);
+    assert_eq!(resp.headers()["retry-after"], "1");
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(code_of(&err), "merge_busy");
+    assert!(t.merge_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn create_merge_publish_failure_is_503_and_fails_the_merge() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    *t.jobs.fail_merge_publish.lock().unwrap() = true;
+    let err = error_of(t.create_merge(dev, into_parent()).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    let rows = t.metadata.merges.lock().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, MergeStatus::Failed);
+    assert!(rows[0].error.as_deref().unwrap_or_default().contains("publish failed"));
+    // The pair is free again.
+    *t.jobs.fail_merge_publish.lock().unwrap() = false;
+    assert_eq!(t.create_merge(dev, into_parent()).await.status(), 202);
+}
+
+#[tokio::test]
+async fn get_and_list_merges() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let other = t.ready("other");
+    let a = t.seed_merge(dev, MergeStatus::Draft, |r| {
+        r.analysis = Some(json!({"items": [], "conflicts": [], "reported": []}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    let b = t.seed_merge(other, MergeStatus::Done, |_| {});
+    t.metadata.merge_events.lock().unwrap().push({
+        let mut e = MergeEvent::new(a.id, "status");
+        e.detail = Some(json!({"to": "draft"}));
+        e
+    });
+
+    let got: Value = t.send(Method::GET, &t.merge_path(a.id), None).await.json().await.unwrap();
+    assert_eq!(got["merge"]["id"], json!(a.id));
+    assert_eq!(got["merge"]["version"], 3);
+    assert_eq!(got["merge"]["plan"], json!({"steps": []}));
+    assert_eq!(got["merge"]["analysis"]["conflicts"], json!([]));
+    assert_eq!(got["merge"]["resolutions"], json!([]));
+    assert_eq!(got["events"].as_array().unwrap().len(), 1);
+    assert_eq!(got["events"][0]["kind"], "status");
+
+    let all: Vec<Value> = t.send(Method::GET, &t.merges(), None).await.json().await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all[0].get("analysis").is_none(), "the list is a summary");
+    let ids = |list: &[Value]| list.iter().map(|m| m["id"].clone()).collect::<Vec<_>>();
+    let for_dev: Vec<Value> =
+        t.send(Method::GET, &format!("{}?branch={}", t.merges(), dev.as_uuid()), None).await.json().await.unwrap();
+    assert_eq!(ids(&for_dev), vec![json!(a.id)]);
+    let for_other: Vec<Value> =
+        t.send(Method::GET, &format!("{}?branch={}", t.merges(), other.as_uuid()), None).await.json().await.unwrap();
+    assert_eq!(ids(&for_other), vec![json!(b.id)]);
+    let bad = t.send(Method::GET, &format!("{}?branch=nope", t.merges()), None).await;
+    assert_eq!(bad.status(), 400);
+
+    // Unknown merges, and another database's, are 404 `not_found` (P16).
+    let err = error_of(t.send(Method::GET, &t.merge_path(uuid::Uuid::new_v4()), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    t.set_merge(a.id, |r| r.database_id = uuid::Uuid::new_v4());
+    let err = error_of(t.send(Method::GET, &t.merge_path(a.id), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+#[tokio::test]
+async fn update_merge_with_stale_version_is_409_with_current() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    let path = t.merge_path(m.id);
+    let resolutions = json!([{ "conflict": "c1", "choice": "keep_target" }, { "conflict": "c2", "choice": { "own_sql": "ALTER TABLE t ADD c int" } }]);
+
+    let resp = t.send(Method::PATCH, &path, Some(json!({ "version": 2, "resolutions": resolutions }))).await;
+    assert_eq!(resp.status(), 409);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(code_of(&err), "merge_version_conflict");
+    assert_eq!(err["error"]["current"]["version"], 3);
+    assert_eq!(err["error"]["current"]["id"], json!(m.id));
+    assert!(t.merge_jobs().is_empty());
+    assert_eq!(t.merge_state(m.id).resolutions, json!([]));
+
+    let saved = t
+        .send(
+            Method::PATCH,
+            &path,
+            Some(json!({
+                "version": 3,
+                "resolutions": resolutions,
+                "steps": [{ "id": "u1", "after": null, "sql": "UPDATE t SET c = 0" }],
+                "acknowledgements": ["column:1:2"],
+                "options": { "lock_timeout_ms": 2000, "after": "delete" },
+            })),
+        )
+        .await;
+    assert_eq!(saved.status(), 200);
+    let saved: Value = saved.json().await.unwrap();
+    assert_eq!(saved["version"], 4);
+    assert_eq!(saved["status"], "computing", "a save recomputes the analysis and the plan");
+    assert_eq!(saved["resolutions"], resolutions);
+    assert_eq!(saved["options"], json!({"lock_timeout_ms": 2000, "after": "delete"}));
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Compute { merge_id: m.id }]);
+    let row = t.merge_state(m.id);
+    assert_eq!(row.user_steps, json!([{ "id": "u1", "after": null, "sql": "UPDATE t SET c = 0" }]));
+    assert_eq!(row.acknowledgements, json!(["column:1:2"]));
+
+    // While the worker computes, the draft can't be edited.
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "version": 4 }))).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(t.merge_jobs().len(), 1);
+}
+
+#[tokio::test]
+async fn update_merge_body_is_validated() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    let path = t.merge_path(m.id);
+    let bad = [
+        json!({ "resolutions": [] }),
+        json!({ "version": 3, "surprise": true }),
+        json!({ "version": 3, "resolutions": [{ "conflict": "c1", "choice": "take_it" }] }),
+        json!({ "version": 3, "resolutions": [{ "conflict": "c1", "choice": { "own_sql": "  " } }] }),
+        json!({ "version": 3, "resolutions": [{ "conflict": "c1", "choice": "keep_target", "x": 1 }] }),
+        json!({ "version": 3, "steps": [{ "id": "u1", "after": null, "sql": "" }] }),
+        json!({ "version": 3, "options": { "after": "explode" } }),
+        json!({ "version": 3, "options": { "lock_timeout_ms": 0 } }),
+        json!({ "version": 3, "options": { "rebaseline": true } }),
+    ];
+    for body in bad {
+        let err = error_of(t.send(Method::PATCH, &path, Some(body.clone())).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{body}");
+    }
+    let err = error_of(t.send(Method::PATCH, &t.merge_path(uuid::Uuid::new_v4()), Some(json!({ "version": 1 }))).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(t.merge_state(m.id).version, 3);
+    assert!(t.merge_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn update_merge_publishes_compute_once_for_concurrent_saves() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsed, |r| r.rehearsal = Some(json!({"ok": true})));
+    let path = t.merge_path(m.id);
+    let body = json!({ "version": 3, "steps": [] });
+    let (a, b) = tokio::join!(
+        t.send(Method::PATCH, &path, Some(body.clone())),
+        t.send(Method::PATCH, &path, Some(body.clone())),
+    );
+    let mut statuses = vec![a.status().as_u16(), b.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, vec![200, 409]);
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Compute { merge_id: m.id }]);
+    let row = t.merge_state(m.id);
+    assert_eq!((row.status, row.rehearsal), (MergeStatus::Computing, None));
+}
+
+#[tokio::test]
+async fn update_merge_publish_failure_fails_the_merge() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    *t.jobs.fail_merge_publish.lock().unwrap() = true;
+    let err = error_of(t.send(Method::PATCH, &t.merge_path(m.id), Some(json!({ "version": 3, "steps": [] }))).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Failed);
+}
+
+#[tokio::test]
+async fn rehearse_needs_a_draft_with_a_plan_and_no_open_conflicts() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    let path = format!("{}/rehearse", t.merge_path(m.id));
+    // No plan yet.
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    // An unresolved conflict.
+    t.set_merge(m.id, |r| {
+        r.analysis = Some(json!({"conflicts": [{"id": "c1"}]}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_conflicts_open");
+    t.set_merge(m.id, |r| r.resolutions = json!([{ "conflict": "c1", "choice": "keep_target" }]));
+    let resp = t.send(Method::POST, &path, None).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.json::<Value>().await.unwrap()["status"], "rehearsing");
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Rehearse { merge_id: m.id }]);
+    // Not a draft any more.
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    // A lost publish puts the draft back.
+    t.set_merge(m.id, |r| r.status = MergeStatus::Draft);
+    *t.jobs.fail_merge_publish.lock().unwrap() = true;
+    let err = error_of(t.send(Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Draft);
+}
+
+#[tokio::test]
+async fn recompute_moves_to_computing_and_stores_rebaseline() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    let path = format!("{}/recompute", t.merge_path(m.id));
+    // An empty body is `{}`.
+    let resp = t.send(Method::POST, &path, None).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.json::<Value>().await.unwrap()["status"], "computing");
+    assert_eq!(t.merge_state(m.id).options.get("rebaseline"), None);
+
+    t.set_merge(m.id, |r| {
+        r.status = MergeStatus::Stale;
+        r.error = Some("old".into());
+    });
+    let resp = t.send(Method::POST, &path, Some(json!({ "rebaseline": true }))).await;
+    assert_eq!(resp.status(), 202);
+    let row = t.merge_state(m.id);
+    assert_eq!((row.status, row.error), (MergeStatus::Computing, None));
+    assert_eq!(row.options["rebaseline"], true);
+    assert_eq!(row.options["lock_timeout_ms"], 5000, "other options stay");
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Compute { merge_id: m.id }; 2]);
+
+    // Not from a computing, rehearsing or rehearsed merge, nor from a failed online phase.
+    for status in [MergeStatus::Computing, MergeStatus::Rehearsing, MergeStatus::Rehearsed, MergeStatus::Done] {
+        t.set_merge(m.id, |r| r.status = status);
+        let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+        assert_eq!(code_of(&err), "conflict", "{status:?}");
+    }
+    t.set_merge(m.id, |r| {
+        r.status = MergeStatus::Failed;
+        r.failed_phase = Some("online".into());
+    });
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert!(message_of(&err).contains("retry"), "{err}");
+    t.set_merge(m.id, |r| r.failed_phase = Some("phase1".into()));
+    assert_eq!(t.send(Method::POST, &path, Some(json!({}))).await.status(), 202);
+    assert_eq!(t.merge_state(m.id).failed_phase, None);
+    let err = error_of(t.send(Method::POST, &path, Some(json!({ "rebaseline": "yes" }))).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+}
+
+fn plan_with(step: Value) -> Value {
+    json!({ "steps": [step] })
+}
+
+#[tokio::test]
+async fn apply_refusal_order() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let other = t.ready("other");
+    let m = t.seed_merge(dev, MergeStatus::Draft, |r| {
+        r.analysis = Some(json!({"conflicts": [{"id": "c1"}]}));
+        r.plan = Some(plan_with(json!({"id": "s1", "items": ["column:1:2"], "data_loss": true, "security": false})));
+    });
+    let path = format!("{}/apply", t.merge_path(m.id));
+    let refused = |code: &'static str| async move { code };
+    let _ = refused;
+    let go = |body: Option<Value>| t.send(Method::POST, &path, body);
+
+    // 1. Not rehearsed.
+    let err = error_of(go(Some(json!({ "confirm": true }))).await, 409).await;
+    assert_eq!(code_of(&err), "merge_not_rehearsed");
+    t.set_merge(m.id, |r| r.status = MergeStatus::Stale);
+    let err = error_of(go(None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_stale");
+    // The apply request doesn't read the target: the message says what stale means, no more.
+    assert_eq!(message_of(&err), "the merge is stale: a schema changed since it was computed; recompute the merge");
+    t.set_merge(m.id, |r| r.status = MergeStatus::Rehearsed);
+    // 2. An open conflict.
+    let err = error_of(go(None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_conflicts_open");
+    t.set_merge(m.id, |r| r.resolutions = json!([{ "conflict": "c1", "choice": "take_source" }]));
+    // 3. Data loss, then security, unacknowledged.
+    let err = error_of(go(None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_drops_unacknowledged");
+    t.set_merge(m.id, |r| r.acknowledgements = json!(["column:1:2"]));
+    t.set_merge(m.id, |r| {
+        r.plan = Some(json!({"steps": [
+            {"id": "s1", "items": ["column:1:2"], "data_loss": true, "security": false},
+            {"id": "s2", "items": ["role:name:admin"], "data_loss": false, "security": true},
+            {"id": "s3", "items": [], "data_loss": false, "security": true},
+        ]}));
+    });
+    let err = error_of(go(None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_drops_unacknowledged");
+    assert_eq!(
+        message_of(&err),
+        "acknowledge these data-loss, security or breaking changes first: role:name:admin, s3",
+        "{err}"
+    );
+    // A step with no items is acknowledged by its own id.
+    t.set_merge(m.id, |r| r.acknowledgements = json!(["column:1:2", "role:name:admin", "s3"]));
+    // 4. A protected target needs `confirm`.
+    t.metadata.branches.lock().unwrap().get_mut(&t.main()).unwrap().protected = true;
+    let err = error_of(go(None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_confirm_required");
+    let err = error_of(go(Some(json!({ "confirm": false }))).await, 409).await;
+    assert_eq!(code_of(&err), "merge_confirm_required");
+    // 5. Another merge applying on the target.
+    let busy = t.seed_merge(other, MergeStatus::Applying, |_| {});
+    let err = error_of(go(Some(json!({ "confirm": true }))).await, 409).await;
+    assert_eq!(code_of(&err), "merge_busy");
+    assert_eq!(err["error"]["merge_id"], json!(busy.id));
+    assert!(t.merge_jobs().is_empty());
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Rehearsed);
+
+    t.set_merge(busy.id, |r| r.status = MergeStatus::Done);
+    let resp = go(Some(json!({ "confirm": true }))).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.json::<Value>().await.unwrap()["status"], "applying");
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Applying);
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Apply { merge_id: m.id }]);
+    // Twice: no longer rehearsed.
+    let err = error_of(go(Some(json!({ "confirm": true }))).await, 409).await;
+    assert_eq!(code_of(&err), "merge_not_rehearsed");
+}
+
+#[tokio::test]
+async fn apply_on_protected_needs_confirm() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsed, |r| {
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    let path = format!("{}/apply", t.merge_path(m.id));
+    t.metadata.branches.lock().unwrap().get_mut(&t.main()).unwrap().protected = true;
+    let err = error_of(t.send(Method::POST, &path, Some(json!({}))).await, 409).await;
+    assert_eq!(code_of(&err), "merge_confirm_required");
+    let err = error_of(t.send(Method::POST, &path, Some(json!({ "unknown": 1 }))).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    assert_eq!(t.send(Method::POST, &path, Some(json!({ "confirm": true }))).await.status(), 202);
+
+    // An unprotected target needs no confirm, and the body may be absent.
+    let m2 = t.seed_merge(dev, MergeStatus::Rehearsed, |r| {
+        r.plan = Some(json!({"steps": []}));
+        r.analysis = Some(json!({"conflicts": []}));
+        r.target_branch_id = t.main().as_uuid();
+    });
+    t.set_merge(m.id, |r| r.status = MergeStatus::Done);
+    t.metadata.branches.lock().unwrap().get_mut(&t.main()).unwrap().protected = false;
+    assert_eq!(t.send(Method::POST, &format!("{}/apply", t.merge_path(m2.id)), None).await.status(), 202);
+}
+
+#[tokio::test]
+async fn apply_publish_failure_puts_the_merge_back_to_rehearsed() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsed, |r| {
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    *t.jobs.fail_merge_publish.lock().unwrap() = true;
+    let err = error_of(t.send(Method::POST, &format!("{}/apply", t.merge_path(m.id)), None).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Rehearsed);
+}
+
+// E20: a failure before the online phase (`roles`, `enum_add`, `tx`) is retried from the
+// start: `failed` → `applying` and an Apply job (the worker's pre-checks run again). Never to
+// `online`.
+#[tokio::test]
+async fn retry_before_the_online_phase_applies_from_the_start() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Failed, |_| {});
+    let path = format!("{}/retry", t.merge_path(m.id));
+    for phase in ["roles", "enum_add", "tx"] {
+        t.set_merge(m.id, |r| {
+            r.status = MergeStatus::Failed;
+            r.failed_phase = Some(phase.into());
+            r.error = Some("step x: boom".into());
+        });
+        t.jobs.merge_jobs.lock().unwrap().clear();
+        let resp = t.send(Method::POST, &path, None).await;
+        assert_eq!(resp.status(), 202, "{phase}");
+        assert_eq!(resp.json::<Value>().await.unwrap()["status"], "applying", "{phase}");
+        let row = t.merge_state(m.id);
+        assert_eq!((row.status, row.failed_phase, row.error), (MergeStatus::Applying, None, None), "{phase}");
+        assert_eq!(t.merge_jobs(), vec![MergeJob::Apply { merge_id: m.id }], "{phase}");
+    }
+
+    // A publish failure puts it back, phase and all.
+    t.set_merge(m.id, |r| {
+        r.status = MergeStatus::Failed;
+        r.failed_phase = Some("tx".into());
+    });
+    *t.jobs.fail_merge_publish.lock().unwrap() = true;
+    let err = error_of(t.send(Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    let row = t.merge_state(m.id);
+    assert_eq!((row.status, row.failed_phase.as_deref()), (MergeStatus::Failed, Some("tx")));
+}
+
+#[tokio::test]
+async fn retry_only_after_online_failure() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    // A failure with no phase (a compute's) or an unknown one isn't retried.
+    let m = t.seed_merge(dev, MergeStatus::Failed, |r| r.failed_phase = None);
+    let path = format!("{}/retry", t.merge_path(m.id));
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    t.set_merge(m.id, |r| r.failed_phase = Some("phase1".into()));
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    t.set_merge(m.id, |r| r.status = MergeStatus::Draft);
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert!(t.merge_jobs().is_empty());
+
+    t.set_merge(m.id, |r| {
+        r.status = MergeStatus::Failed;
+        r.failed_phase = Some("online".into());
+        r.error = Some("lock timeout".into());
+    });
+    let resp = t.send(Method::POST, &path, None).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.json::<Value>().await.unwrap()["status"], "online");
+    let row = t.merge_state(m.id);
+    assert_eq!((row.status, row.failed_phase, row.error), (MergeStatus::Online, None, None));
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Resume { merge_id: m.id }]);
+
+    // Another merge applying on the target: `merge_busy`.
+    let other = t.ready("other");
+    t.set_merge(m.id, |r| {
+        r.status = MergeStatus::Failed;
+        r.failed_phase = Some("online".into());
+    });
+    let busy = t.seed_merge(other, MergeStatus::Applying, |_| {});
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_busy");
+    assert_eq!(err["error"]["merge_id"], json!(busy.id));
+}
+
+/// What the worker leaves on a merge applied with drift: the choice skipped.
+fn drift_result() -> Value {
+    json!({
+        "created_roles": [],
+        "drift": [{ "key": { "kind": "table", "schema": "public", "table": null, "name": "items" },
+                    "kind": "missing", "expected": null, "actual": null, "produced": false }],
+        "after": { "choice": "keep", "skipped": "the target doesn't read back as merged" },
+    })
+}
+
+// E21: with drift, the after-merge choice is run by hand, once.
+#[tokio::test]
+async fn finish_runs_the_after_merge_choice_by_hand_once() {
+    use chelabase_nats::MergeAfter;
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Done, |r| r.result = Some(drift_result()));
+    let path = format!("{}/finish", t.merge_path(m.id));
+    let reset = Some(json!({ "after": "reset" }));
+
+    // Only after drift.
+    let err = error_of(t.send(Method::POST, &path, reset.clone()).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    t.set_merge(m.id, |r| r.status = MergeStatus::AppliedWithDrift);
+    // The body is checked.
+    for bad in [json!({ "after": "nuke" }), json!({ "after": "keep", "x": 1 }), json!({})] {
+        let err = error_of(t.send(Method::POST, &path, Some(bad.clone())).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{bad}");
+    }
+    assert!(t.merge_jobs().is_empty());
+
+    let resp = t.send(Method::POST, &path, reset.clone()).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.json::<Value>().await.unwrap()["status"], "applied_with_drift");
+    let row = t.merge_state(m.id);
+    assert_eq!(row.status, MergeStatus::AppliedWithDrift);
+    let result = row.result.unwrap();
+    assert_eq!(result["after"], json!({ "choice": "reset", "requested": true }));
+    assert_eq!(result["drift"], drift_result()["drift"], "the rest of the result stays");
+    assert_eq!(
+        t.merge_jobs(),
+        vec![MergeJob::Finish { merge_id: m.id, after: MergeAfter::Reset }]
+    );
+
+    // Once: requested (or done), a second call is refused.
+    let err = error_of(t.send(Method::POST, &path, reset.clone()).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    t.set_merge(m.id, |r| {
+        r.result.as_mut().unwrap()["after"] = json!({ "choice": "reset", "outcome": "done" });
+    });
+    let err = error_of(t.send(Method::POST, &path, reset).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(t.merge_jobs().len(), 1);
+}
+
+#[tokio::test]
+async fn finish_from_the_parent_only_keeps_and_a_publish_failure_is_undone() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::AppliedWithDrift, |r| {
+        r.result = Some(drift_result());
+        r.direction = chelabase_metadata::MergeDirection::FromParent;
+    });
+    let path = format!("{}/finish", t.merge_path(m.id));
+    // An update from the parent only keeps (D11, T11 R9).
+    let err = error_of(t.send(Method::POST, &path, Some(json!({ "after": "delete" }))).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+
+    *t.jobs.fail_merge_publish.lock().unwrap() = true;
+    let err = error_of(t.send(Method::POST, &path, Some(json!({ "after": "keep" }))).await, 503).await;
+    assert_eq!(code_of(&err), "worker_unavailable");
+    assert_eq!(t.merge_state(m.id).result, Some(drift_result()), "the request is undone");
+}
+
+#[tokio::test]
+async fn cancel_stops_what_nothing_is_applying() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    let path = format!("{}/cancel", t.merge_path(m.id));
+    let resp = t.send(Method::POST, &path, None).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(resp.json::<Value>().await.unwrap()["status"], "cancelled");
+    assert!(t.merge_jobs().is_empty(), "a draft has nothing to stop");
+
+    // The worker holds a rehearsing merge: it is told to tear down.
+    t.set_merge(m.id, |r| r.status = MergeStatus::Rehearsing);
+    assert_eq!(t.send(Method::POST, &path, None).await.status(), 202);
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Cancelled);
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Cancel { merge_id: m.id }]);
+
+    for status in [MergeStatus::Applying, MergeStatus::Online, MergeStatus::Finishing, MergeStatus::Done, MergeStatus::Failed, MergeStatus::Cancelled] {
+        t.set_merge(m.id, |r| r.status = status);
+        let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+        assert_eq!(code_of(&err), "conflict", "{status:?}");
+        assert_eq!(t.merge_state(m.id).status, status);
+    }
+}
+
+#[tokio::test]
+async fn export_is_text_plain_attachment() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    let path = format!("{}/plan.sql", t.merge_path(m.id));
+    // No plan yet.
+    let err = error_of(t.send(Method::GET, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+
+    let plan = json!({"steps": [{
+        "id": "s1", "kind": "generated", "phase": "tx", "sql": "CREATE TABLE t (id int)",
+        "items": [], "data_loss": false, "rewrite": false, "security": false, "locks": [],
+        "role_op": null, "online": null
+    }]});
+    t.set_merge(m.id, |r| r.plan = Some(plan.clone()));
+    let resp = t.send(Method::GET, &path, None).await;
+    assert_eq!(resp.status(), 200);
+    let headers = resp.headers().clone();
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(headers["content-disposition"], format!("attachment; filename=\"merge-{}.sql\"", m.id));
+    assert_eq!(headers["cache-control"], "no-store");
+    let opts = chelabase_schema::plan::PlanOptions {
+        lock_timeout_ms: chelabase_schema::plan::lock_timeout_ms(&m.options),
+        merge_id: m.id,
+    };
+    let expected =
+        chelabase_schema::export::export_sql(&serde_json::from_value(plan).unwrap(), &opts);
+    assert_eq!(resp.text().await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn branch_ops_refused_while_merge_busy() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsing, |_| {});
+    for branch in [dev, t.main()] {
+        let reset = t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(branch)), None).await;
+        let restore = t
+            .send(Method::POST, &format!("{}/restore", t.branch(branch)), Some(json!({ "at": { "lsn": "0/16B3748" } })))
+            .await;
+        let delete = t.send(Method::DELETE, &t.branch(branch), None).await;
+        for resp in [reset, restore, delete] {
+            let err = error_of(resp, 409).await;
+            // Main has no parent (and a child): its own refusal may come first, but never a job.
+            if branch == dev {
+                assert_eq!(code_of(&err), "branch_merge_busy", "{err}");
+                assert_eq!(err["error"]["merge_id"], json!(m.id));
+            }
+        }
+    }
+    assert!(t.published().is_empty(), "no branch job was published");
+    assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
+    assert_eq!(t.metadata.branch(t.main()).status, BranchStatus::Ready);
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Rehearsing, "a running merge isn't cancelled");
+
+    // Applying holds the target (main) too: restore of main is refused for the merge.
+    t.set_merge(m.id, |r| r.status = MergeStatus::Applying);
+    let restore = t
+        .send(Method::POST, &format!("{}/restore", t.branch(t.main())), Some(json!({ "at": { "lsn": "0/16B3748" } })))
+        .await;
+    let err = error_of(restore, 409).await;
+    assert_eq!(code_of(&err), "branch_merge_busy");
+    // Once nothing runs, the branch ops work again.
+    t.set_merge(m.id, |r| r.status = MergeStatus::Done);
+    assert_eq!(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await.status(), 202);
+}
+
+#[tokio::test]
+async fn delete_branch_cancels_drafts() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let draft = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    let computing = t.seed_merge(dev, MergeStatus::Computing, |r| r.database_name = "web1".into());
+    let done = t.seed_merge(dev, MergeStatus::Done, |_| {});
+    let resp = t.send(Method::DELETE, &t.branch(dev), None).await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(t.merge_state(draft.id).status, MergeStatus::Cancelled);
+    assert_eq!(t.merge_state(computing.id).status, MergeStatus::Cancelled);
+    assert_eq!(t.merge_state(done.id).status, MergeStatus::Done);
+
+    // A refused delete cancels nothing.
+    let other = t.ready("other");
+    t.add("kid", other, BranchKind::Normal, BranchStatus::Ready);
+    let kept = t.seed_merge(other, MergeStatus::Draft, |_| {});
+    assert_eq!(t.send(Method::DELETE, &t.branch(other), None).await.status(), 409);
+    assert_eq!(t.merge_state(kept.id).status, MergeStatus::Draft);
+}
+
+#[tokio::test]
+async fn rehearsal_branches_are_not_listed() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let rehearsal = t.add("_rehearsal-0a1b2c3d", dev, BranchKind::Rehearsal, BranchStatus::Ready);
+    let list: Vec<Value> = t.send(Method::GET, &t.branches(), None).await.json().await.unwrap();
+    assert!(list.iter().all(|b| b["id"] != json!(rehearsal)), "{list:?}");
+    assert_eq!(list.len(), 2);
+    // Nor reachable by id.
+    for (method, path) in [
+        (Method::DELETE, t.branch(rehearsal)),
+        (Method::PATCH, t.branch(rehearsal)),
+        (Method::POST, format!("{}/reset-to-parent", t.branch(rehearsal))),
+        (Method::GET, format!("{}/connection", t.branch(rehearsal))),
+    ] {
+        let err = error_of(t.send(method.clone(), &path, Some(json!({ "protected": true }))).await, 404).await;
+        assert_eq!(code_of(&err), "not_found", "{method} {path}");
+    }
+    assert_eq!(t.metadata.branch(rehearsal).status, BranchStatus::Ready);
+}
+
+#[tokio::test]
+async fn rehearsal_branch_refused_by_console_and_sql_editor() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let rehearsal = t.add("_rehearsal-0a1b2c3d", dev, BranchKind::Rehearsal, BranchStatus::Ready);
+    let base = t.branch(rehearsal);
+    let calls = [
+        (Method::POST, format!("{base}/console/query"), Some(json!({ "role": null, "tree": { "v": 1, "op": "select", "from": "t" } }))),
+        (Method::GET, format!("{base}/console/schema"), None),
+        (Method::POST, format!("{base}/sql"), Some(json!({ "run_id": uuid::Uuid::new_v4(), "sql": "select 1" }))),
+        (Method::GET, format!("{base}/sql/schema"), None),
+        (Method::GET, format!("{base}/roles"), None),
+        (Method::POST, format!("{base}/roles"), Some(json!({ "name": "app" }))),
+        (Method::GET, format!("{base}/keys"), None),
+        (Method::GET, format!("{base}/databases"), None),
+        (Method::POST, format!("{base}/merges"), Some(into_parent())),
+    ];
+    for (method, path, body) in calls {
+        let resp = t.send(method.clone(), &path, body).await;
+        assert!(matches!(resp.status().as_u16(), 404), "{method} {path}: {}", resp.status());
+    }
+}
+
+// --- T14 F3: the merge state machine ---------------------------------------------------------
+
+/// A merge in `state` (source `dev`, target main) that every action could take: an analysis
+/// without conflicts, a plan with one unflagged step, and a drift result whose choice was skipped.
+fn seed_in_state(t: &Branching, dev: BranchId, state: chelabase_metadata::MergeState) -> MergeRecord {
+    // One merge at a time: the earlier ones are out of the way.
+    for r in t.metadata.merges.lock().unwrap().iter_mut() {
+        r.status = MergeStatus::Cancelled;
+        r.failed_phase = None;
+    }
+    t.seed_merge(dev, state.status, |r| {
+        r.failed_phase = state.failed_phase.map(str::to_string);
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(plan_with(json!({
+            "id": "s1", "kind": "generated", "phase": "tx", "sql": "CREATE TABLE t (id int)",
+            "items": [], "data_loss": false, "rewrite": false, "security": false, "locks": [],
+            "role_op": null, "online": null
+        })));
+        r.result = Some(drift_result());
+    })
+}
+
+/// The request of `action` on merge `id`.
+async fn act(t: &Branching, id: uuid::Uuid, action: chelabase_metadata::MergeAction) -> reqwest::Response {
+    use chelabase_metadata::MergeAction::*;
+    let path = t.merge_path(id);
+    match action {
+        Edit => t.send(Method::PATCH, &path, Some(json!({ "version": 3, "steps": [] }))).await,
+        EditKeepsPlan => t.send(Method::PATCH, &path, Some(json!({ "version": 3, "acknowledgements": ["a"] }))).await,
+        Rehearse => t.send(Method::POST, &format!("{path}/rehearse"), None).await,
+        Apply => t.send(Method::POST, &format!("{path}/apply"), Some(json!({ "confirm": true }))).await,
+        Recompute => t.send(Method::POST, &format!("{path}/recompute"), None).await,
+        Retry => t.send(Method::POST, &format!("{path}/retry"), None).await,
+        Cancel => t.send(Method::POST, &format!("{path}/cancel"), None).await,
+        Abandon => t.send(Method::POST, &format!("{path}/abandon"), None).await,
+        Finish => t.send(Method::POST, &format!("{path}/finish"), Some(json!({ "after": "keep" }))).await,
+    }
+}
+
+/// The job an allowed `action` publishes from `state` (T14 F3 fix round, M9): the worker's work
+/// for the new status; none for a move nothing runs.
+fn job_of(state: chelabase_metadata::MergeState, action: chelabase_metadata::MergeAction, id: uuid::Uuid) -> Vec<MergeJob> {
+    use chelabase_metadata::MergeAction::*;
+    match action {
+        Edit | Recompute => vec![MergeJob::Compute { merge_id: id }],
+        EditKeepsPlan | Abandon => vec![],
+        Rehearse => vec![MergeJob::Rehearse { merge_id: id }],
+        Apply => vec![MergeJob::Apply { merge_id: id }],
+        // E20: after an online failure the online phase resumes; before it the apply runs again.
+        Retry if state.failed_phase == Some("online") => vec![MergeJob::Resume { merge_id: id }],
+        Retry => vec![MergeJob::Apply { merge_id: id }],
+        // A worker holds a computing or rehearsing merge: it's told to stop.
+        Cancel if matches!(state.status, MergeStatus::Computing | MergeStatus::Rehearsing) => {
+            vec![MergeJob::Cancel { merge_id: id }]
+        }
+        Cancel => vec![],
+        Finish => vec![MergeJob::Finish { merge_id: id, after: chelabase_nats::MergeAfter::Keep }],
+    }
+}
+
+// The invariant (T14 F3), exhaustively: every action in every state moves the merge exactly as
+// `MergeState::after` says, clears its failed phase, publishes the new status's job (M9), logs an
+// apply attempt's start for a move to `applying` (I2) and lists the leftovers of an abandon (E27);
+// it's refused (409, nothing written, no job) otherwise.
+#[tokio::test]
+async fn every_action_in_every_state_follows_the_table() {
+    use chelabase_metadata::{MergeAction::*, MergeState};
+    let t = branching().await;
+    let dev = t.mergeable();
+    for state in MergeState::all() {
+        for action in [Edit, EditKeepsPlan, Rehearse, Apply, Recompute, Retry, Cancel, Abandon, Finish] {
+            let m = seed_in_state(&t, dev, state);
+            t.jobs.merge_jobs.lock().unwrap().clear();
+            t.metadata.merge_events.lock().unwrap().clear();
+            let resp = act(&t, m.id, action).await;
+            let code = resp.status().as_u16();
+            let row = t.merge_state(m.id);
+            let at = format!("{state:?} {action:?}");
+            match state.after(action) {
+                Some(to) => {
+                    assert!((200..300).contains(&code), "{at}: {code} {}", resp.text().await.unwrap());
+                    assert_eq!(row.status, to, "{at}");
+                    assert_eq!(row.failed_phase, None, "{at}");
+                    assert_eq!(t.merge_jobs(), job_of(state, action, m.id), "{at}");
+                    let starts: Vec<Value> = t
+                        .metadata
+                        .merge_events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.merge_id == m.id && e.kind == "status")
+                        .filter_map(|e| e.detail.clone())
+                        .filter(|d| d["to"] == "applying")
+                        .collect();
+                    assert_eq!(starts.len(), usize::from(to == MergeStatus::Applying), "{at}");
+                    let leftovers = row.result.as_ref().map(|r| r["leftovers"].is_array());
+                    assert_eq!(leftovers, Some(action == Abandon), "{at}");
+                }
+                None => {
+                    assert_eq!(code, 409, "{at}");
+                    assert_eq!((row.status, row.failed_phase.as_deref()), (state.status, state.failed_phase), "{at}");
+                    assert!(t.merge_jobs().is_empty(), "{at}");
+                }
+            }
+        }
+    }
+}
+
+// T14 F3 fix round (M4): apply and rehearse take the version the user saw: another one is a 409
+// `merge_version_conflict` (the merge as it is now in `error.current`), and nothing moves. A save
+// of the after-merge choice keeps a rehearsed merge rehearsed (E34), so without it an apply could
+// run a choice the user never saw.
+#[tokio::test]
+async fn apply_and_rehearse_take_the_version_the_user_saw() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsed, |r| {
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    let apply = format!("{}/apply", t.merge_path(m.id));
+    let err = error_of(t.send(Method::POST, &apply, Some(json!({ "version": m.version - 1 }))).await, 409).await;
+    assert_eq!(code_of(&err), "merge_version_conflict");
+    assert_eq!(err["error"]["current"]["version"], json!(m.version));
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Rehearsed);
+    assert!(t.merge_jobs().is_empty());
+    assert_eq!(t.send(Method::POST, &apply, Some(json!({ "version": m.version }))).await.status(), 202);
+
+    let d = seed_in_state(&t, dev, chelabase_metadata::MergeState::of(MergeStatus::Draft, None));
+    let rehearse = format!("{}/rehearse", t.merge_path(d.id));
+    let err = error_of(t.send(Method::POST, &rehearse, Some(json!({ "version": d.version + 1 }))).await, 409).await;
+    assert_eq!(code_of(&err), "merge_version_conflict");
+    assert_eq!(t.merge_state(d.id).status, MergeStatus::Draft);
+    assert_eq!(t.send(Method::POST, &rehearse, Some(json!({ "version": d.version }))).await.status(), 202);
+}
+
+// T14 F3 fix round (M7): `merge_busy` names a merge failed half applied too, not only one running.
+#[tokio::test]
+async fn merge_busy_names_a_half_applied_merge() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let half = seed_in_state(&t, dev, chelabase_metadata::MergeState::of(MergeStatus::Failed, Some("online")));
+    let other = t.ready("other");
+    t.metadata.add_branch_db(other, "app", "postgres", DatabaseOrigin::Sql);
+    let err = error_of(t.create_merge(other, into_parent()).await, 409).await;
+    assert_eq!(code_of(&err), "merge_busy");
+    assert_eq!(err["error"]["merge_id"], json!(half.id));
+    assert!(message_of(&err).contains("failed half applied"), "{err}");
+    assert!(message_of(&err).contains("retry or abandon"), "{err}");
+}
+
+// T14 F3 fix round (I1, the hold invariant on every path): a delete of a branch that isn't ready
+// (no claim) is refused under the database's lock too, when a merge holds it after the pre-check.
+#[tokio::test]
+async fn a_delete_without_a_claim_is_refused_under_the_lock() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = seed_in_state(&t, dev, chelabase_metadata::MergeState::of(MergeStatus::Failed, Some("online")));
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().status = BranchStatus::Failed;
+    *t.metadata.busy_precheck_misses.lock().unwrap() = true;
+    let err = error_of(t.send(Method::DELETE, &t.branch(dev), None).await, 409).await;
+    assert_eq!(code_of(&err), "branch_merge_busy", "{err}");
+    assert_eq!(err["error"]["merge_id"], json!(m.id));
+    assert!(t.published().is_empty());
+    assert_eq!(t.metadata.branch(dev).status, BranchStatus::Failed);
+}
+
+// The invariant's other half (T14 F3, E27): reset, restore and delete of the source and of the
+// target are refused (`branch_merge_busy`) exactly in the states that hold the branches.
+#[tokio::test]
+async fn branch_ops_in_every_state_follow_the_table() {
+    use chelabase_metadata::MergeState;
+    let t = branching().await;
+    for (i, state) in MergeState::all().into_iter().enumerate() {
+        for op in ["reset", "restore", "delete"] {
+            // A target with the source as its child: an op on the target is otherwise refused
+            // for its child, one on the source goes through.
+            let target = t.ready(&format!("p{i}{op}"));
+            let source = t.add(&format!("c{i}{op}"), target, BranchKind::Normal, BranchStatus::Ready);
+            let m = t.seed_merge(source, state.status, |r| {
+                r.target_branch_id = target.as_uuid();
+                r.failed_phase = state.failed_phase.map(str::to_string);
+            });
+            for (branch, free) in [(source, None), (target, Some("has_children"))] {
+                let resp = match op {
+                    "reset" => t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(branch)), None).await,
+                    "restore" => {
+                        t.send(Method::POST, &format!("{}/restore", t.branch(branch)), Some(json!({ "at": { "lsn": "0/16B3748" } })))
+                            .await
+                    }
+                    _ => t.send(Method::DELETE, &t.branch(branch), None).await,
+                };
+                let code = resp.status().as_u16();
+                let body: Value = resp.json().await.unwrap_or(Value::Null);
+                if state.holds_branches() {
+                    assert_eq!(code, 409, "{state:?} {op} {body}");
+                    assert_eq!(code_of(&body), "branch_merge_busy", "{state:?} {op}");
+                    assert_eq!(body["error"]["merge_id"], json!(m.id));
+                } else {
+                    match free {
+                        None => assert_eq!(code, 202, "{state:?} {op} {body}"),
+                        Some(refusal) => assert_eq!(code_of(&body), refusal, "{state:?} {op}"),
+                    }
+                }
+            }
+            t.set_merge(m.id, |r| r.status = MergeStatus::Cancelled);
+        }
+    }
+}
+
+// T14 M12: a merge that takes the branch between the API's pre-check and its claim is caught by
+// the claim (checked under the branch's lock): refused, nothing published, the branch ready.
+#[tokio::test]
+async fn a_merge_that_takes_the_branch_after_the_precheck_is_refused_by_the_claim() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Applying, |_| {});
+    *t.metadata.busy_precheck_misses.lock().unwrap() = true;
+    for resp in [
+        t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await,
+        t.send(Method::POST, &format!("{}/restore", t.branch(dev)), Some(json!({ "at": { "lsn": "0/16B3748" } }))).await,
+        t.send(Method::DELETE, &t.branch(dev), None).await,
+    ] {
+        let err = error_of(resp, 409).await;
+        assert_eq!(code_of(&err), "branch_merge_busy", "{err}");
+        assert_eq!(err["error"]["merge_id"], json!(m.id));
+    }
+    assert!(t.published().is_empty());
+    assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
+}
+
+// I4: a rehearsal branch of the target still there (a cancel's teardown pending) holds it.
+#[tokio::test]
+async fn a_leftover_rehearsal_holds_its_branch() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let rehearsal = t.add("_rehearsal-0a1b2c3d", dev, BranchKind::Rehearsal, BranchStatus::Ready);
+    let err = error_of(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await, 409).await;
+    assert_eq!(code_of(&err), "branch_merge_busy");
+    assert_eq!(err["error"]["rehearsal_branch_id"], json!(rehearsal));
+    t.metadata.branches.lock().unwrap().get_mut(&rehearsal).unwrap().status = BranchStatus::Deleted;
+    assert_eq!(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await.status(), 202);
+}
+
+// E27: Abandon gives up a merge that failed half applied: `cancelled`, with what phase 1 left on
+// the target and phase 2 didn't finish listed in `result.leftovers`.
+#[tokio::test]
+async fn abandon_cancels_a_half_applied_merge_and_lists_leftovers() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let step = |id: &str, phase: &str, sql: &str, online: Value| {
+        json!({ "id": id, "kind": "generated", "phase": phase, "sql": sql, "items": [],
+                "data_loss": false, "rewrite": false, "security": false, "locks": [],
+                "role_op": null, "online": online })
+    };
+    let nn = "chelabase_merge_nn_2_0123456789abcdef0123456789abcdef";
+    let plan = json!({ "steps": [
+        step("fk", "tx", "ALTER TABLE public.o ADD CONSTRAINT o_fk FOREIGN KEY (c) REFERENCES public.c (id) NOT VALID", Value::Null),
+        step("nn", "tx", &format!("ALTER TABLE public.t ADD CONSTRAINT {nn} CHECK (a IS NOT NULL) NOT VALID"), Value::Null),
+        step("validate-fk", "online", "ALTER TABLE public.o VALIDATE CONSTRAINT o_fk",
+             json!({ "constraint_validated": { "schema": "public", "table": "o", "name": "o_fk" } })),
+        step("validate-nn", "online", &format!("ALTER TABLE public.t VALIDATE CONSTRAINT {nn}"),
+             json!({ "constraint_validated": { "schema": "public", "table": "t", "name": nn } })),
+        step("set-nn", "online", "ALTER TABLE public.t ALTER COLUMN a SET NOT NULL",
+             json!({ "not_null_set": { "schema": "public", "table": "t", "column": "a" } })),
+        step("drop-nn", "online", &format!("ALTER TABLE public.t DROP CONSTRAINT IF EXISTS {nn}"), Value::Null),
+    ]});
+    let m = t.seed_merge(dev, MergeStatus::Failed, |r| {
+        r.failed_phase = Some("online".into());
+        r.plan = Some(plan);
+        r.result = None;
+    });
+    // The nn check was validated and the column set; the fk's validation and the drop weren't.
+    for (step, phase) in [("validate-nn", "online"), ("set-nn", "online")] {
+        let mut e = MergeEvent::new(m.id, "step");
+        e.step_id = Some(step.into());
+        e.phase = Some(phase.into());
+        e.outcome = Some("ok".into());
+        t.metadata.merge_events.lock().unwrap().push(e);
+    }
+    let resp = t.send(Method::POST, &format!("{}/abandon", t.merge_path(m.id)), None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "cancelled");
+    let leftovers = json!([
+        { "kind": "not_valid_constraint", "schema": "public", "table": "o", "name": "o_fk" },
+        { "kind": "not_null_check", "schema": "public", "table": "t", "name": nn },
+    ]);
+    assert_eq!(body["result"]["leftovers"], leftovers);
+    let row = t.merge_state(m.id);
+    assert_eq!(row.status, MergeStatus::Cancelled);
+    assert_eq!(row.result.unwrap()["leftovers"], leftovers);
+    assert!(t.merge_jobs().is_empty(), "nothing for the worker");
+    // The target is free again.
+    assert_eq!(t.send(Method::POST, &format!("{}/reset-to-parent", t.branch(dev)), None).await.status(), 202);
+}
+
+// T14 M11: every merge route answers 404 for a merge of another database.
+#[tokio::test]
+async fn every_merge_route_is_404_for_another_database() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |r| r.database_id = uuid::Uuid::new_v4());
+    let path = t.merge_path(m.id);
+    for (method, p, body) in [
+        (Method::GET, path.clone(), None),
+        (Method::PATCH, path.clone(), Some(json!({ "version": 3 }))),
+        (Method::POST, format!("{path}/rehearse"), None),
+        (Method::POST, format!("{path}/apply"), None),
+        (Method::POST, format!("{path}/recompute"), None),
+        (Method::POST, format!("{path}/retry"), None),
+        (Method::POST, format!("{path}/cancel"), None),
+        (Method::POST, format!("{path}/abandon"), None),
+        (Method::POST, format!("{path}/finish"), Some(json!({ "after": "keep" }))),
+        (Method::GET, format!("{path}/plan.sql"), None),
+    ] {
+        let err = error_of(t.send(method.clone(), &p, body).await, 404).await;
+        assert_eq!(code_of(&err), "not_found", "{method} {p}");
+    }
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Draft);
+}
+
+// T14 M11: `getMerge` and the edit's answers serve the plan's steps only (not the expected model,
+// the own-SQL keys, the digest or the fingerprint, ~100 KB a poll).
+#[tokio::test]
+async fn get_merge_serves_only_the_plan_steps() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |r| {
+        r.plan = Some(json!({ "steps": [], "target_digest": "d", "expected": {"big": true}, "own_sql": [], "precheck_fingerprint": "f", "follows_rename": [] }));
+    });
+    let got: Value = t.send(Method::GET, &t.merge_path(m.id), None).await.json().await.unwrap();
+    assert_eq!(got["merge"]["plan"], json!({ "steps": [] }));
+    let err = error_of(t.send(Method::PATCH, &t.merge_path(m.id), Some(json!({ "version": 1 }))).await, 409).await;
+    assert_eq!(err["error"]["current"]["plan"], json!({ "steps": [] }));
+}
+
+// F1 minor 3 (orchestrator side): a step id the plan reserves (`:`, `.`, control characters) is
+// refused at the save.
+#[tokio::test]
+async fn step_ids_with_reserved_characters_are_refused() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |_| {});
+    // `phase1`: phase 1's own entry in the merge's log (T14 F3 fix round, M8).
+    for id in ["create-index:public.t.ix", "a.1", "line\nbreak", "tab\t", "phase1"] {
+        let body = json!({ "version": 3, "steps": [{ "id": id, "after": null, "sql": "SELECT 1" }] });
+        let err = error_of(t.send(Method::PATCH, &t.merge_path(m.id), Some(body)).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{id:?}");
+    }
+    assert!(t.merge_jobs().is_empty());
+}
+
+// E29a: a rename step (breaking) needs an acknowledgement like a drop.
+#[tokio::test]
+async fn a_breaking_step_needs_an_acknowledgement() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsed, |r| {
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(plan_with(json!({
+            "id": "role:rename:app", "kind": "generated", "phase": "roles", "sql": "ALTER ROLE app RENAME TO web",
+            "items": ["role:name:web"], "data_loss": false, "rewrite": false, "security": false, "locks": [],
+            "role_op": { "rename": { "oid": 16500, "from": "app", "to": "web" } }, "online": null,
+            "breaking": { "role_rename": { "role": "app", "new_name": "web" } }
+        })));
+    });
+    let path = format!("{}/apply", t.merge_path(m.id));
+    let err = error_of(t.send(Method::POST, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "merge_drops_unacknowledged");
+    assert!(message_of(&err).contains("role:name:web"), "{err}");
+    t.set_merge(m.id, |r| r.acknowledgements = json!(["role:name:web"]));
+    assert_eq!(t.send(Method::POST, &path, None).await.status(), 202);
+}
+
+// T10 minor (T14 Studio/API minor 14): rehearse and apply refuse a branch that isn't ready.
+#[tokio::test]
+async fn rehearse_and_apply_refuse_a_branch_that_isnt_ready() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |r| {
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().status = BranchStatus::Resetting;
+    let err = error_of(t.send(Method::POST, &format!("{}/rehearse", t.merge_path(m.id)), None).await, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    t.set_merge(m.id, |r| r.status = MergeStatus::Rehearsed);
+    let err = error_of(t.send(Method::POST, &format!("{}/apply", t.merge_path(m.id)), None).await, 409).await;
+    assert_eq!(code_of(&err), "branch_not_ready");
+    assert!(t.merge_jobs().is_empty());
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Rehearsed);
+}
+
+// T14 M11: a rehearsal runs the draft the user saw: a save landing between the read and the move
+// (a newer version) refuses it.
+#[tokio::test]
+async fn rehearse_is_guarded_by_the_version() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Draft, |r| {
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    *t.metadata.bump_merge_version_on_write.lock().unwrap() = true;
+    let err = error_of(t.send(Method::POST, &format!("{}/rehearse", t.merge_path(m.id)), None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Draft);
+    assert!(t.merge_jobs().is_empty());
+}
+
+// T14 M8: of two concurrent requests for the after-merge choice only one is recorded and
+// published.
+#[tokio::test]
+async fn concurrent_finish_requests_publish_once() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::AppliedWithDrift, |r| r.result = Some(drift_result()));
+    let path = format!("{}/finish", t.merge_path(m.id));
+    *t.metadata.bump_merge_version_on_write.lock().unwrap() = false;
+    *t.metadata.result_changes_before_write.lock().unwrap() = Some(json!({ "after": { "choice": "delete", "requested": true } }));
+    let err = error_of(t.send(Method::POST, &path, Some(json!({ "after": "keep" }))).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert!(t.merge_jobs().is_empty(), "the other request won");
+}
+
+// E34: acknowledgements and the after-merge choice keep a rehearsed merge rehearsed (no
+// recompute); any other edit returns it to draft through a recompute.
+#[tokio::test]
+async fn acknowledgements_keep_a_rehearsed_merge_rehearsed() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsed, |r| r.rehearsal = Some(json!({"ok": true})));
+    let path = t.merge_path(m.id);
+    let resp = t.send(Method::PATCH, &path, Some(json!({ "version": 3, "acknowledgements": ["x"], "options": { "after": "reset" } }))).await;
+    assert_eq!(resp.status(), 200);
+    let row = t.merge_state(m.id);
+    assert_eq!((row.status, row.rehearsal.clone(), row.version), (MergeStatus::Rehearsed, Some(json!({"ok": true})), 4));
+    assert_eq!(row.options["after"], "reset");
+    assert!(t.merge_jobs().is_empty(), "nothing to recompute");
+    // The lock timeout is part of the plan's script: a recompute.
+    let resp = t.send(Method::PATCH, &path, Some(json!({ "version": 4, "options": { "lock_timeout_ms": 2000 } }))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(t.merge_state(m.id).status, MergeStatus::Computing);
+    assert_eq!(t.merge_jobs(), vec![MergeJob::Compute { merge_id: m.id }]);
+}
+
+// I2: applying and retrying log the attempt's start (`status` → `applying`) with the move, so the
+// worker scopes "started" to the attempt.
+#[tokio::test]
+async fn apply_and_retry_log_the_attempt_start() {
+    let t = branching().await;
+    let dev = t.mergeable();
+    let m = t.seed_merge(dev, MergeStatus::Rehearsed, |r| {
+        r.analysis = Some(json!({"conflicts": []}));
+        r.plan = Some(json!({"steps": []}));
+    });
+    assert_eq!(t.send(Method::POST, &format!("{}/apply", t.merge_path(m.id)), None).await.status(), 202);
+    t.set_merge(m.id, |r| {
+        r.status = MergeStatus::Failed;
+        r.failed_phase = Some("tx".into());
+    });
+    assert_eq!(t.send(Method::POST, &format!("{}/retry", t.merge_path(m.id)), None).await.status(), 202);
+    let logged: Vec<Value> = t
+        .metadata
+        .merge_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.merge_id == m.id && e.kind == "status")
+        .filter_map(|e| e.detail.clone())
+        .collect();
+    assert_eq!(logged, vec![json!({"to": "applying"}), json!({"to": "applying"})]);
 }

@@ -14,6 +14,7 @@ const key = (over: Partial<DataKey> & { id: string; name: string }): DataKey => 
   created_at: "2026-10-01T09:00:00Z",
   last_used_at: null,
   role_blocked: false,
+  bypasses_rls: false,
   ...over,
 });
 const publicKey = key({ id: "pub", name: "public", kind: "public", role: "anon", prefix: "chk_pub_zz99", key: "chk_pub_secretvalue" });
@@ -264,11 +265,20 @@ describe("DataApiKeys", () => {
     for (const secret of [FULL, ROTATED]) expect(cachedState(queryClient)).not.toContain(secret);
   });
 
+  it("marks a key whose role bypasses row-level security (E33)", async () => {
+    setup({}, [publicKey, reporting, { ...worker, bypasses_rls: true }]);
+    const row = within(await screen.findByRole("row", { name: /worker/ }));
+    expect(row.getByText("Bypasses RLS")).toBeInTheDocument();
+    expect(row.getByText("it reads and writes past row-level security")).toBeInTheDocument();
+    expect(row.queryByText("Blocked")).toBeNull();
+    expect(within(screen.getByRole("row", { name: /reporting/ })).queryByText("Bypasses RLS")).toBeNull();
+  });
+
   it("blocked_key_badge", async () => {
     const f = setup({}, [publicKey, reporting, { ...worker, role_blocked: true }]).fetch;
     const row = within(await screen.findByRole("row", { name: /worker/ }));
     expect(row.getByText("Blocked")).toBeInTheDocument();
-    expect(row.getByText("the role service can bypass row-level security")).toBeInTheDocument();
+    expect(row.getByText("the role service is owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a member of neon_superuser)")).toBeInTheDocument();
     expect(within(screen.getByRole("row", { name: /reporting/ })).queryByText("Blocked")).toBeNull();
     expect(f.calls.some((r) => new URL(r.url).pathname.endsWith("/roles"))).toBe(false);
   });

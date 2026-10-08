@@ -24,6 +24,53 @@ use crate::compute::{
 };
 
 const ADMIN_SQL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-call options of [`ComputeBackend::admin_sql_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlOpts {
+    /// The whole call (connect, run, read output) gives up after this.
+    pub timeout: Duration,
+    /// `PGAPPNAME` of the psql session, so the caller can find and cancel its backend.
+    pub app_name: Option<String>,
+    /// `VERBOSITY=default` instead of `terse`: errors keep `LINE`, `DETAIL` and `HINT`. Only for
+    /// scripts that carry no secret (a SCRAM verifier would show in the `LINE` excerpt).
+    pub verbose_errors: bool,
+    /// The role psql connects as (`-U`); `None` is `cloud_admin`. Step 6g's merge scripts run in
+    /// the owner's own session (E15): the compute trusts local connections, so no password.
+    pub user: Option<String>,
+}
+
+impl SqlOpts {
+    /// What `admin_sql` runs with: 30 s, no application name, terse errors, `cloud_admin`.
+    pub fn admin_default() -> Self {
+        Self {
+            timeout: ADMIN_SQL_TIMEOUT,
+            app_name: None,
+            verbose_errors: false,
+            user: None,
+        }
+    }
+}
+/// The error of an [`ComputeBackend::admin_sql_with`] call that outlasted its timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlTimedOut {
+    pub endpoint: String,
+    pub after: Duration,
+}
+
+impl std::fmt::Display for SqlTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "psql in compute {} timed out after {:?}", self.endpoint, self.after)
+    }
+}
+
+impl std::error::Error for SqlTimedOut {}
+
+/// Whether `err` is (or wraps) an admin call's timeout ([`SqlTimedOut`]).
+pub fn is_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<SqlTimedOut>())
+}
+
 const MEMORY_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 const NANO_CPUS: i64 = 1_000_000_000;
 
@@ -57,13 +104,30 @@ pub trait ComputeBackend: ComputeLocator {
     ) -> impl Future<Output = anyhow::Result<Option<ComputeStatus>>> + Send;
     /// Endpoint ids of every container carrying ENDPOINT_LABEL, running or not.
     fn list(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
-    /// Runs `sql` (stdin) with psql as cloud_admin inside the compute; returns stdout.
+    /// Runs `sql` (stdin) with psql inside the compute, as `opts.user` (`cloud_admin` when
+    /// `None`); returns stdout. A call that outlasts `opts.timeout` fails with [`SqlTimedOut`]
+    /// (tell it by [`is_timeout`], never by the text), and the psql inside the compute keeps
+    /// running: a caller that must stop its statement cancels the backend by its
+    /// `application_name` (`opts.app_name`).
+    fn admin_sql_with(
+        &self,
+        endpoint_id: &str,
+        database: &str,
+        sql: &str,
+        opts: &SqlOpts,
+    ) -> impl Future<Output = anyhow::Result<String>> + Send;
+    /// [`ComputeBackend::admin_sql_with`] with [`SqlOpts::admin_default`].
     fn admin_sql(
         &self,
         endpoint_id: &str,
         database: &str,
         sql: &str,
-    ) -> impl Future<Output = anyhow::Result<String>> + Send;
+    ) -> impl Future<Output = anyhow::Result<String>> + Send {
+        async move {
+            self.admin_sql_with(endpoint_id, database, sql, &SqlOpts::admin_default())
+                .await
+        }
+    }
 }
 
 /// The container to create for an endpoint. The token goes in the environment, never argv.
@@ -109,6 +173,11 @@ pub fn create_body(
 /// as options or connection parameters. Refused: an empty name, one over 63 bytes (Postgres'
 /// limit) or one with a NUL (it can't be an argument).
 pub fn admin_psql_command(database: &str) -> anyhow::Result<Vec<String>> {
+    admin_psql_command_with(database, &SqlOpts::admin_default())
+}
+
+/// [`admin_psql_command`] with `opts.verbose_errors` and `opts.user` honoured.
+pub fn admin_psql_command_with(database: &str, opts: &SqlOpts) -> anyhow::Result<Vec<String>> {
     if database.is_empty() || database.len() > 63 || database.contains('\0') {
         bail!("database name {database:?} can't be passed to psql");
     }
@@ -133,16 +202,36 @@ pub fn admin_psql_command(database: &str) -> anyhow::Result<Vec<String>> {
         "ON_ERROR_STOP=1",
         // No `LINE n:` excerpt in errors: scripts can carry SCRAM verifiers.
         "-v",
-        "VERBOSITY=terse",
+        if opts.verbose_errors {
+            "VERBOSITY=default"
+        } else {
+            "VERBOSITY=terse"
+        },
         "-h",
-        "localhost",
-        "-U",
-        "cloud_admin",
-        "-d",
     ]
     .map(String::from)
     .into();
+    // `cloud_admin` keeps today's `localhost`. Another role (E15: the owner's own session)
+    // connects over IPv4 loopback, which the compute's pg_hba trusts; `localhost` may resolve
+    // to `::1`.
+    cmd.push(
+        if opts.user.is_some() {
+            "127.0.0.1"
+        } else {
+            "localhost"
+        }
+        .to_string(),
+    );
+    cmd.push("-U".to_string());
+    cmd.push(opts.user.as_deref().unwrap_or("cloud_admin").to_string());
+    cmd.push("-d".to_string());
     cmd.push(target);
+    // The script still comes on stdin; read as a file, psql prefixes each error with
+    // `psql:<stdin>:<line>:`, which the merge maps to the failing step.
+    if opts.verbose_errors {
+        cmd.push("-f".to_string());
+        cmd.push("-".to_string());
+    }
     Ok(cmd)
 }
 
@@ -151,11 +240,30 @@ fn is_status(err: &DockerError, code: u16) -> bool {
 }
 
 /// Environment variables for admin_sql execution.
+#[cfg(test)]
 fn admin_exec_env() -> Vec<String> {
-    vec![
-        "PGCONNECT_TIMEOUT=5".to_string(),
-        "PGOPTIONS=-c neon.forward_ddl=off".to_string(),
-    ]
+    admin_exec_env_with(&SqlOpts::admin_default())
+}
+
+/// [`admin_exec_env`] plus `PGAPPNAME` when `opts` names the session. DDL forwarding is turned
+/// off only for `cloud_admin`: `neon.forward_ddl` is superuser-only, so another role's
+/// connection would be refused (`permission denied to set parameter`). The owner's merge
+/// sessions (E15) run no role or database DDL (P8 refuses it), so forwarding has nothing to do.
+fn admin_exec_env_with(opts: &SqlOpts) -> Vec<String> {
+    let mut env = vec!["PGCONNECT_TIMEOUT=5".to_string()];
+    if opts.user.is_none() {
+        env.push("PGOPTIONS=-c neon.forward_ddl=off".to_string());
+    }
+    if let Some(name) = &opts.app_name {
+        // Postgres keeps 63 bytes of an application_name and turns other than printable ASCII
+        // into `?`: a longer or odder name wouldn't find its backend to cancel.
+        debug_assert!(
+            name.len() <= 63 && name.bytes().all(|b| b.is_ascii_graphic()),
+            "application_name {name:?} isn't at most 63 printable ASCII bytes"
+        );
+        env.push(format!("PGAPPNAME={name}"));
+    }
+    env
 }
 
 /// [`ComputeBackend`] over the Docker Engine API.
@@ -193,6 +301,7 @@ impl DockerBackend {
         &self,
         endpoint_id: &str,
         cmd: Vec<String>,
+        env: Vec<String>,
         sql: &str,
     ) -> anyhow::Result<String> {
         let docker = self.docker();
@@ -205,7 +314,7 @@ impl DockerBackend {
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     user: Some("postgres".to_string()),
-                    env: Some(admin_exec_env()),
+                    env: Some(env),
                     cmd: Some(cmd),
                     ..Default::default()
                 },
@@ -338,16 +447,23 @@ impl ComputeBackend for DockerBackend {
             .collect())
     }
 
-    async fn admin_sql(
+    async fn admin_sql_with(
         &self,
         endpoint_id: &str,
         database: &str,
         sql: &str,
+        opts: &SqlOpts,
     ) -> anyhow::Result<String> {
-        let cmd = admin_psql_command(database)?;
-        tokio::time::timeout(ADMIN_SQL_TIMEOUT, self.run_exec(endpoint_id, cmd, sql))
+        let cmd = admin_psql_command_with(database, opts)?;
+        let env = admin_exec_env_with(opts);
+        tokio::time::timeout(opts.timeout, self.run_exec(endpoint_id, cmd, env, sql))
             .await
-            .with_context(|| format!("psql in compute {endpoint_id} timed out"))?
+            .map_err(|_| {
+                anyhow::Error::new(SqlTimedOut {
+                    endpoint: endpoint_id.to_string(),
+                    after: opts.timeout,
+                })
+            })?
     }
 }
 
@@ -358,9 +474,11 @@ pub mod fake {
     use std::net::{IpAddr, SocketAddr};
     use std::sync::{Arc, Mutex, MutexGuard};
 
+    use std::time::Duration;
+
     use anyhow::bail;
 
-    use super::{ComputeBackend, ComputeStatus};
+    use super::{ComputeBackend, ComputeStatus, SqlOpts, SqlTimedOut};
     use crate::compute::ComputeLocator;
 
     pub type Journal = Arc<Mutex<Vec<String>>>;
@@ -375,6 +493,11 @@ pub mod fake {
         computes: Mutex<HashMap<String, Compute>>,
         /// `(endpoint, database, sql)` for every admin_sql call that reached the compute.
         pub sql: Mutex<Vec<(String, String, String)>>,
+        /// The [`SqlOpts`] of every admin_sql call that reached the compute, like `sql`.
+        pub sql_opts: Mutex<Vec<SqlOpts>>,
+        /// Each admin_sql call takes this long: one with a shorter timeout fails with
+        /// "timed out after" (no real waiting).
+        pub sql_delay: Mutex<Option<Duration>>,
         pub journal: Journal,
         pub fail_create: Mutex<Option<String>>,
         /// Each admin_sql call fails with "not ready" and decrements this while it's above 0.
@@ -383,6 +506,8 @@ pub mod fake {
         pub fail_sql_containing: Mutex<Option<(String, String)>>,
         /// Needles set by [`FakeBackend::fail_when`].
         fail_needles: Mutex<Vec<String>>,
+        /// `(needle, runs)` set by [`FakeBackend::time_out_when`].
+        timeout_needles: Mutex<Vec<(String, bool)>>,
         pub fail_delete: Mutex<Option<String>>,
         /// `control_addr` never answers, like a hung Docker daemon.
         pub hang_control_addr: Mutex<bool>,
@@ -394,6 +519,9 @@ pub mod fake {
         /// `(endpoint, needle, stdout)`: like `answers`, for one endpoint only; tried before
         /// `answers_in`.
         pub answers_at: Mutex<Vec<(String, String, String)>>,
+        /// `(endpoint, needle, stdout)`: like `answers_at`, but each answers once (the first
+        /// match is used up); tried before every other answer.
+        pub answers_once: Mutex<Vec<(String, String, String)>>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -433,10 +561,26 @@ pub mod fake {
             ));
         }
 
+        /// The next SQL run on `endpoint` containing `needle` answers `stdout`, once (before any
+        /// other answer); later ones answer as before.
+        pub fn answer_once_at(&self, endpoint: &str, needle: &str, stdout: &str) {
+            lock(&self.answers_once).push((
+                endpoint.to_string(),
+                needle.to_string(),
+                stdout.to_string(),
+            ));
+        }
+
         /// From now on, SQL containing `needle` fails with "injected failure" (on top of any
         /// earlier needles).
         pub fn fail_when(&self, needle: &str) {
             lock(&self.fail_needles).push(needle.to_string());
+        }
+
+        /// From now on, SQL containing `needle` times out ([`SqlTimedOut`]); with `runs`, after
+        /// it ran (its answer lost: recorded in `sql` like a call that reached the compute).
+        pub fn time_out_when(&self, needle: &str, runs: bool) {
+            lock(&self.timeout_needles).push((needle.to_string(), runs));
         }
 
         fn record(&self, entry: String) {
@@ -542,11 +686,12 @@ pub mod fake {
             Ok(ids)
         }
 
-        async fn admin_sql(
+        async fn admin_sql_with(
             &self,
             endpoint_id: &str,
             database: &str,
             sql: &str,
+            opts: &SqlOpts,
         ) -> anyhow::Result<String> {
             self.record(format!(
                 "compute.sql {endpoint_id} {database} {}",
@@ -567,11 +712,47 @@ pub mod fake {
             if lock(&self.fail_needles).iter().any(|n| sql.contains(n)) {
                 bail!("injected failure");
             }
+            let timeout = lock(&self.timeout_needles)
+                .iter()
+                .find(|(n, _)| sql.contains(n))
+                .map(|(_, runs)| *runs);
+            if let Some(runs) = timeout {
+                if runs {
+                    lock(&self.sql).push((
+                        endpoint_id.to_string(),
+                        database.to_string(),
+                        sql.to_string(),
+                    ));
+                    lock(&self.sql_opts).push(opts.clone());
+                }
+                return Err(anyhow::Error::new(SqlTimedOut {
+                    endpoint: endpoint_id.to_string(),
+                    after: opts.timeout,
+                }));
+            }
+            if let Some(delay) = *lock(&self.sql_delay)
+                && delay > opts.timeout
+            {
+                return Err(anyhow::Error::new(SqlTimedOut {
+                    endpoint: endpoint_id.to_string(),
+                    after: opts.timeout,
+                }));
+            }
             lock(&self.sql).push((
                 endpoint_id.to_string(),
                 database.to_string(),
                 sql.to_string(),
             ));
+            lock(&self.sql_opts).push(opts.clone());
+            {
+                let mut once = lock(&self.answers_once);
+                if let Some(i) = once
+                    .iter()
+                    .position(|(ep, needle, _)| ep == endpoint_id && sql.contains(needle))
+                {
+                    return Ok(once.remove(i).2);
+                }
+            }
             if let Some((_, _, stdout)) = lock(&self.answers_at)
                 .iter()
                 .find(|(ep, needle, _)| ep == endpoint_id && sql.contains(needle))
@@ -832,11 +1013,166 @@ mod tests {
         assert_eq!(fake.sql.lock().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn admin_sql_with_passes_app_name_and_timeout() {
+        let journal = Journal::default();
+        let fake = FakeBackend::with_journal(journal.clone());
+        let opts = SqlOpts {
+            timeout: Duration::from_secs(960),
+            app_name: Some("chelabase-merge-1".into()),
+            verbose_errors: true,
+            user: None,
+        };
+        fake.admin_sql_with("ep-1", "app", "SELECT 1;\nSELECT 2;", &opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            *journal.lock().unwrap(),
+            ["compute.sql ep-1 app SELECT 1;"]
+        );
+        assert_eq!(
+            fake.sql_opts.lock().unwrap().as_slice(),
+            std::slice::from_ref(&opts)
+        );
+        // A call slower than its timeout fails like the real backend.
+        *fake.sql_delay.lock().unwrap() = Some(Duration::from_secs(5));
+        let short = SqlOpts {
+            timeout: Duration::from_secs(1),
+            ..SqlOpts::admin_default()
+        };
+        let err = fake
+            .admin_sql_with("ep-1", "app", "SELECT 3", &short)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out after"), "{err}");
+        // T14 apply minor 1: the timeout is typed, never told apart by its text.
+        assert!(super::is_timeout(&err), "{err}");
+        assert!(fake.admin_sql_with("ep-1", "app", "SELECT 4", &opts).await.is_ok());
+        // An error that only says so (a user's RAISE, say) isn't one.
+        *fake.sql_delay.lock().unwrap() = None;
+        *fake.fail_sql_containing.lock().unwrap() =
+            Some(("SELECT 5".into(), "ERROR:  timed out after 1s".into()));
+        let raised = fake.admin_sql_with("ep-1", "app", "SELECT 5", &short).await.unwrap_err();
+        assert!(!super::is_timeout(&raised), "{raised}");
+    }
+
+    // T14 apply minor 21: the application name is one Postgres keeps whole and psql passes as is.
+    #[test]
+    #[should_panic(expected = "application_name")]
+    fn an_overlong_app_name_is_caught() {
+        let opts = SqlOpts {
+            app_name: Some("x".repeat(64)),
+            ..SqlOpts::admin_default()
+        };
+        let _ = super::admin_exec_env_with(&opts);
+    }
+
+    #[tokio::test]
+    async fn admin_sql_is_admin_sql_with_defaults() {
+        let fake = FakeBackend::default();
+        fake.admin_sql("ep-1", "app", "SELECT 1").await.unwrap();
+        assert_eq!(
+            fake.sql_opts.lock().unwrap().as_slice(),
+            [SqlOpts::admin_default()]
+        );
+        let d = SqlOpts::admin_default();
+        assert_eq!(d.timeout, Duration::from_secs(30));
+        assert_eq!(d.app_name, None);
+        assert!(!d.verbose_errors);
+    }
+
+    #[test]
+    fn sql_opts_shape_the_psql_command_and_env() {
+        let verbose = SqlOpts {
+            verbose_errors: true,
+            app_name: Some("chelabase-merge-7".into()),
+            ..SqlOpts::admin_default()
+        };
+        let cmd = admin_psql_command_with("web_1", &verbose).unwrap();
+        assert!(cmd.contains(&"VERBOSITY=default".to_string()), "{cmd:?}");
+        assert!(!cmd.contains(&"VERBOSITY=terse".to_string()), "{cmd:?}");
+        let env = admin_exec_env_with(&verbose);
+        assert_eq!(env[..2], admin_exec_env()[..]);
+        assert!(env.contains(&"PGAPPNAME=chelabase-merge-7".to_string()), "{env:?}");
+        let plain = SqlOpts::admin_default();
+        assert_eq!(
+            admin_psql_command_with("web_1", &plain).unwrap(),
+            admin_psql_command("web_1").unwrap()
+        );
+        assert_eq!(admin_exec_env_with(&plain), admin_exec_env());
+    }
+
+    // E15: merge scripts run in the owner's own session (`-U postgres`); `None` stays
+    // `cloud_admin`.
+    #[test]
+    fn sql_opts_user_runs_psql_as_that_role() {
+        let owner = SqlOpts {
+            user: Some("postgres".into()),
+            ..SqlOpts::admin_default()
+        };
+        let cmd = admin_psql_command_with("web_1", &owner).unwrap();
+        assert!(
+            cmd.windows(2).any(|w| w[0] == "-U" && w[1] == "postgres"),
+            "{cmd:?}"
+        );
+        assert!(!cmd.contains(&"cloud_admin".to_string()), "{cmd:?}");
+        // Fix round 1 (M4): IPv4 loopback, which the compute's pg_hba trusts; `localhost` may
+        // resolve to `::1`.
+        assert!(
+            cmd.windows(2).any(|w| w[0] == "-h" && w[1] == "127.0.0.1"),
+            "{cmd:?}"
+        );
+        assert!(!cmd.contains(&"localhost".to_string()), "{cmd:?}");
+        assert_eq!(SqlOpts::admin_default().user, None);
+        assert!(
+            admin_psql_command("web_1")
+                .unwrap()
+                .windows(2)
+                .any(|w| w[0] == "-U" && w[1] == "cloud_admin")
+        );
+    }
+
     #[test]
     fn admin_exec_turns_forwarding_off() {
         let env = admin_exec_env();
         assert_eq!(env.len(), 2);
         assert_eq!(env[0], "PGCONNECT_TIMEOUT=5");
         assert_eq!(env[1], "PGOPTIONS=-c neon.forward_ddl=off");
+    }
+
+    /// Verbose sessions read the script with `-f -`, so psql prefixes an error with
+    /// `psql:<stdin>:<line>:` (it doesn't for plain stdin), which the merge maps to its step
+    /// (found live in T13: phase 1 failures were never named).
+    #[test]
+    fn verbose_sessions_name_the_failing_line() {
+        let verbose = SqlOpts {
+            verbose_errors: true,
+            user: Some("postgres".into()),
+            ..SqlOpts::admin_default()
+        };
+        let cmd = admin_psql_command_with("web_1", &verbose).unwrap();
+        assert!(
+            cmd.windows(2).any(|w| w[0] == "-f" && w[1] == "-"),
+            "{cmd:?}"
+        );
+        assert!(!admin_psql_command("web_1").unwrap().contains(&"-f".to_string()));
+    }
+
+    /// `neon.forward_ddl` is superuser-only: the owner's session (E15) can't set it, and its
+    /// connection would fail with `permission denied to set parameter` (found live in T13).
+    #[test]
+    fn the_owner_session_leaves_forwarding_alone() {
+        let owner = SqlOpts {
+            user: Some("postgres".into()),
+            app_name: Some("chelabase-merge-x".into()),
+            ..SqlOpts::admin_default()
+        };
+        let env = admin_exec_env_with(&owner);
+        assert!(
+            !env.iter().any(|e| e.starts_with("PGOPTIONS=")),
+            "{env:?}"
+        );
+        assert!(env.contains(&"PGCONNECT_TIMEOUT=5".to_string()), "{env:?}");
+        assert!(env.contains(&"PGAPPNAME=chelabase-merge-x".to_string()), "{env:?}");
     }
 }

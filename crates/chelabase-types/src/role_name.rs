@@ -61,6 +61,23 @@ pub fn is_reserved_for(name: &str, owner: &str) -> bool {
     RESERVED_ROLE_NAMES.contains(&name) && name != owner
 }
 
+/// A role the API never changes (PATCH): [`is_reserved_for`], plus any `chelabase_…` role
+/// (any case), listed in [`RESERVED_ROLE_NAMES`] or not.
+pub fn is_reserved_target(name: &str, owner: &str) -> bool {
+    is_reserved_for(name, owner) || name.to_ascii_lowercase().starts_with("chelabase_")
+}
+
+/// A role no API-made role may be made a member of (U2): the owner, every reserved name
+/// (`authenticator`, `anon`, `authenticated`, `neon_superuser`, `cloud_admin`, …), any
+/// `chelabase_…` role and any `pg_…` role, in any case. Owner-level is the only way into
+/// `neon_superuser`.
+pub fn is_membership_reserved(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("pg_")
+        || lower.starts_with("chelabase_")
+        || RESERVED_ROLE_NAMES.contains(&lower.as_str())
+}
+
 /// A double-quoted SQL identifier (`"` doubled).
 pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -130,6 +147,41 @@ mod tests {
         assert!(is_reserved_for("PG_x", "postgres"));
         assert!(is_reserved_for("pg_x", "pg_x"));
         assert!(!is_reserved_for("app", "postgres"));
+    }
+
+    #[test]
+    fn chelabase_roles_are_reserved_targets() {
+        for name in ["chelabase_custom", "Chelabase_x", "chelabase_admin", "pg_x", "anon"] {
+            assert!(is_reserved_target(name, "postgres"), "{name}");
+        }
+        for name in ["app", "chela", "postgres", "Anon"] {
+            assert!(!is_reserved_target(name, "postgres"), "{name}");
+        }
+    }
+
+    #[test]
+    fn membership_in_platform_roles_is_refused() {
+        for name in [
+            "postgres",
+            "authenticator",
+            "anon",
+            "authenticated",
+            "neon_superuser",
+            "cloud_admin",
+            "chelabase_admin",
+            "chelabase_auth_sync",
+            "chelabase_anything",
+            "Chelabase_x",
+            "pg_read_all_data",
+            "PG_monitor",
+            "public",
+            "none",
+        ] {
+            assert!(is_membership_reserved(name), "{name}");
+        }
+        for name in ["app", "readers", "My Group", "chela"] {
+            assert!(!is_membership_reserved(name), "{name}");
+        }
     }
 
     #[test]

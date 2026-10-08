@@ -27,9 +27,10 @@ The dashboard lists your tenant's projects, with **New project**. Opening a proj
 
 ## Databases
 
-The **Databases** tab lists each database with its status and endpoint. **Connection details** shows the owner's host, port, user, password and URI; **Reset password** sets a new owner password; **Delete** destroys the database with all its branches and data (you type its name to confirm). The four buttons on a row open a panel under it, once the database is `ready`:
+The **Databases** tab lists each database with its status and endpoint. **Connection details** shows the owner's host, port, user, password and URI; **Reset password** sets a new owner password; **Delete** destroys the database with all its branches and data (you type its name to confirm). The five buttons on a row open a panel under it, once the database is `ready`:
 
-- **Branches**: the branch tree with each branch's status and endpoint, a form for a new branch, and the database's settings (history window, branch limit, max rows, statement timeout, max connections). Each branch has **Connection details**, **Reset password**, **Protect** or **Unprotect**, **Reset to parent**, **Restore**, **Delete branch** and **Roles**. See [Branches](/docs/using/branches) and [Login roles](/docs/using/login-roles).
+- **Branches**: the branch tree with each branch's status and endpoint, a form for a new branch, and the database's settings (history window, branch limit, max rows, statement timeout, max connections). Each branch has **Connection details**, **Reset password**, **Protect** or **Unprotect**, **Reset to parent**, **Restore**, **Delete branch**, **Roles** and, with a parent, **Merge into** and **Update from** it (see [Merging schema](/docs/using/merging-schema#in-studio)). A disabled action says why next to the buttons; while a schema merge holds the branch, a link opens the merge. See [Branches](/docs/using/branches) and [Login roles](/docs/using/login-roles).
+- **Merges**: the database's schema merges, newest first, each opening its [merge page](/docs/using/merging-schema#in-studio).
 - **Data API**: the endpoint, the public key (with **Rotate public key**), secret keys, and per-database access. See [Data API](/docs/using/data-api).
 - **Tables**: the console, below.
 - **SQL**: the [SQL editor](/docs/using/sql-editor).
@@ -46,7 +47,7 @@ It also names the app users table while its RLS is off, even before any role can
 
 ## Tables console
 
-The **Tables** view browses and edits rows in any served database and schema of a branch. Pick the **Branch**, **Database**, **Schema** and **View as** (the owner, `anon`, `authenticated`, or a custom role), then a table or view. The grid sorts, filters (match all or any), pages, edits cells in place, inserts rows and deletes selected rows. Views, materialized views and foreign tables, and tables without a primary key, are read-only.
+The **Tables** view browses and edits rows in any served database and schema of a branch. Pick the **Branch**, **Database**, **Schema** and **View as** (the owner, `anon`, `authenticated`, or a custom role), then a table or view. The grid sorts, filters (match all or any), pages, edits cells in place, inserts rows and deletes selected rows. Views, materialized views and foreign tables, and tables without a primary key, are read-only. **View as** the owner, or a role with `BYPASSRLS`, shows a warning: row-level security is bypassed, and edits apply to every row. Owner-level roles are listed but can't be picked.
 
 Over the API, the console is `POST /v1/databases/{id}/branches/{branch_id}/console/query` with:
 
@@ -57,7 +58,7 @@ Over the API, the console is `POST /v1/databases/{id}/branches/{branch_id}/conso
 `role` is `null` (the owner) or a role name, `database` is `null` (the branch's main database) or a Postgres database name, and `tree` is a data API request, the JSON that `POST /data/v1/query` takes (see [Data API](/docs/using/data-api)). Every operation is allowed, batches included, in one transaction with the data API's `max_rows` and statement timeout. The answer is the data API's.
 
 - **As the owner** (`role: null`, Studio's default): the orchestrator runs the request itself, on a small pool per branch and database (at most 2 connections, closed after 60 seconds idle), with the owner password it holds. Row-level security doesn't apply to the owner. `rest` never sees the owner's password. When the owner's password was set in SQL, Chelabase doesn't know it: the answer is 409 `owner_password_unknown` until you reset it (**Reset password**, or `POST …/branches/{branch_id}/reset-password`), which works at once.
-- **As another role** (`anon`, `authenticated`, a plain role you made): the worker checks the role the first time (the result is remembered for five minutes) and grants it to `authenticator`; `rest` then runs the request as that role. A role that can bypass row-level security (an owner-level role), or one that doesn't exist, is refused: 403 `role_refused`, saying why. A role dropped after its check answers 503 `unavailable` for up to 30 seconds, then 404 `unknown_role`.
+- **As another role** (`anon`, `authenticated`, a plain role you made): the worker checks the role the first time (the result is remembered for five minutes) and grants it to `authenticator`; `rest` then runs the request as that role. An owner-level role (a superuser, or one with `CREATEROLE`, `CREATEDB` or `REPLICATION`, or a `neon_superuser` member), or one that doesn't exist, is refused: 403 `role_refused`, saying why. A role with `BYPASSRLS` alone is allowed and reads past row-level security. A role dropped after its check answers 503 `unavailable` for up to 30 seconds, then 404 `unknown_role`.
 - **Errors:** a Postgres database that isn't served is 409 `data_api_disabled` (Studio offers **Enable data API**); one that doesn't exist is 404 `not_found`; everything else is the data API's code. See [Error codes](/docs/reference/errors).
 - **Audit:** every write is logged at `info` (platform user, branch, database, role, operation kind), never the values.
 

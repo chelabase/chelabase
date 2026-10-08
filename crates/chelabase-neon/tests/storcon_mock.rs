@@ -127,7 +127,7 @@ async fn create_timeline_fresh_and_branch() {
         ),
         (
             201,
-            r#"{"ancestor_lsn":"0/14EE0B8","last_record_lsn":"0/14EE0B8"}"#,
+            r#"{"ancestor_timeline_id":"00000000000000000000000000000002","ancestor_lsn":"0/14EE0B8","last_record_lsn":"0/14EE0B8"}"#,
         ),
         (
             201,
@@ -145,8 +145,10 @@ async fn create_timeline_fresh_and_branch() {
     assert_eq!(
         fresh,
         TimelineInfo {
+            ancestor_timeline_id: None,
             ancestor_lsn: None,
             last_record_lsn: lsn("0/14EE0B8"),
+            applied_gc_cutoff_lsn: None,
         }
     );
     let branch = client
@@ -154,6 +156,7 @@ async fn create_timeline_fresh_and_branch() {
         .await
         .unwrap();
     assert_eq!(branch.ancestor_lsn, Some(lsn("0/14EE0B8")));
+    assert_eq!(branch.ancestor_timeline_id.as_deref(), Some(main.as_str()));
     client
         .create_timeline(&tenant, &head, 17, Some((&main, None)))
         .await
@@ -197,6 +200,23 @@ async fn get_timeline_reads_it_back() {
         seen[0].path,
         format!("/v1/tenant/{tenant}/timeline/{timeline}")
     );
+    // A reply without the GC cutoff (an older pageserver) reads as none.
+    assert_eq!(info.applied_gc_cutoff_lsn, None);
+}
+
+// Step 6g: a base's static compute can't read below the timeline's GC cutoff.
+#[tokio::test]
+async fn get_timeline_reads_the_gc_cutoff() {
+    let m = mock(vec![(
+        200,
+        r#"{"ancestor_lsn":"0/1000000","last_record_lsn":"0/1F98488","applied_gc_cutoff_lsn":"0/1800000"}"#,
+    )])
+    .await;
+    let info = StorconClient::new(&m.base, 0)
+        .get_timeline(&id(1), &id(2))
+        .await
+        .unwrap();
+    assert_eq!(info.applied_gc_cutoff_lsn, Some(lsn("0/1800000")));
 }
 
 #[tokio::test]

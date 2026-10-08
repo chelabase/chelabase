@@ -9,8 +9,8 @@ import { DataApiPanel } from "./data-api-panel";
 const branch = { id: "br", name: "main", kind: "normal", status: "ready" } as unknown as Branch;
 const PUB = "chk_pub_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
 const keys: DataKey[] = [
-  { id: "pub", kind: "public", databases: null, role: "anon", name: "public", prefix: "chk_pub_0123", created_at: "2026-10-01T09:00:00Z", last_used_at: null, role_blocked: false, key: PUB },
-  { id: "k1", kind: "secret", databases: null, role: "authenticated", name: "reporting", prefix: "chk_sec_ab12", created_at: "2026-10-01T09:00:00Z", last_used_at: null, role_blocked: false },
+  { id: "pub", kind: "public", databases: null, role: "anon", name: "public", prefix: "chk_pub_0123", created_at: "2026-10-01T09:00:00Z", last_used_at: null, role_blocked: false, bypasses_rls: false, key: PUB },
+  { id: "k1", kind: "secret", databases: null, role: "authenticated", name: "reporting", prefix: "chk_sec_ab12", created_at: "2026-10-01T09:00:00Z", last_used_at: null, role_blocked: false, bypasses_rls: false },
 ];
 const emptySchema: DataApiSchema = { version: "1", default_schema: "public", schemas: {} };
 const openSchema: DataApiSchema = {

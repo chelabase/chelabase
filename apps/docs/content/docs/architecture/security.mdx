@@ -13,7 +13,7 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 **Management API.** Callers present a Zitadel access token, which the gateway verifies against Zitadel's keys. Another tenant's resources answer exactly like missing ones (404 `not_found`).
 
-**Data API keys.** Chelabase stores only the SHA-256 of a key and its first 12 characters. A secret key is shown once and Chelabase keeps no copy; the public key is also stored encrypted so Studio can show it again. Keys resolve to a role, and `rest` refuses to run a request as an owner-level role (one that is a superuser or has `CREATEROLE`, `CREATEDB`, `BYPASSRLS` or `REPLICATION`, or belongs to `neon_superuser`). Revocation takes effect within 30 seconds. Unknown-key lookups are rate limited per client address.
+**Data API keys.** Chelabase stores only the SHA-256 of a key and its first 12 characters. A secret key is shown once and Chelabase keeps no copy; the public key is also stored encrypted so Studio can show it again. Keys resolve to a role, and `rest` refuses to run a request as an owner-level role (one that is a superuser or has `CREATEROLE`, `CREATEDB` or `REPLICATION`, or belongs to `neon_superuser`). A role with `BYPASSRLS` alone is allowed: its key reads past row-level security, and the key list marks it. Revocation takes effect within 30 seconds. Unknown-key lookups are rate limited per client address.
 
 **Row-level security is off by default.** A new table is reachable by the roles that hold default privileges on it; Studio warns about every reachable object without RLS. Policies are yours to write. See [Data API](/docs/architecture/data-api#row-level-security).
 

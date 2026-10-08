@@ -821,7 +821,7 @@ async fn secret_key_custom_role() {
         .await;
         assert!(matches!(
             l.worker.check_data_role(l.main_id(), "reporter").await,
-            RoleCheck::Ok(_)
+            RoleCheck::Ok(_, false)
         ));
         let reporter = |body| l.query_on(l.main_id(), DataKeyKind::Secret, "reporter", body);
         assert_eq!(
@@ -857,7 +857,7 @@ async fn secret_key_is_bound_to_its_roles_oid() {
              GRANT SELECT ON r TO bound_reader;",
         )
         .await;
-        let RoleCheck::Ok(old) = l.worker.check_data_role(l.main_id(), "bound_reader").await else {
+        let RoleCheck::Ok(old, _) = l.worker.check_data_role(l.main_id(), "bound_reader").await else {
             panic!("the role check passes");
         };
         let select = json!({"v":1,"op":"select","from":"r"});
@@ -870,7 +870,7 @@ async fn secret_key_is_bound_to_its_roles_oid() {
              GRANT SELECT ON r TO bound_reader;",
         )
         .await;
-        let RoleCheck::Ok(new) = l.worker.check_data_role(l.main_id(), "bound_reader").await else {
+        let RoleCheck::Ok(new, _) = l.worker.check_data_role(l.main_id(), "bound_reader").await else {
             panic!("the recreated role passes the check");
         };
         assert_ne!(old, new, "a recreated role has another OID");
@@ -884,9 +884,10 @@ async fn secret_key_is_bound_to_its_roles_oid() {
     .await;
 }
 
-/// Step 6a (Q3): a secret key whose role is owner-level — BYPASSRLS, CREATEDB, CREATEROLE,
-/// REPLICATION or `neon_superuser` at any depth — is refused before rest switches to it. A plain
-/// role next to them still reads.
+/// E33: a secret key whose role is owner-level — CREATEDB, CREATEROLE, REPLICATION or
+/// `neon_superuser` at any depth — is refused before rest switches to it. A plain role reads,
+/// and so does a role with BYPASSRLS (it reads past row-level security; the worker's check
+/// says so, for Studio's mark).
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
 async fn secret_key_of_an_owner_level_role_is_refused() {
@@ -894,6 +895,8 @@ async fn secret_key_of_an_owner_level_role_is_refused() {
         l.owner(
             "CREATE TABLE r (v text);
              INSERT INTO r VALUES ('seen');
+             ALTER TABLE r ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY nobody ON r USING (false);
              CREATE ROLE plain_reader NOLOGIN;
              CREATE ROLE by_bypassrls NOLOGIN BYPASSRLS;
              CREATE ROLE by_createdb NOLOGIN CREATEDB;
@@ -910,16 +913,27 @@ async fn secret_key_of_an_owner_level_role_is_refused() {
             .await;
         assert!(matches!(
             l.worker.check_data_role(l.main_id(), "plain_reader").await,
-            RoleCheck::Ok(_)
+            RoleCheck::Ok(_, false)
+        ));
+        assert!(matches!(
+            l.worker.check_data_role(l.main_id(), "by_bypassrls").await,
+            RoleCheck::Ok(_, true)
         ));
         let select = json!({"v":1,"op":"select","from":"r"});
+        // The policy hides every row from a plain role; BYPASSRLS reads past it.
         assert_eq!(
             l.query_on(l.main_id(), DataKeyKind::Secret, "plain_reader", select.clone())
                 .await
                 .ok(),
+            &json!([])
+        );
+        assert_eq!(
+            l.query_on(l.main_id(), DataKeyKind::Secret, "by_bypassrls", select.clone())
+                .await
+                .ok(),
             &json!([{"v":"seen"}])
         );
-        for role in ["by_bypassrls", "by_createdb", "by_createrole", "by_depth"] {
+        for role in ["by_createdb", "by_createrole", "by_depth"] {
             let answer = l
                 .query_on(l.main_id(), DataKeyKind::Secret, role, select.clone())
                 .await;
@@ -927,8 +941,9 @@ async fn secret_key_of_an_owner_level_role_is_refused() {
             assert_eq!(
                 error["message"],
                 format!(
-                    "the role `{role}` of this key can bypass row-level security; make it \
-                     plain or use another role"
+                    "the role `{role}` of this key is owner-level or has system privileges \
+                     (superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of neon_superuser \
+                     or a system role); use a role without them (BYPASSRLS is allowed)"
                 ),
                 "{role}"
             );
@@ -947,7 +962,7 @@ async fn internal_schema_for_a_console_role() {
             "CREATE SCHEMA hidden;
              CREATE TABLE hidden.t (id int PRIMARY KEY, v text);
              CREATE ROLE console_editor NOLOGIN;
-             CREATE ROLE console_boss NOLOGIN BYPASSRLS;
+             CREATE ROLE console_boss NOLOGIN CREATEDB;
              GRANT USAGE ON SCHEMA hidden TO console_editor;
              GRANT SELECT ON hidden.t TO console_editor;",
         )
@@ -2005,6 +2020,8 @@ async fn stored_key(l: &Live, name: &str, databases: Vec<String>) -> [u8; 32] {
             sealed: None,
             databases: Some(databases),
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         })
         .await
         .expect("insert the key");

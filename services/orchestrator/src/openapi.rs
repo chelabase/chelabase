@@ -388,6 +388,45 @@ impl MetadataPort for Doc {
     ) -> Result<bool, MetadataError> {
         match *self {}
     }
+    async fn create_merge(&self, merge: &NewMerge) -> Result<MergeCreate, MetadataError> {
+        match *self {}
+    }
+    async fn get_merge(&self, id: Uuid) -> Result<Option<MergeRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn list_merges(
+        &self,
+        database_id: DatabaseId,
+        branch: Option<BranchId>,
+    ) -> Result<Vec<MergeRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn update_merge_draft(
+        &self,
+        id: Uuid,
+        expected_version: i64,
+        patch: &MergeDraftPatch,
+    ) -> Result<MergeWrite, MetadataError> {
+        match *self {}
+    }
+    async fn set_merge_status(
+        &self,
+        id: Uuid,
+        from: &[MergeStatus],
+        to: MergeStatus,
+        patch: MergeStatusPatch,
+    ) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn merge_events(&self, id: Uuid) -> Result<Vec<MergeEvent>, MetadataError> {
+        match *self {}
+    }
+    async fn cancel_drafts_for_branch(&self, branch: BranchId) -> Result<u64, MetadataError> {
+        match *self {}
+    }
+    async fn branch_has_busy_merge(&self, branch: BranchId) -> Result<Option<chelabase_metadata::BranchBusy>, MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -408,6 +447,9 @@ impl JobPort for Doc {
         &self,
         job: &JobEnvelope<DatabaseSettingsJob>,
     ) -> Result<(), BoxError> {
+        match *self {}
+    }
+    async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
         match *self {}
     }
     async fn check_data_role(
@@ -457,7 +499,13 @@ impl JobPort for Doc {
     async fn reset_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
         match *self {}
     }
+    async fn update_role(&self, request: RoleUpdateRequest) -> Result<RoleReply, ResetError> {
+        match *self {}
+    }
     async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+        match *self {}
+    }
+    async fn role_sessions(&self, request: RoleRequest) -> Result<RoleSessionsReply, ResetError> {
         match *self {}
     }
     async fn publish_project_delete(&self, job: &JobEnvelope<ProjectDeleteJob>) -> Result<(), BoxError> {
@@ -606,10 +654,17 @@ mod tests {
                 "listRoles",
             ),
             (
+                "GET /v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions",
+                "listRoleSessions",
+            ),
+            (
                 "GET /v1/databases/{id}/branches/{branch_id}/sql/schema",
                 "getSqlSchema",
             ),
             ("GET /v1/databases/{id}/connection", "getDatabaseConnection"),
+            ("GET /v1/databases/{id}/merges", "listMerges"),
+            ("GET /v1/databases/{id}/merges/{merge_id}", "getMerge"),
+            ("GET /v1/databases/{id}/merges/{merge_id}/plan.sql", "exportMergePlan"),
             ("GET /v1/databases/{id}/sql-queries", "listSavedQueries"),
             ("GET /v1/databases/{id}/sql-queries/{query_id}", "getSavedQuery"),
             ("GET /v1/me", "getMe"),
@@ -632,6 +687,11 @@ mod tests {
                 "PATCH /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
                 "updatePgDatabase",
             ),
+            (
+                "PATCH /v1/databases/{id}/branches/{branch_id}/roles/{role}",
+                "updateRole",
+            ),
+            ("PATCH /v1/databases/{id}/merges/{merge_id}", "updateMerge"),
             ("PATCH /v1/databases/{id}/sql-queries/{query_id}", "updateSavedQuery"),
             ("PATCH /v1/projects/{id}", "updateProject"),
             ("PATCH /v1/projects/{id}/users/{user_id}", "updateAppUser"),
@@ -648,6 +708,10 @@ mod tests {
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/keys/{key_id}/rotate",
                 "rotateKey",
+            ),
+            (
+                "POST /v1/databases/{id}/branches/{branch_id}/merges",
+                "createMerge",
             ),
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api",
@@ -678,6 +742,13 @@ mod tests {
                 "POST /v1/databases/{id}/branches/{branch_id}/sql/runs/{run_id}/cancel",
                 "cancelSqlRun",
             ),
+            ("POST /v1/databases/{id}/merges/{merge_id}/abandon", "abandonMerge"),
+            ("POST /v1/databases/{id}/merges/{merge_id}/apply", "applyMerge"),
+            ("POST /v1/databases/{id}/merges/{merge_id}/cancel", "cancelMerge"),
+            ("POST /v1/databases/{id}/merges/{merge_id}/finish", "finishMerge"),
+            ("POST /v1/databases/{id}/merges/{merge_id}/recompute", "recomputeMerge"),
+            ("POST /v1/databases/{id}/merges/{merge_id}/rehearse", "rehearseMerge"),
+            ("POST /v1/databases/{id}/merges/{merge_id}/retry", "retryMerge"),
             (
                 "POST /v1/databases/{id}/reset-password",
                 "resetDatabasePassword",
@@ -716,7 +787,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -748,6 +819,43 @@ mod tests {
         }
     }
 
+    fn operation<'a>(doc: &'a Value, id: &str) -> &'a Value {
+        operations(doc)
+            .into_iter()
+            .find(|(_, _, op)| op["operationId"] == id)
+            .unwrap_or_else(|| panic!("no operation {id}"))
+            .2
+    }
+
+    // T14 F3 fix round (M7): the branch rewrites say a merge holding the branch refuses them,
+    // and what the 409 carries.
+    #[test]
+    fn branch_rewrites_document_the_merge_hold() {
+        let doc = document();
+        for id in ["resetBranchToParent", "restoreBranch", "deleteBranch"] {
+            let conflict = operation(&doc, id)["responses"]["409"]["description"]
+                .as_str()
+                .unwrap();
+            for needle in ["`branch_merge_busy`", "`error.merge_id`", "`error.rehearsal_branch_id`", "abandon"] {
+                assert!(conflict.contains(needle), "{id} lacks {needle}: {conflict}");
+            }
+        }
+    }
+
+    // T14 F3 fix round (M11): a membership list never revokes `pg_*` or Chelabase's own groups.
+    #[test]
+    fn update_role_documents_the_memberships_that_stay() {
+        let doc = document();
+        let description = operation(&doc, "updateRole")["description"].as_str().unwrap();
+        assert!(!description.contains("replaces the whole list"), "{description}");
+        assert!(description.contains("`pg_*` and Chelabase's own groups stay"), "{description}");
+        let field = doc["components"]["schemas"]["UpdateRoleRequest"]["properties"]["member_of"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        assert!(field.contains("`pg_*` and Chelabase's own groups stay"), "{field}");
+    }
+
     /// Schema names become the TypeScript type names of the public client: clear and unique.
     #[test]
     fn schema_names_are_api_facing() {
@@ -759,6 +867,7 @@ mod tests {
             .map(String::as_str)
             .collect();
         let expected = [
+            "AfterMerge",
             "AppUser",
             "AppUserPage",
             "AppUserSession",
@@ -766,6 +875,7 @@ mod tests {
             "AppUsersSettings",
             "AppUsersStatusView",
             "AppUsersTable",
+            "ApplyRequest",
             "ArgDesc",
             "Branch",
             "BranchDatabaseView",
@@ -773,6 +883,7 @@ mod tests {
             "BranchKind",
             "BranchRole",
             "BranchStatus",
+            "ChoiceBody",
             "ColumnDesc",
             "ConnectionDetails",
             "ConsoleRequest",
@@ -781,6 +892,7 @@ mod tests {
             "CreateDatabaseAccepted",
             "CreateDatabaseRequest",
             "CreateKeyRequest",
+            "CreateMergeRequest",
             "CreateProjectRequest",
             "CreateRoleRequest",
             "CreateSavedQueryRequest",
@@ -796,12 +908,20 @@ mod tests {
             "DatabaseStatus",
             "DatabaseSummary",
             "DeleteProjectRequest",
+            "Direction",
             "ErrorBody",
             "ErrorCode",
             "ErrorEnvelope",
+            "FinishRequest",
             "FunctionDesc",
             "Me",
             "MeUser",
+            "Merge",
+            "MergeDetail",
+            "MergeLogEntry",
+            "MergeOptionsBody",
+            "MergeState",
+            "MergeSummary",
             "OnDelete",
             "OperationAccepted",
             "PasswordState",
@@ -812,12 +932,17 @@ mod tests {
             "ProjectInfo",
             "ProjectStatusView",
             "PutAppUsersRequest",
+            "RecomputeRequest",
+            "RehearseRequest",
+            "ResolutionBody",
             "RestoreAccepted",
             "RestoreRequest",
             "ReturnDesc",
             "RoleInUseKey",
             "RoleLevel",
             "RoleOrigin",
+            "RoleSessionView",
+            "RoleSessions",
             "RunSqlRequest",
             "SavedQuery",
             "SavedQuerySummary",
@@ -830,9 +955,12 @@ mod tests {
             "UpdateBranchRequest",
             "UpdateDatabaseRequest",
             "UpdateKeyRequest",
+            "UpdateMergeRequest",
             "UpdatePgDatabaseRequest",
             "UpdateProjectRequest",
+            "UpdateRoleRequest",
             "UpdateSavedQueryRequest",
+            "UserStepBody",
         ];
         // The names are map keys, so a clash between two types would drop one from this list.
         assert_eq!(names, expected);

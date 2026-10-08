@@ -18,14 +18,23 @@ export interface BranchRole {
      * data API refuses (empty for a plain role).
      */
   blocked_keys: RoleInUseKey[];
+  /** BYPASSRLS on its own (an owner-level role has it too, through the owner's attributes). */
+  bypass_rls: boolean;
+  /** The most connections the role may hold at once; `-1` is no limit. */
+  connection_limit: number;
   created_at: string;
+  /** INHERIT: the role uses its groups' privileges without `SET ROLE`. */
+  inherit: boolean;
   /**
-     * `owner_level`: superuser, CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, or a member of
-     * `neon_superuser` at any depth. Such a role can't back a data API secret key.
+     * `owner_level`: superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of
+     * `neon_superuser` at any depth. Such a role can't back a data API secret key. BYPASSRLS
+     * alone isn't owner-level (see `bypass_rls`).
      */
   level: RoleLevel;
   /** Whether the role has the LOGIN attribute. */
   login: boolean;
+  /** The roles it's a direct member of, by name (`neon_superuser` isn't listed). */
+  member_of: string[];
   name: string;
   /** The branch's owner, a role made in SQL, or one made through the API. */
   origin: RoleOrigin;
@@ -36,4 +45,9 @@ export interface BranchRole {
   password: PasswordState;
   /** Written but not yet applied to the compute; applied when the compute next runs. */
   pending: boolean;
+  /**
+     * When the role's password stops working; `null` is never.
+     * @nullable
+     */
+  valid_until?: string | null;
 }

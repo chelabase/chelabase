@@ -31,6 +31,13 @@ export interface Database {
      * @nullable
      */
   port: number | null;
+  /**
+     * The main Postgres database's name: the display name with every character outside
+     * `[A-Za-z0-9_]` turned into `_` ("web-1 prod" is `web_1_prod`). Merges
+     * (`MergeSummary.database`) and SQL name this one. `null` only for a name Postgres can't use.
+     * @nullable
+     */
+  postgres_database: string | null;
   project_id: ProjectId;
   statement_timeout_ms: number;
   status: DatabaseStatus;

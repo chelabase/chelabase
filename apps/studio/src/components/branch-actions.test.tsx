@@ -1,9 +1,16 @@
 import { screen } from "@testing-library/react";
 import { renderWithQuery } from "@/test/render";
-import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
+import { renderWithRouter } from "@/test/render-router";
+import { fakeFetch, jsonResponse, sequence, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
+import { summaryOf } from "@/test/merge-fixtures";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { getGetDatabaseQueryKey, getListBranchesQueryKey, type Branch as BranchSummary } from "@chelabase/management-client";
+import {
+  getGetDatabaseQueryKey,
+  getListBranchesQueryKey,
+  type Branch as BranchSummary,
+  type MergeSummary,
+} from "@chelabase/management-client";
 import { BranchActions } from "./branch-actions";
 
 const mk = (over: Partial<BranchSummary> & { name: string; id: string }): BranchSummary => ({
@@ -37,6 +44,7 @@ function setup(
   const f = fakeFetch(routes);
   const result = renderWithQuery(
     <BranchActions
+      projectId="p1"
       databaseId="db"
       databaseName="web1"
       branch={branch}
@@ -167,7 +175,7 @@ describe("BranchActions", () => {
         }),
     });
     renderWithQuery(
-      <BranchActions databaseId="db" databaseName="web1" branch={dev} branches={[main, dev]} historyWindow={86400} />,
+      <BranchActions projectId="p1" databaseId="db" databaseName="web1" branch={dev} branches={[main, dev]} historyWindow={86400} />,
       { fetch: f },
     );
     await userEvent.click(btn("Connection details"));
@@ -183,7 +191,7 @@ describe("BranchActions", () => {
   it("resets the branch's password", async () => {
     const f = fakeFetch({ "POST /v1/databases/db/branches/d/reset-password": () => new Response(null, { status: 204 }) });
     renderWithQuery(
-      <BranchActions databaseId="db" databaseName="web1" branch={dev} branches={[main, dev]} historyWindow={86400} />,
+      <BranchActions projectId="p1" databaseId="db" databaseName="web1" branch={dev} branches={[main, dev]} historyWindow={86400} />,
       { fetch: f },
     );
     await userEvent.click(btn("Reset password"));
@@ -326,7 +334,7 @@ describe("BranchActions", () => {
     });
 
     it("drops the restore notice once a refresh shows the restore finished", async () => {
-      const props = { databaseId: "db", databaseName: "web1", historyWindow: 7 * 86400 };
+      const props = { projectId: "p1", databaseId: "db", databaseName: "web1", historyWindow: 7 * 86400 };
       const { rerender } = renderWithQuery(<BranchActions {...props} branch={main} branches={[main]} />, {
         fetch: fakeFetch({ "POST /v1/databases/db/branches/m/restore": restored }),
       });
@@ -425,5 +433,127 @@ describe("BranchActions protection", () => {
     const backup = mk({ id: "b", name: "main-before-restore-x", kind: "backup", parent_branch_id: main.id, host: null });
     setup(backup, [main, backup]);
     expect(screen.queryByRole("button", { name: "Protect" })).toBeNull();
+  });
+});
+
+describe("BranchActions merges", () => {
+  const MERGES = "POST /v1/databases/db/branches/d/merges";
+  const openInto = summaryOf({ id: "m7", source_branch_id: "d", target_branch_id: "m", direction: "into_parent", status: "draft" });
+
+  function routed(branch: BranchSummary, all: BranchSummary[], routes: Record<string, FakeHandler> = {}, openMerges: MergeSummary[] = []) {
+    const f = fakeFetch(routes);
+    const result = renderWithRouter(
+      <BranchActions
+        projectId="p1"
+        databaseId="db"
+        databaseName="web1"
+        branch={branch}
+        branches={all}
+        historyWindow={86400}
+        openMerges={openMerges}
+      />,
+      { fetch: f },
+    );
+    return { ...result, fetch: f };
+  }
+
+  it("merge_actions_disabled_with_reasons", () => {
+    const backup = mk({ id: "b", name: "main-before-restore-x", kind: "backup", parent_branch_id: main.id, host: null });
+    const busyMain = { ...main, status: "resetting" as const };
+    const cases: [string, BranchSummary, BranchSummary[], string, string, string][] = [
+      ["main", main, [main], "Merge into parent", "Update from parent", "main has no parent to merge with"],
+      ["a backup", backup, [main, backup], "Merge into main", "Update from main", "a restore backup can't be merged; create a branch from it"],
+      ["a branch that isn't ready", { ...dev, status: "provisioning" }, [main, dev], "Merge into main", "Update from main", "branch is not ready (it is provisioning)"],
+      ["a parent that isn't ready", dev, [busyMain, dev], "Merge into main", "Update from main", "parent main is not ready (it is resetting)"],
+    ];
+    for (const [what, branch, all, into, from, reason] of cases) {
+      const { unmount } = setup(branch, all);
+      for (const name of [into, from]) {
+        expect(btn(name), what).toBeDisabled();
+        expect(btn(name), what).toHaveAccessibleDescription(reason);
+      }
+      unmount();
+    }
+    setup(dev, [main, dev]);
+    expect(btn("Merge into main")).toBeEnabled();
+    expect(btn("Update from main")).toBeEnabled();
+  });
+
+  it("open_merge_reason_links_to_it", async () => {
+    routed(dev, [main, dev], {}, [openInto]);
+    const into = await screen.findByRole("button", { name: "Merge into main" });
+    expect(into).toBeDisabled();
+    expect(into).toHaveAccessibleDescription(/a merge into main is already open/);
+    const link = screen.getByRole("link", { name: "Open the merge into main" });
+    expect(link).toHaveAttribute("href", "/app/projects/p1/databases/db/merges/m7");
+    // The other direction is another pair: still available.
+    expect(btn("Update from main")).toBeEnabled();
+  });
+
+  it("starts a merge and opens its page", async () => {
+    const { fetch, router } = routed(dev, [main, dev], {
+      [MERGES]: () => jsonResponse(summaryOf({ id: "m9", status: "computing" }), 202),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Update from main" }));
+    await vi.waitFor(() => expect(router.state.location.pathname).toBe("/app/projects/p1/databases/db/merges/m9"));
+    const post = fetch.calls.find((r) => r.method === "POST")!;
+    expect(await post.clone().json()).toEqual({ direction: "from_parent" });
+  });
+
+  it("retries a start once, quietly, when a merge of the pair just finished", async () => {
+    const { fetch, router } = routed(dev, [main, dev], {
+      [MERGES]: sequence(
+        () => jsonResponse({ error: { code: "merge_busy", message: "a merge of this pair just finished; try again" } }, 409),
+        () => jsonResponse(summaryOf({ id: "m9", status: "computing" }), 202),
+      ),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Merge into main" }));
+    await vi.waitFor(() => expect(router.state.location.pathname).toBe("/app/projects/p1/databases/db/merges/m9"), { timeout: 3000 });
+    expect(fetch.calls.filter((r) => r.method === "POST")).toHaveLength(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("links the open merge a refused start names", async () => {
+    routed(dev, [main, dev], {
+      [MERGES]: () => jsonResponse({ error: { code: "merge_open_exists", message: "raw", merge_id: "m5" } }, 409),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Merge into main" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("These branches already have an open merge.");
+    expect(screen.getByRole("link", { name: "Open the merge" })).toHaveAttribute("href", "/app/projects/p1/databases/db/merges/m5");
+  });
+
+  it("links the merge that holds the branch when a delete is refused", async () => {
+    routed(dev, [main, dev], {
+      "DELETE /v1/databases/db/branches/d": () =>
+        jsonResponse({ error: { code: "branch_merge_busy", message: "raw", merge_id: "m4" } }, 409),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Delete branch" }));
+    await userEvent.click(btn("Confirm delete branch"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("A merge holds this branch: it is rehearsing or applying, or it failed half applied.");
+    expect(screen.getByRole("link", { name: "Open the merge" })).toHaveAttribute("href", "/app/projects/p1/databases/db/merges/m4");
+  });
+
+  it("says a rehearsal's throwaway branch holds the branch when a reset is refused", async () => {
+    routed(dev, [main, dev], {
+      "POST /v1/databases/db/branches/d/reset-to-parent": () =>
+        jsonResponse({ error: { code: "branch_merge_busy", message: "raw", rehearsal_branch_id: "r1" } }, 409),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Reset to parent" }));
+    await userEvent.click(btn("Confirm reset to parent"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("A merge's rehearsal branch is still being removed from this branch.");
+  });
+
+  it("disables reset, restore and delete while a merge holds the branch, and links it", async () => {
+    const half = summaryOf({ id: "m3", source_branch_id: "d", target_branch_id: "m", status: "failed", failed_phase: "online" });
+    routed(dev, [main, dev], {}, [half]);
+    const reason = "a merge failed half applied on this branch: retry it or abandon it";
+    for (const name of ["Reset to parent", "Restore", "Delete branch"]) {
+      const b = await screen.findByRole("button", { name });
+      expect(b).toBeDisabled();
+      expect(b).toHaveAccessibleDescription(new RegExp(reason));
+    }
+    expect(screen.getByRole("link", { name: "Open the merge" })).toHaveAttribute("href", "/app/projects/p1/databases/db/merges/m3");
+    // The half-applied merge still owns the pair: no second merge into main.
+    expect(btn("Merge into main")).toBeDisabled();
   });
 });

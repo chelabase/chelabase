@@ -39,8 +39,8 @@ const schema = {
 const row = (id: number) => ({ id, name: `n${id}`, qty: id === 2 ? null : id, active: true, meta: null });
 const rows = (n: number, from = 1) => Array.from({ length: n }, (_, i) => row(from + i));
 
-const role = (name: string, level = "plain") => ({
-  name, level, login: false, origin: "sql", password: "none", pending: false, blocked_keys: [], created_at: "2026-10-01T00:00:00Z",
+const role = (name: string, level = "plain", bypass_rls = false) => ({
+  name, level, bypass_rls, login: false, origin: "sql", password: "none", pending: false, blocked_keys: [], created_at: "2026-10-01T00:00:00Z",
 });
 const dbView = (name: string, main: boolean, data_api = "on") => ({ name, main, data_api, data_api_error: null, default_schema: "public", origin: "owner", owner: "o" });
 
@@ -56,7 +56,7 @@ function setup(opts: Opts = {}) {
     "GET /v1/databases/d1": () => jsonResponse({ ...DB_DETAIL, max_rows: opts.maxRows ?? 1000 }),
     [`GET ${B}`]: () => jsonResponse([{ id: "b1", name: "main", kind: "normal", status: "ready", parent_branch_id: null, created_at: "2026-10-01T00:00:00Z", protected: true }]),
     [`GET ${BR}/databases`]: () => jsonResponse(opts.databases ?? [dbView("app", true), dbView("analytics", false), dbView("cold", false, "off")]),
-    [`GET ${BR}/roles`]: () => jsonResponse([role("app_owner", "owner_level"), role("reporter"), role("admin", "owner_level")].map((r, i) => (i === 0 ? { ...r, origin: "owner" } : r))),
+    [`GET ${BR}/roles`]: () => jsonResponse([role("app_owner", "owner_level"), role("reporter"), role("admin", "owner_level"), role("etl", "plain", true)].map((r, i) => (i === 0 ? { ...r, origin: "owner" } : r))),
     [`GET ${BR}/console/schema`]: opts.schema ?? (() => jsonResponse(schema)),
     [`POST ${BR}/console/query`]: opts.query ?? (() => jsonResponse(rows(2))),
   });
@@ -94,7 +94,7 @@ describe("TablesView", () => {
     ["not_found", 404, /no longer exists/],
     ["data_api_disabled", 409, /isn't enabled for this database/],
     ["owner_password_unknown", 409, /owner password isn't known/],
-    ["role_refused", 403, /bypass row-level security/],
+    ["role_refused", 403, /owner-level/],
   ])("schema error %s shows plain text", async (code, status, text) => {
     setup({ schema: denied(code, status, "raw") });
     expect(await screen.findByRole("alert")).toHaveTextContent(text);
@@ -117,8 +117,9 @@ describe("TablesView", () => {
     expect(await screen.findByText("n1")).toBeInTheDocument();
     expect(await last(f)).toMatchObject({ role: null, database: null });
     // owner-level roles are listed but disabled, with the reason
-    const admin = screen.getByRole("option", { name: /admin.*can bypass row-level security/ });
+    const admin = screen.getByRole("option", { name: /admin.*owner-level, so it can't be used/ });
     expect(admin).toBeDisabled();
+    expect(admin).not.toHaveTextContent(/bypass/);
     expect(screen.queryByRole("option", { name: /app_owner/ })).not.toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText("View as"), "anon");
     expect(screen.queryByText(/Viewing as owner/)).not.toBeInTheDocument();
@@ -129,6 +130,22 @@ describe("TablesView", () => {
     await open(user);
     await vi.waitFor(async () => expect(await last(f)).toMatchObject({ database: "analytics" }));
     expect(f.calls.some((r) => r.url.includes("console/schema") && r.url.includes("database=analytics"))).toBe(true);
+  });
+
+  it("view_as_a_bypassrls_role_warns_like_the_owner (M3)", async () => {
+    const { f, user } = setup();
+    await open(user);
+    const etl = await screen.findByRole("option", { name: "etl (bypasses row-level security)" });
+    expect(etl).toBeEnabled();
+    // A plain role needs no warning.
+    await user.selectOptions(screen.getByLabelText("View as"), "reporter");
+    expect(screen.queryByText(/bypasses row-level security, and edits apply/)).not.toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("View as"), "etl");
+    expect(
+      await screen.findByText("Viewing as etl: it has BYPASSRLS, so row-level security is bypassed, and edits apply to every row."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Viewing as owner/)).not.toBeInTheDocument();
+    await vi.waitFor(async () => expect(await last(f)).toMatchObject({ role: "etl" }));
   });
 
   it("paging_and_sort_build_the_right_tree", async () => {

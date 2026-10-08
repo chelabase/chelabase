@@ -50,7 +50,7 @@ const backup: BranchSummary = {
 
 function renderTree(branches: BranchSummary[]) {
   return renderWithQuery(
-    <BranchTree databaseId="db" databaseName="web1" branches={branches} historyWindow={604800} />,
+    <BranchTree projectId="p1" databaseId="db" databaseName="web1" branches={branches} historyWindow={604800} />,
   );
 }
 

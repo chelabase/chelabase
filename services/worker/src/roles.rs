@@ -1,30 +1,40 @@
-//! Login roles made through the API (spec 2026-10-01-login-roles, revision 2, Part 3):
-//! create, reset and delete, each under the endpoint's lock and straight in SQL (forwarding is
-//! off for `admin_sql`), with the metadata copy written alongside.
+//! Roles made through the API (spec 2026-10-01-login-roles, revision 2, Part 3; step 6g U1):
+//! create (LOGIN or NOLOGIN, with the U2 attributes and memberships), update, reset and
+//! delete, each under the endpoint's lock and straight in SQL (forwarding is off for
+//! `admin_sql`), with the metadata copy written alongside. NOLOGIN roles are made by
+//! `admin_sql` like the others, never through the compute spec (which lists only the owner).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
-use chelabase_metadata::{BranchKind, BranchStatus, InsertRoleOutcome, RoleOrigin};
+use chelabase_metadata::{
+    ApiRoleChange, BranchKind, BranchStatus, InsertRoleOutcome, NewApiRole, RenameCopyOutcome,
+    RoleAttributes, RoleCopy, RoleOrigin, RoleWriteOutcome, SecretChange,
+};
 use chelabase_nats::{
-    KeyRef, RESET_NOT_APPLIED, ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED, RoleCreateRequest,
-    RoleReply, RoleRequest, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET,
+    KeyRef, RESET_NOT_APPLIED, ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED,
+    ROLE_UPDATE_NOT_APPLIED, RoleCreateRequest, RoleReply, RoleRequest, RoleUpdateRequest,
+    SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE,
 };
 use chelabase_neon::ComputeBackend;
 use chelabase_neon::backend::admin_psql_command;
-use chelabase_secrets::seal_role_password;
+use chelabase_secrets::{open_role_password, seal_role_password};
 use chelabase_types::BranchId;
 use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{
-    RoleNameError, check_any_role_name, check_login_role_name, is_reserved_for, quote_ident,
-    quote_literal,
+    RoleNameError, check_any_role_name, check_login_role_name, is_membership_reserved,
+    is_reserved_for, is_reserved_target, quote_ident, quote_literal,
 };
+use chrono::{DateTime, SubsecRound, Utc};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
-use crate::resync::{create_role_sql, set_password_sql};
+use crate::resync::{
+    ObservedRole, WantedRole, create_role_sql, parse_observed, password_sql, role_read_sql,
+    set_password_sql, wanted_statements,
+};
 use crate::{OWNER_ROLE, Worker, credentials};
 
 /// How a role operation ended; [`role_reply`] turns it into the RPC's reply.
@@ -105,6 +115,343 @@ fn check_any_name(name: &str) -> Result<(), RoleOutcome> {
     })
 }
 
+/// A role to create (U1): a LOGIN role gets a generated password, a NOLOGIN role none. Only
+/// the attributes of U2 can be expressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSpec {
+    pub name: String,
+    pub owner_level: bool,
+    pub login: bool,
+    pub inherit: bool,
+    /// `-1`: no limit.
+    pub connection_limit: i32,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub bypass_rls: bool,
+    /// Roles it's made a member of; each must exist, the owner must administer it, and none
+    /// may be one of Chelabase's own (`is_membership_reserved`).
+    pub member_of: Vec<String>,
+}
+
+impl RoleSpec {
+    /// A LOGIN role with Postgres' default attributes.
+    pub fn login(name: &str, owner_level: bool) -> Self {
+        Self {
+            name: name.to_string(),
+            owner_level,
+            login: true,
+            inherit: true,
+            connection_limit: -1,
+            valid_until: None,
+            bypass_rls: false,
+            member_of: Vec::new(),
+        }
+    }
+
+    /// Its attributes as stored: VALID UNTIL to the microsecond, memberships sorted once each.
+    pub fn attributes(&self) -> RoleAttributes {
+        RoleAttributes {
+            inherit: self.inherit,
+            connection_limit: self.connection_limit,
+            valid_until: self.valid_until.map(to_micros),
+            bypass_rls: self.bypass_rls,
+            member_of: sorted(&self.member_of),
+        }
+    }
+}
+
+impl From<&RoleCreateRequest> for RoleSpec {
+    fn from(r: &RoleCreateRequest) -> Self {
+        Self {
+            name: r.name.clone(),
+            owner_level: r.owner_level,
+            login: r.login,
+            inherit: r.inherit,
+            connection_limit: r.connection_limit,
+            valid_until: r.valid_until,
+            bypass_rls: r.bypass_rls,
+            member_of: r.member_of.clone(),
+        }
+    }
+}
+
+/// A change to a role (U1): `None` leaves a field as it is; `valid_until: Some(None)` clears
+/// the expiry; `member_of` is the whole new list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolePatch {
+    pub owner_level: Option<bool>,
+    pub login: Option<bool>,
+    pub inherit: Option<bool>,
+    pub connection_limit: Option<i32>,
+    pub valid_until: Option<Option<DateTime<Utc>>>,
+    pub bypass_rls: Option<bool>,
+    pub member_of: Option<Vec<String>>,
+}
+
+impl RolePatch {
+    /// `current` with this change.
+    pub fn apply(&self, current: &RoleAttributes) -> RoleAttributes {
+        RoleAttributes {
+            inherit: self.inherit.unwrap_or(current.inherit),
+            connection_limit: self.connection_limit.unwrap_or(current.connection_limit),
+            valid_until: match self.valid_until {
+                Some(at) => at.map(to_micros),
+                None => current.valid_until,
+            },
+            bypass_rls: self.bypass_rls.unwrap_or(current.bypass_rls),
+            member_of: match &self.member_of {
+                Some(members) => sorted(members),
+                None => current.member_of.clone(),
+            },
+        }
+    }
+}
+
+impl From<&RoleUpdateRequest> for RolePatch {
+    fn from(r: &RoleUpdateRequest) -> Self {
+        Self {
+            owner_level: r.owner_level,
+            login: r.login,
+            inherit: r.inherit,
+            connection_limit: r.connection_limit,
+            valid_until: r.valid_until,
+            bypass_rls: r.bypass_rls,
+            member_of: r.member_of.clone(),
+        }
+    }
+}
+
+/// `at` to the microsecond Postgres keeps.
+fn to_micros(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.trunc_subsecs(6)
+}
+
+fn sorted(names: &[String]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&String> = names.iter().collect();
+    set.into_iter().cloned().collect()
+}
+
+fn membership_refused(message: String) -> RoleOutcome {
+    RoleOutcome::Refused("role_membership_not_allowed", message)
+}
+
+/// `-1` (no limit) or more.
+fn check_connection_limit(limit: i32) -> Result<(), RoleOutcome> {
+    if limit < -1 {
+        return Err(RoleOutcome::Refused(
+            "role_attribute_not_allowed",
+            format!("connection_limit {limit} is out of range: -1 (no limit) or more"),
+        ));
+    }
+    Ok(())
+}
+
+/// U2: never a membership in the owner, Chelabase's own roles, a `pg_` role, or the role
+/// itself; every target a name Postgres can hold.
+fn check_members(name: &str, members: &[String]) -> Result<(), RoleOutcome> {
+    for target in members {
+        if check_any_role_name(target).is_err() {
+            return Err(membership_refused(format!("{target:?} is not a valid role name")));
+        }
+        if target == name || target == OWNER_ROLE || is_membership_reserved(target) {
+            return Err(membership_refused(format!(
+                "a role can't be made a member of {target:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Each of `targets` that exists, hex-encoded, whether the owner holds ADMIN on it, and
+/// whether it is itself a member, at any depth, of a role no API role may reach
+/// (`neon_superuser`, `cloud_admin`, the owner, the Data API roles, any `chelabase_…` or
+/// `pg_…` role): `hex|t|f`, one per line. A superuser target reaches every role.
+fn membership_check_sql(owner: &str, targets: &[String]) -> String {
+    let names: Vec<String> = targets.iter().map(|t| quote_literal(t)).collect();
+    let owner = quote_literal(owner);
+    format!(
+        "SET search_path = pg_catalog, pg_temp; SELECT encode(convert_to(r.rolname, 'UTF8'), \
+         'hex'), pg_has_role({owner}, r.oid, 'MEMBER WITH ADMIN OPTION'), EXISTS (SELECT 1 \
+         FROM pg_roles f WHERE f.oid <> r.oid AND (f.rolname IN ('neon_superuser', \
+         'cloud_admin', 'authenticator', 'anon', 'authenticated', {owner}) OR lower(f.rolname) \
+         LIKE 'chelabase\\_%' OR lower(f.rolname) LIKE 'pg\\_%') AND pg_has_role(r.oid, f.oid, \
+         'MEMBER')) FROM pg_roles r WHERE r.rolname IN ({}) ORDER BY 1;",
+        names.join(", ")
+    )
+}
+
+/// The rules [`Worker::create_role`] checks before it reads anything: the name, the connection
+/// limit and the memberships. A merge's rehearsal (step 6g, P5) checks them too, so it refuses
+/// what the apply would.
+pub(crate) fn check_spec(spec: &RoleSpec) -> Result<(), RoleOutcome> {
+    check_name(&spec.name)?;
+    check_connection_limit(spec.connection_limit)?;
+    check_members(&spec.name, &spec.member_of)
+}
+
+/// The rules [`Worker::update_role`] checks before it reads anything.
+pub(crate) fn check_patch(name: &str, patch: &RolePatch) -> Result<(), RoleOutcome> {
+    check_any_name(name)?;
+    if name == OWNER_ROLE || is_reserved_target(name, OWNER_ROLE) {
+        return Err(reserved(name));
+    }
+    if let Some(limit) = patch.connection_limit {
+        check_connection_limit(limit)?;
+    }
+    if let Some(members) = &patch.member_of {
+        check_members(name, members)?;
+    }
+    Ok(())
+}
+
+/// What an update runs (as `cloud_admin`, memberships as the owner) to take the catalog's `o`
+/// to `wanted`: the password (`verifier` when LOGIN was turned on; dropped when the patch turns
+/// LOGIN off, and only then: a role made NOLOGIN in SQL keeps its password, E32), then
+/// [`wanted_statements`]: the attributes, owner level turned on or off, the memberships.
+/// `wanted` starts from the role's current state ([`current_role_state`]), so owner level
+/// changes only when the patch (or an unconfirmed earlier change) asks.
+pub(crate) fn update_statements(
+    wanted: &WantedRole<'_>,
+    o: &ObservedRole,
+    verifier: Option<&str>,
+    patch: &RolePatch,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    match verifier {
+        Some(verifier) => out.push(password_sql(wanted.name, Some(verifier))),
+        None if patch.login == Some(false) && o.password.is_some() => {
+            out.push(password_sql(wanted.name, None))
+        }
+        None => {}
+    }
+    out.extend(wanted_statements(OWNER_ROLE, wanted, o));
+    out
+}
+
+/// A role's state a change starts from (E32): `(owner_level, login, attributes)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoleState {
+    pub owner_level: bool,
+    pub login: bool,
+    pub attributes: RoleAttributes,
+}
+
+/// Where a change to a role starts (E32, "SQL controls everything"): the catalog's state
+/// (`observed`), except for a role made through the API whose last API change the compute
+/// hasn't confirmed (`attributes_pending`) or that the compute doesn't have: then the stored
+/// wanted state, so that change isn't lost. A role without an API row is the user's only when
+/// the owner administers it (made by the owner, or granted to it with ADMIN); any other, or
+/// one that exists nowhere, is [`RoleOutcome::NotFound`]. The merge's phase 0 (and its
+/// rehearsal) use it the same way.
+pub(crate) fn current_role_state(
+    row: Option<&RoleCopy>,
+    observed: Option<&ObservedRole>,
+) -> Result<RoleState, RoleOutcome> {
+    let api_row = row.filter(|r| r.origin == RoleOrigin::Api);
+    match (api_row, observed) {
+        (Some(r), Some(o)) if !r.attributes_pending => Ok(observed_state(o)),
+        (Some(r), _) => Ok(RoleState {
+            owner_level: r.api_owner_level,
+            login: r.login,
+            attributes: r.attributes.clone(),
+        }),
+        (None, Some(o)) if o.owner_admin => Ok(observed_state(o)),
+        (None, _) => Err(RoleOutcome::NotFound),
+    }
+}
+
+fn observed_state(o: &ObservedRole) -> RoleState {
+    RoleState {
+        owner_level: o.owner_attributes,
+        login: o.login,
+        attributes: o.attributes(),
+    }
+}
+
+/// [`membership_check_sql`]'s answer: each existing target's name and `(owner holds ADMIN,
+/// reaches a reserved role)`.
+fn parse_membership_check(
+    out: &str,
+) -> Result<std::collections::HashMap<String, (bool, bool)>, String> {
+    let flag = |f: &str| match f {
+        "t" => Some(true),
+        "f" => Some(false),
+        _ => None,
+    };
+    let mut found = std::collections::HashMap::new();
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let fields: Vec<&str> = line.split('|').collect();
+        let parsed = match fields[..] {
+            [hex_name, owner_admin, reaches] => (|| {
+                let name = String::from_utf8(hex::decode(hex_name).ok()?).ok()?;
+                Some((name, (flag(owner_admin)?, flag(reaches)?)))
+            })(),
+            _ => None,
+        };
+        let (name, flags) = parsed.ok_or_else(|| "an unexpected answer".to_string())?;
+        found.insert(name, flags);
+    }
+    Ok(found)
+}
+
+/// The verdict on each of `targets` from the check's answer: it exists, the owner holds ADMIN
+/// on it, and it reaches no reserved role.
+fn judge_member_targets(
+    targets: &[String],
+    found: &std::collections::HashMap<String, (bool, bool)>,
+) -> Result<(), RoleOutcome> {
+    for target in targets {
+        match found.get(target) {
+            Some((_, true)) => {
+                return Err(membership_refused(format!(
+                    "{target:?} is itself a member of a reserved role"
+                )));
+            }
+            Some((true, false)) => {}
+            Some((false, false)) => {
+                return Err(membership_refused(format!(
+                    "the owner can't grant membership in {target:?}"
+                )));
+            }
+            None => {
+                return Err(membership_refused(format!("no role named {target:?} exists")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// E29: a rename's names, before anything is read (`rename_role`, and the rehearsal's rename,
+/// T14 F3 M5): both names Postgres can hold, neither the owner, a reserved name nor any
+/// `chelabase_…` role, and not the same name.
+pub(crate) fn check_rename(from: &str, to: &str) -> Result<(), RoleOutcome> {
+    for name in [from, to] {
+        check_any_name(name)?;
+        if name == OWNER_ROLE || is_reserved_target(name, OWNER_ROLE) {
+            return Err(reserved(name));
+        }
+    }
+    if from == to {
+        return Err(RoleOutcome::Refused(
+            "invalid_role_name",
+            format!("the role is already named {to:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// E29: a renamed role is the user's when it exists (`observed`) and the owner administers it,
+/// or it has an API row (`row`).
+pub(crate) fn rename_is_ours(observed: Option<&ObservedRole>, row: Option<&RoleCopy>) -> bool {
+    observed.is_some_and(|o| {
+        o.owner_admin || row.is_some_and(|r| r.origin == RoleOrigin::Api)
+    })
+}
+
+/// The refusal for a name that's taken.
+pub(crate) fn name_taken(name: &str) -> RoleOutcome {
+    exists(name)
+}
+
 fn reserved(name: &str) -> RoleOutcome {
     RoleOutcome::Refused(
         "reserved_role_name",
@@ -134,10 +481,37 @@ fn database_names(out: &str) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
-/// Whether `name` exists in SQL (`admin_sql` prints `1` for a hit).
-fn exists_sql(name: &str) -> String {
+/// Which of `names` exist, hex-encoded, one per line (a rename's outcome when its answer was
+/// lost). The comment is the fakes' needle.
+pub(crate) fn role_names_sql(names: &[&str]) -> String {
+    let names: Vec<String> = names.iter().map(|n| quote_literal(n)).collect();
     format!(
-        "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = {}",
+        "SET search_path = pg_catalog, pg_temp; SELECT /* chelabase: role names */ \
+         encode(convert_to(rolname, 'UTF8'), 'hex') FROM pg_roles WHERE rolname IN ({});",
+        names.join(", ")
+    )
+}
+
+/// [`role_names_sql`]'s answer.
+pub(crate) fn parse_role_names(out: &str) -> Result<std::collections::HashSet<String>, String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            hex::decode(line)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .ok_or_else(|| "an unexpected role name in the answer".to_string())
+        })
+        .collect()
+}
+
+/// Whether `name` exists in SQL (`admin_sql` prints `1` for a hit). On the superuser session
+/// the search path is pinned first: the owner can set the database's `search_path` and create
+/// a `public.=` that would otherwise run as superuser.
+pub(crate) fn exists_sql(name: &str) -> String {
+    format!(
+        "SET search_path = pg_catalog, pg_temp; SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = {}",
         quote_literal(name)
     )
 }
@@ -145,17 +519,13 @@ fn exists_sql(name: &str) -> String {
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
 {
-    /// Creates a login role (spec Part 3): the name rules, a ready `normal` branch, then under
-    /// the endpoint's lock the SQL existence check, the `pending` row, the role made in SQL as
-    /// the owner, the row confirmed and the proxies told. The password is never returned or
-    /// logged.
-    pub async fn create_role(
-        &self,
-        branch: BranchId,
-        name: &str,
-        owner_level: bool,
-    ) -> RoleOutcome {
-        self.create_role_tracked(branch, name, owner_level, &AtomicBool::new(false))
+    /// Creates a role (spec Part 3, U1): the name rules and the attribute and membership
+    /// rules, a ready `normal` branch, then under the endpoint's lock the SQL existence check,
+    /// the membership targets' check, the `pending` row, the role made in SQL as the owner, the
+    /// row confirmed and the proxies told. A LOGIN role gets a generated password, which is
+    /// never returned or logged; a NOLOGIN role has none.
+    pub async fn create_role(&self, branch: BranchId, spec: &RoleSpec) -> RoleOutcome {
+        self.create_role_tracked(branch, spec, &AtomicBool::new(false))
             .await
     }
 
@@ -164,11 +534,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     async fn create_role_tracked(
         &self,
         branch: BranchId,
-        name: &str,
-        owner_level: bool,
+        spec: &RoleSpec,
         stored: &AtomicBool,
     ) -> RoleOutcome {
+        let name = spec.name.as_str();
         if let Err(refusal) = check_name(name) {
+            return refusal;
+        }
+        if let Err(refusal) = check_connection_limit(spec.connection_limit)
+            .and_then(|()| check_members(name, &spec.member_of))
+        {
             return refusal;
         }
         let (ep, database) = match self.role_target(branch).await {
@@ -193,16 +568,31 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 return RoleOutcome::NotReady;
             }
         }
-
-        let password = credentials::generate_password();
-        let verifier = chelabase_neon::scram::verifier(&password);
-        let sealed = seal_role_password(&self.key, &branch.to_string(), name, &password);
-        let cap = self.roles.role_cap;
-        match self
-            .metadata
-            .insert_api_role(&ep, name, owner_level, &verifier, &sealed, cap)
+        if let Err(outcome) = self
+            .check_member_targets(&ep, &database, &spec.member_of)
             .await
         {
+            return outcome;
+        }
+
+        let secret = spec.login.then(|| {
+            let password = credentials::generate_password();
+            let verifier = chelabase_neon::scram::verifier(&password);
+            let sealed = seal_role_password(&self.key, &branch.to_string(), name, &password);
+            (verifier, sealed)
+        });
+        let attributes = spec.attributes();
+        let cap = self.roles.role_cap;
+        let row = NewApiRole {
+            name,
+            owner_level: spec.owner_level,
+            login: spec.login,
+            attributes: &attributes,
+            verifier: secret.as_ref().map(|(v, _)| v.as_str()),
+            password_enc: secret.as_ref().map(|(_, s)| s.as_str()),
+            change_id: uuid::Uuid::new_v4(),
+        };
+        match self.metadata.insert_api_role(&ep, &row, cap).await {
             Ok(InsertRoleOutcome::Inserted) => stored.store(true, Ordering::SeqCst),
             Ok(InsertRoleOutcome::Exists) => return exists(name),
             Ok(InsertRoleOutcome::CapReached) => {
@@ -214,18 +604,269 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Err(e) => return failed(branch, "storing the role", &e),
         }
 
+        let wanted = WantedRole {
+            name,
+            owner_level: spec.owner_level,
+            login: spec.login,
+            attributes: &attributes,
+        };
         let script = format!(
             "SET search_path = pg_catalog, pg_temp;\n{}",
-            create_role_sql(OWNER_ROLE, name, &verifier, owner_level)
+            create_role_sql(OWNER_ROLE, &wanted, row.verifier)
         );
         if let Err(outcome) = self
-            .apply_and_confirm(branch, &ep, &database, name, &script)
+            .apply_and_confirm(branch, &ep, &database, name, &script, Some(row.change_id))
             .await
         {
             return outcome;
         }
-        info!(branch_id = %branch, endpoint_id = %ep, role = name, owner_level, "login role created");
+        info!(
+            branch_id = %branch,
+            endpoint_id = %ep,
+            role = name,
+            owner_level = spec.owner_level,
+            login = spec.login,
+            "role created"
+        );
         RoleOutcome::Ok
+    }
+
+    /// Changes a role (U1): its LOGIN, owner-level, attributes or memberships. Refused for the
+    /// owner, a reserved name, or a membership or attribute the rules refuse. Under the
+    /// endpoint's lock, the role's catalog state is read; an API-made role's row takes the
+    /// wanted state first (`pending`), then the SQL that differs from the catalog runs and the
+    /// row is confirmed. A role made in SQL changes in SQL only (the database wins for it, and
+    /// the resync records it), except that turning LOGIN on gives it a generated password,
+    /// stored sealed so the Connection panel reveals it. Turning LOGIN off drops the password.
+    pub async fn update_role(&self, branch: BranchId, name: &str, patch: &RolePatch) -> RoleOutcome {
+        self.update_role_tracked(branch, name, patch, &AtomicBool::new(false))
+            .await
+    }
+
+    /// [`Self::update_role`], setting `stored` once the row's change is stored.
+    async fn update_role_tracked(
+        &self,
+        branch: BranchId,
+        name: &str,
+        patch: &RolePatch,
+        stored: &AtomicBool,
+    ) -> RoleOutcome {
+        if let Err(refusal) = check_any_name(name) {
+            return refusal;
+        }
+        if name == OWNER_ROLE || is_reserved_target(name, OWNER_ROLE) {
+            return reserved(name);
+        }
+        let mut checks = Ok(());
+        if let Some(limit) = patch.connection_limit {
+            checks = checks.and_then(|()| check_connection_limit(limit));
+        }
+        if let Some(members) = &patch.member_of {
+            checks = checks.and_then(|()| check_members(name, members));
+        }
+        if let Err(refusal) = checks {
+            return refusal;
+        }
+        let (ep, database) = match self.role_target(branch).await {
+            Ok(target) => target,
+            Err(outcome) => return outcome,
+        };
+        let _lock = match self.metadata.lock_endpoint(&ep).await {
+            Ok(lock) => lock,
+            Err(e) => return failed(branch, "locking the endpoint", &e),
+        };
+        let row = match self.metadata.role_copies(&ep).await {
+            Ok((rows, _)) => rows
+                .into_iter()
+                .find(|r| r.origin != RoleOrigin::Owner && r.name == name),
+            Err(e) => return failed(branch, "reading the roles", &e),
+        };
+        let observed = match self
+            .computes
+            .admin_sql(&ep, &database, &role_read_sql(OWNER_ROLE, name))
+            .await
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|out| parse_observed(&out).map_err(|e| e.to_string()))
+        {
+            Ok(o) => o.roles.into_iter().find(|o| o.name == name),
+            Err(e) => {
+                warn!(branch_id = %branch, endpoint_id = %ep, role = name, "reading the role: {e}");
+                return RoleOutcome::NotReady;
+            }
+        };
+        let api_row = row.as_ref().filter(|r| r.origin == RoleOrigin::Api);
+        // What the role is now (E32): the catalog's state, or an API row's unconfirmed one.
+        let current = match current_role_state(row.as_ref(), observed.as_ref()) {
+            Ok(current) => current,
+            Err(outcome) => return outcome,
+        };
+        let (owner_level, login) = (current.owner_level, current.login);
+        let mut attributes = current.attributes;
+        // T14 M1: a stored group dropped in SQL since isn't wanted any more (the catalog's
+        // state only lists groups that exist).
+        let unchecked = patch.member_of.is_none()
+            && api_row.is_some_and(|r| r.attributes_pending || observed.is_none());
+        if unchecked && !attributes.member_of.is_empty() {
+            let found = match self
+                .membership_targets(&ep, &database, &attributes.member_of)
+                .await
+            {
+                Ok(found) => found,
+                Err(outcome) => return outcome,
+            };
+            attributes.member_of.retain(|g| found.contains_key(g));
+        }
+        if let Some(members) = &patch.member_of
+            && let Err(outcome) = self.check_member_targets(&ep, &database, members).await
+        {
+            return outcome;
+        }
+        let wanted_attributes = patch.apply(&attributes);
+        let wanted_login = patch.login.unwrap_or(login);
+        let wanted_owner_level = patch.owner_level.unwrap_or(owner_level);
+        // Turning LOGIN on gives the role a password, and a row without a verifier a new copy,
+        // which the cap counts (I2: checked by the store, under the endpoint's lock).
+        let secret = (wanted_login && !login).then(|| {
+            let password = credentials::generate_password();
+            let verifier = chelabase_neon::scram::verifier(&password);
+            let sealed = seal_role_password(&self.key, &branch.to_string(), name, &password);
+            (verifier, sealed)
+        });
+        let cap = self.roles.role_cap;
+        let cap_reached = || {
+            RoleOutcome::Refused(
+                "role_cap_reached",
+                format!("the branch already has {cap} login roles, the most it may have"),
+            )
+        };
+
+        // The row first, so a change the compute misses is retried by the resync.
+        let change_id = api_row.map(|_| uuid::Uuid::new_v4());
+        let has_row = if let Some(change_id) = change_id {
+            let change = ApiRoleChange {
+                change_id,
+                owner_level: wanted_owner_level,
+                login: wanted_login,
+                attributes: wanted_attributes.clone(),
+                secret: match &secret {
+                    Some((verifier, sealed)) => SecretChange::Set(verifier.clone(), sealed.clone()),
+                    // Only turning LOGIN off drops the password; a role SQL made NOLOGIN keeps
+                    // it (E32).
+                    None if patch.login == Some(false) => SecretChange::Clear,
+                    None => SecretChange::Keep,
+                },
+            };
+            match self.metadata.update_api_role(&ep, name, &change, cap).await {
+                Ok(RoleWriteOutcome::Done) => true,
+                Ok(RoleWriteOutcome::NotFound) => return RoleOutcome::NotFound,
+                Ok(RoleWriteOutcome::CapReached) => return cap_reached(),
+                Err(e) => return failed(branch, "storing the role's change", &e),
+            }
+        } else if let Some((verifier, sealed)) = &secret {
+            match self
+                .metadata
+                .store_role_secret(&ep, name, verifier, sealed, cap)
+                .await
+            {
+                Ok(RoleWriteOutcome::Done) => true,
+                Ok(RoleWriteOutcome::NotFound) => return RoleOutcome::NotFound,
+                Ok(RoleWriteOutcome::CapReached) => return cap_reached(),
+                Err(e) => return failed(branch, "storing the new password", &e),
+            }
+        } else {
+            false
+        };
+        stored.store(has_row, Ordering::SeqCst);
+
+        let Some(o) = observed else {
+            // An API-made role the compute doesn't have yet: the resync makes it as stored.
+            return RoleOutcome::NotApplied;
+        };
+        let wanted = WantedRole {
+            name,
+            owner_level: wanted_owner_level,
+            login: wanted_login,
+            attributes: &wanted_attributes,
+        };
+        let statements = update_statements(&wanted, &o, secret.as_ref().map(|(v, _)| v.as_str()), patch);
+        let script = if statements.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "SET search_path = pg_catalog, pg_temp;\n{}",
+                statements.join("\n")
+            )
+        };
+        if script.is_empty() && !has_row {
+            return RoleOutcome::Ok;
+        }
+        if has_row {
+            if let Err(outcome) = self
+                .apply_and_confirm(branch, &ep, &database, name, &script, change_id)
+                .await
+            {
+                return outcome;
+            }
+        } else {
+            if let Err(e) = self.computes.admin_sql(&ep, &database, &script).await {
+                warn!(branch_id = %branch, endpoint_id = %ep, role = name, "changing the role: {e:#}");
+                return RoleOutcome::Failed(format!("changing the role {name}: {e:#}"));
+            }
+            self.publish_twice(&ep, &[name.to_string()]).await;
+        }
+        // A role made in SQL that lost its password has no copy any more.
+        if !wanted_login
+            && row.as_ref().is_some_and(|r| r.origin == RoleOrigin::Sql)
+            && let Err(e) = self.metadata.delete_role_copy(&ep, name).await
+        {
+            warn!(branch_id = %branch, endpoint_id = %ep, role = name, "removing the row; the resync will: {e}");
+        }
+        info!(branch_id = %branch, endpoint_id = %ep, role = name, "role changed");
+        RoleOutcome::Ok
+    }
+
+    /// I4 (for the merge's rehearsal too): every membership target exists, the owner holds
+    /// ADMIN on it (so the owner can grant it), and it isn't itself a member, at any depth, of
+    /// a reserved role (so no grant reaches one indirectly); otherwise
+    /// `role_membership_not_allowed`. SQL only ([`membership_check_sql`] as `cloud_admin`, read
+    /// only, no lock and no metadata), so it runs on any compute: a branch's or a rehearsal's.
+    /// A compute that can't be asked is [`RoleOutcome::NotReady`]; an answer it can't read is
+    /// [`RoleOutcome::Failed`].
+    pub(crate) async fn check_member_targets(
+        &self,
+        ep: &str,
+        database: &str,
+        targets: &[String],
+    ) -> Result<(), RoleOutcome> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let found = self.membership_targets(ep, database, targets).await?;
+        judge_member_targets(targets, &found)
+    }
+
+    /// The check's answer for `targets` on `ep`: each existing target and its flags.
+    async fn membership_targets(
+        &self,
+        ep: &str,
+        database: &str,
+        targets: &[String],
+    ) -> Result<std::collections::HashMap<String, (bool, bool)>, RoleOutcome> {
+        let out = match self
+            .computes
+            .admin_sql(ep, database, &membership_check_sql(OWNER_ROLE, targets))
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                warn!(endpoint_id = %ep, "checking the membership targets: {e:#}");
+                return Err(RoleOutcome::NotReady);
+            }
+        };
+        parse_membership_check(&out).map_err(|e| {
+            warn!(endpoint_id = %ep, "checking the membership targets: {e}");
+            RoleOutcome::Failed(format!("checking the membership targets: {e}"))
+        })
     }
 
     /// A new password for a login role; the owner's name takes the owner's reset. Any
@@ -271,7 +912,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         let sql = set_password_sql(name, &verifier);
         match self
-            .apply_and_confirm(branch, &ep, &database, name, &sql)
+            .apply_and_confirm(branch, &ep, &database, name, &sql, None)
             .await
         {
             Ok(()) => {}
@@ -350,10 +991,144 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         RoleOutcome::Ok
     }
 
+    /// E29: renames a role through the control plane (a merge's phase 0 calls it for a
+    /// source role renamed in SQL, `RoleOp::Rename`). Both names must be ones Postgres can
+    /// hold, and neither the owner, a reserved name nor any `chelabase_…` role
+    /// (`reserved_role_name`); `to` must differ from `from`. On a ready `normal` branch, under
+    /// the endpoint's lock: the role must exist and be the user's (an API row, or a role the
+    /// owner administers; else [`RoleOutcome::NotFound`]), and `to` must be free in SQL and in
+    /// the metadata (`role_exists`). Then the role's row moves to `to` (its sealed password
+    /// resealed under the new name, its OID-bound data keys following, OID and timeline kept),
+    /// the role is renamed in SQL with forwarding off (the DDL receiver never sees it), and the
+    /// proxies drop both names' cached passwords. When the SQL rename answers an error, the
+    /// catalog decides (F2 fix round I-2): the new name there and not the old means the rename
+    /// committed and its answer was lost ([`RoleOutcome::Ok`]); the old name still there means
+    /// the row and keys move back (best effort, the row's unreadable flag restored); neither
+    /// name means the role went meanwhile and the move stays; both are
+    /// [`RoleOutcome::Failed`]. A catalog that can't be read leaves the move as it is and is
+    /// [`RoleOutcome::NotReady`]. An endpoint gone meanwhile is [`RoleOutcome::NotReady`].
+    pub async fn rename_role(&self, branch: BranchId, from: &str, to: &str) -> RoleOutcome {
+        if let Err(refusal) = check_rename(from, to) {
+            return refusal;
+        }
+        let (ep, database) = match self.role_target(branch).await {
+            Ok(target) => target,
+            Err(outcome) => return outcome,
+        };
+        let _lock = match self.metadata.lock_endpoint(&ep).await {
+            Ok(lock) => lock,
+            Err(e) => return failed(branch, "locking the endpoint", &e),
+        };
+        let row = match self.metadata.role_copies(&ep).await {
+            Ok((rows, _)) => rows
+                .into_iter()
+                .find(|r| r.origin != RoleOrigin::Owner && r.name == from),
+            Err(e) => return failed(branch, "reading the roles", &e),
+        };
+        let observed = match self
+            .computes
+            .admin_sql(&ep, &database, &role_read_sql(OWNER_ROLE, from))
+            .await
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|out| parse_observed(&out).map_err(|e| e.to_string()))
+        {
+            Ok(o) => o.roles.into_iter().find(|o| o.name == from),
+            Err(e) => {
+                warn!(branch_id = %branch, endpoint_id = %ep, role = from, "reading the role: {e}");
+                return RoleOutcome::NotReady;
+            }
+        };
+        if !rename_is_ours(observed.as_ref(), row.as_ref()) {
+            return RoleOutcome::NotFound;
+        }
+        match self
+            .computes
+            .admin_sql(&ep, &database, &exists_sql(to))
+            .await
+        {
+            Ok(out) if !out.trim().is_empty() => return exists(to),
+            Ok(_) => {}
+            Err(e) => {
+                warn!(branch_id = %branch, endpoint_id = %ep, "checking whether role {to} exists: {e:#}");
+                return RoleOutcome::NotReady;
+            }
+        }
+        let aad = branch.to_string();
+        let sealed = row.as_ref().and_then(|r| r.password_enc.clone());
+        let resealed = sealed.as_deref().and_then(|sealed| {
+            match open_role_password(&self.key, &aad, from, sealed) {
+                Ok(password) => Some(seal_role_password(&self.key, &aad, to, &password)),
+                Err(e) => {
+                    warn!(branch_id = %branch, role = from, "a renamed role's sealed password won't open ({e}); dropped");
+                    None
+                }
+            }
+        });
+        let was_unreadable = match self
+            .metadata
+            .rename_role_copy(&ep, branch, from, to, resealed.as_deref(), None)
+            .await
+        {
+            Ok(RenameCopyOutcome::Renamed { was_unreadable, .. }) => was_unreadable,
+            Ok(RenameCopyOutcome::Taken) => return exists(to),
+            // The endpoint went meanwhile (the branch is being deleted or switched).
+            Ok(RenameCopyOutcome::NotFound) => return RoleOutcome::NotReady,
+            Err(e) => return failed(branch, "moving the role's row", &e),
+        };
+        let sql = format!(
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE {} RENAME TO {};",
+            quote_ident(from),
+            quote_ident(to)
+        );
+        if let Err(e) = self.computes.admin_sql(&ep, &database, &sql).await {
+            // The RENAME may have committed with its answer lost: the catalog decides.
+            let names = self
+                .computes
+                .admin_sql(&ep, &database, &role_names_sql(&[from, to]))
+                .await
+                .map_err(|e| format!("{e:#}"))
+                .and_then(|out| parse_role_names(&out));
+            match names {
+                Ok(names) if names.contains(to) && !names.contains(from) => {
+                    info!(branch_id = %branch, endpoint_id = %ep, from, to, "the rename's answer was lost, but it committed: {e:#}");
+                }
+                Ok(names) if !names.contains(from) => {
+                    // The role went meanwhile: a move back would have the resync make `from`
+                    // again, so the row stays under `to`.
+                    warn!(branch_id = %branch, endpoint_id = %ep, role = from, "renaming the role: {e:#}; neither name exists now, the row stays under {to}");
+                    return RoleOutcome::Failed(format!("renaming the role {from}: {e:#}"));
+                }
+                Ok(_) => {
+                    warn!(branch_id = %branch, endpoint_id = %ep, role = from, "renaming the role; moving its row back: {e:#}");
+                    if let Err(back) = self
+                        .metadata
+                        .rename_role_copy(&ep, branch, to, from, sealed.as_deref(), Some(was_unreadable))
+                        .await
+                    {
+                        warn!(branch_id = %branch, endpoint_id = %ep, role = from, "moving the row back; the resync finds the role under its old name: {back}");
+                    }
+                    return RoleOutcome::Failed(format!("renaming the role {from}: {e:#}"));
+                }
+                Err(read) => {
+                    // Can't tell: the row stays under the new name, where a retried rename (or
+                    // the resync, once the compute answers) finds it.
+                    warn!(branch_id = %branch, endpoint_id = %ep, role = from, "renaming the role: {e:#}; reading the outcome: {read}");
+                    return RoleOutcome::NotReady;
+                }
+            }
+        }
+        self.publish_twice(&ep, &[from.to_string(), to.to_string()])
+            .await;
+        info!(branch_id = %branch, endpoint_id = %ep, from, to, "role renamed");
+        RoleOutcome::Ok
+    }
+
     /// After a row's write: reads the version, runs `sql` (forwarding is off), confirms the
     /// row and tells the proxies. A failed `sql` is `NotApplied`: the row stays `pending` and
-    /// the next resync applies it. A confirm that finds the version moved leaves `pending` to
-    /// the resync too; the role itself is done.
+    /// the next resync applies it. The confirm clears `attributes_pending` by the write's
+    /// `attributes_change` (an API create or PATCH) whatever else happened meanwhile; one that
+    /// finds the version moved leaves `pending` to a resync it asks for at once (F2 fix round
+    /// I-1). The role itself is done.
     async fn apply_and_confirm(
         &self,
         branch: BranchId,
@@ -361,6 +1136,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         database: &str,
         name: &str,
         sql: &str,
+        attributes_change: Option<uuid::Uuid>,
     ) -> Result<(), RoleOutcome> {
         let version = match self.metadata.role_copies(ep).await {
             Ok((_, version)) => version,
@@ -369,17 +1145,26 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 return Err(RoleOutcome::NotApplied);
             }
         };
-        if let Err(e) = self.computes.admin_sql(ep, database, sql).await {
+        // Empty: nothing to run, the catalog has it already.
+        if !sql.is_empty()
+            && let Err(e) = self.computes.admin_sql(ep, database, sql).await
+        {
             warn!(branch_id = %branch, endpoint_id = %ep, role = name, "stored but not applied; the resync will: {e:#}");
             return Err(RoleOutcome::NotApplied);
         }
-        match self.metadata.confirm_role(ep, name, version).await {
+        match self
+            .metadata
+            .confirm_role(ep, name, version, attributes_change)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
-                info!(branch_id = %branch, endpoint_id = %ep, role = name, "roles changed meanwhile; the resync clears pending");
+                info!(branch_id = %branch, endpoint_id = %ep, role = name, "roles changed meanwhile; a resync clears pending");
+                self.resync_requests.request(branch);
             }
             Err(e) => {
-                warn!(branch_id = %branch, endpoint_id = %ep, role = name, "confirming the role; the resync clears pending: {e}");
+                warn!(branch_id = %branch, endpoint_id = %ep, role = name, "confirming the role; a resync clears pending: {e}");
+                self.resync_requests.request(branch);
             }
         }
         self.publish_twice(ep, &[name.to_string()]).await;
@@ -454,7 +1239,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     let stored = AtomicBool::new(false);
                     let outcome = timeout(
                         deadline,
-                        self.create_role_tracked(r.branch_id, &r.name, r.owner_level, &stored),
+                        self.create_role_tracked(r.branch_id, &RoleSpec::from(&r), &stored),
                     )
                     .await
                     .unwrap_or_else(|_| {
@@ -463,6 +1248,27 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         } else {
                             RoleOutcome::Failed(
                                 "timed out before the role was stored; a retry is safe".into(),
+                            )
+                        }
+                    });
+                    (r.branch_id, outcome)
+                }
+                Err(e) => return bad(&e),
+            },
+            SUBJECT_ROLE_UPDATE => match serde_json::from_slice::<RoleUpdateRequest>(payload) {
+                Ok(r) => {
+                    let stored = AtomicBool::new(false);
+                    let outcome = timeout(
+                        deadline,
+                        self.update_role_tracked(r.branch_id, &r.name, &RolePatch::from(&r), &stored),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        if stored.load(Ordering::SeqCst) {
+                            RoleOutcome::NotApplied
+                        } else {
+                            RoleOutcome::Failed(
+                                "timed out before the change was stored; a retry is safe".into(),
                             )
                         }
                     });
@@ -499,6 +1305,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             let message = match subject {
                 SUBJECT_ROLE_CREATE => ROLE_CREATE_NOT_APPLIED,
                 SUBJECT_ROLE_DELETE => ROLE_DELETE_NOT_APPLIED,
+                SUBJECT_ROLE_UPDATE => ROLE_UPDATE_NOT_APPLIED,
                 _ => RESET_NOT_APPLIED,
             };
             reply.error = Some(message.into());
@@ -555,7 +1362,18 @@ mod tests {
     use crate::fakes::{FakeLogin, FakeWorker, Journal, entries, position, ready_database, worker};
 
     /// The existence check, as the fake backend journals it.
-    const EXISTS_SQL: &str = "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname";
+    const EXISTS_SQL: &str =
+        "SET search_path = pg_catalog, pg_temp; SELECT 1 FROM pg_catalog.pg_roles WHERE rolname";
+
+    // Fix round 1 (I3): the check runs on the superuser session; an owner who set the
+    // database's search_path and made `public.=` must not have it run there.
+    #[test]
+    fn exists_sql_pins_the_search_path() {
+        assert_eq!(
+            exists_sql("app"),
+            "SET search_path = pg_catalog, pg_temp; SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app'"
+        );
+    }
     /// The first line of the create script.
     const SCRIPT: &str = "SET search_path = pg_catalog, pg_temp;\nSET ROLE \"postgres\";\n";
 
@@ -620,6 +1438,9 @@ mod tests {
                 login: true,
                 level: RoleLevel::Plain,
                 api_owner_level: false,
+                attributes: chelabase_metadata::RoleAttributes::default(),
+                attributes_pending: false,
+                attributes_change_id: None,
             },
         );
     }
@@ -641,7 +1462,7 @@ mod tests {
         let (w, journal) = worker();
         let (branch, ep, db) = ready(&w, &journal).await;
 
-        assert_eq!(w.create_role(branch, "app", false).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
 
         let (verifier, sealed, pending) = login(&w, &ep, "app").unwrap();
         let verifier = verifier.unwrap();
@@ -653,7 +1474,7 @@ mod tests {
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert_eq!(
             sent[0],
-            "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app'"
+            "SET search_path = pg_catalog, pg_temp; SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app'"
         );
         assert_eq!(
             sent[1],
@@ -666,7 +1487,11 @@ mod tests {
                 &format!("compute.sql {ep} {db} {EXISTS_SQL} = 'app'"),
             ),
             pos(&journal, "metadata.insert_api_role"),
-            pos(&journal, &format!("compute.sql {ep} {db} SET search_path")),
+            // The create script (its first line is the pin alone; the check's goes on).
+            entries(&journal)
+                .iter()
+                .position(|e| *e == format!("compute.sql {ep} {db} SET search_path = pg_catalog, pg_temp;"))
+                .expect("the create script ran"),
             pos(&journal, "metadata.confirm_role"),
             pos(&journal, &format!("cache.password_updated {ep} app")),
         ];
@@ -686,7 +1511,7 @@ mod tests {
         let (w, journal) = worker();
         let (branch, ep, _db) = ready(&w, &journal).await;
 
-        assert_eq!(w.create_role(branch, "admin", true).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("admin", true)).await, RoleOutcome::Ok);
 
         let script = sql(&w).pop().unwrap();
         let verifier = login(&w, &ep, "admin").unwrap().0.unwrap();
@@ -719,7 +1544,7 @@ mod tests {
             ("authenticator", "reserved_role_name"),
             ("pg_x", "reserved_role_name"),
         ] {
-            let outcome = w.create_role(branch, name, false).await;
+            let outcome = w.create_role(branch, &RoleSpec::login(name, false)).await;
             assert!(refused(code)(&outcome), "{name:?}: {outcome:?}");
         }
         assert!(position(&journal, "compute.sql").is_none());
@@ -732,7 +1557,7 @@ mod tests {
         let (branch, ep, _db) = ready(&w, &journal).await;
         w.computes.answer(EXISTS_SQL, "1\n");
 
-        let outcome = w.create_role(branch, "app", false).await;
+        let outcome = w.create_role(branch, &RoleSpec::login("app", false)).await;
 
         assert!(refused("role_exists")(&outcome), "{outcome:?}");
         assert!(position(&journal, "metadata.insert_api_role").is_none());
@@ -742,7 +1567,7 @@ mod tests {
         // A row already there (made in SQL, recorded by the receiver) is a conflict too.
         w.computes.answers.lock().unwrap().clear();
         sql_row(&w, &ep, "reporter", "SCRAM-SHA-256$x");
-        let outcome = w.create_role(branch, "reporter", false).await;
+        let outcome = w.create_role(branch, &RoleSpec::login("reporter", false)).await;
         assert!(refused("role_exists")(&outcome), "{outcome:?}");
         assert_eq!(login(&w, &ep, "reporter").unwrap().1, None);
     }
@@ -754,9 +1579,9 @@ mod tests {
         let (branch, ep, _db) = ready(&w, &journal).await;
         // A role made in SQL counts.
         sql_row(&w, &ep, "reporter", "SCRAM-SHA-256$x");
-        assert_eq!(w.create_role(branch, "a", true).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("a", true)).await, RoleOutcome::Ok);
 
-        let outcome = w.create_role(branch, "b", true).await;
+        let outcome = w.create_role(branch, &RoleSpec::login("b", true)).await;
 
         assert!(
             matches!(&outcome, RoleOutcome::Refused("role_cap_reached", m) if m.contains('2')),
@@ -772,14 +1597,14 @@ mod tests {
         let (branch, ep, _db) = ready(&w, &journal).await;
 
         assert_eq!(
-            w.create_role(BranchId::new(), "app", false).await,
+            w.create_role(BranchId::new(), &RoleSpec::login("app", false)).await,
             RoleOutcome::NotReady
         );
         let pending = w
             .metadata
             .insert_database("p", chelabase_metadata::DatabaseStatus::Pending);
         assert_eq!(
-            w.create_role(BranchId::from(pending), "app", false).await,
+            w.create_role(BranchId::from(pending), &RoleSpec::login("app", false)).await,
             RoleOutcome::NotReady
         );
         assert!(position(&journal, "metadata.lock_endpoint").is_none());
@@ -787,14 +1612,14 @@ mod tests {
         // The compute doesn't answer the existence check.
         *w.computes.sql_failures_left.lock().unwrap() = 1;
         assert_eq!(
-            w.create_role(branch, "app", false).await,
+            w.create_role(branch, &RoleSpec::login("app", false)).await,
             RoleOutcome::NotReady
         );
         assert!(login(&w, &ep, "app").is_none());
 
         w.metadata.state().fail = Some("get_branch");
         assert!(matches!(
-            w.create_role(branch, "app", false).await,
+            w.create_role(branch, &RoleSpec::login("app", false)).await,
             RoleOutcome::Failed(_)
         ));
     }
@@ -807,7 +1632,7 @@ mod tests {
             Some(("CREATE ROLE".into(), "connection reset".into()));
 
         assert_eq!(
-            w.create_role(branch, "app", false).await,
+            w.create_role(branch, &RoleSpec::login("app", false)).await,
             RoleOutcome::NotApplied
         );
 
@@ -822,7 +1647,7 @@ mod tests {
         let (w, journal) = worker();
         let (branch, ep, _db) = ready(&w, &journal).await;
 
-        assert_eq!(w.create_role(branch, "app", false).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
 
         let entry = format!("cache.password_updated {ep} app");
         assert_eq!(count(&journal, &entry), 1);
@@ -835,10 +1660,10 @@ mod tests {
         let (w, journal) = worker();
         let (branch, _ep, _db) = ready(&w, &journal).await;
         *w.cache.fail.lock().unwrap() = Some("valkey down".into());
-        assert_eq!(w.create_role(branch, "app", false).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
         *w.cache.fail.lock().unwrap() = None;
         *w.cache.receivers.lock().unwrap() = 0;
-        assert_eq!(w.create_role(branch, "other", false).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("other", false)).await, RoleOutcome::Ok);
     }
 
     // --- Reset ---------------------------------------------------------------------------
@@ -847,7 +1672,7 @@ mod tests {
     async fn reset_rotates_only_that_role() {
         let (w, journal) = worker();
         let (branch, ep, _db) = ready(&w, &journal).await;
-        assert_eq!(w.create_role(branch, "app", false).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
         let owner_before = owner_secret(&w, branch, &ep);
         let (old_verifier, old_sealed, _) = login(&w, &ep, "app").unwrap();
         journal.lock().unwrap().clear();
@@ -1021,7 +1846,7 @@ mod tests {
 
     // --- Delete --------------------------------------------------------------------------
 
-    const EXISTS_APP: &str = "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app'";
+    const EXISTS_APP: &str = "SET search_path = pg_catalog, pg_temp; SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app'";
     const TERMINATE: &str = "SET search_path = pg_catalog, pg_temp; ALTER ROLE \"app\" NOLOGIN; \
         SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'app';";
     const DATABASES: &str = "SET search_path = pg_catalog, pg_temp; SELECT \
@@ -1052,7 +1877,7 @@ mod tests {
     /// `app` created (plain) on a ready branch, and the journal and SQL log emptied.
     async fn with_app(w: &FakeWorker, journal: &Journal) -> (BranchId, String, String) {
         let (branch, ep, db) = ready(w, journal).await;
-        assert_eq!(w.create_role(branch, "app", false).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
         journal.lock().unwrap().clear();
         w.computes.sql.lock().unwrap().clear();
         (branch, ep, db)
@@ -1070,6 +1895,8 @@ mod tests {
             sealed: None,
             databases: None,
             role_oid: None,
+            role_timeline: None,
+            role_bypass_rls: false,
         }
     }
 
@@ -1287,11 +2114,7 @@ mod tests {
             })
             .unwrap()
         };
-        let create = serde_json::to_vec(&RoleCreateRequest {
-            branch_id: branch,
-            name: "app".into(),
-            owner_level: true,
-        })
+        let create = serde_json::to_vec(&RoleCreateRequest::login(branch, "app", true))
         .unwrap();
 
         let reply = w
@@ -1341,11 +2164,7 @@ mod tests {
         let (branch, ep, _db) = ready(&w, &journal).await;
         let deadline = Duration::from_secs(5);
         for (name, owner_level) in [("reader", false), ("boss", true)] {
-            let create = serde_json::to_vec(&RoleCreateRequest {
-                branch_id: branch,
-                name: name.into(),
-                owner_level,
-            })
+            let create = serde_json::to_vec(&RoleCreateRequest::login(branch, name, owner_level))
             .unwrap();
             w.computes.sql.lock().unwrap().clear();
 
@@ -1385,11 +2204,7 @@ mod tests {
             name: "app".into(),
         })
         .unwrap();
-        let create = serde_json::to_vec(&RoleCreateRequest {
-            branch_id: branch,
-            name: "other".into(),
-            owner_level: true,
-        })
+        let create = serde_json::to_vec(&RoleCreateRequest::login(branch, "other", true))
         .unwrap();
         let deadline = Duration::from_secs(1);
 
@@ -1417,11 +2232,7 @@ mod tests {
             name: "app".into(),
         })
         .unwrap();
-        let create = serde_json::to_vec(&RoleCreateRequest {
-            branch_id: branch,
-            name: "other".into(),
-            owner_level: false,
-        })
+        let create = serde_json::to_vec(&RoleCreateRequest::login(branch, "other", false))
         .unwrap();
 
         for (subject, payload, message) in [
@@ -1432,5 +2243,929 @@ mod tests {
             assert_eq!(reply.code.as_deref(), Some("not_applied"), "{subject}");
             assert_eq!(reply.error.as_deref(), Some(message), "{subject}");
         }
+    }
+
+    // --- U1: NOLOGIN, attributes, memberships, update ------------------------------------
+
+    /// The membership check's SQL, as the fake backend answers it.
+    const MEMBERSHIP_CHECK: &str = "MEMBER WITH ADMIN OPTION";
+    /// One role's catalog read.
+    const ROLE_READ: &str = "FROM pg_authid";
+
+    fn until() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_900_000_000, 0).unwrap()
+    }
+
+    /// The membership check's answer: each name and whether the owner holds ADMIN on it.
+    fn groups(names: &[(&str, bool)]) -> String {
+        let plain: Vec<(&str, bool, bool)> = names.iter().map(|(n, a)| (*n, *a, false)).collect();
+        reaching(&plain)
+    }
+
+    /// The membership check's answer: each name, whether the owner holds ADMIN on it, and
+    /// whether it's a member (at any depth) of a reserved role.
+    fn reaching(names: &[(&str, bool, bool)]) -> String {
+        let tf = |b: bool| if b { "t" } else { "f" };
+        names
+            .iter()
+            .map(|(n, admin, reaches)| format!("{}|{}|{}\n", hex::encode(n), tf(*admin), tf(*reaches)))
+            .collect()
+    }
+
+    /// The stored attributes of a non-owner row.
+    fn attributes(w: &FakeWorker, ep: &str, name: &str) -> chelabase_metadata::RoleAttributes {
+        w.metadata.state().endpoints[ep].logins[name].attributes.clone()
+    }
+
+    /// The catalog read of one role answers `role`.
+    fn in_catalog(w: &FakeWorker, role: &crate::resync::ObservedRole) {
+        w.computes.answers.lock().unwrap().retain(|(n, _)| n != ROLE_READ);
+        w.computes.answer(ROLE_READ, &crate::resync::role_line(role));
+    }
+
+    fn observed(name: &str, login: bool, password: Option<&str>) -> crate::resync::ObservedRole {
+        crate::resync::ObservedRole {
+            name: name.into(),
+            login,
+            password: password.map(str::to_string),
+            ..crate::resync::ObservedRole::plain(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn create_nologin_role_has_no_password() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        let spec = RoleSpec {
+            login: false,
+            ..RoleSpec::login("readers", false)
+        };
+
+        assert_eq!(w.create_role(branch, &spec).await, RoleOutcome::Ok);
+
+        assert_eq!(login(&w, &ep, "readers"), Some((None, None, false)));
+        let row = w.metadata.state().endpoints[&ep].logins["readers"].clone();
+        assert_eq!((row.origin, row.login), (RoleOrigin::Api, false));
+        let script = sql(&w).pop().unwrap();
+        assert_eq!(
+            script,
+            format!("{SCRIPT}CREATE ROLE \"readers\" NOLOGIN;\nRESET ROLE;")
+        );
+        assert!(!script.contains("PASSWORD"), "{script}");
+    }
+
+    #[tokio::test]
+    async fn create_role_applies_attributes_and_memberships() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        w.computes.answer(MEMBERSHIP_CHECK, &groups(&[("g", true)]));
+        let spec = RoleSpec {
+            login: false,
+            inherit: false,
+            connection_limit: 3,
+            valid_until: Some(until()),
+            bypass_rls: true,
+            member_of: vec!["g".into()],
+            ..RoleSpec::login("r", false)
+        };
+
+        assert_eq!(w.create_role(branch, &spec).await, RoleOutcome::Ok);
+
+        let sent = sql(&w);
+        assert!(
+            sent.iter().any(|s| s.contains(MEMBERSHIP_CHECK) && s.contains("'g'")),
+            "{sent:?}"
+        );
+        assert_eq!(
+            sent.last().unwrap(),
+            &format!(
+                "{SCRIPT}CREATE ROLE \"r\" NOLOGIN NOINHERIT CONNECTION LIMIT 3 VALID UNTIL \
+                 '2030-03-17T17:46:40.000000Z' BYPASSRLS;\nGRANT \"g\" TO \"r\";\nRESET ROLE;"
+            )
+        );
+        assert_eq!(attributes(&w, &ep, "r"), spec.attributes());
+        assert!(!login(&w, &ep, "r").unwrap().2, "confirmed");
+
+        // A LOGIN role keeps its password, after the attributes.
+        w.computes.sql.lock().unwrap().clear();
+        let spec = RoleSpec {
+            connection_limit: 0,
+            member_of: vec!["g".into()],
+            ..RoleSpec::login("app", false)
+        };
+        assert_eq!(w.create_role(branch, &spec).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0.unwrap();
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            &format!(
+                "{SCRIPT}CREATE ROLE \"app\" LOGIN CONNECTION LIMIT 0 PASSWORD '{verifier}';\n\
+                 GRANT \"g\" TO \"app\";\nRESET ROLE;"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_in_reserved_role_is_refused() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        let not_allowed = refused("role_membership_not_allowed");
+
+        for target in [
+            "authenticator",
+            "anon",
+            "authenticated",
+            "chelabase_admin",
+            "chelabase_auth_sync",
+            "neon_superuser",
+            "cloud_admin",
+            "postgres",
+            "pg_read_all_data",
+            "r",
+        ] {
+            let spec = RoleSpec {
+                member_of: vec![target.into()],
+                ..RoleSpec::login("r", false)
+            };
+            let outcome = w.create_role(branch, &spec).await;
+            assert!(not_allowed(&outcome), "{target}: {outcome:?}");
+        }
+        assert!(position(&journal, "metadata.lock_endpoint").is_none());
+        assert!(sql(&w).is_empty(), "{:?}", sql(&w));
+
+        // A role that doesn't exist, or one the owner can't administer.
+        w.computes
+            .answer(MEMBERSHIP_CHECK, &groups(&[("theirs", false)]));
+        for target in ["ghost", "theirs"] {
+            let spec = RoleSpec {
+                member_of: vec![target.into()],
+                ..RoleSpec::login("r", false)
+            };
+            let outcome = w.create_role(branch, &spec).await;
+            assert!(not_allowed(&outcome), "{target}: {outcome:?}");
+        }
+        assert!(position(&journal, "metadata.insert_api_role").is_none());
+        assert!(login(&w, &ep, "r").is_none());
+
+        // An update is held to the same rules.
+        assert_eq!(
+            w.create_role(branch, &RoleSpec::login("app", false)).await,
+            RoleOutcome::Ok
+        );
+        for target in ["anon", "neon_superuser", "app"] {
+            let patch = RolePatch {
+                member_of: Some(vec![target.into()]),
+                ..RolePatch::default()
+            };
+            let outcome = w.update_role(branch, "app", &patch).await;
+            assert!(not_allowed(&outcome), "{target}: {outcome:?}");
+        }
+        // And an attribute outside the allowed values.
+        let patch = RolePatch {
+            connection_limit: Some(-2),
+            ..RolePatch::default()
+        };
+        assert!(refused("role_attribute_not_allowed")(
+            &w.update_role(branch, "app", &patch).await
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_role_toggles_login_and_reseals() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(
+            w.create_role(branch, &RoleSpec::login("app", false)).await,
+            RoleOutcome::Ok
+        );
+        let (verifier, _, _) = login(&w, &ep, "app").unwrap();
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.computes.sql.lock().unwrap().clear();
+        let off = RolePatch {
+            login: Some(false),
+            ..RolePatch::default()
+        };
+
+        assert_eq!(w.update_role(branch, "app", &off).await, RoleOutcome::Ok);
+
+        assert_eq!(login(&w, &ep, "app"), Some((None, None, false)));
+        assert!(!w.metadata.state().endpoints[&ep].logins["app"].login);
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" PASSWORD NULL;\n\
+             ALTER ROLE \"app\" NOLOGIN;"
+        );
+
+        // Back on: a new password, sealed for the branch, revealable again.
+        in_catalog(&w, &observed("app", false, None));
+        journal.lock().unwrap().clear();
+        let on = RolePatch {
+            login: Some(true),
+            ..RolePatch::default()
+        };
+        assert_eq!(w.update_role(branch, "app", &on).await, RoleOutcome::Ok);
+
+        let (verifier, sealed, pending) = login(&w, &ep, "app").unwrap();
+        let verifier = verifier.unwrap();
+        assert!(!pending);
+        let password =
+            open_role_password(&w.key, &branch.to_string(), "app", &sealed.unwrap()).unwrap();
+        let params = verifier.split('$').nth(1).unwrap();
+        let (iterations, salt) = params.split_once(':').unwrap();
+        use base64::Engine;
+        let salt = base64::engine::general_purpose::STANDARD
+            .decode(salt)
+            .unwrap();
+        assert_eq!(
+            chelabase_neon::scram::verifier_with_salt(&password, &salt, iterations.parse().unwrap()),
+            verifier
+        );
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            &format!(
+                "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" PASSWORD '{verifier}';\n\
+                 ALTER ROLE \"app\" LOGIN;"
+            )
+        );
+        // The catalog read comes first; the change runs after the row is stored.
+        let applied = entries(&journal)
+            .iter()
+            .rposition(|e| e.starts_with(&format!("compute.sql {ep} ")))
+            .unwrap();
+        let order = [
+            pos(&journal, "metadata.lock_endpoint"),
+            pos(&journal, "metadata.update_api_role"),
+            applied,
+            pos(&journal, "metadata.confirm_role"),
+            pos(&journal, &format!("cache.password_updated {ep} app")),
+        ];
+        assert!(order.is_sorted(), "{:?}", entries(&journal));
+    }
+
+    #[tokio::test]
+    async fn update_role_bypass_rls() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(
+            w.create_role(branch, &RoleSpec::login("app", false)).await,
+            RoleOutcome::Ok
+        );
+        let (verifier, sealed, _) = login(&w, &ep, "app").unwrap();
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.computes.sql.lock().unwrap().clear();
+        let on = RolePatch {
+            bypass_rls: Some(true),
+            ..RolePatch::default()
+        };
+
+        assert_eq!(w.update_role(branch, "app", &on).await, RoleOutcome::Ok);
+
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" BYPASSRLS;"
+        );
+        assert!(attributes(&w, &ep, "app").bypass_rls);
+        // The password is untouched.
+        assert_eq!(login(&w, &ep, "app"), Some((verifier, sealed, false)));
+
+        // A role made in SQL (NOLOGIN, so without a row) changes in SQL only.
+        in_catalog(&w, &observed("reporting", false, None));
+        w.computes.sql.lock().unwrap().clear();
+        assert_eq!(w.update_role(branch, "reporting", &on).await, RoleOutcome::Ok);
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"reporting\" BYPASSRLS;"
+        );
+        assert!(login(&w, &ep, "reporting").is_none());
+
+        // Unknown everywhere: not found, nothing run.
+        w.computes.answers.lock().unwrap().clear();
+        w.computes.sql.lock().unwrap().clear();
+        assert_eq!(w.update_role(branch, "ghost", &on).await, RoleOutcome::NotFound);
+        assert!(!sql(&w).iter().any(|s| s.contains("ALTER")), "{:?}", sql(&w));
+        // The owner and reserved names are refused.
+        for name in [OWNER_ROLE, "authenticator"] {
+            assert!(refused("reserved_role_name")(
+                &w.update_role(branch, name, &on).await
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_role_refuses_roles_the_owner_does_not_administer() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        let on = RolePatch {
+            bypass_rls: Some(true),
+            ..RolePatch::default()
+        };
+
+        // A role made in SQL by someone else (the owner has no ADMIN on it): not ours.
+        let mut theirs = observed("theirs", false, None);
+        theirs.owner_admin = false;
+        in_catalog(&w, &theirs);
+        w.computes.sql.lock().unwrap().clear();
+        assert_eq!(w.update_role(branch, "theirs", &on).await, RoleOutcome::NotFound);
+        assert!(!sql(&w).iter().any(|s| s.contains("ALTER")), "{:?}", sql(&w));
+        assert!(position(&journal, "metadata.store_role_secret").is_none());
+
+        // Turning LOGIN on doesn't store a password for it either.
+        let login_on = RolePatch {
+            login: Some(true),
+            ..RolePatch::default()
+        };
+        assert_eq!(w.update_role(branch, "theirs", &login_on).await, RoleOutcome::NotFound);
+        assert!(login(&w, &ep, "theirs").is_none());
+        assert!(!sql(&w).iter().any(|s| s.contains("ALTER")), "{:?}", sql(&w));
+
+        // Any `chelabase_` role is Chelabase's own, whatever its catalog says.
+        journal.lock().unwrap().clear();
+        for name in ["chelabase_custom", "Chelabase_x"] {
+            assert!(
+                refused("reserved_role_name")(&w.update_role(branch, name, &on).await),
+                "{name}"
+            );
+        }
+        assert!(position(&journal, "metadata.lock_endpoint").is_none());
+    }
+
+    #[tokio::test]
+    async fn membership_reaching_reserved_roles_is_refused() {
+        let (w, journal) = worker();
+        let (branch, _ep, _db) = ready(&w, &journal).await;
+        // `g` is the owner's to grant but is itself (at some depth) a member of a reserved role.
+        w.computes
+            .answer(MEMBERSHIP_CHECK, &reaching(&[("g", true, true)]));
+        let spec = RoleSpec {
+            member_of: vec!["g".into()],
+            ..RoleSpec::login("r", false)
+        };
+
+        let outcome = w.create_role(branch, &spec).await;
+
+        assert!(refused("role_membership_not_allowed")(&outcome), "{outcome:?}");
+        assert!(
+            matches!(&outcome, RoleOutcome::Refused(_, m) if m.contains("reserved")),
+            "{outcome:?}"
+        );
+        let check = sql(&w)
+            .into_iter()
+            .find(|s| s.contains(MEMBERSHIP_CHECK))
+            .unwrap();
+        for reserved in [
+            "'neon_superuser'",
+            "'authenticator'",
+            "'anon'",
+            "'authenticated'",
+            "'chelabase\\_%'",
+            "'pg\\_%'",
+            "'MEMBER')",
+        ] {
+            assert!(check.contains(reserved), "{reserved}: {check}");
+        }
+        assert!(position(&journal, "metadata.insert_api_role").is_none());
+
+        // The same group without the reserved reach is accepted.
+        w.computes.answers.lock().unwrap().clear();
+        w.computes
+            .answer(MEMBERSHIP_CHECK, &reaching(&[("g", true, false)]));
+        assert_eq!(w.create_role(branch, &spec).await, RoleOutcome::Ok);
+
+        // An update is held to the same rule.
+        w.computes.answers.lock().unwrap().clear();
+        w.computes
+            .answer(MEMBERSHIP_CHECK, &reaching(&[("g", true, true)]));
+        in_catalog(&w, &observed("r", true, None));
+        let patch = RolePatch {
+            member_of: Some(vec!["g".into()]),
+            ..RolePatch::default()
+        };
+        let outcome = w.update_role(branch, "r", &patch).await;
+        assert!(refused("role_membership_not_allowed")(&outcome), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn role_update_rpc_replies() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(
+            w.create_role(branch, &RoleSpec::login("app", false)).await,
+            RoleOutcome::Ok
+        );
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        let request = chelabase_nats::RoleUpdateRequest {
+            inherit: Some(false),
+            ..chelabase_nats::RoleUpdateRequest::new(branch, "app")
+        };
+        let payload = serde_json::to_vec(&request).unwrap();
+
+        let reply = w
+            .role_rpc_reply(chelabase_nats::SUBJECT_ROLE_UPDATE, &payload, Duration::from_secs(5))
+            .await;
+
+        assert!(reply.ok, "{reply:?}");
+        assert!(!attributes(&w, &ep, "app").inherit);
+        let mut changed = observed("app", true, verifier.as_deref());
+        changed.inherit = false;
+        in_catalog(&w, &changed);
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("ALTER ROLE".into(), "connection reset".into()));
+        let request = chelabase_nats::RoleUpdateRequest {
+            inherit: Some(true),
+            ..chelabase_nats::RoleUpdateRequest::new(branch, "app")
+        };
+        let reply = w
+            .role_rpc_reply(
+                chelabase_nats::SUBJECT_ROLE_UPDATE,
+                &serde_json::to_vec(&request).unwrap(),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(reply.code.as_deref(), Some("not_applied"));
+        assert_eq!(
+            reply.error.as_deref(),
+            Some(chelabase_nats::ROLE_UPDATE_NOT_APPLIED)
+        );
+    }
+
+    // --- T14 fix batch F2 -------------------------------------------------------------------
+
+    /// I2: turning LOGIN on gives the role a copy, so it counts against the cap: refused at
+    /// the cap for an API row and for a role made in SQL, with nothing stored or run.
+    #[tokio::test]
+    async fn turning_login_on_at_the_cap_is_refused() {
+        let (mut w, journal) = worker();
+        w.roles.role_cap = 2;
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        sql_row(&w, &ep, "reporter", "SCRAM-SHA-256$x");
+        let group = RoleSpec {
+            login: false,
+            ..RoleSpec::login("grp", false)
+        };
+        assert_eq!(w.create_role(branch, &group).await, RoleOutcome::Ok);
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let on = RolePatch {
+            login: Some(true),
+            ..RolePatch::default()
+        };
+
+        in_catalog(&w, &observed("grp", false, None));
+        w.computes.sql.lock().unwrap().clear();
+        let outcome = w.update_role(branch, "grp", &on).await;
+        assert!(
+            matches!(&outcome, RoleOutcome::Refused("role_cap_reached", m) if m.contains('2')),
+            "{outcome:?}"
+        );
+        assert_eq!(login(&w, &ep, "grp"), Some((None, None, false)), "nothing stored");
+        assert!(!w.metadata.state().endpoints[&ep].logins["grp"].login);
+        assert!(!sql(&w).iter().any(|s| s.contains("ALTER")), "{:?}", sql(&w));
+
+        // A role made in SQL without a password: the same.
+        in_catalog(&w, &observed("made_in_sql", false, None));
+        let outcome = w.update_role(branch, "made_in_sql", &on).await;
+        assert!(refused("role_cap_reached")(&outcome), "{outcome:?}");
+        assert!(login(&w, &ep, "made_in_sql").is_none());
+        assert!(!sql(&w).iter().any(|s| s.contains("ALTER")), "{:?}", sql(&w));
+
+        // Under the cap it goes through.
+        w.roles.role_cap = 3;
+        in_catalog(&w, &observed("grp", false, None));
+        assert_eq!(w.update_role(branch, "grp", &on).await, RoleOutcome::Ok);
+        assert!(login(&w, &ep, "grp").unwrap().0.is_some());
+        assert_eq!(
+            role_reply(RoleOutcome::Refused("role_cap_reached", "x".into())).code.as_deref(),
+            Some("role_cap_reached")
+        );
+    }
+
+    /// E32: a PATCH starts from the catalog, not from the stored row: SQL changes made since
+    /// stick (no INHERIT revert, no REVOKE), and the row records the result.
+    #[tokio::test]
+    async fn a_patch_starts_from_what_sql_made_of_an_api_role() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        // Since then, in SQL: NOINHERIT, a membership and BYPASSRLS.
+        let mut now = observed("app", true, verifier.as_deref());
+        now.inherit = false;
+        now.bypass_rls = true;
+        now.member_of = vec!["g".into()];
+        now.owner_granted = vec!["g".into()];
+        in_catalog(&w, &now);
+        w.computes.sql.lock().unwrap().clear();
+        let patch = RolePatch {
+            connection_limit: Some(5),
+            ..RolePatch::default()
+        };
+
+        assert_eq!(w.update_role(branch, "app", &patch).await, RoleOutcome::Ok);
+
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" CONNECTION LIMIT 5;"
+        );
+        let stored = attributes(&w, &ep, "app");
+        assert_eq!(
+            stored,
+            chelabase_metadata::RoleAttributes {
+                inherit: false,
+                connection_limit: 5,
+                valid_until: None,
+                bypass_rls: true,
+                member_of: vec!["g".into()],
+            }
+        );
+        assert!(!w.metadata.state().endpoints[&ep].logins["app"].attributes_pending);
+    }
+
+    /// F2 fix round I-1: a confirm that loses to a version bump (a receiver write meanwhile)
+    /// still clears the change's `attributes_pending` by its change id, and asks for a resync
+    /// for the rest. A later SQL `GRANT` is then recorded by the resync, never revoked.
+    #[tokio::test]
+    async fn a_lost_confirm_doesnt_leave_a_stale_change_to_drive() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        w.metadata.state().confirm_version_moves = true;
+
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+
+        let row = w.metadata.state().endpoints[&ep].logins["app"].clone();
+        assert!(!row.attributes_pending, "cleared by its change id");
+        assert!(row.pending, "the version guard still holds for pending");
+        assert_eq!(w.resync_requests.sent(), [branch], "a resync is asked for");
+
+        // `GRANT readers TO app` in SQL, then the resync it triggers.
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        let mut granted = observed("app", true, verifier.as_deref());
+        granted.member_of = vec!["readers".into()];
+        granted.owner_granted = vec!["readers".into()];
+        w.computes.answer(
+            "FROM pg_authid",
+            &format!(
+                "{}{}",
+                crate::resync::role_line(&granted),
+                crate::resync::role_line(&observed("readers", false, None))
+            ),
+        );
+        w.computes.sql.lock().unwrap().clear();
+        w.resync(branch).await.unwrap();
+        assert!(!sql(&w).iter().any(|s| s.contains("REVOKE")), "{:?}", sql(&w));
+        assert_eq!(attributes(&w, &ep, "app").member_of, ["readers"]);
+        assert!(!w.metadata.state().endpoints[&ep].logins["app"].pending);
+    }
+
+    /// E32: a role SQL made NOLOGIN keeps its password through an unrelated PATCH (only a
+    /// PATCH turning LOGIN off drops it), so `ALTER ROLE … LOGIN` in SQL brings it back.
+    #[tokio::test]
+    async fn an_unrelated_patch_keeps_the_password_of_a_role_sql_made_nologin() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let (verifier, sealed, _) = login(&w, &ep, "app").unwrap();
+        // `ALTER ROLE app NOLOGIN` in SQL: forwarded, the row's login follows.
+        w.metadata.state().endpoints.get_mut(&ep).unwrap().logins.get_mut("app").unwrap().login = false;
+        in_catalog(&w, &observed("app", false, verifier.as_deref()));
+        w.computes.sql.lock().unwrap().clear();
+        let patch = RolePatch {
+            connection_limit: Some(5),
+            ..RolePatch::default()
+        };
+
+        assert_eq!(w.update_role(branch, "app", &patch).await, RoleOutcome::Ok);
+
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" CONNECTION LIMIT 5;"
+        );
+        assert_eq!(login(&w, &ep, "app"), Some((verifier, sealed, false)), "the password stays");
+    }
+
+    /// T14 M1: a change the compute hasn't confirmed yet is the starting point instead, and a
+    /// stored group dropped in SQL since isn't granted again by an unrelated PATCH.
+    #[tokio::test]
+    async fn an_unrelated_patch_doesnt_grant_a_dropped_group() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        w.computes.answer(MEMBERSHIP_CHECK, &groups(&[("g", true)]));
+        let spec = RoleSpec {
+            member_of: vec!["g".into()],
+            inherit: false,
+            ..RoleSpec::login("app", false)
+        };
+        assert_eq!(w.create_role(branch, &spec).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        // The create's change wasn't confirmed (still pending), and `g` was dropped since.
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&ep)
+            .unwrap()
+            .logins
+            .get_mut("app")
+            .unwrap()
+            .attributes_pending = true;
+        w.computes.answers.lock().unwrap().clear();
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.computes.sql.lock().unwrap().clear();
+        let patch = RolePatch {
+            connection_limit: Some(5),
+            ..RolePatch::default()
+        };
+
+        assert_eq!(w.update_role(branch, "app", &patch).await, RoleOutcome::Ok);
+
+        let script = sql(&w).last().unwrap().clone();
+        assert!(!script.contains("GRANT"), "{script}");
+        // The pending NOINHERIT is still driven; the limit too.
+        assert!(script.contains("NOINHERIT") && script.contains("CONNECTION LIMIT 5"), "{script}");
+        assert_eq!(attributes(&w, &ep, "app").member_of, Vec::<String>::new());
+    }
+
+    /// I3/I4 helpers for the merge (F3): the stored-or-catalog starting point, exhaustively.
+    #[test]
+    fn a_roles_current_state_follows_the_catalog_unless_a_change_is_pending() {
+        let row = |origin: RoleOrigin, pending: bool| chelabase_metadata::RoleCopy {
+            name: "r".into(),
+            origin,
+            scram_verifier: None,
+            password_enc: None,
+            login: true,
+            level: RoleLevel::Plain,
+            api_owner_level: true,
+            pending,
+            attributes_pending: pending,
+            created_at: chrono::Utc::now(),
+            attributes: chelabase_metadata::RoleAttributes {
+                connection_limit: 7,
+                ..Default::default()
+            },
+        };
+        let catalog = |owner_admin: bool| crate::resync::ObservedRole {
+            owner_admin,
+            login: false,
+            connection_limit: 3,
+            ..crate::resync::ObservedRole::plain("r")
+        };
+        let stored = (true, true, 7);
+        let seen = (false, false, 3);
+        for origin in [None, Some(RoleOrigin::Sql), Some(RoleOrigin::Api)] {
+            for pending in [false, true] {
+                for observed in [None, Some(false), Some(true)] {
+                    let r = origin.map(|o| row(o, pending));
+                    let o = observed.map(catalog);
+                    let got = current_role_state(r.as_ref(), o.as_ref())
+                        .map(|s| (s.owner_level, s.login, s.attributes.connection_limit));
+                    let api = origin == Some(RoleOrigin::Api);
+                    let want = match (api, pending, observed) {
+                        (true, true, _) | (true, _, None) => Ok(stored),
+                        (true, false, Some(_)) => Ok(seen),
+                        (false, _, Some(true)) => Ok(seen),
+                        (false, _, _) => Err(RoleOutcome::NotFound),
+                    };
+                    assert_eq!(got, want, "{origin:?} pending={pending} observed={observed:?}");
+                }
+            }
+        }
+    }
+
+    /// I4 helper for the merge (F3): the membership check runs as SQL alone on any compute
+    /// (a rehearsal's), with the roles path's verdicts.
+    #[tokio::test]
+    async fn the_member_check_runs_on_any_compute() {
+        let (w, journal) = worker();
+        let (_branch, _ep, _db) = ready(&w, &journal).await;
+        w.computes.answer_at(
+            "ep-rehearsal",
+            MEMBERSHIP_CHECK,
+            &reaching(&[("ok", true, false), ("theirs", false, false), ("deep", true, true)]),
+        );
+        let check = |targets: &[&str]| {
+            let targets: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+            let w = &w;
+            async move { w.check_member_targets("ep-rehearsal", "app", &targets).await }
+        };
+        assert_eq!(check(&[]).await, Ok(()));
+        assert_eq!(check(&["ok"]).await, Ok(()));
+        for bad in ["theirs", "deep", "ghost"] {
+            let outcome = check(&["ok", bad]).await.unwrap_err();
+            assert!(refused("role_membership_not_allowed")(&outcome), "{bad}: {outcome:?}");
+        }
+        let ran = entries(&journal);
+        assert!(ran.iter().any(|e| e.starts_with("compute.sql ep-rehearsal app")), "{ran:?}");
+    }
+
+    /// E29: a rename through the control plane: the role in SQL (forwarding off), its row
+    /// (resealed under the new name), its keys and the proxies' copies move together.
+    #[tokio::test]
+    async fn rename_role_moves_the_role_its_row_and_its_keys() {
+        let (w, journal) = worker();
+        let (branch, ep, db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let (verifier, sealed, _) = login(&w, &ep, "app").unwrap();
+        let password =
+            open_role_password(&w.key, &branch.to_string(), "app", &sealed.unwrap()).unwrap();
+        w.metadata.state().data_keys.push(secret(branch, "app", "app-key"));
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        journal.lock().unwrap().clear();
+        w.computes.sql.lock().unwrap().clear();
+
+        assert_eq!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::Ok);
+
+        assert!(
+            sql(&w).iter().any(|s| s.ends_with("ALTER ROLE \"app\" RENAME TO \"app_v2\";")),
+            "{:?}",
+            sql(&w)
+        );
+        assert!(login(&w, &ep, "app").is_none());
+        let (moved_verifier, moved_sealed, _) = login(&w, &ep, "app_v2").unwrap();
+        assert_eq!(moved_verifier, verifier);
+        assert_eq!(
+            open_role_password(&w.key, &branch.to_string(), "app_v2", &moved_sealed.unwrap())
+                .unwrap(),
+            password,
+            "resealed under the new name"
+        );
+        let key = w.metadata.state().data_keys.iter().find(|k| k.name == "app-key").cloned().unwrap();
+        assert_eq!(key.role, "app_v2");
+        let order = [
+            pos(&journal, "metadata.lock_endpoint"),
+            pos(&journal, &format!("compute.sql {ep} {db} {EXISTS_SQL} = 'app_v2'")),
+            pos(&journal, "metadata.rename_role_copy"),
+            pos(&journal, &format!("cache.password_updated {ep} app")),
+            pos(&journal, &format!("cache.password_updated {ep} app_v2")),
+        ];
+        assert!(order.is_sorted(), "{:?}", entries(&journal));
+    }
+
+    /// E29: the rename's refusals, none of which changes anything.
+    #[tokio::test]
+    async fn rename_role_refusals() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.computes.sql.lock().unwrap().clear();
+
+        for (from, to) in [
+            ("app", OWNER_ROLE),
+            (OWNER_ROLE, "boss"),
+            ("app", "anon"),
+            ("app", "pg_x"),
+            ("app", "chelabase_x"),
+            ("authenticator", "x"),
+        ] {
+            let outcome = w.rename_role(branch, from, to).await;
+            assert!(refused("reserved_role_name")(&outcome), "{from} -> {to}: {outcome:?}");
+        }
+        for (from, to) in [("app", ""), ("", "x"), ("app", "a\0b")] {
+            let outcome = w.rename_role(branch, from, to).await;
+            assert!(refused("invalid_role_name")(&outcome), "{from:?} -> {to:?}: {outcome:?}");
+        }
+        assert!(refused("invalid_role_name")(&w.rename_role(branch, "app", "app").await));
+        // The new name is taken in SQL.
+        w.computes.answer_once_at(&ep, "rolname = 'taken'", "1\n");
+        let outcome = w.rename_role(branch, "app", "taken").await;
+        assert!(refused("role_exists")(&outcome), "{outcome:?}");
+        // A row already holds it.
+        sql_row(&w, &ep, "held", "SCRAM-SHA-256$h");
+        let outcome = w.rename_role(branch, "app", "held").await;
+        assert!(refused("role_exists")(&outcome), "{outcome:?}");
+        // A role made in SQL by someone else, or one that doesn't exist.
+        let mut theirs = observed("theirs", false, None);
+        theirs.owner_admin = false;
+        in_catalog(&w, &theirs);
+        assert_eq!(w.rename_role(branch, "theirs", "mine").await, RoleOutcome::NotFound);
+        w.computes.answers.lock().unwrap().retain(|(n, _)| n != ROLE_READ);
+        assert_eq!(w.rename_role(branch, "ghost", "mine").await, RoleOutcome::NotFound);
+        assert!(!sql(&w).iter().any(|s| s.contains("RENAME")), "{:?}", sql(&w));
+        assert!(login(&w, &ep, "app").is_some());
+        // Not ready.
+        assert_eq!(w.rename_role(BranchId::new(), "app", "x").await, RoleOutcome::NotReady);
+    }
+
+    /// E29: when the SQL rename fails, the row and keys move back to the old name.
+    #[tokio::test]
+    async fn a_failed_sql_rename_moves_the_row_back() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let (verifier, sealed, _) = login(&w, &ep, "app").unwrap();
+        w.metadata.state().data_keys.push(secret(branch, "app", "app-key"));
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("RENAME TO".into(), "connection reset".into()));
+        // The catalog afterwards: still under the old name.
+        w.computes.answer(ROLE_NAMES, &format!("{}\n", hex::encode("app")));
+
+        let outcome = w.rename_role(branch, "app", "app_v2").await;
+
+        assert!(matches!(&outcome, RoleOutcome::Failed(m) if m.contains("connection reset")), "{outcome:?}");
+        assert_eq!(login(&w, &ep, "app").map(|l| (l.0, l.1)), Some((verifier, sealed)));
+        assert!(login(&w, &ep, "app_v2").is_none());
+        let key = w.metadata.state().data_keys.iter().find(|k| k.name == "app-key").cloned().unwrap();
+        assert_eq!(key.role, "app");
+    }
+
+    /// The role names the post-rename check answers.
+    const ROLE_NAMES: &str = "chelabase: role names";
+
+    /// F2 fix round I-2: the RENAME committed but its answer was lost: the catalog shows the
+    /// new name and not the old, so the rename stands (row and keys stay moved).
+    #[tokio::test]
+    async fn a_rename_whose_answer_was_lost_stands() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        w.metadata.state().data_keys.push(secret(branch, "app", "app-key"));
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("RENAME TO".into(), "server closed the connection".into()));
+        w.computes.answer(ROLE_NAMES, &format!("{}\n", hex::encode("app_v2")));
+
+        assert_eq!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::Ok);
+
+        assert!(login(&w, &ep, "app").is_none());
+        assert_eq!(login(&w, &ep, "app_v2").unwrap().0, verifier);
+        let key = w.metadata.state().data_keys.iter().find(|k| k.name == "app-key").cloned().unwrap();
+        assert_eq!(key.role, "app_v2");
+        assert!(position(&journal, &format!("cache.password_updated {ep} app_v2")).is_some());
+
+        // The check itself can't be read: not ready, the move left as it is.
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.computes.fail_when("RENAME TO");
+        w.computes.fail_when(ROLE_NAMES);
+        assert_eq!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::NotReady);
+        assert!(login(&w, &ep, "app_v2").is_some());
+    }
+
+    /// F2 fix round I-2: the RENAME answered an error and the catalog has neither name (the
+    /// role went meanwhile): the row isn't moved back, since a move back would have the resync
+    /// make `from` again; the outcome is a failure.
+    #[tokio::test]
+    async fn a_failed_rename_of_a_vanished_role_isnt_moved_back() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        w.metadata.state().data_keys.push(secret(branch, "app", "app-key"));
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("RENAME TO".into(), "connection reset".into()));
+        w.computes.answer(ROLE_NAMES, "");
+
+        let outcome = w.rename_role(branch, "app", "app_v2").await;
+
+        assert!(matches!(&outcome, RoleOutcome::Failed(m) if m.contains("connection reset")), "{outcome:?}");
+        assert!(login(&w, &ep, "app").is_none());
+        assert!(login(&w, &ep, "app_v2").is_some());
+        assert!(position(&journal, &format!("metadata.rename_role_copy {ep} app_v2 -> app")).is_none());
+        let key = w.metadata.state().data_keys.iter().find(|k| k.name == "app-key").cloned().unwrap();
+        assert_eq!(key.role, "app_v2");
+    }
+
+    /// F2 fix round M5: an endpoint gone between the checks and the row's move is not ready,
+    /// never `role_exists`.
+    #[tokio::test]
+    async fn a_rename_whose_endpoint_went_meanwhile_is_not_ready() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.metadata.state().rename_endpoint_vanishes = true;
+
+        assert_eq!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::NotReady);
+        assert!(!sql(&w).iter().any(|s| s.contains("RENAME TO")), "{:?}", sql(&w));
+    }
+
+    /// F2 fix round M4: a rename that couldn't reseal marks the row unreadable; moving it back
+    /// restores the flag it had.
+    #[tokio::test]
+    async fn moving_a_rename_back_restores_the_unreadable_flag() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        // A sealed password that won't open.
+        w.metadata.state().endpoints.get_mut(&ep).unwrap().logins.get_mut("app").unwrap().password_enc =
+            Some("v1:garbage".into());
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("RENAME TO".into(), "connection reset".into()));
+        w.computes.answer(ROLE_NAMES, &format!("{}\n", hex::encode("app")));
+
+        assert!(matches!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::Failed(_)));
+
+        let state = w.metadata.state();
+        let endpoint = &state.endpoints[&ep];
+        assert_eq!(endpoint.logins["app"].password_enc.as_deref(), Some("v1:garbage"));
+        assert!(!endpoint.unreadable.contains("app"), "the flag it had");
     }
 }
