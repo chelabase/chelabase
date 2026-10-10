@@ -23,6 +23,7 @@ import {
   type Sort,
   type Tree,
 } from "@/lib/console";
+import { actAsRoles, useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { ConsoleFilters } from "./console-filters";
 import { ConsoleGrid, rowKey, type Row } from "./console-grid";
@@ -33,7 +34,7 @@ export interface TablesViewProps {
   databaseId: string;
 }
 
-const field = "h-8 rounded-lg border border-input bg-background px-2 text-sm";
+const field = "h-8 border border-input bg-background px-2 text-sm";
 const READ_ONLY_KIND: Record<string, string> = {
   view: "Views are read-only.",
   materialized_view: "Materialized views are read-only.",
@@ -57,12 +58,18 @@ export function TablesView({ databaseId }: TablesViewProps) {
   const dbParam = db && !db.main ? db.name : null;
 
   const roles = useListRoles(databaseId, branchId ?? "", { query: { enabled: branchId !== null } });
-  const [role, setRole] = useState("");
+  // Only roles the caller may act as: the owner is Admin's; below Admin the granted roles and their chains.
+  const allowed = actAsRoles(useProjectCaps(), roles.data ?? []);
+  const apiRoles = ["anon", "authenticated"].filter((n) => allowed.owner || allowed.roles.includes(n));
+  const [pickedRole, setRole] = useState("");
+  const usable = [...apiRoles, ...allowed.roles];
+  const role = usable.includes(pickedRole) ? pickedRole : allowed.owner ? "" : (usable[0] ?? "");
+  const noRole = !allowed.owner && role === "";
 
   // What the viewing role reaches (the owner without a role), so the lists match what it can read.
   const schemaParams = { ...(dbParam ? { database: dbParam } : {}), ...(role !== "" ? { role } : {}) };
   const schemaQuery = useGetConsoleSchema(databaseId, branchId ?? "", schemaParams, {
-    query: { enabled: branchId !== null && db !== null, retry: false },
+    query: { enabled: branchId !== null && db !== null && (allowed.owner || roles.isSuccess) && !noRole, retry: false },
   });
   const schema = schemaQuery.data;
   const [pickedSchema, setPickedSchema] = useState<string | null>(null);
@@ -74,7 +81,9 @@ export function TablesView({ databaseId }: TablesViewProps) {
 
   const error = branches.error ?? dbs.error ?? roles.error ?? schemaQuery.error;
   const errorMessage = error ? consoleErrorText(error, { role: role === "" ? null : role, op: "select" }) : null;
-  const roleRows = (roles.data ?? []).filter((r) => r.origin !== "owner" && r.name !== "anon" && r.name !== "authenticated");
+  const roleRows = (roles.data ?? []).filter(
+    (r) => r.origin !== "owner" && r.name !== "anon" && r.name !== "authenticated" && allowed.roles.includes(r.name),
+  );
 
   return (
     <div className="space-y-4 py-3">
@@ -133,9 +142,12 @@ export function TablesView({ databaseId }: TablesViewProps) {
         <label className="flex flex-col gap-1">
           <span>View as</span>
           <select value={role} onChange={(e) => setRole(e.target.value)} className={field}>
-            <option value="">Owner</option>
-            <option value="anon">anon</option>
-            <option value="authenticated">authenticated</option>
+            {allowed.owner && <option value="">Owner</option>}
+            {apiRoles.map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
             {roleRows.map((r) => (
               <option key={r.name} value={r.name} disabled={r.level === "owner_level"}>
                 {r.level === "owner_level"
@@ -149,13 +161,16 @@ export function TablesView({ databaseId }: TablesViewProps) {
         </label>
       </div>
 
-      {role === "" && (
-        <p className="rounded-lg border border-destructive/40 p-2 text-sm">
+      {role === "" && allowed.owner && (
+        <p className="border border-destructive/40 p-2 text-sm">
           Viewing as owner: row-level security is bypassed, and edits apply to every row.
         </p>
       )}
+      {noRole && roles.isSuccess && (
+        <p className="text-sm text-muted-foreground">You can't act as any Postgres role here, so there's nothing to browse.</p>
+      )}
       {role !== "" && roleRows.find((r) => r.name === role)?.bypass_rls && (
-        <p className="rounded-lg border border-destructive/40 p-2 text-sm">
+        <p className="border border-destructive/40 p-2 text-sm">
           Viewing as {role}: it has BYPASSRLS, so row-level security is bypassed, and edits apply to every row.
         </p>
       )}
@@ -179,11 +194,11 @@ export function TablesView({ databaseId }: TablesViewProps) {
                 aria-pressed={table === name}
                 aria-label={`${name}${t.kind !== "table" ? `, ${t.kind.replace("_", " ")}` : ""}${t.rls ? ", row-level security on" : ""}`}
                 onClick={() => setTable(name)}
-                className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left hover:bg-muted ${table === name ? "bg-muted" : ""}`}
+                className={`flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-muted ${table === name ? "bg-muted" : ""}`}
               >
                 {name}
                 {t.kind !== "table" && <span className="text-xs text-muted-foreground">{t.kind.replace("_", " ")}</span>}
-                {t.rls && <span className="rounded-full border px-1.5 text-xs">RLS</span>}
+                {t.rls && <span className="border px-1.5 text-xs">RLS</span>}
               </button>
             ))}
             {Object.keys(entry.functions).length > 0 && (
@@ -236,7 +251,10 @@ interface TableDataProps {
 function TableData({ databaseId, branchId, database, role, schemaName, tableName, desc, enums, pageSize }: TableDataProps) {
   const columns: Record<string, ColumnDesc> = desc.columns;
   const pk = desc.primary_key ?? [];
-  const readOnlyReason = READ_ONLY_KIND[desc.kind] ?? (pk.length === 0 ? NO_PK : null);
+  // Viewers read through the console; writes need Developer (the API refuses them below it).
+  const canWrite = useProjectCaps().atLeast("developer");
+  const readOnlyReason =
+    READ_ONLY_KIND[desc.kind] ?? (pk.length === 0 ? NO_PK : !canWrite ? "Viewers can read rows but not change them." : null);
   const readOnly = readOnlyReason !== null;
 
   const [page, setPage] = useState(0);
@@ -367,7 +385,7 @@ function TableData({ databaseId, branchId, database, role, schemaName, tableName
         />
       )}
       {confirmDelete && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <p>
             Delete {selected.size} {selected.size === 1 ? "row" : "rows"}? This can&apos;t be undone.
             {role === null && " You are the owner, so row-level security does not limit this."}

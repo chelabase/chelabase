@@ -53,8 +53,13 @@ pub struct ZUser {
     pub org_id: String,
     pub email: String,
     pub email_verified: bool,
+    /// `human.profile.displayName`; empty when unset.
+    pub display_name: String,
     pub state: UserState,
     pub created_at: Option<DateTime<Utc>>,
+    /// Whether the user ever set a password (`human.passwordChanged`): an invitee who never
+    /// accepted has none.
+    pub has_password: bool,
 }
 
 /// What an org's email lookup found.
@@ -72,6 +77,9 @@ pub struct UserPage {
     pub users: Vec<ZUser>,
     pub next_offset: Option<u64>,
 }
+
+/// Sessions per `sessions/search` page.
+const SESSION_PAGE: u32 = 100;
 
 pub struct Zitadel {
     http: reqwest::Client,
@@ -105,6 +113,11 @@ fn parse_user(v: &Value) -> Option<ZUser> {
             .pointer("/human/email/isVerified")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        display_name: v
+            .pointer("/human/profile/displayName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         state: match v.get("state").and_then(Value::as_str) {
             Some("USER_STATE_ACTIVE") => UserState::Active,
             Some("USER_STATE_INACTIVE") => UserState::Inactive,
@@ -115,6 +128,9 @@ fn parse_user(v: &Value) -> Option<ZUser> {
             .and_then(|d| d.get("creationDate"))
             .and_then(Value::as_str)
             .and_then(|t| t.parse().ok()),
+        has_password: v
+            .pointer("/human/passwordChanged")
+            .is_some_and(|p| !p.is_null()),
     })
 }
 
@@ -122,6 +138,34 @@ fn parse_user(v: &Value) -> Option<ZUser> {
 fn as_u64(v: &Value) -> Option<u64> {
     v.as_u64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// An error body's text: Zitadel's `message` (localized, with the error id appended) followed
+/// by each `details[]` entry's `id` and `message`, so the stable error key
+/// (`Errors.User.Code.Expired`) and id survive a localized top-level message.
+fn error_text(body: Option<&Value>) -> String {
+    let Some(body) = body else {
+        return String::new();
+    };
+    let mut text = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    for d in body
+        .get("details")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for key in ["id", "message"] {
+            if let Some(v) = d.get(key).and_then(Value::as_str) {
+                text.push_str(" | ");
+                text.push_str(v);
+            }
+        }
+    }
+    text
 }
 
 impl Zitadel {
@@ -163,12 +207,7 @@ impl Zitadel {
             serde_json::from_str::<Value>(&text).ok()
         };
         if status.is_client_error() {
-            let message = parsed
-                .as_ref()
-                .and_then(|v| v.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let message = error_text(parsed.as_ref());
             return Err(ZError::Rejected {
                 status: status.as_u16(),
                 message,
@@ -277,6 +316,127 @@ impl Zitadel {
         )
         .await?;
         Ok(())
+    }
+
+    /// Checks an invite code (`POST /v2/users/{userId}/invite_code/verify`, body
+    /// `{"verificationCode"}`). An expired code is `Rejected` with a message naming `Expired`;
+    /// a deleted user is `Rejected { status: 404 }`.
+    pub async fn verify_invite_code(&self, user_id: &str, code: &str) -> Result<(), ZError> {
+        self.call(
+            Method::POST,
+            &format!("/v2/users/{user_id}/invite_code/verify"),
+            Some(json!({"verificationCode": code})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A passwordless human user in `org_id` (an invitee): the username is the email, the
+    /// names are its local part, and the email is created unverified with `returnCode`, so
+    /// Zitadel sends no verification mail (the invite is the only one). Returns the user id.
+    pub async fn create_user_without_password(
+        &self,
+        org_id: &str,
+        email: &str,
+    ) -> Result<String, ZError> {
+        let local = email.split('@').next().filter(|l| !l.is_empty()).unwrap_or(email);
+        let body = json!({
+            "organizationId": org_id,
+            "human": {
+                "profile": {"givenName": local, "familyName": local, "displayName": local},
+                "email": {"email": email, "returnCode": {}},
+            },
+        });
+        let answer = self.call(Method::POST, "/v2/users/new", Some(body)).await?;
+        str_at(&answer, "/id")
+    }
+
+    /// Sends the user an invite code (Zitadel v4.19.1 `POST /v2/users/{userId}/invite_code`,
+    /// body `{"sendCode": {"urlTemplate", "applicationName"}}`). A new code replaces the old one.
+    /// The template may use `{{.UserID}}`, `{{.OrgID}}` and `{{.Code}}` (200 characters at most).
+    pub async fn create_invite_code(&self, user_id: &str, url_template: &str) -> Result<(), ZError> {
+        self.call(
+            Method::POST,
+            &format!("/v2/users/{user_id}/invite_code"),
+            Some(json!({"sendCode": {"urlTemplate": url_template, "applicationName": "Chelabase"}})),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Makes a new invite code and returns it instead of mailing it (Zitadel v4.19.1
+    /// `POST /v2/users/{userId}/invite_code`, body `{"returnCode": {}}`, answering `inviteCode`).
+    /// A new code replaces the old one. The caller builds the link and must never log it.
+    pub async fn return_invite_code(&self, user_id: &str) -> Result<String, ZError> {
+        let answer = self
+            .call(
+                Method::POST,
+                &format!("/v2/users/{user_id}/invite_code"),
+                Some(json!({"returnCode": {}})),
+            )
+            .await?;
+        str_at(&answer, "/inviteCode")
+    }
+
+    /// Whether the user has any way to sign in: a password, a passkey, an OTP or U2F factor or an
+    /// IdP link (Zitadel v4.19.1 `GET /v2/users/{userId}/authentication_methods`). No
+    /// `domainQuery`: without one every method counts, passkeys and U2F of any domain (or none,
+    /// added through the v1 APIs) included; a `domainQuery` needs a non-empty `domain`, so
+    /// `includeWithoutDomain` alone is a 400.
+    pub async fn has_auth_methods(&self, user_id: &str) -> Result<bool, ZError> {
+        let answer = self
+            .call(Method::GET, &format!("/v2/users/{user_id}/authentication_methods"), None)
+            .await?;
+        Ok(answer
+            .get("authMethodTypes")
+            .and_then(Value::as_array)
+            .is_some_and(|types| !types.is_empty()))
+    }
+
+    /// Whether an email provider is active, so Zitadel can mail invites (Zitadel v4.19.1
+    /// `POST /admin/v1/email/_search`, ListEmailProviders; the older `/admin/v1/smtp/_search`
+    /// is deprecated). A provider's `state` is `EMAIL_PROVIDER_ACTIVE` or
+    /// `EMAIL_PROVIDER_INACTIVE`; SMTP and HTTP providers both count. Needs the admin token.
+    pub async fn email_provider_active(&self) -> Result<bool, ZError> {
+        let answer = self
+            .call(Method::POST, "/admin/v1/email/_search", Some(json!({})))
+            .await?;
+        Ok(answer
+            .get("result")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|p| p.get("state").and_then(Value::as_str) == Some("EMAIL_PROVIDER_ACTIVE")))
+    }
+
+    /// Ends every session of the user (`POST /v2/sessions/search` with a `userIdQuery`, then a
+    /// delete of each; one already gone is fine). The search is paged, so it repeats until a
+    /// search comes back empty, or finds only sessions it already ended (a session that
+    /// outlives its delete isn't retried forever). Returns how many were ended.
+    pub async fn delete_user_sessions(&self, user_id: &str) -> Result<usize, ZError> {
+        let mut ended = std::collections::HashSet::new();
+        loop {
+            let body = json!({
+                "query": {"limit": SESSION_PAGE},
+                "queries": [{"userIdQuery": {"id": user_id}}],
+            });
+            let answer = self.call(Method::POST, "/v2/sessions/search", Some(body)).await?;
+            let ids: Vec<String> = answer
+                .get("sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.get("id").and_then(Value::as_str).map(str::to_string))
+                .filter(|id| !ended.contains(id))
+                .collect();
+            if ids.is_empty() {
+                return Ok(ended.len());
+            }
+            for id in ids {
+                self.delete_session_admin(&id).await?;
+                ended.insert(id);
+            }
+        }
     }
 
     pub async fn resend_code(&self, user_id: &str, url_template: &str) -> Result<(), ZError> {

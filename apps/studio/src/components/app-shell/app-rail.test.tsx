@@ -22,7 +22,7 @@ beforeAll(() => {
  * Renders the rail at `path` inside a memory router that knows the routes it links to.
  * The behaviour lives in state, like the shell's, so `setBehaviour` re-renders the same rail.
  */
-async function renderRail(initial: RailBehaviour, path = "/app") {
+async function renderRail(initial: RailBehaviour, path = "/app", badges?: { members?: number }) {
   const onBehaviourChange = vi.fn();
   let setter: (next: RailBehaviour) => void = () => {};
   function Layout() {
@@ -32,6 +32,7 @@ async function renderRail(initial: RailBehaviour, path = "/app") {
       <>
         <AppRail
           behaviour={behaviour}
+          badges={badges}
           onBehaviourChange={(next) => {
             onBehaviourChange(next);
             setBehaviourState(next);
@@ -51,8 +52,9 @@ async function renderRail(initial: RailBehaviour, path = "/app") {
     path: "/app/projects/$projectId",
     component: () => <p>project</p>,
   });
+  const members = createRoute({ getParentRoute: () => root, path: "/app/members", component: () => <p>members</p> });
   const router = createRouter({
-    routeTree: root.addChildren([dashboard, api, project]),
+    routeTree: root.addChildren([dashboard, api, project, members]),
     history: createMemoryHistory({ initialEntries: [path] }),
   });
   render(<RouterProvider router={router} />);
@@ -68,6 +70,21 @@ afterEach(() => {
 });
 
 describe("AppRail", () => {
+  // The browser pass: at 375px "Expanded" took 232px of the width and the page scrolled sideways.
+  // Below 40rem it keeps the narrow rail in the layout and opens over the page like "hover".
+  it("expanded below 40rem: the rail stays narrow in the layout and opens over the page", async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) =>
+      ({ matches: query.includes("max-width: 40rem"), media: query, onchange: null, addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false }) as MediaQueryList);
+    try {
+      const { nav } = await renderRail("expanded");
+      expect(nav).toHaveAttribute("data-expanded", "false");
+      expect(nav.className).toContain("w-14");
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
   it("expanded: labels are visible and no tooltip appears on focus", async () => {
     const { nav } = await renderRail("expanded");
     expect(nav).toHaveAttribute("data-behaviour", "expanded");
@@ -195,7 +212,12 @@ describe("AppRail", () => {
   });
 
   it('marks only the current item with aria-current="page"', async () => {
-    const current: Record<string, string> = { "/app": "Projects", "/app/api": "API reference", "/app/projects/p1": "Projects" };
+    const current: Record<string, string> = {
+      "/app": "Projects",
+      "/app/api": "API reference",
+      "/app/projects/p1": "Projects",
+      "/app/members": "Members",
+    };
     for (const [path, name] of Object.entries(current)) {
       const { nav } = await renderRail("expanded", path);
       const marked = nav.querySelectorAll('[aria-current="page"]');
@@ -258,7 +280,7 @@ describe("AppRail", () => {
   it("placeholders are aria-disabled and not focusable", async () => {
     await renderRail("expanded");
     const placeholders = screen.getAllByText("Placeholder").map((label) => label.closest("[aria-disabled]"));
-    expect(placeholders).toHaveLength(2);
+    expect(placeholders).toHaveLength(1);
     for (const placeholder of placeholders) {
       expect(placeholder).toHaveAttribute("aria-disabled", "true");
       expect(placeholder).not.toHaveAttribute("tabindex");
@@ -274,5 +296,20 @@ describe("AppRail", () => {
       expect(visited.some((el) => placeholder?.contains(el))).toBe(false);
     }
     expect(visited).toContain(screen.getByRole("button", { name: "Sidebar behaviour" }));
+  });
+
+  it("rail_badge_counts_pending: the Members item carries the number of waiting requests", async () => {
+    await renderRail("expanded", "/app", { members: 3 });
+    const link = screen.getByRole("link", { name: "Members, 3 requests waiting" });
+    expect(within(link).getByText("3")).toBeInTheDocument();
+    cleanup();
+
+    await renderRail("collapsed", "/app", { members: 1 });
+    const collapsed = screen.getByRole("link", { name: "Members, 1 request waiting" });
+    expect(collapsed.querySelector("[data-badge-dot]")).not.toBeNull();
+    cleanup();
+
+    await renderRail("expanded", "/app", { members: 0 });
+    expect(screen.getByRole("link", { name: "Members" })).toBeInTheDocument();
   });
 });

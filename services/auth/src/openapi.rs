@@ -85,6 +85,8 @@ mod tests {
             ("/auth/v1/auth-request", "getAuthRequest"),
             ("/auth/v1/sign-in", "signIn"),
             ("/auth/v1/sign-up", "signUp"),
+            ("/auth/v1/accept-invite", "acceptInvite"),
+            ("/auth/v1/invite", "describeInvite"),
             ("/auth/v1/verify-email", "verifyEmail"),
             ("/auth/v1/resend-code", "resendCode"),
             ("/auth/v1/password-reset", "requestPasswordReset"),

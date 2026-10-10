@@ -12,11 +12,28 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 const GATEWAY_URL: &str = "http://localhost:8000";
 
-pub async fn run() -> Result<()> {
+/// Zitadel's first-instance human admin, the dev stack's sign-in.
+pub const DEV_USER_EMAIL: &str = "zitadel-admin@zitadel.localhost";
+
+/// The admin's email (trimmed, lowercased, like the members table) and whether it was asked
+/// for: a requested email that no Zitadel user has is an error, the default only a warning.
+fn resolve_admin_email(requested: Option<&str>) -> (String, bool) {
+    match requested.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(email) => (chelabase_zitadel::rules::normalize_email(email), true),
+        None => (DEV_USER_EMAIL.to_string(), false),
+    }
+}
+
+/// Whether the demo machine user is made a tenant admin: on a self-hosted dev stack only.
+fn demo_admin(mode: chelabase_types::mode::Mode) -> bool {
+    mode == chelabase_types::mode::Mode::SelfHosted
+}
+
+pub async fn run(admin_email: Option<&str>) -> Result<()> {
     let iss = issuer();
     let zdir = zitadel_dir();
     fs::create_dir_all(&zdir).with_context(|| format!("mkdir {}", zdir.display()))?;
@@ -41,7 +58,7 @@ pub async fn run() -> Result<()> {
 
     let mode = chelabase_types::mode::Mode::from_env().map_err(anyhow::Error::msg)?;
     let api = HttpZitadel::new(&iss, &admin_pat);
-    let org_id = wait_ready(|| steps::ensure_org(&api)).await?;
+    let (org_id, org_name) = wait_ready(|| steps::ensure_org(&api)).await?;
     let project_id = steps::ensure_project(&api, &org_id).await?;
     let api_client_id = steps::ensure_api_app(&api, &project_id).await?;
     let studio_client_id = steps::ensure_studio_app(&api, &project_id, mode).await?;
@@ -50,10 +67,35 @@ pub async fn run() -> Result<()> {
     let demo_user_id = steps::ensure_demo_user(&api, &org_id).await?;
     steps::ensure_demo_key(&api, &demo_user_id, &zdir.join("demo-sa.json")).await?;
     steps::ensure_smtp(&api).await?;
+    steps::ensure_zitadel_registration_off(&api).await?;
     steps::ensure_actions_target(&api, &zdir.join("actions.env")).await?;
+
+    // The admin is looked up before the org is bound to the tenant: a tenant with no member
+    // lets the first person to sign in claim the admin, so a bind must never be left without
+    // its admin when the admin was asked for.
+    let (email, requested) = resolve_admin_email(admin_email);
+    let admin = steps::find_user_by_email(&api, &org_id, &email).await?;
+    if admin.is_none() && requested {
+        bail!("no Zitadel user with email {email} in the org: create that user in Zitadel first");
+    }
 
     let demo_tenant = demo_tenant_id();
     tenant::bind_demo_tenant(&org_id, &demo_tenant)?;
+    if let Some(name) = &org_name {
+        tenant::fill_display_name(&demo_tenant, name)?;
+    }
+    match &admin {
+        Some(user_id) => tenant::bootstrap_admin(&demo_tenant, user_id, &email)?,
+        None => warn!(
+            "dev user {email} not found in Zitadel: no tenant admin is set, so the first person to \
+             sign in to Studio claims it. Re-run with --admin-email before exposing Studio"
+        ),
+    }
+    // Every `dev token` script acts as the demo machine user, so it is an admin too (self-hosted
+    // dev stacks only; it has no email).
+    if demo_admin(mode) {
+        tenant::bootstrap_admin(&demo_tenant, &demo_user_id, "")?;
+    }
 
     let path = |p: &Path| p.display().to_string();
     let demo_env = zdir.join("demo.env");
@@ -111,10 +153,10 @@ async fn wait_for_file(path: &Path, what: &str, attempts: u32, delay: Duration) 
 }
 
 /// Zitadel answers JWKS before its APIs are ready; retry the first real call.
-async fn wait_ready<F, Fut>(call: F) -> Result<String>
+async fn wait_ready<T, F, Fut>(call: F) -> Result<T>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<String>>,
+    Fut: std::future::Future<Output = Result<T>>,
 {
     let mut last = None;
     for _ in 0..60 {
@@ -168,6 +210,67 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("just zitadel-reset"), "{err}");
+    }
+
+    #[test]
+    fn admin_email_defaults_to_dev_user() {
+        assert_eq!(resolve_admin_email(None), (DEV_USER_EMAIL.to_string(), false));
+        assert_eq!(resolve_admin_email(Some("  ")), (DEV_USER_EMAIL.to_string(), false));
+        // Emails are stored trimmed and lowercased; an explicit one is required to exist.
+        assert_eq!(
+            resolve_admin_email(Some(" Ada@Example.COM ")),
+            ("ada@example.com".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn the_demo_machine_user_is_an_admin_on_self_hosted_stacks_only() {
+        use chelabase_types::mode::Mode;
+        assert!(demo_admin(Mode::SelfHosted));
+        assert!(!demo_admin(Mode::Platform));
+    }
+
+    #[test]
+    fn admin_sql_stores_no_email_for_a_user_without_one() {
+        // The demo machine user has none: NULL, not an empty string another such user would clash with.
+        let sql = tenant::ADMIN_SQL;
+        assert!(!sql.contains("lower(btrim(:'email'))\n") || sql.contains("NULLIF(lower(btrim(:'email')), '')"), "{sql}");
+        for line in sql.lines().filter(|l| l.contains(":'email'")) {
+            assert!(line.contains("NULLIF(lower(btrim(:'email')), '')"), "{line}");
+        }
+    }
+
+    // M5: the module rule (`lock_tenant` in the metadata crate): a tenant is locked
+    // FOR NO KEY UPDATE, which a concurrent insert of a member (a foreign key to it) doesn't wait
+    // on. members_live `bootstrap_admin_sql_matches_the_metadata_crate` runs the SQL itself.
+    #[test]
+    fn admin_sql_locks_the_tenant_for_no_key_update() {
+        let sql = tenant::ADMIN_SQL;
+        assert!(sql.contains("FROM tenants WHERE id = :'tenant' FOR NO KEY UPDATE;"), "{sql}");
+        assert!(!sql.contains("FOR UPDATE"), "{sql}");
+    }
+
+    #[test]
+    fn admin_sql_is_idempotent_and_logs_event() {
+        let sql = tenant::ADMIN_SQL;
+        // Upsert keyed on the member's identity, writing only when something changes.
+        assert!(sql.contains("INSERT INTO members"), "{sql}");
+        assert!(sql.contains("ON CONFLICT (tenant_id, zitadel_user_id) DO UPDATE"), "{sql}");
+        assert!(sql.contains("IS DISTINCT FROM"), "{sql}");
+        assert!(sql.contains("tenant_admin = true"), "{sql}");
+        assert!(sql.contains("status = 'active'"), "{sql}");
+        // An email held by another live member is cleared first (R8).
+        assert!(sql.contains("SET email = NULL"), "{sql}");
+        assert!(sql.contains("status <> 'removed'"), "{sql}");
+        // One admin_set event with no actor, only when the status or the flag changed.
+        assert!(sql.contains("INSERT INTO access_events"), "{sql}");
+        assert!(sql.contains("'admin_set'"), "{sql}");
+        assert!(sql.contains("NULL::uuid, 'admin_set'"), "{sql}");
+        assert!(sql.contains("p.id IS NULL OR p.status <> 'active' OR NOT p.tenant_admin"), "{sql}");
+        // Values go through psql variables, never string-built into the SQL.
+        for var in [":'tenant'", ":'zuid'", ":'email'"] {
+            assert!(sql.contains(var), "{var} missing");
+        }
     }
 
     // auth's SameSite=Strict cookies are dropped on cross-site fetches: Studio and the

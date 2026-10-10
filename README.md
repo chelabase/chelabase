@@ -40,7 +40,7 @@ just dev
 
 `just dev` starts the Compose dependencies, bootstraps Zitadel, builds the Rust services and runs them and Studio in the background. The first run builds a lot and takes a while.
 
-Open http://localhost:3000 and choose **Create account**. Email verification is off in self-hosted mode; emails such as password resets land in Mailpit at http://localhost:8025.
+Open http://localhost:3000 and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` sets it). Self-sign-up is off by default: an admin invites everyone else (or switches open sign-up on and approves requests). Emails such as invites and password resets land in Mailpit at http://localhost:8025.
 
 Stop everything with `just stop`. `just` lists every recipe.
 

@@ -24,11 +24,13 @@ import type {
 } from '@tanstack/react-query';
 
 import type {
+  AccessEventPage,
   AppUser,
   AppUserPage,
   AppUserSession,
   AppUsersSettings,
   ApplyRequest,
+  ApproveMemberRequest,
   Branch,
   BranchDatabaseView,
   BranchRole,
@@ -39,8 +41,10 @@ import type {
   CreateBranchRequest,
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
+  CreateInviteRequest,
   CreateKeyRequest,
   CreateMergeRequest,
+  CreateProjectInviteRequest,
   CreateProjectRequest,
   CreateRoleRequest,
   CreateSavedQueryRequest,
@@ -49,6 +53,7 @@ import type {
   DataKey,
   Database,
   DatabaseSettings,
+  DeleteGrantOverrideParams,
   DeleteProjectRequest,
   DisableDataApiParams,
   ErrorEnvelope,
@@ -58,32 +63,48 @@ import type {
   GetDataApiSchemaParams,
   GetSqlSchema200,
   GetSqlSchemaParams,
+  GrantOverride,
+  InstanceSettings,
+  InviteDelivery,
+  InviteResult,
+  ListAccessEventsParams,
   ListAppUsersParams,
   ListMergesParams,
-  Me,
+  ListProjectAccessEventsParams,
+  MeResponse,
+  Member,
   Merge,
   MergeDetail,
   MergeSummary,
   OperationAccepted,
+  ProjectGrant,
   ProjectInfo,
   PutAppUsersRequest,
+  PutGrantOverrideRequest,
+  PutGrantRequest,
   RecomputeRequest,
   RehearseRequest,
+  ResendInviteRequest,
+  ResentInvite,
   RestoreAccepted,
   RestoreRequest,
   RoleSessions,
   RunSqlRequest,
   SavedQuery,
   SavedQuerySummary,
+  TenantName,
   UpdateAppUserRequest,
   UpdateBranchRequest,
   UpdateDatabaseRequest,
+  UpdateInstanceSettingsRequest,
   UpdateKeyRequest,
+  UpdateMemberRequest,
   UpdateMergeRequest,
   UpdatePgDatabaseRequest,
   UpdateProjectRequest,
   UpdateRoleRequest,
-  UpdateSavedQueryRequest
+  UpdateSavedQueryRequest,
+  UpdateTenantRequest
 } from './model';
 
 import { customFetch } from '../fetch.ts';
@@ -108,6 +129,115 @@ const withQueryKey = <T extends object, K>(query: T, queryKey: K): T & { queryKe
   }
   return result;
 };
+
+export const getListAccessEventsUrl = (params?: ListAccessEventsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/access-events?${stringifiedParams}` : `/v1/access-events`
+}
+
+/**
+ * Every access change (members, grants, overrides, invites, open sign-up, the tenant's name), newest first. The log can't be changed.
+ * @summary Read the tenant's access log
+ */
+export const listAccessEvents = async (params?: ListAccessEventsParams, options?: Parameters<typeof customFetch>[1]): Promise<AccessEventPage> => {
+
+  return customFetch<AccessEventPage>(getListAccessEventsUrl(params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListAccessEventsQueryKey = (params?: ListAccessEventsParams,) => {
+    return [
+    `/v1/access-events`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getListAccessEventsQueryOptions = <TData = Awaited<ReturnType<typeof listAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(params?: ListAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listAccessEvents>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListAccessEventsQueryKey(params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listAccessEvents>>> = ({ signal }) => listAccessEvents(params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listAccessEvents>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListAccessEventsQueryResult = NonNullable<Awaited<ReturnType<typeof listAccessEvents>>>
+export type ListAccessEventsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListAccessEvents<TData = Awaited<ReturnType<typeof listAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ params: undefined |  ListAccessEventsParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listAccessEvents>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listAccessEvents>>,
+          TError,
+          Awaited<ReturnType<typeof listAccessEvents>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListAccessEvents<TData = Awaited<ReturnType<typeof listAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ params?: ListAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listAccessEvents>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listAccessEvents>>,
+          TError,
+          Awaited<ReturnType<typeof listAccessEvents>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListAccessEvents<TData = Awaited<ReturnType<typeof listAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ params?: ListAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listAccessEvents>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Read the tenant's access log
+ */
+
+export function useListAccessEvents<TData = Awaited<ReturnType<typeof listAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ params?: ListAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listAccessEvents>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListAccessEventsQueryOptions(params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
 
 export const getCreateDatabaseUrl = () => {
 
@@ -958,7 +1088,7 @@ export const getConsoleQueryUrl = (id: string,
 }
 
 /**
- * Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and isn't owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a member of `neon_superuser`); a role with BYPASSRLS passes, and the console then reads and writes past row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.
+ * Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and isn't owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a member of `neon_superuser`); a role with BYPASSRLS passes (Admin only), and the console then reads and writes past row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.
  * @summary Run a data API request from the console
  */
 export const consoleQuery = async (id: string,
@@ -1058,7 +1188,7 @@ export const getGetConsoleSchemaUrl = (id: string,
 }
 
 /**
- * What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and isn't owner-level; BYPASSRLS is allowed).
+ * What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and isn't owner-level; BYPASSRLS is allowed, Admin only).
  * @summary The schema the console can show, as the owner or a role
  */
 export const getConsoleSchema = async (id: string,
@@ -3027,7 +3157,7 @@ export const getRunSqlUrl = (id: string,
 }
 
 /**
- * Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (or, with `role`, after `SET ROLE` to it: a preview of that role's view, not a security boundary). The script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. Unless `confirm` is true, risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.
+ * Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (Admin only), or, with `role`, as that role: the connection logs in as your own hidden member role on the branch, which can only become the roles you were granted (and what they can become), then runs `SET ROLE` to `role`, so a script that resets its role is never the owner. When the run ends (however it ends), its session is ended, whatever the script made as the member role itself is handed to `role`, and every privilege, default privilege or policy naming the member role is dropped. An Admin acting as a role a member role can't hold (LOGIN, owner-level, or reaching a reserved role) uses the owner's connection and `SET ROLE`; naming the owner runs as the owner. The script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. Unless `confirm` is true, risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.
  * @summary Run SQL on a branch
  */
 export const runSql = async (id: string,
@@ -3120,7 +3250,7 @@ export const getCancelSqlRunUrl = (id: string,
 }
 
 /**
- * Cancels one of your runs in flight: Postgres's cancel request is sent and the run's stream ends with `done` (`outcome: cancelled`). Closing the stream cancels too.
+ * Cancels a run in flight that you started (an Admin may cancel any): Postgres's cancel request is sent and the run's stream ends with `done` (`outcome: cancelled`). Closing the stream cancels too.
  * @summary Cancel a SQL run
  */
 export const cancelSqlRun = async (id: string,
@@ -3206,7 +3336,7 @@ export const getGetSqlSchemaUrl = (id: string,
 }
 
 /**
- * Everything the database's owner sees in one Postgres database of the branch, read on a fresh owner connection with postgres-language-server's own introspection (the version `PGLS_VERSION` pins), as the JSON its WASM build's `setSchema` takes. Not cached on the server.
+ * Everything the database's owner (or, with `role`, that role) can use in one Postgres database of the branch, read on the same kind of fresh connection a run with that `role` uses, with postgres-language-server's own introspection (the version `PGLS_VERSION` pins), as the JSON its WASM build's `setSchema` takes. Not cached on the server.
  * @summary The schema for the SQL editor's completion
  */
 export const getSqlSchema = async (id: string,
@@ -4905,7 +5035,7 @@ export const getUpdateSavedQueryUrl = (id: string,
 }
 
 /**
- * Changes the given fields of one of the caller's saved queries. `version` must be the version last seen; the version goes up by one with each change. `pg_database` and `role` accept `null` to clear them.
+ * Changes the given fields of one of the caller's saved queries (an Admin may change any). `version` must be the version last seen; the version goes up by one with each change. `pg_database` and `role` accept `null` to clear them.
  * @summary Update a saved SQL query
  */
 export const updateSavedQuery = async (id: string,
@@ -4987,6 +5117,552 @@ export const useUpdateSavedQuery = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getUpdateSavedQueryMutationOptions(options), queryClient);
     }
 
+export const getGetInstanceSettingsUrl = () => {
+
+
+
+
+  return `/v1/instance/settings`
+}
+
+/**
+ * @summary Read the instance's settings
+ */
+export const getInstanceSettings = async ( options?: Parameters<typeof customFetch>[1]): Promise<InstanceSettings> => {
+
+  return customFetch<InstanceSettings>(getGetInstanceSettingsUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetInstanceSettingsQueryKey = () => {
+    return [
+    `/v1/instance/settings`
+    ] as const;
+    }
+
+
+export const getGetInstanceSettingsQueryOptions = <TData = Awaited<ReturnType<typeof getInstanceSettings>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInstanceSettings>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetInstanceSettingsQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getInstanceSettings>>> = ({ signal }) => getInstanceSettings({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getInstanceSettings>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetInstanceSettingsQueryResult = NonNullable<Awaited<ReturnType<typeof getInstanceSettings>>>
+export type GetInstanceSettingsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetInstanceSettings<TData = Awaited<ReturnType<typeof getInstanceSettings>>, TError = ErrorType<ErrorEnvelope>>(
+  options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInstanceSettings>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getInstanceSettings>>,
+          TError,
+          Awaited<ReturnType<typeof getInstanceSettings>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetInstanceSettings<TData = Awaited<ReturnType<typeof getInstanceSettings>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInstanceSettings>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getInstanceSettings>>,
+          TError,
+          Awaited<ReturnType<typeof getInstanceSettings>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetInstanceSettings<TData = Awaited<ReturnType<typeof getInstanceSettings>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInstanceSettings>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Read the instance's settings
+ */
+
+export function useGetInstanceSettings<TData = Awaited<ReturnType<typeof getInstanceSettings>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInstanceSettings>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetInstanceSettingsQueryOptions(options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getUpdateInstanceSettingsUrl = () => {
+
+
+
+
+  return `/v1/instance/settings`
+}
+
+/**
+ * Open sign-up lets anyone sign up; they start with no access. Self-hosted only.
+ * @summary Change the instance's settings
+ */
+export const updateInstanceSettings = async (updateInstanceSettingsRequest: UpdateInstanceSettingsRequest, options?: Parameters<typeof customFetch>[1]): Promise<InstanceSettings> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<InstanceSettings>(getUpdateInstanceSettingsUrl(),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateInstanceSettingsRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateInstanceSettingsMutationKey = () => ['updateInstanceSettings'] as const;
+
+export const getUpdateInstanceSettingsMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateInstanceSettings>>, TError,UpdateInstanceSettingsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateInstanceSettings>>, TError,UpdateInstanceSettingsMutationVariables, TContext> => {
+
+const mutationKey = getUpdateInstanceSettingsMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateInstanceSettings>>, UpdateInstanceSettingsMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  updateInstanceSettings(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateInstanceSettingsMutationResult = NonNullable<Awaited<ReturnType<typeof updateInstanceSettings>>>
+    export type UpdateInstanceSettingsMutationBody = UpdateInstanceSettingsRequest
+    export type UpdateInstanceSettingsMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateInstanceSettingsMutationVariables = {data: UpdateInstanceSettingsRequest}
+
+    /**
+ * @summary Change the instance's settings
+ */
+export const useUpdateInstanceSettings = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateInstanceSettings>>, TError,UpdateInstanceSettingsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateInstanceSettings>>,
+        TError,
+        UpdateInstanceSettingsMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateInstanceSettingsMutationOptions(options), queryClient);
+    }
+
+export const getCreateInviteUrl = () => {
+
+
+
+
+  return `/v1/invites`
+}
+
+/**
+ * Matches the email to a person: an existing member just gets the grants, all or none (200); an active user of the organisation who has a password and was never a member becomes an active member (201, `added`, no mail); anyone else, a removed member or a deactivated or passwordless user of the organisation included, gets a Zitadel invite mail with a link to Studio's `/accept-invite` and is `invited` until they accept (201); one who already has a way to sign in (a removed member invited again) gets Zitadel's password-reset mail with the same link marked `reset=1`, since Zitadel makes no invite code for them. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: "link"` (only when the invite makes the Zitadel user, or the user has never had a way to sign in (password, passkey, OTP, U2F, IdP link); else 409 `link_not_allowed`, send by email) nothing is mailed (no email provider needed): the response carries the link as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.
+ * @summary Invite a person
+ */
+export const createInvite = async (createInviteRequest: CreateInviteRequest, options?: Parameters<typeof customFetch>[1]): Promise<InviteResult> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<InviteResult>(getCreateInviteUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createInviteRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateInviteMutationKey = () => ['createInvite'] as const;
+
+export const getCreateInviteMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createInvite>>, TError,CreateInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createInvite>>, TError,CreateInviteMutationVariables, TContext> => {
+
+const mutationKey = getCreateInviteMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createInvite>>, CreateInviteMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  createInvite(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateInviteMutationResult = NonNullable<Awaited<ReturnType<typeof createInvite>>>
+    export type CreateInviteMutationBody = CreateInviteRequest
+    export type CreateInviteMutationError = ErrorType<ErrorEnvelope>
+    export type CreateInviteMutationVariables = {data: CreateInviteRequest}
+
+    /**
+ * @summary Invite a person
+ */
+export const useCreateInvite = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createInvite>>, TError,CreateInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createInvite>>,
+        TError,
+        CreateInviteMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateInviteMutationOptions(options), queryClient);
+    }
+
+export const getGetInviteDeliveryUrl = () => {
+
+
+
+
+  return `/v1/invites/delivery`
+}
+
+/**
+ * Asks Zitadel whether an email provider is active. Without one, invite by link (`delivery: "link"`). A Zitadel that can't be asked is not an error: the answer is `email_available: false` with the reason.
+ * @summary Can invites be emailed?
+ */
+export const getInviteDelivery = async ( options?: Parameters<typeof customFetch>[1]): Promise<InviteDelivery> => {
+
+  return customFetch<InviteDelivery>(getGetInviteDeliveryUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetInviteDeliveryQueryKey = () => {
+    return [
+    `/v1/invites/delivery`
+    ] as const;
+    }
+
+
+export const getGetInviteDeliveryQueryOptions = <TData = Awaited<ReturnType<typeof getInviteDelivery>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInviteDelivery>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetInviteDeliveryQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getInviteDelivery>>> = ({ signal }) => getInviteDelivery({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getInviteDelivery>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetInviteDeliveryQueryResult = NonNullable<Awaited<ReturnType<typeof getInviteDelivery>>>
+export type GetInviteDeliveryQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetInviteDelivery<TData = Awaited<ReturnType<typeof getInviteDelivery>>, TError = ErrorType<ErrorEnvelope>>(
+  options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInviteDelivery>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getInviteDelivery>>,
+          TError,
+          Awaited<ReturnType<typeof getInviteDelivery>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetInviteDelivery<TData = Awaited<ReturnType<typeof getInviteDelivery>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInviteDelivery>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getInviteDelivery>>,
+          TError,
+          Awaited<ReturnType<typeof getInviteDelivery>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetInviteDelivery<TData = Awaited<ReturnType<typeof getInviteDelivery>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInviteDelivery>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Can invites be emailed?
+ */
+
+export function useGetInviteDelivery<TData = Awaited<ReturnType<typeof getInviteDelivery>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getInviteDelivery>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetInviteDeliveryQueryOptions(options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getRevokeInviteUrl = (inviteId: string,) => {
+
+
+
+
+  return `/v1/invites/${encodeURIComponent(String(inviteId))}`
+}
+
+/**
+ * The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again). Revoking an invite whose member is still removed retries the Zitadel step.
+ * @summary Revoke an invite
+ */
+export const revokeInvite = async (inviteId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getRevokeInviteUrl(inviteId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getRevokeInviteMutationKey = () => ['revokeInvite'] as const;
+
+export const getRevokeInviteMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeInvite>>, TError,RevokeInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof revokeInvite>>, TError,RevokeInviteMutationVariables, TContext> => {
+
+const mutationKey = getRevokeInviteMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof revokeInvite>>, RevokeInviteMutationVariables> = (props) => {
+          const {inviteId} = props ?? {};
+
+          return  revokeInvite(inviteId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RevokeInviteMutationResult = NonNullable<Awaited<ReturnType<typeof revokeInvite>>>
+
+    export type RevokeInviteMutationError = ErrorType<ErrorEnvelope>
+    export type RevokeInviteMutationVariables = {inviteId: string}
+
+    /**
+ * @summary Revoke an invite
+ */
+export const useRevokeInvite = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeInvite>>, TError,RevokeInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof revokeInvite>>,
+        TError,
+        RevokeInviteMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRevokeInviteMutationOptions(options), queryClient);
+    }
+
+export const getResendInviteUrl = (inviteId: string,) => {
+
+
+
+
+  return `/v1/invites/${encodeURIComponent(String(inviteId))}/resend`
+}
+
+/**
+ * Zitadel mails a new code (the old one stops working), or with `delivery: "link"` (only for an invitee with no way to sign in yet; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. The body may be left out (then `email`).
+ * @summary Send an invite again
+ */
+export const resendInvite = async (inviteId: string,
+    resendInviteRequestNull?: ResendInviteRequest | null, options?: Parameters<typeof customFetch>[1]): Promise<ResentInvite> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<ResentInvite>(getResendInviteUrl(inviteId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(resendInviteRequestNull)
+  }
+);}
+
+
+
+
+
+export const getResendInviteMutationKey = () => ['resendInvite'] as const;
+
+export const getResendInviteMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resendInvite>>, TError,ResendInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof resendInvite>>, TError,ResendInviteMutationVariables, TContext> => {
+
+const mutationKey = getResendInviteMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof resendInvite>>, ResendInviteMutationVariables> = (props) => {
+          const {inviteId,data} = props ?? {};
+
+          return  resendInvite(inviteId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ResendInviteMutationResult = NonNullable<Awaited<ReturnType<typeof resendInvite>>>
+    export type ResendInviteMutationBody = ResendInviteRequest | null | undefined
+    export type ResendInviteMutationError = ErrorType<ErrorEnvelope>
+    export type ResendInviteMutationVariables = {inviteId: string;data?: ResendInviteRequest | null}
+
+    /**
+ * @summary Send an invite again
+ */
+export const useResendInvite = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resendInvite>>, TError,ResendInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof resendInvite>>,
+        TError,
+        ResendInviteMutationVariables,
+        TContext
+      > => {
+      return useMutation(getResendInviteMutationOptions(options), queryClient);
+    }
+
 export const getGetMeUrl = () => {
 
 
@@ -4996,11 +5672,11 @@ export const getGetMeUrl = () => {
 }
 
 /**
- * @summary The caller and their tenant
+ * @summary The caller, their capabilities and their tenant
  */
-export const getMe = async ( options?: Parameters<typeof customFetch>[1]): Promise<Me> => {
+export const getMe = async ( options?: Parameters<typeof customFetch>[1]): Promise<MeResponse> => {
 
-  return customFetch<Me>(getGetMeUrl(),
+  return customFetch<MeResponse>(getGetMeUrl(),
   {
     ...options,
     method: 'GET'
@@ -5067,7 +5743,7 @@ export function useGetMe<TData = Awaited<ReturnType<typeof getMe>>, TError = Err
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 /**
- * @summary The caller and their tenant
+ * @summary The caller, their capabilities and their tenant
  */
 
 export function useGetMe<TData = Awaited<ReturnType<typeof getMe>>, TError = ErrorType<ErrorEnvelope>>(
@@ -5087,6 +5763,438 @@ export function useGetMe<TData = Awaited<ReturnType<typeof getMe>>, TError = Err
 
 
 
+
+export const getListMembersUrl = () => {
+
+
+
+
+  return `/v1/members`
+}
+
+/**
+ * Invited, pending and active members, by email: names and emails, for grant pickers. An invited member carries its open invite; a pending one (signed up, waiting for approval) can be approved or declined.
+ * @summary List the tenant's members
+ */
+export const listMembers = async ( options?: Parameters<typeof customFetch>[1]): Promise<Member[]> => {
+
+  return customFetch<Member[]>(getListMembersUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListMembersQueryKey = () => {
+    return [
+    `/v1/members`
+    ] as const;
+    }
+
+
+export const getListMembersQueryOptions = <TData = Awaited<ReturnType<typeof listMembers>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMembers>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListMembersQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listMembers>>> = ({ signal }) => listMembers({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listMembers>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListMembersQueryResult = NonNullable<Awaited<ReturnType<typeof listMembers>>>
+export type ListMembersQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListMembers<TData = Awaited<ReturnType<typeof listMembers>>, TError = ErrorType<ErrorEnvelope>>(
+  options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMembers>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMembers>>,
+          TError,
+          Awaited<ReturnType<typeof listMembers>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMembers<TData = Awaited<ReturnType<typeof listMembers>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMembers>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMembers>>,
+          TError,
+          Awaited<ReturnType<typeof listMembers>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMembers<TData = Awaited<ReturnType<typeof listMembers>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMembers>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List the tenant's members
+ */
+
+export function useListMembers<TData = Awaited<ReturnType<typeof listMembers>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMembers>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListMembersQueryOptions(options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getRemoveMemberUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}`
+}
+
+/**
+ * The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user is deactivated with its sessions ended; a still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.
+ * @summary Remove a member
+ */
+export const removeMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getRemoveMemberUrl(memberId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getRemoveMemberMutationKey = () => ['removeMember'] as const;
+
+export const getRemoveMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof removeMember>>, TError,RemoveMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof removeMember>>, TError,RemoveMemberMutationVariables, TContext> => {
+
+const mutationKey = getRemoveMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof removeMember>>, RemoveMemberMutationVariables> = (props) => {
+          const {memberId} = props ?? {};
+
+          return  removeMember(memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RemoveMemberMutationResult = NonNullable<Awaited<ReturnType<typeof removeMember>>>
+
+    export type RemoveMemberMutationError = ErrorType<ErrorEnvelope>
+    export type RemoveMemberMutationVariables = {memberId: string}
+
+    /**
+ * @summary Remove a member
+ */
+export const useRemoveMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof removeMember>>, TError,RemoveMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof removeMember>>,
+        TError,
+        RemoveMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRemoveMemberMutationOptions(options), queryClient);
+    }
+
+export const getUpdateMemberUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}`
+}
+
+/**
+ * A tenant admin manages people and projects and is admin on every project. Every branch of the tenant reconciles its member roles.
+ * @summary Make a member a tenant admin, or not
+ */
+export const updateMember = async (memberId: string,
+    updateMemberRequest: UpdateMemberRequest, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Member>(getUpdateMemberUrl(memberId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateMemberRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateMemberMutationKey = () => ['updateMember'] as const;
+
+export const getUpdateMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateMember>>, TError,UpdateMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateMember>>, TError,UpdateMemberMutationVariables, TContext> => {
+
+const mutationKey = getUpdateMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateMember>>, UpdateMemberMutationVariables> = (props) => {
+          const {memberId,data} = props ?? {};
+
+          return  updateMember(memberId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateMemberMutationResult = NonNullable<Awaited<ReturnType<typeof updateMember>>>
+    export type UpdateMemberMutationBody = UpdateMemberRequest
+    export type UpdateMemberMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateMemberMutationVariables = {memberId: string;data: UpdateMemberRequest}
+
+    /**
+ * @summary Make a member a tenant admin, or not
+ */
+export const useUpdateMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateMember>>, TError,UpdateMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateMember>>,
+        TError,
+        UpdateMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateMemberMutationOptions(options), queryClient);
+    }
+
+export const getApproveMemberUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}/approve`
+}
+
+/**
+ * A person who signed up under open sign-up is `pending` and can do nothing (`pending_approval`) until a tenant admin approves them here, with their first grants. The grants are checked exactly as an invite's are; the member becomes `active`, the grants are stored and one `member_approved` event is written in one step.
+ * @summary Approve a sign-up
+ */
+export const approveMember = async (memberId: string,
+    approveMemberRequest: ApproveMemberRequest, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Member>(getApproveMemberUrl(memberId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(approveMemberRequest)
+  }
+);}
+
+
+
+
+
+export const getApproveMemberMutationKey = () => ['approveMember'] as const;
+
+export const getApproveMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof approveMember>>, TError,ApproveMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof approveMember>>, TError,ApproveMemberMutationVariables, TContext> => {
+
+const mutationKey = getApproveMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof approveMember>>, ApproveMemberMutationVariables> = (props) => {
+          const {memberId,data} = props ?? {};
+
+          return  approveMember(memberId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ApproveMemberMutationResult = NonNullable<Awaited<ReturnType<typeof approveMember>>>
+    export type ApproveMemberMutationBody = ApproveMemberRequest
+    export type ApproveMemberMutationError = ErrorType<ErrorEnvelope>
+    export type ApproveMemberMutationVariables = {memberId: string;data: ApproveMemberRequest}
+
+    /**
+ * @summary Approve a sign-up
+ */
+export const useApproveMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof approveMember>>, TError,ApproveMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof approveMember>>,
+        TError,
+        ApproveMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getApproveMemberMutationOptions(options), queryClient);
+    }
+
+export const getDeclineMemberUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}/decline`
+}
+
+/**
+ * The pending member becomes `removed` (one `member_declined` event), then their Zitadel user is deactivated and its sessions ended; a still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.
+ * @summary Decline a sign-up
+ */
+export const declineMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeclineMemberUrl(memberId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeclineMemberMutationKey = () => ['declineMember'] as const;
+
+export const getDeclineMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof declineMember>>, TError,DeclineMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof declineMember>>, TError,DeclineMemberMutationVariables, TContext> => {
+
+const mutationKey = getDeclineMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof declineMember>>, DeclineMemberMutationVariables> = (props) => {
+          const {memberId} = props ?? {};
+
+          return  declineMember(memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeclineMemberMutationResult = NonNullable<Awaited<ReturnType<typeof declineMember>>>
+
+    export type DeclineMemberMutationError = ErrorType<ErrorEnvelope>
+    export type DeclineMemberMutationVariables = {memberId: string}
+
+    /**
+ * @summary Decline a sign-up
+ */
+export const useDeclineMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof declineMember>>, TError,DeclineMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof declineMember>>,
+        TError,
+        DeclineMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeclineMemberMutationOptions(options), queryClient);
+    }
 
 export const getListProjectsUrl = () => {
 
@@ -5559,6 +6667,123 @@ export const useUpdateProject = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getUpdateProjectMutationOptions(options), queryClient);
     }
 
+export const getListProjectAccessEventsUrl = (id: string,
+    params?: ListProjectAccessEventsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/projects/${encodeURIComponent(String(id))}/access-events?${stringifiedParams}` : `/v1/projects/${encodeURIComponent(String(id))}/access-events`
+}
+
+/**
+ * The access changes on this project (its grants and its databases' overrides), newest first.
+ * @summary Read a project's access log
+ */
+export const listProjectAccessEvents = async (id: string,
+    params?: ListProjectAccessEventsParams, options?: Parameters<typeof customFetch>[1]): Promise<AccessEventPage> => {
+
+  return customFetch<AccessEventPage>(getListProjectAccessEventsUrl(id,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListProjectAccessEventsQueryKey = (id: string,
+    params?: ListProjectAccessEventsParams,) => {
+    return [
+    `/v1/projects/${id}/access-events`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getListProjectAccessEventsQueryOptions = <TData = Awaited<ReturnType<typeof listProjectAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    params?: ListProjectAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectAccessEvents>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListProjectAccessEventsQueryKey(id,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listProjectAccessEvents>>> = ({ signal }) => listProjectAccessEvents(id,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listProjectAccessEvents>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListProjectAccessEventsQueryResult = NonNullable<Awaited<ReturnType<typeof listProjectAccessEvents>>>
+export type ListProjectAccessEventsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListProjectAccessEvents<TData = Awaited<ReturnType<typeof listProjectAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params: undefined |  ListProjectAccessEventsParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectAccessEvents>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listProjectAccessEvents>>,
+          TError,
+          Awaited<ReturnType<typeof listProjectAccessEvents>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListProjectAccessEvents<TData = Awaited<ReturnType<typeof listProjectAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params?: ListProjectAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectAccessEvents>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listProjectAccessEvents>>,
+          TError,
+          Awaited<ReturnType<typeof listProjectAccessEvents>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListProjectAccessEvents<TData = Awaited<ReturnType<typeof listProjectAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params?: ListProjectAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectAccessEvents>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Read a project's access log
+ */
+
+export function useListProjectAccessEvents<TData = Awaited<ReturnType<typeof listProjectAccessEvents>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    params?: ListProjectAccessEventsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectAccessEvents>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListProjectAccessEventsQueryOptions(id,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
 export const getGetAppUsersUrl = (id: string,) => {
 
 
@@ -5823,6 +7048,544 @@ export const useDisableAppUsers = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getDisableAppUsersMutationOptions(options), queryClient);
+    }
+
+export const getListProjectGrantsUrl = (id: string,) => {
+
+
+
+
+  return `/v1/projects/${encodeURIComponent(String(id))}/grants`
+}
+
+/**
+ * Every member's grant on the project (an invited member's counts once they accept), with its overrides on the project's databases. Tenant admins are admin everywhere without a grant.
+ * @summary List a project's grants
+ */
+export const listProjectGrants = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<ProjectGrant[]> => {
+
+  return customFetch<ProjectGrant[]>(getListProjectGrantsUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListProjectGrantsQueryKey = (id: string,) => {
+    return [
+    `/v1/projects/${id}/grants`
+    ] as const;
+    }
+
+
+export const getListProjectGrantsQueryOptions = <TData = Awaited<ReturnType<typeof listProjectGrants>>, TError = ErrorType<ErrorEnvelope>>(id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectGrants>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListProjectGrantsQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listProjectGrants>>> = ({ signal }) => listProjectGrants(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listProjectGrants>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListProjectGrantsQueryResult = NonNullable<Awaited<ReturnType<typeof listProjectGrants>>>
+export type ListProjectGrantsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListProjectGrants<TData = Awaited<ReturnType<typeof listProjectGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectGrants>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listProjectGrants>>,
+          TError,
+          Awaited<ReturnType<typeof listProjectGrants>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListProjectGrants<TData = Awaited<ReturnType<typeof listProjectGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectGrants>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listProjectGrants>>,
+          TError,
+          Awaited<ReturnType<typeof listProjectGrants>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListProjectGrants<TData = Awaited<ReturnType<typeof listProjectGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectGrants>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a project's grants
+ */
+
+export function useListProjectGrants<TData = Awaited<ReturnType<typeof listProjectGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectGrants>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListProjectGrantsQueryOptions(id,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getPutProjectGrantUrl = (id: string,
+    memberId: string,) => {
+
+
+
+
+  return `/v1/projects/${encodeURIComponent(String(id))}/grants/${encodeURIComponent(String(memberId))}`
+}
+
+/**
+ * Creates or replaces the member's grant. `admin` includes the database owner, so `owner` (or the owner's name) is never listed. Below `admin`, each role must be a NOLOGIN group whose memberships (every one, whatever its options) reach no owner-level role (the owner, `neon_superuser`, `cloud_admin`, or SUPERUSER, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), LOGIN role, reserved role or role that holds the ADMIN option on another role, on any branch. The same holds on each database for what the member's overrides there leave of the grant; a grant that breaks it is refused naming the database. Every branch of the project then reconciles its member roles.
+ * @summary Grant a member access to a project
+ */
+export const putProjectGrant = async (id: string,
+    memberId: string,
+    putGrantRequest: PutGrantRequest, options?: Parameters<typeof customFetch>[1]): Promise<ProjectGrant> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<ProjectGrant>(getPutProjectGrantUrl(id,memberId),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(putGrantRequest)
+  }
+);}
+
+
+
+
+
+export const getPutProjectGrantMutationKey = () => ['putProjectGrant'] as const;
+
+export const getPutProjectGrantMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putProjectGrant>>, TError,PutProjectGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof putProjectGrant>>, TError,PutProjectGrantMutationVariables, TContext> => {
+
+const mutationKey = getPutProjectGrantMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof putProjectGrant>>, PutProjectGrantMutationVariables> = (props) => {
+          const {id,memberId,data} = props ?? {};
+
+          return  putProjectGrant(id,memberId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PutProjectGrantMutationResult = NonNullable<Awaited<ReturnType<typeof putProjectGrant>>>
+    export type PutProjectGrantMutationBody = PutGrantRequest
+    export type PutProjectGrantMutationError = ErrorType<ErrorEnvelope>
+    export type PutProjectGrantMutationVariables = {id: string;memberId: string;data: PutGrantRequest}
+
+    /**
+ * @summary Grant a member access to a project
+ */
+export const usePutProjectGrant = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putProjectGrant>>, TError,PutProjectGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof putProjectGrant>>,
+        TError,
+        PutProjectGrantMutationVariables,
+        TContext
+      > => {
+      return useMutation(getPutProjectGrantMutationOptions(options), queryClient);
+    }
+
+export const getDeleteProjectGrantUrl = (id: string,
+    memberId: string,) => {
+
+
+
+
+  return `/v1/projects/${encodeURIComponent(String(id))}/grants/${encodeURIComponent(String(memberId))}`
+}
+
+/**
+ * Every branch of the project then reconciles its member roles. The member's overrides on the project's databases stay; they can only narrow a later grant.
+ * @summary Take a member's access to a project away
+ */
+export const deleteProjectGrant = async (id: string,
+    memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteProjectGrantUrl(id,memberId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteProjectGrantMutationKey = () => ['deleteProjectGrant'] as const;
+
+export const getDeleteProjectGrantMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteProjectGrant>>, TError,DeleteProjectGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteProjectGrant>>, TError,DeleteProjectGrantMutationVariables, TContext> => {
+
+const mutationKey = getDeleteProjectGrantMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteProjectGrant>>, DeleteProjectGrantMutationVariables> = (props) => {
+          const {id,memberId} = props ?? {};
+
+          return  deleteProjectGrant(id,memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteProjectGrantMutationResult = NonNullable<Awaited<ReturnType<typeof deleteProjectGrant>>>
+
+    export type DeleteProjectGrantMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteProjectGrantMutationVariables = {id: string;memberId: string}
+
+    /**
+ * @summary Take a member's access to a project away
+ */
+export const useDeleteProjectGrant = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteProjectGrant>>, TError,DeleteProjectGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteProjectGrant>>,
+        TError,
+        DeleteProjectGrantMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteProjectGrantMutationOptions(options), queryClient);
+    }
+
+export const getPutGrantOverrideUrl = (id: string,
+    memberId: string,) => {
+
+
+
+
+  return `/v1/projects/${encodeURIComponent(String(id))}/grants/${encodeURIComponent(String(memberId))}/overrides`
+}
+
+/**
+ * An override only narrows: its role is at most the grant's, its roles some of the grant's. Narrowing below `admin` takes the database owner away there, and the roles left must pass the same checks as a grant below `admin`. Every branch of the project then reconciles its member roles.
+ * @summary Narrow a member's grant on one database
+ */
+export const putGrantOverride = async (id: string,
+    memberId: string,
+    putGrantOverrideRequest: PutGrantOverrideRequest, options?: Parameters<typeof customFetch>[1]): Promise<GrantOverride> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<GrantOverride>(getPutGrantOverrideUrl(id,memberId),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(putGrantOverrideRequest)
+  }
+);}
+
+
+
+
+
+export const getPutGrantOverrideMutationKey = () => ['putGrantOverride'] as const;
+
+export const getPutGrantOverrideMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putGrantOverride>>, TError,PutGrantOverrideMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof putGrantOverride>>, TError,PutGrantOverrideMutationVariables, TContext> => {
+
+const mutationKey = getPutGrantOverrideMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof putGrantOverride>>, PutGrantOverrideMutationVariables> = (props) => {
+          const {id,memberId,data} = props ?? {};
+
+          return  putGrantOverride(id,memberId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PutGrantOverrideMutationResult = NonNullable<Awaited<ReturnType<typeof putGrantOverride>>>
+    export type PutGrantOverrideMutationBody = PutGrantOverrideRequest
+    export type PutGrantOverrideMutationError = ErrorType<ErrorEnvelope>
+    export type PutGrantOverrideMutationVariables = {id: string;memberId: string;data: PutGrantOverrideRequest}
+
+    /**
+ * @summary Narrow a member's grant on one database
+ */
+export const usePutGrantOverride = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putGrantOverride>>, TError,PutGrantOverrideMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof putGrantOverride>>,
+        TError,
+        PutGrantOverrideMutationVariables,
+        TContext
+      > => {
+      return useMutation(getPutGrantOverrideMutationOptions(options), queryClient);
+    }
+
+export const getDeleteGrantOverrideUrl = (id: string,
+    memberId: string,
+    params: DeleteGrantOverrideParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/projects/${encodeURIComponent(String(id))}/grants/${encodeURIComponent(String(memberId))}/overrides?${stringifiedParams}` : `/v1/projects/${encodeURIComponent(String(id))}/grants/${encodeURIComponent(String(memberId))}/overrides`
+}
+
+/**
+ * @summary Stop narrowing a member's grant on a database
+ */
+export const deleteGrantOverride = async (id: string,
+    memberId: string,
+    params: DeleteGrantOverrideParams, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteGrantOverrideUrl(id,memberId,params),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteGrantOverrideMutationKey = () => ['deleteGrantOverride'] as const;
+
+export const getDeleteGrantOverrideMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteGrantOverride>>, TError,DeleteGrantOverrideMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteGrantOverride>>, TError,DeleteGrantOverrideMutationVariables, TContext> => {
+
+const mutationKey = getDeleteGrantOverrideMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteGrantOverride>>, DeleteGrantOverrideMutationVariables> = (props) => {
+          const {id,memberId,params} = props ?? {};
+
+          return  deleteGrantOverride(id,memberId,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteGrantOverrideMutationResult = NonNullable<Awaited<ReturnType<typeof deleteGrantOverride>>>
+
+    export type DeleteGrantOverrideMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteGrantOverrideMutationVariables = {id: string;memberId: string;params: DeleteGrantOverrideParams}
+
+    /**
+ * @summary Stop narrowing a member's grant on a database
+ */
+export const useDeleteGrantOverride = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteGrantOverride>>, TError,DeleteGrantOverrideMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteGrantOverride>>,
+        TError,
+        DeleteGrantOverrideMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteGrantOverrideMutationOptions(options), queryClient);
+    }
+
+export const getCreateProjectInviteUrl = (id: string,) => {
+
+
+
+
+  return `/v1/projects/${encodeURIComponent(String(id))}/invites`
+}
+
+/**
+ * As `createInvite` (including `delivery`), with one grant on this project.
+ * @summary Invite a person into this project
+ */
+export const createProjectInvite = async (id: string,
+    createProjectInviteRequest: CreateProjectInviteRequest, options?: Parameters<typeof customFetch>[1]): Promise<InviteResult> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<InviteResult>(getCreateProjectInviteUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createProjectInviteRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateProjectInviteMutationKey = () => ['createProjectInvite'] as const;
+
+export const getCreateProjectInviteMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createProjectInvite>>, TError,CreateProjectInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createProjectInvite>>, TError,CreateProjectInviteMutationVariables, TContext> => {
+
+const mutationKey = getCreateProjectInviteMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createProjectInvite>>, CreateProjectInviteMutationVariables> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  createProjectInvite(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateProjectInviteMutationResult = NonNullable<Awaited<ReturnType<typeof createProjectInvite>>>
+    export type CreateProjectInviteMutationBody = CreateProjectInviteRequest
+    export type CreateProjectInviteMutationError = ErrorType<ErrorEnvelope>
+    export type CreateProjectInviteMutationVariables = {id: string;data: CreateProjectInviteRequest}
+
+    /**
+ * @summary Invite a person into this project
+ */
+export const useCreateProjectInvite = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createProjectInvite>>, TError,CreateProjectInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createProjectInvite>>,
+        TError,
+        CreateProjectInviteMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateProjectInviteMutationOptions(options), queryClient);
     }
 
 export const getListAppUsersUrl = (id: string,
@@ -6646,5 +8409,94 @@ export const useRevokeAppUserSessions = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getRevokeAppUserSessionsMutationOptions(options), queryClient);
+    }
+
+export const getUpdateTenantUrl = () => {
+
+
+
+
+  return `/v1/tenant`
+}
+
+/**
+ * Sets the tenant's display name (what Studio and invite pages call it); readers fall back to the slug while it is empty. One `tenant_renamed` access event records the change.
+ * @summary Rename the tenant
+ */
+export const updateTenant = async (updateTenantRequest: UpdateTenantRequest, options?: Parameters<typeof customFetch>[1]): Promise<TenantName> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<TenantName>(getUpdateTenantUrl(),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateTenantRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateTenantMutationKey = () => ['updateTenant'] as const;
+
+export const getUpdateTenantMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateTenant>>, TError,UpdateTenantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateTenant>>, TError,UpdateTenantMutationVariables, TContext> => {
+
+const mutationKey = getUpdateTenantMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateTenant>>, UpdateTenantMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  updateTenant(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateTenantMutationResult = NonNullable<Awaited<ReturnType<typeof updateTenant>>>
+    export type UpdateTenantMutationBody = UpdateTenantRequest
+    export type UpdateTenantMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateTenantMutationVariables = {data: UpdateTenantRequest}
+
+    /**
+ * @summary Rename the tenant
+ */
+export const useUpdateTenant = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateTenant>>, TError,UpdateTenantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateTenant>>,
+        TError,
+        UpdateTenantMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateTenantMutationOptions(options), queryClient);
     }
 

@@ -1,6 +1,7 @@
 //! Caps and password-strength settings for login roles, read by the orchestrator and the worker.
 
 use crate::mode::Mode;
+use crate::mode_policy::ModePolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoleSettings {
@@ -48,12 +49,13 @@ impl RoleSettings {
                 ));
             }
         };
-        let platform = mode == Mode::Platform;
+        let policy = ModePolicy::new(mode);
+        let forced = policy.password_strength_forced();
         Ok(Self {
             role_cap,
             database_cap,
-            strength: strength || platform,
-            prehashed_allowed: !platform,
+            strength: strength || forced,
+            prehashed_allowed: policy.prehashed_passwords_allowed(),
         })
     }
 }

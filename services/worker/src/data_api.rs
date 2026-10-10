@@ -7,7 +7,7 @@ use chelabase_metadata::{
     BranchDatabase, BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseOrigin,
     MetadataError, NewDataKey, ServedDatabase,
 };
-use chelabase_nats::{CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest, GrantDataRoleRequest};
+use chelabase_nats::{CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest};
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::{Purpose, open_credential, seal_credential};
 use chelabase_types::BranchId;
@@ -1050,48 +1050,6 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             RoleCheck::Refused(message) => CheckDataRoleReply::refused(message),
             RoleCheck::NotReady => CheckDataRoleReply::not_ready(),
             RoleCheck::Failed(message) => CheckDataRoleReply::failed(message),
-        }
-    }
-
-    /// Grants `anon` or `authenticated` to the branch's owner `WITH INHERIT FALSE, SET TRUE`
-    /// (the owner gains nothing until `SET ROLE`), for the SQL editor. Any other role is
-    /// refused; a branch whose data API was never set up has no such role: refused.
-    pub async fn grant_data_role_to_owner_reply(&self, request: &GrantDataRoleRequest) -> CheckDataRoleReply {
-        if !matches!(request.role.as_str(), "anon" | "authenticated") {
-            return CheckDataRoleReply::refused("only anon and authenticated can be granted to the owner");
-        }
-        if request.owner.is_empty() {
-            return CheckDataRoleReply::refused("owner role missing");
-        }
-        let branch = request.branch_id;
-        let row = match self.metadata.branch_connection(branch).await {
-            Ok(row) => row,
-            Err(e) => {
-                warn!(branch_id = %branch, "reading the branch to grant a role: {e}");
-                return CheckDataRoleReply::failed(format!("reading the branch: {e}"));
-            }
-        };
-        let Some((ep, database_name)) = row
-            .filter(|r| r.status == BranchStatus::Ready)
-            .and_then(|r| Some((r.endpoint_id?, r.database_name?)))
-        else {
-            return CheckDataRoleReply::not_ready();
-        };
-        let sql = format!(
-            "GRANT {} TO {} WITH INHERIT FALSE, SET TRUE",
-            quote_ident(&request.role),
-            quote_ident(&request.owner)
-        );
-        match self.computes.admin_sql(&ep, &database_name, &sql).await {
-            Ok(_) => CheckDataRoleReply::ok(),
-            Err(e) => {
-                let message = format!("{e:#}");
-                if message.contains(&format!("role \"{}\" does not exist", request.role)) {
-                    return CheckDataRoleReply::refused("the data API isn't set up on this branch");
-                }
-                warn!(branch_id = %branch, endpoint_id = %ep, "granting {} to the owner: {message}", request.role);
-                CheckDataRoleReply::failed(message)
-            }
         }
     }
 
@@ -2321,98 +2279,6 @@ COMMIT;
             );
         }
         assert_eq!(count(&journal, "compute.sql"), 0, "{:?}", entries(&journal));
-    }
-
-    fn grant_ask(role: &str, branch: BranchId) -> GrantDataRoleRequest {
-        GrantDataRoleRequest { branch_id: branch, role: role.into(), owner: "postgres".into() }
-    }
-
-    #[tokio::test]
-    async fn grant_refuses_other_roles() {
-        let (w, _journal) = worker();
-        let id = ready_database(&w).await;
-        w.computes.sql.lock().unwrap().clear();
-        for role in ["postgres", "authenticator", "cloud_admin", "ANON", "anon, postgres", ""] {
-            let reply = w.grant_data_role_to_owner_reply(&grant_ask(role, BranchId::from(id))).await;
-            assert_eq!(reply.kind.as_deref(), Some("refused"), "{role}");
-        }
-        assert!(grants(&w).is_empty());
-    }
-
-    #[tokio::test]
-    async fn grant_runs_the_grant_sql() {
-        let (w, _journal) = worker();
-        let id = ready_database(&w).await;
-        w.computes.sql.lock().unwrap().clear();
-        for role in ["anon", "authenticated"] {
-            let mut ask = grant_ask(role, BranchId::from(id));
-            ask.owner = "own\"er".into();
-            let reply = w.grant_data_role_to_owner_reply(&ask).await;
-            assert_eq!(reply, CheckDataRoleReply::ok(), "{role}");
-        }
-        let main = w.metadata.main(id);
-        let sql = w.computes.sql.lock().unwrap().clone();
-        assert_eq!(
-            sql,
-            vec![
-                (
-                    main.endpoint_id.clone().unwrap(),
-                    "app".to_string(),
-                    "GRANT \"anon\" TO \"own\"\"er\" WITH INHERIT FALSE, SET TRUE".to_string()
-                ),
-                (
-                    main.endpoint_id.unwrap(),
-                    "app".to_string(),
-                    "GRANT \"authenticated\" TO \"own\"\"er\" WITH INHERIT FALSE, SET TRUE".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn grant_on_missing_role_is_refused() {
-        let (w, _journal) = worker();
-        let id = ready_database(&w).await;
-        *w.computes.fail_sql_containing.lock().unwrap() =
-            Some(("GRANT".into(), "role \"anon\" does not exist".into()));
-        let reply = w.grant_data_role_to_owner_reply(&grant_ask("anon", BranchId::from(id))).await;
-        assert_eq!(
-            reply,
-            CheckDataRoleReply::refused("the data API isn't set up on this branch")
-        );
-        // A different missing thing (the owner) is ours, not a refusal.
-        *w.computes.fail_sql_containing.lock().unwrap() =
-            Some(("GRANT".into(), "role \"postgres\" does not exist".into()));
-        let reply = w.grant_data_role_to_owner_reply(&grant_ask("anon", BranchId::from(id))).await;
-        assert_eq!(reply.kind.as_deref(), Some("failed"));
-        // Other failures are ours.
-        *w.computes.fail_sql_containing.lock().unwrap() = Some(("GRANT".into(), "boom".into()));
-        let reply = w.grant_data_role_to_owner_reply(&grant_ask("anon", BranchId::from(id))).await;
-        assert_eq!(reply.kind.as_deref(), Some("failed"));
-    }
-
-    #[tokio::test]
-    async fn grant_refuses_an_empty_owner() {
-        let (w, _journal) = worker();
-        let id = ready_database(&w).await;
-        let mut ask = grant_ask("anon", BranchId::from(id));
-        ask.owner.clear();
-        let reply = w.grant_data_role_to_owner_reply(&ask).await;
-        assert_eq!(reply, CheckDataRoleReply::refused("owner role missing"));
-    }
-
-    #[tokio::test]
-    async fn grant_on_unready_branch_is_not_ready() {
-        let (w, _journal) = worker();
-        let id = ready_database(&w).await;
-        let main = BranchId::from(id);
-        w.computes.sql.lock().unwrap().clear();
-        let reply = w.grant_data_role_to_owner_reply(&grant_ask("anon", BranchId::new())).await;
-        assert_eq!(reply, CheckDataRoleReply::not_ready());
-        w.metadata.state().branches.get_mut(&main).unwrap().status = BranchStatus::Resetting;
-        let reply = w.grant_data_role_to_owner_reply(&grant_ask("anon", main)).await;
-        assert_eq!(reply, CheckDataRoleReply::not_ready());
-        assert!(grants(&w).is_empty());
     }
 
     #[tokio::test]

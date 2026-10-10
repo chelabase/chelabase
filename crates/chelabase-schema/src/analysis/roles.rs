@@ -5,7 +5,7 @@
 //! changed on a role is listed here and never merged; the merged model keeps the target's values
 //! for it ([`super::merge`]) and the drift compare ignores it ([`crate::compare`]):
 //! - other attributes (`SUPERUSER`, `CREATEDB`, `CREATEROLE`, `REPLICATION`) and the comment;
-//! - memberships the roles path refuses (`pg_*`, reserved and `chelabase_…` roles, the owner);
+//! - memberships the roles path refuses (`pg_*`, reserved, `chelabase_…` and `cb_m_…` roles, the owner);
 //! - the options of a membership both sides have;
 //! - every attribute of the owner ([`OWNER_ROLE`]); its memberships are never a change (E22).
 

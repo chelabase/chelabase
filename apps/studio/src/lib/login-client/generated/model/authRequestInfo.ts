@@ -6,8 +6,18 @@
  */
 
 /**
- * Whether the pending sign-in's instance allows sign-up.
+ * What the sign-in page needs to know about the pending sign-in.
  */
 export interface AuthRequestInfo {
+  /**
+     * The visitor asked to create an account (`prompt=create`) and this instance allows it:
+     * Studio goes to its sign-up page. `false` for a refused sign-up request too, which then
+     * lands on the plain sign-in page.
+     */
   signUp: boolean;
+  /**
+     * This instance takes sign-ups (open sign-up is on, or the tenant has no member yet): the
+     * sign-in page may offer "Create account". Always `false` in platform mode.
+     */
+  signUpAllowed: boolean;
 }

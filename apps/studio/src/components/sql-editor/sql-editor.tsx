@@ -9,6 +9,7 @@ import {
   useListRoles,
   type SavedQuery,
 } from "@chelabase/management-client";
+import { actAsRoles, useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import type { PglsClient } from "@/lib/pgls/client";
 import { sqlExtensions } from "@/lib/pgls/codemirror";
@@ -63,13 +64,20 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
   const dbParam = db && !db.main ? db.name : null;
 
   const rolesQuery = useListRoles(databaseId, branchId ?? "", { query: { enabled: branchId !== null } });
+  // Only the roles the caller may act as: Admin has the owner and every role; below Admin the
+  // granted roles and their chains (the API decides; this only hides what it would refuse).
+  const caps = useProjectCaps();
+  const allowed = actAsRoles(caps, rolesQuery.data ?? []);
   const roleOptionsFor = (d: typeof db) => {
-    const own = (rolesQuery.data ?? []).filter((r) => r.origin !== "owner" && r.name !== "anon" && r.name !== "authenticated").map((r) => r.name);
-    return d?.data_api === "on" ? ["anon", "authenticated", ...own] : own;
+    const own = allowed.roles.filter((n) => n !== "anon" && n !== "authenticated");
+    const api = ["anon", "authenticated"].filter((n) => allowed.owner || allowed.roles.includes(n));
+    return d?.data_api === "on" ? [...api, ...own] : own;
   };
   const roleOptions = roleOptionsFor(db);
   const [pickedRole, setPickedRole] = useState("");
-  const role = roleOptions.includes(pickedRole) ? pickedRole : "";
+  // "" is the owner; without it the first allowed role is the default.
+  const role = roleOptions.includes(pickedRole) ? pickedRole : allowed.owner ? "" : (roleOptions[0] ?? "");
+  const noRole = !allowed.owner && role === "";
 
   const [timeoutMs, setTimeoutMs] = useState(loadTimeout);
 
@@ -96,9 +104,11 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const schemaKey = `${branchId}|${dbParam}`;
-  const schemaQuery = useGetSqlSchema(databaseId, branchId ?? "", dbParam ? { database: dbParam } : {}, {
-    query: { enabled: branchId !== null && db !== null, staleTime: Infinity, retry: false },
+  // The schema read follows the chosen role's USAGE (T9): `?role=` unless it's the owner.
+  const schemaKey = `${branchId}|${dbParam}|${role}`;
+  const schemaParams = { ...(dbParam ? { database: dbParam } : {}), ...(role !== "" ? { role } : {}) };
+  const schemaQuery = useGetSqlSchema(databaseId, branchId ?? "", schemaParams, {
+    query: { enabled: branchId !== null && db !== null && rolesQuery.isSuccess && !noRole, staleTime: Infinity, retry: false },
   });
   const schemaData = schemaQuery.data;
   const [pglsSchema, setPglsSchema] = useState<{ key: string; ok: boolean } | null>(null);
@@ -278,6 +288,7 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
         database={db?.name ?? null}
         onDatabase={setPickedDb}
         roles={roleOptions}
+        ownerAllowed={allowed.owner}
         role={role}
         onRole={setPickedRole}
         timeoutMs={timeoutMs}
@@ -286,20 +297,28 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
           saveTimeout(ms);
         }}
         running={run?.running === true}
-        canRun={branchId !== null && db !== null}
+        canRun={branchId !== null && db !== null && !noRole}
         onRun={start}
         onCancel={() => void cancel()}
         onRefreshSchema={() => void schemaQuery.refetch()}
       />
 
-      {role === "" ? (
-        <p className="rounded-lg border border-destructive/40 p-2 text-sm">Running as owner: row-level security is bypassed.</p>
+      {noRole ? (
+        rolesQuery.isSuccess && (
+          <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>
+        )
+      ) : role === "" ? (
+        <p className="border border-destructive/40 p-2 text-sm">Running as owner: row-level security is bypassed.</p>
+      ) : !allowed.owner ? (
+        <p className="border p-2 text-sm">
+          Running as <code>{role}</code>: Postgres applies this role&apos;s privileges and row-level security.
+        </p>
       ) : (
-        <p className="rounded-lg border p-2 text-sm">
+        <p className="border p-2 text-sm">
           Running as <code>{role}</code> (SET ROLE). This previews that role&apos;s view; it isn&apos;t a security boundary, since a script can RESET ROLE.
         </p>
       )}
-      {branch?.protected && <p className="rounded-lg border p-2 text-sm">Protected branch: every change asks for confirmation.</p>}
+      {branch?.protected && <p className="border p-2 text-sm">Protected branch: every change asks for confirmation.</p>}
       {fatal && (
         <p role="alert" className="text-sm text-destructive">
           {errorText(fatal)}

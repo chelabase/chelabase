@@ -9,6 +9,7 @@ description = "Encryption at rest for Chelabase control-plane secrets"
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

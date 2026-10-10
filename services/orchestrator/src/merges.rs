@@ -35,8 +35,48 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use crate::access::{authorize, authorize_database, Authorized, Target};
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
-use crate::{ApiBytes, AppState, AuthPrincipal, BACKUP_REFUSAL, JobPort, MetadataPort, load_owned};
+use crate::{ApiBytes, AppState, AuthPrincipal, BACKUP_REFUSAL, JobPort, MetadataPort};
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::{Access, PlatformRole};
+
+/// The access check of a route on merge `merge_id` of database `id`: `Branch` routes go by the
+/// branch the merge goes into. An unknown merge, or another database's, counts as protected
+/// (`load_merge` answers 404 after the check).
+async fn authorize_merge<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    access: Access,
+    id: Uuid,
+    merge_id: Uuid,
+) -> Result<DatabaseRecord, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    authorize_merge_full(state, principal, access, id, merge_id).await?.into_record()
+}
+
+/// [`authorize_merge`], also returning what the check resolved (the caller's grant).
+async fn authorize_merge_full<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    access: Access,
+    id: Uuid,
+    merge_id: Uuid,
+) -> Result<Authorized, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let merged_into = match state.metadata.get_merge(merge_id).await {
+        Ok(Some(merge)) if merge.database_id == id => merge.target_branch_id,
+        Ok(_) => Uuid::nil(),
+        Err(err) => return Err(internal("load merge", err)),
+    };
+    authorize(state, principal, access, Target::Branch { database: id, branch: merged_into }).await
+}
 
 pub(crate) fn routes<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>
 where
@@ -742,12 +782,32 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = load_owned(state, principal, id).await?;
+    let request: CreateMergeRequest = parse_body(&axum::body::Bytes::copy_from_slice(body))?;
+    let direction: MergeDirection = request.direction.into();
+    // The access check reads the protection of the branch merged into: the path's branch's
+    // parent, or the path's branch itself when merging from the parent. One the database
+    // doesn't hold (or a missing parent) counts as protected; the checks below answer it.
+    let merged_into = match direction {
+        MergeDirection::FromParent => branch_id,
+        MergeDirection::IntoParent => match state.metadata.get_branch(BranchId(branch_id)).await {
+            Ok(Some(b)) if b.database_id.as_uuid() == id => {
+                b.parent_branch_id.map_or(Uuid::nil(), |p| p.as_uuid())
+            }
+            Ok(_) => Uuid::nil(),
+            Err(err) => return Err(internal("load branch", err)),
+        },
+    };
+    let record = authorize_database(
+        state,
+        principal,
+        ep::CREATE_MERGE.policy.access,
+        Target::Branch { database: id, branch: merged_into },
+    )
+    .await?;
     let branch = load_branch(state, &record, branch_id).await?;
     if branch.kind != BranchKind::Normal {
         return Err(conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL));
     }
-    let request: CreateMergeRequest = parse_body(&axum::body::Bytes::copy_from_slice(body))?;
     let Some(parent_id) = branch.parent_branch_id else {
         return Err(unprocessable("main has no parent to merge with"));
     };
@@ -764,7 +824,6 @@ where
         }
     }
     let database_name = pick_database(state, &branch, &parent, request.database.as_deref()).await?;
-    let direction: MergeDirection = request.direction.into();
     let (source, target) = match direction {
         MergeDirection::IntoParent => (branch.id, parent.id),
         MergeDirection::FromParent => (parent.id, branch.id),
@@ -843,7 +902,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::LIST_MERGES.policy.access, Target::Database(id)).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -886,7 +945,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let record = authorize_database(&state, &principal, ep::GET_MERGE.policy.access, Target::Database(id)).await?;
         let merge = load_merge(&state, &record, merge_id).await?;
         let events = state.metadata.merge_events(merge_id).await.map_err(|e| internal("merge events", e))?;
         Ok::<_, ApiError>(MergeDetail {
@@ -1010,7 +1069,7 @@ fn draft_patch(request: &UpdateMergeRequest, current_options: &Value) -> Result<
         (status = 200, description = "The merge after the save (`computing`, or as it was for an acknowledgement or after-merge choice)", body = Merge),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: acknowledging (or un-acknowledging) a security step needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the merge doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`merge_version_conflict`: `version` is stale (the response carries the merge as `error.current`); `conflict`: the merge isn't a draft or rehearsed", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -1046,9 +1105,21 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = load_owned(state, principal, id).await?;
+    let authorized = authorize_merge_full(state, principal, ep::UPDATE_MERGE.policy.access, id, merge_id).await?;
+    let record = authorized.clone().into_record()?;
     let merge = load_merge(state, &record, merge_id).await?;
     let request: UpdateMergeRequest = parse_body(&axum::body::Bytes::copy_from_slice(body))?;
+    // R25: acknowledging a security step is an Admin's act, adding or removing it.
+    if let Some(acks) = &request.acknowledgements
+        && !is_admin(&authorized)
+    {
+        let secure = security_items(&merge);
+        let old: HashSet<&str> = merge.acknowledgements.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let new: HashSet<&str> = acks.iter().map(String::as_str).collect();
+        if new.symmetric_difference(&old).any(|item| secure.contains(*item)) {
+            return Err(admin_only());
+        }
+    }
     let patch = draft_patch(&request, &merge.options)?;
     // One statement saves, bumps the version and moves to `computing`: of two saves of one
     // version only one wins, and only the winner publishes.
@@ -1070,6 +1141,54 @@ where
 }
 
 // ---- actions ------------------------------------------------------------------------------
+
+/// Whether the plan has a security step (BYPASSRLS, owner-level; E28): applying it needs Admin.
+fn has_security_steps(merge: &MergeRecord) -> bool {
+    merge
+        .plan
+        .as_ref()
+        .and_then(|p| p["steps"].as_array())
+        .into_iter()
+        .flatten()
+        .any(|step| match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
+            Ok(s) => s.security,
+            // A step this build can't read: by its flag, as the engine writes it; without one it
+            // counts as a security step (an access check fails closed).
+            Err(_) => step["security"].as_bool().unwrap_or(true),
+        })
+}
+
+/// The items an acknowledgement of a security step goes by: the step's items, or its id when
+/// it has none (as `unacknowledged` reads them).
+fn security_items(merge: &MergeRecord) -> HashSet<String> {
+    let mut items = HashSet::new();
+    for step in merge.plan.as_ref().and_then(|p| p["steps"].as_array()).into_iter().flatten() {
+        let secure = match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
+            Ok(s) => s.security,
+            Err(_) => step["security"].as_bool().unwrap_or(true),
+        };
+        if !secure {
+            continue;
+        }
+        let listed: Vec<&str> = step["items"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        if listed.is_empty() {
+            items.extend(step["id"].as_str().map(str::to_string));
+        } else {
+            items.extend(listed.into_iter().map(str::to_string));
+        }
+    }
+    items
+}
+
+fn admin_only() -> ApiError {
+    crate::access::deny_to_api(chelabase_types::access::Deny::Forbidden {
+        required: PlatformRole::Admin.as_str().to_string(),
+    })
+}
+
+fn is_admin(authorized: &Authorized) -> bool {
+    authorized.grant.as_ref().is_some_and(|g| g.platform_role == PlatformRole::Admin)
+}
 
 /// The conflict ids the analysis lists that no resolution answers.
 fn open_conflicts(merge: &MergeRecord) -> Vec<String> {
@@ -1159,7 +1278,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let record = authorize_merge(&state, &principal, ep::REHEARSE_MERGE.policy.access, id, merge_id).await?;
         let merge = load_merge(&state, &record, merge_id).await?;
         let request: RehearseRequest = optional_body(&body)?;
         if merge.state().after(MergeAction::Rehearse).is_none() {
@@ -1215,7 +1334,7 @@ where
         (status = 202, description = "Accepted; the merge is `applying`", body = MergeSummary),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: a plan with a security step (BYPASSRLS, owner-level) needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the merge doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`merge_not_rehearsed`, `merge_stale`, `merge_version_conflict` (`error.current`), `merge_conflicts_open`, `merge_drops_unacknowledged`, `merge_confirm_required`, `merge_busy` (`error.merge_id`): see the description; `branch_not_ready`: either branch isn't ready", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -1235,8 +1354,13 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let authorized = authorize_merge_full(&state, &principal, ep::APPLY_MERGE.policy.access, id, merge_id).await?;
+        let record = authorized.clone().into_record()?;
         let merge = load_merge(&state, &record, merge_id).await?;
+        // Security steps (BYPASSRLS, owner-level) are acknowledged by an Admin, on any target.
+        if has_security_steps(&merge) && !is_admin(&authorized) {
+            return Err(admin_only());
+        }
         let request: ApplyRequest = optional_body(&body)?;
         match merge.status {
             _ if merge.state().after(MergeAction::Apply).is_some() => {}
@@ -1346,7 +1470,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let record = authorize_merge(&state, &principal, ep::RECOMPUTE_MERGE.policy.access, id, merge_id).await?;
         let merge = load_merge(&state, &record, merge_id).await?;
         let request: RecomputeRequest = optional_body(&body)?;
         match merge.status {
@@ -1432,7 +1556,7 @@ where
         (status = 202, description = "Accepted; the merge is `online` (after an online failure) or `applying` again", body = MergeSummary),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: a retry that runs a plan with a security step again needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the merge doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: the merge didn't fail while applying; `merge_busy`: another merge is applying to the target, or failed half applied on it (`error.merge_id`); `branch_not_ready`: either branch isn't ready (a retry before the online phase)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -1449,7 +1573,8 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let authorized = authorize_merge_full(&state, &principal, ep::RETRY_MERGE.policy.access, id, merge_id).await?;
+        let record = authorized.clone().into_record()?;
         let merge = load_merge(&state, &record, merge_id).await?;
         // E20: a failure in phase 2 resumes there (phase 1 committed); one before it (roles,
         // enum values, the transaction) applies again from the start, pre-checks included.
@@ -1464,6 +1589,10 @@ where
                 ));
             }
         };
+        // R25: running the plan again re-runs its security steps (the online resume doesn't).
+        if matches!(job, MergeJob::Apply { .. }) && has_security_steps(&merge) && !is_admin(&authorized) {
+            return Err(admin_only());
+        }
         if let Some(other) = applying_on(&state, &record, merge.target_branch_id, merge_id).await? {
             return Err(busy(Some(other)));
         }
@@ -1534,7 +1663,7 @@ where
     const CANCELLABLE: [MergeStatus; 4] =
         [MergeStatus::Computing, MergeStatus::Draft, MergeStatus::Rehearsing, MergeStatus::Rehearsed];
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let record = authorize_merge(&state, &principal, ep::CANCEL_MERGE.policy.access, id, merge_id).await?;
         let merge = load_merge(&state, &record, merge_id).await?;
         if merge.state().after(MergeAction::Cancel).is_none() {
             return Err(wrong_state("cancel", merge.status));
@@ -1605,7 +1734,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let record = authorize_merge(&state, &principal, ep::ABANDON_MERGE.policy.access, id, merge_id).await?;
         let merge = load_merge(&state, &record, merge_id).await?;
         if merge.state().after(MergeAction::Abandon).is_none() {
             return Err(conflict(
@@ -1681,7 +1810,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let record = authorize_merge(&state, &principal, ep::FINISH_MERGE.policy.access, id, merge_id).await?;
         let merge = load_merge(&state, &record, merge_id).await?;
         let request: FinishRequest = parse_body(&axum::body::Bytes::copy_from_slice(&body))?;
         if merge.state().after(MergeAction::Finish).is_none() {
@@ -1760,7 +1889,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = load_owned(&state, &principal, id).await?;
+        let record = authorize_database(&state, &principal, ep::EXPORT_MERGE_PLAN.policy.access, Target::Database(id)).await?;
         let merge = load_merge(&state, &record, merge_id).await?;
         let Some(plan) = merge.plan else {
             return Err(conflict(ErrorCode::Conflict, "the merge has no plan yet"));

@@ -33,6 +33,16 @@ export interface BranchRole {
   level: RoleLevel;
   /** Whether the role has the LOGIN attribute. */
   login: boolean;
+  /**
+     * Those of `member_of` with the ADMIN option: the role can grant the group on (I2). A role
+     * holding it is Admin-only to grant (R30).
+     */
+  member_admin: string[];
+  /**
+     * Those of `member_of` without the SET option: the role can't `SET ROLE` to them, though
+     * it still inherits their privileges (I2).
+     */
+  member_no_set: string[];
   /** The roles it's a direct member of, by name (`neon_superuser` isn't listed). */
   member_of: string[];
   name: string;

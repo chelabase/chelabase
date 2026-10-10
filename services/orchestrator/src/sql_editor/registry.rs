@@ -13,6 +13,8 @@ type Runs = Mutex<HashMap<(String, Uuid), Entry>>;
 
 struct Entry {
     branch: BranchId,
+    /// The member who started the run (`None`: no member row, platform mode).
+    member: Option<Uuid>,
     database: String,
     cancel: CancellationToken,
 }
@@ -21,6 +23,26 @@ struct Entry {
 #[derive(Default)]
 pub struct RunRegistry {
     runs: Arc<Runs>,
+}
+
+/// Who asks to cancel a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Canceller {
+    /// A member: only the runs they started.
+    Member(Uuid),
+    /// An Admin: any run.
+    Admin,
+}
+
+/// What a cancel request found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cancelled {
+    /// The token was fired.
+    Done,
+    /// A run with this id is in flight on the branch, but someone else started it.
+    NotYours,
+    /// No such run in flight on the branch.
+    Missing,
 }
 
 /// Why a run can't start.
@@ -47,6 +69,7 @@ impl RunRegistry {
         &self,
         user: &str,
         run_id: Uuid,
+        member: Option<Uuid>,
         branch: BranchId,
         database: &str,
     ) -> Result<RunGuard, ReserveError> {
@@ -70,6 +93,7 @@ impl RunRegistry {
             key.clone(),
             Entry {
                 branch,
+                member,
                 database: database.to_string(),
                 cancel: cancel.clone(),
             },
@@ -81,16 +105,29 @@ impl RunRegistry {
         })
     }
 
-    /// Fires the run's token; false when this user has no such run.
-    pub fn cancel(&self, user: &str, run_id: Uuid) -> bool {
+    /// Fires the token of run `run_id` on `branch` when `by` may cancel it: its starter, or an
+    /// Admin.
+    pub fn cancel(&self, run_id: Uuid, branch: BranchId, by: Canceller) -> Cancelled {
         let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(&(user.to_string(), run_id)) {
-            Some(entry) => {
+        let on_branch: Vec<&Entry> = runs
+            .iter()
+            .filter(|((_, id), e)| *id == run_id && e.branch == branch)
+            .map(|(_, e)| e)
+            .collect();
+        let mut found = Cancelled::Missing;
+        for entry in on_branch {
+            let allowed = match by {
+                Canceller::Admin => true,
+                Canceller::Member(member) => entry.member == Some(member),
+            };
+            if allowed {
                 entry.cancel.cancel();
-                true
+                found = Cancelled::Done;
+            } else if found == Cancelled::Missing {
+                found = Cancelled::NotYours;
             }
-            None => false,
         }
+        found
     }
 }
 
@@ -120,53 +157,68 @@ mod tests {
         let branch = BranchId::new();
         let other = BranchId::new();
         let id = Uuid::new_v4();
-        let first = registry.reserve("alice", id, branch, "main").unwrap();
+        let first = registry.reserve("alice", id, None, branch, "main").unwrap();
         assert!(matches!(
-            registry.reserve("alice", id, other, "main"),
+            registry.reserve("alice", id, None, other, "main"),
             Err(ReserveError::InUse)
         ));
         let _a2 = registry
-            .reserve("alice", Uuid::new_v4(), other, "main")
+            .reserve("alice", Uuid::new_v4(), None, other, "main")
             .unwrap();
         let _a3 = registry
-            .reserve("alice", Uuid::new_v4(), other, "main")
+            .reserve("alice", Uuid::new_v4(), None, other, "main")
             .unwrap();
         let _a4 = registry
-            .reserve("alice", Uuid::new_v4(), other, "main")
+            .reserve("alice", Uuid::new_v4(), None, other, "main")
             .unwrap();
         assert!(matches!(
-            registry.reserve("alice", Uuid::new_v4(), other, "app"),
+            registry.reserve("alice", Uuid::new_v4(), None, other, "app"),
             Err(ReserveError::UserLimit)
         ));
         // `other`/main now has 3 of alice's runs; bob adds the 4th, the 5th is refused.
         let _b1 = registry
-            .reserve("bob", Uuid::new_v4(), other, "main")
+            .reserve("bob", Uuid::new_v4(), None, other, "main")
             .unwrap();
         assert!(matches!(
-            registry.reserve("bob", Uuid::new_v4(), other, "main"),
+            registry.reserve("bob", Uuid::new_v4(), None, other, "main"),
             Err(ReserveError::TargetLimit)
         ));
         // Another database on the same branch is another target.
         let _b2 = registry
-            .reserve("bob", Uuid::new_v4(), other, "app")
+            .reserve("bob", Uuid::new_v4(), None, other, "app")
             .unwrap();
         drop(first);
-        let _again = registry.reserve("alice", id, branch, "main").unwrap();
+        let _again = registry.reserve("alice", id, None, branch, "main").unwrap();
     }
 
     #[test]
-    fn cancel_fires_only_the_callers_run() {
+    fn cancel_fires_only_for_the_starter_or_an_admin() {
         let registry = RunRegistry::default();
-        let id = Uuid::new_v4();
+        let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let (id, branch) = (Uuid::new_v4(), BranchId::new());
         let guard = registry
-            .reserve("alice", id, BranchId::new(), "main")
+            .reserve("alice", id, Some(alice), branch, "main")
             .unwrap();
-        assert!(!registry.cancel("bob", id));
+        assert_eq!(registry.cancel(id, branch, Canceller::Member(bob)), Cancelled::NotYours);
         assert!(!guard.token().is_cancelled());
-        assert!(!registry.cancel("alice", Uuid::new_v4()));
-        assert!(registry.cancel("alice", id));
+        assert_eq!(
+            registry.cancel(Uuid::new_v4(), branch, Canceller::Member(alice)),
+            Cancelled::Missing
+        );
+        // Another branch's run isn't this branch's.
+        assert_eq!(
+            registry.cancel(id, BranchId::new(), Canceller::Admin),
+            Cancelled::Missing
+        );
+        assert_eq!(registry.cancel(id, branch, Canceller::Member(alice)), Cancelled::Done);
         assert!(guard.token().is_cancelled());
         drop(guard);
-        assert!(!registry.cancel("alice", id));
+        assert_eq!(registry.cancel(id, branch, Canceller::Admin), Cancelled::Missing);
+
+        // An Admin cancels another member's run; a run with no member is only an Admin's.
+        let guard = registry.reserve("carol", id, None, branch, "main").unwrap();
+        assert_eq!(registry.cancel(id, branch, Canceller::Member(alice)), Cancelled::NotYours);
+        assert_eq!(registry.cancel(id, branch, Canceller::Admin), Cancelled::Done);
+        assert!(guard.token().is_cancelled());
     }
 }

@@ -45,11 +45,14 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use crate::access::{authorize, authorize_database, deny_to_api, Target};
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
 use crate::{
     ApiBytes, AppState, AuthPrincipal, BACKUP_REFUSAL, JobPort, MetadataPort, ResetError,
-    RestInternal, load_owned, roles,
+    RestInternal, roles,
 };
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::{Deny, PlatformRole, Requested};
 
 /// Connections one owner pool holds at most.
 pub const OWNER_POOL_CONNECTIONS: u32 = 2;
@@ -285,7 +288,7 @@ where
     operation_id = "consoleQuery",
     tag = "data-api",
     summary = "Run a data API request from the console",
-    description = "Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and isn't owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a member of `neon_superuser`); a role with BYPASSRLS passes, and the console then reads and writes past row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.",
+    description = "Runs one data API request (`tree`, the JSON `POST /data/v1/query` takes; every operation, batches included) on a branch, in one transaction with the data API's `max_rows` and statement timeout. `role: null` runs as the database's owner; any other role runs as that role, after a check that it exists and isn't owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a member of `neon_superuser`); a role with BYPASSRLS passes (Admin only), and the console then reads and writes past row-level security. The answer is the data API's: its JSON on success, and its error body (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …) when the request fails in the database. Every write is logged without its values.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -295,7 +298,7 @@ where
         (status = 200, description = "The data API's answer: the rows, the written rows or count, a call's result, or a batch's results in order", body = serde_json::Value),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON; the data API's `invalid_query` or `invalid_value`: the tree is malformed, the request and its tree name different databases, or Postgres refused a value", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `permission_denied` or `role_not_allowed`", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `permission_denied` or `role_not_allowed`; a Viewer's write (`insert`, `update`, `delete`, `call`, or a batch holding one) is refused with `required: \"developer\"`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; the data API's `unknown_table` or `unknown_function`, or `unknown_role` when the role was dropped after the check (a passed check is remembered five minutes)", body = ErrorEnvelope),
         (status = 409, description = "`data_api_disabled`: the Postgres database isn't served by the data API (enable it first); `owner_password_unknown`: the owner's password was set in SQL (reset it to view as owner); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; the data API's `conflict` or `retry`", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit, or the answer is over the data API's response cap", body = ErrorEnvelope),
@@ -341,20 +344,10 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = or_answer!(load_owned(state, principal, id).await);
-    let branch = or_answer!(load_branch(state, &record, branch_id).await);
-    if branch.kind == BranchKind::Backup {
-        return conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
-    }
-    if branch.status != BranchStatus::Ready {
-        return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
-    }
+    // The request is read first: the access check needs the role and the Postgres database.
     let request: ConsoleRequest = or_answer!(parse_body(body));
     if request.role.as_deref().is_some_and(str::is_empty) {
         return unprocessable("role must not be empty (null runs as the owner)").into_response();
-    }
-    if request.role.as_deref() == Some(roles::owner_name(&record)) {
-        return unprocessable("use role: null to run as the owner").into_response();
     }
     // The tree is checked here for both paths: a bad one never reaches a database or rest.
     let tree =
@@ -372,6 +365,34 @@ where
         }
         (a, b) => a.or(b),
     };
+    let target = Target::Role {
+        database: id,
+        branch: branch_id,
+        pg_database: name.unwrap_or(""),
+        role: request.role.as_deref().map_or(Requested::Owner, Requested::Role),
+    };
+    let authorized = or_answer!(authorize(state, principal, ep::CONSOLE_QUERY.policy.access, target).await);
+    // A Viewer only reads: a write (or a batch holding one) is refused before it reaches rest.
+    if write_kind(&parsed.op).is_some()
+        && authorized
+            .grant
+            .as_ref()
+            .is_none_or(|g| g.platform_role < PlatformRole::Developer)
+    {
+        return deny_to_api(Deny::Forbidden { required: PlatformRole::Developer.as_str().to_string() })
+            .into_response();
+    }
+    let record = or_answer!(authorized.into_record());
+    let branch = or_answer!(load_branch(state, &record, branch_id).await);
+    if branch.kind == BranchKind::Backup {
+        return conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
+    }
+    if branch.status != BranchStatus::Ready {
+        return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
+    }
+    if request.role.as_deref() == Some(roles::owner_name(&record)) {
+        return unprocessable("use role: null to run as the owner").into_response();
+    }
     let rows = or_answer!(
         state
             .metadata
@@ -472,24 +493,35 @@ where
             ));
         }
     };
-    let addr = match state.locator.postgres_addr(endpoint_id).await {
-        Ok(Some(addr)) => addr,
-        Ok(None) => {
-            return Err(unavailable("the branch's compute isn't running; try again"));
-        }
-        Err(err) => {
-            warn!(branch_id = %branch.id, "locate the compute: {err:#}");
-            return Err(unavailable(
-                "the branch's compute can't be reached right now; try again",
-            ));
-        }
-    };
+    let addr = compute_addr(state, branch.id, endpoint_id).await?;
     Ok(OwnerTarget {
         addr,
         user: owner.to_string(),
         password,
         sealed: sealed.to_string(),
     })
+}
+
+/// The Postgres address of the branch's compute: 503 when it isn't running or can't be found.
+pub(crate) async fn compute_addr<M, J>(
+    state: &AppState<M, J>,
+    branch: chelabase_types::BranchId,
+    endpoint_id: &str,
+) -> Result<SocketAddr, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    match state.locator.postgres_addr(endpoint_id).await {
+        Ok(Some(addr)) => Ok(addr),
+        Ok(None) => Err(unavailable("the branch's compute isn't running; try again")),
+        Err(err) => {
+            warn!(branch_id = %branch, "locate the compute: {err:#}");
+            Err(unavailable(
+                "the branch's compute can't be reached right now; try again",
+            ))
+        }
+    }
 }
 
 /// The owner pool of `row`'s database on `branch`; errors as [`owner_target`].
@@ -600,7 +632,7 @@ pub struct ConsoleSchemaQuery {
     operation_id = "getConsoleSchema",
     tag = "data-api",
     summary = "The schema the console can show, as the owner or a role",
-    description = "What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and isn't owner-level; BYPASSRLS is allowed).",
+    description = "What the console may show for one Postgres database of a branch, in the data API schema's shape (schemas, tables with their primary keys and the role's privileges, functions, enums). Without `role`, everything the database's owner reaches; with it, what that role reaches, after the same check the console's queries pass (it exists and isn't owner-level; BYPASSRLS is allowed, Admin only).",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -629,7 +661,20 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = or_answer!(load_owned(&state, &principal, id).await);
+    let Ok(axum::extract::Query(query)) = query else {
+        return unprocessable("the query string is malformed").into_response();
+    };
+    if query.role.as_deref() == Some("") {
+        return unprocessable("role must not be empty (omit it to view the schema as the owner)")
+            .into_response();
+    }
+    let target = Target::Role {
+        database: id,
+        branch: branch_id,
+        pg_database: query.database.as_deref().unwrap_or(""),
+        role: query.role.as_deref().map_or(Requested::Owner, Requested::Role),
+    };
+    let record = or_answer!(authorize_database(&state, &principal, ep::CONSOLE_SCHEMA.policy.access, target).await);
     let branch = or_answer!(load_branch(&state, &record, branch_id).await);
     if branch.kind == BranchKind::Backup {
         return conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
@@ -637,15 +682,8 @@ where
     if branch.status != BranchStatus::Ready {
         return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
     }
-    let Ok(axum::extract::Query(query)) = query else {
-        return unprocessable("the query string is malformed").into_response();
-    };
     let owner = roles::owner_name(&record).to_owned();
     match query.role.as_deref() {
-        Some("") => {
-            return unprocessable("role must not be empty (omit it to view the schema as the owner)")
-                .into_response();
-        }
         Some(role) if role == owner => {
             return unprocessable("omit role to view the schema as the owner").into_response();
         }

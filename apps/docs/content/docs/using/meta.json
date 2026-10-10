@@ -4,6 +4,8 @@
   "pages": [
     "quickstart",
     "projects-and-databases",
+    "members-and-invites",
+    "roles-and-schema-isolation",
     "branches",
     "merging-schema",
     "login-roles",
@@ -11,6 +13,7 @@
     "client",
     "app-users",
     "sql-editor",
-    "studio"
+    "studio",
+    "self-hosted-vs-platform"
   ]
 }

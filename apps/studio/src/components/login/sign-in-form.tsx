@@ -1,5 +1,5 @@
 import { ApiError } from "@chelabase/management-client";
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode, type Ref } from "react";
 import { Button } from "@/components/ui/button";
 import { useGetAuthRequest, useSignIn } from "@/lib/login-client/generated/endpoints";
 import type { NextStep, SignedIn } from "@/lib/login-client/generated/model";
@@ -49,11 +49,13 @@ export function follow(next: NextStep | SignedIn, go: (url: string) => void, toV
   else toVerify();
 }
 
-export function LoginLayout({ title, children }: { title: string; children: ReactNode }) {
+export function LoginLayout({ title, titleRef, children }: { title: string; titleRef?: Ref<HTMLHeadingElement>; children: ReactNode }) {
   return (
     <main className="flex min-h-screen items-center justify-center bg-background p-8 text-foreground">
       <div className="w-full max-w-sm space-y-6">
-        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+        <h1 ref={titleRef} tabIndex={titleRef ? -1 : undefined} className="text-2xl font-semibold tracking-tight outline-none">
+          {title}
+        </h1>
         {children}
       </div>
     </main>
@@ -69,7 +71,7 @@ export function Field({ label, type = "text", value, onChange, autoComplete }: {
       <label htmlFor={id} className="text-sm font-medium">{label}</label>
       <input id={id} type={type} value={value} autoComplete={autoComplete} required
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm" />
+        className="w-full border border-input bg-background px-3 py-2 text-sm" />
     </div>
   );
 }
@@ -88,13 +90,19 @@ export function SignInForm({ authRequest = "", go, toVerify, toRegister, notice 
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<LoginProblem | null>(authRequest ? null : EXPIRED_PROBLEM);
+  // Whether this instance takes sign-ups (the pending sign-in's answer); closed until it says so.
+  const [canSignUp, setCanSignUp] = useState(false);
   const { mutate: lookUp } = useGetAuthRequest();
   const signIn = useSignIn(SECRET);
 
   useEffect(() => {
     if (!authRequest) return;
     lookUp({ data: { authRequest } }, {
-      onSuccess: ({ signUp }) => { if (signUp && !notice) toRegister?.(); },
+      onSuccess: ({ signUp, signUpAllowed }) => {
+        setCanSignUp(signUpAllowed);
+        // A request for account creation (prompt=create) only forwards while sign-up is open.
+        if (signUp && signUpAllowed && !notice) toRegister?.();
+      },
       onError: (err) => setError(problemOf(err)),
     });
   }, [lookUp, authRequest, toRegister, notice]);
@@ -126,6 +134,15 @@ export function SignInForm({ authRequest = "", go, toVerify, toRegister, notice 
       <p className="text-sm text-muted-foreground">
         <a href="/password-reset" className="underline">Forgot your password?</a>
       </p>
+      {canSignUp && toRegister ? (
+        <p className="text-sm text-muted-foreground">
+          No account? <button type="button" onClick={toRegister} className="underline">Create account</button>
+        </p>
+      ) : (
+        // The sign-in answer never says whether an email has an account, so this is always shown
+        // while sign-up is closed.
+        <p className="text-sm text-muted-foreground">No account? Ask your admin for an invite.</p>
+      )}
     </LoginLayout>
   );
 }

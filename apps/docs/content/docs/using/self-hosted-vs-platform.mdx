@@ -1,0 +1,38 @@
+---
+title: Self-hosted vs platform
+description: Every rule that differs between self-hosted mode and platform mode, from one policy table in the code.
+---
+
+`CHELABASE_MODE` is `self-hosted` (the default, and what you run yourself) or `platform` (the hosted cloud, not built yet). Every decision that depends on the mode lives in one place in the code, `ModePolicy`, so nothing else compares the mode. **Platform mode fails closed**: where a feature isn't designed for it yet, the answer is refused (403 `not_available_in_platform_mode`) rather than falling back to the self-hosted behaviour.
+
+## In practice
+
+- **Sign-up.** Self-hosted has no self-sign-up unless a tenant admin turns on open sign-up. People who sign up then wait as pending members for an admin to approve them. Platform mode refuses self-sign-up until it is designed. See [Members and invites](/docs/using/members-and-invites#how-people-join).
+- **Instance settings** (`/v1/instance/settings`, open sign-up) are for the active tenant admin when self-hosted; in platform mode they are for members of the operator organization (`CHELABASE_OPERATOR_ORG_ID`), and nobody passes while it is unset. The open sign-up switch exists only when self-hosted.
+- **Auto-created members.** Self-hosted: a person in the tenant's organization with no member row is admitted on their first request. The first one claims the admin (the fresh-install window, open until the first `just zitadel-bootstrap you@example.com`: run it before exposing Studio; the loser of a simultaneous race is admitted as pending); others become pending while open sign-up is on and are refused while it is off. Platform: members are only made explicitly.
+- **Safety defaults** (email verification, secure cookies, password strength, owner superuser, pre-hashed passwords, the CA file on reveal) are relaxed for local use in self-hosted mode and strict in platform mode. `CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides email verification in either mode.
+
+Correctness and safety checks are the same in both modes: the access rules in [Access per route](/docs/reference/access) apply identically.
+
+## Every rule
+
+This table is generated from `ModePolicy` and checked by a test (`just check`).
+
+{/* BEGIN GENERATED mode-table */}
+
+| Rule | What it decides | Self-hosted | Platform |
+|---|---|---|---|
+| `instance_admin` | Who may use instance-level routes. | active tenant admin | member of the operator organisation |
+| `sign_up` | Whether a visitor may create their own account. | gated by the tenant | refused |
+| `open_signup_switchable` | Whether the tenant may switch open sign-up on. | true | false |
+| `email_verification_default` | Whether sign-ups must verify their email by default. | false | true |
+| `secure_cookies_default` | Whether session cookies are marked Secure by default. | false | true |
+| `owner_superuser_allowed` | Whether a database's owner role may be a superuser. | true | false |
+| `password_strength_forced` | Whether role passwords must pass the strength check. | false | true |
+| `prehashed_passwords_allowed` | Whether role passwords may be supplied pre-hashed. | true | false |
+| `ca_file_on_reveal` | Whether revealing connection details includes the dev CA path. | true | false |
+| `cli_manages_studio_login` | Whether the CLI manages Studio's login settings in Zitadel. | true | false |
+| `auto_create_members` | Whether a person in the tenant's org becomes a member on their first request. | true | false |
+| `default_internal_token_allowed` | Whether the services may start with the development internal bearer (a platform instance refuses to start with it). | true | false |
+
+{/* END GENERATED mode-table */}

@@ -22,6 +22,8 @@ fn identity() -> Identity {
         auth: AuthMethod::ManagementJwt,
         request_id: "rid-1".into(),
         data: None,
+        email: None,
+        name: None,
     }
 }
 
@@ -156,6 +158,8 @@ fn data_identity_round_trips_in_claims() {
         auth: AuthMethod::DataKey,
         request_id: "rid-2".into(),
         data: Some(data.clone()),
+        email: None,
+        name: None,
     };
     let token = signer.sign("rest", &identity).unwrap();
     let claims = verifier.verify(&token, "rest").unwrap();

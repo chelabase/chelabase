@@ -1638,6 +1638,11 @@ mod tests {
         assert_eq!(ex::USERS_SYNC_ROLE, USERS_SYNC_ROLE);
         assert!(ex::RESERVED_ROLES.contains(&USERS_SYNC_ROLE));
         assert!(ex::USERS_GRANTEES.contains(&USERS_SYNC_ROLE));
+        assert_eq!(
+            ex::MEMBER_ROLE_PREFIX,
+            chelabase_types::role_name::MEMBER_ROLE_PREFIX
+        );
+        assert!(crate::resync::resync_sql("postgres").contains(ex::MEMBER_ROLE_PREFIX));
         // The users machinery's names, as the worker's bootstrap writes them.
         let users = users_bootstrap_sql("public", "users", "SCRAM-SHA-256$x", crate::OWNER_ROLE);
         for name in ex::USERS_GUARD_TRIGGERS

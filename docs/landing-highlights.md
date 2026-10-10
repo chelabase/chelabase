@@ -7,9 +7,9 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Landing split (2026-10-08, in progress)
+## Landing split (2026-10-08, shipped)
 
-Branch `landing-split`, at the end-of-step pause. Spec `docs/superpowers/specs/2026-10-08-landing-split-design.md`; plan `docs/superpowers/plans/2026-10-08-landing-split.md` (both on the branch).
+Merged into `main` 2026-10-08. Spec `docs/superpowers/specs/2026-10-08-landing-split-design.md`; plan `docs/superpowers/plans/2026-10-08-landing-split.md`.
 
 ### The landing page as its own static app on the shared lagoon
 

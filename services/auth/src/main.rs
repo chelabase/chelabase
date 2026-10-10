@@ -29,13 +29,22 @@ async fn main() -> anyhow::Result<()> {
     info!("auth listening on {}", config.listen);
     let app = match AppConfig::from_env()? {
         Some(c) => {
+            AppConfig::check_internal_token(config.mode, &c.internal_token)?;
             info!("app users' flows are on (access tokens live {} s)", c.access_ttl.as_secs());
             Some(AppUsers::from_config(&c, &config.issuer)?)
         }
         None => None,
     };
+    let signup_gate = {
+        let c = AppConfig::internal_from_env();
+        AppConfig::check_internal_token(config.mode, &c.1)?;
+        auth::app_users::InternalClient::new(&c.0, &c.1)
+    };
     let state = Arc::new(AppState {
         app,
+        signup_gate: Some(signup_gate),
+        used_tickets: Default::default(),
+        admin: AppConfig::admin_from_env(&config.issuer)?,
         zitadel: Zitadel::new(&config.issuer, &config.token),
         config,
         limiter: RateLimiter::default(),

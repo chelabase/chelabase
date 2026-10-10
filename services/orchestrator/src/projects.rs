@@ -22,7 +22,10 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use crate::access::{authorize, authorize_project, Target};
 use crate::{AppState, AuthPrincipal, JobPort, MetadataPort};
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::Access;
 
 pub(crate) fn routes<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>
 where
@@ -123,24 +126,19 @@ pub struct DeleteProjectRequest {
     pub confirm: String,
 }
 
-/// The caller's own, live project, or the response to send instead.
+/// The caller's own, live project once `access` allows the caller on it, or the response to
+/// send instead.
 pub(crate) async fn load_project<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
+    access: Access,
     id: Uuid,
 ) -> Result<ProjectRecord, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    match state.metadata.get_project(principal.tenant_id, ProjectId(id)).await {
-        Ok(Some(record)) => Ok(record),
-        Ok(None) => Err(ApiError::not_found("project not found")),
-        Err(err) => {
-            error!("load project: {err}");
-            Err(ApiError::internal())
-        }
-    }
+    authorize_project(state, principal, access, id).await
 }
 
 /// The name trimmed, or the 422 to send.
@@ -172,7 +170,7 @@ where
     tag = "projects",
     summary = "List the caller's projects",
     responses(
-        (status = 200, description = "The tenant's projects, oldest first", body = Vec<ProjectInfo>),
+        (status = 200, description = "The projects the caller has a grant on, oldest first (a tenant admin sees every project of the tenant)", body = Vec<ProjectInfo>),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -183,13 +181,30 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let records = match state.metadata.list_projects(principal.tenant_id).await {
+    if let Err(err) = authorize(&state, &principal, ep::LIST_PROJECTS.policy.access, Target::None).await {
+        return err.into_response();
+    }
+    let mut records = match state.metadata.list_projects(principal.tenant_id).await {
         Ok(records) => records,
         Err(err) => {
             error!("list projects: {err}");
             return ApiError::internal().into_response();
         }
     };
+    // Only the projects the caller has a grant on; tenant admins see them all.
+    if !principal.member.as_ref().is_some_and(|m| m.tenant_admin) {
+        let Some(member) = principal.member.as_ref() else {
+            return ApiError::internal().into_response();
+        };
+        let granted = match state.metadata.member_projects(member.id).await {
+            Ok(granted) => granted,
+            Err(err) => {
+                error!("list member projects: {err}");
+                return ApiError::internal().into_response();
+            }
+        };
+        records.retain(|r| granted.iter().any(|(project, _)| *project == r.id.as_uuid()));
+    }
     // One query for every project's app-users status.
     let statuses = match state.metadata.project_auth_statuses(principal.tenant_id).await {
         Ok(statuses) => statuses,
@@ -236,6 +251,9 @@ where
     M: MetadataPort,
     J: JobPort,
 {
+    if let Err(err) = authorize(&state, &principal, ep::CREATE_PROJECT.policy.access, Target::None).await {
+        return err.into_response();
+    }
     let name = match checked_name(&body.name) {
         Ok(name) => name,
         Err(err) => return err.into_response(),
@@ -277,7 +295,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_project(&state, &principal, id).await {
+    let record = match load_project(&state, &principal, ep::GET_PROJECT.policy.access, id).await {
         Ok(record) => record,
         Err(err) => return err.into_response(),
     };
@@ -319,6 +337,9 @@ where
     M: MetadataPort,
     J: JobPort,
 {
+    if let Err(err) = load_project(&state, &principal, ep::UPDATE_PROJECT.policy.access, id).await {
+        return err.into_response();
+    }
     let name = match checked_name(&body.name) {
         Ok(name) => name,
         Err(err) => return err.into_response(),
@@ -372,7 +393,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_project(&state, &principal, id).await {
+    let record = match load_project(&state, &principal, ep::DELETE_PROJECT.policy.access, id).await {
         Ok(record) => record,
         Err(err) => return err.into_response(),
     };

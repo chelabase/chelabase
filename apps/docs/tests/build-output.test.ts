@@ -258,8 +258,9 @@ describe('the built docs site', () => {
     );
     // A content page in the reference tab: the footer card to the neighbouring operation is
     // rendered; its sidebar folders are collapsed in the HTML and rendered by the client from the
-    // serialized page tree, which carries the same Badge markup.
-    const contentHtml = read('docs/reference/errors/index.html');
+    // serialized page tree, which carries the same Badge markup. Access sits between data and
+    // errors in the reference meta.json, so its previous neighbour is the last operation of data.
+    const contentHtml = read('docs/reference/access/index.html');
     expect(badges(contentHtml).length).toBeGreaterThan(0);
     const tree = treeBadges(contentHtml);
     for (const method of ['GET', 'POST', 'PATCH', 'PUT', 'DELETE']) {

@@ -1,6 +1,8 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { Navigate, createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useState } from "react";
 import { LoginProviders } from "@/components/login/login-providers";
 import { SignInForm } from "@/components/login/sign-in-form";
+import { resumeInvite } from "@/lib/pending-invite";
 
 export const Route = createFileRoute("/login")({
   validateSearch: (search: Record<string, unknown>) => ({
@@ -13,6 +15,9 @@ export const Route = createFileRoute("/login")({
 function LoginPage() {
   const { authRequest, notice } = Route.useSearch();
   const navigate = useNavigate();
+  // An invite link started this sign-in: finish it on the accept page instead.
+  const [resume] = useState(() => resumeInvite(authRequest));
+  if (resume) return <Navigate to="/accept-invite" search={{ user: resume.user, code: "", t: "", reset: false, authRequest: resume.authRequest }} replace />;
   return (
     <LoginProviders>
       <SignInForm authRequest={authRequest} notice={notice}

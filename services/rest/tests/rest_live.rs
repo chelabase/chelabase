@@ -434,6 +434,8 @@ impl Live {
                 project_id: None,
                 role_oid: Some(oid),
             }),
+            email: None,
+            name: None,
         };
         let resp = self
             .http
@@ -470,6 +472,8 @@ impl Live {
                 project_id: None,
                 role_oid: None,
             }),
+            email: None,
+            name: None,
         };
         self.signer.sign("rest", &identity).unwrap()
     }

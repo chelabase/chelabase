@@ -32,10 +32,13 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use crate::access::{authorize_database, Target};
 use crate::branches::load_branch;
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::Access;
 use crate::{
     AppState, AuthPrincipal, BACKUP_REFUSAL, JobPort, MetadataPort, RESET_NOT_APPLIED, ResetError,
-    load_owned, reset_branch_password,
+    reset_branch_password,
 };
 
 /// Documents the `keys` extra of `role_in_use`, which no handler returns as a body type.
@@ -86,6 +89,12 @@ pub(crate) struct BranchRole {
     bypass_rls: bool,
     /// The roles it's a direct member of, by name (`neon_superuser` isn't listed).
     member_of: Vec<String>,
+    /// Those of `member_of` without the SET option: the role can't `SET ROLE` to them, though
+    /// it still inherits their privileges (I2).
+    member_no_set: Vec<String>,
+    /// Those of `member_of` with the ADMIN option: the role can grant the group on (I2). A role
+    /// holding it is Admin-only to grant (R30).
+    member_admin: Vec<String>,
 }
 
 impl BranchRole {
@@ -112,6 +121,8 @@ impl BranchRole {
             valid_until: row.attributes.valid_until,
             bypass_rls: row.attributes.bypass_rls,
             member_of: row.attributes.member_of,
+            member_no_set: row.attributes.member_no_set,
+            member_admin: row.attributes.member_admin,
         }
     }
 }
@@ -289,6 +300,7 @@ fn usable(branch: BranchRecord) -> Result<(BranchRecord, String), ApiError> {
 async fn load_target<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
+    access: Access,
     id: Uuid,
     branch_id: Uuid,
 ) -> Result<(DatabaseRecord, BranchRecord, String), ApiError>
@@ -296,7 +308,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = load_owned(state, principal, id).await?;
+    let record = authorize_database(state, principal, access, Target::Branch { database: id, branch: branch_id }).await?;
     let branch = load_branch(state, &record, branch_id).await?;
     let (branch, endpoint) = usable(branch)?;
     Ok((record, branch, endpoint))
@@ -403,7 +415,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (_, branch, endpoint) = match load_target(&state, &principal, id, branch_id).await {
+    let (_, branch, endpoint) = match load_target(&state, &principal, ep::LIST_ROLES.policy.access, id, branch_id).await {
         Ok(target) => target,
         Err(err) => return err.into_response(),
     };
@@ -456,7 +468,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (record, branch, endpoint) = match load_target(&state, &principal, id, branch_id).await {
+    let (record, branch, endpoint) = match load_target(&state, &principal, ep::CREATE_ROLE.policy.access, id, branch_id).await {
         Ok(target) => target,
         Err(err) => return err.into_response(),
     };
@@ -542,7 +554,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::RESET_ROLE.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(err) => return err.into_response(),
     };
@@ -605,7 +617,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (record, branch, _) = match load_target(&state, &principal, id, branch_id).await {
+    let (record, branch, _) = match load_target(&state, &principal, ep::DELETE_ROLE.policy.access, id, branch_id).await {
         Ok(target) => target,
         Err(err) => return err.into_response(),
     };
@@ -662,7 +674,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (record, branch, endpoint) = match load_target(&state, &principal, id, branch_id).await {
+    let (record, branch, endpoint) = match load_target(&state, &principal, ep::UPDATE_ROLE.policy.access, id, branch_id).await {
         Ok(target) => target,
         Err(err) => return err.into_response(),
     };
@@ -798,7 +810,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (_, branch, _) = match load_target(&state, &principal, id, branch_id).await {
+    let (_, branch, _) = match load_target(&state, &principal, ep::LIST_ROLE_SESSIONS.policy.access, id, branch_id).await {
         Ok(target) => target,
         Err(err) => return err.into_response(),
     };

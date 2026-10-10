@@ -36,6 +36,14 @@ reserved AS (
                       'chelabase_auth_sync', 'cloud_admin', 'neon_superuser')
      OR r.rolname LIKE 'pg\_%'
      OR lower(r.rolname) LIKE 'chelabase\_%'
+     OR lower(r.rolname) LIKE 'cb\_m\_%'
+),
+-- Roles that never appear as an ACL grantee: Chelabase's own and the hidden member login roles.
+-- (Not all of `reserved`: grants to anon / authenticated stay.)
+hidden AS (
+  SELECT r.oid FROM pg_roles r
+  WHERE lower(r.rolname) LIKE 'chelabase\_%'
+     OR lower(r.rolname) LIKE 'cb\_m\_%'
 ),
 tabs AS (
   SELECT c.oid, c.relname, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity,
@@ -60,7 +68,8 @@ schemas_j AS (
               ORDER BY a.grantee, a.privilege_type, a.grantor), '[]'::jsonb)
             FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
             LEFT JOIN pg_roles gr ON gr.oid = a.grantor
-            LEFT JOIN pg_roles ge ON ge.oid = a.grantee)
+            LEFT JOIN pg_roles ge ON ge.oid = a.grantee
+            WHERE a.grantee NOT IN (SELECT oid FROM hidden))
   ) AS j
   FROM ns n JOIN pg_roles o ON o.oid = n.nspowner
 ),
@@ -83,7 +92,8 @@ tables_j AS (
             FROM aclexplode(coalesce(t.relacl, acldefault('r', t.relowner))) a
             LEFT JOIN pg_roles gr ON gr.oid = a.grantor
             LEFT JOIN pg_roles ge ON ge.oid = a.grantee
-            WHERE NOT (t.is_users
+            WHERE a.grantee NOT IN (SELECT oid FROM hidden)
+              AND NOT (t.is_users
                        AND coalesce(ge.rolname, '') IN ('authenticated', 'chelabase_auth_sync'))),
     'columns', (SELECT coalesce(jsonb_agg(jsonb_build_object(
         'attnum', a.attnum,
@@ -113,7 +123,8 @@ tables_j AS (
                       ORDER BY sa.grantee, sa.privilege_type, sa.grantor), '[]'::jsonb)
                     FROM aclexplode(coalesce(s.relacl, acldefault('s', s.relowner))) sa
                     LEFT JOIN pg_roles sgr ON sgr.oid = sa.grantor
-                    LEFT JOIN pg_roles sge ON sge.oid = sa.grantee))
+                    LEFT JOIN pg_roles sge ON sge.oid = sa.grantee
+                    WHERE sa.grantee NOT IN (SELECT oid FROM hidden)))
           FROM pg_depend d
           JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
           JOIN pg_sequence sq ON sq.seqrelid = s.oid
@@ -127,7 +138,8 @@ tables_j AS (
                   ORDER BY ca.grantee, ca.privilege_type, ca.grantor), '[]'::jsonb)
                 FROM aclexplode(a.attacl) ca
                 LEFT JOIN pg_roles cgr ON cgr.oid = ca.grantor
-                LEFT JOIN pg_roles cge ON cge.oid = ca.grantee)
+                LEFT JOIN pg_roles cge ON cge.oid = ca.grantee
+                WHERE ca.grantee NOT IN (SELECT oid FROM hidden))
       ) ORDER BY a.attnum), '[]'::jsonb)
       FROM pg_attribute a
       JOIN pg_type ty ON ty.oid = a.atttypid
@@ -242,7 +254,8 @@ sequences_j AS (
               ORDER BY a.grantee, a.privilege_type, a.grantor), '[]'::jsonb)
             FROM aclexplode(coalesce(s.relacl, acldefault('s', s.relowner))) a
             LEFT JOIN pg_roles gr ON gr.oid = a.grantor
-            LEFT JOIN pg_roles ge ON ge.oid = a.grantee)
+            LEFT JOIN pg_roles ge ON ge.oid = a.grantee
+            WHERE a.grantee NOT IN (SELECT oid FROM hidden))
   ) AS j
   FROM pg_class s
   JOIN ns n ON n.oid = s.relnamespace
@@ -270,7 +283,9 @@ roles_j AS (
                   FROM pg_auth_members m
                   JOIN pg_roles mr ON mr.oid = m.roleid
                   JOIN pg_roles mg ON mg.oid = m.grantor
-                  WHERE m.member = r.oid),
+                  WHERE m.member = r.oid
+                    AND mr.oid NOT IN (SELECT oid FROM hidden)
+                    AND mg.oid NOT IN (SELECT oid FROM hidden)),
     'other_attributes', to_jsonb(array_remove(ARRAY[
         CASE WHEN r.rolsuper THEN 'SUPERUSER' END,
         CASE WHEN r.rolcreatedb THEN 'CREATEDB' END,
@@ -297,7 +312,8 @@ default_privileges_raw AS (
             FROM aclexplode(d.defaclacl) a
             LEFT JOIN pg_roles gr ON gr.oid = a.grantor
             LEFT JOIN pg_roles ge ON ge.oid = a.grantee
-            WHERE NOT (d.defaclnamespace <> 0 AND dr.rolname = 'postgres'
+            WHERE a.grantee NOT IN (SELECT oid FROM hidden)
+              AND NOT (d.defaclnamespace <> 0 AND dr.rolname = 'postgres'
                        AND coalesce(ge.rolname, '') IN ('anon', 'authenticated')))
   ) AS j
   FROM pg_default_acl d

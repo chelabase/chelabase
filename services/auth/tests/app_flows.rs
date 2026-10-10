@@ -199,6 +199,9 @@ async fn harness_opts(verification: bool, min_ms: u64, app_on: bool) -> H {
         config,
         limiter: RateLimiter::default(),
         app,
+        signup_gate: None,
+        used_tickets: Default::default(),
+        admin: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -259,6 +262,8 @@ impl H {
                         project_id: Some(self.project),
                         role_oid: None,
                     }),
+                    email: None,
+                    name: None,
                 },
             )
             .unwrap()
@@ -283,6 +288,8 @@ impl H {
                         project_id: Some(self.project),
                         role_oid: None,
                     }),
+                    email: None,
+                    name: None,
                 },
             )
             .unwrap()
@@ -349,6 +356,7 @@ impl H {
             locked: false,
             org_id: self.org(),
             username: id.clone(),
+            display_name: String::new(),
             inactive: false,
             created_at: "2026-10-03T10:00:00Z".into(),
         });

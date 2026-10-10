@@ -693,6 +693,7 @@ pub(crate) mod tests {
                 locked: false,
                 org_id: org.into(),
                 username: id.to_string(),
+                display_name: String::new(),
                 inactive: false,
                 created_at: "2026-10-03T10:00:00Z".into(),
             });
@@ -1394,8 +1395,10 @@ pub(crate) mod tests {
             org_id: "org".into(),
             email: email.into(),
             email_verified: verified,
+            display_name: String::new(),
             state: UserState::Active,
             created_at: None,
+            has_password: true,
         }
     }
 

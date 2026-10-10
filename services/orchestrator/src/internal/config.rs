@@ -85,6 +85,12 @@ impl InternalConfig {
         })
     }
 
+    /// Startup refusals that depend on the mode (M9): a platform instance doesn't run with the
+    /// development bearer (`CHELABASE_APP_AUTH_INTERNAL_TOKEN` unset), which is public.
+    pub fn check_mode(&self, policy: &chelabase_types::mode_policy::ModePolicy) -> Result<()> {
+        policy.check_internal_token(&self.app_auth_token).map_err(|e| anyhow!(e))
+    }
+
     /// The Zitadel admin client (P2), or `None` (with a warning) when the PAT file or the
     /// issuer is missing: then Zitadel sessions aren't deleted on revoke.
     pub fn load_zitadel(&self) -> Option<chelabase_zitadel::client::Zitadel> {
@@ -277,6 +283,22 @@ mod tests {
         assert_eq!(c.actions_signing_key, None);
         assert_eq!(c.zitadel_admin_pat_file, None);
         assert_eq!(c.zitadel_issuer, None);
+    }
+
+    // M9: a platform instance refuses to start with the development bearer.
+    #[test]
+    fn platform_refuses_the_default_app_auth_token() {
+        use chelabase_types::mode::Mode;
+        use chelabase_types::mode_policy::ModePolicy;
+        let default = InternalConfig::from_lookup(|_| None).unwrap();
+        let own = InternalConfig::from_lookup(|name| {
+            (name == "CHELABASE_APP_AUTH_INTERNAL_TOKEN").then(|| "a-long-random-secret".to_string())
+        })
+        .unwrap();
+        let (sh, pf) = (ModePolicy::new(Mode::SelfHosted), ModePolicy::new(Mode::Platform));
+        assert!(default.check_mode(&sh).is_ok());
+        assert!(default.check_mode(&pf).is_err());
+        assert!(own.check_mode(&sh).is_ok() && own.check_mode(&pf).is_ok());
     }
 
     #[test]

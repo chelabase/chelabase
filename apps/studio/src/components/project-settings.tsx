@@ -9,6 +9,7 @@ import {
   type ProjectInfo,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { AppUsersCard } from "./app-users-card";
 import { DeleteProjectDialog } from "./delete-project-dialog";
@@ -24,11 +25,14 @@ export interface ProjectSettingsProps {
 
 export function ProjectSettings({ project, databases, databasesError, onDeleted }: ProjectSettingsProps) {
   const deleting = project.status === "deleting";
+  // Renaming, app-user auth and deleting are Admin's; others read the settings.
+  const admin = useProjectCaps().atLeast("admin");
   return (
-    <fieldset disabled={deleting} className="m-0 min-w-0 space-y-8 border-0 p-0">
-      <RenameForm project={project} />
+    <fieldset disabled={deleting || !admin} className="m-0 min-w-0 space-y-8 border-0 p-0">
+      {!admin && <p className="text-sm text-chalk-dim">Only project Admins can change these settings.</p>}
+      {admin && <RenameForm project={project} />}
       <AppUsersCard project={project} databases={databases} />
-      <DangerZone project={project} databases={databases} databasesError={databasesError} onDeleted={onDeleted} />
+      {admin && <DangerZone project={project} databases={databases} databasesError={databasesError} onDeleted={onDeleted} />}
     </fieldset>
   );
 }
@@ -74,7 +78,7 @@ function RenameForm({ project }: { project: ProjectInfo }) {
               setSaved(false);
             }}
             maxLength={64}
-            className="h-8 w-64 rounded-lg border border-input bg-background px-2"
+            className="h-8 w-64 border border-input bg-background px-2"
           />
         </label>
         <Button type="submit" disabled={!trimmed || trimmed === project.name || update.isPending}>
@@ -95,7 +99,7 @@ function DangerZone({ project, databases, databasesError, onDeleted }: ProjectSe
   const [open, setOpen] = useState(false);
   const [started, setStarted] = useState(false);
   return (
-    <section className="space-y-3 rounded-lg border border-destructive/40 p-4">
+    <section className="space-y-3 border border-destructive/40 p-4">
       <h2 className="text-lg font-semibold text-destructive">Danger zone</h2>
       <p className="text-sm text-muted-foreground">
         Deleting the project destroys all its databases, branches and data. This can't be undone.

@@ -11,6 +11,7 @@ use chelabase_metadata::{
     NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, OnDelete, ProjectAuth, ProjectRecord,
     ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
 };
+use chelabase_metadata::members::InviteDescription;
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
 use chelabase_types::{DatabaseId, ProjectId, TenantId};
 use chelabase_zitadel::client::Zitadel;
@@ -76,6 +77,10 @@ struct FakeNeon {
     ddl_lock_timeout: Arc<Mutex<bool>>,
     /// App users (step 6b).
     app: Arc<Mutex<AppRows>>,
+    /// Zitadel org id -> (open sign-up, has members) for the sign-up gate.
+    signup: Arc<Mutex<HashMap<String, (bool, bool)>>>,
+    /// Zitadel user id -> the user's open invite (a closed one is simply absent).
+    invites: Arc<Mutex<HashMap<String, InviteDescription>>>,
 }
 
 /// The app-user rows the fake holds.
@@ -240,6 +245,23 @@ impl DdlPort for FakeDdl {
             self.wrote = true;
         }
         Ok(removable)
+    }
+    async fn upsert_no_password(&mut self, name: &str) -> Result<(), MetadataError> {
+        match self.state.roles.get_mut(name) {
+            Some(r) if r.origin == RoleOrigin::Sql => {
+                r.scram_verifier = None;
+                r.password_enc = None;
+            }
+            Some(_) => {}
+            None => {
+                let mut row = copy(name, RoleOrigin::Sql, None, None);
+                row.login = false;
+                self.state.roles.insert(name.into(), row);
+            }
+        }
+        self.state.stamped.insert(name.into());
+        self.wrote = true;
+        Ok(())
     }
     async fn rename_copy(
         &mut self,
@@ -563,6 +585,27 @@ impl NeonMetadataPort for FakeNeon {
             .iter()
             .find(|a| a.zitadel_org_id.as_deref() == Some(org_id))
             .cloned())
+    }
+
+    async fn signup_facts(
+        &self,
+        zitadel_org_id: &str,
+    ) -> Result<Option<orchestrator::internal::SignUpFacts>, MetadataError> {
+        self.check()?;
+        Ok(self
+            .signup
+            .lock()
+            .unwrap()
+            .get(zitadel_org_id)
+            .map(|(open, has_members)| orchestrator::internal::SignUpFacts {
+                open: *open,
+                has_members: *has_members,
+            }))
+    }
+
+    async fn open_invite_for_user(&self, zitadel_user_id: &str) -> Result<Option<InviteDescription>, MetadataError> {
+        self.check()?;
+        Ok(self.invites.lock().unwrap().get(zitadel_user_id).cloned())
     }
 
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -955,6 +998,7 @@ struct AppSetup {
     zitadel: Option<String>,
     jobs: FakeJobs,
     resync: FakeResync,
+    mode: Mode,
 }
 
 impl Default for AppSetup {
@@ -965,20 +1009,30 @@ impl Default for AppSetup {
             zitadel: None,
             jobs: FakeJobs::default(),
             resync: FakeResync::default(),
+            mode: Mode::SelfHosted,
         }
     }
 }
 
-/// Records each branch the receiver asked the worker to resync.
+/// Records each branch the receiver asked the worker to resync, and each it asked to
+/// reconcile the member roles of.
 #[derive(Clone, Default)]
 struct FakeResync {
     asked: Arc<Mutex<Vec<BranchId>>>,
+    members_asked: Arc<Mutex<Vec<BranchId>>>,
 }
 
 impl ResyncPort for FakeResync {
     fn resync_branch(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
             self.asked.lock().unwrap().push(branch);
+            Ok(())
+        })
+    }
+
+    fn reconcile_member_roles(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.members_asked.lock().unwrap().push(branch);
             Ok(())
         })
     }
@@ -1041,6 +1095,7 @@ async fn spawn_with_app(
             .zitadel
             .map(|base| Zitadel::new(&base, chelabase_zitadel::mock::ADMIN_TOKEN)),
         app_jobs: Arc::new(app.jobs),
+        policy: chelabase_types::mode_policy::ModePolicy::new(app.mode),
     });
     let addr = serve(build_internal_router(state)).await;
     Internal {
@@ -2361,7 +2416,8 @@ fn rows() -> Vec<Rule> {
             body: roles_delta(vec![json!({ "op": "set", "name": "r1" }), set("app_rw", STRONG, SCRAM)]),
             status: 200,
             text: "",
-            check: |s| assert!(s.roles.contains_key("app_rw") && !s.roles.contains_key("r1")),
+            // r1 stays, without a password: the role exists; the cap counts only verifiers.
+            check: |s| assert!(s.roles.contains_key("app_rw") && s.roles["r1"].scram_verifier.is_none()),
         },
         Rule {
             what: "at the cap, a new copy then PASSWORD NULL",
@@ -2370,7 +2426,7 @@ fn rows() -> Vec<Rule> {
             body: roles_delta(vec![set("app_rw", STRONG, SCRAM), json!({ "op": "set", "name": "r1" })]),
             status: 200,
             text: "",
-            check: |s| assert!(s.roles.contains_key("app_rw") && !s.roles.contains_key("r1")),
+            check: |s| assert!(s.roles.contains_key("app_rw") && s.roles["r1"].scram_verifier.is_none()),
         },
         Rule {
             what: "over the cap from before, a delta that doesn't add a copy",
@@ -2414,24 +2470,24 @@ fn rows() -> Vec<Rule> {
             check: |s| assert!(!s.owner_password_cleared),
         },
         Rule {
-            what: "PASSWORD NULL removes a copy",
+            what: "PASSWORD NULL keeps an sql row without its verifier",
             rules: sh,
             setup: two_sql_copies,
             body: roles_delta(vec![json!({ "op": "set", "name": "r1" })]),
             status: 200,
             text: "",
-            check: |s| assert!(!s.roles.contains_key("r1") && s.roles.contains_key("r2")),
+            check: |s| assert!(s.roles["r1"].scram_verifier.is_none() && s.roles.contains_key("r2")),
         },
         Rule {
-            what: "a group role",
+            what: "a group role gets a row without a password",
             rules: sh,
             setup: none,
             body: roles_delta(vec![json!({ "op": "set", "name": "grp" })]),
             status: 200,
             text: "",
             check: |s| {
-                assert!(!s.roles.contains_key("grp"));
-                assert_eq!(s.roles_version, 0);
+                assert_eq!((s.roles["grp"].origin, s.roles["grp"].scram_verifier.as_deref()), (RoleOrigin::Sql, None));
+                assert_eq!(s.roles_version, 1);
             },
         },
         Rule {
@@ -2731,16 +2787,29 @@ async fn ddl_rename_reseals_an_api_password() {
 }
 
 // A role made, renamed and given `PASSWORD NULL` in one transaction reaches the receiver as
-// one op for `c` (old name `b`, password null) while neither name has a row: nothing to move
-// or clear, so no row appears for either.
+// one op for `c` (old name `b`, password null) while neither name has a row: nothing moves,
+// and `c` exists without a password, so it gets a row with no verifier.
 #[tokio::test]
-async fn ddl_rename_of_an_unknown_role_with_null_password_leaves_no_row() {
+async fn ddl_rename_of_an_unknown_role_with_null_password_leaves_a_row_without_a_password() {
     let (neon, _) = ddl_neon();
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     let body = roles_delta(vec![json!({ "op": "set", "name": "c", "old_name": "b", "password": null })]);
     assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
     let state = neon.ddl_state();
-    assert!(!state.roles.contains_key("b") && !state.roles.contains_key("c"), "{:?}", state.roles.keys());
+    assert!(!state.roles.contains_key("b"), "{:?}", state.roles.keys());
+    assert_eq!((state.roles["c"].origin, state.roles["c"].scram_verifier.as_deref()), (RoleOrigin::Sql, None));
+}
+
+// A group role made in SQL (`CREATE ROLE billing`, no password) gets a row without a
+// verifier, so members can be granted it; it never counts against the login-role cap.
+#[tokio::test]
+async fn ddl_group_role_gets_a_row_without_a_password() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let body = roles_delta(vec![json!({ "op": "set", "name": "billing", "password": null, "login": false })]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
+    let row = neon.ddl_state().roles["billing"].clone();
+    assert_eq!((row.origin, row.scram_verifier.as_deref(), row.login), (RoleOrigin::Sql, None, false));
 }
 
 fn rename(old: &str, new: &str) -> Value {
@@ -3080,6 +3149,35 @@ async fn ddl_touched_roles_ask_for_one_resync() {
     assert_eq!(state.roles_version, before.roles_version);
 }
 
+// Members T8 (I3, R17): every accepted delta that touches roles (made, dropped, renamed,
+// touched attributes or memberships, a password) asks for one member-role reconcile of the
+// branch; a databases-only delta asks for none (member roles are cluster-wide), and neither
+// does a refused one.
+#[tokio::test]
+async fn ddl_role_changes_ask_for_a_member_reconcile() {
+    let (neon, branch) = ddl_neon();
+    neon.edit(two_sql_copies);
+    let resync = FakeResync::default();
+    let app = spawn_with_resync(neon.clone(), resync.clone()).await;
+    let db = dbs_delta(vec![json!({ "op": "set", "name": "extra", "owner": "postgres" })]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &db).await.0, 200);
+    let refused = roles_delta(vec![set("anon", STRONG, SCRAM)]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &refused).await.0, 409);
+    for (i, op) in [
+        set("app_rw", STRONG, SCRAM),
+        json!({ "op": "set", "name": "grp", "touched": true }),
+        json!({ "op": "set", "name": "r9", "old_name": "r1" }),
+        json!({ "op": "del", "name": "grp" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op.clone()])).await.0, 200, "{op}");
+        assert!(wait_until(|| resync.members_asked.lock().unwrap().len() == i + 1).await, "{op}");
+    }
+    assert_eq!(*resync.members_asked.lock().unwrap(), [branch; 4]);
+}
+
 // M1: dropping a group role changes its members' derived levels, so a `del` resyncs too.
 #[tokio::test]
 async fn ddl_a_role_drop_asks_for_one_resync() {
@@ -3152,9 +3250,10 @@ async fn ddl_token_is_checked_before_the_body_is_buffered() {
     }
 }
 
-// C7: an explicit `"password": null` next to `old_name` is a rename that removes the copy.
+// C7: an explicit `"password": null` next to `old_name` is a rename that removes the password:
+// the row moves and keeps no verifier.
 #[tokio::test]
-async fn ddl_rename_with_explicit_null_password_removes_the_copy() {
+async fn ddl_rename_with_explicit_null_password_removes_the_password() {
     let (neon, _) = ddl_neon();
     let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
     neon.edit(|s| {
@@ -3167,7 +3266,7 @@ async fn ddl_rename_with_explicit_null_password_removes_the_copy() {
     assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &body).await.0, 200);
     let state = neon.ddl_state();
     assert!(!state.roles.contains_key("r1"));
-    assert!(!state.roles.contains_key("r2"));
+    assert_eq!(state.roles["r2"].scram_verifier, None);
 }
 
 // C7 and E8: the owner can't lose its password, with or without a rename.
@@ -3276,12 +3375,12 @@ async fn ddl_recreated_role_without_keys_is_taken() {
     let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
     assert_eq!(status, 200, "{text}");
     assert_eq!(neon.ddl_state().roles["app"].scram_verifier.as_deref(), Some(SCRAM2));
-    // Without a password: the copy goes.
+    // Without a password: the old row goes and the new role's row has no verifier.
     let mut op = json!({ "op": "set", "name": "app", "password": null, "recreated": true });
     op["touched"] = json!(true);
     let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
     assert_eq!(status, 200, "{text}");
-    assert!(!neon.ddl_state().roles.contains_key("app"));
+    assert_eq!(neon.ddl_state().roles["app"].scram_verifier, None);
 }
 
 // I1: a recreated role is a new role. Its row starts fresh (origin `sql`, plain, no API
@@ -3655,6 +3754,7 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
             zitadel: zitadel.map(|z| z.base.clone()),
             jobs: jobs.clone(),
             resync: FakeResync::default(),
+            mode: Mode::SelfHosted,
         },
     )
     .await;
@@ -4504,4 +4604,183 @@ async fn webhook_503_without_signing_key() {
     let body = user_event("user.human.added", ORG, &uuid::Uuid::new_v4().to_string(), chrono::Utc::now());
     assert_eq!(a.app.event(&body, signed(&body)).await, 503);
     assert_eq!(a.app.event(&body, None).await, 503);
+}
+
+#[tokio::test]
+async fn signup_allowed_reasons() {
+    let neon = FakeNeon::default();
+    {
+        let mut m = neon.signup.lock().unwrap();
+        m.insert("org-open".into(), (true, true));
+        m.insert("org-first".into(), (false, false));
+        m.insert("org-closed".into(), (false, true));
+    }
+    let setup = |mode| AppSetup { mode, ..AppSetup::default() };
+    let spawn = |neon: FakeNeon, mode| {
+        spawn_with_app(
+            neon,
+            FakeLocator::default(),
+            "http://127.0.0.1:9",
+            rules(Mode::SelfHosted, false),
+            FakeCache::default(),
+            "http://127.0.0.1:9",
+            setup(mode),
+        )
+    };
+    let app = spawn(neon.clone(), Mode::SelfHosted).await;
+    let ask = |org: &'static str| {
+        let app = &app;
+        async move {
+            app.get(&format!("/internal/signup/allowed?org={org}"), Some(APP_AUTH_TOKEN))
+                .await
+        }
+    };
+    assert_eq!(ask("org-open").await, (200, json!({"allowed": true, "reason": "open"})));
+    assert_eq!(ask("org-first").await, (200, json!({"allowed": true, "reason": "first_member"})));
+    assert_eq!(ask("org-closed").await, (200, json!({"allowed": false, "reason": "closed"})));
+    assert_eq!(ask("org-unknown").await, (200, json!({"allowed": false, "reason": "closed"})));
+    assert_eq!(
+        app.get("/internal/signup/allowed?org=org-open", Some("wrong")).await.0,
+        401
+    );
+    assert_eq!(app.get("/internal/signup/allowed?org=org-open", None).await.0, 401);
+    let platform = spawn(neon, Mode::Platform).await;
+    assert_eq!(
+        platform
+            .get("/internal/signup/allowed?org=org-open", Some(APP_AUTH_TOKEN))
+            .await,
+        (200, json!({"allowed": false, "reason": "platform"}))
+    );
+}
+
+// T12x: the invite description (R32). The auth service asks with the Zitadel user id and the
+// SHA-256 of the link's token; only an open invite with that exact hash answers.
+fn invite_fixture(neon: &FakeNeon, hash: Option<[u8; 32]>) {
+    neon.invites.lock().unwrap().insert(
+        "u1".into(),
+        InviteDescription {
+            token_hash: hash.map(|h| h.to_vec()),
+            inviter_name: "Alice".into(),
+            inviter_email: Some("alice@x.com".into()),
+            tenant_slug: "acme".into(),
+            tenant_display_name: None,
+        },
+    );
+}
+
+async fn describe_app(neon: FakeNeon) -> Internal {
+    spawn_with_app(
+        neon,
+        FakeLocator::default(),
+        "http://127.0.0.1:9",
+        rules(Mode::SelfHosted, false),
+        FakeCache::default(),
+        "http://127.0.0.1:9",
+        AppSetup::default(),
+    )
+    .await
+}
+
+fn token_hash(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn token_hash_hex(token: &str) -> String {
+    hex::encode(token_hash(token))
+}
+
+#[tokio::test]
+async fn describe_invite_needs_the_token() {
+    let neon = FakeNeon::default();
+    invite_fixture(&neon, Some(token_hash("right")));
+    let app = describe_app(neon).await;
+    let ask = |user: &str, hash: &str| {
+        let body = json!({ "user": user, "token_hash": hash });
+        let app = &app;
+        async move { app.post_json("/internal/invites/describe", Some(APP_AUTH_TOKEN), body).await }
+    };
+    assert_eq!(
+        ask("u1", &token_hash_hex("right")).await,
+        (200, json!({"inviter_name": "Alice", "inviter_email": "alice@x.com", "tenant_name": "acme"}))
+    );
+    // Every wrong part answers the same 404.
+    let wrong_token = ask("u1", &token_hash_hex("wrong")).await;
+    let wrong_user = ask("u2", &token_hash_hex("right")).await;
+    let not_hex = ask("u1", "zz").await;
+    let short = ask("u1", &token_hash_hex("right")[..60]).await;
+    assert_eq!(wrong_token.0, 404);
+    assert_eq!(wrong_token, wrong_user);
+    assert_eq!(wrong_token, not_hex);
+    assert_eq!(wrong_token, short);
+    assert_eq!(wrong_token.1["error"]["code"], "not_found");
+    // The bearer is the app-auth one.
+    let body = json!({ "user": "u1", "token_hash": token_hash_hex("right") });
+    assert_eq!(app.post_json("/internal/invites/describe", Some("wrong"), body.clone()).await.0, 401);
+    assert_eq!(app.post_json("/internal/invites/describe", None, body).await.0, 401);
+    // A body that is not the expected JSON is the same 404 as any other mismatch.
+    let junk = app.post_json("/internal/invites/describe", Some(APP_AUTH_TOKEN), json!({ "user": 1 })).await;
+    assert_eq!(junk, wrong_token);
+}
+
+// R36: the invite page names the workspace by its display name, and by its slug without one.
+#[tokio::test]
+async fn describe_invite_uses_display_name() {
+    let neon = FakeNeon::default();
+    invite_fixture(&neon, Some(token_hash("right")));
+    let app = describe_app(neon.clone()).await;
+    let ask = || {
+        let body = json!({ "user": "u1", "token_hash": token_hash_hex("right") });
+        let app = &app;
+        async move { app.post_json("/internal/invites/describe", Some(APP_AUTH_TOKEN), body).await }
+    };
+    assert_eq!(ask().await.1["tenant_name"], "acme");
+    neon.invites.lock().unwrap().get_mut("u1").unwrap().tenant_display_name = Some("Acme Corp".into());
+    assert_eq!(ask().await.1["tenant_name"], "Acme Corp");
+}
+
+// Live finding: an inviter without a name falls back to its email's local part, and one with
+// neither (a machine user, like the dev bootstrap's demo user) to "An admin" (only tenant and
+// project Admins invite), so the invite page never says " invited you to …".
+#[tokio::test]
+async fn describe_invite_names_an_inviter_without_a_name() {
+    let neon = FakeNeon::default();
+    invite_fixture(&neon, Some(token_hash("right")));
+    let app = describe_app(neon.clone()).await;
+    let ask = || {
+        let body = json!({ "user": "u1", "token_hash": token_hash_hex("right") });
+        let app = &app;
+        async move { app.post_json("/internal/invites/describe", Some(APP_AUTH_TOKEN), body).await.1 }
+    };
+    neon.invites.lock().unwrap().get_mut("u1").unwrap().inviter_name = " ".into();
+    let named = ask().await;
+    assert_eq!((named["inviter_name"].as_str(), named["inviter_email"].as_str()), (Some("alice"), Some("alice@x.com")));
+    neon.invites.lock().unwrap().get_mut("u1").unwrap().inviter_email = None;
+    assert_eq!(
+        ask().await,
+        json!({"inviter_name": "An admin", "inviter_email": null, "tenant_name": "acme"})
+    );
+}
+
+#[tokio::test]
+async fn describe_invite_closed_is_404() {
+    // No open invite (revoked, accepted, expired or none: the metadata answers `None`) and an
+    // invite made before tokens existed both answer the same 404 as a wrong token.
+    let neon = FakeNeon::default();
+    let app = describe_app(neon.clone()).await;
+    let ask = |hash: String| {
+        let app = &app;
+        async move {
+            app.post_json("/internal/invites/describe", Some(APP_AUTH_TOKEN), json!({ "user": "u1", "token_hash": hash }))
+                .await
+        }
+    };
+    let closed = ask(token_hash_hex("t")).await;
+    assert_eq!(closed.0, 404);
+    invite_fixture(&neon, None);
+    assert_eq!(ask(token_hash_hex("t")).await, closed);
+    // No stored token, and a presented hash of 64 zeros (what an unset hash might look like).
+    assert_eq!(ask("0".repeat(64)).await, closed);
+    invite_fixture(&neon, Some([0; 32]));
+    assert_eq!(ask(token_hash_hex("t")).await, closed);
 }

@@ -155,6 +155,9 @@ impl RoleSpec {
             valid_until: self.valid_until.map(to_micros),
             bypass_rls: self.bypass_rls,
             member_of: sorted(&self.member_of),
+            // A role the API makes is granted its groups plainly (SET, no ADMIN).
+            member_no_set: Vec::new(),
+            member_admin: Vec::new(),
         }
     }
 }
@@ -190,7 +193,17 @@ pub struct RolePatch {
 impl RolePatch {
     /// `current` with this change.
     pub fn apply(&self, current: &RoleAttributes) -> RoleAttributes {
+        let member_of = match &self.member_of {
+            Some(members) => sorted(members),
+            None => current.member_of.clone(),
+        };
+        // A membership the change keeps keeps its options (I2); a new one is granted plainly.
+        let kept = |options: &[String]| -> Vec<String> {
+            options.iter().filter(|g| member_of.contains(g)).cloned().collect()
+        };
         RoleAttributes {
+            member_no_set: kept(&current.member_no_set),
+            member_admin: kept(&current.member_admin),
             inherit: self.inherit.unwrap_or(current.inherit),
             connection_limit: self.connection_limit.unwrap_or(current.connection_limit),
             valid_until: match self.valid_until {
@@ -198,10 +211,7 @@ impl RolePatch {
                 None => current.valid_until,
             },
             bypass_rls: self.bypass_rls.unwrap_or(current.bypass_rls),
-            member_of: match &self.member_of {
-                Some(members) => sorted(members),
-                None => current.member_of.clone(),
-            },
+            member_of,
         }
     }
 }
@@ -628,6 +638,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             login = spec.login,
             "role created"
         );
+        // A grant may name it (or a tenant admin gets every role): the members' roles follow.
+        self.member_role_requests.request(branch);
         RoleOutcome::Ok
     }
 
@@ -822,6 +834,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             warn!(branch_id = %branch, endpoint_id = %ep, role = name, "removing the row; the resync will: {e}");
         }
         info!(branch_id = %branch, endpoint_id = %ep, role = name, "role changed");
+        // An owner-level or membership change can make the role unsafe for member roles (R16).
+        self.member_role_requests.request(branch);
         RoleOutcome::Ok
     }
 
@@ -988,6 +1002,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         self.publish_twice(&ep, &[name.to_string()]).await;
         info!(branch_id = %branch, endpoint_id = %ep, role = name, "login role deleted");
+        self.member_role_requests.request(branch);
         RoleOutcome::Ok
     }
 
@@ -1120,6 +1135,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.publish_twice(&ep, &[from.to_string(), to.to_string()])
             .await;
         info!(branch_id = %branch, endpoint_id = %ep, from, to, "role renamed");
+        // A membership follows the role's OID, a grant its name: the members' roles follow.
+        self.member_role_requests.request(branch);
         RoleOutcome::Ok
     }
 
@@ -1461,8 +1478,10 @@ mod tests {
     async fn create_runs_as_the_owner_in_one_script() {
         let (w, journal) = worker();
         let (branch, ep, db) = ready(&w, &journal).await;
+        let asked = w.member_role_requests.sent().len();
 
         assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        assert_eq!(w.member_role_requests.sent().len(), asked + 1, "a member-role reconcile is asked for");
 
         let (verifier, sealed, pending) = login(&w, &ep, "app").unwrap();
         let verifier = verifier.unwrap();
@@ -1470,6 +1489,7 @@ mod tests {
         let password =
             open_role_password(&w.key, &branch.to_string(), "app", &sealed.unwrap()).unwrap();
         assert!(chelabase_neon::scram::verifier(&password).starts_with("SCRAM-SHA-256$"));
+        assert_eq!(w.member_role_requests.sent().last(), Some(&branch));
         let sent = sql(&w);
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert_eq!(
@@ -1907,8 +1927,11 @@ mod tests {
         w.computes.answer(EXISTS_APP, "1\n");
         w.computes
             .answer("FROM pg_database", &databases(&["app", "other"]));
+        let asked = w.member_role_requests.sent().len();
 
         assert_eq!(w.delete_role(branch, "app").await, RoleOutcome::Ok);
+        assert_eq!(w.member_role_requests.sent().len(), asked + 1, "a member-role reconcile is asked for");
+        assert_eq!(w.member_role_requests.sent().last(), Some(&branch));
 
         let on = |d: &str, s: &str| (d.to_string(), s.to_string());
         assert_eq!(
@@ -2004,6 +2027,9 @@ mod tests {
             (OWNER_ROLE, "reserved_role_name"),
             ("authenticator", "reserved_role_name"),
             ("pg_x", "reserved_role_name"),
+            ("chelabase_x", "reserved_role_name"),
+            ("cb_m_x", "reserved_role_name"),
+            ("CB_M_X", "reserved_role_name"),
             ("", "invalid_role_name"),
         ] {
             let outcome = w.delete_role(branch, name).await;
@@ -2444,8 +2470,13 @@ mod tests {
             login: Some(false),
             ..RolePatch::default()
         };
+        let asked = w.member_role_requests.sent().len();
 
         assert_eq!(w.update_role(branch, "app", &off).await, RoleOutcome::Ok);
+        // T8 I3: a successful update asks for a member-role reconcile (an owner-level or
+        // membership change can make the role unsafe for member roles, R16).
+        assert_eq!(w.member_role_requests.sent().len(), asked + 1, "a member-role reconcile is asked for");
+        assert_eq!(w.member_role_requests.sent().last(), Some(&branch));
 
         assert_eq!(login(&w, &ep, "app"), Some((None, None, false)));
         assert!(!w.metadata.state().endpoints[&ep].logins["app"].login);
@@ -2774,6 +2805,8 @@ mod tests {
                 valid_until: None,
                 bypass_rls: true,
                 member_of: vec!["g".into()],
+                member_no_set: vec![],
+                member_admin: vec![],
             }
         );
         assert!(!w.metadata.state().endpoints[&ep].logins["app"].attributes_pending);
@@ -2969,8 +3002,10 @@ mod tests {
         in_catalog(&w, &observed("app", true, verifier.as_deref()));
         journal.lock().unwrap().clear();
         w.computes.sql.lock().unwrap().clear();
+        let asked = w.member_role_requests.sent().len();
 
         assert_eq!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::Ok);
+        assert_eq!(w.member_role_requests.sent().len(), asked + 1, "a member-role reconcile is asked for");
 
         assert!(
             sql(&w).iter().any(|s| s.ends_with("ALTER ROLE \"app\" RENAME TO \"app_v2\";")),

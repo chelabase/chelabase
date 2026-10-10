@@ -1,1889 +1,5 @@
-use axum::Router;
-use chelabase_auth::internal::{
-    generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier, IDENTITY_HEADER,
-};
-use chelabase_metadata::{
-    BeginDelete, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseOrigin, DataKeyRecord, DatabaseRecord,
-    DatabaseStatus, MetadataError, NewBranch, NewDataKey, PasswordState, ProjectOverview, ProjectStatus, RoleAttributes, RoleLevel, RoleOrigin, RoleRow, SettingsPatch,
-    TenantOverview,
-    AppSession, AppUsersStatus, BeginEnable, BeginProjectDelete, BranchAuthSync, NewProjectAuth, OnDelete, ProjectAuth,
-    ProjectRecord, RenameProject, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
-    BranchBusy, MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
-};
-use chelabase_nats::{
-    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, MergeJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
-    ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RoleSession, RoleSessionsReply, RoleUpdateRequest, RESET_NOT_APPLIED,
-};
-use chelabase_routes::{Service, ENDPOINTS};
-use chelabase_types::mode::Mode;
-use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use chelabase_secrets::{open_credential, seal_credential, Purpose, SecretKey};
-use chelabase_types::data_key::{self, DataKeyKind};
-use orchestrator::{
-    build_router, AppState, Console, JobPort, MetadataPort, PostgresAddr, ProxyAddress, ResetError,
-    RestInternal,
-};
-use std::collections::{HashMap, HashSet};
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::TcpListener;
-
-type KeyRow = (DataKeyRecord, [u8; 32]);
-/// A key store, a key id and the role name it takes.
-type RenameOnCheck = (Arc<Mutex<Vec<KeyRow>>>, uuid::Uuid, String);
-
-#[derive(Clone, Default)]
-struct FakeMetadata {
-    tenants_by_org: Arc<Mutex<HashMap<String, TenantId>>>,
-    fail_insert: Arc<Mutex<bool>>,
-    /// Project ids that belong to another tenant / that do not exist, for `insert_database_pending`.
-    foreign_projects: Arc<Mutex<Vec<ProjectId>>>,
-    missing_projects: Arc<Mutex<Vec<ProjectId>>>,
-    /// The next `get_branch` fails with a database error.
-    fail_get_branch: Arc<Mutex<bool>>,
-    /// `list_roles` fails with a database error while set.
-    fail_list_roles: Arc<Mutex<bool>>,
-    databases: Arc<Mutex<HashMap<DatabaseId, DatabaseRecord>>>,
-    branches: Arc<Mutex<HashMap<BranchId, BranchRecord>>>,
-    overviews: Arc<Mutex<HashMap<TenantId, TenantOverview>>>,
-    /// Calls to `main_branches_with_counts`: /v1/me makes exactly one per request.
-    main_count_queries: Arc<AtomicUsize>,
-    /// While set, `create_secret_key` and `rotate_secret_key` fail with `EndpointLockTimeout` (a DDL transaction holds the endpoint).
-    endpoint_busy: Arc<Mutex<bool>>,
-    /// Data API keys, live and revoked, with their hashes.
-    keys: Arc<Mutex<Vec<KeyRow>>>,
-    /// Roles by endpoint id, and login roles' sealed passwords by (endpoint id, name).
-    roles: Arc<Mutex<HashMap<String, Vec<RoleRow>>>>,
-    role_passwords: Arc<Mutex<HashMap<(String, String), String>>>,
-    /// The branch's Postgres databases.
-    branch_dbs: Arc<Mutex<HashMap<BranchId, Vec<BranchDatabase>>>>,
-    /// `begin_branch_delete` protects this branch first: a flag set after the API's check.
-    protect_on_delete: Arc<Mutex<Option<BranchId>>>,
-    /// Calls to `branch_databases` and to `branches_with_main_database`.
-    branch_db_queries: Arc<AtomicUsize>,
-    main_db_batch_queries: Arc<AtomicUsize>,
-    /// Project rows (the fake's own `projects` table) and their app-users settings.
-    projects: Arc<Mutex<Vec<ProjectRecord>>>,
-    project_auths: Arc<Mutex<HashMap<ProjectId, ProjectAuth>>>,
-    branch_syncs: Arc<Mutex<HashMap<BranchId, BranchAuthSync>>>,
-    app_sessions: Arc<Mutex<Vec<AppSession>>>,
-    /// Calls to `project_auth` and to `project_auth_statuses`.
-    /// `revoke_user_sessions` fails while set.
-    fail_revoke: Arc<Mutex<bool>>,
-    project_auth_reads: Arc<AtomicUsize>,
-    project_auth_batch_reads: Arc<AtomicUsize>,
-    /// Saved queries with their (database, user).
-    saved_queries: Arc<Mutex<Vec<(uuid::Uuid, String, SavedQuery)>>>,
-    /// Merge rows and their events.
-    merges: Arc<Mutex<Vec<MergeRecord>>>,
-    merge_events: Arc<Mutex<Vec<MergeEvent>>>,
-    /// `create_merge` finds the open merge gone: the insert conflicted, the lookup found nothing.
-    create_merge_conflicts: Arc<Mutex<bool>>,
-    /// `branch_has_busy_merge` finds nothing (a merge takes the branch after the pre-check).
-    busy_precheck_misses: Arc<Mutex<bool>>,
-    /// The next status write finds the version bumped (a save landed in between).
-    bump_merge_version_on_write: Arc<Mutex<bool>>,
-    /// The next status write finds this result (another request landed in between).
-    result_changes_before_write: Arc<Mutex<Option<Value>>>,
-}
-
-/// A database row and its main branch, which holds the endpoint and the sealed password.
-/// Derefs to the database row, so tests set its fields directly.
-#[derive(Clone)]
-struct Db {
-    record: DatabaseRecord,
-    main: BranchRecord,
-}
-
-impl Deref for Db {
-    type Target = DatabaseRecord;
-    fn deref(&self) -> &DatabaseRecord {
-        &self.record
-    }
-}
-
-impl DerefMut for Db {
-    fn deref_mut(&mut self) -> &mut DatabaseRecord {
-        &mut self.record
-    }
-}
-
-/// A database with its default main: endpoint `ep-0123456789ab`, and a sealed password
-/// no key opens.
-impl From<DatabaseRecord> for Db {
-    fn from(record: DatabaseRecord) -> Self {
-        let main = main_for(&record);
-        Self { record, main }
-    }
-}
-
-fn main_for(record: &DatabaseRecord) -> BranchRecord {
-    let now = chrono::Utc::now();
-    BranchRecord {
-        id: BranchId::from(record.database_id),
-        database_id: record.database_id,
-        name: "main".into(),
-        parent_branch_id: None,
-        kind: BranchKind::Normal,
-        status: BranchStatus::from(record.status),
-        timeline_id: Some("0123456789abcdef0123456789abcdef".into()),
-        pending_timeline_id: None,
-        pending_timeline_at: None,
-        superseded_timeline_id: None,
-        endpoint_id: Some("ep-0123456789ab".into()),
-        owner_password_enc: Some("v1:secret-owner-sealed".into()),
-        branched_at_time: None,
-        branched_at_lsn: None,
-        error: None,
-        created_at: now,
-        updated_at: now,
-        history_start: None,
-        authenticator_password_enc: None,
-            protected: false,
-    }
-}
-
-impl FakeMetadata {
-    fn bind_org(&self, org_id: &str, tenant_id: TenantId) {
-        self.tenants_by_org
-            .lock()
-            .unwrap()
-            .insert(org_id.to_string(), tenant_id);
-    }
-
-    fn insert_database(&self, db: impl Into<Db>) {
-        let Db { record, main } = db.into();
-        self.branches.lock().unwrap().insert(main.id, main);
-        self.databases
-            .lock()
-            .unwrap()
-            .insert(record.database_id, record);
-    }
-
-    /// Adds a branch of `db` under `parent`; a ready normal branch gets an endpoint.
-    fn add_branch(
-        &self,
-        db: DatabaseId,
-        name: &str,
-        parent: BranchId,
-        kind: BranchKind,
-        status: BranchStatus,
-    ) -> BranchId {
-        let now = chrono::Utc::now();
-        let id = BranchId::new();
-        let has_endpoint = kind == BranchKind::Normal && status == BranchStatus::Ready;
-        self.branches.lock().unwrap().insert(
-            id,
-            BranchRecord {
-                id,
-                database_id: db,
-                name: name.into(),
-                parent_branch_id: Some(parent),
-                kind,
-                status,
-                timeline_id: Some("fedcba9876543210fedcba9876543210".into()),
-                pending_timeline_id: None,
-                pending_timeline_at: None,
-                superseded_timeline_id: None,
-                endpoint_id: has_endpoint.then(|| format!("ep-{:012x}", id.as_uuid().as_u128() & 0xffff_ffff_ffff)),
-                owner_password_enc: None,
-                branched_at_time: None,
-                branched_at_lsn: None,
-                error: None,
-                created_at: now,
-                updated_at: now,
-                history_start: None,
-                authenticator_password_enc: None,
-            protected: false,
-            },
-        );
-        id
-    }
-
-    fn branch(&self, id: BranchId) -> BranchRecord {
-        self.branches.lock().unwrap().get(&id).cloned().expect("branch row")
-    }
-
-    fn database(&self, id: DatabaseId) -> DatabaseRecord {
-        self.databases.lock().unwrap().get(&id).cloned().expect("database row")
-    }
-
-    /// Adds a role row to an endpoint, as the worker would have written it.
-    fn add_role(&self, endpoint: &str, name: &str, origin: RoleOrigin, privileged: bool, pending: bool) {
-        self.roles.lock().unwrap().entry(endpoint.to_string()).or_default().push(RoleRow {
-            name: name.into(),
-            origin,
-            level: if privileged { RoleLevel::OwnerLevel } else { RoleLevel::Plain },
-            login: true,
-            password: PasswordState::Generated,
-            created_at: chrono::Utc::now(),
-            pending,
-            attributes: RoleAttributes::default(),
-        });
-    }
-
-    /// Adds a role row built by the caller.
-    fn add_role_row(&self, endpoint: &str, row: RoleRow) {
-        self.roles.lock().unwrap().entry(endpoint.to_string()).or_default().push(row);
-    }
-
-    /// Records a Postgres database of a branch.
-    fn add_branch_db(&self, branch: BranchId, name: &str, owner: &str, origin: DatabaseOrigin) {
-        self.branch_dbs.lock().unwrap().entry(branch).or_default().push(BranchDatabase {
-            name: name.into(),
-            owner: owner.into(),
-            origin,
-            data_api: chelabase_metadata::DataApiState::Off,
-            data_api_error: None,
-            default_schema: "public".into(),
-            data_api_bootstrapped: origin == DatabaseOrigin::Main,
-        });
-    }
-
-    fn fail_next_insert(&self) {
-        *self.fail_insert.lock().unwrap() = true;
-    }
-
-    /// Databases without a main branch yet get the default one.
-    fn set_overview(&self, overview: TenantOverview) {
-        let mut branches = self.branches.lock().unwrap();
-        for db in overview.projects.iter().flat_map(|p| &p.databases) {
-            branches
-                .entry(BranchId::from(db.database_id))
-                .or_insert_with(|| main_for(db));
-        }
-        self.overviews.lock().unwrap().insert(overview.id, overview);
-    }
-}
-
-/// A minimal `Ready` database record for the given tenant, for GET/soft-bind tests
-/// that don't care about provisioning details.
-fn sample_database(tenant_id: TenantId) -> Db {
-    Db::from(DatabaseRecord {
-        database_id: DatabaseId::new(),
-        project_id: ProjectId::new(),
-        tenant_id,
-        name: "demo-db".into(),
-        status: DatabaseStatus::Ready,
-        database_name: None,
-        owner_role: None,
-        error: None,
-        neon_tenant_id: None,
-        history_window: std::time::Duration::from_secs(7 * 24 * 3600),
-        max_branches: 5,
-        max_rows: 1000,
-        statement_timeout_ms: 8000,
-        max_connections: 5,
-    })
-}
-
-impl MetadataPort for FakeMetadata {
-    async fn get_tenant_by_zitadel_org_id(
-        &self,
-        zitadel_org_id: &str,
-    ) -> Result<Option<TenantId>, MetadataError> {
-        Ok(self.tenants_by_org.lock().unwrap().get(zitadel_org_id).copied())
-    }
-
-    async fn insert_database_pending(
-        &self,
-        _database_id: DatabaseId,
-        tenant_id: TenantId,
-        project_id: ProjectId,
-        _name: &str,
-    ) -> Result<(), MetadataError> {
-        if self.foreign_projects.lock().unwrap().contains(&project_id) {
-            return Err(MetadataError::ProjectTenantMismatch { project_id, tenant_id });
-        }
-        if self.missing_projects.lock().unwrap().contains(&project_id) {
-            return Err(MetadataError::ProjectNotFound(project_id));
-        }
-        if self
-            .projects
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|p| p.id == project_id && p.status != ProjectStatus::Active)
-        {
-            return Err(MetadataError::ProjectDeleting(project_id));
-        }
-        if *self.fail_insert.lock().unwrap() {
-            return Err(MetadataError::DuplicateDatabaseName);
-        }
-        Ok(())
-    }
-
-    async fn set_failed(&self, _database_id: DatabaseId, _error: &str) -> Result<(), MetadataError> {
-        Ok(())
-    }
-
-    async fn get_database(
-        &self,
-        database_id: DatabaseId,
-    ) -> Result<Option<DatabaseRecord>, MetadataError> {
-        Ok(self.databases.lock().unwrap().get(&database_id).cloned())
-    }
-
-    async fn tenant_overview(
-        &self,
-        tenant_id: TenantId,
-    ) -> Result<Option<TenantOverview>, MetadataError> {
-        Ok(self.overviews.lock().unwrap().get(&tenant_id).cloned())
-    }
-
-    async fn get_branch(&self, branch_id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
-        if std::mem::take(&mut *self.fail_get_branch.lock().unwrap()) {
-            return Err(MetadataError::Config("injected".into()));
-        }
-        Ok(self.branches.lock().unwrap().get(&branch_id).cloned())
-    }
-
-    async fn begin_delete(&self, database_id: DatabaseId) -> Result<BeginDelete, MetadataError> {
-        let mut dbs = self.databases.lock().unwrap();
-        match dbs.get_mut(&database_id) {
-            Some(db) if !matches!(db.status, DatabaseStatus::Deleting | DatabaseStatus::Deleted) => {
-                let protected = self.branches.lock().unwrap().values().any(|b| {
-                    b.database_id == database_id
-                        && b.protected
-                        && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted)
-                });
-                if protected {
-                    return Ok(BeginDelete::Protected);
-                }
-                db.status = DatabaseStatus::Deleting;
-                Ok(BeginDelete::Started)
-            }
-            _ => Ok(BeginDelete::NotReady),
-        }
-    }
-
-    async fn list_branches(&self, database_id: DatabaseId) -> Result<Vec<BranchRecord>, MetadataError> {
-        let mut list: Vec<_> = self
-            .branches
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|b| b.database_id == database_id && b.status != BranchStatus::Deleted)
-            .cloned()
-            .collect();
-        // Main first, as `created_at` would put it; then by name for a stable order.
-        list.sort_by_key(|b| (b.parent_branch_id.is_some(), b.name.clone()));
-        Ok(list)
-    }
-
-    async fn main_branches_with_counts(
-        &self,
-        tenant_id: TenantId,
-    ) -> Result<Vec<(BranchRecord, i64)>, MetadataError> {
-        self.main_count_queries.fetch_add(1, Ordering::SeqCst);
-        let overview = self.overviews.lock().unwrap().get(&tenant_id).cloned();
-        let branches = self.branches.lock().unwrap();
-        Ok(overview
-            .iter()
-            .flat_map(|o| o.projects.iter().flat_map(|p| &p.databases))
-            .filter_map(|db| {
-                let main = branches.get(&BranchId::from(db.database_id))?.clone();
-                let count = branches
-                    .values()
-                    .filter(|b| {
-                        b.database_id == db.database_id
-                            && b.kind == BranchKind::Normal
-                            && b.status != BranchStatus::Deleted
-                    })
-                    .count();
-                Some((main, count as i64))
-            })
-            .collect())
-    }
-
-    async fn create_branch(&self, b: &NewBranch<'_>) -> Result<CreateBranchOutcome, MetadataError> {
-        let max = match self.databases.lock().unwrap().get(&b.database_id) {
-            Some(db) if !matches!(db.status, DatabaseStatus::Deleting | DatabaseStatus::Deleted) => {
-                db.max_branches
-            }
-            _ => return Ok(CreateBranchOutcome::DatabaseNotLive),
-        };
-        let mut branches = self.branches.lock().unwrap();
-        let parent_ready = branches
-            .get(&b.parent_branch_id)
-            .is_some_and(|p| p.database_id == b.database_id && p.status == BranchStatus::Ready);
-        if !parent_ready {
-            return Ok(CreateBranchOutcome::ParentNotReady);
-        }
-        let live = |x: &&BranchRecord| x.database_id == b.database_id && x.status != BranchStatus::Deleted;
-        if branches.values().filter(live).any(|x| x.name == b.name) {
-            return Ok(CreateBranchOutcome::NameTaken);
-        }
-        let count = branches
-            .values()
-            .filter(live)
-            .filter(|x| x.kind == BranchKind::Normal && x.parent_branch_id.is_some())
-            .count();
-        if count as i64 >= i64::from(max) {
-            return Ok(CreateBranchOutcome::CapReached { max });
-        }
-        let now = chrono::Utc::now();
-        branches.insert(
-            b.id,
-            BranchRecord {
-                id: b.id,
-                database_id: b.database_id,
-                name: b.name.into(),
-                parent_branch_id: Some(b.parent_branch_id),
-                kind: BranchKind::Normal,
-                status: BranchStatus::Pending,
-                timeline_id: None,
-                pending_timeline_id: None,
-                pending_timeline_at: None,
-                superseded_timeline_id: None,
-                endpoint_id: None,
-                owner_password_enc: None,
-                branched_at_time: b.branched_at_time,
-                branched_at_lsn: b.branched_at_lsn.map(str::to_string),
-                error: None,
-                created_at: now,
-                updated_at: now,
-                history_start: None,
-                authenticator_password_enc: None,
-            protected: false,
-            },
-        );
-        Ok(CreateBranchOutcome::Created)
-    }
-
-    async fn live_children(&self, branch_id: BranchId) -> Result<Vec<BranchRecord>, MetadataError> {
-        let mut children: Vec<_> = self
-            .branches
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|b| {
-                b.parent_branch_id == Some(branch_id)
-                    && b.kind == BranchKind::Normal
-                    && b.status != BranchStatus::Deleted
-            })
-            .cloned()
-            .collect();
-        children.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(children)
-    }
-
-    async fn set_branch_status(
-        &self,
-        branch_id: BranchId,
-        from: &[BranchStatus],
-        to: BranchStatus,
-    ) -> Result<bool, MetadataError> {
-        let mut branches = self.branches.lock().unwrap();
-        match branches.get_mut(&branch_id) {
-            Some(b)
-                if from.contains(&b.status)
-                    && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) =>
-            {
-                b.status = to;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn claim_branch_for_switch(
-        &self,
-        branch_id: BranchId,
-        allow_protected: bool,
-    ) -> Result<ClaimOutcome, MetadataError> {
-        // T14 M12: the merge check under the claim, as the real one does under the row lock.
-        let ready = self.branches.lock().unwrap().get(&branch_id).is_some_and(|b| b.status == BranchStatus::Ready);
-        if ready && let Some(busy) = self.busy(branch_id) {
-            return Ok(ClaimOutcome::MergeBusy(busy));
-        }
-        match self.branches.lock().unwrap().get_mut(&branch_id) {
-            Some(b) if b.status == BranchStatus::Ready && b.protected && !allow_protected => {
-                Ok(ClaimOutcome::Protected)
-            }
-            Some(b) if b.status == BranchStatus::Ready => {
-                b.status = BranchStatus::Resetting;
-                b.error = None;
-                Ok(ClaimOutcome::Claimed)
-            }
-            _ => Ok(ClaimOutcome::NotReady),
-        }
-    }
-
-    async fn set_branch_protected(
-        &self,
-        branch_id: BranchId,
-        protected: bool,
-    ) -> Result<Option<BranchRecord>, MetadataError> {
-        match self.branches.lock().unwrap().get_mut(&branch_id) {
-            Some(b)
-                if b.kind == BranchKind::Normal
-                    && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) =>
-            {
-                b.protected = protected;
-                Ok(Some(b.clone()))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    async fn set_branch_failed(&self, branch_id: BranchId, error: &str) -> Result<(), MetadataError> {
-        if let Some(b) = self.branches.lock().unwrap().get_mut(&branch_id) {
-            b.status = BranchStatus::Failed;
-            b.error = Some(error.into());
-        }
-        Ok(())
-    }
-
-    async fn begin_branch_delete(&self, branch_id: BranchId) -> Result<BranchDeleteOutcome, MetadataError> {
-        // T14 F3 (I1): a merge holding the live branch refuses it, as the real one checks under
-        // the branch's row lock.
-        let live_now = self
-            .branches
-            .lock()
-            .unwrap()
-            .get(&branch_id)
-            .is_some_and(|b| !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted));
-        if live_now && let Some(busy) = self.busy(branch_id) {
-            return Ok(BranchDeleteOutcome::MergeBusy(busy));
-        }
-        let mut branches = self.branches.lock().unwrap();
-        if *self.protect_on_delete.lock().unwrap() == Some(branch_id) {
-            branches.get_mut(&branch_id).unwrap().protected = true;
-        }
-        // Like the real guard: refused while the branch or a live backup of it has live
-        // normal children (the branch's own first, then each backup's, oldest first).
-        let live = |b: &BranchRecord| !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted);
-        if branches.get(&branch_id).is_some_and(live) {
-            let children_of = |parent: BranchId| {
-                let mut names: Vec<String> = branches
-                    .values()
-                    .filter(|c| {
-                        c.parent_branch_id == Some(parent)
-                            && c.kind == BranchKind::Normal
-                            && c.status != BranchStatus::Deleted
-                    })
-                    .map(|c| c.name.clone())
-                    .collect();
-                names.sort();
-                names
-            };
-            let own = children_of(branch_id);
-            if !own.is_empty() {
-                return Ok(BranchDeleteOutcome::HasChildren { backup: None, children: own });
-            }
-            let mut backups: Vec<&BranchRecord> = branches
-                .values()
-                .filter(|b| {
-                    b.parent_branch_id == Some(branch_id)
-                        && b.kind == BranchKind::Backup
-                        && b.status != BranchStatus::Deleted
-                })
-                .collect();
-            backups.sort_by_key(|b| (b.created_at, b.id.to_string()));
-            for backup in backups {
-                let children = children_of(backup.id);
-                if !children.is_empty() {
-                    return Ok(BranchDeleteOutcome::HasChildren { backup: Some(backup.name.clone()), children });
-                }
-            }
-        }
-        let moved = match branches.get_mut(&branch_id) {
-            Some(b) if !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) && b.protected => {
-                return Ok(BranchDeleteOutcome::Protected);
-            }
-            Some(b) if !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) => {
-                b.status = BranchStatus::Deleting;
-                b.error = None;
-                true
-            }
-            _ => false,
-        };
-        for b in branches.values_mut() {
-            if b.parent_branch_id == Some(branch_id)
-                && b.kind == BranchKind::Backup
-                && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted)
-            {
-                b.status = BranchStatus::Deleting;
-            }
-        }
-        Ok(if moved { BranchDeleteOutcome::Started } else { BranchDeleteOutcome::NotMoved })
-    }
-
-    async fn update_database_settings(
-        &self,
-        database_id: DatabaseId,
-        patch: &SettingsPatch,
-    ) -> Result<bool, MetadataError> {
-        let mut dbs = self.databases.lock().unwrap();
-        match dbs.get_mut(&database_id) {
-            Some(db) if !matches!(db.status, DatabaseStatus::Deleting | DatabaseStatus::Deleted) => {
-                if let Some(w) = patch.history_window {
-                    db.history_window = w;
-                }
-                if let Some(m) = patch.max_branches {
-                    db.max_branches = m;
-                }
-                if let Some(v) = patch.max_rows {
-                    db.max_rows = v;
-                }
-                if let Some(v) = patch.statement_timeout_ms {
-                    db.statement_timeout_ms = v;
-                }
-                if let Some(v) = patch.max_connections {
-                    db.max_connections = v;
-                }
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn insert_data_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
-        let mut keys = self.keys.lock().unwrap();
-        insert_key(&mut keys, key)
-    }
-
-    async fn create_secret_key(&self, key: &NewDataKey) -> Result<(), MetadataError> {
-        if *self.endpoint_busy.lock().unwrap() {
-            return Err(MetadataError::EndpointLockTimeout("ep-test".into()));
-        }
-        let mut keys = self.keys.lock().unwrap();
-        insert_key(&mut keys, key)
-    }
-
-    async fn rotate_secret_key(
-        &self,
-        branch: BranchId,
-        old: uuid::Uuid,
-        new: &NewDataKey,
-    ) -> Result<bool, MetadataError> {
-        if *self.endpoint_busy.lock().unwrap() {
-            return Err(MetadataError::EndpointLockTimeout("ep-test".into()));
-        }
-        // As the store: the old key's identity carries over (`rotated_identity`, E26).
-        let stored = self
-            .keys
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(k, _)| k.id == old && k.branch_id == branch && k.revoked_at.is_none())
-            .map(|(k, _)| (k.role.clone(), k.role_oid, k.role_timeline.clone()));
-        let mut new = new.clone();
-        if let Some((role, oid, timeline)) = stored {
-            (new.role_oid, new.role_timeline) = chelabase_metadata::rotated_identity(
-                &role,
-                (oid, timeline),
-                (new.role_oid, new.role_timeline.clone()),
-                &new.role,
-            )?;
-        }
-        self.rotate_data_key(branch, old, &new).await
-    }
-
-    async fn list_data_keys(&self, branch: BranchId) -> Result<Vec<DataKeyRecord>, MetadataError> {
-        let mut list: Vec<_> = self
-            .keys
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(k, _)| k.branch_id == branch && k.revoked_at.is_none())
-            .map(|(k, _)| k.clone())
-            .collect();
-        list.reverse(); // newest first
-        Ok(list)
-    }
-
-    async fn revoke_data_key(&self, branch: BranchId, key_id: uuid::Uuid) -> Result<bool, MetadataError> {
-        let mut keys = self.keys.lock().unwrap();
-        match keys.iter_mut().find(|(k, _)| {
-            k.id == key_id && k.branch_id == branch && k.revoked_at.is_none() && k.kind == DataKeyKind::Secret
-        }) {
-            Some((k, _)) => {
-                k.revoked_at = Some(chrono::Utc::now());
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn rotate_data_key(
-        &self,
-        branch: BranchId,
-        old: uuid::Uuid,
-        new: &NewDataKey,
-    ) -> Result<bool, MetadataError> {
-        let mut keys = self.keys.lock().unwrap();
-        let Some(i) = keys
-            .iter()
-            .position(|(k, _)| k.id == old && k.branch_id == branch && k.revoked_at.is_none())
-        else {
-            return Ok(false);
-        };
-        keys[i].0.revoked_at = Some(chrono::Utc::now());
-        // As the real one does: the replacement reaches the same databases.
-        let mut new = new.clone();
-        new.databases = keys[i].0.databases.clone();
-        match insert_key(&mut keys, &new) {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                keys[i].0.revoked_at = None;
-                Err(e)
-            }
-        }
-    }
-
-    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
-        if *self.fail_list_roles.lock().unwrap() {
-            return Err(MetadataError::Config("injected".into()));
-        }
-        Ok(self.roles.lock().unwrap().get(endpoint_id).cloned().unwrap_or_default())
-    }
-
-    async fn role_password(
-        &self,
-        endpoint_id: &str,
-        name: &str,
-    ) -> Result<Option<String>, MetadataError> {
-        Ok(self
-            .role_passwords
-            .lock()
-            .unwrap()
-            .get(&(endpoint_id.to_string(), name.to_string()))
-            .cloned())
-    }
-
-    async fn branches_with_main_database(&self, ids: &[BranchId]) -> Result<HashSet<BranchId>, MetadataError> {
-        self.main_db_batch_queries.fetch_add(1, Ordering::SeqCst);
-        let dbs = self.branch_dbs.lock().unwrap();
-        Ok(ids
-            .iter()
-            .filter(|id| dbs.get(id).is_some_and(|rows| rows.iter().any(|d| d.origin == DatabaseOrigin::Main)))
-            .copied()
-            .collect())
-    }
-
-    async fn begin_enable_data_api(
-        &self,
-        branch: BranchId,
-        name: &str,
-        cap: u32,
-    ) -> Result<chelabase_metadata::EnableStart, MetadataError> {
-        use chelabase_metadata::{DataApiState, EnableStart};
-        let mut all = self.branch_dbs.lock().unwrap();
-        let rows = all.entry(branch).or_default();
-        let Some(i) = rows.iter().position(|d| d.name == name) else {
-            return Ok(EnableStart::Unknown);
-        };
-        if rows[i].origin == DatabaseOrigin::System {
-            return Ok(EnableStart::System);
-        }
-        if rows[i].data_api == DataApiState::On {
-            return Ok(EnableStart::AlreadyOn);
-        }
-        let others = rows
-            .iter()
-            .filter(|d| d.name != name && matches!(d.data_api, DataApiState::On | DataApiState::Enabling))
-            .count();
-        if others >= cap as usize {
-            return Ok(EnableStart::OverCap(cap));
-        }
-        rows[i].data_api = DataApiState::Enabling;
-        rows[i].data_api_error = None;
-        rows[i].data_api_bootstrapped = true;
-        Ok(EnableStart::Started)
-    }
-
-    async fn set_database_default_schema(
-        &self,
-        branch: BranchId,
-        name: &str,
-        schema: &str,
-    ) -> Result<bool, MetadataError> {
-        let mut all = self.branch_dbs.lock().unwrap();
-        match all.entry(branch).or_default().iter_mut().find(|d| d.name == name) {
-            Some(d) => {
-                d.default_schema = schema.to_string();
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn set_key_databases(
-        &self,
-        branch: BranchId,
-        key_id: uuid::Uuid,
-        databases: Option<Vec<String>>,
-    ) -> Result<bool, MetadataError> {
-        let mut keys = self.keys.lock().unwrap();
-        match keys
-            .iter_mut()
-            .find(|(k, _)| k.id == key_id && k.branch_id == branch && k.revoked_at.is_none())
-        {
-            Some((k, _)) => {
-                k.databases = databases;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    async fn branch_databases(&self, branch: BranchId) -> Result<Vec<BranchDatabase>, MetadataError> {
-        self.branch_db_queries.fetch_add(1, Ordering::SeqCst);
-        let mut rows = self.branch_dbs.lock().unwrap().get(&branch).cloned().unwrap_or_default();
-        rows.sort_by_key(|d| (d.origin != DatabaseOrigin::Main, d.name.clone()));
-        Ok(rows)
-    }
-
-    async fn list_projects(&self, tenant: TenantId) -> Result<Vec<ProjectRecord>, MetadataError> {
-        Ok(self
-            .projects
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|p| p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
-            .cloned()
-            .collect())
-    }
-
-    async fn get_project(&self, tenant: TenantId, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
-        Ok(self
-            .projects
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|p| p.id == id && p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
-            .cloned())
-    }
-
-    async fn project_by_id(&self, id: ProjectId) -> Result<Option<ProjectRecord>, MetadataError> {
-        Ok(self
-            .projects
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|p| p.id == id && p.status != ProjectStatus::Deleted)
-            .cloned())
-    }
-
-    async fn create_project(&self, tenant: TenantId, name: &str) -> Result<ProjectRecord, MetadataError> {
-        let mut projects = self.projects.lock().unwrap();
-        let taken: HashSet<String> = projects
-            .iter()
-            .filter(|p| p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
-            .map(|p| p.slug.clone())
-            .collect();
-        let base = chelabase_metadata::slug_base(name);
-        let mut slug = base.clone();
-        let mut n = 2;
-        while taken.contains(&slug) {
-            slug = format!("{base}-{n}");
-            n += 1;
-        }
-        let now = chrono::Utc::now();
-        let record = ProjectRecord {
-            id: ProjectId::new(),
-            tenant_id: tenant,
-            name: name.to_string(),
-            slug,
-            status: ProjectStatus::Active,
-            error: None,
-            created_at: now,
-            updated_at: now,
-        };
-        projects.push(record.clone());
-        Ok(record)
-    }
-
-    async fn rename_project(
-        &self,
-        tenant: TenantId,
-        id: ProjectId,
-        name: &str,
-    ) -> Result<RenameProject, MetadataError> {
-        let mut projects = self.projects.lock().unwrap();
-        let Some(p) = projects
-            .iter_mut()
-            .find(|p| p.id == id && p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
-        else {
-            return Ok(RenameProject::NotFound);
-        };
-        if p.status != ProjectStatus::Active {
-            return Ok(RenameProject::Deleting);
-        }
-        p.name = name.to_string();
-        p.updated_at = chrono::Utc::now();
-        Ok(RenameProject::Renamed(p.clone()))
-    }
-
-    /// Mirrors the real function's refusal order; the databases are the fake's own rows.
-    async fn begin_project_delete(
-        &self,
-        tenant: TenantId,
-        id: ProjectId,
-    ) -> Result<BeginProjectDelete, MetadataError> {
-        let mut projects = self.projects.lock().unwrap();
-        let Some(project) = projects
-            .iter_mut()
-            .find(|p| p.id == id && p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
-        else {
-            return Ok(BeginProjectDelete::NotFound);
-        };
-        if project.status == ProjectStatus::Deleting {
-            return Ok(BeginProjectDelete::AlreadyDeleting);
-        }
-        let mut databases = self.databases.lock().unwrap();
-        let branches = self.branches.lock().unwrap();
-        let mut ids: Vec<DatabaseId> = databases
-            .values()
-            .filter(|d| d.project_id == id && d.status != DatabaseStatus::Deleted)
-            .map(|d| d.database_id)
-            .collect();
-        ids.sort_by_key(|d| d.as_uuid());
-        for db in &ids {
-            if matches!(databases[db].status, DatabaseStatus::Pending | DatabaseStatus::Provisioning) {
-                return Ok(BeginProjectDelete::NotReady(*db));
-            }
-        }
-        if let Some(b) = branches
-            .values()
-            .find(|b| ids.contains(&b.database_id) && b.protected && b.status != BranchStatus::Deleting)
-        {
-            return Ok(BeginProjectDelete::Protected(b.database_id));
-        }
-        if let Some(auth) = self.project_auths.lock().unwrap().get(&id)
-            && matches!(auth.status, AppUsersStatus::Enabling | AppUsersStatus::Disabling)
-        {
-            return Ok(BeginProjectDelete::AppUsersBusy);
-        }
-        project.status = ProjectStatus::Deleting;
-        let mut started = Vec::new();
-        for db in ids {
-            let record = databases.get_mut(&db).unwrap();
-            if matches!(record.status, DatabaseStatus::Ready | DatabaseStatus::Failed) {
-                record.status = DatabaseStatus::Deleting;
-                started.push(db);
-            }
-        }
-        Ok(BeginProjectDelete::Started(started))
-    }
-
-    async fn project_databases(
-        &self,
-        id: ProjectId,
-    ) -> Result<Vec<(DatabaseId, DatabaseStatus, Option<String>)>, MetadataError> {
-        Ok(self
-            .databases
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|d| d.project_id == id && d.status != DatabaseStatus::Deleted)
-            .map(|d| (d.database_id, d.status, d.error.clone()))
-            .collect())
-    }
-
-    async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
-        self.project_auth_reads.fetch_add(1, Ordering::SeqCst);
-        Ok(self.project_auths.lock().unwrap().get(&project).cloned())
-    }
-
-    async fn project_auth_statuses(&self, tenant: TenantId) -> Result<HashMap<ProjectId, AppUsersStatus>, MetadataError> {
-        self.project_auth_batch_reads.fetch_add(1, Ordering::SeqCst);
-        let projects = self.projects.lock().unwrap();
-        Ok(self
-            .project_auths
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(id, _)| projects.iter().any(|p| p.id == **id && p.tenant_id == tenant))
-            .map(|(id, a)| (*id, a.status))
-            .collect())
-    }
-
-    async fn begin_enable_app_users(&self, new: &NewProjectAuth<'_>) -> Result<BeginEnable, MetadataError> {
-        let mut auths = self.project_auths.lock().unwrap();
-        if let Some(existing) = auths.get_mut(&new.project_id) {
-            let same = existing.database_id == new.database_id
-                && existing.pg_database == new.pg_database
-                && existing.schema_name == new.schema_name
-                && existing.table_name == new.table_name;
-            if existing.status == AppUsersStatus::Failed && same {
-                existing.status = AppUsersStatus::Enabling;
-                existing.error = None;
-                existing.email_verification = new.email_verification;
-                existing.on_delete = new.on_delete;
-                return Ok(BeginEnable::Retry);
-            }
-            return Ok(BeginEnable::Exists(existing.clone()));
-        }
-        let now = chrono::Utc::now();
-        auths.insert(
-            new.project_id,
-            ProjectAuth {
-                project_id: new.project_id,
-                status: AppUsersStatus::Enabling,
-                error: None,
-                zitadel_org_id: None,
-                database_id: new.database_id,
-                pg_database: new.pg_database.to_string(),
-                schema_name: new.schema_name.to_string(),
-                table_name: new.table_name.to_string(),
-                email_verification: new.email_verification,
-                on_delete: new.on_delete,
-                created_at: now,
-                updated_at: now,
-            },
-        );
-        Ok(BeginEnable::Started)
-    }
-
-    async fn update_app_users_settings(
-        &self,
-        project: ProjectId,
-        email_verification: Option<bool>,
-        on_delete: Option<OnDelete>,
-    ) -> Result<Option<ProjectAuth>, MetadataError> {
-        let mut auths = self.project_auths.lock().unwrap();
-        let Some(auth) = auths.get_mut(&project) else { return Ok(None) };
-        if let Some(v) = email_verification {
-            auth.email_verification = v;
-        }
-        if let Some(v) = on_delete {
-            auth.on_delete = v;
-        }
-        Ok(Some(auth.clone()))
-    }
-
-    async fn begin_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
-        let mut auths = self.project_auths.lock().unwrap();
-        match auths.get_mut(&project) {
-            Some(a) if matches!(a.status, AppUsersStatus::Enabled | AppUsersStatus::Failed) => {
-                a.status = AppUsersStatus::Disabling;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn branch_auth_sync(&self, branch: BranchId) -> Result<Option<BranchAuthSync>, MetadataError> {
-        Ok(self.branch_syncs.lock().unwrap().get(&branch).cloned())
-    }
-
-    async fn list_user_sessions(&self, project: ProjectId, user: uuid::Uuid) -> Result<Vec<AppSession>, MetadataError> {
-        Ok(self
-            .app_sessions
-            .lock()
-            .unwrap()
-            .iter()
-            // Like the real query: live only (not revoked, not expired).
-            .filter(|s| s.project_id == project && s.user_id == user && s.revoked_at.is_none() && s.expires_at > chrono::Utc::now())
-            .cloned()
-            .collect())
-    }
-
-    async fn revoke_user_sessions(
-        &self,
-        project: ProjectId,
-        user: uuid::Uuid,
-        keep: Option<uuid::Uuid>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Vec<AppSession>, MetadataError> {
-        if *self.fail_revoke.lock().unwrap() {
-            return Err(MetadataError::Conflict);
-        }
-        let mut revoked = Vec::new();
-        for s in self.app_sessions.lock().unwrap().iter_mut() {
-            if s.project_id == project
-                && s.user_id == user
-                && s.revoked_at.is_none()
-                && Some(s.id) != keep
-                && created_before.is_none_or(|t| s.created_at < t)
-            {
-                s.revoked_at = Some(chrono::Utc::now());
-                revoked.push(s.clone());
-            }
-        }
-        Ok(revoked)
-    }
-
-    async fn app_auth_for_database(&self, db: DatabaseId) -> Result<Option<ProjectAuth>, MetadataError> {
-        Ok(self.project_auths.lock().unwrap().values().find(|a| a.database_id == db).cloned())
-    }
-
-    async fn list_saved_queries(&self, database: uuid::Uuid, user: &str) -> Result<Vec<SavedQuerySummary>, MetadataError> {
-        let mut rows: Vec<SavedQuerySummary> = self
-            .saved_queries
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(d, u, _)| *d == database && u == user)
-            .map(|(_, _, q)| SavedQuerySummary {
-                id: q.id,
-                name: q.name.clone(),
-                pg_database: q.pg_database.clone(),
-                role: q.role.clone(),
-                version: q.version,
-                updated_at: q.updated_at,
-            })
-            .collect();
-        rows.sort_by_key(|q| q.name.to_lowercase());
-        Ok(rows)
-    }
-
-    async fn get_saved_query(&self, database: uuid::Uuid, user: &str, id: uuid::Uuid) -> Result<Option<SavedQuery>, MetadataError> {
-        Ok(self
-            .saved_queries
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(d, u, q)| *d == database && u == user && q.id == id)
-            .map(|(_, _, q)| q.clone()))
-    }
-
-    async fn create_saved_query(
-        &self,
-        database: uuid::Uuid,
-        user: &str,
-        id: uuid::Uuid,
-        name: &str,
-        sql: &str,
-        pg_database: Option<&str>,
-        role: Option<&str>,
-    ) -> Result<SavedQueryWrite, MetadataError> {
-        let mut rows = self.saved_queries.lock().unwrap();
-        let mine = || rows.iter().filter(|(d, u, _)| *d == database && u == user);
-        if mine().count() as i64 >= orchestrator::sql_editor::SAVED_QUERY_CAP {
-            return Ok(SavedQueryWrite::CapReached);
-        }
-        if mine().any(|(_, _, q)| q.name.to_lowercase() == name.to_lowercase()) {
-            return Ok(SavedQueryWrite::NameTaken);
-        }
-        let now = chrono::Utc::now();
-        let q = SavedQuery {
-            id,
-            name: name.into(),
-            sql: sql.into(),
-            pg_database: pg_database.map(Into::into),
-            role: role.map(Into::into),
-            version: 1,
-            created_at: now,
-            updated_at: now,
-        };
-        rows.push((database, user.into(), q.clone()));
-        Ok(SavedQueryWrite::Saved(q))
-    }
-
-    async fn update_saved_query(
-        &self,
-        database: uuid::Uuid,
-        user: &str,
-        id: uuid::Uuid,
-        version: i32,
-        patch: &SavedQueryPatch,
-    ) -> Result<SavedQueryWrite, MetadataError> {
-        let mut rows = self.saved_queries.lock().unwrap();
-        let Some(at) = rows.iter().position(|(d, u, q)| *d == database && u == user && q.id == id) else {
-            return Ok(SavedQueryWrite::NotFound);
-        };
-        if rows[at].2.version != version {
-            return Ok(SavedQueryWrite::Stale(rows[at].2.clone()));
-        }
-        if let Some(name) = &patch.name
-            && rows.iter().any(|(d, u, q)| {
-                *d == database && u == user && q.id != id && q.name.to_lowercase() == name.to_lowercase()
-            })
-        {
-            return Ok(SavedQueryWrite::NameTaken);
-        }
-        let q = &mut rows[at].2;
-        if let Some(name) = &patch.name {
-            q.name = name.clone();
-        }
-        if let Some(sql) = &patch.sql {
-            q.sql = sql.clone();
-        }
-        if let Some(v) = &patch.pg_database {
-            q.pg_database = v.clone();
-        }
-        if let Some(v) = &patch.role {
-            q.role = v.clone();
-        }
-        q.version += 1;
-        q.updated_at = chrono::Utc::now();
-        Ok(SavedQueryWrite::Saved(q.clone()))
-    }
-
-    async fn delete_saved_query(&self, database: uuid::Uuid, user: &str, id: uuid::Uuid) -> Result<bool, MetadataError> {
-        let mut rows = self.saved_queries.lock().unwrap();
-        let before = rows.len();
-        rows.retain(|(d, u, q)| !(*d == database && u == user && q.id == id));
-        Ok(rows.len() < before)
-    }
-    async fn create_merge(&self, m: &NewMerge) -> Result<MergeCreate, MetadataError> {
-        if *self.create_merge_conflicts.lock().unwrap() {
-            return Err(MetadataError::Conflict);
-        }
-        let mut rows = self.merges.lock().unwrap();
-        if let Some(r) = rows.iter().find(|r| r.target_branch_id == m.target_branch_id.as_uuid() && r.state().is_applying()) {
-            return Ok(MergeCreate::ApplyingExists(r.id));
-        }
-        if let Some(r) = rows.iter().find(|r| {
-            r.source_branch_id == m.source_branch_id.as_uuid()
-                && r.target_branch_id == m.target_branch_id.as_uuid()
-                && r.database_name == m.database_name
-                && r.state().is_open()
-        }) {
-            return Ok(MergeCreate::OpenExists(r.id));
-        }
-        let now = chrono::Utc::now();
-        let record = MergeRecord {
-            id: m.id,
-            database_id: m.database_id.as_uuid(),
-            source_branch_id: m.source_branch_id.as_uuid(),
-            target_branch_id: m.target_branch_id.as_uuid(),
-            direction: m.direction,
-            database_name: m.database_name.clone(),
-            status: MergeStatus::Computing,
-            failed_phase: None,
-            version: 1,
-            base_fingerprint: None,
-            source_fingerprint: None,
-            target_fingerprint: None,
-            analysis: None,
-            resolutions: json!([]),
-            user_steps: json!([]),
-            acknowledgements: json!([]),
-            options: m.options.clone().unwrap_or_else(|| json!({"lock_timeout_ms": 5000, "after": "keep"})),
-            plan: None,
-            rehearsal: None,
-            result: None,
-            rebaselined: false,
-            error: None,
-            claimed_at: Some(now),
-            created_by: m.created_by.clone(),
-            created_at: now,
-            updated_at: now,
-        };
-        rows.push(record.clone());
-        Ok(MergeCreate::Created(record))
-    }
-
-    async fn get_merge(&self, id: uuid::Uuid) -> Result<Option<MergeRecord>, MetadataError> {
-        Ok(self.merges.lock().unwrap().iter().find(|r| r.id == id).cloned())
-    }
-
-    async fn list_merges(&self, database_id: DatabaseId, branch: Option<BranchId>) -> Result<Vec<MergeRecord>, MetadataError> {
-        let mut rows: Vec<MergeRecord> = self
-            .merges
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| {
-                r.database_id == database_id.as_uuid()
-                    && branch.is_none_or(|b| r.source_branch_id == b.as_uuid() || r.target_branch_id == b.as_uuid())
-            })
-            .cloned()
-            .collect();
-        rows.reverse();
-        Ok(rows)
-    }
-
-    async fn update_merge_draft(&self, id: uuid::Uuid, expected_version: i64, patch: &MergeDraftPatch) -> Result<MergeWrite, MetadataError> {
-        let mut rows = self.merges.lock().unwrap();
-        let Some(r) = rows.iter_mut().find(|r| r.id == id) else { return Ok(MergeWrite::NotFound) };
-        if !matches!(r.status, MergeStatus::Draft | MergeStatus::Rehearsed) {
-            return Ok(MergeWrite::NotEditable(r.status));
-        }
-        if r.version != expected_version {
-            return Ok(MergeWrite::Stale(r.clone()));
-        }
-        r.version += 1;
-        if r.status == MergeStatus::Rehearsed && (patch.start_compute || !patch.keep_plan) {
-            r.rehearsal = None;
-            r.status = MergeStatus::Draft;
-        }
-        if patch.start_compute {
-            r.status = MergeStatus::Computing;
-            r.claimed_at = Some(chrono::Utc::now());
-        }
-        if let Some(v) = &patch.resolutions { r.resolutions = v.clone(); }
-        if let Some(v) = &patch.user_steps { r.user_steps = v.clone(); }
-        if let Some(v) = &patch.acknowledgements { r.acknowledgements = v.clone(); }
-        if let Some(v) = &patch.options { r.options = v.clone(); }
-        Ok(MergeWrite::Saved(r.clone()))
-    }
-
-    async fn set_merge_status(&self, id: uuid::Uuid, from: &[MergeStatus], to: MergeStatus, patch: MergeStatusPatch) -> Result<bool, MetadataError> {
-        if patch.guard_branches_ready {
-            let Some(m) = self.merges.lock().unwrap().iter().find(|r| r.id == id).cloned() else { return Ok(false) };
-            let branches = self.branches.lock().unwrap();
-            let ready = |b: uuid::Uuid| branches.get(&BranchId(b)).is_some_and(|b| b.status == BranchStatus::Ready);
-            if !ready(m.source_branch_id) || !ready(m.target_branch_id) {
-                return Ok(false);
-            }
-        }
-        let mut rows = self.merges.lock().unwrap();
-        if std::mem::take(&mut *self.bump_merge_version_on_write.lock().unwrap())
-            && let Some(r) = rows.iter_mut().find(|r| r.id == id)
-        {
-            r.version += 1;
-        }
-        if let Some(result) = self.result_changes_before_write.lock().unwrap().take()
-            && let Some(r) = rows.iter_mut().find(|r| r.id == id)
-        {
-            r.result = Some(result);
-        }
-        let Some(r) = rows.iter().position(|r| {
-            r.id == id
-                && from.contains(&r.status)
-                && patch.guard_failed_phase.as_ref().is_none_or(|p| &r.failed_phase == p)
-                && patch.guard_version.is_none_or(|v| r.version == v)
-                && patch.guard_result.as_ref().is_none_or(|v| &r.result == v)
-        }) else {
-            return Ok(false);
-        };
-        // `merges_one_applying`: the state after the write against the others'.
-        let failed_phase = patch.failed_phase.clone().unwrap_or_else(|| rows[r].failed_phase.clone());
-        let after = chelabase_metadata::MergeState::of(to, failed_phase.as_deref());
-        if after.is_applying()
-            && rows.iter().any(|o| o.id != id && o.target_branch_id == rows[r].target_branch_id && o.state().is_applying())
-        {
-            return Err(MetadataError::Conflict);
-        }
-        if patch.log_status {
-            let mut e = MergeEvent::new(id, "status");
-            e.detail = Some(json!({ "to": to.as_str() }));
-            self.merge_events.lock().unwrap().push(e);
-        }
-        let r = &mut rows[r];
-        r.status = to;
-        r.claimed_at = to.is_working().then(chrono::Utc::now);
-        if patch.analysis.is_some() || patch.plan.is_some() { r.version += 1; }
-        if let Some(v) = patch.analysis { r.analysis = Some(v); }
-        if let Some(v) = patch.plan { r.plan = Some(v); }
-        if let Some(v) = patch.rehearsal { r.rehearsal = Some(v); }
-        if let Some(v) = patch.result { r.result = Some(v); }
-        if let Some(v) = patch.error { r.error = v; }
-        if let Some(v) = patch.failed_phase { r.failed_phase = v; }
-        if let Some(v) = patch.rebaselined { r.rebaselined = v; }
-        if let Some(v) = patch.options { r.options = v; }
-        Ok(true)
-    }
-
-    async fn merge_events(&self, id: uuid::Uuid) -> Result<Vec<MergeEvent>, MetadataError> {
-        Ok(self.merge_events.lock().unwrap().iter().filter(|e| e.merge_id == id).cloned().collect())
-    }
-
-    async fn cancel_drafts_for_branch(&self, branch: BranchId) -> Result<u64, MetadataError> {
-        let mut n = 0;
-        for r in self.merges.lock().unwrap().iter_mut() {
-            if (r.source_branch_id == branch.as_uuid() || r.target_branch_id == branch.as_uuid())
-                && matches!(r.status, MergeStatus::Computing | MergeStatus::Draft | MergeStatus::Rehearsed)
-            {
-                r.status = MergeStatus::Cancelled;
-                n += 1;
-            }
-        }
-        Ok(n)
-    }
-
-    async fn branch_has_busy_merge(&self, branch: BranchId) -> Result<Option<BranchBusy>, MetadataError> {
-        if *self.busy_precheck_misses.lock().unwrap() {
-            return Ok(None);
-        }
-        Ok(self.busy(branch))
-    }
-}
-
-impl FakeMetadata {
-    /// What holds `branch` (as `MetadataClient::branch_has_busy_merge` reads it).
-    fn busy(&self, branch: BranchId) -> Option<BranchBusy> {
-        let merge = self.merges.lock().unwrap().iter().find(|r| {
-            (r.source_branch_id == branch.as_uuid() || r.target_branch_id == branch.as_uuid()) && r.state().holds_branches()
-        }).map(|r| BranchBusy::Merge(r.id));
-        merge.or_else(|| {
-            self.branches
-                .lock()
-                .unwrap()
-                .values()
-                .find(|b| b.parent_branch_id == Some(branch) && b.kind == BranchKind::Rehearsal && b.status != BranchStatus::Deleted)
-                .map(|b| BranchBusy::Rehearsal(b.id))
-        })
-    }
-}
-
-fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataError> {
-    if key.kind == DataKeyKind::Public
-        && keys
-            .iter()
-            .any(|(k, _)| k.branch_id == key.branch_id && k.kind == DataKeyKind::Public && k.revoked_at.is_none())
-    {
-        return Err(MetadataError::Conflict);
-    }
-    keys.push((
-        DataKeyRecord {
-            id: key.id,
-            branch_id: key.branch_id,
-            kind: key.kind,
-            role: key.role.clone(),
-            name: key.name.clone(),
-            prefix: key.prefix.clone(),
-            sealed: key.sealed.clone(),
-            created_at: chrono::Utc::now(),
-            last_used_at: None,
-            revoked_at: None,
-            databases: key.databases.clone(),
-            role_oid: key.role_oid,
-            role_timeline: key.role_timeline.clone(),
-            role_bypass_rls: key.kind == DataKeyKind::Secret && key.role_bypass_rls,
-        },
-        key.sha256,
-    ));
-    Ok(())
-}
-
-#[derive(Clone, Copy, Default)]
-enum FakeReset {
-    #[default]
-    Ok,
-    NotReady,
-    /// The worker stored the new password but couldn't apply it yet.
-    NotApplied,
-    Timeout,
-    /// The worker gave up on the database (its own deadline).
-    WorkerTimedOut,
-    /// No worker is listening (NATS no-responders).
-    Unavailable,
-}
-
-#[derive(Clone, Default)]
-struct FakeJobs {
-    published: Arc<Mutex<Vec<JobEnvelope<ProvisionDatabaseJob>>>>,
-    deleted: Arc<Mutex<Vec<DatabaseId>>>,
-    resets: Arc<Mutex<Vec<(DatabaseId, BranchId)>>>,
-    reset: Arc<Mutex<FakeReset>>,
-    branch_jobs: Arc<Mutex<Vec<JobEnvelope<BranchJob>>>>,
-    settings_jobs: Arc<Mutex<Vec<DatabaseId>>>,
-    merge_jobs: Arc<Mutex<Vec<MergeJob>>>,
-    /// Merge jobs can't be published.
-    fail_merge_publish: Arc<Mutex<bool>>,
-    /// Provision jobs can't be published.
-    fail_provision_publish: Arc<Mutex<bool>>,
-    /// Branch jobs can't be published.
-    fail_branch_publish: Arc<Mutex<bool>>,
-    /// (branch, role) of each check-role request.
-    role_checks: Arc<Mutex<Vec<(BranchId, String)>>>,
-    role_check: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
-    /// On the next check-role request, the key `id` in this store takes role `name` (a rename
-    /// that lands while the worker looks).
-    rename_on_check: Arc<Mutex<Option<RenameOnCheck>>>,
-    /// (branch, role, owner) of each grant-to-owner request.
-    role_grants: Arc<Mutex<Vec<(BranchId, String, String)>>>,
-    /// What the worker answers to a grant-to-owner request; `ok` when unset.
-    role_grant: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
-    /// Each login-role RPC as `create:<name>:<privileged>`, `reset:<name>` or `delete:<name>`.
-    role_calls: Arc<Mutex<Vec<String>>>,
-    /// Every create request as sent, and every update request.
-    role_creates: Arc<Mutex<Vec<RoleCreateRequest>>>,
-    role_updates: Arc<Mutex<Vec<RoleUpdateRequest>>>,
-    /// What the worker answers to the role RPCs; `ok` when unset.
-    role_reply: Arc<Mutex<Option<Result<RoleReply, ResetError>>>>,
-    /// (branch, role) of each role-sessions read.
-    session_reads: Arc<Mutex<Vec<(BranchId, String)>>>,
-    /// What the worker answers to a role-sessions read; running with none when unset.
-    sessions_reply: Arc<Mutex<Option<Result<RoleSessionsReply, ResetError>>>>,
-    /// Each data API job as `enable:<name>`, `disable:<name>:<remove>` or `rebootstrap:<name>`.
-    data_api_calls: Arc<Mutex<Vec<String>>>,
-    /// What the worker answers to disable and rebootstrap; `ok` when unset.
-    data_api_reply: Arc<Mutex<Option<Result<CheckDataRoleReply, ResetError>>>>,
-    /// The enable message can't be published.
-    fail_enable_publish: Arc<Mutex<bool>>,
-    project_deletes: Arc<Mutex<Vec<ProjectId>>>,
-    app_users_jobs: Arc<Mutex<Vec<AppUsersJob>>>,
-    app_users_sync_jobs: Arc<Mutex<Vec<AppUsersSyncJob>>>,
-    /// Each app-users location check as `<pg_database>.<schema>.<table>`.
-    app_users_checks: Arc<Mutex<Vec<String>>>,
-    /// What the worker answers to a location check; ok when unset.
-    app_users_check_reply: Arc<Mutex<Option<AppUsersCheckReply>>>,
-}
-
-impl FakeJobs {
-    fn reset_answers(&self, answer: FakeReset) {
-        *self.reset.lock().unwrap() = answer;
-    }
-}
-
-impl JobPort for FakeJobs {
-    async fn publish_provision(
-        &self,
-        job: &JobEnvelope<ProvisionDatabaseJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if *self.fail_provision_publish.lock().unwrap() {
-            return Err("nats is down".into());
-        }
-        self.published.lock().unwrap().push(job.clone());
-        Ok(())
-    }
-
-    async fn publish_delete(
-        &self,
-        job: &JobEnvelope<DeleteDatabaseJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.deleted.lock().unwrap().push(job.payload.database_id);
-        Ok(())
-    }
-
-    async fn publish_branch(
-        &self,
-        job: &JobEnvelope<BranchJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if *self.fail_branch_publish.lock().unwrap() {
-            return Err("nats is down".into());
-        }
-        self.branch_jobs.lock().unwrap().push(job.clone());
-        Ok(())
-    }
-
-    async fn publish_database_settings(
-        &self,
-        job: &JobEnvelope<DatabaseSettingsJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.settings_jobs.lock().unwrap().push(job.payload.database_id);
-        Ok(())
-    }
-
-    async fn publish_merge(
-        &self,
-        job: &JobEnvelope<MergeJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if *self.fail_merge_publish.lock().unwrap() {
-            return Err("nats is down".into());
-        }
-        self.merge_jobs.lock().unwrap().push(job.payload.clone());
-        Ok(())
-    }
-
-    async fn check_data_role(
-        &self,
-        branch_id: BranchId,
-        role: &str,
-    ) -> Result<CheckDataRoleReply, ResetError> {
-        self.role_checks.lock().unwrap().push((branch_id, role.to_string()));
-        if let Some((keys, id, name)) = self.rename_on_check.lock().unwrap().take() {
-            for (k, _) in keys.lock().unwrap().iter_mut() {
-                if k.id == id {
-                    k.role = name.clone();
-                }
-            }
-        }
-        match self.role_check.lock().unwrap().clone() {
-            Some(answer) => answer,
-            None => Ok(CheckDataRoleReply::ok()),
-        }
-    }
-
-    async fn grant_data_role_to_owner(
-        &self,
-        branch: BranchId,
-        role: &str,
-        owner: &str,
-    ) -> Result<CheckDataRoleReply, ResetError> {
-        self.role_grants.lock().unwrap().push((branch, role.to_string(), owner.to_string()));
-        match self.role_grant.lock().unwrap().clone() {
-            Some(answer) => answer,
-            None => Ok(CheckDataRoleReply::ok()),
-        }
-    }
-
-    async fn enable_data_api(
-        &self,
-        _branch_id: BranchId,
-        name: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if *self.fail_enable_publish.lock().unwrap() {
-            return Err("nats is down".into());
-        }
-        self.data_api_calls.lock().unwrap().push(format!("enable:{name}"));
-        Ok(())
-    }
-
-    async fn disable_data_api(
-        &self,
-        _branch_id: BranchId,
-        name: &str,
-        remove: bool,
-    ) -> Result<CheckDataRoleReply, ResetError> {
-        self.data_api_calls.lock().unwrap().push(format!("disable:{name}:{remove}"));
-        self.data_api_answer()
-    }
-
-    async fn rebootstrap_data_api(
-        &self,
-        _branch_id: BranchId,
-        name: &str,
-        grant_existing: bool,
-    ) -> Result<CheckDataRoleReply, ResetError> {
-        let flag = if grant_existing { ":grant_existing" } else { "" };
-        self.data_api_calls.lock().unwrap().push(format!("rebootstrap:{name}{flag}"));
-        self.data_api_answer()
-    }
-
-    async fn reset_password(
-        &self,
-        database_id: DatabaseId,
-        branch_id: BranchId,
-    ) -> Result<ResetPasswordReply, ResetError> {
-        self.resets.lock().unwrap().push((database_id, branch_id));
-        let answer = *self.reset.lock().unwrap();
-        match answer {
-            FakeReset::Ok => Ok(ResetPasswordReply { ok: true, error: None }),
-            FakeReset::NotApplied => Ok(ResetPasswordReply { ok: false, error: Some(RESET_NOT_APPLIED.into()) }),
-            FakeReset::NotReady => Ok(ResetPasswordReply { ok: false, error: Some("not ready".into()) }),
-            FakeReset::Timeout => Err(ResetError::Timeout),
-            FakeReset::WorkerTimedOut => Ok(ResetPasswordReply { ok: false, error: Some("timed out".into()) }),
-            FakeReset::Unavailable => Err(ResetError::Transport("no worker listening".into())),
-        }
-    }
-
-    async fn create_role(&self, request: RoleCreateRequest) -> Result<RoleReply, ResetError> {
-        self.role_calls
-            .lock()
-            .unwrap()
-            .push(format!("create:{}:{}", request.name, request.owner_level));
-        self.role_creates.lock().unwrap().push(request);
-        self.role_answer()
-    }
-
-    async fn update_role(&self, request: RoleUpdateRequest) -> Result<RoleReply, ResetError> {
-        self.role_calls.lock().unwrap().push(format!("update:{}", request.name));
-        self.role_updates.lock().unwrap().push(request);
-        self.role_answer()
-    }
-
-    async fn reset_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
-        self.role_calls.lock().unwrap().push(format!("reset:{}", request.name));
-        self.role_answer()
-    }
-
-    async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
-        self.role_calls.lock().unwrap().push(format!("delete:{}", request.name));
-        self.role_answer()
-    }
-
-    async fn role_sessions(&self, request: RoleRequest) -> Result<RoleSessionsReply, ResetError> {
-        self.session_reads.lock().unwrap().push((request.branch_id, request.name));
-        match self.sessions_reply.lock().unwrap().clone() {
-            Some(answer) => answer,
-            None => Ok(RoleSessionsReply::running(Vec::new())),
-        }
-    }
-
-    async fn publish_project_delete(
-        &self,
-        job: &JobEnvelope<ProjectDeleteJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.project_deletes.lock().unwrap().push(job.payload.project_id);
-        Ok(())
-    }
-
-    async fn publish_app_users(
-        &self,
-        job: &JobEnvelope<AppUsersJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.app_users_jobs.lock().unwrap().push(job.payload.clone());
-        Ok(())
-    }
-
-    async fn publish_app_users_sync(
-        &self,
-        job: &JobEnvelope<AppUsersSyncJob>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.app_users_sync_jobs.lock().unwrap().push(job.payload.clone());
-        Ok(())
-    }
-
-    async fn check_app_users_location(
-        &self,
-        request: &AppUsersCheckRequest,
-    ) -> Result<AppUsersCheckReply, Box<dyn std::error::Error + Send + Sync>> {
-        self.app_users_checks
-            .lock()
-            .unwrap()
-            .push(format!("{}.{}.{}", request.pg_database, request.schema, request.table));
-        Ok(self
-            .app_users_check_reply
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or(AppUsersCheckReply { ok: true, code: None, error: None }))
-    }
-}
-
-impl FakeJobs {
-    fn data_api_answer(&self) -> Result<CheckDataRoleReply, ResetError> {
-        match self.data_api_reply.lock().unwrap().clone() {
-            Some(answer) => answer,
-            None => Ok(CheckDataRoleReply::ok()),
-        }
-    }
-
-    fn role_answer(&self) -> Result<RoleReply, ResetError> {
-        match self.role_reply.lock().unwrap().clone() {
-            Some(answer) => answer,
-            None => Ok(RoleReply { ok: true, code: None, error: None, keys: vec![] }),
-        }
-    }
-}
-
-/// Where the fake Docker says each compute's Postgres is published: one address for every
-/// endpoint (`None`: no compute running), and the endpoints asked about.
-#[derive(Clone, Default)]
-struct FakeLocator {
-    addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
-    asked: Arc<Mutex<Vec<String>>>,
-}
-
-impl PostgresAddr for FakeLocator {
-    fn postgres_addr<'a>(
-        &'a self,
-        endpoint_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Option<std::net::SocketAddr>>> + Send + 'a>> {
-        self.asked.lock().unwrap().push(endpoint_id.to_string());
-        let addr = *self.addr.lock().unwrap();
-        Box::pin(async move { Ok(addr) })
-    }
-}
-
-/// A running orchestrator plus the signer standing in for the gateway.
-struct TestApp {
-    base: String,
-    signer: InternalSigner,
-    /// The secrets key the orchestrator decrypts with.
-    key: SecretKey,
-    /// Where the console finds a compute's Postgres.
-    locator: FakeLocator,
-    /// The orchestrator's state (the SQL editor's run registry).
-    state: Arc<AppState<FakeMetadata, FakeJobs>>,
-}
-
-impl TestApp {
-    /// An internal identity token for `org_id`, as the gateway would mint it.
-    fn token_for_org(&self, org_id: &str) -> String {
-        self.signer
-            .sign(Service::Orchestrator.name(), &identity(org_id))
-            .unwrap()
-    }
-}
-
-fn identity(org_id: &str) -> Identity {
-    Identity {
-        sub: "user-1".into(),
-        org_id: org_id.into(),
-        auth: AuthMethod::ManagementJwt,
-        request_id: "test-rid".into(),
-        data: None,
-    }
-}
-
-/// Boots the real orchestrator router (fake metadata/jobs, fresh internal
-/// keypair) on an ephemeral port.
-async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
-    // Nothing listens on the discard port: rest is "down".
-    spawn_app_with_rest(metadata, jobs, "http://127.0.0.1:9").await
-}
-
-const REST_TOKEN: &str = "rest-internal-token";
-
-async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str) -> TestApp {
-    spawn_app_in_mode(metadata, jobs, rest_url, Mode::SelfHosted).await
-}
-
-async fn spawn_app_in_mode(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, mode: Mode) -> TestApp {
-    spawn_app_full(metadata, jobs, rest_url, mode, 10).await
-}
-
-async fn spawn_app_full(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, mode: Mode, cap: u32) -> TestApp {
-    spawn_app_parts(
-        metadata,
-        jobs,
-        rest_url,
-        mode,
-        cap,
-        None,
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-    )
-    .await
-}
-
-async fn spawn_app_parts(
-    metadata: FakeMetadata,
-    jobs: FakeJobs,
-    rest_url: &str,
-    mode: Mode,
-    cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
-    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-) -> TestApp {
-    let (private_pem, public_pem) = generate_keypair_pem();
-    let key = SecretKey::generate();
-    let locator = FakeLocator::default();
-    let state = Arc::new(AppState {
-        metadata,
-        js: jobs,
-        identity: InternalVerifier::from_pem(public_pem.as_bytes()).unwrap(),
-        secrets: key.clone(),
-        proxy: ProxyAddress::local("localtest.me"),
-        rest: RestInternal {
-            url: rest_url.into(),
-            token: REST_TOKEN.into(),
-            http: reqwest::Client::new(),
-        },
-        mode,
-        proxy_ca_file: ".chelabase/neon/proxy-ca.crt".into(),
-        data_api_database_cap: cap,
-        locator: Arc::new(locator.clone()),
-        console: Console::default(),
-        zitadel,
-        users_db,
-        sql_editor: Default::default(),
-    });
-    let app: Router = build_router(state.clone());
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    TestApp {
-        base: format!("http://{addr}"),
-        signer: InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
-        key,
-        locator,
-        state,
-    }
-}
-
-fn create_body(tenant_id: TenantId) -> serde_json::Value {
-    serde_json::json!({
-        "tenant_id": tenant_id,
-        "project_id": ProjectId::new(),
-        "name": "demo",
-    })
-}
-
-async fn post_create(app: &TestApp, identity_header: Option<&str>, body: serde_json::Value) -> reqwest::Response {
-    let mut req = reqwest::Client::new()
-        .post(format!("{}/v1/databases", app.base))
-        .json(&body);
-    if let Some(token) = identity_header {
-        req = req.header(IDENTITY_HEADER, token);
-    }
-    req.send().await.unwrap()
-}
+// The fakes and the test app, shared with `access_walk.rs`.
+include!("common/fakes.rs");
 
 #[tokio::test]
 async fn health_is_public() {
@@ -1988,30 +104,19 @@ async fn unbound_org_is_tenant_not_bound() {
 }
 
 #[tokio::test]
-async fn body_tenant_mismatch_is_403() {
-    let metadata = FakeMetadata::default();
-    metadata.bind_org("org-1", TenantId::new());
-    let app = spawn_app(metadata, FakeJobs::default()).await;
-    let token = app.token_for_org("org-1");
-    let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
-    assert_eq!(resp.status(), 403);
-}
-
-#[tokio::test]
 async fn valid_request_is_202_accepted_and_publishes_job() {
     let metadata = FakeMetadata::default();
     let bound_tenant = TenantId::new();
     metadata.bind_org("org-1", bound_tenant);
     let jobs = FakeJobs::default();
+    let project_id = metadata.create_project(bound_tenant, "Default").await.unwrap().id;
     let app = spawn_app(metadata, jobs.clone()).await;
     let token = app.token_for_org("org-1");
 
-    let project_id = ProjectId::new();
     let resp = post_create(
         &app,
         Some(&token),
         serde_json::json!({
-            "tenant_id": bound_tenant,
             "project_id": project_id,
             "name": "demo-db",
         }),
@@ -2046,7 +151,7 @@ async fn invalid_names_are_422_everywhere() {
         let resp = post_create(
             &app,
             Some(&token),
-            serde_json::json!({ "tenant_id": bound_tenant, "project_id": ProjectId::new(), "name": name }),
+            serde_json::json!({ "project_id": ProjectId::new(), "name": name }),
         )
         .await;
         let err = error_of(resp, 422).await;
@@ -2104,9 +209,11 @@ async fn duplicate_database_name_is_409() {
     let bound_tenant = TenantId::new();
     metadata.bind_org("org-1", bound_tenant);
     metadata.fail_next_insert();
+    let project = metadata.create_project(bound_tenant, "Default").await.unwrap().id;
     let app = spawn_app(metadata, FakeJobs::default()).await;
     let token = app.token_for_org("org-1");
-    let resp = post_create(&app, Some(&token), create_body(bound_tenant)).await;
+    let body = json!({ "project_id": project, "name": "demo" });
+    let resp = post_create(&app, Some(&token), body).await;
     assert_eq!(resp.status(), 409);
 }
 
@@ -2190,6 +297,7 @@ fn overview_with_database(tenant_id: TenantId) -> TenantOverview {
     TenantOverview {
         id: tenant_id,
         slug: "demo".into(),
+        display_name: None,
         projects: vec![ProjectOverview {
             id: project_id,
             name: "Default".into(),
@@ -2847,8 +955,6 @@ fn fill_params(template: &str) -> String {
 
 // --- Branches ------------------------------------------------------------------
 
-use reqwest::Method;
-use serde_json::{json, Value};
 
 struct Branching {
     app: TestApp,
@@ -4513,9 +2619,10 @@ async fn publish_failure_is_503_worker_unavailable() {
     metadata.bind_org("org-1", tenant);
     let jobs = FakeJobs::default();
     *jobs.fail_provision_publish.lock().unwrap() = true;
+    let project = metadata.create_project(tenant, "Default").await.unwrap().id;
     let app = spawn_app(metadata, jobs).await;
     let token = app.token_for_org("org-1");
-    let resp = post_create(&app, Some(&token), create_body(tenant)).await;
+    let resp = post_create(&app, Some(&token), json!({ "project_id": project, "name": "demo" })).await;
     let err = error_of(resp, 503).await;
     assert_eq!(code_of(&err), "worker_unavailable");
 }
@@ -4540,7 +2647,7 @@ async fn create_database_in_another_tenants_project_is_the_missing_project_answe
     metadata.missing_projects.lock().unwrap().push(missing);
     let app = spawn_app(metadata, FakeJobs::default()).await;
     let token = app.token_for_org("org-1");
-    let body = |project: ProjectId| json!({ "tenant_id": tenant, "project_id": project, "name": "demo" });
+    let body = |project: ProjectId| json!({ "project_id": project, "name": "demo" });
 
     let resp = post_create(&app, Some(&token), body(foreign)).await;
     let foreign_err = error_of(resp, 404).await;
@@ -4811,6 +2918,8 @@ async fn create_role_takes_owner_level_and_refuses_privileged() {
             "inherit",
             "level",
             "login",
+            "member_admin",
+            "member_no_set",
             "member_of",
             "name",
             "origin",
@@ -4846,6 +2955,8 @@ async fn create_role_accepts_new_fields() {
         valid_until: chrono::DateTime::from_timestamp(1_900_000_000, 0),
         bypass_rls: true,
         member_of: vec!["readers".into()],
+        member_no_set: vec![],
+        member_admin: vec![],
     };
     t.metadata.add_role_row(
         &ep,
@@ -4980,7 +3091,7 @@ async fn patch_role_is_202_and_publishes() {
     let err = error_of(t.send(Method::PATCH, &owner, Some(json!({ "inherit": false }))).await, 422).await;
     assert_eq!(code_of(&err), "reserved_role_name");
     // Any `chelabase_` role is Chelabase's own, listed reserved or not.
-    for name in ["chelabase_custom", "Chelabase_x"] {
+    for name in ["chelabase_custom", "Chelabase_x", "cb_m_x", "CB_M_X"] {
         let target = format!("{}/{name}", t.roles(dev));
         let err = error_of(t.send(Method::PATCH, &target, Some(json!({ "inherit": false }))).await, 422).await;
         assert_eq!(code_of(&err), "reserved_role_name", "{name}");
@@ -5016,6 +3127,8 @@ async fn role_list_shows_attributes_without_password() {
                 valid_until: None,
                 bypass_rls: true,
                 member_of: vec!["a".into(), "b".into()],
+                member_no_set: vec!["b".into()],
+                member_admin: vec!["a".into()],
             },
             ..role_row("grp", RoleOrigin::Api, RoleLevel::Plain, PasswordState::None)
         },
@@ -5028,6 +3141,9 @@ async fn role_list_shows_attributes_without_password() {
     assert_eq!(row["valid_until"], Value::Null);
     assert_eq!(row["bypass_rls"], true);
     assert_eq!(row["member_of"], json!(["a", "b"]));
+    // I2: the options of the memberships.
+    assert_eq!(row["member_no_set"], json!(["b"]));
+    assert_eq!(row["member_admin"], json!(["a"]));
     assert_eq!(row["password"], "none");
     let owner = body.as_array().unwrap().iter().find(|r| r["name"] == "postgres").unwrap();
     assert_eq!(owner["inherit"], true);
@@ -5056,6 +3172,10 @@ async fn create_role_bad_name_is_422_without_rpc() {
         ("", "invalid_role_name"),
         ("postgres", "reserved_role_name"),
         ("pg_x", "reserved_role_name"),
+        ("chelabase_x", "reserved_role_name"),
+        ("Chelabase_X", "reserved_role_name"),
+        ("cb_m_x", "reserved_role_name"),
+        ("CB_M_X", "reserved_role_name"),
     ] {
         let err = error_of(t.send(Method::POST, &t.roles(dev), Some(json!({ "name": name }))).await, 422).await;
         assert_eq!(code_of(&err), code, "{name}");
@@ -7066,7 +5186,7 @@ async fn create_database_in_deleting_project_409() {
     let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
     let p = metadata.create_project(tenant, "Going").await.unwrap();
     metadata.begin_project_delete(tenant, p.id).await.unwrap();
-    let body = json!({ "tenant_id": tenant, "project_id": p.id, "name": "demo" });
+    let body = json!({ "project_id": p.id, "name": "demo" });
     let resp = post_create(&app, Some(&app.token_for_org("org-1")), body).await;
     assert_eq!(code_of(&error_of(resp, 409).await), "project_deleting");
 }
@@ -7275,6 +5395,7 @@ impl Au {
             locked: false,
             org_id: org.into(),
             username: email.into(),
+            display_name: String::new(),
             inactive: false,
             created_at: "2026-10-03T10:00:00Z".into(),
         });
@@ -7969,8 +6090,13 @@ impl Branching {
         format!("/v1/databases/{}/sql-queries", self.db.as_uuid())
     }
 
-    /// A request as another user of org-1.
+    /// A request as another user of org-1, a tenant admin too (so as much access as the
+    /// default caller).
     async fn send_as(&self, sub: &str, method: Method, path: &str, body: Option<Value>) -> reqwest::Response {
+        let tenant = self.metadata.database(self.db).tenant_id;
+        if self.metadata.member(tenant, sub).is_none() {
+            self.metadata.add_member(tenant, sub, MemberStatus::Active, true);
+        }
         let mut id = identity("org-1");
         id.sub = sub.into();
         let token = self.app.signer.sign(Service::Orchestrator.name(), &id).unwrap();
@@ -8035,28 +6161,32 @@ async fn saved_queries_list_create_get_update_delete() {
     assert_eq!(list[0]["id"], b["id"]);
 }
 
+// R24: saved queries are shared within the database's project: every Developer lists and reads
+// them; only the author or an Admin changes them.
 #[tokio::test]
-async fn another_users_saved_query_is_404() {
+async fn another_users_saved_query_is_visible_but_not_editable() {
     let t = branching().await;
     let q = t.save("mine", "select 1").await;
+    t.grant_member("user-2", PlatformRole::Developer, &[]);
     let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
-    for (method, body) in [
-        (Method::GET, None),
-        (Method::PATCH, Some(serde_json::json!({"version": 1, "name": "x"}))),
-        (Method::DELETE, None),
-    ] {
-        let body = error_of(t.send_as("user-2", method, &one, body).await, 404).await;
-        assert_eq!(code_of(&body), "not_found");
-        assert_eq!(message_of(&body), "saved query not found");
-    }
+    let got: Value = body_of(t.send_as("user-2", Method::GET, &one, None).await).await;
+    assert_eq!(got["sql"], "select 1");
     let list: Vec<Value> = t.send_as("user-2", Method::GET, &t.queries(), None).await.json().await.unwrap();
-    assert!(list.is_empty());
-    // Same name for the other user is fine.
+    assert_eq!(list.len(), 1);
+    for (method, body) in [(Method::PATCH, Some(serde_json::json!({"version": 1, "name": "x"}))), (Method::DELETE, None)] {
+        let err = error_of(t.send_as("user-2", method, &one, body).await, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")));
+    }
+    // Same name for the other user is fine (names are unique per user).
     let resp = t
         .send_as("user-2", Method::POST, &t.queries(), Some(serde_json::json!({"name": "MINE", "sql": "select 9"})))
         .await;
     assert_eq!(resp.status(), 201);
-    // A query of another database is 404 too.
+    // A missing query, and one of another database, are 404.
+    let missing = format!("{}/{}", t.queries(), uuid::Uuid::new_v4());
+    for method in [Method::GET, Method::DELETE] {
+        assert_eq!(t.send_as("user-2", method, &missing, None).await.status(), 404);
+    }
     let other = format!("/v1/databases/{}/sql-queries/{}", uuid::Uuid::new_v4(), q["id"].as_str().unwrap());
     assert_eq!(t.send(Method::GET, &other, None).await.status(), 404);
 }
@@ -8112,6 +6242,7 @@ async fn saved_query_cap_is_409() {
             version: 1,
             created_at: now,
             updated_at: now,
+            author_member_id: None,
         };
         t.metadata.saved_queries.lock().unwrap().push((t.db.as_uuid(), "user-1".into(), q));
     }
@@ -8242,10 +6373,6 @@ impl Branching {
         self.send(Method::POST, &format!("{}/sql/runs/{run_id}/cancel", self.branch(branch)), None).await
     }
 
-    fn role_grants(&self) -> Vec<(BranchId, String, String)> {
-        self.jobs.role_grants.lock().unwrap().clone()
-    }
-
     fn set_protected(&self, branch: BranchId) {
         self.metadata.branches.lock().unwrap().get_mut(&branch).unwrap().protected = true;
     }
@@ -8286,7 +6413,6 @@ async fn run_validation_is_422() {
         assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
     }
     assert_eq!(t.compute_lookups(), 2);
-    assert!(t.role_grants().is_empty());
 }
 
 #[tokio::test]
@@ -8303,26 +6429,20 @@ async fn run_with_a_nul_byte_is_422() {
 }
 
 #[tokio::test]
-async fn run_unknown_database_or_role_is_404() {
+async fn run_unknown_database_is_404() {
     let t = sql_app().await;
     let main = t.main();
     for body in [
         with(run_body("select 1"), "database", json!("nope")),
         with(run_body("select 1"), "database", json!("postgres")),
-        with(run_body("select 1"), "role", json!("ghost")),
-        // `analytics` never had the data API's machinery: no `anon` there.
-        with(with(run_body("select 1"), "database", json!("analytics")), "role", json!("anon")),
     ] {
         let resp = t.run_sql(main, body.clone()).await;
         assert_eq!(code_of(&error_of(resp, 404).await), "not_found", "{body}");
     }
-    let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("ghost"))).await;
-    assert_eq!(message_of(&error_of(resp, 404).await), "role not found");
     assert_eq!(t.compute_lookups(), 0);
     // A database made in SQL (not served by the data API) and a known role are accepted.
     let ok = with(with(run_body("select 1"), "database", json!("analytics")), "role", json!("editor"));
     assert_eq!(code_of(&error_of(t.run_sql(main, ok).await, 503).await), "unavailable");
-    assert!(t.role_grants().is_empty(), "only anon and authenticated are granted");
 }
 
 #[tokio::test]
@@ -8352,9 +6472,8 @@ async fn risky_statement_needs_confirm() {
     assert_eq!(statements[0]["kind"], "DropStmt");
     assert_eq!(statements[0]["reason"], "risky");
     assert_eq!(statements[0]["text_preview"], "DROP TABLE notes");
-    // Nothing was connected or granted.
+    // Nothing was connected.
     assert_eq!(t.compute_lookups(), 0);
-    assert!(t.role_grants().is_empty());
     // `confirm: false` is the same as absent.
     let resp = t.run_sql(main, with(run_body("TRUNCATE notes"), "confirm", json!(false))).await;
     assert_eq!(code_of(&error_of(resp, 409).await), "sql_confirm_required");
@@ -8388,47 +6507,318 @@ async fn confirm_skips_the_guard() {
     assert_eq!(t.compute_lookups(), 1);
 }
 
-#[tokio::test]
-async fn anon_is_granted_once_then_cached() {
-    let t = sql_app().await;
-    let main = t.main();
-    for _ in 0..2 {
-        let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("anon"))).await;
-        assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+// ---- Act-as through member roles (members and roles, T9) ----
+
+impl Branching {
+    /// A member role row for `member` on `branch`, as the reconciler records it, sealed with
+    /// the orchestrator's key (password `pw`).
+    fn member_role_row(&self, member: uuid::Uuid, branch: BranchId, applied: &[&str]) -> MemberBranchRole {
+        let role_name = chelabase_types::role_name::member_role_name(member);
+        let password_enc =
+            chelabase_secrets::seal_member_role_password(&self.app.key, branch.as_uuid(), &role_name, "pw").unwrap();
+        MemberBranchRole {
+            member_id: member,
+            branch_id: branch.as_uuid(),
+            role_name,
+            password_enc,
+            applied_roles: applied.iter().map(|r| r.to_string()).collect(),
+        }
     }
-    // The owner the editor connects as is the one granted the role.
-    assert_eq!(t.role_grants(), vec![(main, "anon".to_string(), "postgres".to_string())]);
-    let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("authenticated"))).await;
+
+    fn put_member_role(&self, row: MemberBranchRole) {
+        let mut rows = self.metadata.member_roles.lock().unwrap();
+        rows.retain(|r| (r.member_id, r.branch_id) != (row.member_id, row.branch_id));
+        rows.push(row);
+    }
+
+    /// A reconcile writes `rows` (as the worker would) and answers with them.
+    fn on_reconcile(&self, rows: Vec<MemberBranchRole>) {
+        *self.jobs.member_rows_on_reconcile.lock().unwrap() = Some((self.metadata.member_roles.clone(), rows));
+    }
+
+    fn reconciles(&self) -> Vec<MemberRolesReconcileRequest> {
+        self.jobs.member_reconciles.lock().unwrap().clone()
+    }
+
+    /// The member row of `sub` (made by its first request).
+    fn member_of_sub(&self, sub: &str) -> uuid::Uuid {
+        self.metadata.members.lock().unwrap().iter().find(|m| m.zitadel_user_id == sub).expect("a member row").id
+    }
+
+    async fn run_as(&self, sub: &str, branch: BranchId, role: Option<&str>) -> reqwest::Response {
+        let body = with(run_body("select 1"), "role", json!(role));
+        self.send_as(sub, Method::POST, &format!("{}/sql", self.branch(branch)), Some(body)).await
+    }
+
+    async fn schema_as(&self, sub: &str, branch: BranchId, query: &str) -> reqwest::Response {
+        self.send_as(sub, Method::GET, &format!("{}/sql/schema{query}", self.branch(branch)), None).await
+    }
+}
+
+/// `sql_app` with group roles `billing`, `billing_admin` (which can become `billing`) and
+/// `sales` on main, and a Developer `dev` granted `billing_admin` and `sales`.
+async fn act_as_app() -> (Branching, uuid::Uuid) {
+    let t = sql_app().await;
+    let ep = t.metadata.branch(t.main()).endpoint_id.unwrap();
+    t.metadata.add_group_role(&ep, "billing", &[]);
+    t.metadata.add_group_role(&ep, "billing_admin", &["billing"]);
+    t.metadata.add_group_role(&ep, "sales", &[]);
+    let dev = t.grant_member("dev", PlatformRole::Developer, &["billing_admin", "sales"]);
+    (t, dev)
+}
+
+// A named role runs on the member role's own connection: no owner password is needed, and a
+// fresh row (the granted roles, a role reached through one's chain) asks for no reconcile.
+#[tokio::test]
+async fn sql_run_as_role_uses_member_session() {
+    let (t, dev) = act_as_app().await;
+    let main = t.main();
+    t.put_member_role(t.member_role_row(dev, main, &["billing_admin", "sales"]));
+    // Without an owner password the owner's connection can't open: only the member's does.
+    t.seal_owner_password(None);
+    for role in ["billing_admin", "billing", "sales"] {
+        let resp = t.run_as("dev", main, Some(role)).await;
+        assert_eq!(code_of(&error_of(resp, 503).await), "unavailable", "{role}");
+    }
+    // The schema read takes the same session for `?role=`.
+    let resp = t.schema_as("dev", main, "?role=billing").await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    assert!(t.reconciles().is_empty(), "{:?}", t.reconciles());
+    assert_eq!(t.compute_lookups(), 4);
+    // The owner (no role) is still Admin-only, on the owner's connection.
+    let err = error_of(t.run_as("dev", main, None).await, 403).await;
+    assert_eq!(err["error"]["required"], "owner");
+    let err = error_of(t.schema_as("dev", main, "").await, 403).await;
+    assert_eq!(err["error"]["required"], "owner");
+    let resp = t.run_as(DEFAULT_SUB, main, None).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    // `anon` works like any other role, through membership: no grant to the owner.
+    let admin = t.member_of_sub(DEFAULT_SUB);
+    t.put_member_role(t.member_role_row(admin, main, &["anon", "billing"]));
+    let resp = t.run_as(DEFAULT_SUB, main, Some("anon")).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    assert!(t.reconciles().is_empty(), "{:?}", t.reconciles());
+}
+
+// A missing row, a granted role the row lacks, a role the row holds but the grant no longer
+// lists (revoked), and a password that won't open: each asks the worker first, for this member.
+#[tokio::test]
+async fn sql_run_reconciles_when_stale() {
+    let (t, dev) = act_as_app().await;
+    let main = t.main();
+    t.seal_owner_password(None);
+    let fresh = t.member_role_row(dev, main, &["billing_admin", "sales"]);
+    let mut unopenable = fresh.clone();
+    unopenable.password_enc = t.member_role_row(dev, BranchId::new(), &[]).password_enc;
+    let stale: Vec<(&str, Option<MemberBranchRole>)> = vec![
+        ("missing", None),
+        ("lacks the role", Some(t.member_role_row(dev, main, &["sales"]))),
+        ("holds a revoked role", Some(t.member_role_row(dev, main, &["billing_admin", "sales", "billing"]))),
+        ("password won't open", Some(unopenable)),
+    ];
+    t.on_reconcile(vec![fresh.clone()]);
+    for (i, (case, row)) in stale.into_iter().enumerate() {
+        t.metadata.member_roles.lock().unwrap().clear();
+        if let Some(row) = row {
+            t.put_member_role(row);
+        }
+        let resp = t.run_as("dev", main, Some("billing")).await;
+        assert_eq!(code_of(&error_of(resp, 503).await), "unavailable", "{case}");
+        let asked = t.reconciles();
+        assert_eq!(asked.len(), i + 1, "{case}");
+        assert_eq!(
+            asked[i],
+            MemberRolesReconcileRequest { branch_id: main.as_uuid(), member_id: Some(dev) },
+            "{case}"
+        );
+        // The reconcile's row is the one used: the next run is fresh.
+        let resp = t.run_as("dev", main, Some("billing")).await;
+        assert_eq!(resp.status(), 503, "{case}");
+        assert_eq!(t.reconciles().len(), i + 1, "{case}");
+    }
+    // The schema read checks the same way.
+    t.metadata.member_roles.lock().unwrap().clear();
+    let resp = t.schema_as("dev", main, "?role=sales").await;
     assert_eq!(resp.status(), 503);
-    assert_eq!(t.role_grants().len(), 2);
-    assert_eq!(t.compute_lookups(), 3);
+    assert_eq!(t.reconciles().len(), 5);
 }
 
 #[tokio::test]
-async fn grant_refusal_is_403() {
-    let t = sql_app().await;
+async fn sql_run_reconcile_failure_is_503() {
+    let (t, dev) = act_as_app().await;
     let main = t.main();
-    *t.jobs.role_grant.lock().unwrap() =
-        Some(Ok(CheckDataRoleReply::refused("the data API isn't set up on this branch")));
-    for _ in 0..2 {
-        let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("anon"))).await;
-        let err = error_of(resp, 403).await;
-        assert_eq!(code_of(&err), "role_refused");
-        assert_eq!(message_of(&err), "the data API isn't set up on this branch");
-    }
-    // A refusal isn't remembered.
-    assert_eq!(t.role_grants().len(), 2);
-    assert_eq!(t.compute_lookups(), 0);
-    // The other answers map as the console's role check does.
-    for (answer, status, code) in [
-        (Ok(CheckDataRoleReply::not_ready()), 409, "branch_not_ready"),
-        (Err(ResetError::Timeout), 504, "timeout"),
-        (Err(ResetError::Transport("no worker".into())), 503, "worker_unavailable"),
-        (Ok(CheckDataRoleReply::failed("boom")), 500, "internal"),
+    for answer in [
+        Ok(MemberRolesReply::Failed { message: "psql failed".into() }),
+        Err(ResetError::Timeout),
+        Err(ResetError::Transport("no worker listening".into())),
+        // Done, but nothing recorded for this member.
+        Ok(MemberRolesReply::Done { roles: vec![MemberRoleApplied {
+            member_id: dev,
+            role_name: "cb_m_x".into(),
+            applied_roles: vec!["sales".into()],
+        }] }),
     ] {
-        *t.jobs.role_grant.lock().unwrap() = Some(answer);
-        let resp = t.run_sql(main, with(run_body("select 1"), "role", json!("anon"))).await;
-        assert_eq!(code_of(&error_of(resp, status).await), code);
+        *t.jobs.member_reconcile_reply.lock().unwrap() = Some(answer.clone());
+        for resp in [t.run_as("dev", main, Some("sales")).await, t.schema_as("dev", main, "?role=sales").await] {
+            assert_eq!(resp.status(), 503, "{answer:?}");
+            assert_eq!(resp.headers()["retry-after"], "2", "{answer:?}");
+            let err: Value = resp.json().await.unwrap();
+            assert_eq!(code_of(&err), "member_role_reconcile_failed", "{answer:?}");
+        }
+    }
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+// A role the member role can't become even after a reconcile (missing on the branch, or left
+// out by the reconciler) is 403 `forbidden{required: "role:<name>"}`.
+#[tokio::test]
+async fn act_as_missing_role_is_forbidden() {
+    let (t, dev) = act_as_app().await;
+    let main = t.main();
+    // A tenant admin may name any role; `ghost` doesn't exist on the branch.
+    t.run_as(DEFAULT_SUB, main, None).await; // makes the member row (an owner run: one lookup)
+    let admin = t.member_of_sub(DEFAULT_SUB);
+    let lookups = t.compute_lookups();
+    t.on_reconcile(vec![t.member_role_row(admin, main, &["billing", "sales"])]);
+    for (sub, role) in [(DEFAULT_SUB, "ghost"), (DEFAULT_SUB, "Ghost2")] {
+        let err = error_of(t.run_as(sub, main, Some(role)).await, 403).await;
+        assert_eq!(code_of(&err), "forbidden", "{role}");
+        assert_eq!(err["error"]["required"], format!("role:{role}"), "{role}");
+        let err = error_of(t.schema_as(sub, main, &format!("?role={role}")).await, 403).await;
+        assert_eq!(err["error"]["required"], format!("role:{role}"), "{role}");
+    }
+    // M10: a Developer granted `ghost` itself (a role the grant names but the branch lacks): the
+    // grant makes it listed, the branch doesn't have it, so the member role never does.
+    t.grant_member("gus", PlatformRole::Developer, &["ghost"]);
+    let gus = t.member_of_sub("gus");
+    t.on_reconcile(vec![t.member_role_row(gus, main, &["billing"])]);
+    let err = error_of(t.run_as("gus", main, Some("ghost")).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("role:ghost")));
+    let err = error_of(t.schema_as("gus", main, "?role=ghost").await, 403).await;
+    assert_eq!(err["error"]["required"], "role:ghost");
+    // The reconciler left `sales` out of the Developer's role (its chain became unsafe).
+    t.on_reconcile(vec![t.member_role_row(dev, main, &["billing_admin"])]);
+    let err = error_of(t.run_as("dev", main, Some("sales")).await, 403).await;
+    assert_eq!(err["error"]["required"], "role:sales");
+    // The worker answered `Done` without this member: no member role at all.
+    *t.jobs.member_reconcile_reply.lock().unwrap() = Some(Ok(MemberRolesReply::Done { roles: vec![] }));
+    t.metadata.member_roles.lock().unwrap().clear();
+    let err = error_of(t.run_as("dev", main, Some("billing")).await, 403).await;
+    assert_eq!(err["error"]["required"], "role:billing");
+    // None of these reached the compute.
+    assert_eq!(t.compute_lookups(), lookups);
+}
+
+// R16 and R22: a LOGIN or owner-level role is never in a member role. An Admin acts as it on the
+// owner's connection (`SET ROLE`), as before; a Developer can't name it at all.
+#[tokio::test]
+async fn admin_acts_as_login_role_through_the_owner() {
+    let (t, _dev) = act_as_app().await;
+    let main = t.main();
+    t.seal_owner_password(None);
+    // `editor` is a LOGIN role: the owner's connection, which has no password here.
+    let resp = t.run_as(DEFAULT_SUB, main, Some("editor")).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    let resp = t.schema_as(DEFAULT_SUB, main, "?role=editor").await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    assert!(t.reconciles().is_empty());
+    t.grant_member("dev2", PlatformRole::Developer, &["editor"]);
+    let err = error_of(t.run_as("dev2", main, Some("editor")).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+}
+
+// I2 (T9 review): an effective Admin acts as any role of the branch. When the member role can't
+// hold it (a chain through a reserved role, R23; or one the reconciler left out, e.g. an ADMIN
+// chain 6a can't see), the owner's connection and `SET ROLE` serve it instead.
+#[tokio::test]
+async fn admin_falls_back_to_the_owner_when_the_member_role_cant_hold_the_role() {
+    let (t, _dev) = act_as_app().await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    t.metadata.add_group_role(&ep, "analyst", &["pg_read_all_data"]);
+    t.seal_owner_password(None);
+    // Seen in the graph: straight to the owner, no reconcile.
+    let resp = t.run_as(DEFAULT_SUB, main, Some("analyst")).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    let resp = t.schema_as(DEFAULT_SUB, main, "?role=analyst").await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    assert!(t.reconciles().is_empty());
+    // Left out by the reconciler: after it says so, the owner.
+    let admin = t.member_of_sub(DEFAULT_SUB);
+    t.on_reconcile(vec![t.member_role_row(admin, main, &["billing"])]);
+    let resp = t.run_as(DEFAULT_SUB, main, Some("sales")).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    assert_eq!(t.reconciles().len(), 1);
+    // A project Admin (not a tenant admin) the same.
+    let adm = t.grant_member("adm", PlatformRole::Admin, &["analyst"]);
+    let resp = t.run_as("adm", main, Some("analyst")).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
+    assert!(!t.reconciles().iter().any(|r| r.member_id == Some(adm)));
+}
+
+// R31: an act-as run records the role it acts as on the member's row before it starts (a
+// reconcile hands leftovers to it); a schema read and an owner run record nothing.
+#[tokio::test]
+async fn act_as_run_records_the_acted_role() {
+    let (t, dev) = act_as_app().await;
+    let main = t.main();
+    t.put_member_role(t.member_role_row(dev, main, &["billing_admin", "sales"]));
+    let recorded = || t.metadata.acted_roles.lock().unwrap().get(&(dev, main.as_uuid())).cloned();
+    let resp = t.schema_as("dev", main, "?role=sales").await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(recorded(), None);
+    for role in ["sales", "billing"] {
+        let resp = t.run_as("dev", main, Some(role)).await;
+        assert_eq!(code_of(&error_of(resp, 503).await), "unavailable", "{role}");
+        assert_eq!(recorded().as_deref(), Some(role));
+    }
+    let resp = t.run_as(DEFAULT_SUB, main, None).await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(t.metadata.acted_roles.lock().unwrap().len(), 1);
+}
+
+// M5 (T9 review), single rule: below Admin, a role whose chain the graph already refuses (here
+// through a reserved role) is 403 `admin` from the access check, without asking the worker.
+#[tokio::test]
+async fn developer_poisoned_chain_is_403_without_reconcile() {
+    let (t, _dev) = act_as_app().await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    t.metadata.add_group_role(&ep, "analyst", &["pg_read_all_data"]);
+    t.grant_member("dev3", PlatformRole::Developer, &["analyst"]);
+    for resp in [t.run_as("dev3", main, Some("analyst")).await, t.schema_as("dev3", main, "?role=analyst").await] {
+        let err = error_of(resp, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")));
+    }
+    assert!(t.reconciles().is_empty());
+}
+
+// M1 (T9 review): a row holding a role that has since become unsafe (LOGIN, or a chain through
+// a reserved or owner-level role) is stale, even when the requested role is reachable.
+#[tokio::test]
+async fn a_row_holding_a_role_that_became_unsafe_is_stale() {
+    let (t, dev) = act_as_app().await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    t.seal_owner_password(None);
+    let fresh = t.member_role_row(dev, main, &["billing_admin", "sales"]);
+    t.on_reconcile(vec![t.member_role_row(dev, main, &["billing_admin"])]);
+    for (i, change) in ["login", "reserved chain"].into_iter().enumerate() {
+        {
+            let mut roles = t.metadata.roles.lock().unwrap();
+            let sales = roles.get_mut(&ep).unwrap().iter_mut().find(|r| r.name == "sales").unwrap();
+            match change {
+                "login" => sales.login = true,
+                _ => {
+                    sales.login = false;
+                    sales.attributes.member_of = vec!["pg_monitor".into()];
+                }
+            }
+        }
+        t.put_member_role(fresh.clone());
+        let resp = t.run_as("dev", main, Some("billing")).await;
+        assert_eq!(code_of(&error_of(resp, 503).await), "unavailable", "{change}");
+        assert_eq!(t.reconciles().len(), i + 1, "{change}");
     }
 }
 
@@ -8438,7 +6828,7 @@ async fn fifth_run_is_429() {
     let main = t.main();
     let runs = t.app.state.sql_editor.runs();
     let held: Vec<_> = (0..4)
-        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), BranchId::new(), "web1").unwrap())
+        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), None, BranchId::new(), "web1").unwrap())
         .collect();
     let resp = t.run_sql(main, run_body("select 1")).await;
     assert_eq!(resp.status(), 429);
@@ -8455,7 +6845,7 @@ async fn duplicate_run_id_is_409() {
     let t = sql_app().await;
     let main = t.main();
     let id = uuid::Uuid::new_v4();
-    let _held = t.app.state.sql_editor.runs().reserve("user-1", id, main, "web1").unwrap();
+    let _held = t.app.state.sql_editor.runs().reserve("user-1", id, None, main, "web1").unwrap();
     let resp = t.run_sql(main, json!({ "run_id": id, "sql": "select 1" })).await;
     assert_eq!(code_of(&error_of(resp, 409).await), "run_id_in_use");
     // Another user may use the same id.
@@ -8475,12 +6865,13 @@ async fn cancel_unknown_run_is_404() {
     assert_eq!(message_of(&err), "run not found");
     // A run in flight is cancelled: 202 `{}` and its token fires.
     let id = uuid::Uuid::new_v4();
-    let held = t.app.state.sql_editor.runs().reserve("user-1", id, main, "web1").unwrap();
-    // Another user's cancel doesn't reach it.
+    let held = t.app.state.sql_editor.runs().reserve("user-1", id, None, main, "web1").unwrap();
+    // Another Developer's cancel doesn't reach it.
+    t.grant_member("user-2", PlatformRole::Developer, &[]);
     let resp = t
         .send_as("user-2", Method::POST, &format!("{}/sql/runs/{id}/cancel", t.branch(main)), None)
         .await;
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 403);
     assert!(!held.token().is_cancelled());
     let resp = t.cancel_run(main, id).await;
     assert_eq!(resp.status(), 202);
@@ -8505,7 +6896,7 @@ async fn owner_password_unknown_is_409() {
     assert_eq!(code_of(&err), "owner_password_unknown");
     assert_eq!(t.compute_lookups(), 0);
     // The slot was given back.
-    assert!(t.app.state.sql_editor.runs().reserve("user-1", id, main, "web1").is_ok());
+    assert!(t.app.state.sql_editor.runs().reserve("user-1", id, None, main, "web1").is_ok());
 }
 
 #[tokio::test]
@@ -8516,8 +6907,8 @@ async fn run_refuses_backups_unready_branches_and_strangers() {
     assert_eq!(code_of(&error_of(t.run_sql(backup, run_body("select 1")).await, 409).await), "backup_branch");
     let pending = t.add("dev", main, BranchKind::Normal, BranchStatus::Pending);
     assert_eq!(code_of(&error_of(t.run_sql(pending, run_body("select 1")).await, 409).await), "branch_not_ready");
-    // The branch checks come before the body's.
-    assert_eq!(code_of(&error_of(t.run_sql(pending, json!({})).await, 409).await), "branch_not_ready");
+    // The body is read before the branch checks: the access check needs its role and database.
+    assert_eq!(code_of(&error_of(t.run_sql(pending, json!({})).await, 422).await), "invalid_request");
     let resp = t
         .send(Method::POST, &format!("{}/{}/sql", t.branches(), uuid::Uuid::new_v4()), Some(run_body("select 1")))
         .await;
@@ -8581,7 +6972,7 @@ async fn sql_schema_counts_against_the_run_limits() {
     let main = t.main();
     let runs = t.app.state.sql_editor.runs();
     let held: Vec<_> = (0..4)
-        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), BranchId::new(), "web1").unwrap())
+        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), None, BranchId::new(), "web1").unwrap())
         .collect();
     let resp = t.sql_schema(main, "").await;
     assert_eq!(resp.status(), 429);
@@ -8592,7 +6983,7 @@ async fn sql_schema_counts_against_the_run_limits() {
     // A schema read's slot is given back when it ends.
     assert_eq!(code_of(&error_of(t.sql_schema(main, "").await, 503).await), "unavailable");
     let held: Vec<_> = (0..4)
-        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), main, "web1").unwrap())
+        .map(|_| runs.reserve("user-1", uuid::Uuid::new_v4(), None, main, "web1").unwrap())
         .collect();
     drop(held);
 }
@@ -8612,12 +7003,12 @@ async fn read_events(mut resp: reqwest::Response) -> Vec<Value> {
         .collect()
 }
 
-/// Owner sessions of the SQL editor on the scratch compute.
+/// Sessions of the SQL editor (the owner's or a member role's) in the scratch database.
 async fn editor_sessions(scratch: &ScratchCompute) -> i64 {
     let (n,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = 'chelabase-sql-editor'",
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND application_name = 'chelabase-sql-editor'",
     )
-    .bind(&scratch.owner)
+    .bind(&scratch.database)
     .fetch_one(&scratch.admin)
     .await
     .unwrap();
@@ -8659,7 +7050,7 @@ async fn run_streams_events_over_http() {
     assert_eq!(events[4]["outcome"], "ok");
     // The connection is closed and the slot given back.
     wait_no_editor_sessions(&scratch).await;
-    assert!(t.app.state.sql_editor.runs().reserve("user-1", id, main, &scratch.database).is_ok());
+    assert!(t.app.state.sql_editor.runs().reserve("user-1", id, None, main, &scratch.database).is_ok());
     // One audit line, with the tags, without the SQL or its values.
     let text = logs.text();
     let audit: Vec<&str> = text.lines().filter(|l| l.contains("sql run")).collect();
@@ -8718,6 +7109,117 @@ async fn closing_the_stream_cancels_the_run() {
     scratch.drop().await;
 }
 
+// I4: the run route registers the starter, so a Developer cancels their own run over HTTP and
+// another Developer can't.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn developer_cancels_their_own_run_over_http() {
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("starter-pass").await;
+    let group = format!("{}_grp", scratch.owner);
+    scratch.exec_in(&format!("CREATE ROLE {group} NOLOGIN; GRANT {group} TO {}", scratch.owner)).await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("starter-pass"));
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    t.metadata.add_group_role(&ep, &group, &[]);
+    let a = t.grant_member("dev-a", PlatformRole::Developer, &[&group]);
+    t.grant_member("dev-b", PlatformRole::Developer, &[&group]);
+    // dev-a's member role, as the reconciler would have made it (T9: runs log in as it).
+    let row = t.member_role_row(a, main, &[&group]);
+    scratch
+        .exec_in(&format!(
+            "CREATE ROLE {0} LOGIN NOINHERIT PASSWORD 'pw'; GRANT {group} TO {0} WITH INHERIT FALSE, SET TRUE",
+            row.role_name
+        ))
+        .await;
+    let member_role = row.role_name.clone();
+    t.put_member_role(row);
+
+    let id = uuid::Uuid::new_v4();
+    let path = format!("{}/sql", t.branch(main));
+    let resp = t
+        .send_as("dev-a", Method::POST, &path, Some(json!({ "run_id": id, "role": group, "sql": "SELECT pg_sleep(30)" })))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let cancel = format!("{}/sql/runs/{id}/cancel", t.branch(main));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while editor_sessions(&scratch).await == 0 {
+        assert!(std::time::Instant::now() < deadline, "the run never started");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let err = error_of(t.send_as("dev-b", Method::POST, &cancel, None).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    assert_eq!(t.send_as("dev-a", Method::POST, &cancel, None).await.status(), 202);
+    let events = read_events(resp).await;
+    assert_eq!(events.last().unwrap()["outcome"], "cancelled", "{events:?}");
+    // R5: after `done`, the run's hand-over is asked for, with the run's backend.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while t.jobs.member_hand_overs.lock().unwrap().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no hand-over asked for");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let asked = t.jobs.member_hand_overs.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        (asked[0].branch_id, asked[0].member_id, asked[0].database.as_str(), asked[0].acted_role.as_str()),
+        (main.as_uuid(), a, scratch.database.as_str(), group.as_str())
+    );
+    assert!(asked[0].backend_pid.is_some_and(|pid| pid > 0), "{asked:?}");
+    wait_no_editor_sessions(&scratch).await;
+    let admin = scratch.admin.clone();
+    scratch.drop().await;
+    use sqlx::Executor;
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {member_role}; DROP ROLE {group}"))).await.unwrap();
+}
+
+// M6 (T9 review): a member-role login the server refuses (28P01: the password changed under
+// us) forces one reconcile, then the login is tried again; still refused is 503.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn member_login_refused_forces_one_reconcile() {
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("owner-pass").await;
+    let group = format!("{}_grp", scratch.owner);
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("owner-pass"));
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    t.metadata.add_group_role(&ep, &group, &[]);
+    let a = t.grant_member("dev-a", PlatformRole::Developer, &[&group]);
+    let row = t.member_role_row(a, main, &[&group]); // sealed "pw"
+    let member_role = row.role_name.clone();
+    scratch
+        .exec_in(&format!(
+            "CREATE ROLE {group} NOLOGIN; \
+             CREATE ROLE {member_role} LOGIN NOINHERIT PASSWORD 'changed-in-sql'; \
+             GRANT {group} TO {member_role} WITH INHERIT FALSE, SET TRUE"
+        ))
+        .await;
+    t.put_member_role(row.clone());
+    // The worker's reconcile puts the right password back (here: a row sealing the catalog's).
+    let mut fixed = row.clone();
+    fixed.password_enc =
+        chelabase_secrets::seal_member_role_password(&t.app.key, main.as_uuid(), &member_role, "changed-in-sql").unwrap();
+    t.on_reconcile(vec![fixed]);
+    let resp = t.run_as("dev-a", main, Some(&group)).await;
+    assert_eq!(resp.status(), 200);
+    let events = read_events(resp).await;
+    assert_eq!(events.last().unwrap()["outcome"], "ok", "{events:?}");
+    assert_eq!(t.reconciles().len(), 1);
+    // A reconcile that doesn't fix it: one forced reconcile, then 503.
+    t.put_member_role(row.clone());
+    t.on_reconcile(vec![row]);
+    let resp = t.run_as("dev-a", main, Some(&group)).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "member_role_reconcile_failed");
+    assert_eq!(t.reconciles().len(), 2);
+    wait_no_editor_sessions(&scratch).await;
+    let admin = scratch.admin.clone();
+    scratch.drop().await;
+    use sqlx::Executor;
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {member_role}; DROP ROLE {group}"))).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "needs the metadata Postgres (just deps-up)"]
 async fn schema_route_returns_pgls_json() {
@@ -8740,39 +7242,6 @@ async fn schema_route_returns_pgls_json() {
 }
 
 // --- Schema merges (step 6g, T10) ------------------------------------------------------------
-
-/// A merge row as the fake stores it, for tests that start from a given state.
-fn merge_row(db: DatabaseId, source: BranchId, target: BranchId, status: MergeStatus) -> MergeRecord {
-    let now = chrono::Utc::now();
-    MergeRecord {
-        id: uuid::Uuid::new_v4(),
-        database_id: db.as_uuid(),
-        source_branch_id: source.as_uuid(),
-        target_branch_id: target.as_uuid(),
-        direction: chelabase_metadata::MergeDirection::IntoParent,
-        database_name: "app".into(),
-        status,
-        failed_phase: None,
-        version: 3,
-        base_fingerprint: None,
-        source_fingerprint: None,
-        target_fingerprint: None,
-        analysis: None,
-        resolutions: json!([]),
-        user_steps: json!([]),
-        acknowledgements: json!([]),
-        options: json!({"lock_timeout_ms": 5000, "after": "keep"}),
-        plan: None,
-        rehearsal: None,
-        result: None,
-        rebaselined: false,
-        error: None,
-        claimed_at: None,
-        created_by: "user-1".into(),
-        created_at: now,
-        updated_at: now,
-    }
-}
 
 impl Branching {
     fn merges(&self) -> String {
@@ -10055,4 +8524,3038 @@ async fn apply_and_retry_log_the_attempt_start() {
         .filter_map(|e| e.detail.clone())
         .collect();
     assert_eq!(logged, vec![json!({"to": "applying"}), json!({"to": "applying"})]);
+}
+
+// --- Members: who may call what (members and roles, T5) --------------------------------------
+
+#[tokio::test]
+async fn removed_member_is_refused_with_a_valid_token() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "bob", w.project, PlatformRole::Admin, &[]);
+    let path = format!("/v1/databases/{}", w.db);
+    assert_eq!(w.app.send_as("bob", "org-1", Method::GET, &path, None).await.status(), 200);
+
+    w.metadata.set_member(w.tenant, "bob", |m| m.status = MemberStatus::Removed);
+    let err = error_of(w.app.send_as("bob", "org-1", Method::GET, &path, None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    // The request neither revives the member nor makes a new one.
+    assert_eq!(w.metadata.member(w.tenant, "bob").unwrap().status, MemberStatus::Removed);
+    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.zitadel_user_id == "bob").count(), 1);
+
+    // A removed tenant admin is refused too, on every project.
+    w.metadata.set_member(w.tenant, DEFAULT_SUB, |m| m.status = MemberStatus::Removed);
+    let err = error_of(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let err = error_of(w.app.send_as(DEFAULT_SUB, "org-1", Method::POST, "/v1/projects", Some(json!({"name": "x"}))).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+#[tokio::test]
+async fn invited_member_activates_on_first_request() {
+    let w = member_world(Mode::SelfHosted).await;
+    let id = w.metadata.add_member(w.tenant, "carol", MemberStatus::Invited, false);
+    w.metadata.add_open_invite(id);
+    w.metadata.grant(id, w.project, PlatformRole::Viewer, &[]);
+    let path = format!("/v1/databases/{}", w.db);
+    assert_eq!(w.app.send_as("carol", "org-1", Method::GET, &path, None).await.status(), 200);
+    let m = w.metadata.member(w.tenant, "carol").unwrap();
+    assert_eq!(m.status, MemberStatus::Active);
+    assert!(m.accepted_at.is_some());
+    assert_eq!(m.email.as_deref(), Some("carol@example.test"), "the token's claims are stored");
+}
+
+// I1: an invited member whose invite expired (or never existed) stays invited and gets
+// `no_access_yet`, whatever token they hold.
+#[tokio::test]
+async fn expired_invite_sign_in_is_no_access_yet() {
+    let w = member_world(Mode::SelfHosted).await;
+    let id = w.metadata.add_member(w.tenant, "dave", MemberStatus::Invited, false);
+    w.metadata.add_open_invite(id);
+    w.metadata.grant(id, w.project, PlatformRole::Viewer, &[]);
+    w.metadata.expire_invites(id);
+    let path = format!("/v1/databases/{}", w.db);
+    let err = error_of(w.app.send_as("dave", "org-1", Method::GET, &path, None).await, 403).await;
+    assert_eq!(code_of(&err), "no_access_yet");
+    assert_eq!(w.metadata.member(w.tenant, "dave").unwrap().status, MemberStatus::Invited);
+}
+
+// R49: an invited member whose invite expired can't read the member list, so `/v1/me` names
+// the tenant admins to ask (active ones only); nobody else gets the list there.
+#[tokio::test]
+async fn me_names_the_tenant_admins_for_an_expired_invite() {
+    let w = member_world(Mode::SelfHosted).await;
+    let id = w.metadata.add_member(w.tenant, "dave", MemberStatus::Invited, false);
+    w.metadata.add_open_invite(id);
+    w.metadata.expire_invites(id);
+    w.metadata.add_member(w.tenant, "gone_admin", MemberStatus::Removed, true);
+    let me: Value = w.app.send_as("dave", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["member"]["status"], "invited");
+    let admins = me["tenant_admins"].as_array().expect("tenant_admins").clone();
+    let default_admin = w.metadata.member(w.tenant, DEFAULT_SUB).unwrap();
+    assert_eq!(admins, vec![json!({ "name": default_admin.display_name, "email": default_admin.email })]);
+    // An active member reads the member list instead: no list here.
+    w.metadata.add_granted(w.tenant, "erin", w.project, PlatformRole::Viewer, &[]);
+    let me: Value = w.app.send_as("erin", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["tenant_admins"], json!([]));
+}
+
+// I3: `/v1/me` lists, per project, the databases the member's grant is narrowed on, with the
+// effective role and roles there; a database without an override is not listed, a tenant admin
+// has none.
+#[tokio::test]
+async fn me_lists_narrowed_databases() {
+    let w = member_world(Mode::SelfHosted).await;
+    let m = w.metadata.add_granted(w.tenant, "nat", w.project, PlatformRole::Admin, &["app", "reports"]);
+    w.metadata.narrow(m, w.db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: Some(vec!["app".into()]) });
+    let me: Value = w.app.send_as("nat", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(
+        me["projects"],
+        json!([{
+            "project_id": w.project,
+            "platform_role": "admin",
+            "roles": ["owner", "app", "reports"],
+            "databases": [{ "database_id": w.db, "platform_role": "developer", "roles": ["app"] }],
+        }]),
+        "{me}"
+    );
+    // A role-only override keeps the grant's role.
+    w.metadata.narrow(m, w.db, OverrideRow { platform_role: None, pg_roles: Some(vec!["reports".into()]) });
+    let me: Value = w.app.send_as("nat", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["projects"][0]["databases"], json!([{ "database_id": w.db, "platform_role": "admin", "roles": ["owner", "reports"] }]));
+    // No override: an empty list. A tenant admin: always empty.
+    w.metadata.add_granted(w.tenant, "pia", w.project, PlatformRole::Viewer, &[]);
+    let me: Value = w.app.send_as("pia", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["projects"][0]["databases"], json!([]));
+    let me: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert!(me["projects"].as_array().unwrap().iter().all(|p| p["databases"] == json!([]) && p["roles"] == "all"), "{me}");
+}
+
+// R39: sign-up is off unless the tenant switched it on: a person in the org with no invite and
+// no row is refused (the "ask your admin for an invite" answer) and nothing is written.
+#[tokio::test]
+async fn closed_signup_creates_no_member() {
+    let w = member_world(Mode::SelfHosted).await;
+    let path = format!("/v1/databases/{}", w.db);
+    let before = (w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len());
+    let err = error_of(w.app.send_as("hal", "org-1", Method::GET, &path, None).await, 403).await;
+    assert_eq!(code_of(&err), "no_access_yet");
+    let err = error_of(w.app.send_as("hal", "org-1", Method::GET, "/v1/members", None).await, 403).await;
+    assert_eq!(code_of(&err), "no_access_yet");
+    assert!(w.metadata.member(w.tenant, "hal").is_none(), "no member row");
+    assert_eq!((w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len()), before);
+    // /v1/me still answers, with no membership.
+    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert!(me["member"].is_null(), "{me}");
+    assert_eq!(me["projects"], json!([]));
+}
+
+// M7 (R41): on a fresh install two people may sign up before either has a member row (the gate
+// counts members). The one whose first request comes second is not stranded: while the tenant's
+// admin claim is recent they are a pending request (shown in Requests). Anyone later is refused.
+#[tokio::test]
+async fn first_member_race_loser_is_a_pending_request() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::minutes(5)));
+    let me: Value = w.app.send_as("late", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    let late = w.metadata.member(w.tenant, "late").expect("a member row");
+    assert_eq!((late.status, late.tenant_admin), (MemberStatus::Pending, false));
+    assert_eq!(me["member"]["status"], "pending", "{me}");
+    let events: Vec<String> = w.metadata.events.lock().unwrap().iter().map(|e| e.action.clone()).collect();
+    assert_eq!(events, vec!["member_joined".to_string()]);
+    // The admin sees the request.
+    let list: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/members", None).await.json().await.unwrap();
+    assert!(list.as_array().unwrap().iter().any(|m| m["status"] == "pending"), "{list}");
+
+    // Once the claim is old, a person with no row is refused again, and nothing is written.
+    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::hours(3)));
+    let before = w.metadata.members.lock().unwrap().len();
+    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert!(me["member"].is_null(), "{me}");
+    assert_eq!(w.metadata.members.lock().unwrap().len(), before);
+    // And a tenant whose admin was not claimed through sign-up never admits one.
+    w.metadata.set_admin_claim(w.tenant, None);
+    let me: Value = w.app.send_as("ivy", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert!(me["member"].is_null(), "{me}");
+}
+
+// R39: with open sign-up on, the same person becomes a pending member (one `member_joined`
+// event) who can do nothing yet.
+#[tokio::test]
+async fn open_signup_creates_pending_member() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.open_signups.lock().unwrap().insert(w.tenant, true);
+    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    let hal = w.metadata.member(w.tenant, "hal").unwrap().id;
+    assert_eq!(me["member"], json!({ "id": hal, "status": "pending", "tenant_admin": false }));
+    assert_eq!(me["projects"], json!([]));
+    let m = w.metadata.member(w.tenant, "hal").expect("a member row");
+    assert_eq!((m.status, m.tenant_admin), (MemberStatus::Pending, false), "the tenant has an admin already");
+    let events: Vec<String> = w.metadata.events.lock().unwrap().iter().map(|e| e.action.clone()).collect();
+    assert_eq!(events, vec!["member_joined"]);
+    // Asking again changes nothing, and a pending member stays out.
+    let path = format!("/v1/databases/{}", w.db);
+    let err = error_of(w.app.send_as("hal", "org-1", Method::GET, &path, None).await, 403).await;
+    assert_eq!(code_of(&err), "pending_approval");
+    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.zitadel_user_id == "hal").count(), 1);
+    assert_eq!(w.metadata.events.lock().unwrap().len(), 1, "no second event");
+}
+
+// R40: a pending member is 403 `pending_approval` on every route except /v1/me.
+#[tokio::test]
+async fn pending_member_is_403_pending_approval() {
+    let t = mw(Mode::SelfHosted).await;
+    let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+    let project = t.w.project;
+    let db = t.w.db;
+    for (method, path, body) in [
+        (Method::GET, "/v1/members".to_string(), None),
+        (Method::GET, "/v1/projects".to_string(), None),
+        (Method::GET, format!("/v1/databases/{db}"), None),
+        (Method::GET, format!("/v1/projects/{project}"), None),
+        (Method::GET, "/v1/invites/delivery".to_string(), None),
+        (Method::PATCH, "/v1/tenant".to_string(), Some(json!({ "display_name": "x" }))),
+        (Method::POST, "/v1/invites".to_string(), Some(json!({ "email": "a@x.com" }))),
+        (Method::POST, format!("/v1/members/{pat}/approve"), Some(json!({ "grants": [] }))),
+        (Method::POST, format!("/v1/members/{pat}/decline"), None),
+    ] {
+        let err = error_of(t.send("pat", method.clone(), &path, body).await, 403).await;
+        assert_eq!(code_of(&err), "pending_approval", "{method} {path}");
+    }
+    let me = body_of(t.send("pat", Method::GET, "/v1/me", None).await).await;
+    assert_eq!(me["member"], json!({ "id": pat, "status": "pending", "tenant_admin": false }));
+    assert_eq!(me["projects"], json!([]));
+    assert_eq!(t.w.metadata.member(t.w.tenant, "pat").unwrap().status, MemberStatus::Pending);
+    assert!(t.actions().is_empty());
+}
+
+// R40: approval stores the first grants and activates the member in one step, then reconciles.
+#[tokio::test]
+async fn approve_grants_and_activates() {
+    let t = mw(Mode::SelfHosted).await;
+    let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+    let body = invite_body(&t.w, "ignored@x.com", "developer", &["app"]);
+    let approve = |sub: &'static str, id: uuid::Uuid, body: Value| {
+        let t = &t;
+        async move { t.send(sub, Method::POST, &format!("/v1/members/{id}/approve"), Some(body)).await }
+    };
+    // Only a tenant admin approves.
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
+    let err = error_of(approve("padmin", pat, json!({ "grants": body["grants"] })).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("tenant admin")));
+    assert_eq!(t.w.metadata.member(t.w.tenant, "pat").unwrap().status, MemberStatus::Pending);
+
+    let resp = approve(DEFAULT_SUB, pat, json!({ "grants": body["grants"] })).await;
+    assert_eq!(resp.status(), 200);
+    let member = body_of(resp).await;
+    assert_eq!((member["status"].as_str(), member["has_access"].as_bool()), (Some("active"), Some(true)));
+    assert_eq!(t.grant_of(pat), Some(GrantRow { platform_role: PlatformRole::Developer, pg_roles: vec!["app".into()] }));
+    assert_eq!(t.w.metadata.member(t.w.tenant, "pat").unwrap().status, MemberStatus::Active);
+    assert_eq!(t.actions(), vec!["member_approved"]);
+    assert_eq!(t.enqueued(), t.branches(), "the project's branches reconcile");
+    // The member can use what was granted.
+    let path = format!("/v1/databases/{}", t.w.db);
+    assert_eq!(t.send("pat", Method::GET, &path, None).await.status(), 200);
+    // Approving again, or a member who is not pending, is a conflict; a stranger's id is 404.
+    let err = error_of(approve(DEFAULT_SUB, pat, json!({ "grants": [] })).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    let err = error_of(approve(DEFAULT_SUB, uuid::Uuid::new_v4(), json!({ "grants": [] })).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    // No grants is fine: active, no access yet.
+    let bob = t.w.metadata.add_member(t.w.tenant, "bob", MemberStatus::Pending, false);
+    let member = body_of(approve(DEFAULT_SUB, bob, json!({})).await).await;
+    assert_eq!((member["status"].as_str(), member["has_access"].as_bool()), (Some("active"), Some(false)));
+    assert_eq!(t.actions(), vec!["member_approved", "member_approved"]);
+}
+
+// I-A: a pending member has no grants or overrides until it is approved, so every write of
+// them is refused, and the refusal changes nothing.
+#[tokio::test]
+async fn grant_and_override_writes_on_a_pending_member_are_refused() {
+    let t = mw(Mode::SelfHosted).await;
+    let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+    // A leftover grant, so the override routes get as far as the store.
+    t.w.metadata.grant(pat, t.w.project, PlatformRole::Developer, &[]);
+    let before = t.grant_of(pat);
+    let grant = format!("/v1/projects/{}/grants/{pat}", t.w.project);
+    let calls = [
+        (Method::PUT, grant.clone(), Some(json!({ "platform_role": "viewer", "pg_roles": [] }))),
+        (Method::DELETE, grant.clone(), None),
+        (Method::PUT, format!("{grant}/overrides"), Some(json!({ "database_id": t.w.db, "platform_role": "viewer" }))),
+        (Method::DELETE, format!("{grant}/overrides?database_id={}", t.w.db), None),
+    ];
+    for (method, path, body) in calls {
+        let resp = t.send(DEFAULT_SUB, method.clone(), &path, body).await;
+        assert_eq!(resp.status(), 409, "{method} {path}");
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(code_of(&err), "conflict", "{method} {path}");
+        assert!(err["error"]["message"].as_str().unwrap().contains("approve it first"), "{err}");
+    }
+    assert_eq!(t.grant_of(pat), before, "nothing changed");
+    assert!(t.actions().is_empty());
+    // An invite for its email is refused too: approve it instead (its own code, naming the member).
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "pat@example.test", "viewer", &[]))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&err), "signup_pending");
+    assert_eq!(err["error"]["member_id"], json!(pat.to_string()), "{err}");
+    assert_eq!(t.grant_of(pat), before);
+}
+
+// I-A: approval checks the grants against the member's existing overrides, as any grant is
+// checked: an Admin grant holding a role that is only safe for Admins is refused when an
+// override narrows the member below Admin on a database.
+#[tokio::test]
+async fn approve_checks_grants_against_overrides() {
+    let t = mw(Mode::SelfHosted).await;
+    let ep = t.main_endpoint();
+    t.w.metadata.add_group_role(&ep, "billing", &[]);
+    t.w.metadata.add_role(&ep, "svc", RoleOrigin::Sql, false, false); // a LOGIN role
+    t.w.metadata.add_group_role(&ep, "via_login", &["billing", "svc"]);
+    let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+    t.w.metadata.overrides.lock().unwrap().insert(
+        (pat, t.w.db.as_uuid()),
+        chelabase_metadata::members::OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None },
+    );
+    let path = format!("/v1/members/{pat}/approve");
+    let body = json!({ "grants": [{ "project_id": t.w.project, "platform_role": "admin", "pg_roles": ["via_login"] }] });
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(body.clone())).await, 422).await;
+    assert_eq!(err["error"]["role"], "via_login");
+    assert_eq!(t.w.metadata.member(t.w.tenant, "pat").unwrap().status, MemberStatus::Pending);
+    assert_eq!(t.grant_of(pat), None);
+    // Without the override the same grant is fine (Admin may hold it).
+    t.w.metadata.overrides.lock().unwrap().clear();
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, Some(body)).await.status(), 200);
+}
+
+// M4: a member who went away between the check and the write is "member not found".
+#[tokio::test]
+async fn approve_of_a_member_who_went_away_is_member_not_found() {
+    let t = mw(Mode::SelfHosted).await;
+    let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+    *t.w.metadata.vanish_on_approve.lock().unwrap() = Some(pat);
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{pat}/approve"), Some(json!({ "grants": [] }))).await,
+        404,
+    )
+    .await;
+    assert_eq!((code_of(&err), err["error"]["message"].as_str()), ("not_found", Some("member not found")));
+    assert!(t.actions().is_empty());
+}
+
+// R40: the grants are checked as an invite's are; a refused approval changes nothing.
+#[tokio::test]
+async fn approve_checks_grants() {
+    let t = mw(Mode::SelfHosted).await;
+    let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+    let path = format!("/v1/members/{pat}/approve");
+    let grant = |role: &str, roles: &[&str]| {
+        json!({ "grants": [{ "project_id": t.w.project, "platform_role": role, "pg_roles": roles }] })
+    };
+    for roles in [&["owner"][..], &["cb_m_0123"], &["chelabase_x"], &["pg_read_all_data"], &["postgres"]] {
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(grant("developer", roles))).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{roles:?}");
+    }
+    // A project twice, and a project of nobody's.
+    let twice = json!({ "grants": [
+        { "project_id": t.w.project, "platform_role": "viewer", "pg_roles": [] },
+        { "project_id": t.w.project, "platform_role": "developer", "pg_roles": [] },
+    ] });
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(twice)).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    let nowhere = json!({ "grants": [{ "project_id": uuid::Uuid::new_v4(), "platform_role": "viewer", "pg_roles": [] }] });
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, Some(nowhere)).await.status(), 404);
+    assert_eq!(t.w.metadata.member(t.w.tenant, "pat").unwrap().status, MemberStatus::Pending);
+    assert_eq!(t.grant_of(pat), None);
+    assert!(t.actions().is_empty());
+    assert!(t.enqueued().is_empty());
+    // A valid one still works afterwards.
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, Some(grant("viewer", &[]))).await.status(), 200);
+}
+
+// R40: declining removes the pending member and deactivates its Zitadel user, as removal does.
+#[tokio::test]
+async fn decline_removes_and_deactivates() {
+    let t = mw(Mode::SelfHosted).await;
+    let zid = t.mock.add_user_in("org-1", "pat@example.test", "", false);
+    let pat = t.w.metadata.add_member(t.w.tenant, &zid, MemberStatus::Pending, false);
+    let path = format!("/v1/members/{pat}/decline");
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
+    let err = error_of(t.send("padmin", Method::POST, &path, None).await, 403).await;
+    assert_eq!(err["error"]["required"], "tenant admin");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert_eq!(t.w.metadata.member(t.w.tenant, &zid).unwrap().status, MemberStatus::Removed);
+    assert!(t.mock.user_by_id(&zid).unwrap().inactive, "the Zitadel user is deactivated");
+    assert!(t.mock.calls().contains(&"POST /v2/sessions/search".to_string()), "its sessions are ended");
+    assert_eq!(t.actions(), vec!["member_declined"]);
+    // A repeat retries the Zitadel steps and writes nothing more.
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert_eq!(t.actions(), vec!["member_declined"]);
+    // An active member isn't declined; a stranger's id is 404.
+    let active = t.w.metadata.add_granted(t.w.tenant, "act", t.w.project, PlatformRole::Viewer, &[]);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{active}/decline"), None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{}/decline", uuid::Uuid::new_v4()), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+// R39, R40: a pending member never becomes the first admin; whoever finds the tenant without
+// one claims it.
+#[tokio::test]
+async fn pending_never_becomes_first_admin() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    metadata.members.lock().unwrap().retain(|m| m.zitadel_user_id != DEFAULT_SUB); // no admin yet
+    metadata.open_signups.lock().unwrap().insert(tenant, true);
+    let pat = metadata.add_member(tenant, "pat", MemberStatus::Pending, false);
+    let app = spawn_app_full(metadata.clone(), FakeJobs::default(), "http://127.0.0.1:9", Mode::SelfHosted, 10).await;
+    let me: Value = app.send_as("pat", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["member"], json!({ "id": pat, "status": "pending", "tenant_admin": false }));
+    let m = metadata.member(tenant, "pat").unwrap();
+    assert_eq!((m.id, m.status, m.tenant_admin), (pat, MemberStatus::Pending, false));
+    let me: Value = app.send_as("first", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!((&me["member"]["status"], &me["member"]["tenant_admin"]), (&json!("active"), &json!(true)));
+    assert!(me["member"]["id"].as_str().is_some_and(|id| id.len() == 36), "{me}");
+    assert_eq!(metadata.member(tenant, "pat").unwrap().status, MemberStatus::Pending);
+    // Even with the claim made by someone else, pat stays pending on every later request.
+    app.send_as("pat", "org-1", Method::GET, "/v1/me", None).await;
+    assert!(!metadata.member(tenant, "pat").unwrap().tenant_admin);
+}
+
+#[tokio::test]
+async fn platform_mode_creates_no_members() {
+    let w = member_world(Mode::Platform).await;
+    let before = w.metadata.members.lock().unwrap().len();
+    let path = format!("/v1/databases/{}", w.db);
+    let err = error_of(w.app.send_as("dave", "org-1", Method::GET, &path, None).await, 403).await;
+    assert_eq!(code_of(&err), "not_available_in_platform_mode");
+    let me: Value = w.app.send_as("dave", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert!(me["member"].is_null(), "{me}");
+    assert_eq!(me["projects"], json!([]));
+    assert_eq!(w.metadata.members.lock().unwrap().len(), before);
+    assert!(w.metadata.member(w.tenant, "dave").is_none());
+
+    // An existing member is served; a tenant admin isn't an instance admin without the
+    // operator org.
+    assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await.status(), 200);
+    let me: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["instance_admin"], json!(false));
+}
+
+#[tokio::test]
+async fn me_lists_capabilities() {
+    let w = member_world(Mode::SelfHosted).await;
+    let other = w.metadata.create_project(w.tenant, "Other").await.unwrap().id;
+    let overview = |id: ProjectId, name: &str| ProjectOverview {
+        id,
+        name: name.into(),
+        slug: name.to_lowercase(),
+        status: ProjectStatus::Active,
+        databases: vec![],
+    };
+    w.metadata.set_overview(TenantOverview {
+        id: w.tenant,
+        slug: "demo".into(),
+        display_name: None,
+        projects: vec![overview(w.project, "Billing"), overview(other, "Other")],
+    });
+    w.metadata.add_granted(w.tenant, "erin", w.project, PlatformRole::Developer, &["sales", "billing"]);
+
+    let me: Value = w.app.send_as("erin", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["sub"], "erin");
+    assert_eq!(me["email"], "erin@example.test");
+    assert_eq!(me["name"], "erin");
+    assert_eq!(me["tenant_id"], json!(w.tenant));
+    let erin = w.metadata.member(w.tenant, "erin").unwrap().id;
+    assert_eq!(me["member"], json!({ "id": erin, "status": "active", "tenant_admin": false }));
+    assert_eq!(me["instance_admin"], json!(false));
+    assert_eq!(
+        me["projects"],
+        json!([{ "project_id": w.project, "platform_role": "developer", "roles": ["billing", "sales"], "databases": [] }])
+    );
+    // The tenant overview shows only the projects the member is granted.
+    let names: Vec<&str> = me["tenant"]["projects"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Billing"]);
+
+    // An Admin grant includes the database owner.
+    w.metadata.add_granted(w.tenant, "fay", other, PlatformRole::Admin, &["billing"]);
+    let me: Value = w.app.send_as("fay", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!(me["projects"][0]["roles"], json!(["owner", "billing"]));
+
+    // The tenant admin: every project, every role, and (self-hosted) the instance.
+    let me: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+    assert_eq!((&me["member"]["status"], &me["member"]["tenant_admin"]), (&json!("active"), &json!(true)));
+    assert!(me["member"]["id"].as_str().is_some_and(|id| id.len() == 36), "{me}");
+    assert_eq!(me["instance_admin"], json!(true));
+    let mut expected = vec![
+        json!({ "project_id": w.project, "platform_role": "admin", "roles": "all", "databases": [] }),
+        json!({ "project_id": other, "platform_role": "admin", "roles": "all", "databases": [] }),
+    ];
+    let mut got = me["projects"].as_array().unwrap().clone();
+    let key = |v: &Value| v["project_id"].as_str().unwrap().to_string();
+    expected.sort_by_key(key);
+    got.sort_by_key(key);
+    assert_eq!(got, expected);
+    assert_eq!(me["tenant"]["projects"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn tenant_admin_is_admin_on_every_project() {
+    let w = member_world(Mode::SelfHosted).await;
+    // The tenant admin holds no grant rows, yet passes Admin-only routes on the project.
+    let path = format!("/v1/databases/{}/connection", w.db);
+    assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await.status(), 200);
+    let renamed = w
+        .app
+        .send_as(DEFAULT_SUB, "org-1", Method::PATCH, &format!("/v1/projects/{}", w.project), Some(json!({"name": "B2"})))
+        .await;
+    assert_eq!(renamed.status(), 200);
+
+    // A tenant admin's own override rows don't narrow them.
+    let admin = w.metadata.member(w.tenant, DEFAULT_SUB).unwrap().id;
+    w.metadata.narrow(admin, w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+    assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await.status(), 200);
+
+    // A Developer grant is too low for the same route.
+    w.metadata.add_granted(w.tenant, "gus", w.project, PlatformRole::Developer, &[]);
+    let err = error_of(w.app.send_as("gus", "org-1", Method::GET, &path, None).await, 403).await;
+    assert_eq!(code_of(&err), "forbidden");
+    assert_eq!(err["error"]["required"], "admin");
+}
+
+#[tokio::test]
+async fn overrides_narrow_the_project_grant() {
+    let w = member_world(Mode::SelfHosted).await;
+    let ivy = w.metadata.add_granted(w.tenant, "ivy", w.project, PlatformRole::Admin, &["app"]);
+    let connection = format!("/v1/databases/{}/connection", w.db);
+    assert_eq!(w.app.send_as("ivy", "org-1", Method::GET, &connection, None).await.status(), 200);
+
+    // Down to Viewer on this database: reads pass, the owner's credentials don't.
+    w.metadata.narrow(ivy, w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+    let err = error_of(w.app.send_as("ivy", "org-1", Method::GET, &connection, None).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    let get = format!("/v1/databases/{}", w.db);
+    assert_eq!(w.app.send_as("ivy", "org-1", Method::GET, &get, None).await.status(), 200);
+
+    // A roles-only override keeps Admin but takes `app` away, in every Postgres database of
+    // the Chelabase database (no Postgres-database level, R17).
+    let console = format!("/v1/databases/{}/branches/{}/console/query", w.db, w.dev.as_uuid());
+    let body = |database: &str| json!({ "role": "app", "database": database, "tree": { "v": 1, "op": "select", "from": "notes" } });
+    w.metadata.narrow(ivy, w.db, OverrideRow { platform_role: None, pg_roles: Some(vec!["other".into()]) });
+    assert_eq!(w.app.send_as("ivy", "org-1", Method::GET, &connection, None).await.status(), 200);
+    for database in ["web1", "web2"] {
+        let err = error_of(w.app.send_as("ivy", "org-1", Method::POST, &console, Some(body(database))).await, 403).await;
+        assert_eq!(err["error"]["required"], "role:app", "{database}");
+    }
+}
+
+// --- T5 review fixes (R16-R19) ---------------------------------------------------------------
+
+/// Whether a response body is an access refusal (`forbidden`, `no_access_yet` or
+/// `not_available_in_platform_mode`).
+fn access_refusal(body: &Value) -> bool {
+    matches!(
+        body["error"]["code"].as_str(),
+        Some("forbidden" | "no_access_yet" | "not_available_in_platform_mode")
+    )
+}
+
+async fn body_of(resp: reqwest::Response) -> Value {
+    resp.json().await.unwrap_or(Value::Null)
+}
+
+fn protect(metadata: &FakeMetadata, branch: BranchId) {
+    metadata.branches.lock().unwrap().get_mut(&branch).unwrap().protected = true;
+}
+
+// R16: a role that is owner-level, has BYPASSRLS, or reaches the owner or an owner-level role
+// through its memberships is Admin-only to act as, even when the grant lists it.
+#[tokio::test]
+async fn developer_cannot_act_as_owner_level_role() {
+    let w = member_world(Mode::SelfHosted).await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "app", &[]);
+    w.metadata.add_role(&ep, "power", RoleOrigin::Sql, true, false);
+    let mut bypass = role_row("bypass", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Generated);
+    bypass.attributes.bypass_rls = true;
+    let mut reacher = role_row("reacher", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Generated);
+    reacher.attributes.member_of = vec!["middle".into()];
+    let mut middle = role_row("middle", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Generated);
+    middle.attributes.member_of = vec!["power".into()];
+    let mut ownerish = role_row("ownerish", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Generated);
+    ownerish.attributes.member_of = vec!["postgres".into()];
+    let mut looped = role_row("looped", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Generated);
+    looped.attributes.member_of = vec!["looped2".into()];
+    let mut looped2 = role_row("looped2", RoleOrigin::Sql, RoleLevel::Plain, PasswordState::Generated);
+    looped2.attributes.member_of = vec!["looped".into()];
+    looped.login = false;
+    looped2.login = false;
+    for row in [bypass, reacher, middle, ownerish, looped, looped2] {
+        w.metadata.add_role_row(&ep, row);
+    }
+    let all = ["app", "power", "bypass", "reacher", "middle", "ownerish", "looped"];
+    w.metadata.add_granted(w.tenant, "dan", w.project, PlatformRole::Developer, &all);
+    w.metadata.add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &all);
+    let console = format!("/v1/databases/{}/branches/{}/console/query", w.db, w.dev.as_uuid());
+    let sql = format!("/v1/databases/{}/branches/{}/sql", w.db, w.dev.as_uuid());
+    let query = |role: &str| json!({ "role": role, "tree": { "v": 1, "op": "select", "from": "notes" } });
+    let run = |role: &str| json!({ "run_id": uuid::Uuid::new_v4(), "role": role, "sql": "select 1" });
+    for role in ["power", "bypass", "reacher", "middle", "ownerish"] {
+        let err = error_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(query(role))).await, 403).await;
+        assert_eq!(err["error"]["required"], "admin", "{role}");
+        let err = error_of(w.app.send_as("dan", "org-1", Method::POST, &sql, Some(run(role))).await, 403).await;
+        assert_eq!(err["error"]["required"], "admin", "{role}");
+        let conn = format!("/v1/databases/{}/branches/{}/connection?role={role}", w.db, w.dev.as_uuid());
+        let err = error_of(w.app.send_as("dan", "org-1", Method::GET, &conn, None).await, 403).await;
+        assert_eq!(err["error"]["required"], "admin", "{role}");
+        // An Admin may act as it.
+        let ok = body_of(w.app.send_as("ada", "org-1", Method::POST, &console, Some(query(role))).await).await;
+        assert!(!access_refusal(&ok), "{role}: {ok}");
+    }
+    // A plain role, and a membership loop that reaches nothing owner-level, are fine.
+    for role in ["app", "looped"] {
+        let ok = body_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(query(role))).await).await;
+        assert!(!access_refusal(&ok), "{role}: {ok}");
+    }
+}
+
+// I1: a route whose body names a Chelabase database reads that database's override.
+#[tokio::test]
+async fn put_app_users_reads_the_database_override() {
+    let w = member_world(Mode::SelfHosted).await;
+    let pat = w.metadata.add_granted(w.tenant, "pat", w.project, PlatformRole::Admin, &[]);
+    let path = format!("/v1/projects/{}/app-users", w.project);
+    let body = json!({ "database_id": w.db });
+    let before = body_of(w.app.send_as("pat", "org-1", Method::PUT, &path, Some(body.clone())).await).await;
+    assert!(!access_refusal(&before), "{before}");
+    w.metadata.narrow(pat, w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+    let err = error_of(w.app.send_as("pat", "org-1", Method::PUT, &path, Some(body)).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+}
+
+// I2 (R18): a token without email or name claims gets them from Zitadel, once.
+#[tokio::test]
+async fn missing_claims_are_read_from_zitadel() {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    metadata.open_signups.lock().unwrap().insert(tenant, true);
+    let mock = MockZitadel::start().await;
+    let zed = mock.add_user("Zed@Example.Test", "correct-horse-9", true);
+    mock.set_display_name(&zed, "Zed Zulu");
+    let app = spawn_app_parts(
+        metadata.clone(),
+        FakeJobs::default(),
+        "http://127.0.0.1:9",
+        Mode::SelfHosted,
+        10,
+        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+    )
+    .await;
+    let bare = |sub: &str| Identity { email: None, name: None, ..identity_of(sub, "org-1") };
+    let me = body_of(app.send_identity(&bare(&zed), Method::GET, "/v1/me").await).await;
+    assert_eq!(me["email"], "zed@example.test", "{me}");
+    assert_eq!(me["name"], "Zed Zulu");
+    let m = metadata.member(tenant, &zed).unwrap();
+    assert_eq!((m.email.as_deref(), m.display_name.as_str()), (Some("zed@example.test"), "Zed Zulu"));
+    // Known now: the next request doesn't ask Zitadel again.
+    app.send_identity(&bare(&zed), Method::GET, "/v1/me").await;
+    let lookups = mock.inner.lock().unwrap().calls.iter().filter(|c| c.contains(&format!("/v2/users/{zed}"))).count();
+    assert_eq!(lookups, 1);
+    // A Zitadel failure isn't fatal: the member is made without them (pending, as zed is).
+    let me = body_of(app.send_identity(&bare("ghost"), Method::GET, "/v1/me").await).await;
+    assert!(me["email"].is_null() && me["name"].is_null(), "{me}");
+    assert_eq!(me["member"]["status"], "pending");
+}
+
+// I3: `create_merge` goes by the branch merged into.
+#[tokio::test]
+async fn create_merge_into_protected_parent_needs_admin() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "dev1", w.project, PlatformRole::Developer, &[]);
+    let main = BranchId::from(w.db);
+    protect(&w.metadata, main);
+    let path = format!("/v1/databases/{}/branches/{}/merges", w.db, w.dev.as_uuid());
+    let body = |direction: &str| json!({ "direction": direction, "database": "app" });
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &path, Some(body("into_parent"))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    let ok = body_of(w.app.send_as("dev1", "org-1", Method::POST, &path, Some(body("from_parent"))).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    // From the parent into a protected dev: the other way round.
+    w.metadata.branches.lock().unwrap().get_mut(&main).unwrap().protected = false;
+    protect(&w.metadata, w.dev);
+    let ok = body_of(w.app.send_as("dev1", "org-1", Method::POST, &path, Some(body("into_parent"))).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &path, Some(body("from_parent"))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+}
+
+// I3: merge actions go by the merge's target branch, not its source.
+#[tokio::test]
+async fn merge_actions_follow_the_target_branch() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "dev1", w.project, PlatformRole::Developer, &[]);
+    let main = BranchId::from(w.db);
+    protect(&w.metadata, main);
+    let into_main = w.merge;
+    let from_main = merge_row(w.db, main, w.dev, MergeStatus::Draft);
+    let from_main_id = from_main.id;
+    w.metadata.merges.lock().unwrap().push(from_main);
+    for action in ["rehearse", "apply", "cancel", "recompute", "abandon"] {
+        let into = format!("/v1/databases/{}/merges/{into_main}/{action}", w.db);
+        let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &into, Some(json!({}))).await, 403).await;
+        assert_eq!(err["error"]["required"], "admin", "{action}");
+        let from = format!("/v1/databases/{}/merges/{from_main_id}/{action}", w.db);
+        let ok = body_of(w.app.send_as("dev1", "org-1", Method::POST, &from, Some(json!({}))).await).await;
+        assert!(!access_refusal(&ok), "{action}: {ok}");
+    }
+}
+
+// M3: an admission answer doesn't depend on whether the target exists.
+#[tokio::test]
+async fn admission_answers_dont_reveal_existence() {
+    let w = member_world(Mode::SelfHosted).await;
+    let paths = [
+        format!("/v1/databases/{}", w.db),
+        format!("/v1/databases/{}", uuid::Uuid::new_v4()),
+        format!("/v1/projects/{}", w.project),
+        format!("/v1/projects/{}", uuid::Uuid::new_v4()),
+    ];
+    for path in &paths {
+        let err = error_of(w.app.send_as("nobody", "org-1", Method::GET, path, None).await, 403).await;
+        assert_eq!(code_of(&err), "no_access_yet", "{path}");
+    }
+    let p = member_world(Mode::Platform).await;
+    let paths = [format!("/v1/databases/{}", p.db), format!("/v1/databases/{}", uuid::Uuid::new_v4())];
+    for path in &paths {
+        let err = error_of(p.app.send_as("dave", "org-1", Method::GET, path, None).await, 403).await;
+        assert_eq!(code_of(&err), "not_available_in_platform_mode", "{path}");
+    }
+}
+
+// M4: one read of the member row per request, in both modes, with or without claims.
+#[tokio::test]
+async fn the_member_row_is_read_once_per_request() {
+    for mode in [Mode::SelfHosted, Mode::Platform] {
+        let w = member_world(mode).await;
+        let path = format!("/v1/databases/{}", w.db);
+        let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB, "org-1") };
+        let full = identity_of(DEFAULT_SUB, "org-1");
+        for (label, identity) in [("claims", &full), ("no claims", &bare)] {
+            // The first request may refresh the claims; count the steady state.
+            w.app.send_identity(identity, Method::GET, &path).await;
+            let before = w.metadata.member_reads.load(Ordering::SeqCst);
+            assert_eq!(w.app.send_identity(identity, Method::GET, &path).await.status(), 200);
+            assert_eq!(w.metadata.member_reads.load(Ordering::SeqCst) - before, 1, "{mode:?} {label}");
+        }
+    }
+}
+
+// M6: an unknown name is null, like an unknown email.
+#[tokio::test]
+async fn me_name_is_null_when_unknown() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.set_member(w.tenant, DEFAULT_SUB, |m| {
+        m.display_name = String::new();
+        m.email = None;
+    });
+    let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB, "org-1") };
+    let me = body_of(w.app.send_identity(&bare, Method::GET, "/v1/me").await).await;
+    assert!(me["name"].is_null(), "{me}");
+    assert!(me["email"].is_null(), "{me}");
+}
+
+// M7 (R19): `Instance` routes are checked before the tenant binding, so a platform operator
+// whose org is no tenant reaches them; every other route still answers `tenant_not_bound`.
+#[tokio::test]
+async fn instance_routes_skip_tenant_binding_for_operators() {
+    let spawn = |mode: Mode, metadata: FakeMetadata| async move {
+        spawn_app_custom(
+            metadata,
+            FakeJobs::default(),
+            "http://127.0.0.1:9",
+            mode,
+            10,
+            None,
+            Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+            Some("ops"),
+        )
+        .await
+    };
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    metadata.add_member(tenant, "plain", MemberStatus::Active, false);
+    let app = spawn(Mode::Platform, metadata.clone()).await;
+    // The operator org isn't a tenant: the probe passes, any tenant route doesn't.
+    let resp = app.send_as("op", "ops", Method::GET, INSTANCE_PROBE, None).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "op");
+    let err = error_of(app.send_as("op", "ops", Method::GET, "/v1/projects", None).await, 403).await;
+    assert_eq!(code_of(&err), "tenant_not_bound");
+    // In platform mode a tenant admin isn't an instance admin, and another org is unbound.
+    let err = error_of(app.send_as(DEFAULT_SUB, "org-1", Method::GET, INSTANCE_PROBE, None).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("instance admin")));
+    let err = error_of(app.send_as("x", "elsewhere", Method::GET, INSTANCE_PROBE, None).await, 403).await;
+    assert_eq!(code_of(&err), "tenant_not_bound");
+
+    // Self-hosted: the tenant admin passes, another member doesn't, the operator org is nothing.
+    let app = spawn(Mode::SelfHosted, metadata).await;
+    assert_eq!(app.send_as(DEFAULT_SUB, "org-1", Method::GET, INSTANCE_PROBE, None).await.status(), 200);
+    let err = error_of(app.send_as("plain", "org-1", Method::GET, INSTANCE_PROBE, None).await, 403).await;
+    assert_eq!(err["error"]["required"], "instance admin");
+    let err = error_of(app.send_as("op", "ops", Method::GET, INSTANCE_PROBE, None).await, 403).await;
+    assert_eq!(code_of(&err), "tenant_not_bound");
+}
+
+// --- Route-specific refinements (members and roles, T6) --------------------------------------
+
+fn select_tree() -> Value {
+    json!({ "v": 1, "op": "select", "from": "notes" })
+}
+
+fn write_tree() -> Value {
+    json!({ "v": 1, "op": "insert", "into": "notes", "values": [{ "body": "x" }] })
+}
+
+fn console_path(w: &MemberWorld) -> String {
+    format!("/v1/databases/{}/branches/{}/console/query", w.db, w.dev.as_uuid())
+}
+
+// Console: a Viewer reads (select), and nothing that writes reaches rest.
+#[tokio::test]
+async fn viewer_console_select_ok_write_forbidden() {
+    let w = member_world(Mode::SelfHosted).await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "app", &[]);
+    w.metadata.add_granted(w.tenant, "vic", w.project, PlatformRole::Viewer, &["app"]);
+    w.metadata.add_granted(w.tenant, "dev1", w.project, PlatformRole::Developer, &["app"]);
+    let path = console_path(&w);
+    let body = |tree: Value| json!({ "role": "app", "tree": tree });
+
+    let read = body_of(w.app.send_as("vic", "org-1", Method::POST, &path, Some(body(select_tree()))).await).await;
+    assert!(!access_refusal(&read), "{read}");
+    for tree in [write_tree(), json!({ "v": 1, "op": "delete", "from": "notes", "where": { "col": "id", "eq": 1 } })] {
+        let err = error_of(w.app.send_as("vic", "org-1", Method::POST, &path, Some(body(tree))).await, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("developer")));
+    }
+    // A Developer's write is not refused.
+    let ok = body_of(w.app.send_as("dev1", "org-1", Method::POST, &path, Some(body(write_tree()))).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+}
+
+#[tokio::test]
+async fn viewer_batch_with_write_forbidden() {
+    let w = member_world(Mode::SelfHosted).await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "app", &[]);
+    w.metadata.add_granted(w.tenant, "vic", w.project, PlatformRole::Viewer, &["app"]);
+    let path = console_path(&w);
+    let batch = |ops: Vec<Value>| json!({ "role": "app", "tree": { "v": 1, "op": "batch", "ops": ops } });
+
+    let reads = batch(vec![select_tree(), select_tree()]);
+    let ok = body_of(w.app.send_as("vic", "org-1", Method::POST, &path, Some(reads)).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    // One write anywhere in the batch refuses all of it.
+    let mixed = batch(vec![select_tree(), json!({ "op": "delete", "from": "notes", "where": { "col": "id", "eq": 1 } })]);
+    let err = error_of(w.app.send_as("vic", "org-1", Method::POST, &path, Some(mixed)).await, 403).await;
+    assert_eq!(err["error"]["required"], "developer");
+}
+
+impl Branching {
+    /// An active member with `role` on the database's project.
+    fn grant_member(&self, sub: &str, role: PlatformRole, pg_roles: &[&str]) -> uuid::Uuid {
+        let record = self.metadata.database(self.db);
+        self.metadata.add_granted(record.tenant_id, sub, record.project_id, role, pg_roles)
+    }
+}
+
+// SQL editor cancel: the run's starter or an Admin; another Developer is refused.
+#[tokio::test]
+async fn cancel_by_other_developer_forbidden() {
+    let t = sql_app().await;
+    let main = t.main();
+    let a = t.grant_member("dev-a", PlatformRole::Developer, &[]);
+    t.grant_member("dev-b", PlatformRole::Developer, &[]);
+    t.grant_member("adm", PlatformRole::Admin, &[]);
+    let id = uuid::Uuid::new_v4();
+    let path = format!("{}/sql/runs/{id}/cancel", t.branch(main));
+    let runs = t.app.state.sql_editor.runs();
+    let held = runs.reserve("dev-a", id, Some(a), main, "web1").unwrap();
+
+    let err = error_of(t.send_as("dev-b", Method::POST, &path, None).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")));
+    assert!(!held.token().is_cancelled());
+    assert_eq!(t.send_as("dev-a", Method::POST, &path, None).await.status(), 202);
+    assert!(held.token().is_cancelled());
+    drop(held);
+
+    // A project Admin and a tenant admin may cancel anyone's.
+    for sub in ["adm", DEFAULT_SUB] {
+        let held = runs.reserve("dev-a", id, Some(a), main, "web1").unwrap();
+        assert_eq!(t.send_as(sub, Method::POST, &path, None).await.status(), 202, "{sub}");
+        assert!(held.token().is_cancelled(), "{sub}");
+    }
+    // No such run is still a 404.
+    let err = error_of(t.send_as("dev-b", Method::POST, &path, None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+// Saved queries: the author or an Admin edits and deletes; a query saved before members has
+// no author, so only an Admin does.
+#[tokio::test]
+async fn saved_query_edit_by_author_or_admin() {
+    let t = branching().await;
+    t.grant_member("dev-a", PlatformRole::Developer, &[]);
+    t.grant_member("dev-b", PlatformRole::Developer, &[]);
+    t.grant_member("adm", PlatformRole::Admin, &[]);
+    let created = t.send_as("dev-a", Method::POST, &t.queries(), Some(json!({ "name": "mine", "sql": "select 1" }))).await;
+    assert_eq!(created.status(), 201);
+    let q: Value = created.json().await.unwrap();
+    let one = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+
+    // Another Developer sees it, but it isn't theirs.
+    assert_eq!(t.send_as("dev-b", Method::GET, &one, None).await.status(), 200);
+    for (method, body) in [(Method::PATCH, Some(json!({ "version": 1, "name": "x" }))), (Method::DELETE, None)] {
+        let err = error_of(t.send_as("dev-b", method, &one, body).await, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")));
+    }
+    // The author, then an Admin (not the author) on the same query.
+    let resp = t.send_as("dev-a", Method::PATCH, &one, Some(json!({ "version": 1, "sql": "select 2" }))).await;
+    assert_eq!(resp.status(), 200);
+    let resp = t.send_as("adm", Method::PATCH, &one, Some(json!({ "version": 2, "name": "renamed" }))).await;
+    assert_eq!(resp.status(), 200);
+    let upd: Value = resp.json().await.unwrap();
+    assert_eq!((upd["name"].as_str(), upd["version"].as_i64()), (Some("renamed"), Some(3)));
+    assert_eq!(t.send_as("dev-b", Method::DELETE, &one, None).await.status(), 403);
+    assert_eq!(t.send_as("adm", Method::DELETE, &one, None).await.status(), 204);
+
+    // The author deletes their own.
+    let q: Value = t.send_as("dev-a", Method::POST, &t.queries(), Some(json!({ "name": "again", "sql": "select 1" }))).await.json().await.unwrap();
+    let again = format!("{}/{}", t.queries(), q["id"].as_str().unwrap());
+    assert_eq!(t.send_as("dev-a", Method::DELETE, &again, None).await.status(), 204);
+
+    // Saved before members: no author.
+    let now = chrono::Utc::now();
+    let old = SavedQuery {
+        id: uuid::Uuid::new_v4(),
+        name: "old".into(),
+        sql: "select 0".into(),
+        pg_database: None,
+        role: None,
+        version: 1,
+        created_at: now,
+        updated_at: now,
+        author_member_id: None,
+    };
+    t.metadata.saved_queries.lock().unwrap().push((t.db.as_uuid(), "dev-a".into(), old.clone()));
+    let legacy = format!("{}/{}", t.queries(), old.id);
+    assert_eq!(t.send_as("dev-a", Method::PATCH, &legacy, Some(json!({ "version": 1, "name": "x" }))).await.status(), 403);
+    assert_eq!(t.send_as("dev-a", Method::DELETE, &legacy, None).await.status(), 403);
+    assert_eq!(t.send_as("adm", Method::PATCH, &legacy, Some(json!({ "version": 1, "name": "x" }))).await.status(), 200);
+    assert_eq!(t.send_as("adm", Method::DELETE, &legacy, None).await.status(), 204);
+}
+
+fn seed_key(w: &MemberWorld, kind: DataKeyKind, role: &str, name: &str) -> uuid::Uuid {
+    let generated = data_key::generate(kind);
+    let id = uuid::Uuid::new_v4();
+    let new = NewDataKey {
+        id,
+        branch_id: w.dev,
+        kind,
+        role: role.into(),
+        name: name.into(),
+        prefix: generated.prefix.clone(),
+        sha256: generated.sha256,
+        sealed: None,
+        databases: None,
+        role_oid: None,
+        role_timeline: None,
+        role_bypass_rls: false,
+    };
+    insert_key(&mut w.metadata.keys.lock().unwrap(), &new).unwrap();
+    id
+}
+
+// Data keys: a Developer manages keys bound to roles they may use; an Admin any key; a key
+// bound to an owner-level role is Admin-only (R16).
+#[tokio::test]
+async fn key_for_disallowed_role_forbidden() {
+    let w = member_world(Mode::SelfHosted).await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "reporting", &[]);
+    w.metadata.add_group_role(&ep, "other", &[]);
+    w.metadata.add_role(&ep, "power", RoleOrigin::Sql, true, false);
+    w.metadata.add_granted(w.tenant, "dan", w.project, PlatformRole::Developer, &["reporting", "power"]);
+    w.metadata.add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &[]);
+    let keys = format!("/v1/databases/{}/branches/{}/keys", w.db, w.dev.as_uuid());
+    let as_dan = |method: Method, path: String, body: Option<Value>| {
+        let app = &w.app;
+        async move { app.send_as("dan", "org-1", method, &path, body).await }
+    };
+    let required = |err: &Value| err["error"]["required"].as_str().map(str::to_string);
+
+    // Create.
+    assert_eq!(as_dan(Method::POST, keys.clone(), Some(json!({ "name": "ok", "role": "reporting" }))).await.status(), 201);
+    let err = error_of(as_dan(Method::POST, keys.clone(), Some(json!({ "name": "no", "role": "other" }))).await, 403).await;
+    assert_eq!((code_of(&err), required(&err)), ("forbidden", Some("role:other".into())));
+    // Listed but owner-level: Admin only.
+    let err = error_of(as_dan(Method::POST, keys.clone(), Some(json!({ "name": "no", "role": "power" }))).await, 403).await;
+    assert_eq!(required(&err), Some("admin".into()));
+    assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &keys, Some(json!({ "name": "any", "role": "other" }))).await.status(), 201);
+    assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &keys, Some(json!({ "name": "pow", "role": "power" }))).await.status(), 201);
+
+    // Rotate, patch and delete, by the key's role.
+    let mine = seed_key(&w, DataKeyKind::Secret, "reporting", "mine");
+    let theirs = seed_key(&w, DataKeyKind::Secret, "other", "theirs");
+    let powerful = seed_key(&w, DataKeyKind::Secret, "power", "powerful");
+    let public = seed_key(&w, DataKeyKind::Public, "anon", "public");
+    let patch = Some(json!({ "databases": null }));
+    for (id, want) in [(theirs, "role:other"), (powerful, "admin"), (public, "role:anon")] {
+        let one = format!("{keys}/{id}");
+        let rotate = format!("{one}/rotate");
+        for (method, path, body) in [(Method::POST, rotate, None), (Method::PATCH, one.clone(), patch.clone()), (Method::DELETE, one, None)] {
+            let err = error_of(as_dan(method.clone(), path.clone(), body).await, 403).await;
+            assert_eq!(required(&err), Some(want.into()), "{method} {path}");
+        }
+    }
+    let one = format!("{keys}/{mine}");
+    assert_eq!(as_dan(Method::PATCH, one.clone(), patch.clone()).await.status(), 200);
+    assert_eq!(as_dan(Method::POST, format!("{one}/rotate"), None).await.status(), 201);
+    // An Admin manages any key.
+    for id in [theirs, powerful, public] {
+        let one = format!("{keys}/{id}");
+        assert_eq!(w.app.send_as("ada", "org-1", Method::PATCH, &one, patch.clone()).await.status(), 200, "{id}");
+    }
+    assert_eq!(w.app.send_as("ada", "org-1", Method::DELETE, &format!("{keys}/{theirs}"), None).await.status(), 204);
+}
+
+// Merges: a plan with a security step is applied by an Admin, even into an unprotected target.
+#[tokio::test]
+async fn merge_with_security_steps_needs_admin() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "dev1", w.project, PlatformRole::Developer, &[]);
+    w.metadata.add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &[]);
+    let set = |plan: Value| {
+        let mut rows = w.metadata.merges.lock().unwrap();
+        let m = rows.iter_mut().find(|r| r.id == w.merge).unwrap();
+        m.status = MergeStatus::Rehearsed;
+        m.analysis = Some(json!({"conflicts": []}));
+        m.plan = Some(plan);
+        m.acknowledgements = json!(["grant"]);
+    };
+    let apply = format!("/v1/databases/{}/merges/{}/apply", w.db, w.merge);
+
+    set(json!({ "steps": [{ "id": "grant", "security": true }] }));
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &apply, Some(json!({}))).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")));
+    assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &apply, Some(json!({}))).await.status(), 202);
+
+    // Without a security step a Developer applies it.
+    w.metadata.merges.lock().unwrap().iter_mut().find(|r| r.id == w.merge).unwrap().status = MergeStatus::Draft;
+    set(json!({ "steps": [{ "id": "t1", "data_loss": false, "security": false }] }));
+    assert_eq!(w.app.send_as("dev1", "org-1", Method::POST, &apply, Some(json!({}))).await.status(), 202);
+}
+
+// Projects: the list shows the projects the caller has a grant on; a tenant admin sees all.
+#[tokio::test]
+async fn project_list_filtered_by_grant() {
+    let w = member_world(Mode::SelfHosted).await;
+    let other = w.metadata.create_project(w.tenant, "Other").await.unwrap().id;
+    w.metadata.add_granted(w.tenant, "erin", w.project, PlatformRole::Viewer, &[]);
+    w.metadata.add_granted(w.tenant, "fay", other, PlatformRole::Developer, &[]);
+    w.metadata.add_member(w.tenant, "new", MemberStatus::Active, false);
+    let ids = |sub: &'static str| {
+        let app = &w.app;
+        async move {
+            let list: Value = body_of(app.send_as(sub, "org-1", Method::GET, "/v1/projects", None).await).await;
+            let mut ids: Vec<String> = list.as_array().map(|a| a.iter().map(|p| p["id"].as_str().unwrap().to_string()).collect()).unwrap_or_default();
+            ids.sort();
+            ids
+        }
+    };
+    assert_eq!(ids("erin").await, [w.project.to_string()]);
+    assert_eq!(ids("fay").await, [other.to_string()]);
+    let mut both = vec![w.project.to_string(), other.to_string()];
+    both.sort();
+    assert_eq!(ids(DEFAULT_SUB).await, both);
+    // A member with no grant anywhere lists nothing.
+    assert_eq!(ids("new").await, Vec::<String>::new());
+}
+
+// Databases: created under a project the caller administers (the body has no tenant_id).
+#[tokio::test]
+async fn create_database_needs_project_admin() {
+    let w = member_world(Mode::SelfHosted).await;
+    let other = w.metadata.create_project(w.tenant, "Other").await.unwrap().id;
+    w.metadata.add_granted(w.tenant, "dev1", w.project, PlatformRole::Developer, &[]);
+    w.metadata.add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &[]);
+    let body = |project: ProjectId| json!({ "project_id": project, "name": "fresh" });
+
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, "/v1/databases", Some(body(w.project))).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")));
+    // A project the caller has no grant on is a missing one.
+    let err = error_of(w.app.send_as("ada", "org-1", Method::POST, "/v1/databases", Some(body(other))).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let resp = w.app.send_as("ada", "org-1", Method::POST, "/v1/databases", Some(body(w.project))).await;
+    assert_eq!(resp.status(), 202);
+    // A tenant admin passes anywhere.
+    let resp = w.app.send_as(DEFAULT_SUB, "org-1", Method::POST, "/v1/databases", Some(body(other))).await;
+    assert_eq!(resp.status(), 202);
+}
+
+// R20: the app-user routes act on the project's auth database, so its override applies.
+#[tokio::test]
+async fn app_user_routes_apply_the_auth_database_override() {
+    let w = member_world(Mode::SelfHosted).await;
+    let now = chrono::Utc::now();
+    let enabled = |database_id: DatabaseId| ProjectAuth {
+        project_id: w.project,
+        status: AppUsersStatus::Enabled,
+        error: None,
+        zitadel_org_id: Some("zorg".into()),
+        database_id,
+        pg_database: "web1".into(),
+        schema_name: "public".into(),
+        table_name: "users".into(),
+        email_verification: false,
+        on_delete: OnDelete::Delete,
+        created_at: now,
+        updated_at: now,
+    };
+    w.metadata.project_auths.lock().unwrap().insert(w.project, enabled(w.db));
+    let pat = w.metadata.add_granted(w.tenant, "pat", w.project, PlatformRole::Admin, &[]);
+    w.metadata.add_granted(w.tenant, "quin", w.project, PlatformRole::Admin, &[]);
+    let base = format!("/v1/projects/{}", w.project);
+    let create = json!({ "email": "a@example.test", "password": "correct-horse-9" });
+
+    // Without an override: not refused (the Zitadel client is missing, which is another answer).
+    let ok = body_of(w.app.send_as("pat", "org-1", Method::DELETE, &format!("{base}/app-users"), None).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    w.metadata.narrow(pat, w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+    assert_eq!(w.app.send_as("pat", "org-1", Method::GET, &format!("{base}/app-users"), None).await.status(), 200);
+    let err = error_of(w.app.send_as("pat", "org-1", Method::DELETE, &format!("{base}/app-users"), None).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    let err = error_of(w.app.send_as("pat", "org-1", Method::POST, &format!("{base}/users"), Some(create.clone())).await, 403).await;
+    assert_eq!(err["error"]["required"], "developer");
+    // The same Admin grant without the override still passes.
+    let ok = body_of(w.app.send_as("quin", "org-1", Method::POST, &format!("{base}/users"), Some(create.clone())).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+
+    // Fail closed: an auth database the check can't resolve is a refusal, not a pass.
+    w.metadata.project_auths.lock().unwrap().insert(w.project, enabled(DatabaseId::new()));
+    let err = error_of(w.app.send_as("quin", "org-1", Method::POST, &format!("{base}/users"), Some(create)).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+// --- T6 review fixes (R21-R25) ---------------------------------------------------------------
+
+// R22: a LOGIN role is Admin-only to act as, to bind a key to, and to read a connection string
+// for; a NOLOGIN group role is what a grant should name.
+#[tokio::test]
+async fn login_roles_are_admin_only() {
+    let w = member_world(Mode::SelfHosted).await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "grp", &[]);
+    w.metadata.add_role(&ep, "svc", RoleOrigin::Sql, false, false);
+    w.metadata.add_granted(w.tenant, "dan", w.project, PlatformRole::Developer, &["grp", "svc"]);
+    w.metadata.add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &["grp", "svc"]);
+    let console = console_path(&w);
+    let sql = format!("/v1/databases/{}/branches/{}/sql", w.db, w.dev.as_uuid());
+    let keys = format!("/v1/databases/{}/branches/{}/keys", w.db, w.dev.as_uuid());
+    let query = |role: &str| json!({ "role": role, "tree": select_tree() });
+    let run = |role: &str| json!({ "run_id": uuid::Uuid::new_v4(), "role": role, "sql": "select 1" });
+
+    let err = error_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(query("svc"))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    let err = error_of(w.app.send_as("dan", "org-1", Method::POST, &sql, Some(run("svc"))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    let err = error_of(w.app.send_as("dan", "org-1", Method::POST, &keys, Some(json!({ "name": "k", "role": "svc" }))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    let ok = body_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(query("grp"))).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    assert_eq!(w.app.send_as("dan", "org-1", Method::POST, &keys, Some(json!({ "name": "k", "role": "grp" }))).await.status(), 201);
+    // An Admin may use a login role.
+    let ok = body_of(w.app.send_as("ada", "org-1", Method::POST, &console, Some(query("svc"))).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &keys, Some(json!({ "name": "k2", "role": "svc" }))).await.status(), 201);
+
+    // Connection strings: Admin for every role.
+    for role in ["grp", "svc"] {
+        let conn = format!("/v1/databases/{}/branches/{}/connection?role={role}", w.db, w.dev.as_uuid());
+        let err = error_of(w.app.send_as("dan", "org-1", Method::GET, &conn, None).await, 403).await;
+        assert_eq!(err["error"]["required"], "admin", "{role}");
+        let ok = body_of(w.app.send_as("ada", "org-1", Method::GET, &conn, None).await).await;
+        assert!(!access_refusal(&ok), "{role}: {ok}");
+    }
+}
+
+// R21: a role reachable through a granted role's membership chain is allowed; a chain that
+// reaches an owner-level, LOGIN or reserved role makes the granted role contribute nothing.
+fn chain_world_roles(w: &MemberWorld) {
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "billing", &[]);
+    w.metadata.add_group_role(&ep, "billing_admin", &["billing"]);
+    w.metadata.add_role(&ep, "svc", RoleOrigin::Sql, false, false);
+    w.metadata.add_role(&ep, "power", RoleOrigin::Sql, true, false);
+    w.metadata.add_group_role(&ep, "via_login", &["billing", "svc"]);
+    w.metadata.add_group_role(&ep, "via_reserved", &["billing", "pg_monitor"]);
+    w.metadata.add_group_role(&ep, "via_owner_level", &["billing", "power"]);
+    w.metadata.add_group_role(&ep, "via_owner", &["billing", "postgres"]);
+    for (sub, granted) in [
+        ("dan", "billing_admin"),
+        ("e1", "via_login"),
+        ("e2", "via_reserved"),
+        ("e3", "via_owner_level"),
+        ("e4", "via_owner"),
+    ] {
+        w.metadata.add_granted(w.tenant, sub, w.project, PlatformRole::Developer, &[granted]);
+    }
+}
+
+// M3: an act-as reads the branch's roles once: `authorize` carries the graph it loaded to the
+// handler, which doesn't read it again.
+#[tokio::test]
+async fn act_as_reads_the_branch_roles_once() {
+    let w = member_world(Mode::SelfHosted).await;
+    chain_world_roles(&w);
+    w.metadata.add_granted(w.tenant, "direct", w.project, PlatformRole::Developer, &["billing"]);
+    w.metadata.add_branch_db(w.dev, "web", "postgres", chelabase_metadata::DatabaseOrigin::Main);
+    let sql = format!("/v1/databases/{}/branches/{}/sql", w.db, w.dev.as_uuid());
+    // `dan` is granted `billing_admin` and acts as `billing` (through the chain); `direct` is
+    // granted `billing` itself.
+    for (sub, role) in [("dan", "billing"), ("direct", "billing")] {
+        let before = w.metadata.role_reads.load(Ordering::SeqCst);
+        let run = json!({ "run_id": uuid::Uuid::new_v4(), "role": role, "sql": "select 1" });
+        let answer = body_of(w.app.send_as(sub, "org-1", Method::POST, &sql, Some(run)).await).await;        assert_eq!(w.metadata.role_reads.load(Ordering::SeqCst) - before, 1, "{sub} acting as {role}: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn act_as_chain_reachable_role_allowed() {
+    let w = member_world(Mode::SelfHosted).await;
+    chain_world_roles(&w);
+    let console = console_path(&w);
+    let query = json!({ "role": "billing", "tree": select_tree() });
+    let ok = body_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(query.clone())).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    // The sql editor takes the same chain, through dan's member role (granted `billing_admin`).
+    let dan = w.metadata.members.lock().unwrap().iter().find(|m| m.zitadel_user_id == "dan").unwrap().id;
+    let role_name = chelabase_types::role_name::member_role_name(dan);
+    let password_enc =
+        chelabase_secrets::seal_member_role_password(&w.app.key, w.dev.as_uuid(), &role_name, "pw").unwrap();
+    w.metadata.member_roles.lock().unwrap().push(MemberBranchRole {
+        member_id: dan,
+        branch_id: w.dev.as_uuid(),
+        role_name,
+        password_enc,
+        applied_roles: vec!["billing_admin".into()],
+    });
+    let sql = format!("/v1/databases/{}/branches/{}/sql", w.db, w.dev.as_uuid());
+    let run = json!({ "run_id": uuid::Uuid::new_v4(), "role": "billing", "sql": "select 1" });
+    let ok = body_of(w.app.send_as("dan", "org-1", Method::POST, &sql, Some(run)).await).await;
+    assert!(!access_refusal(&ok), "{ok}");
+    // A chain through a LOGIN, reserved, owner-level or owner role contributes nothing.
+    for sub in ["e1", "e2", "e3", "e4"] {
+        let err = error_of(w.app.send_as(sub, "org-1", Method::POST, &console, Some(query.clone())).await, 403).await;
+        assert_eq!(err["error"]["required"], "role:billing", "{sub}");
+    }
+    // Not reachable at all.
+    let other = json!({ "role": "svc", "tree": select_tree() });
+    let err = error_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(other)).await, 403).await;
+    assert!(matches!(err["error"]["required"].as_str(), Some("role:svc" | "admin")), "{err}");
+}
+
+/// `deep` → `mid` → `svc` (LOGIN), and `deep_res` → `pg_monitor` (reserved), granted to the
+/// Developer `dee`.
+fn deep_chain_roles(w: &MemberWorld) {
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_role(&ep, "svc", RoleOrigin::Sql, false, false);
+    w.metadata.add_group_role(&ep, "mid", &["svc"]);
+    w.metadata.add_group_role(&ep, "deep", &["mid"]);
+    w.metadata.add_group_role(&ep, "deep_res", &["pg_monitor"]);
+    w.metadata.add_granted(w.tenant, "dee", w.project, PlatformRole::Developer, &["deep", "deep_res"]);
+}
+
+// Single rule (T7 merge, R33): acting as a role whose chain reaches a LOGIN role (however deep)
+// or a reserved role is Admin-only, decided by `RoleGraph::refusal` in `authorize`.
+#[tokio::test]
+async fn act_as_a_role_reaching_a_deeper_login_or_reserved_role_needs_admin() {
+    let w = member_world(Mode::SelfHosted).await;
+    deep_chain_roles(&w);
+    let console = console_path(&w);
+    let sql = format!("/v1/databases/{}/branches/{}/sql", w.db, w.dev.as_uuid());
+    for role in ["deep", "deep_res"] {
+        let query = json!({ "role": role, "tree": select_tree() });
+        let err = error_of(w.app.send_as("dee", "org-1", Method::POST, &console, Some(query)).await, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")), "{role}");
+        let run = json!({ "run_id": uuid::Uuid::new_v4(), "role": role, "sql": "select 1" });
+        let err = error_of(w.app.send_as("dee", "org-1", Method::POST, &sql, Some(run)).await, 403).await;
+        assert_eq!(err["error"]["required"], "admin", "{role}");
+    }
+    assert!(w.jobs.member_reconciles.lock().unwrap().is_empty());
+}
+
+// R33 (user): a data key below Admin can't be bound to a role whose chain reaches a LOGIN,
+// owner-level or reserved role.
+#[tokio::test]
+async fn key_bound_to_a_role_reaching_a_login_or_reserved_role_needs_admin() {
+    let w = member_world(Mode::SelfHosted).await;
+    deep_chain_roles(&w);
+    let keys = format!("/v1/databases/{}/branches/{}/keys", w.db, w.dev.as_uuid());
+    for role in ["deep", "deep_res"] {
+        let create = json!({ "name": format!("k-{role}"), "role": role });
+        let err = error_of(w.app.send_as("dee", "org-1", Method::POST, &keys, Some(create)).await, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")), "{role}");
+    }
+}
+
+#[tokio::test]
+async fn key_bound_to_chain_reachable_role_allowed() {
+    let w = member_world(Mode::SelfHosted).await;
+    chain_world_roles(&w);
+    let keys = format!("/v1/databases/{}/branches/{}/keys", w.db, w.dev.as_uuid());
+    let create = json!({ "name": "bill", "role": "billing" });
+    assert_eq!(w.app.send_as("dan", "org-1", Method::POST, &keys, Some(create.clone())).await.status(), 201);
+    let key = seed_key(&w, DataKeyKind::Secret, "billing", "seeded");
+    let one = format!("{keys}/{key}");
+    assert_eq!(w.app.send_as("dan", "org-1", Method::PATCH, &one, Some(json!({ "databases": null }))).await.status(), 200);
+    assert_eq!(w.app.send_as("dan", "org-1", Method::POST, &format!("{one}/rotate"), None).await.status(), 201);
+    for sub in ["e1", "e2", "e3", "e4"] {
+        let err = error_of(w.app.send_as(sub, "org-1", Method::POST, &keys, Some(create.clone())).await, 403).await;
+        assert_eq!(err["error"]["required"], "role:billing", "{sub}");
+    }
+}
+
+// M7: a Viewer's `update` and `call` are writes too, alone or inside a batch.
+#[tokio::test]
+async fn viewer_console_refuses_update_and_call() {
+    let w = member_world(Mode::SelfHosted).await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "app", &[]);
+    w.metadata.add_granted(w.tenant, "vic", w.project, PlatformRole::Viewer, &["app"]);
+    let path = console_path(&w);
+    let update = json!({ "v": 1, "op": "update", "table": "notes", "set": { "body": "y" }, "where": { "col": "id", "eq": 1 } });
+    let call = json!({ "v": 1, "op": "call", "fn": "touch", "args": {} });
+    let batch_call = json!({ "v": 1, "op": "batch", "ops": [select_tree(), { "op": "call", "fn": "touch" }] });
+    for tree in [update, call, batch_call] {
+        let err = error_of(w.app.send_as("vic", "org-1", Method::POST, &path, Some(json!({ "role": "app", "tree": tree }))).await, 403).await;
+        assert_eq!(err["error"]["required"], "developer");
+    }
+}
+
+fn set_plan(w: &MemberWorld, status: MergeStatus, plan: Value) {
+    let mut rows = w.metadata.merges.lock().unwrap();
+    let m = rows.iter_mut().find(|r| r.id == w.merge).unwrap();
+    m.status = status;
+    m.analysis = Some(json!({"conflicts": []}));
+    m.plan = Some(plan);
+    m.rehearsal = Some(json!({"ok": true}));
+    if status == MergeStatus::Failed {
+        m.failed_phase = Some("tx".into());
+    }
+}
+
+// R25 and M3: a retry that re-runs security steps, and a change to their acknowledgements, are
+// Admin's; a step the orchestrator can't read counts as a security step.
+#[tokio::test]
+async fn merge_security_retry_and_acknowledgements_need_admin() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "dev1", w.project, PlatformRole::Developer, &[]);
+    w.metadata.add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &[]);
+    let merge = format!("/v1/databases/{}/merges/{}", w.db, w.merge);
+    let secure = json!({ "steps": [{ "id": "grant", "security": true, "items": ["role:x"] }] });
+
+    // Retry.
+    set_plan(&w, MergeStatus::Failed, secure.clone());
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &format!("{merge}/retry"), Some(json!({}))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &format!("{merge}/retry"), Some(json!({}))).await.status(), 202);
+    set_plan(&w, MergeStatus::Failed, json!({ "steps": [{ "id": "t1", "security": false }] }));
+    assert_eq!(w.app.send_as("dev1", "org-1", Method::POST, &format!("{merge}/retry"), Some(json!({}))).await.status(), 202);
+
+    // Acknowledgements.
+    set_plan(&w, MergeStatus::Rehearsed, secure);
+    let version = w.metadata.merges.lock().unwrap().iter().find(|r| r.id == w.merge).unwrap().version;
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::PATCH, &merge, Some(json!({ "version": version, "acknowledgements": ["role:x"] }))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    // Other items stay a Developer's.
+    let resp = w.app.send_as("dev1", "org-1", Method::PATCH, &merge, Some(json!({ "version": version, "acknowledgements": ["other"] }))).await;
+    assert_eq!(resp.status(), 200);
+    let resp = w.app.send_as("ada", "org-1", Method::PATCH, &merge, Some(json!({ "version": version + 1, "acknowledgements": ["other", "role:x"] }))).await;
+    assert_eq!(resp.status(), 200);
+
+    // M3: a step that doesn't parse and carries no flag counts as a security step.
+    set_plan(&w, MergeStatus::Rehearsed, json!({ "steps": [{ "wat": 1 }] }));
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &format!("{merge}/apply"), Some(json!({}))).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+}
+
+// I2: the database that holds a project's app users can't be deleted from under them.
+#[tokio::test]
+async fn delete_database_refuses_the_app_auth_database() {
+    let w = member_world(Mode::SelfHosted).await;
+    let now = chrono::Utc::now();
+    w.metadata.project_auths.lock().unwrap().insert(
+        w.project,
+        ProjectAuth {
+            project_id: w.project,
+            status: AppUsersStatus::Enabled,
+            error: None,
+            zitadel_org_id: Some("zorg".into()),
+            database_id: w.db,
+            pg_database: "web1".into(),
+            schema_name: "public".into(),
+            table_name: "users".into(),
+            email_verification: false,
+            on_delete: OnDelete::Delete,
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    let path = format!("/v1/databases/{}", w.db);
+    let err = error_of(w.app.send_as(DEFAULT_SUB, "org-1", Method::DELETE, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert!(message_of(&err).contains("app users"), "{err}");
+    // Once app users are gone the delete goes ahead.
+    w.metadata.project_auths.lock().unwrap().clear();
+    assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::DELETE, &path, None).await.status(), 202);
+}
+
+// I5: the tenant of a new database comes from the caller, whatever the body says.
+#[tokio::test]
+async fn create_database_takes_the_tenant_from_the_caller() {
+    let w = member_world(Mode::SelfHosted).await;
+    let foreign = TenantId::new();
+    let body = json!({ "project_id": w.project, "name": "fresh", "tenant_id": foreign });
+    let resp = w.app.send_as(DEFAULT_SUB, "org-1", Method::POST, "/v1/databases", Some(body)).await;
+    assert_eq!(resp.status(), 202);
+    let published = w.jobs.published.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].payload.tenant_id, w.tenant);
+    assert_eq!(published[0].payload.project_id, w.project);
+}
+
+// ---- T7: the member management API --------------------------------------------------------
+
+/// The member world (org-1's tenant; project Billing with database web1, owner `postgres`,
+/// main plus `dev`), with Zitadel's mock behind the orchestrator (admin PAT; org-1 exists in
+/// it) and, in platform mode, `ops` as the operator org.
+struct Mw {
+    w: MemberWorld,
+    mock: MockZitadel,
+}
+
+async fn mw(mode: Mode) -> Mw {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let mock = MockZitadel::start().await;
+    mock.add_org("org-1");
+    let app = spawn_app_custom(
+        metadata.clone(),
+        jobs.clone(),
+        "http://127.0.0.1:9",
+        mode,
+        10,
+        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+        Some("ops"),
+    )
+    .await;
+    let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
+    let mut db = sample_database(tenant);
+    db.project_id = project;
+    db.name = "web1".into();
+    db.database_name = Some("web1".into());
+    db.owner_role = Some("postgres".into());
+    let (db_id, main) = (db.database_id, db.main.id);
+    metadata.insert_database(db);
+    let dev = metadata.add_branch(db_id, "dev", main, BranchKind::Normal, BranchStatus::Ready);
+    let w = MemberWorld { app, metadata, tenant, project, db: db_id, dev, merge: uuid::Uuid::nil(), jobs };
+    Mw { w, mock }
+}
+
+impl Mw {
+    async fn send(&self, sub: &str, method: Method, path: &str, body: Option<Value>) -> reqwest::Response {
+        self.w.app.send_as(sub, "org-1", method, path, body).await
+    }
+    /// Main and dev, as `project_branches` lists them.
+    fn branches(&self) -> Vec<BranchId> {
+        let mut out = vec![BranchId::from(self.w.db), self.w.dev];
+        out.sort_by_key(|b| b.as_uuid());
+        out
+    }
+    fn enqueued(&self) -> Vec<BranchId> {
+        let mut out = self.w.jobs.member_role_enqueues.lock().unwrap().clone();
+        out.sort_by_key(|b| b.as_uuid());
+        out.dedup();
+        out
+    }
+    fn clear_enqueued(&self) {
+        self.w.jobs.member_role_enqueues.lock().unwrap().clear();
+    }
+    fn grant_of(&self, member: uuid::Uuid) -> Option<GrantRow> {
+        self.w.metadata.grants.lock().unwrap().get(&(member, self.w.project.as_uuid())).cloned()
+    }
+    fn actions(&self) -> Vec<String> {
+        self.w.metadata.events.lock().unwrap().iter().map(|e| e.action.clone()).collect()
+    }
+    fn main_endpoint(&self) -> String {
+        self.w.metadata.branch(BranchId::from(self.w.db)).endpoint_id.unwrap()
+    }
+}
+
+fn invite_body(w: &MemberWorld, email: &str, role: &str, roles: &[&str]) -> Value {
+    json!({ "email": email, "grants": [{ "project_id": w.project, "platform_role": role, "pg_roles": roles }] })
+}
+
+#[tokio::test]
+async fn invite_creates_zitadel_user_and_invited_member() {
+    let t = mw(Mode::SelfHosted).await;
+    let resp = t
+        .send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "  New@Example.COM ", "developer", &["app"])))
+        .await;
+    assert_eq!(resp.status(), 201);
+    let body = body_of(resp).await;
+    assert_eq!(body["outcome"], "invited");
+    let member = &body["member"];
+    assert_eq!((member["email"].as_str(), member["status"].as_str()), (Some("new@example.com"), Some("invited")));
+    assert_eq!(member["tenant_admin"], false);
+    let invite_id = member["invite"]["id"].as_str().unwrap().to_string();
+    let expires: chrono::DateTime<chrono::Utc> = member["invite"]["expires_at"].as_str().unwrap().parse().unwrap();
+    let hours = (expires - chrono::Utc::now()).num_minutes();
+    assert!((71 * 60..=72 * 60).contains(&hours), "the invite lives 72 h: {hours} min");
+
+    // Zitadel: a passwordless user in the tenant's org, and only the invite mail.
+    let user = t.mock.user("new@example.com").expect("a Zitadel user");
+    assert_eq!((user.org_id.as_str(), user.password.as_str()), ("org-1", ""));
+    assert_eq!(t.mock.emails(), vec![(user.id.clone(), "invite".to_string())]);
+    assert!(
+        t.mock
+            .invite_template(&user.id)
+            .is_some_and(|u| u.starts_with("http://studio.test/accept-invite?user={{.UserID}}&code={{.Code}}&t=")),
+        "{:?}",
+        t.mock.invite_template(&user.id)
+    );
+    // Metadata: an invited member with its (inert) grant, an invite, one event.
+    let id: uuid::Uuid = member["id"].as_str().unwrap().parse().unwrap();
+    let stored = t.w.metadata.members.lock().unwrap().iter().find(|m| m.id == id).cloned().unwrap();
+    assert_eq!((stored.zitadel_user_id.as_str(), stored.status), (user.id.as_str(), MemberStatus::Invited));
+    assert_eq!(t.grant_of(id), Some(GrantRow { platform_role: PlatformRole::Developer, pg_roles: vec!["app".into()] }));
+    assert_eq!(t.actions(), vec!["invite_created"]);
+    // Everyone in the tenant sees the invited member and its open invite.
+    t.w.metadata.add_granted(t.w.tenant, "viewer", t.w.project, PlatformRole::Viewer, &[]);
+    let list = body_of(t.send("viewer", Method::GET, "/v1/members", None).await).await;
+    let listed = list.as_array().unwrap().iter().find(|m| m["id"] == member["id"]).cloned().unwrap();
+    assert_eq!(listed["invite"]["id"], invite_id.as_str());
+}
+
+// Review focus 3, R8 and R18: a member is matched by Zitadel user id first, then by a non-NULL
+// email (trimmed, any case); no second Zitadel user is made.
+#[tokio::test]
+async fn invite_matches_existing_member_case_insensitively() {
+    let t = mw(Mode::SelfHosted).await;
+    let bob = t.w.metadata.add_member(t.w.tenant, "bob", MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, "bob", |m| m.email = Some("bob@x.com".into()));
+    let resp = t
+        .send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, " Bob@X.com", "viewer", &[])))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let body = body_of(resp).await;
+    assert_eq!(body["outcome"], "existing_member");
+    assert_eq!(body["member"]["id"], bob.to_string());
+    assert!(!t.mock.calls().iter().any(|c| c == "POST /v2/users/new"), "{:?}", t.mock.calls());
+    assert_eq!(t.grant_of(bob).map(|g| g.platform_role), Some(PlatformRole::Viewer));
+    assert_eq!(t.enqueued(), t.branches());
+
+    // Id first: Zitadel says carol@x.com is user Z; the member with Z has no stored email (it
+    // went stale) while another member still holds it.
+    let z = t.mock.add_user_in("org-1", "carol@x.com", "Secret-pass1", true);
+    let carol = t.w.metadata.add_member(t.w.tenant, &z, MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, &z, |m| m.email = None);
+    let stale = t.w.metadata.add_member(t.w.tenant, "stale", MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, "stale", |m| m.email = Some("carol@x.com".into()));
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "CAROL@x.com", "developer", &[])))
+            .await,
+    )
+    .await;
+    assert_eq!(body["outcome"], "existing_member");
+    assert_eq!(body["member"]["id"], carol.to_string());
+    assert_eq!(t.grant_of(stale), None);
+}
+
+#[tokio::test]
+async fn invite_existing_org_user_gets_member_row() {
+    let t = mw(Mode::SelfHosted).await;
+    let z = t.mock.add_user_in("org-1", "dana@x.com", "Secret-pass1", true);
+    t.mock.set_display_name(&z, "Dana D");
+    let resp = t
+        .send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "dana@x.com", "developer", &["app"])))
+        .await;
+    assert_eq!(resp.status(), 201);
+    let body = body_of(resp).await;
+    assert_eq!(body["outcome"], "added");
+    let m = &body["member"];
+    assert_eq!((m["status"].as_str(), m["display_name"].as_str()), (Some("active"), Some("Dana D")));
+    assert!(m["invite"].is_null());
+    let stored = t.w.metadata.member(t.w.tenant, &z).expect("a member row for the Zitadel user");
+    assert_eq!(stored.status, MemberStatus::Active);
+    assert_eq!(t.grant_of(stored.id).map(|g| g.pg_roles), Some(vec!["app".to_string()]));
+    // No new Zitadel user and no mail.
+    assert!(t.mock.emails().is_empty());
+    assert_eq!(t.mock.users_with_email("dana@x.com"), 1);
+    assert_eq!(t.actions(), vec!["member_added"]);
+    assert_eq!(t.enqueued(), t.branches());
+    // Inviting them again finds the member.
+    let again = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "dana@x.com", "viewer", &[])))
+            .await,
+    )
+    .await;
+    assert_eq!(again["outcome"], "existing_member");
+}
+
+#[tokio::test]
+async fn project_admin_invites_into_own_project_only() {
+    let t = mw(Mode::SelfHosted).await;
+    let other = t.w.metadata.create_project(t.w.tenant, "Other").await.unwrap().id;
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
+    let body = json!({ "email": "eve@x.com", "platform_role": "viewer", "pg_roles": [] });
+    let own = format!("/v1/projects/{}/invites", t.w.project);
+    let resp = t.send("padmin", Method::POST, &own, Some(body.clone())).await;
+    assert_eq!(resp.status(), 201);
+    let eve: uuid::Uuid = body_of(resp).await["member"]["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(t.grant_of(eve).map(|g| g.platform_role), Some(PlatformRole::Viewer));
+    // Another project: no grant there, so it doesn't exist for them.
+    let theirs = format!("/v1/projects/{other}/invites");
+    let err = error_of(t.send("padmin", Method::POST, &theirs, Some(body.clone())).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    // Tenant invites are a tenant admin's.
+    let err = error_of(
+        t.send("padmin", Method::POST, "/v1/invites", Some(invite_body(&t.w, "fay@x.com", "viewer", &[]))).await,
+        403,
+    )
+    .await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("tenant admin")));
+    // A Developer can't invite into the project.
+    t.w.metadata.add_granted(t.w.tenant, "dev", t.w.project, PlatformRole::Developer, &[]);
+    let err = error_of(t.send("dev", Method::POST, &own, Some(body)).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+}
+
+#[tokio::test]
+async fn override_cannot_widen() {
+    let t = mw(Mode::SelfHosted).await;
+    let m = t.w.metadata.add_granted(t.w.tenant, "m", t.w.project, PlatformRole::Developer, &["app", "web"]);
+    let path = format!("/v1/projects/{}/grants/{m}/overrides", t.w.project);
+    let put = |body: Value| t.send(DEFAULT_SUB, Method::PUT, &path, Some(body));
+    for widening in [
+        json!({ "database_id": t.w.db, "platform_role": "admin" }),
+        json!({ "database_id": t.w.db, "pg_roles": ["app", "other"] }),
+        json!({ "database_id": t.w.db }),
+    ] {
+        let err = error_of(put(widening.clone()).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{widening}");
+    }
+    assert!(t.w.metadata.overrides.lock().unwrap().is_empty());
+    let resp = put(json!({ "database_id": t.w.db, "platform_role": "viewer", "pg_roles": ["web"] })).await;
+    assert_eq!(resp.status(), 200);
+    let body = body_of(resp).await;
+    assert_eq!((body["platform_role"].as_str(), body["pg_roles"][0].as_str()), (Some("viewer"), Some("web")));
+    assert_eq!(
+        t.w.metadata.overrides.lock().unwrap().get(&(m, t.w.db.as_uuid())),
+        Some(&OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: Some(vec!["web".into()]) })
+    );
+    // A member with no grant on the project has nothing to narrow.
+    let bare = t.w.metadata.add_member(t.w.tenant, "bare", MemberStatus::Active, false);
+    let bare_path = format!("/v1/projects/{}/grants/{bare}/overrides", t.w.project);
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::PUT, &bare_path, Some(json!({ "database_id": t.w.db, "platform_role": "viewer" }))).await,
+        422,
+    )
+    .await;
+    assert_eq!(code_of(&err), "invalid_request");
+    // Another project's database isn't this project's.
+    let other = t.w.metadata.create_project(t.w.tenant, "Other").await.unwrap().id;
+    let mut odb = sample_database(t.w.tenant);
+    odb.project_id = other;
+    let odb_id = odb.database_id;
+    t.w.metadata.insert_database(odb);
+    let err = error_of(put(json!({ "database_id": odb_id, "platform_role": "viewer" })).await, 404).await;
+    assert_eq!(message_of(&err), "database not found");
+    // Deleting it: once, then 404.
+    let del = format!("{path}?database_id={}", t.w.db);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &del, None).await.status(), 204);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &del, None).await.status(), 404);
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 400).await;
+    assert_eq!(code_of(&err), "invalid_request");
+}
+
+#[tokio::test]
+async fn grant_change_enqueues_reconcile_for_every_branch() {
+    let t = mw(Mode::SelfHosted).await;
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let resp = t
+        .send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "developer", "pg_roles": ["b", "a", "b"] })))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let body = body_of(resp).await;
+    assert_eq!((body["member_id"].as_str(), body["pg_roles"].clone()), (Some(m.to_string().as_str()), json!(["a", "b"])));
+    assert_eq!(t.enqueued(), t.branches());
+    let list = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/projects/{}/grants", t.w.project), None).await).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["platform_role"], "developer");
+
+    let overrides = format!("{grant}/overrides");
+    for (method, path, body) in [
+        (Method::PUT, overrides.clone(), Some(json!({ "database_id": t.w.db, "platform_role": "viewer" }))),
+        (Method::DELETE, format!("{overrides}?database_id={}", t.w.db), None),
+        (Method::DELETE, grant.clone(), None),
+    ] {
+        t.clear_enqueued();
+        let resp = t.send(DEFAULT_SUB, method.clone(), &path, body).await;
+        assert!(resp.status().is_success(), "{method} {path}: {}", resp.status());
+        assert_eq!(t.enqueued(), t.branches(), "{method} {path}");
+    }
+    assert_eq!(t.actions(), vec!["grant_put", "override_put", "override_deleted", "grant_deleted"]);
+    // Nothing changed, nothing enqueued: a missing grant is 404.
+    t.clear_enqueued();
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &grant, None).await, 404).await;
+    assert_eq!(message_of(&err), "grant not found");
+    assert!(t.enqueued().is_empty());
+}
+
+#[tokio::test]
+async fn remove_member_deactivates_and_enqueues() {
+    let t = mw(Mode::SelfHosted).await;
+    let z = t.mock.add_user_in("org-1", "gil@x.com", "Secret-pass1", true);
+    let gil = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
+    let z_client = Zitadel::new(&t.mock.base, ADMIN_TOKEN);
+    z_client.create_session(&z, "Secret-pass1").await.unwrap();
+    let other = t.mock.add_user_in("org-1", "hal@x.com", "Secret-pass1", true);
+    z_client.create_session(&other, "Secret-pass1").await.unwrap();
+    assert_eq!(t.send(&z, Method::GET, "/v1/projects", None).await.status(), 200);
+
+    let path = format!("/v1/members/{gil}");
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&z).unwrap().inactive);
+    assert_eq!(t.mock.session_count(), 1, "only gil's session ended");
+    assert_eq!(t.enqueued(), t.branches());
+    assert_eq!(t.w.metadata.member(t.w.tenant, &z).unwrap().status, MemberStatus::Removed);
+    assert_eq!(t.grant_of(gil), None);
+    // Their still-valid token is refused at once.
+    let err = error_of(t.send(&z, Method::GET, &format!("/v1/projects/{}", t.w.project), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    // Removing again is a retry: Zitadel says already inactive, which is fine.
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    // Another tenant's member, or none, is 404.
+    let foreign = TenantId::new();
+    let stranger = t.w.metadata.add_member(foreign, "s", MemberStatus::Active, false);
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{stranger}"), None).await, 404).await;
+    assert_eq!(message_of(&err), "member not found");
+}
+
+#[tokio::test]
+async fn last_admin_demotion_conflicts() {
+    let t = mw(Mode::SelfHosted).await;
+    let me = t.w.metadata.member(t.w.tenant, DEFAULT_SUB).unwrap().id;
+    let path = format!("/v1/members/{me}");
+    let err = error_of(t.send(DEFAULT_SUB, Method::PATCH, &path, Some(json!({ "tenant_admin": false }))).await, 409).await;
+    assert_eq!(code_of(&err), "last_tenant_admin");
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 409).await;
+    assert_eq!(code_of(&err), "last_tenant_admin");
+    // With a second admin, the first may step down.
+    let other = t.w.metadata.add_member(t.w.tenant, "other", MemberStatus::Active, false);
+    let resp = t
+        .send(DEFAULT_SUB, Method::PATCH, &format!("/v1/members/{other}"), Some(json!({ "tenant_admin": true })))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await["tenant_admin"], true);
+    t.clear_enqueued();
+    let resp = t.send(DEFAULT_SUB, Method::PATCH, &path, Some(json!({ "tenant_admin": false }))).await;
+    assert_eq!(resp.status(), 200);
+    // A tenant admin's roles cover every project: every branch reconciles.
+    assert_eq!(t.enqueued(), t.branches());
+}
+
+// R9: only an active member may become a tenant admin.
+#[tokio::test]
+async fn promote_invited_member_conflicts() {
+    let t = mw(Mode::SelfHosted).await;
+    let invited = t.w.metadata.add_member(t.w.tenant, "inv", MemberStatus::Invited, false);
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::PATCH, &format!("/v1/members/{invited}"), Some(json!({ "tenant_admin": true }))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&err), "conflict");
+    assert!(!t.w.metadata.member(t.w.tenant, "inv").unwrap().tenant_admin);
+}
+
+#[tokio::test]
+async fn open_signup_platform_refused() {
+    // Platform mode: an operator may read the settings, never switch open sign-up on.
+    let t = mw(Mode::Platform).await;
+    let op = |method: Method, body: Option<Value>| {
+        t.w.app.send_as("operator", "ops", method, "/v1/instance/settings", body)
+    };
+    let err = error_of(op(Method::PATCH, Some(json!({ "open_signup": true }))).await, 403).await;
+    assert_eq!(code_of(&err), "not_available_in_platform_mode");
+    let settings = body_of(op(Method::GET, None).await).await;
+    assert_eq!(settings, json!({ "open_signup": false, "open_signup_switchable": false }));
+
+    // Self-hosted: the tenant admin switches it; anyone else is refused.
+    let t = mw(Mode::SelfHosted).await;
+    let resp = t.send(DEFAULT_SUB, Method::PATCH, "/v1/instance/settings", Some(json!({ "open_signup": true }))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await, json!({ "open_signup": true, "open_signup_switchable": true }));
+    assert_eq!(t.actions(), vec!["open_signup_set"]);
+    let got = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/instance/settings", None).await).await;
+    assert_eq!(got["open_signup"], true);
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
+    let err = error_of(t.send("padmin", Method::GET, "/v1/instance/settings", None).await, 403).await;
+    assert_eq!(err["error"]["required"], "instance admin");
+}
+
+#[tokio::test]
+async fn revoke_invite_deletes_zitadel_user() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "ivy@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let member: uuid::Uuid = body["member"]["id"].as_str().unwrap().parse().unwrap();
+    let user = t.mock.user("ivy@x.com").unwrap();
+    let path = format!("/v1/invites/{invite}");
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&user.id).is_none(), "the never-activated user is deleted");
+    assert!(t.mock.calls().contains(&format!("DELETE /v2/users/{}", user.id)));
+    assert_eq!(t.w.metadata.member(t.w.tenant, &user.id).unwrap().status, MemberStatus::Removed);
+    assert_eq!(t.grant_of(member), None);
+    // I4: revoking again (the member is removed) retries the Zitadel delete; it is gone: fine.
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{}", uuid::Uuid::new_v4()), None).await, 404).await;
+    assert_eq!(message_of(&err), "invite not found");
+}
+
+// ---- T7 review fixes --------------------------------------------------------------------------
+
+/// The role pool of the grant-invariant tests, on every database's branches:
+/// `plain` and `group2` are NOLOGIN groups; `login` is a LOGIN role; `boss` reaches the owner
+/// (`postgres`) on the first database only, and is a plain group on the second. `lead` holds
+/// ADMIN on `plain` and `sneaky` is a member of the owner without the SET option on the first
+/// database only (I2: neither is reach, both make the chain unsafe).
+const POOL: [&str; 6] = ["plain", "group2", "boss", "login", "lead", "sneaky"];
+
+/// Whether `role` may be held below Admin on database `first` (true) or the second (false).
+fn pool_bad(first: bool, role: &str) -> bool {
+    role == "login" || role == "lead" || (first && (role == "boss" || role == "sneaky"))
+}
+
+impl Mw {
+    /// A second database of the project (its own endpoint), and the pool's roles on both mains.
+    fn second_database(&self) -> DatabaseId {
+        let mut db = sample_database(self.w.tenant);
+        db.project_id = self.w.project;
+        db.name = "web2".into();
+        db.owner_role = Some("postgres".into());
+        db.main.endpoint_id = Some("ep-second000000".into());
+        let id = db.database_id;
+        self.w.metadata.insert_database(db);
+        for (ep, first) in [(self.main_endpoint(), true), ("ep-second000000".to_string(), false)] {
+            let md = &self.w.metadata;
+            md.add_group_role(&ep, "plain", &[]);
+            md.add_group_role(&ep, "group2", &[]);
+            md.add_group_role(&ep, "boss", if first { &["postgres"] } else { &[] });
+            md.add_role(&ep, "login", RoleOrigin::Sql, false, false);
+            md.add_group_role_with(&ep, "lead", &["plain"], &[], &["plain"]);
+            if first {
+                md.add_group_role_with(&ep, "sneaky", &["postgres"], &["postgres"], &[]);
+            } else {
+                md.add_group_role(&ep, "sneaky", &[]);
+            }
+        }
+        id
+    }
+}
+
+// I4: a grant, an invite of an existing member and an override are written only while the
+// member's access is what the check read. Each of these has the other request's write land
+// between the check and the write; the check runs again on the new state and refuses.
+#[tokio::test]
+async fn grant_put_checks_again_when_an_override_lands_in_between() {
+    let t = mw(Mode::SelfHosted).await;
+    t.second_database();
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    t.w.metadata.grant(m, t.w.project, PlatformRole::Admin, &["plain"]);
+    let db = t.w.db;
+    // Admin may hold `boss`; but another request narrows the member to Developer on web1.
+    t.w.metadata.race_once(move |md| {
+        md.narrow(m, db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None });
+    });
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "admin", "pg_roles": ["plain", "boss"] }))).await,
+        422,
+    )
+    .await;
+    assert_eq!((err["error"]["role"].as_str(), err["error"]["database_id"].as_str()), (Some("boss"), Some(db.to_string().as_str())), "{err}");
+    assert_eq!(t.grant_of(m).unwrap().pg_roles, vec!["plain".to_string()], "nothing written");
+}
+
+#[tokio::test]
+async fn invite_of_an_existing_member_checks_again_when_an_override_lands_in_between() {
+    let t = mw(Mode::SelfHosted).await;
+    t.second_database();
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, "m", |r| r.email = Some("m@x.com".into()));
+    t.w.metadata.grant(m, t.w.project, PlatformRole::Admin, &["plain"]);
+    let db = t.w.db;
+    t.w.metadata.race_once(move |md| {
+        md.narrow(m, db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None });
+    });
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "m@x.com", "admin", &["boss"]))).await,
+        422,
+    )
+    .await;
+    assert_eq!(err["error"]["database_id"], t.w.db.to_string(), "{err}");
+    assert_eq!(t.grant_of(m).unwrap().pg_roles, vec!["plain".to_string()], "nothing written");
+}
+
+#[tokio::test]
+async fn override_put_checks_again_when_the_grant_changes_in_between() {
+    let t = mw(Mode::SelfHosted).await;
+    t.second_database();
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    t.w.metadata.grant(m, t.w.project, PlatformRole::Admin, &["plain"]);
+    let project = t.w.project;
+    // Another request gives the member `boss` as Admin, which is fine until the override lands.
+    t.w.metadata.race_once(move |md| md.grant(m, project, PlatformRole::Admin, &["plain", "boss"]));
+    let o = format!("/v1/projects/{}/grants/{m}/overrides", t.w.project);
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": t.w.db, "platform_role": "developer" }))).await,
+        422,
+    )
+    .await;
+    assert_eq!((err["error"]["role"].as_str(), err["error"]["database_id"].as_str()), (Some("boss"), Some(t.w.db.to_string().as_str())), "{err}");
+    assert!(t.w.metadata.overrides.lock().unwrap().is_empty(), "nothing written");
+}
+
+#[tokio::test]
+async fn override_delete_checks_again_when_the_grant_changes_in_between() {
+    let t = mw(Mode::SelfHosted).await;
+    t.second_database();
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    t.w.metadata.grant(m, t.w.project, PlatformRole::Developer, &["plain"]);
+    t.w.metadata.narrow(m, t.w.db, OverrideRow { platform_role: None, pg_roles: Some(vec!["plain".into()]) });
+    let project = t.w.project;
+    // Another request gives the Developer `boss`: fine while the override keeps only `plain`,
+    // but not once the delete takes the override away.
+    t.w.metadata.race_once(move |md| md.grant(m, project, PlatformRole::Developer, &["plain", "boss"]));
+    let o = format!("/v1/projects/{}/grants/{m}/overrides?database_id={}", t.w.project, t.w.db);
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &o, None).await, 422).await;
+    assert_eq!(err["error"]["database_id"], t.w.db.to_string(), "{err}");
+    assert_eq!(t.w.metadata.overrides.lock().unwrap().len(), 1, "the override stays");
+}
+
+// I4: a second change during the retry is a 409, with nothing written.
+#[tokio::test]
+async fn a_checked_write_that_keeps_changing_is_a_conflict() {
+    let t = mw(Mode::SelfHosted).await;
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    t.w.metadata.grant(m, t.w.project, PlatformRole::Viewer, &[]);
+    let project = t.w.project;
+    for roles in [&["a"][..], &["b"][..]] {
+        let roles: Vec<&'static str> = roles.to_vec();
+        t.w.metadata.race_once(move |md| md.grant(m, project, PlatformRole::Viewer, &roles));
+    }
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "developer", "pg_roles": [] }))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(t.grant_of(m).unwrap().platform_role, PlatformRole::Viewer);
+}
+
+// M16: a refusal names the branch whose roles broke it. A role can be a plain group on main and
+// reach a LOGIN role on a branch; the picker reads each database's main, so the 422 is what
+// tells it which branch (and database and chain) to show.
+#[tokio::test]
+async fn grant_refusal_names_the_non_main_branch_it_was_found_on() {
+    let t = mw(Mode::SelfHosted).await;
+    let main_ep = t.main_endpoint();
+    let dev_ep = t.w.metadata.branch(t.w.dev).endpoint_id.unwrap();
+    for ep in [&main_ep, &dev_ep] {
+        t.w.metadata.add_group_role(ep, "tidy", &[]);
+    }
+    // `reports` is a plain group on main, but on dev it is a member of a LOGIN role.
+    t.w.metadata.add_group_role(&main_ep, "reports", &[]);
+    t.w.metadata.add_role(&dev_ep, "svc", RoleOrigin::Sql, false, false);
+    t.w.metadata.add_group_role(&dev_ep, "reports", &["svc"]);
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let put = |roles: &[&str]| {
+        t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "developer", "pg_roles": roles })))
+    };
+    let err = error_of(put(&["tidy", "reports"]).await, 422).await;
+    let dev_name = t.w.metadata.branch(t.w.dev).name;
+    assert_eq!(
+        (err["error"]["role"].as_str(), err["error"]["branch"].as_str(), err["error"]["branch_main"].as_bool()),
+        (Some("reports"), Some(dev_name.as_str()), Some(false)),
+        "{err}"
+    );
+    assert_eq!(err["error"]["chain"], json!(["reports", "svc"]));
+    assert_eq!(err["error"]["branch_id"], t.w.dev.as_uuid().to_string());
+    assert_eq!(err["error"]["database_id"], t.w.db.to_string());
+    // A refusal on main names main.
+    t.w.metadata.add_role(&main_ep, "svc2", RoleOrigin::Sql, false, false);
+    t.w.metadata.add_group_role(&main_ep, "mainbad", &["svc2"]);
+    let err = error_of(put(&["mainbad"]).await, 422).await;
+    assert_eq!((err["error"]["branch_main"].as_bool(), err["error"]["branch"].as_str()), (Some(true), Some("main")), "{err}");
+}
+
+// I2 (R30 as changed): a role that holds ADMIN on another role, or whose chain does, is refused
+// below Admin at grant time, naming the chain; a membership without the SET option is no reach
+// but still counts in the chain.
+#[tokio::test]
+async fn grant_of_a_chain_holding_admin_or_inheriting_the_owner_is_refused() {
+    let t = mw(Mode::SelfHosted).await;
+    t.second_database();
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let put = |role: &str| {
+        t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "developer", "pg_roles": [role] })))
+    };
+    let err = error_of(put("lead").await, 422).await;
+    assert_eq!(err["error"]["chain"], json!(["lead"]), "{err}");
+    assert!(message_of(&err).contains("ADMIN"), "{err}");
+    // Why, for clients to put in their own words; a one-role chain reaches nothing else.
+    assert_eq!(err["error"]["why"], "admin", "{err}");
+    assert!(!message_of(&err).contains("through"), "{err}");
+    let err = error_of(put("sneaky").await, 422).await;
+    assert_eq!(err["error"]["chain"], json!(["sneaky", "postgres"]), "{err}");
+    assert_eq!(err["error"]["why"], "owner_level", "{err}");
+    assert_eq!(put("plain").await.status(), 200);
+    // Admin may hold them.
+    let resp = t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "admin", "pg_roles": ["lead", "sneaky"] }))).await;
+    assert_eq!(resp.status(), 200);
+}
+
+// I1: a grant put re-checks the member's overrides: the effective set on each database must
+// still pass, named by the database.
+#[tokio::test]
+async fn grant_put_rechecks_existing_overrides() {
+    let t = mw(Mode::SelfHosted).await;
+    let db2 = t.second_database();
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let put = |role: &str, roles: &[&str]| {
+        t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": role, "pg_roles": roles })))
+    };
+    assert_eq!(put("admin", &["plain"]).await.status(), 200);
+    let o = format!("{grant}/overrides");
+    let resp = t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": t.w.db, "platform_role": "developer" }))).await;
+    assert_eq!(resp.status(), 200);
+    let events = t.actions().len();
+    // Admin may hold `boss`, but on web1 the override leaves Developer with it.
+    let err = error_of(put("admin", &["plain", "boss"]).await, 422).await;
+    assert_eq!(err["error"]["database_id"], t.w.db.to_string(), "{err}");
+    assert_eq!(err["error"]["role"], "boss");
+    assert!(message_of(&err).contains("web1"), "{err}");
+    assert_eq!(t.grant_of(m).unwrap().pg_roles, vec!["plain".to_string()], "nothing written");
+    assert_eq!(t.actions().len(), events);
+    // The same through an invite of the member.
+    t.w.metadata.set_member(t.w.tenant, "m", |r| r.email = Some("m@x.com".into()));
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "m@x.com", "admin", &["boss"]))).await,
+        422,
+    )
+    .await;
+    assert_eq!(err["error"]["database_id"], t.w.db.to_string());
+    assert_eq!(err["error"]["project_id"], t.w.project.to_string(), "{err}");
+    // A narrowing that removes `boss` makes it fine: the effective set is intersected.
+    let resp = t
+        .send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": t.w.db, "platform_role": "developer", "pg_roles": ["plain"] })))
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(put("admin", &["plain", "boss", "login"]).await.status(), 200);
+    // Dropping web1's narrowing leaves the Admin grant there: fine.
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("{o}?database_id={}", t.w.db), None).await.status(), 204);
+    // On web2 an override down to Developer would leave `login`: refused, named web2.
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": db2, "platform_role": "viewer" }))).await,
+        422,
+    )
+    .await;
+    assert_eq!(err["error"]["database_id"], db2.to_string());
+    assert_eq!(err["error"]["role"], "login");
+}
+
+// I2 (R29): a removed member comes back only as `invited`, with a fresh code (a password-reset
+// one: they have a password); the Zitadel user stays deactivated, and the event names the inviter.
+#[tokio::test]
+async fn removed_member_is_reinvited_with_a_code() {
+    let t = mw(Mode::SelfHosted).await;
+    let z = t.mock.add_user_in("org-1", "rae@x.com", "Secret-pass1", true);
+    let rae = t.w.metadata.add_member(t.w.tenant, &z, MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, &z, |m| m.email = Some("rae@x.com".into()));
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{rae}"), None).await.status(), 204);
+    assert!(t.mock.user_by_id(&z).unwrap().inactive);
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
+    let padmin = t.w.metadata.member(t.w.tenant, "padmin").unwrap().id;
+    let body = json!({ "email": "rae@x.com", "platform_role": "viewer", "pg_roles": [] });
+    let resp = t.send("padmin", Method::POST, &format!("/v1/projects/{}/invites", t.w.project), Some(body)).await;
+    assert_eq!(resp.status(), 201);
+    let body = body_of(resp).await;
+    assert_eq!((body["outcome"].as_str(), body["member"]["status"].as_str()), (Some("invited"), Some("invited")));
+    assert_eq!(body["member"]["id"], rae.to_string(), "the same member row");
+    // I1: the invite never reactivates the user; accept-invite does, once the code is verified.
+    assert!(t.mock.user_by_id(&z).unwrap().inactive, "still deactivated until the code is accepted");
+    assert!(!t.mock.calls().iter().any(|c| c.contains("reactivate")), "{:?}", t.mock.calls());
+    // Zitadel makes no invite code for a user who has a password ("already initialized"): the
+    // code is a password-reset one, mailed with the accept-invite link marked `reset=1`.
+    assert!(t.mock.invite_code(&z).is_none());
+    assert!(t.mock.emails().contains(&(z.clone(), "reset".to_string())));
+    let template = t.mock.reset_template(&z).expect("a reset mail with a link");
+    assert!(
+        template.starts_with("http://studio.test/accept-invite?user={{.UserID}}&code={{.Code}}&t=")
+            && template.ends_with("&reset=1"),
+        "{template}"
+    );
+    let event = t.w.metadata.events.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (event.action.as_str(), event.actor_member_id, event.project_id),
+        ("invite_created", Some(padmin), Some(t.w.project.as_uuid()))
+    );
+    // Revoking it never deletes a user who once had a password: it is deactivated again.
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
+    assert!(t.mock.user_by_id(&z).unwrap().inactive);
+}
+
+// M4: when the code can't be sent the invite is revoked at once, and the log says why.
+#[tokio::test]
+async fn failed_invite_delivery_is_revoked_with_its_reason() {
+    let t = mw(Mode::SelfHosted).await;
+    t.mock.fail("/invite_code", 503, "Errors.Internal", 1);
+    let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "fail@x.com", "viewer", &[]))).await;
+    assert_eq!(resp.status(), 503);
+    let events = t.w.metadata.events.lock().unwrap().clone();
+    let revoked = events.iter().find(|e| e.action == "invite_revoked").expect("a compensating revoke");
+    assert_eq!(revoked.after.as_ref().unwrap()["reason"], "delivery_failed");
+}
+
+// I2 (R29): a user of the org who never set a password, or isn't Active, is invited by mail: an
+// invite code for one with no way to sign in, a password-reset code for one with a password
+// (Zitadel makes no invite code for them, Initial state included).
+#[tokio::test]
+async fn org_user_without_password_gets_an_invite_code() {
+    let t = mw(Mode::SelfHosted).await;
+    let nopw = t.mock.add_user_in("org-1", "nopw@x.com", "", false);
+    let initial = t.mock.add_user_in("org-1", "init@x.com", "Secret-pass1", true);
+    t.mock.set_initial(&initial);
+    for (email, z, reset) in [("nopw@x.com", &nopw, false), ("init@x.com", &initial, true)] {
+        let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, email, "viewer", &[]))).await;
+        assert_eq!(resp.status(), 201, "{email}");
+        let body = body_of(resp).await;
+        assert_eq!(body["outcome"], "invited", "{email}");
+        assert_eq!(t.w.metadata.member(t.w.tenant, z).unwrap().status, MemberStatus::Invited);
+        assert_eq!(t.mock.invite_code(z).is_some(), !reset, "{email}");
+        assert_eq!(t.mock.reset_template(z).is_some(), reset, "{email}");
+    }
+    assert_eq!(t.mock.users_with_email("nopw@x.com"), 1, "no second user");
+}
+
+// I3: an existing member's invite writes all its grants or none.
+#[tokio::test]
+async fn existing_member_invite_is_all_or_nothing() {
+    let t = mw(Mode::SelfHosted).await;
+    t.second_database();
+    let other = t.w.metadata.create_project(t.w.tenant, "Other").await.unwrap().id;
+    let m = t.w.metadata.add_granted(t.w.tenant, "m", t.w.project, PlatformRole::Admin, &["plain"]);
+    t.w.metadata.set_member(t.w.tenant, "m", |r| r.email = Some("m@x.com".into()));
+    t.w.metadata.narrow(m, t.w.db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None });
+    t.clear_enqueued();
+    // The second grant is refused (web1's override would leave Developer with `boss`).
+    let body = json!({ "email": "m@x.com", "grants": [
+        { "project_id": other, "platform_role": "viewer", "pg_roles": [] },
+        { "project_id": t.w.project, "platform_role": "admin", "pg_roles": ["boss"] },
+    ] });
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 422).await;
+    assert_eq!(err["error"]["database_id"], t.w.db.to_string());
+    assert!(t.w.metadata.grants.lock().unwrap().get(&(m, other.as_uuid())).is_none(), "nothing written");
+    assert!(t.enqueued().is_empty());
+    // Both fine: both written, one event each, both projects reconciled.
+    let body = json!({ "email": "m@x.com", "grants": [
+        { "project_id": other, "platform_role": "viewer", "pg_roles": [] },
+        { "project_id": t.w.project, "platform_role": "admin", "pg_roles": ["plain", "group2"] },
+    ] });
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await.status(), 200);
+    assert!(t.w.metadata.grants.lock().unwrap().get(&(m, other.as_uuid())).is_some());
+    assert_eq!(t.grant_of(m).unwrap().pg_roles, vec!["group2".to_string(), "plain".to_string()]);
+    assert_eq!(t.actions().iter().filter(|a| *a == "grant_put").count(), 2);
+}
+
+// I4: the metadata revoke comes first; a Zitadel failure is retried by revoking again.
+#[tokio::test]
+async fn revoke_retries_the_zitadel_delete() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "zed@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let user = t.mock.user("zed@x.com").unwrap();
+    let path = format!("/v1/invites/{invite}");
+    t.mock.fail("DELETE /v2/users/", 503, "Errors.Internal", 1);
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &user.id).unwrap().status, MemberStatus::Removed, "revoked first");
+    assert!(t.mock.user_by_id(&user.id).is_some());
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&user.id).is_none());
+    // An old invite of a member invited again (same row, a newer open invite) is closed: 409.
+    // Yan is invited, then removed as a member (the invite is revoked, the user deactivated but
+    // kept), then invited again: R29 brings the same row back with a new code.
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "yan@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let old = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let yan = body["member"]["id"].as_str().unwrap().to_string();
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{yan}"), None).await.status(), 204);
+    let again = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "yan@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    assert_eq!((again["outcome"].as_str(), again["member"]["id"].as_str()), (Some("invited"), Some(yan.as_str())));
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{old}"), None).await, 409).await;
+    assert_eq!(code_of(&err), "invite_closed");
+}
+
+// M6: a write that changes nothing enqueues no reconcile.
+#[tokio::test]
+async fn no_op_writes_enqueue_nothing() {
+    let t = mw(Mode::SelfHosted).await;
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, "m", |r| r.email = Some("m@x.com".into()));
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let body = json!({ "platform_role": "developer", "pg_roles": ["b", "a"] });
+    t.send(DEFAULT_SUB, Method::PUT, &grant, Some(body.clone())).await;
+    let o = json!({ "database_id": t.w.db, "platform_role": "viewer" });
+    t.send(DEFAULT_SUB, Method::PUT, &format!("{grant}/overrides"), Some(o.clone())).await;
+    t.clear_enqueued();
+    let events = t.actions().len();
+    for (method, path, body) in [
+        (Method::PUT, grant.clone(), Some(json!({ "platform_role": "developer", "pg_roles": ["a", "b", "a"] }))),
+        (Method::PUT, format!("{grant}/overrides"), Some(o)),
+        (Method::PATCH, format!("/v1/members/{m}"), Some(json!({ "tenant_admin": false }))),
+        (Method::POST, "/v1/invites".to_string(), Some(invite_body(&t.w, "m@x.com", "developer", &["a", "b"]))),
+    ] {
+        let resp = t.send(DEFAULT_SUB, method.clone(), &path, body).await;
+        assert!(resp.status().is_success(), "{method} {path}: {}", resp.status());
+        assert!(t.enqueued().is_empty(), "{method} {path}");
+    }
+    assert_eq!(t.actions().len(), events, "no event either");
+}
+
+// M5: removal reconciles the projects a member holds member roles in, grants or not.
+#[tokio::test]
+async fn remove_member_reconciles_branches_it_has_roles_on() {
+    let t = mw(Mode::SelfHosted).await;
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    t.w.metadata.member_branch_roles.lock().unwrap().push((m, t.w.dev));
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{m}"), None).await.status(), 204);
+    assert_eq!(t.enqueued(), t.branches());
+}
+
+// M3: a project's log lists the invites and removals whose grants name it.
+#[tokio::test]
+async fn project_access_events_list_invites_and_removals() {
+    let t = mw(Mode::SelfHosted).await;
+    let other = t.w.metadata.create_project(t.w.tenant, "Other").await.unwrap().id;
+    let body = json!({ "email": "two@x.com", "grants": [
+        { "project_id": other, "platform_role": "viewer", "pg_roles": [] },
+        { "project_id": t.w.project, "platform_role": "viewer", "pg_roles": [] },
+    ] });
+    let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await;
+    assert_eq!(resp.status(), 201);
+    let member = body_of(resp).await["member"]["id"].as_str().unwrap().to_string();
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+    let page = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/projects/{}/access-events", t.w.project), None).await).await;
+    let actions: Vec<&str> = page["events"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, vec!["member_removed", "invite_created"]);
+}
+
+// The grant invariant (T7 review, second finding in grant/override validation): after any
+// sequence of grant puts and deletes, override puts and deletes and invites, every member's
+// effective grant on every database passes the role check for its effective platform role.
+// A write that would break it is refused with 422 naming the database, and writes nothing.
+mod grant_invariant {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        PutGrant { member: usize, role: PlatformRole, roles: Vec<&'static str> },
+        DeleteGrant { member: usize },
+        PutOverride { member: usize, first: bool, role: Option<PlatformRole>, roles: Option<Vec<&'static str>> },
+        DeleteOverride { member: usize, first: bool },
+        Invite { member: usize, role: PlatformRole, roles: Vec<&'static str> },
+    }
+
+    fn role() -> impl Strategy<Value = PlatformRole> {
+        prop_oneof![Just(PlatformRole::Viewer), Just(PlatformRole::Developer), Just(PlatformRole::Admin)]
+    }
+
+    fn roles() -> impl Strategy<Value = Vec<&'static str>> {
+        proptest::sample::subsequence(POOL.to_vec(), 0..=POOL.len())
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        let member = 0..2usize;
+        prop_oneof![
+            (member.clone(), role(), roles()).prop_map(|(member, role, roles)| Op::PutGrant { member, role, roles }),
+            member.clone().prop_map(|member| Op::DeleteGrant { member }),
+            (member.clone(), any::<bool>(), proptest::option::of(role()), proptest::option::of(roles()))
+                .prop_map(|(member, first, role, roles)| Op::PutOverride { member, first, role, roles }),
+            (member.clone(), any::<bool>()).prop_map(|(member, first)| Op::DeleteOverride { member, first }),
+            (member, role(), roles()).prop_map(|(member, role, roles)| Op::Invite { member, role, roles }),
+        ]
+    }
+
+    /// Every (member, database) whose effective grant holds, below Admin, a role the pool says
+    /// is refused there.
+    fn violations(t: &Mw, members: &[uuid::Uuid], db2: DatabaseId) -> Vec<String> {
+        let mut out = vec![];
+        for m in members {
+            let Some(g) = t.grant_of(*m) else { continue };
+            for (db, first) in [(t.w.db, true), (db2, false)] {
+                let o = t.w.metadata.overrides.lock().unwrap().get(&(*m, db.as_uuid())).cloned();
+                let role = o.as_ref().and_then(|o| o.platform_role).map_or(g.platform_role, |r| r.min(g.platform_role));
+                let held: Vec<&String> = match o.as_ref().and_then(|o| o.pg_roles.as_ref()) {
+                    Some(narrow) => g.pg_roles.iter().filter(|r| narrow.contains(r)).collect(),
+                    None => g.pg_roles.iter().collect(),
+                };
+                if role < PlatformRole::Admin {
+                    for r in held.into_iter().filter(|r| pool_bad(first, r)) {
+                        out.push(format!("member {m} on {}: {role:?} holds {r}", if first { "web1" } else { "web2" }));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    type Snapshot = (Vec<(uuid::Uuid, uuid::Uuid, GrantRow)>, Vec<(uuid::Uuid, uuid::Uuid, OverrideRow)>, usize);
+
+    fn snapshot(t: &Mw) -> Snapshot {
+        let mut grants: Vec<_> = t.w.metadata.grants.lock().unwrap().iter().map(|((m, p), g)| (*m, *p, g.clone())).collect();
+        grants.sort_by_key(|(m, p, _)| (*m, *p));
+        let mut overrides: Vec<_> =
+            t.w.metadata.overrides.lock().unwrap().iter().map(|((m, d), o)| (*m, *d, o.clone())).collect();
+        overrides.sort_by_key(|(m, d, _)| (*m, *d));
+        (grants, overrides, t.w.metadata.events.lock().unwrap().len())
+    }
+
+    async fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let t = mw(Mode::SelfHosted).await;
+        let db2 = t.second_database();
+        let members: Vec<uuid::Uuid> = (0..2)
+            .map(|i| {
+                let sub = format!("m{i}");
+                let id = t.w.metadata.add_member(t.w.tenant, &sub, MemberStatus::Active, false);
+                t.w.metadata.set_member(t.w.tenant, &sub, |r| r.email = Some(format!("m{i}@x.com")));
+                id
+            })
+            .collect();
+        for (step, op) in ops.into_iter().enumerate() {
+            let before = snapshot(&t);
+            let (method, path, body) = match &op {
+                Op::PutGrant { member, role, roles } => (
+                    Method::PUT,
+                    format!("/v1/projects/{}/grants/{}", t.w.project, members[*member]),
+                    Some(json!({ "platform_role": role, "pg_roles": roles })),
+                ),
+                Op::DeleteGrant { member } => (Method::DELETE, format!("/v1/projects/{}/grants/{}", t.w.project, members[*member]), None),
+                Op::PutOverride { member, first, role, roles } => (
+                    Method::PUT,
+                    format!("/v1/projects/{}/grants/{}/overrides", t.w.project, members[*member]),
+                    Some(json!({ "database_id": if *first { t.w.db } else { db2 }, "platform_role": role, "pg_roles": roles })),
+                ),
+                Op::DeleteOverride { member, first } => (
+                    Method::DELETE,
+                    format!(
+                        "/v1/projects/{}/grants/{}/overrides?database_id={}",
+                        t.w.project,
+                        members[*member],
+                        if *first { t.w.db } else { db2 }
+                    ),
+                    None,
+                ),
+                Op::Invite { member, role, roles } => {
+                    (Method::POST, "/v1/invites".to_string(), Some(invite_body(&t.w, &format!("m{member}@x.com"), role.as_str(), roles)))
+                }
+            };
+            let resp = t.send(DEFAULT_SUB, method, &path, body).await;
+            let status = resp.status().as_u16();
+            let answer: Value = resp.json().await.unwrap_or(Value::Null);
+            prop_assert!(status < 500, "step {step} {op:?}: {status} {answer}");
+            if status >= 400 {
+                prop_assert_eq!(&snapshot(&t), &before, "step {} {:?}: a refusal wrote", step, op);
+                if !answer["error"]["chain"].is_null() {
+                    prop_assert!(!answer["error"]["database_id"].is_null(), "step {step} {op:?}: {answer}");
+                }
+            }
+            let broken = violations(&t, &members, db2);
+            prop_assert!(broken.is_empty(), "step {step} {op:?} -> {status}: {broken:?}");
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+        #[test]
+        fn effective_grants_always_pass_the_role_check(ops in proptest::collection::vec(op(), 1..12)) {
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+            rt.block_on(run(ops))?;
+        }
+    }
+}
+
+#[tokio::test]
+async fn resend_invite_sends_a_new_code() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "jay@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let user = t.mock.user("jay@x.com").unwrap();
+    let first = t.mock.invite_code(&user.id).unwrap();
+    let resp = t.send(DEFAULT_SUB, Method::POST, &format!("/v1/invites/{invite}/resend"), None).await;
+    assert_eq!(resp.status(), 200);
+    let resent = body_of(resp).await;
+    assert_eq!(resent["id"], invite.as_str());
+    assert_ne!(t.mock.invite_code(&user.id).unwrap(), first);
+    assert_eq!(t.mock.emails().len(), 2);
+    assert_eq!(t.actions(), vec!["invite_created", "invite_resent"]);
+    // A revoked invite can't be resent.
+    t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await;
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/invites/{invite}/resend"), None).await, 409).await;
+    assert_eq!(code_of(&err), "invite_closed");
+}
+
+// R7: grants, overrides and invites refuse reserved role names.
+#[tokio::test]
+async fn grant_with_reserved_role_name_is_refused() {
+    let t = mw(Mode::SelfHosted).await;
+    t.w.metadata.databases.lock().unwrap().get_mut(&t.w.db).unwrap().owner_role = Some("web_owner".into());
+    let m = t.w.metadata.add_granted(t.w.tenant, "m", t.w.project, PlatformRole::Admin, &["app"]);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    for name in ["owner", "OWNER", "web_owner", "postgres", "cb_m_0123", "CB_M_x", "chelabase_admin", "Chelabase_x", "pg_read_all_data", "cloud_admin", "neon_superuser", "authenticator", ""] {
+        for role in ["admin", "developer"] {
+            let err = error_of(
+                t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": role, "pg_roles": [name] }))).await,
+                422,
+            )
+            .await;
+            assert_eq!(code_of(&err), "invalid_request", "{role} {name:?}");
+        }
+        let err = error_of(
+            t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "kai@x.com", "viewer", &[name]))).await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&err), "invalid_request", "invite {name:?}");
+        // The refusal names the invite's project, and the database whose owner the name is.
+        assert_eq!(err["error"]["project_id"], t.w.project.to_string(), "invite {name:?}: {err}");
+        if name == "web_owner" {
+            assert_eq!(err["error"]["database_id"], t.w.db.to_string(), "{err}");
+        }
+        let err = error_of(
+            t.send(DEFAULT_SUB, Method::PUT, &format!("{grant}/overrides"), Some(json!({ "database_id": t.w.db, "pg_roles": [name] })))
+                .await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&err), "invalid_request", "override {name:?}");
+    }
+    assert!(t.mock.user("kai@x.com").is_none(), "a refused invite makes no Zitadel user");
+    assert_eq!(t.grant_of(m).unwrap().pg_roles, vec!["app".to_string()]);
+    // The data API's own roles stay grantable (R10).
+    for name in ["anon", "authenticated"] {
+        let resp = t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "developer", "pg_roles": [name] }))).await;
+        assert_eq!(resp.status(), 200, "{name}");
+    }
+}
+
+// R16 and R21–R23: below Admin, a granted role and its whole chain must be plain NOLOGIN groups.
+#[tokio::test]
+async fn grant_whose_chain_is_not_plain_groups_is_refused_below_admin() {
+    let t = mw(Mode::SelfHosted).await;
+    let ep = t.main_endpoint();
+    let md = &t.w.metadata;
+    md.add_group_role(&ep, "reader", &[]);
+    md.add_group_role(&ep, "billing_admin", &["billing"]);
+    md.add_group_role(&ep, "billing", &["postgres"]);
+    md.add_group_role(&ep, "creator", &[]);
+    md.roles.lock().unwrap().get_mut(&ep).unwrap().last_mut().unwrap().level = RoleLevel::OwnerLevel;
+    md.add_group_role(&ep, "rls_free", &[]);
+    md.roles.lock().unwrap().get_mut(&ep).unwrap().last_mut().unwrap().attributes.bypass_rls = true;
+    md.add_role(&ep, "app_login", RoleOrigin::Sql, false, false);
+    md.add_group_role(&ep, "via_login", &["app_login"]);
+    md.add_group_role(&ep, "via_reserved", &["authenticator"]);
+    // On dev only: the check covers every branch of the project.
+    let dev_ep = md.branch(t.w.dev).endpoint_id.unwrap();
+    md.add_group_role(&dev_ep, "dev_only", &["neon_superuser"]);
+    let m = md.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    let put = |role: &str, name: &str| {
+        t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": role, "pg_roles": [name] })))
+    };
+    for (name, chain) in [
+        ("billing_admin", vec!["billing_admin", "billing", "postgres"]),
+        ("creator", vec!["creator"]),
+        ("rls_free", vec!["rls_free"]),
+        ("app_login", vec!["app_login"]),
+        ("via_login", vec!["via_login", "app_login"]),
+        ("via_reserved", vec!["via_reserved", "authenticator"]),
+        ("dev_only", vec!["dev_only", "neon_superuser"]),
+    ] {
+        for role in ["developer", "viewer"] {
+            let err = error_of(put(role, name).await, 422).await;
+            assert_eq!(code_of(&err), "invalid_request", "{role} {name}");
+            assert_eq!(err["error"]["role"], name, "{err}");
+            assert_eq!(err["error"]["chain"], json!(chain), "{err}");
+            assert!(message_of(&err).contains(name), "{err}");
+        }
+        // Admin may hold it (R16: owner-level and LOGIN roles are Admin-only).
+        assert_eq!(put("admin", name).await.status(), 200, "admin {name}");
+        // An override may not narrow such a grant below Admin.
+        let err = error_of(
+            t.send(DEFAULT_SUB, Method::PUT, &format!("{grant}/overrides"), Some(json!({ "database_id": t.w.db, "platform_role": "developer" })))
+                .await,
+            422,
+        )
+        .await;
+        assert_eq!(err["error"]["chain"], json!(chain), "override {name}");
+        // The same goes for invites.
+        let err = error_of(
+            t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "lee@x.com", "developer", &[name]))).await,
+            422,
+        )
+        .await;
+        assert_eq!(err["error"]["role"], name);
+    }
+    // Plain groups, and roles no branch has (yet), are fine.
+    assert_eq!(put("developer", "reader").await.status(), 200);
+    assert_eq!(put("viewer", "not_there_yet").await.status(), 200);
+}
+
+#[tokio::test]
+async fn access_events_page_newest_first() {
+    let t = mw(Mode::SelfHosted).await;
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    for role in ["viewer", "developer", "admin"] {
+        t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": role, "pg_roles": [] }))).await;
+    }
+    t.send(DEFAULT_SUB, Method::PATCH, "/v1/instance/settings", Some(json!({ "open_signup": true }))).await;
+    let page = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/access-events?limit=2", None).await).await;
+    let events = page["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!((events[0]["action"].as_str(), events[1]["action"].as_str()), (Some("open_signup_set"), Some("grant_put")));
+    let next = page["next_before"].as_i64().unwrap();
+    let rest = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/access-events?before={next}&limit=10"), None).await).await;
+    assert_eq!(rest["events"].as_array().unwrap().len(), 2);
+    assert!(rest["next_before"].is_null());
+    // The project's log has only its own events.
+    let project = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/projects/{}/access-events", t.w.project), None).await).await;
+    assert_eq!(project["events"].as_array().unwrap().len(), 3);
+    assert_eq!(project["events"][0]["target_member_id"], m.to_string());
+    for bad in ["limit=0", "limit=201", "limit=x", "before=y"] {
+        let err = error_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/access-events?{bad}"), None).await, 400).await;
+        assert_eq!(code_of(&err), "invalid_request", "{bad}");
+    }
+    // Only a tenant admin reads the tenant's log.
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
+    let err = error_of(t.send("padmin", Method::GET, "/v1/access-events", None).await, 403).await;
+    assert_eq!(err["error"]["required"], "tenant admin");
+    assert_eq!(t.send("padmin", Method::GET, &format!("/v1/projects/{}/access-events", t.w.project), None).await.status(), 200);
+}
+
+// ---- T12x: API additions for the Members UI ------------------------------------------------
+
+/// The invite link's `t` parameter: the token of the template Zitadel was given.
+fn token_of(template: &str) -> String {
+    template.split("&t=").nth(1).expect("the template carries t=").to_string()
+}
+
+/// SHA-256 of a token, as stored.
+fn hash_of(token: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(token.as_bytes()).into()
+}
+
+fn stored_hash(t: &Mw, invite: &str) -> [u8; 32] {
+    let id: uuid::Uuid = invite.parse().unwrap();
+    t.w.metadata.invites.lock().unwrap().iter().find(|i| i.id == id).unwrap().token_hash
+}
+
+#[tokio::test]
+async fn list_members_reports_has_access_and_created_at() {
+    let t = mw(Mode::SelfHosted).await;
+    let md = &t.w.metadata;
+    let bare = md.add_member(t.w.tenant, "bare", MemberStatus::Active, false);
+    let granted = md.add_granted(t.w.tenant, "granted", t.w.project, PlatformRole::Viewer, &[]);
+    let boss = md.add_member(t.w.tenant, "boss", MemberStatus::Active, true);
+    // An override alone is not access.
+    md.narrow(bare, t.w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+    // An invited member holds its (inert) grants: that counts.
+    let invited = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "inv@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let bare_invite = body_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(json!({ "email": "none@x.com", "grants": [] }))).await).await;
+    assert_eq!(invited["member"]["has_access"], true);
+    assert!(invited["member"]["created_at"].as_str().unwrap().parse::<chrono::DateTime<chrono::Utc>>().is_ok());
+    assert_eq!(bare_invite["member"]["has_access"], false);
+
+    let list = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/members", None).await).await;
+    let find = |id: String| list.as_array().unwrap().iter().find(|m| m["id"] == id.as_str()).cloned().unwrap();
+    for (id, want) in [
+        (bare, false),
+        (granted, true),
+        (boss, true),
+        (uuid::Uuid::parse_str(invited["member"]["id"].as_str().unwrap()).unwrap(), true),
+        (uuid::Uuid::parse_str(bare_invite["member"]["id"].as_str().unwrap()).unwrap(), false),
+    ] {
+        let m = find(id.to_string());
+        assert_eq!(m["has_access"], want, "{m}");
+        assert!(m["created_at"].as_str().unwrap().parse::<chrono::DateTime<chrono::Utc>>().is_ok(), "{m}");
+    }
+    // `created_at` is the row's own: the same in the write's answer and the list, and later
+    // invites are later.
+    let at = |m: &Value| m["created_at"].as_str().unwrap().parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+    let listed_invited = find(invited["member"]["id"].as_str().unwrap().to_string());
+    let listed_bare_invite = find(bare_invite["member"]["id"].as_str().unwrap().to_string());
+    assert_eq!(at(&listed_invited), at(&invited["member"]));
+    assert_eq!(at(&listed_bare_invite), at(&bare_invite["member"]));
+    assert!(at(&invited["member"]) < at(&bare_invite["member"]));
+    assert!(at(&find(bare.to_string())) < at(&listed_invited), "seeded members came first");
+    // A grant on a soft-deleted project is no access.
+    let ghost = md.create_project(t.w.tenant, "Ghost").await.unwrap().id;
+    let holder = md.add_granted(t.w.tenant, "holder", ghost, PlatformRole::Viewer, &[]);
+    let has = |list: &Value, id: uuid::Uuid| list.as_array().unwrap().iter().find(|m| m["id"] == id.to_string().as_str()).unwrap()["has_access"].clone();
+    let list = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/members", None).await).await;
+    assert_eq!(has(&list, holder), true);
+    md.projects.lock().unwrap().iter_mut().find(|p| p.id == ghost).unwrap().status = chelabase_metadata::ProjectStatus::Deleted;
+    let list = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/members", None).await).await;
+    assert_eq!(has(&list, holder), false);
+    // The single-member answers carry them too.
+    let updated = body_of(t.send(DEFAULT_SUB, Method::PATCH, &format!("/v1/members/{bare}"), Some(json!({ "tenant_admin": true }))).await).await;
+    assert_eq!(updated["has_access"], true);
+    assert!(updated["created_at"].is_string());
+}
+
+#[tokio::test]
+async fn access_events_name_removed_members_and_projects() {
+    let t = mw(Mode::SelfHosted).await;
+    let md = &t.w.metadata;
+    let m = md.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "viewer", "pg_roles": [] }))).await;
+    let admin_email = md.member(t.w.tenant, DEFAULT_SUB).unwrap().email;
+    let events = |path: String| {
+        let t = &t;
+        async move { body_of(t.send(DEFAULT_SUB, Method::GET, &path, None).await).await }
+    };
+    let page = events("/v1/access-events".into()).await;
+    let put = &page["events"][0];
+    assert_eq!(put["action"], "grant_put");
+    assert_eq!(put["actor_email"].as_str(), admin_email.as_deref());
+    assert_eq!(put["target_email"], "m@example.test");
+    assert_eq!(put["project_name"], "Billing");
+    let project_page = events(format!("/v1/projects/{}/access-events", t.w.project)).await;
+    assert_eq!(project_page["events"][0]["project_name"], "Billing");
+    assert_eq!(project_page["events"][0]["target_email"], "m@example.test");
+
+    // The target is removed (the row is kept, only marked) and the project is deleted (its row
+    // stays with its last name): both still resolve.
+    md.set_member(t.w.tenant, "m", |m| m.status = MemberStatus::Removed);
+    md.projects.lock().unwrap().iter_mut().find(|p| p.id == t.w.project).unwrap().status = chelabase_metadata::ProjectStatus::Deleted;
+    let put = &events("/v1/access-events".into()).await["events"][0];
+    assert_eq!((put["target_email"].as_str(), put["project_name"].as_str()), (Some("m@example.test"), Some("Billing")));
+    // A project row that is gone, and an event with no actor or project, resolve to null.
+    md.projects.lock().unwrap().retain(|p| p.id != t.w.project);
+    md.log(t.w.tenant, None, "open_signup_set", None, None, None, None);
+    let page = events("/v1/access-events".into()).await;
+    let system = &page["events"][0];
+    assert_eq!((system["actor_email"].is_null(), system["target_email"].is_null(), system["project_name"].is_null()), (true, true, true));
+    let put = &page["events"][1];
+    assert!(put["project_name"].is_null() && put["project_id"].is_string(), "{put}");
+    assert_eq!(put["target_email"], "m@example.test");
+}
+
+// R32: the invite link carries a Chelabase token besides Zitadel's code; the Zitadel mail gets
+// it in the URL template and only its SHA-256 is stored.
+#[tokio::test]
+async fn invite_url_template_carries_the_token() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "tok@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let user = t.mock.user("tok@x.com").unwrap();
+    let template = t.mock.invite_template(&user.id).unwrap();
+    assert!(
+        template.starts_with("http://studio.test/accept-invite?user={{.UserID}}&code={{.Code}}&t="),
+        "{template}"
+    );
+    let token = token_of(&template);
+    assert_eq!(token.len(), 43, "32 bytes, base64url without padding: {token}");
+    assert!(token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "{token}");
+    assert_eq!(stored_hash(&t, body["member"]["invite"]["id"].as_str().unwrap()), hash_of(&token));
+    // The Zitadel user's own tokens are never reused: another invite, another token.
+    t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "tok2@x.com", "viewer", &[]))).await;
+    let other = token_of(&t.mock.invite_template(&t.mock.user("tok2@x.com").unwrap().id).unwrap());
+    assert_ne!(other, token);
+}
+
+#[tokio::test]
+async fn resend_rotates_the_token() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "rot@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let user = t.mock.user("rot@x.com").unwrap();
+    let first = token_of(&t.mock.invite_template(&user.id).unwrap());
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/invites/{invite}/resend"), None).await.status(), 200);
+    let second = token_of(&t.mock.invite_template(&user.id).unwrap());
+    assert_ne!(first, second);
+    // Only the new link's token is stored.
+    let stored = stored_hash(&t, &invite);
+    assert_eq!(stored, hash_of(&second));
+    assert_ne!(stored, hash_of(&first));
+}
+
+// --- R35: invites by link, and the delivery probe --------------------------------------------
+
+/// `invite_body` with `delivery: "link"`.
+fn link_invite_body(w: &MemberWorld, email: &str) -> Value {
+    let mut body = invite_body(w, email, "developer", &[]);
+    body["delivery"] = json!("link");
+    body
+}
+
+// With `link`, Zitadel hands back the code instead of mailing it; the response carries the
+// whole `/accept-invite` link once, and nothing keeps it.
+#[tokio::test]
+async fn link_invite_returns_the_url_once_and_sends_no_mail() {
+    let t = mw(Mode::SelfHosted).await;
+    let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, " Link@X.com "))).await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let body = body_of(resp).await;
+    assert_eq!(body["outcome"], "invited");
+    let user = t.mock.user("link@x.com").expect("a Zitadel user");
+    let code = t.mock.invite_code(&user.id).unwrap();
+    let url = body["invite_url"].as_str().unwrap().to_string();
+    let prefix = format!("http://studio.test/accept-invite?user={}&code={code}&t=", user.id);
+    assert!(url.starts_with(&prefix), "{url}");
+    let token = url[prefix.len()..].to_string();
+    assert_eq!(token.len(), 43, "{token}");
+    // No mail and no template: Zitadel sent nothing.
+    assert!(t.mock.emails().is_empty());
+    assert_eq!(t.mock.invite_template(&user.id), None);
+    // Only the token's hash is stored, and the Zitadel code is the one in the link.
+    let invite = body["member"]["invite"]["id"].as_str().unwrap();
+    assert_eq!(stored_hash(&t, invite), hash_of(&token));
+    assert_eq!(t.actions(), vec!["invite_created"]);
+    // Shown once: the member list has neither the link nor the code.
+    let list = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/members", None).await).await.to_string();
+    assert!(!list.contains(&code) && !list.contains("invite_url") && !list.contains(&token), "{list}");
+    // The default is email, and an email invite has no link.
+    let by_mail = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "mail@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    assert!(by_mail.get("invite_url").is_none(), "{by_mail}");
+    assert_eq!(t.mock.emails().len(), 1);
+    // A person who needs no code (already a member) gets no link.
+    let again = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "link@x.com"))).await;
+    assert_eq!(again.status(), 200);
+    let again = body_of(again).await;
+    assert_eq!(again["outcome"], "existing_member");
+    assert!(again.get("invite_url").is_none(), "{again}");
+    // The project invite takes `delivery` too.
+    let mut project = json!({ "email": "proj@x.com", "platform_role": "viewer" });
+    project["delivery"] = json!("link");
+    let resp = t.send(DEFAULT_SUB, Method::POST, &format!("/v1/projects/{}/invites", t.w.project), Some(project)).await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    assert!(body_of(resp).await["invite_url"].as_str().unwrap().starts_with("http://studio.test/accept-invite?user="));
+    // A delivery that is neither is refused before anything is made.
+    let mut bad = link_invite_body(&t.w, "bad@x.com");
+    bad["delivery"] = json!("pigeon");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(bad)).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    assert!(t.mock.user("bad@x.com").is_none());
+}
+
+#[tokio::test]
+async fn link_resend_rotates_code_and_token() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "relink@x.com"))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let user = t.mock.user("relink@x.com").unwrap();
+    let (first_url, first_code) = (body["invite_url"].as_str().unwrap().to_string(), t.mock.invite_code(&user.id).unwrap());
+    let path = format!("/v1/invites/{invite}/resend");
+    let resp = t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let resent = body_of(resp).await;
+    let second_code = t.mock.invite_code(&user.id).unwrap();
+    let second_url = resent["invite_url"].as_str().unwrap().to_string();
+    assert_ne!(first_code, second_code);
+    assert_ne!(first_url, second_url);
+    let prefix = format!("http://studio.test/accept-invite?user={}&code={second_code}&t=", user.id);
+    assert!(second_url.starts_with(&prefix), "{second_url}");
+    // Only the new link's token is stored; no mail went out.
+    assert_eq!(stored_hash(&t, &invite), hash_of(&second_url[prefix.len()..]));
+    assert!(t.mock.emails().is_empty());
+    assert_eq!(resent["id"], invite.as_str());
+    assert_eq!(t.actions(), vec!["invite_created", "invite_resent"]);
+    // Without a body the resend is by email, as before: a mail and no link.
+    let resp = t.send(DEFAULT_SUB, Method::POST, &path, None).await;
+    assert_eq!(resp.status(), 200);
+    assert!(body_of(resp).await.get("invite_url").is_none());
+    assert_eq!(t.mock.emails().len(), 1);
+    // An unknown delivery is refused.
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "pigeon" }))).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    // M3: a `null` body is the default too: by email.
+    let mails = t.mock.emails().len();
+    let resp = t.send(DEFAULT_SUB, Method::POST, &path, Some(Value::Null)).await;
+    assert_eq!(resp.status(), 200);
+    assert!(body_of(resp).await.get("invite_url").is_none());
+    assert_eq!(t.mock.emails().len(), mails + 1);
+}
+
+// I1: a link carries only a code, so it is for a Zitadel user the invite makes or one that has
+// never had a password; anyone else is 409 "send by email", before anything changes.
+#[tokio::test]
+async fn link_invite_is_for_users_without_a_password() {
+    let t = mw(Mode::SelfHosted).await;
+    // A removed member whose Zitadel user has a password: a link is refused, email works.
+    let zid = t.mock.add_user_in("org-1", "back@x.com", "Correct-horse-9", true);
+    t.w.metadata.add_member(t.w.tenant, &zid, MemberStatus::Removed, false);
+    t.mock.set_inactive(&zid, true);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "back@x.com"))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+    // Whether email delivery works now, so Studio can offer it (no provider in this mock).
+    assert_eq!(err["error"]["email_available"], json!(false), "{err}");
+    let writes = |t: &Mw| {
+        t.mock.calls().iter().filter(|c| c.contains("invite_code") || c.contains("reactivate") || c.contains("users/new")).count()
+    };
+    assert_eq!(writes(&t), 0, "nothing was changed in Zitadel");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &zid).unwrap().status, MemberStatus::Removed);
+    assert!(t.actions().is_empty());
+    let by_mail = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "back@x.com", "viewer", &[]))).await;
+    assert_eq!(by_mail.status(), 201);
+    assert!(body_of(by_mail).await.get("invite_url").is_none());
+    // Any other way to sign in counts as much as a password: a passkey, an OTP, an IdP link.
+    for (i, method) in ["PASSKEY", "TOTP", "U2F", "OTP_EMAIL", "IDP"].into_iter().enumerate() {
+        let email = format!("factor{i}@x.com");
+        let zid = t.mock.add_user_in("org-1", &email, "", false);
+        t.mock.add_auth_method(&zid, &format!("AUTHENTICATION_METHOD_TYPE_{method}"));
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, &email))).await, 409).await;
+        assert_eq!(code_of(&err), "link_not_allowed", "{method}");
+        assert!(t.w.metadata.member(t.w.tenant, &zid).is_none(), "{method}: nothing was made");
+    }
+    // An org user who never set a password: a link is fine.
+    let fresh = t.mock.add_user_in("org-1", "fresh@x.com", "", false);
+    let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "fresh@x.com"))).await;
+    assert_eq!(resp.status(), 201);
+    assert!(body_of(resp).await["invite_url"].as_str().unwrap().contains(&format!("user={fresh}&code=")));
+}
+
+// I1 for resend: the invitee set a password since (outside the invite), so only email resends.
+#[tokio::test]
+async fn link_resend_refused_after_the_invitee_has_a_password() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "late@x.com"))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let user = t.mock.user("late@x.com").unwrap();
+    let path = format!("/v1/invites/{invite}/resend");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await.status(), 200);
+    let code = t.mock.invite_code(&user.id);
+    // A password, or any other factor, since the invite was made.
+    for after in ["password", "AUTHENTICATION_METHOD_TYPE_TOTP", "AUTHENTICATION_METHOD_TYPE_PASSKEY"] {
+        if after == "password" {
+            t.mock.set_password(&user.id, "Correct-horse-9");
+        } else {
+            t.mock.set_password(&user.id, "");
+            t.mock.add_auth_method(&user.id, after);
+        }
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
+        assert_eq!(code_of(&err), "link_not_allowed", "{after}");
+        assert_eq!(err["error"]["email_available"], json!(false), "{after}");
+        assert_eq!(t.mock.invite_code(&user.id), code, "{after}: no new code was made");
+    }
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200);
+    // By email: a password-reset code (Zitadel makes no invite code for them now).
+    assert!(t.mock.reset_template(&user.id).is_some_and(|t| t.ends_with("&reset=1")));
+    // With an active email provider, the refusal says so.
+    t.mock.set_email_providers(&[("p1", true)]);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
+    assert_eq!((code_of(&err), &err["error"]["email_available"]), ("link_not_allowed", &json!(true)), "{err}");
+}
+
+// Each invite 409 has its own code, so Studio never reads message text.
+#[tokio::test]
+async fn invite_conflicts_have_their_own_codes() {
+    let t = mw(Mode::SelfHosted).await;
+    // Two users of the organisation share the email.
+    t.mock.allow_duplicate_emails();
+    t.mock.add_user_in("org-1", "twin@x.com", "", false);
+    t.mock.add_user_in("org-1", "twin@x.com", "", false);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "twin@x.com", "viewer", &[]))).await, 409).await;
+    assert_eq!(code_of(&err), "email_ambiguous", "{err}");
+    // A user of another organisation already has it: Zitadel refuses to make a second one.
+    let t = mw(Mode::SelfHosted).await;
+    t.mock.add_org("org-2");
+    t.mock.add_user_in("org-2", "elsewhere@x.com", "Correct-horse-9", true);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "elsewhere@x.com", "viewer", &[]))).await, 409).await;
+    assert_eq!(code_of(&err), "email_in_use_elsewhere", "{err}");
+    // A revoked invite can't be resent (revoking a replaced one: `revoke_retries_the_zitadel_delete`).
+    let body = body_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "gone@x.com", "viewer", &[]))).await).await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/invites/{invite}/resend"), None).await, 409).await;
+    assert_eq!(code_of(&err), "invite_closed", "{err}");
+}
+
+#[tokio::test]
+async fn delivery_reports_smtp_state() {
+    let t = mw(Mode::SelfHosted).await;
+    let ask = |sub: &'static str| {
+        let t = &t;
+        async move { body_of(t.send(sub, Method::GET, "/v1/invites/delivery", None).await).await }
+    };
+    // No provider at all, then only an inactive one.
+    assert_eq!(ask(DEFAULT_SUB).await, json!({ "email_available": false, "reason": "no_email_provider" }));
+    t.mock.set_email_providers(&[("p1", false)]);
+    assert_eq!(ask(DEFAULT_SUB).await, json!({ "email_available": false, "reason": "no_email_provider" }));
+    // An active one; any active member may ask (the answer decides the invite dialog).
+    t.mock.set_email_providers(&[("p1", false), ("p2", true)]);
+    t.w.metadata.add_granted(t.w.tenant, "viewer", t.w.project, PlatformRole::Viewer, &[]);
+    assert_eq!(ask("viewer").await, json!({ "email_available": true, "reason": null }));
+    // A Zitadel failure is a plain "no", with the reason.
+    t.mock.set_down(true);
+    assert_eq!(ask(DEFAULT_SUB).await, json!({ "email_available": false, "reason": "zitadel_unavailable" }));
+    t.mock.set_down(false);
+    // The server asked Zitadel's admin API, once per question.
+    assert!(t.mock.calls().contains(&"POST /admin/v1/email/_search".to_string()));
+    // Platform mode makes no members: a stranger is refused like on any tenant route.
+    let platform = mw(Mode::Platform).await;
+    let err = error_of(platform.send("stranger", Method::GET, "/v1/invites/delivery", None).await, 403).await;
+    assert_eq!(code_of(&err), "not_available_in_platform_mode");
+    // Without a Zitadel client the answer is "no", not an error.
+    let w = member_world(Mode::SelfHosted).await;
+    let resp = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/invites/delivery", None).await;
+    assert_eq!(
+        body_of(resp).await,
+        json!({ "email_available": false, "reason": "zitadel_not_configured" })
+    );
+}
+
+// --- R36: tenant display names ---------------------------------------------------------------
+
+#[tokio::test]
+async fn tenant_admin_renames_tenant() {
+    let t = mw(Mode::SelfHosted).await;
+    t.w.metadata.set_overview(TenantOverview {
+        id: t.w.tenant,
+        slug: "demo".into(),
+        display_name: None,
+        projects: vec![],
+    });
+    let me = |sub: &'static str| {
+        let t = &t;
+        async move { body_of(t.send(sub, Method::GET, "/v1/me", None).await).await }
+    };
+    assert_eq!(me(DEFAULT_SUB).await["tenant"]["display_name"], Value::Null);
+    let patch = |body: Value| {
+        let t = &t;
+        async move { t.send(DEFAULT_SUB, Method::PATCH, "/v1/tenant", Some(body)).await }
+    };
+    // Trimmed; the slug stays.
+    let resp = patch(json!({ "display_name": "  Acme Corp  " })).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await, json!({ "display_name": "Acme Corp" }));
+    let tenant = me(DEFAULT_SUB).await["tenant"].clone();
+    assert_eq!((tenant["slug"].as_str(), tenant["display_name"].as_str()), (Some("demo"), Some("Acme Corp")));
+    assert_eq!(tenant["id"], json!(t.w.tenant));
+    // One event in the same step, with the old and the new name.
+    assert_eq!(t.actions(), vec!["tenant_renamed"]);
+    {
+        let events = t.w.metadata.events.lock().unwrap();
+        assert_eq!(events[0].before, Some(json!({ "display_name": null })));
+        assert_eq!(events[0].after, Some(json!({ "display_name": "Acme Corp" })));
+    }
+    // The same name writes nothing.
+    assert_eq!(patch(json!({ "display_name": "Acme Corp" })).await.status(), 200);
+    assert_eq!(t.actions().len(), 1);
+    // 80 characters (not bytes) are fine.
+    let long = "é".repeat(80);
+    assert_eq!(body_of(patch(json!({ "display_name": long })).await).await["display_name"], long.as_str());
+    // Empty or blank clears it: readers fall back to the slug.
+    assert_eq!(body_of(patch(json!({ "display_name": "   " })).await).await, json!({ "display_name": null }));
+    assert_eq!(me(DEFAULT_SUB).await["tenant"]["display_name"], Value::Null);
+    assert_eq!(body_of(patch(json!({ "display_name": null })).await).await, json!({ "display_name": null }));
+    // Too long, control characters, a missing or mistyped field: 422, and nothing changes.
+    let events = t.actions().len();
+    for bad in [
+        json!({ "display_name": "x".repeat(81) }),
+        json!({ "display_name": "a\nb" }),
+        json!({}),
+        json!({ "display_name": 7 }),
+    ] {
+        let err = error_of(patch(bad.clone()).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{bad}");
+    }
+    assert_eq!(t.actions().len(), events);
+}
+
+#[tokio::test]
+async fn rename_needs_tenant_admin() {
+    let t = mw(Mode::SelfHosted).await;
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
+    let body = || Some(json!({ "display_name": "Mine" }));
+    let err = error_of(t.send("padmin", Method::PATCH, "/v1/tenant", body()).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("tenant admin")));
+    let err = error_of(t.send("stranger", Method::PATCH, "/v1/tenant", body()).await, 403).await;
+    assert_eq!(code_of(&err), "no_access_yet", "a stranger has no row while sign-up is closed");
+    assert!(t.actions().is_empty());
 }

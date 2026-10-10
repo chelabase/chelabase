@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live check of Zitadel v4 + auth + the gateway (needs `just dev`): sign-up with a code
-# from Mailpit, token exchange, /v1/me, sign-in, identical failures, password reset, logout.
+# Live check of Zitadel v4 + auth + the gateway (needs `just dev`): closed sign-up, a link invite
+# and accepting it, token exchange, /v1/me, sign-in, identical failures, password reset, logout.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,23 +64,34 @@ exchange() {
     -d "redirect_uri=$STUDIO/callback" -d "client_id=$CLIENT" -d "code_verifier=$VERIFIER" | jq -r .access_token
 }
 
+# Sign-up is off by default (R34): a sign-up request is refused, and the page isn't offered it.
 ar="$(authorize create)"
-[[ "$(ui auth-request "{\"authRequest\":\"$ar\"}")" == '{"signUp":true}' ]] || die "prompt=create not reported"
-signed_up="$(ui sign-up "{\"authRequest\":\"$ar\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"givenName\":\"E\",\"familyName\":\"Two\"}")"
-[[ "$(status)" == 200 ]] || die "sign-up: $(status)"
-if [[ "$(jq -r .next <<<"$signed_up")" == verify ]]; then
-  # CHELABASE_REQUIRE_EMAIL_VERIFICATION=true: finish with the code from Mailpit.
-  code="$(mail_link "$EMAIL" verify | sed -E 's/.*code=([^&]+).*/\1/')"
-  signed_up="$(ui verify-email "{\"code\":\"$code\"}")"
-  say "verified the email with the code from Mailpit"
-fi
+[[ "$(ui auth-request "{\"authRequest\":\"$ar\"}")" == '{"signUp":false,"signUpAllowed":false}' ]] || die "closed sign-up was offered: $(status)"
+ui sign-up "{\"authRequest\":\"$ar\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"givenName\":\"E\",\"familyName\":\"Two\"}" >/dev/null
+[[ "$(status)" == 403 ]] || die "closed sign-up should be 403: $(status)"
+say "sign-up is closed"
+
+# People join by invite. An admin (the demo token's user, `chelabase-demo`, which `just
+# zitadel-bootstrap` makes a tenant admin on a self-hosted stack) checks that email can be sent
+# (Mailpit is the SMTP provider) and invites by link.
+ADMIN_TOKEN="$(cd "$ROOT" && cargo run -q -p chelabase -- dev token)" || die "chelabase dev token"
+api() { curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' "$@"; }
+jq -e '.member.tenant_admin == true' <<<"$(api "$GW/v1/me")" >/dev/null || die "the demo token's user isn't a tenant admin: re-run just zitadel-bootstrap"
+[[ "$(api "$GW/v1/invites/delivery" | jq -c .)" == '{"email_available":true,"reason":null}' ]] || die "invites can't be emailed: is Mailpit the active SMTP provider?"
+invite="$(api -X POST "$GW/v1/invites" -d "{\"email\":\"$EMAIL\",\"grants\":[],\"delivery\":\"link\"}")"
+url="$(jq -r .invite_url <<<"$invite")"
+[[ "$url" == "$STUDIO/accept-invite?user="* ]] || die "no invite link: $invite"
+uid="$(sed -E 's/.*[?&]user=([^&]+).*/\1/' <<<"$url")"; invite_code="$(sed -E 's/.*[&?]code=([^&]+).*/\1/' <<<"$url")"
+ar="$(authorize)"
+signed_up="$(ui accept-invite "{\"authRequest\":\"$ar\",\"user\":\"$uid\",\"code\":\"$invite_code\",\"password\":\"$PASSWORD\"}")"
+[[ "$(status)" == 200 ]] || die "accept-invite: $(status) $signed_up"
 redirect="$(jq -r .redirect <<<"$signed_up")"
-[[ "$redirect" == "$STUDIO/callback?"* ]] || die "sign-up didn't finish: $signed_up"
+[[ "$redirect" == "$STUDIO/callback?"* ]] || die "accept-invite didn't finish: $signed_up"
 token="$(exchange "$redirect")"
 [[ -n "$token" && "$token" != null ]] || die "no access token"
 me="$(curl -sS -H "Authorization: Bearer $token" "$GW/v1/me")"
 jq -e '.tenant != null' <<<"$me" >/dev/null || die "/v1/me: $me"
-say "signed up, exchanged the code and resolved the tenant"
+say "invited by link, accepted, exchanged the code and resolved the tenant"
 
 ar="$(authorize)"
 signed="$(ui sign-in "{\"authRequest\":\"$ar\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")"

@@ -417,6 +417,192 @@ async fn an_unchanged_email_is_refused_and_marked_verified_through_update_user()
     ));
 }
 
+/// Members T7: an invitee is a passwordless user whose email goes unverified and unmailed
+/// (`returnCode`), so the only mail they get is the invite.
+#[tokio::test]
+async fn a_user_without_password_gets_no_mail_and_cannot_sign_in() {
+    let (mock, _) = setup().await;
+    let admin = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    let id = admin
+        .create_user_without_password("o1", "new.person@example.com")
+        .await
+        .unwrap();
+    let u = mock.user_by_id(&id).unwrap();
+    assert_eq!(
+        (u.org_id.as_str(), u.email.as_str(), u.username.as_str(), u.display_name.as_str()),
+        ("o1", "new.person@example.com", "new.person@example.com", "new.person")
+    );
+    assert!(!u.verified);
+    assert!(u.password.is_empty());
+    assert!(mock.emails().is_empty(), "{:?}", mock.emails());
+    assert!(admin.create_session(&id, "").await.is_err());
+    // The same email again in the org is a conflict; an unknown org is 404.
+    assert!(matches!(
+        admin.create_user_without_password("o1", "new.person@example.com").await,
+        Err(ZError::Rejected { status: 409, .. })
+    ));
+    assert!(matches!(
+        admin.create_user_without_password("nope", "x@example.com").await,
+        Err(ZError::Rejected { status: 404, .. })
+    ));
+}
+
+/// Zitadel v4.19.1 `POST /v2/users/{userId}/invite_code` with
+/// `{"sendCode": {"urlTemplate", "applicationName"}}`: the invite mail carries a fresh code that
+/// `invite_code/verify` accepts; a second request replaces it.
+#[tokio::test]
+async fn an_invite_code_is_mailed_with_the_template_and_verifies() {
+    let (mock, _) = setup().await;
+    let admin = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    let id = admin
+        .create_user_without_password("o1", "ivan@example.com")
+        .await
+        .unwrap();
+    let template = "http://studio/accept-invite?user={{.UserID}}&code={{.Code}}";
+    admin.create_invite_code(&id, template).await.unwrap();
+    assert_eq!(mock.emails(), vec![(id.clone(), "invite".to_string())]);
+    assert_eq!(mock.invite_template(&id).as_deref(), Some(template));
+    assert_eq!(mock.invite_application(&id).as_deref(), Some("Chelabase"));
+    let first = mock.invite_code(&id).unwrap();
+    admin.create_invite_code(&id, template).await.unwrap();
+    let second = mock.invite_code(&id).unwrap();
+    assert_ne!(first, second);
+    assert!(matches!(
+        admin.verify_invite_code(&id, &first).await,
+        Err(ZError::Rejected { status: 400, .. })
+    ));
+    admin.verify_invite_code(&id, &second).await.unwrap();
+    assert!(mock
+        .calls()
+        .contains(&format!("POST /v2/users/{id}/invite_code")));
+    assert!(matches!(
+        admin.create_invite_code("missing", template).await,
+        Err(ZError::Rejected { status: 404, .. })
+    ));
+}
+
+/// Zitadel v4.19.1 `POST /v2/users/{userId}/invite_code` with `{"returnCode": {}}`: the code
+/// comes back as `inviteCode`, nothing is mailed, and it verifies like a mailed one. A second
+/// request replaces it.
+#[tokio::test]
+async fn a_returned_invite_code_sends_no_mail_and_verifies() {
+    let (mock, _) = setup().await;
+    let admin = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    let id = admin
+        .create_user_without_password("o1", "ivan@example.com")
+        .await
+        .unwrap();
+    let first = admin.return_invite_code(&id).await.unwrap();
+    assert!(mock.emails().is_empty());
+    assert_eq!(mock.invite_code(&id).as_deref(), Some(first.as_str()));
+    assert_eq!(mock.invite_template(&id), None);
+    let second = admin.return_invite_code(&id).await.unwrap();
+    assert_ne!(first, second);
+    assert!(matches!(
+        admin.verify_invite_code(&id, &first).await,
+        Err(ZError::Rejected { status: 400, .. })
+    ));
+    admin.verify_invite_code(&id, &second).await.unwrap();
+    assert!(matches!(
+        admin.return_invite_code("missing").await,
+        Err(ZError::Rejected { status: 404, .. })
+    ));
+}
+
+/// Zitadel v4.19.1 `GET /v2/users/{userId}/authentication_methods` (no domain query: every
+/// method counts, passkeys and U2F of any domain included; a domain query without a domain is a
+/// 400, as the live pass found): a user with a password, a passkey, an OTP or an IdP link has
+/// methods; one made by an invite has none.
+#[tokio::test]
+async fn auth_methods_tell_whether_a_user_ever_could_sign_in() {
+    let (mock, _) = setup().await;
+    let admin = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    let fresh = admin.create_user_without_password("o1", "new@example.com").await.unwrap();
+    assert!(!admin.has_auth_methods(&fresh).await.unwrap());
+    let with_password = mock.add_user("pw@example.com", "Correct-horse-9", true);
+    assert!(admin.has_auth_methods(&with_password).await.unwrap());
+    for method in ["PASSKEY", "TOTP", "U2F", "OTP_SMS", "OTP_EMAIL", "IDP"] {
+        let user = admin.create_user_without_password("o1", &format!("{method}@example.com")).await.unwrap();
+        mock.add_auth_method(&user, &format!("AUTHENTICATION_METHOD_TYPE_{method}"));
+        assert!(admin.has_auth_methods(&user).await.unwrap(), "{method}");
+    }
+    assert!(mock
+        .calls()
+        .iter()
+        .any(|c| c.starts_with(&format!("GET /v2/users/{fresh}/authentication_methods"))));
+    assert!(matches!(
+        admin.has_auth_methods("missing").await,
+        Err(ZError::Rejected { status: 404, .. })
+    ));
+}
+
+/// Zitadel v4.19.1 `POST /admin/v1/email/_search` lists the email providers; one with state
+/// `EMAIL_PROVIDER_ACTIVE` can send invites. None, only inactive ones, an HTTP provider and an
+/// SMTP provider are told apart.
+#[tokio::test]
+async fn the_active_email_provider_is_read_from_the_admin_search() {
+    let (mock, _) = setup().await;
+    let admin = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    assert!(!admin.email_provider_active().await.unwrap());
+    mock.set_email_providers(&[("s1", false)]);
+    assert!(!admin.email_provider_active().await.unwrap());
+    mock.set_email_providers(&[("s1", false), ("s2", true)]);
+    assert!(admin.email_provider_active().await.unwrap());
+    assert!(mock.calls().contains(&"POST /admin/v1/email/_search".to_string()));
+    // The login client's token has no admin rights.
+    let login = Zitadel::new(&mock.base, TOKEN);
+    assert!(matches!(login.email_provider_active().await, Err(ZError::Rejected { status: 403, .. })));
+}
+
+/// `POST /v2/sessions/search` with a `userIdQuery`, then a delete of each: only that user's
+/// sessions end.
+#[tokio::test]
+async fn a_users_sessions_are_found_and_ended() {
+    let (mock, z) = setup().await;
+    let admin = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    let id = mock.add_user("jo@example.com", "Secret-pass1", true);
+    let other = mock.add_user("kim@example.com", "Secret-pass1", true);
+    z.create_session(&id, "Secret-pass1").await.unwrap();
+    z.create_session(&id, "Secret-pass1").await.unwrap();
+    z.create_session(&other, "Secret-pass1").await.unwrap();
+    assert_eq!(admin.delete_user_sessions(&id).await.unwrap(), 2);
+    assert_eq!(mock.session_count(), 1);
+    assert_eq!(admin.delete_user_sessions(&id).await.unwrap(), 0);
+    assert!(mock.calls().contains(&"POST /v2/sessions/search".to_string()));
+}
+
+/// T7 fix M4: the session search is paged; ending a user's sessions searches until none is left.
+#[tokio::test]
+async fn ending_sessions_pages_until_none_are_left() {
+    let (mock, z) = setup().await;
+    let admin = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    mock.set_session_page(2);
+    let id = mock.add_user("lou@example.com", "Secret-pass1", true);
+    for _ in 0..5 {
+        z.create_session(&id, "Secret-pass1").await.unwrap();
+    }
+    assert_eq!(admin.delete_user_sessions(&id).await.unwrap(), 5);
+    assert_eq!(mock.session_count(), 0);
+}
+
+/// T7 fix I2 (R29): whether a user ever set a password (`human.passwordChanged`), and the
+/// Initial state, are read; Initial is not Active.
+#[tokio::test]
+async fn get_user_reads_whether_a_password_is_set() {
+    let (mock, z) = setup().await;
+    let with = mock.add_user("pat@example.com", "Secret-pass1", true);
+    let without = mock.add_user("nop@example.com", "", false);
+    assert!(z.get_user(&with).await.unwrap().unwrap().has_password);
+    let u = z.get_user(&without).await.unwrap().unwrap();
+    assert!(!u.has_password);
+    mock.set_initial(&without);
+    assert_eq!(z.get_user(&without).await.unwrap().unwrap().state, UserState::Other);
+    match z.find_user_in_org("o1", "pat@example.com").await.unwrap() {
+        EmailMatch::One(u) => assert!(u.has_password),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn deactivating_twice_is_a_precondition_refusal() {
     let (mock, z) = setup().await;

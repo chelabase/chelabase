@@ -3,7 +3,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Outlet, createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useAuth, type AuthContextProps } from "react-oidc-context";
-import { AppShell } from "@/components/app-shell/app-shell";
+import { SignedInApp } from "@/components/app-shell/signed-in-app";
 import { SignInError } from "@/components/sign-in-error";
 import { AccessTokenContext } from "@/lib/access-token";
 import { useRegisterDevtoolsQueryClient } from "@/lib/devtools-query-client";
@@ -74,9 +74,9 @@ function AppPage() {
       {/* The token value (not a getter) so pages re-render when it refreshes. */}
       <AccessTokenContext.Provider value={auth.user?.access_token}>
         <AppSessionContext.Provider value={session}>
-          <AppShell profile={session.profile} onSignOut={session.onSignOut}>
+          <SignedInApp profile={session.profile} onSignOut={session.onSignOut}>
             <Outlet />
-          </AppShell>
+          </SignedInApp>
         </AppSessionContext.Provider>
       </AccessTokenContext.Provider>
     </QueryClientProvider>

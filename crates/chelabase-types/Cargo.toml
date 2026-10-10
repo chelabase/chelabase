@@ -22,3 +22,4 @@ openapi = ["dep:utoipa"]
 tokio = { workspace = true }
 tower = { version = "0.5.3", features = ["util"] }
 serde_json = { workspace = true }
+proptest = { workspace = true }

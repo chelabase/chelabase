@@ -30,7 +30,9 @@ use uuid::Uuid;
 
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
 use crate::data_api_databases::validate_key_databases;
-use crate::{AppState, ApiBytes, BACKUP_REFUSAL, AuthPrincipal, JobPort, MetadataPort, ResetError, load_owned};
+use crate::access::{authorize, authorize_database, authorize_key_role, Target};
+use crate::{AppState, ApiBytes, BACKUP_REFUSAL, AuthPrincipal, JobPort, MetadataPort, ResetError};
+use chelabase_routes::orchestrator as ep;
 
 /// Longest key name.
 const MAX_NAME_LEN: usize = 63;
@@ -203,7 +205,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::LIST_KEYS.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -275,7 +277,7 @@ struct CreateKeyRequest {
         (status = 201, description = "The new key; its value is shown only here", body = CreatedDataKey),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use (in your roles, or reachable through a granted role), or `admin` for a LOGIN or owner-level role", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -295,9 +297,12 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
-        Ok(record) => record,
+    let authorized = match authorize(&state, &principal, ep::CREATE_KEY.policy.access, Target::Branch { database: id, branch: branch_id }).await {
+        Ok(authorized) => authorized,
         Err(resp) => return resp.into_response(),
+    };
+    let Ok(record) = authorized.clone().into_record() else {
+        return ApiError::internal().into_response();
     };
     let branch = match load_branch(&state, &record, branch_id).await {
         Ok(branch) => branch,
@@ -313,6 +318,9 @@ where
     let role = request.role.unwrap_or_else(|| DEFAULT_ROLE.to_string());
     if role.is_empty() {
         return unprocessable("role must not be empty").into_response();
+    }
+    if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &role).await {
+        return err.into_response();
     }
     if let Some(names) = &request.databases
         && let Err(err) = validate_key_databases(&state, branch.id, names).await
@@ -359,7 +367,7 @@ where
         (status = 201, description = "The replacement key (same kind, role and name); the old one stops working", body = CreatedDataKey),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`public_key_exists`: the branch already has a public key; `branch_not_ready`: a secret key's role can't be checked while the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`role_refused`: the worker refused the secret key's role (it no longer exists or may not back a key; a rename is followed), or the role was dropped and created again since the key was made", body = ErrorEnvelope),
@@ -377,9 +385,12 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
-        Ok(record) => record,
+    let authorized = match authorize(&state, &principal, ep::ROTATE_KEY.policy.access, Target::Branch { database: id, branch: branch_id }).await {
+        Ok(authorized) => authorized,
         Err(resp) => return resp.into_response(),
+    };
+    let Ok(record) = authorized.clone().into_record() else {
+        return ApiError::internal().into_response();
     };
     let branch = match load_branch(&state, &record, branch_id).await {
         Ok(branch) => branch,
@@ -390,6 +401,9 @@ where
         Ok(None) => return ApiError::not_found("key not found").into_response(),
         Err(resp) => return resp.into_response(),
     };
+    if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &old.role).await {
+        return err.into_response();
+    }
     // A secret key's role is checked on the compute again, for its OID: the store refuses a
     // role dropped and created again since the old key was made. A refusal may be a rename
     // that landed meanwhile (the key moved with it): the key is read again and its new name
@@ -409,6 +423,9 @@ where
                     Ok(identity) => identity,
                     Err(err) => return err.into_response(),
                 };
+                if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &renamed.role).await {
+                    return err.into_response();
+                }
                 old = renamed;
                 identity
             }
@@ -552,7 +569,7 @@ where
         (status = 200, description = "The key after the change; only the public key carries its full value", body = DataKey),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: `databases` is missing or isn't null or a list of 1 to 20 distinct names of the branch's databases", body = ErrorEnvelope),
@@ -569,9 +586,12 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
-        Ok(record) => record,
+    let authorized = match authorize(&state, &principal, ep::UPDATE_KEY.policy.access, Target::Branch { database: id, branch: branch_id }).await {
+        Ok(authorized) => authorized,
         Err(resp) => return resp.into_response(),
+    };
+    let Ok(record) = authorized.clone().into_record() else {
+        return ApiError::internal().into_response();
     };
     let branch = match load_branch(&state, &record, branch_id).await {
         Ok(branch) => branch,
@@ -589,6 +609,9 @@ where
         Ok(None) => return ApiError::not_found("key not found").into_response(),
         Err(resp) => return resp.into_response(),
     };
+    if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &old.role).await {
+        return err.into_response();
+    }
     if let Some(names) = &databases
         && let Err(err) = validate_key_databases(&state, branch.id, names).await
     {
@@ -630,7 +653,7 @@ where
         (status = 204, description = "The key is revoked"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`public_key_not_revocable`: a public key can only be rotated", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -645,9 +668,12 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
-        Ok(record) => record,
+    let authorized = match authorize(&state, &principal, ep::REVOKE_KEY.policy.access, Target::Branch { database: id, branch: branch_id }).await {
+        Ok(authorized) => authorized,
         Err(resp) => return resp.into_response(),
+    };
+    let Ok(record) = authorized.clone().into_record() else {
+        return ApiError::internal().into_response();
     };
     let branch = match load_branch(&state, &record, branch_id).await {
         Ok(branch) => branch,
@@ -658,6 +684,9 @@ where
         Ok(None) => return ApiError::not_found("key not found").into_response(),
         Err(resp) => return resp.into_response(),
     };
+    if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &key.role).await {
+        return err.into_response();
+    }
     // A branch always has a public key; revoking it would leave the Studio and the SDK without one.
     if key.kind == DataKeyKind::Public {
         return conflict(ErrorCode::PublicKeyNotRevocable, "rotate the public key instead")
@@ -738,7 +767,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::DATA_API_SCHEMA.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };

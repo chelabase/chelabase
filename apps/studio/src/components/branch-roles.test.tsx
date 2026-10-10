@@ -19,6 +19,8 @@ const role = (over: Partial<BranchRole> & { name: string }): BranchRole => ({
   valid_until: null,
   bypass_rls: false,
   member_of: [],
+  member_no_set: [],
+  member_admin: [],
   ...over,
 });
 const owner = role({ name: "chelabase_owner", origin: "owner", level: "owner_level" });

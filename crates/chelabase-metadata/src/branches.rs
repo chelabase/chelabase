@@ -857,8 +857,8 @@ impl MetadataClient {
                 "INSERT INTO neon_roles
                      (endpoint_id, name, scram_verifier, origin, password_enc, login, level,
                       api_owner_level, pending, inherit, connection_limit, valid_until,
-                      bypass_rls, member_of)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                      bypass_rls, member_of, member_no_set, member_admin)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
             )
             .bind(ep.id)
             .bind(copy.name)
@@ -874,6 +874,8 @@ impl MetadataClient {
             .bind(copy.attributes.valid_until)
             .bind(copy.attributes.bypass_rls)
             .bind(&copy.attributes.member_of)
+            .bind(&copy.attributes.member_no_set)
+            .bind(&copy.attributes.member_admin)
             .execute(&mut *tx)
             .await?;
         }

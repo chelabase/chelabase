@@ -61,6 +61,10 @@ pub struct Identity {
     pub auth: AuthMethod,
     pub request_id: String,
     pub data: Option<DataIdentity>,
+    /// The person's email and name from the management token, when it carries them (members
+    /// are refreshed from these). Always `None` for a data key.
+    pub email: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +80,10 @@ pub struct InternalClaims {
     pub rid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<DataIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 pub struct InternalSigner {
@@ -120,6 +128,8 @@ impl InternalSigner {
             auth: identity.auth,
             rid: identity.request_id.clone(),
             data: identity.data.clone(),
+            email: identity.email.clone(),
+            name: identity.name.clone(),
         };
         encode(&Header::new(Algorithm::EdDSA), &claims, &self.key)
             .map_err(|e| AuthError::Config(format!("sign internal token: {e}")))

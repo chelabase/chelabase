@@ -6,3 +6,5 @@ license.workspace = true
 description = "Chelabase public endpoint declarations shared by the gateway and services"
 
 [dependencies]
+# No features: the access model is plain types (no axum, no utoipa).
+chelabase-types = { workspace = true }

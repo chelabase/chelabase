@@ -14,6 +14,8 @@ pub const SCHEMA_SETTINGS: &str = "SET statement_timeout = '30s'; SET lock_timeo
 #[derive(Debug)]
 pub enum SchemaError {
     Query(String),
+    /// `SET ROLE` was refused (the role went, or the membership did, since the check).
+    Role(String),
     TooLarge(usize),
 }
 
@@ -21,6 +23,7 @@ impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query(e) => f.write_str(e),
+            Self::Role(e) => write!(f, "set role: {e}"),
             Self::TooLarge(n) => write!(f, "schema too large ({n} bytes)"),
         }
     }
@@ -89,13 +92,24 @@ async fn run(
     Err(query_error(name, "no row returned"))
 }
 
-/// Runs pgls 0.26.0's introspection on `client` (as whoever it's connected as) and returns
-/// the JSON `Workspace.setSchema` takes, serialized; `TooLarge` beyond `MAX_SCHEMA_BYTES`.
-pub async fn introspect(client: &tokio_postgres::Client) -> Result<String, SchemaError> {
+/// Runs pgls 0.26.0's introspection on `client` (as whoever it's connected as, after `SET
+/// ROLE role` when given: the queries keep what that role may use) and returns the JSON
+/// `Workspace.setSchema` takes, serialized; `TooLarge` beyond `MAX_SCHEMA_BYTES`.
+pub async fn introspect(
+    client: &tokio_postgres::Client,
+    role: Option<&str>,
+) -> Result<String, SchemaError> {
     client
         .batch_execute(SCHEMA_SETTINGS)
         .await
         .map_err(|e| SchemaError::Query(format!("settings: {e}")))?;
+    if let Some(role) = role {
+        let sql = format!("SET ROLE {}", chelabase_types::role_name::quote_ident(role));
+        client
+            .batch_execute(&sql)
+            .await
+            .map_err(|e| SchemaError::Role(e.to_string()))?;
+    }
     let parts = RawParts {
         versions: run(client, "versions", VERSIONS, true).await?,
         schemas: run(client, "schemas", SCHEMAS, false).await?,

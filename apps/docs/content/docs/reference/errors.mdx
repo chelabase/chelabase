@@ -36,6 +36,30 @@ These come from the management API, the login API (the dashboard sign-in and app
 | 503 | `unavailable` | A service behind the API (the compute, the user service, the identity provider) can't be reached right now. |
 | 504 | `timeout` | A service didn't answer in time. The gateway also answers `timeout` with 408 when a request times out. |
 
+### Members, access and invites
+
+Any project route can answer the first four rows. See [Access per route](/docs/reference/access) for which level each route needs.
+
+| Status | Code | Meaning |
+|---|---|---|
+| 403 | `forbidden` | The caller's grant is too low, or the Postgres role asked for isn't in their effective set. `error.required` names what is needed: a tenant, project or branch level (`tenant admin`, `developer`, `admin`), `instance admin`, `owner`, or `role:<name>`. A project the caller has no grant on answers 404 `not_found` instead. |
+| 403 | `no_access_yet` | The caller is a member with no grants anywhere. A tenant admin must grant them a project. |
+| 403 | `pending_approval` | The caller signed up and waits for a tenant admin to approve them. |
+| 403 | `not_available_in_platform_mode` | The feature (or self-sign-up) isn't designed for platform mode yet. |
+| 403 | `sign_up_closed` | Open sign-up is off and the tenant already has members. |
+| 409 | `last_tenant_admin` | The change would leave the tenant without an active tenant admin (demoting or removing the last one). |
+| 409 | `link_not_allowed` | A link invite (`delivery: "link"`) for someone who already has a way to sign in (a password, passkey, OTP or identity-provider link). Send it by email instead; `error.email_available` says whether email delivery works now. |
+| 409 | `signup_pending` | The person signed up and waits for approval. Approve or decline the sign-up instead of inviting them; `error.member_id` names the member. |
+| 409 | `email_ambiguous` | More than one user of the organisation has this email. Resolve it in the identity provider first. |
+| 409 | `email_in_use_elsewhere` | A user outside the tenant's organisation already has this email. Use another email, or fix the account in the identity provider. |
+| 409 | `invite_closed` | The invite was revoked, accepted or replaced since. Reload the list. |
+| 410 | `invite_expired` | The invite's code has expired. Ask for a new invite. |
+| 410 | `invite_revoked` | The invite was revoked. |
+| 503 | `invite_incomplete` | The code was accepted but a later step failed. `error.accept_ticket` lets the page retry without the spent code. |
+| 503 | `member_role_reconcile_failed` | The caller's Postgres role on this branch couldn't be prepared right now. Comes with `Retry-After`; try again. |
+
+Two more refusals use general codes. A grant or override below Admin that lists an owner-level, `LOGIN` or reserved role, or a role whose chain reaches one, is 422 `invalid_request`, and so is a grant at any level (Admin too) whose role chain holds `ADMIN` on another role; the message names the role, its chain and the database (`error.role`, `error.chain`, `error.database_id`), and invites and approvals also name the grant's project (`error.project_id`). A Developer who acts as such a role, or creates a data key bound to one, gets 403 `forbidden` with `required: "admin"`.
+
 ### Projects and databases
 
 | Status | Code | Meaning |

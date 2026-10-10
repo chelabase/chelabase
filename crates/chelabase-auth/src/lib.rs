@@ -62,6 +62,10 @@ impl ZitadelAuthConfig {
 pub struct VerifiedClaims {
     pub sub: String,
     pub org_id: String,
+    /// The `email` claim, when the token carries a non-empty one.
+    pub email: Option<String>,
+    /// The `name` claim, when the token carries a non-empty one.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -238,7 +242,14 @@ fn build_claims(claims: &Value, config: &ZitadelAuthConfig) -> Result<VerifiedCl
         })?
         .to_string();
 
-    Ok(VerifiedClaims { sub, org_id })
+    let text = |key: &str| {
+        claims
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Ok(VerifiedClaims { sub, org_id, email: text("email"), name: text("name") })
 }
 
 fn check_audience(claims: &Value, config: &ZitadelAuthConfig) -> Result<(), AuthError> {
@@ -310,6 +321,23 @@ mod tests {
         });
         let result = build_claims(&claims, &config(vec![])).unwrap();
         assert_eq!(result.org_id, "org-2");
+    }
+
+    #[test]
+    fn build_claims_reads_email_and_name_when_present() {
+        let claims = json!({
+            "sub": "user-1",
+            CLAIM_ORG_ID: "org-1",
+            "email": "Bob@X.com",
+            "name": "Bob Builder",
+        });
+        let result = build_claims(&claims, &config(vec![])).unwrap();
+        assert_eq!(result.email.as_deref(), Some("Bob@X.com"));
+        assert_eq!(result.name.as_deref(), Some("Bob Builder"));
+
+        let bare = build_claims(&json!({ "sub": "u", CLAIM_ORG_ID: "o", "email": "" }), &config(vec![])).unwrap();
+        assert_eq!(bare.email, None, "an empty claim is absent");
+        assert_eq!(bare.name, None);
     }
 
     #[test]

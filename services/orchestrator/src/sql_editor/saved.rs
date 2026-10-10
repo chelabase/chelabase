@@ -8,8 +8,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chelabase_metadata::{SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite};
+use chelabase_metadata::{SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
+use chelabase_types::access::PlatformRole;
 use chelabase_types::{ApiJson, ApiPath};
 use serde::Deserialize;
 use tracing::error;
@@ -19,7 +20,9 @@ use uuid::Uuid;
 
 use super::{SAVED_QUERY_CAP, invalid_sql};
 use crate::branches::{conflict, unprocessable};
-use crate::{AppState, AuthPrincipal, JobPort, MetadataPort, load_owned};
+use crate::access::{authorize, authorize_database, Target};
+use crate::{AppState, AuthPrincipal, JobPort, MetadataPort};
+use chelabase_routes::orchestrator as ep;
 
 const MAX_NAME_CHARS: usize = 120;
 /// Postgres identifiers are at most 63 bytes.
@@ -80,6 +83,46 @@ fn saved_not_found() -> ApiError {
 fn internal(err: impl std::fmt::Display) -> ApiError {
     error!("saved queries: {err}");
     ApiError::internal()
+}
+
+/// Who is editing: an Admin may change any saved query; anyone else only their own, and a query
+/// saved before members has no author (Admin only).
+fn editor(
+    principal: &AuthPrincipal,
+    grant: Option<&chelabase_types::access::Grant>,
+) -> Result<SavedQueryEditor, ApiError> {
+    if grant.is_some_and(|g| g.platform_role == PlatformRole::Admin) {
+        return Ok(SavedQueryEditor::Admin);
+    }
+    match principal.member.as_ref() {
+        Some(member) => Ok(SavedQueryEditor::Author(member.id)),
+        None => Err(internal("an edit passed access without a member")),
+    }
+}
+
+/// The saved query, or the refusal for `by`: 404 when there is none in this database, 403
+/// `forbidden{required:"admin"}` when it is visible but not theirs (saved queries are shared in
+/// the project; a legacy row has no author, so only an Admin changes it).
+async fn editable<M, J>(
+    state: &AppState<M, J>,
+    database: Uuid,
+    query_id: Uuid,
+    by: SavedQueryEditor,
+) -> Result<(), ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let Some(row) = state.metadata.get_saved_query(database, query_id).await.map_err(internal)? else {
+        return Err(saved_not_found());
+    };
+    match by {
+        SavedQueryEditor::Admin => Ok(()),
+        SavedQueryEditor::Author(member) if row.author_member_id == Some(member) => Ok(()),
+        SavedQueryEditor::Author(_) => Err(crate::access::deny_to_api(chelabase_types::access::Deny::Forbidden {
+            required: PlatformRole::Admin.as_str().to_string(),
+        })),
+    }
 }
 
 fn valid_name(name: &str) -> Result<String, ApiError> {
@@ -146,8 +189,8 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    load_owned(&state, &principal, id).await?;
-    let rows = state.metadata.list_saved_queries(id, &principal.sub).await.map_err(internal)?;
+    authorize_database(&state, &principal, ep::LIST_SAVED_QUERIES.policy.access, Target::Database(id)).await?;
+    let rows = state.metadata.list_saved_queries(id).await.map_err(internal)?;
     Ok(Json(rows))
 }
 
@@ -182,7 +225,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    load_owned(&state, &principal, id).await?;
+    authorize_database(&state, &principal, ep::CREATE_SAVED_QUERY.policy.access, Target::Database(id)).await?;
     let name = valid_name(&request.name)?;
     valid_sql(&request.sql)?;
     valid_hint("pg_database", request.pg_database.as_deref())?;
@@ -192,6 +235,7 @@ where
         .create_saved_query(
             id,
             &principal.sub,
+            principal.member.as_ref().map(|m| m.id),
             Uuid::new_v4(),
             &name,
             &request.sql,
@@ -240,10 +284,10 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    load_owned(&state, &principal, id).await?;
+    authorize_database(&state, &principal, ep::GET_SAVED_QUERY.policy.access, Target::Database(id)).await?;
     state
         .metadata
-        .get_saved_query(id, &principal.sub, query_id)
+        .get_saved_query(id, query_id)
         .await
         .map_err(internal)?
         .map(Json)
@@ -256,7 +300,7 @@ where
     operation_id = "updateSavedQuery",
     tag = "sql-editor",
     summary = "Update a saved SQL query",
-    description = "Changes the given fields of one of the caller's saved queries. `version` must be the version last seen; the version goes up by one with each change. `pg_database` and `role` accept `null` to clear them.",
+    description = "Changes the given fields of one of the caller's saved queries (an Admin may change any). `version` must be the version last seen; the version goes up by one with each change. `pg_database` and `role` accept `null` to clear them.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("query_id" = Uuid, Path, description = "Saved query id"),
@@ -266,7 +310,7 @@ where
         (status = 200, description = "The updated saved query", body = SavedQuery),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the query isn't yours (or has no author) and you aren't an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the saved query doesn't exist, or isn't the caller's", body = ErrorEnvelope),
         (status = 409, description = "`saved_query_conflict`: `version` is stale (the response carries the row as `error.current`); `saved_query_name_taken`: another query of the caller's has that name", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -284,7 +328,10 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    load_owned(&state, &principal, id).await?;
+    let authorized =
+        authorize(&state, &principal, ep::UPDATE_SAVED_QUERY.policy.access, Target::Database(id)).await?;
+    let by = editor(&principal, authorized.grant.as_ref())?;
+    editable(&state, id, query_id, by).await?;
     let name = request.name.as_deref().map(valid_name).transpose()?;
     if let Some(sql) = &request.sql {
         valid_sql(sql)?;
@@ -299,7 +346,7 @@ where
     };
     let written = state
         .metadata
-        .update_saved_query(id, &principal.sub, query_id, request.version, &patch)
+        .update_saved_query(id, by, query_id, request.version, &patch)
         .await
         .map_err(internal)?;
     match written {
@@ -325,7 +372,7 @@ where
         (status = 204, description = "The saved query is deleted"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the query isn't yours (or has no author) and you aren't an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the saved query doesn't exist, or isn't the caller's", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -339,8 +386,11 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    load_owned(&state, &principal, id).await?;
-    if state.metadata.delete_saved_query(id, &principal.sub, query_id).await.map_err(internal)? {
+    let authorized =
+        authorize(&state, &principal, ep::DELETE_SAVED_QUERY.policy.access, Target::Database(id)).await?;
+    let by = editor(&principal, authorized.grant.as_ref())?;
+    editable(&state, id, query_id, by).await?;
+    if state.metadata.delete_saved_query(id, by, query_id).await.map_err(internal)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(saved_not_found())

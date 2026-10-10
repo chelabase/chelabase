@@ -1,14 +1,16 @@
-import { Fragment, lazy, Suspense, useEffect, useState, type ReactNode } from "react";
+import { Fragment, lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   ApiError,
   useGetMe,
   useGetProject,
   type DatabaseSummary,
-  type Me,
+  type MeResponse as Me,
   type ProjectInfo,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { Tabs } from "@/components/ui/tabs";
+import { ProjectCapsContext, noAccess, projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import type { ConnectionFocus } from "@/lib/project-search";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";
@@ -16,7 +18,10 @@ import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
 import { DatabaseDataApi } from "./database-data-api";
+
+import { NO_ACCESS_POLL_MS, NoAccess } from "./no-access";
 import { MergesList } from "./merges/merges-list";
+import { AccessTab } from "./project-access/access-tab";
 import { ProjectSettings } from "./project-settings";
 import { TablesView } from "./tables-view";
 import { UsersTab } from "./users-tab";
@@ -24,7 +29,11 @@ import { UsersTab } from "./users-tab";
 // The editor, CodeMirror and the pgls worker load only when a SQL view opens.
 const SqlEditor = lazy(() => import("./sql-editor/sql-editor").then((m) => ({ default: m.SqlEditor })));
 
-export type ProjectTab = "databases" | "users" | "settings";
+const pollDatabases = pollWhile<Me>((m) =>
+  (m.tenant?.projects ?? []).some((p) => p.databases.some((d) => TRANSITIONAL.has(d.status))),
+);
+
+export type ProjectTab = "databases" | "users" | "access" | "settings";
 
 export interface ProjectPageProps {
   projectId: string;
@@ -48,9 +57,8 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   // The tenant's workspace carries the project's databases; kept fresh while any is changing.
   const me = useGetMe({
     query: {
-      refetchInterval: pollWhile<Me>((m) =>
-        (m.tenant?.projects ?? []).some((p) => p.databases.some((d) => TRANSITIONAL.has(d.status))),
-      ),
+      // Without any project, the no-access screen checks again every 30 s (as it says).
+      refetchInterval: (q) => (q.state.data && noAccess(q.state.data) ? NO_ACCESS_POLL_MS : pollDatabases(q)),
     },
   });
 
@@ -59,6 +67,14 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
     if (gone) onGone();
   }, [gone]);
 
+  // Access arrived while the no-access screen showed: the project's earlier 403 is stale.
+  const waiting = me.data !== undefined && noAccess(me.data);
+  const wasWaiting = useRef(false);
+  useEffect(() => {
+    if (wasWaiting.current && !waiting) void project.refetch();
+    wasWaiting.current = waiting;
+  }, [waiting]);
+
   const loaded = project.isSuccess && me.isSuccess;
   useEffect(() => {
     if (loaded) onLoaded?.();
@@ -66,11 +82,30 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
 
   const tenant = me.data?.tenant ?? null;
   const databases: DatabaseSummary[] = tenant?.projects.find((p) => p.id === projectId)?.databases ?? [];
+  const tenantProject = tenant?.projects.find((p) => p.id === projectId);
   const usersEnabled = project.data?.app_users === "enabled";
   const failure = project.data === undefined ? project.error : null;
   const restarting = project.error?.signInRestarted === true || me.error?.signInRestarted === true;
+  const caps = projectCaps(me.data, projectId);
+
+  // A member with no project at all sees the no-access screen here too, not a 403 (Q9).
+  if (me.data && noAccess(me.data)) {
+    return (
+      <div className="mx-auto max-w-4xl space-y-8 p-8">
+        <NoAccess me={me.data} checking={me.isFetching} onCheck={() => void me.refetch()} />
+      </div>
+    );
+  }
+
+  const tabs = [
+    { id: "databases" as const, label: "Databases" },
+    ...(usersEnabled ? [{ id: "users" as const, label: "Users" }] : []),
+    { id: "access" as const, label: "Access" },
+    { id: "settings" as const, label: "Settings" },
+  ];
 
   return (
+    <ProjectCapsContext.Provider value={caps}>
     <div className="mx-auto max-w-4xl space-y-8 p-8">
       {restarting ? (
         <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
@@ -101,42 +136,41 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
             </p>
           </div>
           {project.data.status === "deleting" && (
-            <div role="alert" className="space-y-1 rounded-lg border border-destructive/40 p-3 text-sm">
+            <div role="alert" className="space-y-1 border border-destructive/40 p-3 text-sm">
               <p className="font-medium text-destructive">This project is being deleted.</p>
               {project.data.error && <p>{project.data.error}</p>}
             </div>
           )}
-          <div role="tablist" className="flex gap-1 border-b">
-            <TabButton active={tab === "databases"} onClick={() => onTabChange("databases")}>
-              Databases
-            </TabButton>
-            {usersEnabled && (
-              <TabButton active={tab === "users"} onClick={() => onTabChange("users")}>
-                Users
-              </TabButton>
-            )}
-            <TabButton active={tab === "settings"} onClick={() => onTabChange("settings")}>
-              Settings
-            </TabButton>
-          </div>
+          <Tabs label="Project sections" items={tabs} value={tabs.some((t) => t.id === tab) ? tab : "databases"} onValueChange={onTabChange}>
           {/* A deleting project refuses every change: disabled fieldsets switch all actions off. */}
           {tab === "databases" ? (
             <fieldset
               disabled={project.data.status === "deleting"}
               className="m-0 min-w-0 space-y-6 border-0 p-0"
             >
-              {tenant ? (
-                <CreateDatabaseForm tenantId={tenant.id} projectId={projectId} />
-              ) : me.error ? (
+              {caps.atLeast("admin") && <CreateDatabaseForm projectId={projectId} />}
+              {me.error ? (
                 <p role="alert" className="text-destructive">
                   Couldn't load your databases: {errorText(me.error)}
                 </p>
               ) : null}
-              <DatabasesTable projectId={projectId} databases={databases} apiUrl={apiUrl} focus={focus} />
+              <DatabasesTable projectId={projectId} databases={databases} apiUrl={apiUrl} focus={focus} me={me.data} />
             </fieldset>
           ) : tab === "users" && usersEnabled ? (
             <fieldset disabled={project.data.status === "deleting"} className="m-0 min-w-0 border-0 p-0">
               <UsersTab projectId={projectId} />
+            </fieldset>
+          ) : tab === "access" ? (
+            <fieldset disabled={project.data.status === "deleting"} className="m-0 min-w-0 border-0 p-0">
+              {tenantProject ? (
+                <AccessTab project={tenantProject} />
+              ) : me.data ? (
+                <p className="text-sm text-chalk-dim">
+                  {project.data.name} isn't in your workspace, or you can't see it. Go back to All projects and open it from there.
+                </p>
+              ) : (
+                <p className="text-sm text-chalk-dim">Loading access…</p>
+              )}
             </fieldset>
           ) : (
             <ProjectSettings
@@ -144,25 +178,11 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
               databases={tenant ? databases : undefined}
               databasesError={me.error} onDeleted={() => {}} />
           )}
+          </Tabs>
         </>
       )}
     </div>
-  );
-}
-
-function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-      className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
-        active ? "border-primary text-foreground" : "border-transparent text-muted-foreground hover:text-foreground"
-      }`}
-    >
-      {children}
-    </button>
+    </ProjectCapsContext.Provider>
   );
 }
 
@@ -173,11 +193,14 @@ function DatabasesTable({
   databases,
   apiUrl,
   focus,
+  me,
 }: {
   projectId: string;
   databases: DatabaseSummary[];
   apiUrl: string;
   focus: ConnectionFocus | null;
+  /** `/v1/me`: where a grant is narrowed, a database's own caps apply (I3). */
+  me: Me | undefined;
 }) {
   // A focused branch opens its database's branches; read once, on the first render.
   const [open, setOpen] = useState<{ id: string; view: DatabaseView } | null>(() =>
@@ -199,8 +222,14 @@ function DatabasesTable({
         </tr>
       </thead>
       <tbody>
-        {databases.map((db) => (
-          <Fragment key={db.database_id}>
+        {databases.map((db) => {
+          // Each database is shown with what the caller may do there: the project's caps, or the
+          // narrower ones of an override on that database.
+          const dbCaps = projectCaps(me, projectId, db.database_id);
+          const canSql = dbCaps.atLeast("developer");
+          return (
+          <ProjectCapsContext.Provider key={db.database_id} value={dbCaps}>
+          <Fragment>
             <tr className="border-b last:border-0">
               <td className="py-2">{db.name}</td>
               <td className="py-2">{db.status}</td>
@@ -244,15 +273,18 @@ function DatabasesTable({
                   >
                     Tables
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={db.status !== "ready"}
-                    aria-expanded={open?.id === db.database_id && open.view === "sql"}
-                    onClick={() => toggle(db.database_id, "sql")}
-                  >
-                    SQL
-                  </Button>
+                  {/* The SQL editor needs Developer; Viewers read through Tables. */}
+                  {canSql && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={db.status !== "ready"}
+                      aria-expanded={open?.id === db.database_id && open.view === "sql"}
+                      onClick={() => toggle(db.database_id, "sql")}
+                    >
+                      SQL
+                    </Button>
+                  )}
                 </div>
               </td>
             </tr>
@@ -269,7 +301,7 @@ function DatabasesTable({
                     <MergesList projectId={projectId} databaseId={db.database_id} />
                   ) : open.view === "tables" ? (
                     <TablesView databaseId={db.database_id} />
-                  ) : open.view === "sql" ? (
+                  ) : open.view === "sql" && canSql ? (
                     <Suspense fallback={<p className="py-3 text-sm text-muted-foreground">Loading the editor…</p>}>
                       <SqlEditor databaseId={db.database_id} />
                     </Suspense>
@@ -280,7 +312,9 @@ function DatabasesTable({
               </tr>
             )}
           </Fragment>
-        ))}
+          </ProjectCapsContext.Provider>
+          );
+        })}
       </tbody>
     </table>
   );

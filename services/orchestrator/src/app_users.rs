@@ -26,6 +26,8 @@ use uuid::Uuid;
 use crate::branches::{conflict, unprocessable, valid_schema_name};
 use crate::projects::{AppUsersStatusView, load_project};
 use crate::{AppState, AuthPrincipal, JobPort, MetadataPort, load_main};
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::Access;
 
 const DEFAULT_SCHEMA: &str = "public";
 const DEFAULT_TABLE: &str = "users";
@@ -101,13 +103,14 @@ pub struct PutAppUsersRequest {
 pub(crate) async fn load_live_project<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
+    access: Access,
     id: Uuid,
 ) -> Result<ProjectRecord, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    let project = load_project(state, principal, id).await?;
+    let project = load_project(state, principal, access, id).await?;
     if project.status != chelabase_metadata::ProjectStatus::Active {
         return Err(project_deleting());
     }
@@ -134,6 +137,32 @@ where
         error!("project auth: {err}");
         ApiError::internal()
     })
+}
+
+/// [`read_auth`] for a route called with `access`: the row's Chelabase database is the one the
+/// route acts on, so its override applies too (R20; an override only narrows, and a refusal
+/// fails closed).
+pub(crate) async fn read_auth_checked<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    access: Access,
+    project: &ProjectRecord,
+) -> Result<Option<ProjectAuth>, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let auth = read_auth(state, project).await?;
+    if let Some(auth) = &auth {
+        crate::access::authorize(
+            state,
+            principal,
+            access,
+            crate::access::Target::Database(auth.database_id.as_uuid()),
+        )
+        .await?;
+    }
+    Ok(auth)
 }
 
 /// Reserved schemas, `information_schema` and the `pg_` prefix (I8).
@@ -167,11 +196,11 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let project = match load_live_project(&state, &principal, id).await {
+    let project = match load_live_project(&state, &principal, ep::GET_APP_USERS.policy.access, id).await {
         Ok(project) => project,
         Err(err) => return err.into_response(),
     };
-    match read_auth(&state, &project).await {
+    match read_auth_checked(&state, &principal, ep::GET_APP_USERS.policy.access, &project).await {
         Ok(Some(auth)) => Json(AppUsersSettings::from(auth)).into_response(),
         Ok(None) => app_users_disabled(404).into_response(),
         Err(err) => err.into_response(),
@@ -394,7 +423,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let project = match load_live_project(&state, &principal, id).await {
+    let project = match load_live_project(&state, &principal, ep::PUT_APP_USERS.policy.access, id).await {
         Ok(project) => project,
         Err(err) => return err.into_response(),
     };
@@ -402,7 +431,18 @@ where
         Ok(wanted) => wanted,
         Err(err) => return err.into_response(),
     };
-    let existing = match read_auth(&state, &project).await {
+    // The body names a Chelabase database: its override applies too (an override only narrows).
+    if let Err(err) = crate::access::authorize(
+        &state,
+        &principal,
+        ep::PUT_APP_USERS.policy.access,
+        crate::access::Target::Database(wanted.database_id.as_uuid()),
+    )
+    .await
+    {
+        return err.into_response();
+    }
+    let existing = match read_auth_checked(&state, &principal, ep::PUT_APP_USERS.policy.access, &project).await {
         Ok(existing) => existing,
         Err(err) => return err.into_response(),
     };
@@ -511,11 +551,11 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let project = match load_live_project(&state, &principal, id).await {
+    let project = match load_live_project(&state, &principal, ep::DISABLE_APP_USERS.policy.access, id).await {
         Ok(project) => project,
         Err(err) => return err.into_response(),
     };
-    let auth = match read_auth(&state, &project).await {
+    let auth = match read_auth_checked(&state, &principal, ep::DISABLE_APP_USERS.policy.access, &project).await {
         Ok(Some(auth)) => auth,
         Ok(None) => return app_users_disabled(404).into_response(),
         Err(err) => return err.into_response(),

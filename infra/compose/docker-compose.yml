@@ -99,6 +99,9 @@ services:
       ZITADEL_EXTERNALSECURE: "false"
       ZITADEL_EXTERNALDOMAIN: localhost
       ZITADEL_EXTERNALPORT: "8080"
+      # Zitadel's own registration is off: sign-up goes only through Chelabase's rules. (A volume
+      # made before this setting gets it from `chelabase dev bootstrap`.)
+      ZITADEL_DEFAULTINSTANCE_LOGINPOLICY_ALLOWREGISTER: "false"
       ZITADEL_FIRSTINSTANCE_PATPATH: /zitadel-bootstrap/admin.pat
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: chelabase-bootstrap
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Chelabase Bootstrap
@@ -125,7 +128,7 @@ services:
     volumes:
       - ../../.chelabase/zitadel:/zitadel-bootstrap
 
-  # Local mail catcher: Zitadel's signup verification codes land here (UI :8025).
+  # Local mail catcher: Zitadel's emails (invites, resets, verification codes) land here (UI :8025).
   mailpit:
     image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
     restart: unless-stopped

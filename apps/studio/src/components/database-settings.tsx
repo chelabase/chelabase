@@ -2,6 +2,7 @@ import { useId, useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { getGetDatabaseQueryKey, useUpdateDatabase, type DatabaseSettings as Settings } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { parseSettings, windowParts, type WindowUnit } from "@/lib/branches";
 
@@ -13,6 +14,8 @@ export interface DatabaseSettingsProps {
 }
 
 export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSettingsProps) {
+  // Changing the database's settings is Admin's (updateDatabase); others read them.
+  const admin = useProjectCaps().atLeast("admin");
   const queryClient = useQueryClient();
   const update = useUpdateDatabase({
     mutation: {
@@ -45,13 +48,14 @@ export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSett
 
   function submit(event: FormEvent) {
     event.preventDefault();
-    if (!parsed.ok || busy) return;
+    if (!parsed.ok || busy || !admin) return;
     update.mutate({ id: databaseId, data: parsed.settings });
   }
 
-  const field = "h-8 rounded-lg border border-input bg-background px-2 text-sm";
+  const field = "h-8 border border-input bg-background px-2 text-sm";
   return (
-    <form onSubmit={submit} className="space-y-2 rounded-lg border p-3 text-sm">
+    <form onSubmit={submit} className="space-y-2 border p-3 text-sm">
+      <fieldset disabled={!admin} className="m-0 min-w-0 space-y-2 border-0 p-0">
       <div className="flex flex-wrap items-end gap-3">
         <label className="flex flex-col gap-1">
           <span>History window</span>
@@ -116,16 +120,20 @@ export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSett
             className={`${field} w-24`}
           />
         </label>
-        <Button
-          type="submit"
-          size="sm"
-          disabled={!parsed.ok || busy}
-          aria-describedby={!parsed.ok || busy ? reasonId : undefined}
-        >
-          Save settings
-        </Button>
+        {admin && (
+          <Button
+            type="submit"
+            size="sm"
+            disabled={!parsed.ok || busy}
+            aria-describedby={!parsed.ok || busy ? reasonId : undefined}
+          >
+            Save settings
+          </Button>
+        )}
       </div>
-      <p className="text-xs text-muted-foreground">Shrinking the window lets older history be removed.</p>
+      <p className="text-xs text-muted-foreground">
+        {admin ? "Shrinking the window lets older history be removed." : "Only project Admins change these settings."}
+      </p>
       {(busy || !parsed.ok) && (
         <div id={reasonId} className="space-y-1">
           {busy ? (
@@ -158,6 +166,7 @@ export function DatabaseSettings({ databaseId, settings, onSaved }: DatabaseSett
           {error}
         </p>
       )}
+      </fieldset>
     </form>
   );
 }

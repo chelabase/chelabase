@@ -10,20 +10,21 @@ use chelabase_routes::{orchestrator as routes, Service};
 use chelabase_metadata::{
     AppSession, AppUsersStatus, BeginDelete, BeginEnable, BeginProjectDelete, BranchAuthSync, BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, CreateBranchOutcome, DatabaseRecord, DatabaseStatus, EnableStart,
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
-    NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite, SettingsPatch, TenantOverview,
+    NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite, SettingsPatch, TenantOverview,
     MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
 };
 use chelabase_nats::{
-    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, MergeJob, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob, GrantDataRoleRequest,
+    AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, MergeJob, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob,
     JetStreamContext, JobEnvelope,
     ProjectDeleteJob, ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
     RoleCreateRequest, RoleReply, RoleRequest, RoleSessionsReply, RoleUpdateRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
-    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_GRANT_DATA_ROLE_TO_OWNER, SUBJECT_RESET_PASSWORD,
+    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_RESET_PASSWORD,
     SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_SESSIONS, SUBJECT_ROLE_UPDATE,
 };
 use chelabase_secrets::{open_credential, open_role_password, Purpose, SecretKey};
 use chelabase_types::api_error::{ApiError, ErrorCode};
-use chelabase_types::mode::Mode;
+use chelabase_metadata::members::{Admission, GrantRow, GrantRows, MemberRecord, MemberStatus, OverrideRow};
+use chelabase_types::mode_policy::ModePolicy;
 use chelabase_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
 use chelabase_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
+pub mod access;
 mod branches;
 mod console;
 mod data_api_databases;
@@ -43,6 +45,7 @@ mod app_user_admin;
 mod app_users;
 mod data_keys;
 pub mod internal;
+pub mod members;
 mod merges;
 mod openapi;
 pub mod projects;
@@ -50,6 +53,7 @@ mod roles;
 pub mod sql_editor;
 pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, RestReply};
 pub use openapi::openapi;
+use access::{authorize, authorize_database, Target};
 
 /// The orchestrator's log filter when `RUST_LOG` is unset.
 pub const DEFAULT_LOG_FILTER: &str = "orchestrator=info,tower_http=info,chelabase_auth=info";
@@ -109,8 +113,9 @@ fn proxy_host(endpoint_id: &str, domain: &str) -> String {
 }
 
 /// Abstraction over tenant/database metadata lookups, so tests can inject an
-/// in-memory fake instead of a real Postgres-backed `MetadataClient`.
-pub trait MetadataPort: Send + Sync + 'static {
+/// in-memory fake instead of a real Postgres-backed `MetadataClient`. The member API's reads
+/// and writes are [`members::MembersPort`].
+pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
     fn get_tenant_by_zitadel_org_id(
         &self,
         zitadel_org_id: &str,
@@ -274,6 +279,22 @@ pub trait MetadataPort: Send + Sync + 'static {
         endpoint_id: &str,
     ) -> impl Future<Output = Result<Vec<RoleRow>, MetadataError>> + Send;
 
+    /// The member roles the reconciler recorded on a branch (one per member, R17).
+    fn member_branch_roles(
+        &self,
+        branch: Uuid,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::members::MemberBranchRole>, MetadataError>>
+           + Send;
+
+    /// R31: records `role` as the last role `member` acted as on `branch` (an act-as run is
+    /// starting); false when the member has no member role row there.
+    fn record_member_acted_role(
+        &self,
+        member: Uuid,
+        branch: Uuid,
+        role: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
     /// A non-owner role's sealed password; `None` when there's no such row or nothing sealed.
     fn role_password(
         &self,
@@ -429,13 +450,11 @@ pub trait MetadataPort: Send + Sync + 'static {
     fn list_saved_queries(
         &self,
         database: Uuid,
-        user: &str,
     ) -> impl Future<Output = Result<Vec<SavedQuerySummary>, MetadataError>> + Send;
 
     fn get_saved_query(
         &self,
         database: Uuid,
-        user: &str,
         id: Uuid,
     ) -> impl Future<Output = Result<Option<SavedQuery>, MetadataError>> + Send;
 
@@ -444,6 +463,7 @@ pub trait MetadataPort: Send + Sync + 'static {
         &self,
         database: Uuid,
         user: &str,
+        author: Option<Uuid>,
         id: Uuid,
         name: &str,
         sql: &str,
@@ -454,7 +474,7 @@ pub trait MetadataPort: Send + Sync + 'static {
     fn update_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
         version: i32,
         patch: &SavedQueryPatch,
@@ -463,7 +483,7 @@ pub trait MetadataPort: Send + Sync + 'static {
     fn delete_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     /// Inserts a `computing` merge, or says which merge is in the way.
@@ -517,6 +537,46 @@ pub trait MetadataPort: Send + Sync + 'static {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::BranchBusy>, MetadataError>> + Send;
+
+    /// The tenant's member with this Zitadel user id, whatever its status.
+    fn member_by_zitadel(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> impl Future<Output = Result<Option<MemberRecord>, MetadataError>> + Send;
+
+    /// The caller's member row, made (or an invited one activated) on its first request, with
+    /// the email and name refreshed from the claims; a removed or pending member comes back as
+    /// is. A person with no row becomes what `admission` says, unless the tenant has no active
+    /// admin yet (then they claim it): `Closed` writes nothing and is `NotAdmitted` (R39).
+    fn ensure_member(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: Admission,
+    ) -> impl Future<Output = Result<MemberRecord, MetadataError>> + Send;
+
+    /// Every stored grant level for one (member, project, Chelabase database).
+    fn grant_rows(
+        &self,
+        member: Uuid,
+        project: Uuid,
+        database: Option<Uuid>,
+    ) -> impl Future<Output = Result<GrantRows, MetadataError>> + Send;
+
+    /// The member's project grants on live projects, by project id.
+    fn member_projects(
+        &self,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<(Uuid, GrantRow)>, MetadataError>> + Send;
+
+    /// The member's overrides on live databases, as (project, database, override).
+    fn member_overrides(
+        &self,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<(Uuid, Uuid, OverrideRow)>, MetadataError>> + Send;
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -667,6 +727,22 @@ impl MetadataPort for MetadataClient {
 
     async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
         MetadataClient::list_roles(self, endpoint_id).await
+    }
+
+    async fn member_branch_roles(
+        &self,
+        branch: Uuid,
+    ) -> Result<Vec<chelabase_metadata::members::MemberBranchRole>, MetadataError> {
+        MetadataClient::member_branch_roles(self, branch).await
+    }
+
+    async fn record_member_acted_role(
+        &self,
+        member: Uuid,
+        branch: Uuid,
+        role: &str,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::record_member_acted_role(self, member, branch, role).await
     }
 
     async fn role_password(
@@ -844,51 +920,50 @@ impl MetadataPort for MetadataClient {
     async fn list_saved_queries(
         &self,
         database: Uuid,
-        user: &str,
     ) -> Result<Vec<SavedQuerySummary>, MetadataError> {
-        MetadataClient::list_saved_queries(self, database, user).await
+        MetadataClient::list_saved_queries(self, database).await
     }
 
     async fn get_saved_query(
         &self,
         database: Uuid,
-        user: &str,
         id: Uuid,
     ) -> Result<Option<SavedQuery>, MetadataError> {
-        MetadataClient::get_saved_query(self, database, user, id).await
+        MetadataClient::get_saved_query(self, database, id).await
     }
 
     async fn create_saved_query(
         &self,
         database: Uuid,
         user: &str,
+        author: Option<Uuid>,
         id: Uuid,
         name: &str,
         sql: &str,
         pg_database: Option<&str>,
         role: Option<&str>,
     ) -> Result<SavedQueryWrite, MetadataError> {
-        MetadataClient::create_saved_query(self, database, user, id, name, sql, pg_database, role).await
+        MetadataClient::create_saved_query(self, database, user, author, id, name, sql, pg_database, role).await
     }
 
     async fn update_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
         version: i32,
         patch: &SavedQueryPatch,
     ) -> Result<SavedQueryWrite, MetadataError> {
-        MetadataClient::update_saved_query(self, database, user, id, version, patch).await
+        MetadataClient::update_saved_query(self, database, by, id, version, patch).await
     }
 
     async fn delete_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::delete_saved_query(self, database, user, id).await
+        MetadataClient::delete_saved_query(self, database, by, id).await
     }
     async fn create_merge(&self, merge: &NewMerge) -> Result<MergeCreate, MetadataError> {
         MetadataClient::create_merge(self, merge).await
@@ -936,6 +1011,42 @@ impl MetadataPort for MetadataClient {
     async fn branch_has_busy_merge(&self, branch: BranchId) -> Result<Option<chelabase_metadata::BranchBusy>, MetadataError> {
         MetadataClient::branch_has_busy_merge(self, branch).await
     }
+
+    async fn member_by_zitadel(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<Option<MemberRecord>, MetadataError> {
+        MetadataClient::member_by_zitadel(self, tenant, zitadel_user_id).await
+    }
+
+    async fn ensure_member(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: Admission,
+    ) -> Result<MemberRecord, MetadataError> {
+        MetadataClient::ensure_member(self, tenant, zitadel_user_id, email, name, admission).await
+    }
+
+    async fn grant_rows(
+        &self,
+        member: Uuid,
+        project: Uuid,
+        database: Option<Uuid>,
+    ) -> Result<GrantRows, MetadataError> {
+        MetadataClient::grant_rows(self, member, project, database).await
+    }
+
+    async fn member_projects(&self, member: Uuid) -> Result<Vec<(Uuid, GrantRow)>, MetadataError> {
+        MetadataClient::member_projects(self, member).await
+    }
+
+    async fn member_overrides(&self, member: Uuid) -> Result<Vec<(Uuid, Uuid, OverrideRow)>, MetadataError> {
+        MetadataClient::member_overrides(self, member).await
+    }
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -950,8 +1061,9 @@ pub enum ResetError {
 }
 
 /// Talking to the worker: durable jobs and the reset-password RPC. Abstracted
-/// so tests can inject an in-memory fake instead of NATS.
-pub trait JobPort: Send + Sync + 'static {
+/// so tests can inject an in-memory fake instead of NATS. Member-role reconciles are
+/// [`members::MemberRolesQueue`].
+pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
     fn publish_provision(
         &self,
         job: &JobEnvelope<ProvisionDatabaseJob>,
@@ -985,14 +1097,19 @@ pub trait JobPort: Send + Sync + 'static {
         role: &str,
     ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
 
-    /// Asks the worker to grant `anon` or `authenticated` to the branch's owner (`WITH INHERIT
-    /// FALSE, SET TRUE`), so the SQL editor can `SET ROLE` to it.
-    fn grant_data_role_to_owner(
+    /// Asks the worker to make a branch's member roles (only `member_id`'s, when given) match
+    /// the metadata now (`chelabase.rpc.member_roles.reconcile`); the SQL editor's lazy check.
+    fn reconcile_member_roles(
         &self,
-        branch: BranchId,
-        role: &str,
-        owner: &str,
-    ) -> impl Future<Output = Result<CheckDataRoleReply, ResetError>> + Send;
+        request: chelabase_nats::MemberRolesReconcileRequest,
+    ) -> impl Future<Output = Result<chelabase_nats::MemberRolesReply, ResetError>> + Send;
+
+    /// Asks the worker for the hand-over after an act-as run
+    /// (`chelabase.rpc.member_roles.hand_over`; R5 and the member-role invariant).
+    fn hand_over_member_role(
+        &self,
+        request: chelabase_nats::MemberRoleHandOverRequest,
+    ) -> impl Future<Output = Result<chelabase_nats::MemberRolesReply, ResetError>> + Send;
 
     /// Tells the worker to bootstrap the data API in a database the orchestrator marked
     /// `enabling` (a core publish: no reply; reconcile retries a row left `enabling`).
@@ -1107,6 +1224,28 @@ async fn role_rpc<T: Serialize>(
     serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
 }
 
+/// One member-role request/reply to the worker on `subject`, waiting up to [`RESET_TIMEOUT`].
+async fn member_roles_rpc<T: Serialize>(
+    client: &async_nats::Client,
+    subject: &'static str,
+    request: &T,
+) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
+    use async_nats::RequestErrorKind;
+    let body = serde_json::to_vec(request).map_err(|e| ResetError::Transport(e.to_string()))?;
+    let request = async_nats::Request::new()
+        .payload(body.into())
+        .timeout(Some(RESET_TIMEOUT));
+    let reply = client
+        .send_request(subject, request)
+        .await
+        .map_err(|e| match e.kind() {
+            RequestErrorKind::TimedOut => ResetError::Timeout,
+            RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
+            _ => ResetError::Transport(e.to_string()),
+        })?;
+    serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+}
+
 /// One request/reply to the worker on `subject` answering a [`CheckDataRoleReply`].
 async fn data_api_rpc(
     client: &async_nats::Client,
@@ -1196,32 +1335,18 @@ impl JobPort for NatsPorts {
         serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
     }
 
-    async fn grant_data_role_to_owner(
+    async fn reconcile_member_roles(
         &self,
-        branch: BranchId,
-        role: &str,
-        owner: &str,
-    ) -> Result<CheckDataRoleReply, ResetError> {
-        use async_nats::RequestErrorKind;
-        let body = serde_json::to_vec(&GrantDataRoleRequest {
-            branch_id: branch,
-            role: role.to_string(),
-            owner: owner.to_string(),
-        })
-        .map_err(|e| ResetError::Transport(e.to_string()))?;
-        let request = async_nats::Request::new()
-            .payload(body.into())
-            .timeout(Some(RESET_TIMEOUT));
-        let reply = self
-            .client
-            .send_request(SUBJECT_GRANT_DATA_ROLE_TO_OWNER, request)
-            .await
-            .map_err(|e| match e.kind() {
-                RequestErrorKind::TimedOut => ResetError::Timeout,
-                RequestErrorKind::NoResponders => ResetError::Transport("no worker listening".into()),
-                _ => ResetError::Transport(e.to_string()),
-            })?;
-        serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+        request: chelabase_nats::MemberRolesReconcileRequest,
+    ) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
+        member_roles_rpc(&self.client, chelabase_nats::SUBJECT_MEMBER_ROLES_RECONCILE, &request).await
+    }
+
+    async fn hand_over_member_role(
+        &self,
+        request: chelabase_nats::MemberRoleHandOverRequest,
+    ) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
+        member_roles_rpc(&self.client, chelabase_nats::SUBJECT_MEMBER_ROLES_HAND_OVER, &request).await
     }
 
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
@@ -1356,8 +1481,11 @@ pub struct AppState<M, J> {
     pub proxy: ProxyAddress,
     /// The REST service's internal listener (the data API's schema).
     pub rest: RestInternal,
-    /// Self-hosted mode reveals the dev CA's path next to the connection details.
-    pub mode: Mode,
+    /// Every self-hosted/platform decision (the dev CA path is revealed only self-hosted).
+    pub policy: ModePolicy,
+    /// `CHELABASE_OPERATOR_ORG_ID`: in platform mode, members of this Zitadel org are instance
+    /// admins. `None` (unset or blank) means nobody is.
+    pub operator_org: Option<String>,
     /// Where the dev proxy's CA certificate is (`CHELABASE_PROXY_CA_FILE`); self-hosted only.
     pub proxy_ca_file: String,
     /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: databases a branch serves, main included.
@@ -1373,6 +1501,8 @@ pub struct AppState<M, J> {
     pub users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
     /// Studio's SQL editor: runs in flight and the data-role grant cache.
     pub sql_editor: sql_editor::SqlEditor,
+    /// `CHELABASE_STUDIO_URL` (no trailing `/`): invite links go to its `/accept-invite`.
+    pub studio_url: String,
 }
 
 /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
@@ -1434,6 +1564,9 @@ struct Caller {
     sub: String,
     org_id: String,
     request_id: String,
+    /// The token's email and name claims, when it carries them.
+    email: Option<String>,
+    name: Option<String>,
 }
 
 impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for Caller
@@ -1464,18 +1597,213 @@ where
             sub: claims.sub,
             org_id: claims.org_id,
             request_id: claims.rid,
+            email: claims.email,
+            name: claims.name,
         })
     }
 }
 
-/// Caller whose org is bound to a Chelabase tenant (soft-bind).
+/// Caller whose org is bound to a Chelabase tenant (soft-bind), with their member row.
 #[derive(Debug, Clone)]
-struct AuthPrincipal {
-    sub: String,
-    #[allow(dead_code)]
-    org_id: String,
-    tenant_id: TenantId,
-    request_id: String,
+pub struct AuthPrincipal {
+    pub sub: String,
+    pub org_id: String,
+    pub tenant_id: TenantId,
+    pub request_id: String,
+    /// The caller's member row in the tenant: `None` only in platform mode, which makes no
+    /// members on its own. [`access::authorize`] checks its status on every request.
+    pub member: Option<MemberRecord>,
+    /// Whether the caller's org is `CHELABASE_OPERATOR_ORG_ID` (platform instance routes).
+    pub in_operator_org: bool,
+}
+
+/// The caller's member row in `tenant`, read once per request in the common case.
+///
+/// - Self-hosted (`ModePolicy::auto_create_members`), a person in the tenant's org who has no
+///   row yet is admitted on their first request (R39): the first one claims the tenant's admin;
+///   an invited one is activated; anyone else becomes `pending` when the tenant's open sign-up
+///   is on, and otherwise gets no row (`None`: 403 `no_access_yet`). Platform mode makes no
+///   members and only refreshes existing ones.
+/// - The email and name come from the token's claims. A claim the token lacks keeps the stored
+///   value; when there is none (a new member, or one with no email or name stored), the user is
+///   read once through the admin Zitadel client (ruling R18). A Zitadel failure isn't fatal:
+///   the value stays unknown and a warning is logged.
+/// - An active member whose stored values the token doesn't change isn't written.
+async fn resolve_member<M: MetadataPort, J>(
+    state: &AppState<M, J>,
+    tenant: TenantId,
+    caller: &Caller,
+) -> Result<Option<MemberRecord>, ApiError> {
+    let failed = |err: MetadataError| {
+        error!("resolve member: {err}");
+        ApiError::internal()
+    };
+    let auto_create = state.policy.auto_create_members();
+    // Both claims at hand: `ensure_member` reads, refreshes or makes the row in one go.
+    if auto_create && let (Some(email), Some(name)) = (&caller.email, &caller.name) {
+        return admit(state, tenant, &caller.sub, email, name).await.map_err(failed);
+    }
+    let existing = state
+        .metadata
+        .member_by_zitadel(tenant, &caller.sub)
+        .await
+        .map_err(failed)?;
+    let existing = match existing {
+        None if !auto_create => return Ok(None),
+        // A removed or pending member is returned as is: neither refreshes its claims.
+        Some(m) if matches!(m.status, MemberStatus::Removed | MemberStatus::Pending) => return Ok(Some(m)),
+        other => other,
+    };
+    let mut email = caller
+        .email
+        .clone()
+        .or_else(|| existing.as_ref().and_then(|m| m.email.clone()));
+    let mut name = caller.name.clone().or_else(|| {
+        existing
+            .as_ref()
+            .map(|m| m.display_name.clone())
+            .filter(|n| !n.is_empty())
+    });
+    if email.is_none() || name.is_none() {
+        let (z_email, z_name) = zitadel_claims(state, &caller.sub).await;
+        email = email.or(z_email);
+        name = name.or(z_name);
+    }
+    if let Some(m) = &existing
+        && m.status == MemberStatus::Active
+        && email.as_deref().map(chelabase_zitadel::rules::normalize_email) == m.email
+        && name.as_deref().unwrap_or("") == m.display_name
+    {
+        return Ok(existing);
+    }
+    admit(
+        state,
+        tenant,
+        &caller.sub,
+        email.as_deref().unwrap_or(""),
+        name.as_deref().unwrap_or(""),
+    )
+    .await
+    .map_err(failed)
+}
+
+/// How long after a tenant's admin claim a person with no row is still taken as the other half of
+/// the fresh-install race (R41, M7): the sign-up gate lets everyone in while the tenant has no
+/// member, so two concurrent sign-ups both get accounts, and the second one's first request
+/// arrives after the first has claimed the admin. Long enough for an email verification.
+const FIRST_MEMBER_WINDOW: chrono::Duration = chrono::Duration::hours(1);
+
+/// [`MetadataPort::ensure_member`] with the tenant's sign-up rule: asked with `Closed` first, so
+/// a member who already has a row costs no extra read; only a newcomer reads `open_signup`, and
+/// is then admitted as `pending` or not at all (`None`). M7: a newcomer is also `pending` while
+/// the tenant's admin claim is within [`FIRST_MEMBER_WINDOW`], so the loser of the fresh-install
+/// race isn't stranded with an account and no way in: the admin sees the request.
+async fn admit<M: MetadataPort, J>(
+    state: &AppState<M, J>,
+    tenant: TenantId,
+    sub: &str,
+    email: &str,
+    name: &str,
+) -> Result<Option<MemberRecord>, MetadataError> {
+    match state.metadata.ensure_member(tenant, sub, email, name, Admission::Closed).await {
+        Err(MetadataError::NotAdmitted(_)) => {
+            let race = || state.metadata.admin_claimed_since(tenant, chrono::Utc::now() - FIRST_MEMBER_WINDOW);
+            if state.metadata.open_signup(tenant).await? || race().await? {
+                state.metadata.ensure_member(tenant, sub, email, name, Admission::Pending).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+        other => other.map(Some),
+    }
+}
+
+/// The user's email and display name from Zitadel (`GET /v2/users/{id}`), each `None` when
+/// unknown. Failures are logged and give `None`s.
+async fn zitadel_claims<M, J>(state: &AppState<M, J>, user_id: &str) -> (Option<String>, Option<String>) {
+    let Some(zitadel) = state.zitadel.as_ref() else {
+        return (None, None);
+    };
+    match zitadel.get_user(user_id).await {
+        Ok(Some(user)) => {
+            let text = |s: String| Some(s).filter(|s| !s.trim().is_empty());
+            (text(user.email), text(user.display_name))
+        }
+        Ok(None) => {
+            tracing::warn!(user_id, "member claims: no such Zitadel user; email and name stay unknown");
+            (None, None)
+        }
+        Err(err) => {
+            tracing::warn!(user_id, "member claims: Zitadel lookup failed, email and name stay unknown: {err}");
+            (None, None)
+        }
+    }
+}
+
+fn in_operator_org<M, J>(state: &AppState<M, J>, org_id: &str) -> bool {
+    state.operator_org.as_deref().is_some_and(|org| !org.is_empty() && org == org_id)
+}
+
+/// A caller allowed on an `Instance` route. Checked before the tenant binding (ruling R19): in
+/// platform mode a member of the operator org passes whether or not the org is a tenant's.
+/// Anyone else needs a bound org (else `tenant_not_bound`) and, self-hosted, to be an active
+/// tenant admin. Instance handlers take this instead of [`AuthPrincipal`].
+#[derive(Debug, Clone)]
+pub struct InstancePrincipal {
+    pub sub: String,
+    pub org_id: String,
+    pub request_id: String,
+    /// The caller's tenant; `None` for an operator whose org is no tenant's.
+    pub tenant_id: Option<TenantId>,
+    pub member: Option<MemberRecord>,
+}
+
+impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for InstancePrincipal
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState<M, J>>,
+    ) -> Result<Self, Self::Rejection> {
+        use chelabase_types::access::{decide, Access, CallerFacts};
+        let caller = Caller::from_request_parts(parts, state).await?;
+        let operator = in_operator_org(state, &caller.org_id);
+        if state.policy.instance_admin(false, operator) {
+            return Ok(InstancePrincipal {
+                sub: caller.sub,
+                org_id: caller.org_id,
+                request_id: caller.request_id,
+                tenant_id: None,
+                member: None,
+            });
+        }
+        let tenant_id = lookup_tenant(state, &caller.org_id)
+            .await
+            .map_err(|_| ApiError::internal())?
+            .ok_or_else(tenant_not_bound)?;
+        let member = resolve_member(state, tenant_id, &caller).await?;
+        let facts = CallerFacts { member: access::member_facts(member.as_ref()), in_operator_org: operator };
+        decide(&state.policy, &facts, None, None, None, None, Access::Instance).map_err(access::deny_to_api)?;
+        Ok(InstancePrincipal {
+            sub: caller.sub,
+            org_id: caller.org_id,
+            request_id: caller.request_id,
+            tenant_id: Some(tenant_id),
+            member,
+        })
+    }
+}
+
+fn tenant_not_bound() -> ApiError {
+    ApiError::new(
+        403,
+        ErrorCode::TenantNotBound,
+        "no Chelabase tenant bound to this Zitadel org; run just zitadel-bootstrap",
+    )
 }
 
 impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for AuthPrincipal
@@ -1501,11 +1829,14 @@ where
                 )
             })?;
 
+        let member = resolve_member(state, tenant_id, &caller).await?;
         Ok(AuthPrincipal {
+            in_operator_org: in_operator_org(state, &caller.org_id),
             sub: caller.sub,
             org_id: caller.org_id,
             tenant_id,
             request_id: caller.request_id,
+            member,
         })
     }
 }
@@ -1547,7 +1878,7 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for ApiBytes {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateDatabaseRequest {
-    pub tenant_id: TenantId,
+    /// The project to create it in; the caller needs Admin on it.
     pub project_id: ProjectId,
     pub name: String,
 }
@@ -1656,12 +1987,114 @@ impl Database {
     }
 }
 
+/// The caller and what they may do. Studio only hides what this rules out; the API decides.
 #[derive(Debug, Serialize, ToSchema)]
-struct Me {
-    user: MeUser,
+struct MeResponse {
+    sub: String,
+    /// The member's email (null when unknown), else the token's.
+    #[schema(required = true)]
+    email: Option<String>,
+    /// The member's name (null when unknown), else the token's.
+    #[schema(required = true)]
+    name: Option<String>,
     /// `None` when the caller's org isn't bound to a Chelabase tenant yet.
     #[schema(required = true)]
+    tenant_id: Option<TenantId>,
+    /// The caller's membership in the tenant; `None` when they aren't a member (platform mode
+    /// makes no members) or the org isn't bound.
+    #[schema(required = true)]
+    member: Option<MeMember>,
+    /// Whether the caller may use instance routes (self-hosted: an active tenant admin;
+    /// platform: a member of the operator organisation).
+    instance_admin: bool,
+    /// Each project the caller may use, with their platform role and the Postgres roles they
+    /// may act as there. A tenant admin is Admin with every role on every project.
+    projects: Vec<MeProject>,
+    user: MeUser,
+    /// The tenant with the projects the caller may use; `None` when the caller's org isn't
+    /// bound to a Chelabase tenant yet.
+    #[schema(required = true)]
     tenant: Option<Tenant>,
+    /// The tenant's active admins, for an invited member (an invite that expired before it was
+    /// accepted; R49), who can't read the member list but must know whom to ask. Empty for
+    /// everyone else.
+    tenant_admins: Vec<MeAdmin>,
+}
+
+/// A tenant admin to ask for a new invite.
+#[derive(Debug, Serialize, ToSchema)]
+struct MeAdmin {
+    /// Their display name; empty when they have none.
+    name: String,
+    #[schema(required = true)]
+    email: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct MeMember {
+    /// The caller's member id (as `listMembers` names them).
+    id: Uuid,
+    status: MemberStatusView,
+    tenant_admin: bool,
+}
+
+/// Where a member is: `invited` (not signed in yet), `pending` (signed up, waiting for an
+/// admin to approve), `active`, or `removed`.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemberStatusView {
+    Invited,
+    Pending,
+    Active,
+    Removed,
+}
+
+impl From<MemberStatus> for MemberStatusView {
+    fn from(status: MemberStatus) -> Self {
+        match status {
+            MemberStatus::Invited => Self::Invited,
+            MemberStatus::Pending => Self::Pending,
+            MemberStatus::Active => Self::Active,
+            MemberStatus::Removed => Self::Removed,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+struct MeProject {
+    project_id: ProjectId,
+    platform_role: chelabase_types::access::PlatformRole,
+    /// The Postgres roles the caller may act as on the project: `"all"` for a tenant admin,
+    /// else the names (`owner`, the database's owner, comes with the admin role). A database
+    /// the grant is narrowed on may allow less: see `databases`.
+    roles: MeRoles,
+    /// The databases of the project the caller's grant is narrowed on, with what they may do
+    /// there. A database not listed has the project's `platform_role` and `roles`.
+    databases: Vec<MeDatabase>,
+}
+
+/// The caller's access to one database of a project, where an override narrows it.
+#[derive(Debug, Serialize, ToSchema)]
+struct MeDatabase {
+    database_id: DatabaseId,
+    /// The effective platform role: the grant's, or the lower one the override sets.
+    platform_role: chelabase_types::access::PlatformRole,
+    /// The effective Postgres roles (`owner` only with the admin role).
+    roles: MeRoles,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+enum MeRoles {
+    All(AllRoles),
+    Only(Vec<String>),
+}
+
+/// Every role, the owner included.
+#[derive(Debug, Serialize, ToSchema)]
+enum AllRoles {
+    #[serde(rename = "all")]
+    All,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1674,6 +2107,9 @@ struct MeUser {
 struct Tenant {
     id: TenantId,
     slug: String,
+    /// The tenant's chosen name; `null` means show the slug.
+    #[schema(required = true)]
+    display_name: Option<String>,
     projects: Vec<Project>,
 }
 
@@ -1714,6 +2150,7 @@ impl Tenant {
         Self {
             id: t.id,
             slug: t.slug,
+            display_name: t.display_name,
             projects: t
                 .projects
                 .into_iter()
@@ -1781,6 +2218,7 @@ where
         .merge(projects::routes())
         .merge(app_users::routes())
         .merge(app_user_admin::routes())
+        .merge(members::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
@@ -1806,9 +2244,9 @@ async fn health() -> impl IntoResponse {
     path = "/v1/me",
     operation_id = "getMe",
     tag = "me",
-    summary = "The caller and their tenant",
+    summary = "The caller, their capabilities and their tenant",
     responses(
-        (status = 200, description = "The signed-in user and, once their org is bound, the tenant with its projects and databases", body = Me),
+        (status = 200, description = "The signed-in user, their membership and what they may use, and, once their org is bound, the tenant with the projects and databases they may use", body = MeResponse),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -1818,32 +2256,134 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let tenant = match lookup_tenant(&state, &caller.org_id).await {
-        Err(_) => return ApiError::internal().into_response(),
-        Ok(None) => None,
-        Ok(Some(tenant_id)) => match state.metadata.tenant_overview(tenant_id).await {
+    match me_response(&state, caller).await {
+        Ok(me) => Json(me).into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn me_response<M, J>(state: &AppState<M, J>, caller: Caller) -> Result<MeResponse, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    use chelabase_types::access::{effective, PlatformRole, RoleSet};
+    let failed = |what: &str, err: MetadataError| {
+        error!("{what}: {err}");
+        ApiError::internal()
+    };
+    let tenant_id = lookup_tenant(state, &caller.org_id).await.map_err(|_| ApiError::internal())?;
+    let member = match tenant_id {
+        Some(tenant) => resolve_member(state, tenant, &caller).await?,
+        None => None,
+    };
+    let active = member.as_ref().filter(|m| m.status == MemberStatus::Active);
+    let tenant_admin = active.is_some_and(|m| m.tenant_admin);
+    let instance_admin = state.policy.instance_admin(tenant_admin, in_operator_org(state, &caller.org_id));
+
+    // The projects the caller may use: all of them for a tenant admin, else their grants.
+    let projects = match (tenant_id, active) {
+        (Some(tenant), Some(_)) if tenant_admin => state
+            .metadata
+            .list_projects(tenant)
+            .await
+            .map_err(|e| failed("list projects", e))?
+            .into_iter()
+            .map(|p| MeProject {
+                project_id: p.id,
+                platform_role: PlatformRole::Admin,
+                roles: MeRoles::All(AllRoles::All),
+                databases: Vec::new(),
+            })
+            .collect(),
+        (Some(_), Some(m)) => {
+            let grants = state
+                .metadata
+                .member_projects(m.id)
+                .await
+                .map_err(|e| failed("member projects", e))?;
+            let overrides = state
+                .metadata
+                .member_overrides(m.id)
+                .await
+                .map_err(|e| failed("member overrides", e))?;
+            let roles_of = |roles: RoleSet| match roles {
+                RoleSet::All => MeRoles::All(AllRoles::All),
+                RoleSet::Only(set) => MeRoles::Only(set.iter().map(|r| r.as_str().to_string()).collect()),
+            };
+            grants
+                .into_iter()
+                .map(|(project, row)| {
+                    let base = access::grant_of(&row);
+                    let grant = effective(&base, None);
+                    let databases = overrides
+                        .iter()
+                        .filter(|(p, _, _)| *p == project)
+                        .map(|(_, database, o)| {
+                            let narrowed = effective(&base, Some(&access::narrowing_of(o)));
+                            MeDatabase {
+                                database_id: DatabaseId(*database),
+                                platform_role: narrowed.platform_role,
+                                roles: roles_of(narrowed.roles),
+                            }
+                        })
+                        .collect();
+                    MeProject {
+                        project_id: ProjectId(project),
+                        platform_role: grant.platform_role,
+                        roles: roles_of(grant.roles),
+                        databases,
+                    }
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+
+    let tenant = match tenant_id {
+        None => None,
+        Some(tenant_id) => match state.metadata.tenant_overview(tenant_id).await {
             Ok(None) => None,
-            Ok(Some(overview)) => match main_branches(&state.metadata, overview.id).await {
-                Ok(mains) => Some(Tenant::new(overview, &mains, &state.proxy)),
-                Err(err) => {
-                    error!("main branches: {err}");
-                    return ApiError::internal().into_response();
-                }
-            },
-            Err(err) => {
-                error!("tenant overview: {err}");
-                return ApiError::internal().into_response();
+            Ok(Some(mut overview)) => {
+                let visible: HashSet<ProjectId> = projects.iter().map(|p| p.project_id).collect();
+                overview.projects.retain(|p| tenant_admin || visible.contains(&p.id));
+                let mains = main_branches(&state.metadata, overview.id)
+                    .await
+                    .map_err(|e| failed("main branches", e))?;
+                Some(Tenant::new(overview, &mains, &state.proxy))
             }
+            Err(err) => return Err(failed("tenant overview", err)),
         },
     };
-    Json(Me {
-        user: MeUser {
-            sub: caller.sub,
-            org_id: caller.org_id,
-        },
+    let (email, name) = match &member {
+        Some(m) => (m.email.clone(), Some(m.display_name.clone()).filter(|n| !n.is_empty())),
+        None => (caller.email.clone(), caller.name.clone()),
+    };
+    // R49: an invited member (their invite expired before it was accepted) learns whom to ask.
+    let tenant_admins = match (tenant_id, &member) {
+        (Some(tenant), Some(m)) if m.status == MemberStatus::Invited => state
+            .metadata
+            .list_members(tenant)
+            .await
+            .map_err(|e| failed("tenant admins", e))?
+            .into_iter()
+            .filter(|l| l.tenant_admin && l.status == MemberStatus::Active)
+            .map(|l| MeAdmin { name: l.display_name.clone(), email: l.email.clone() })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(MeResponse {
+        sub: caller.sub.clone(),
+        email,
+        name,
+        tenant_id,
+        member: member.as_ref().map(|m| MeMember { id: m.id, status: m.status.into(), tenant_admin: m.tenant_admin }),
+        instance_admin,
+        projects,
+        user: MeUser { sub: caller.sub, org_id: caller.org_id },
         tenant,
+        tenant_admins,
     })
-    .into_response()
 }
 
 #[utoipa::path(
@@ -1858,8 +2398,8 @@ where
         (status = 202, description = "Accepted; the database is provisioned in the background (poll it until `ready`)", body = CreateDatabaseAccepted),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: `tenant_id` isn't the caller's tenant", body = ErrorEnvelope),
-        (status = 404, description = "`not_found`: the tenant or project doesn't exist (another tenant's project answers the same)", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 404, description = "the project doesn't exist or is another tenant's", body = ErrorEnvelope),
         (status = 409, description = "`name_taken`: a database with this name exists in the project; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -1877,20 +2417,22 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    if body.tenant_id != principal.tenant_id {
-        return ApiError::new(
-            403,
-            ErrorCode::Forbidden,
-            "tenant_id does not match authenticated Zitadel org binding",
-        )
-        .into_response();
-    }
-
     if body.name.trim().is_empty() {
         return ApiError::invalid_request(422, "name is required").into_response();
     }
     if let Err(err) = chelabase_metadata::postgres_database_name(&body.name) {
         return ApiError::invalid_request(422, err.to_string()).into_response();
+    }
+    // The project comes from the body: a missing or another tenant's one is 404.
+    if let Err(err) = authorize(
+        &state,
+        &principal,
+        routes::CREATE_DATABASE.policy.access,
+        Target::Project(body.project_id.as_uuid()),
+    )
+    .await
+    {
+        return err.into_response();
     }
 
     let job_id = Uuid::new_v4();
@@ -1898,7 +2440,7 @@ where
 
     if let Err(err) = state
         .metadata
-        .insert_database_pending(database_id, body.tenant_id, body.project_id, &body.name)
+        .insert_database_pending(database_id, principal.tenant_id, body.project_id, &body.name)
         .await
     {
         return map_metadata_error(err);
@@ -1909,7 +2451,7 @@ where
         payload: ProvisionDatabaseJob {
             database_id,
             project_id: body.project_id,
-            tenant_id: body.tenant_id,
+            tenant_id: principal.tenant_id,
             name: body.name.clone(),
         },
     };
@@ -1972,64 +2514,34 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let database_id = DatabaseId(id);
-    match state.metadata.get_database(database_id).await {
-        // Tombstones are invisible through the API.
-        Ok(Some(record)) if record.status == DatabaseStatus::Deleted => {
-            ApiError::not_found("database not found").into_response()
-        }
-        Ok(Some(record)) => {
-            // Another tenant's database answers exactly what a missing one does.
-            if record.tenant_id != principal.tenant_id {
-                return ApiError::not_found("database not found").into_response();
-            }
-            let branches = match state.metadata.list_branches(database_id).await {
-                Ok(branches) => branches,
-                Err(err) => {
-                    error!("list branches: {err}");
-                    return ApiError::internal().into_response();
-                }
-            };
-            let count = branches.iter().filter(|b| b.kind == BranchKind::Normal).count() as i64;
-            let main = branches.iter().find(|b| b.id == BranchId::from(database_id));
-            (
-                StatusCode::OK,
-                Json(Database::new(record, main, count, &state.proxy)),
-            )
-                .into_response()
-        }
-        Ok(None) => ApiError::not_found("database not found").into_response(),
+    // Tombstones, another tenant's database and one the caller has no grant on all answer
+    // exactly what a missing one does.
+    let record = match authorize_database(
+        &state,
+        &principal,
+        routes::GET_DATABASE.policy.access,
+        Target::Database(id),
+    )
+    .await
+    {
+        Ok(record) => record,
+        Err(err) => return err.into_response(),
+    };
+    let database_id = record.database_id;
+    let branches = match state.metadata.list_branches(database_id).await {
+        Ok(branches) => branches,
         Err(err) => {
-            error!("get_database: {err}");
-            ApiError::internal().into_response()
+            error!("list branches: {err}");
+            return ApiError::internal().into_response();
         }
-    }
-}
-
-/// The caller's own, non-deleted database, or the response to send instead.
-async fn load_owned<M, J>(
-    state: &AppState<M, J>,
-    principal: &AuthPrincipal,
-    id: Uuid,
-) -> Result<DatabaseRecord, ApiError>
-where
-    M: MetadataPort,
-    J: JobPort,
-{
-    match state.metadata.get_database(DatabaseId(id)).await {
-        Ok(Some(record)) if record.status == DatabaseStatus::Deleted => {
-            Err(ApiError::not_found("database not found"))
-        }
-        Ok(Some(record)) if record.tenant_id != principal.tenant_id => {
-            Err(ApiError::not_found("database not found"))
-        }
-        Ok(Some(record)) => Ok(record),
-        Ok(None) => Err(ApiError::not_found("database not found")),
-        Err(err) => {
-            error!("load database: {err}");
-            Err(ApiError::internal())
-        }
-    }
+    };
+    let count = branches.iter().filter(|b| b.kind == BranchKind::Normal).count() as i64;
+    let main = branches.iter().find(|b| b.id == BranchId::from(database_id));
+    (
+        StatusCode::OK,
+        Json(Database::new(record, main, count, &state.proxy)),
+    )
+        .into_response()
 }
 
 /// The database's main branch, if it has one.
@@ -2127,7 +2639,14 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(
+        &state,
+        &principal,
+        routes::DATABASE_CONNECTION.policy.access,
+        Target::Database(id),
+    )
+    .await
+    {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -2306,7 +2825,7 @@ where
             password_state,
             uri,
             http_url,
-            ca_file: (state.mode == Mode::SelfHosted).then(|| state.proxy_ca_file.clone()),
+            ca_file: state.policy.ca_file_on_reveal().then(|| state.proxy_ca_file.clone()),
         }),
     )
         .into_response()
@@ -2340,7 +2859,14 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(
+        &state,
+        &principal,
+        routes::RESET_PASSWORD.policy.access,
+        Target::Database(id),
+    )
+    .await
+    {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -2438,7 +2964,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
-        (status = 409, description = "`already_deleting`: the database is already being deleted; `branch_protected`: a branch of the database is protected, unprotect it first", body = ErrorEnvelope),
+        (status = 409, description = "`already_deleting`: the database is already being deleted; `branch_protected`: a branch of the database is protected, unprotect it first; `conflict`: the database holds the project's app users, disable app users first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -2451,10 +2977,34 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(
+        &state,
+        &principal,
+        routes::DELETE_DATABASE.policy.access,
+        Target::Database(id),
+    )
+    .await
+    {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
+    // The database that holds a project's app users can't go while they are enabled (R20: the
+    // app-user routes act on it, and disabling needs it).
+    match state.metadata.app_auth_for_database(record.database_id).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return ApiError::new(
+                409,
+                ErrorCode::Conflict,
+                "this database holds the project's app users; disable app users first",
+            )
+            .into_response();
+        }
+        Err(err) => {
+            error!("app auth for database: {err}");
+            return ApiError::internal().into_response();
+        }
+    }
     match state.metadata.begin_delete(record.database_id).await {
         Ok(BeginDelete::Started) => {}
         Ok(BeginDelete::Protected) => {

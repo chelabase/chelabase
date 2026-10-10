@@ -3,6 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
+import type { MeResponse as Me } from "@chelabase/management-client";
+import { ProjectCapsContext, projectCaps, type ProjectCaps } from "@/lib/capabilities";
 import { TablesView } from "./tables-view";
 
 const B = "/v1/databases/d1/branches";
@@ -50,6 +52,7 @@ interface Opts {
   schema?: FakeHandler;
   query?: FakeHandler;
   databases?: unknown[];
+  caps?: ProjectCaps;
 }
 function setup(opts: Opts = {}) {
   const f: FakeFetch = fakeFetch({
@@ -60,7 +63,8 @@ function setup(opts: Opts = {}) {
     [`GET ${BR}/console/schema`]: opts.schema ?? (() => jsonResponse(schema)),
     [`POST ${BR}/console/query`]: opts.query ?? (() => jsonResponse(rows(2))),
   });
-  const result = renderWithQuery(<TablesView databaseId="d1" />, { fetch: f });
+  const view = <TablesView databaseId="d1" />;
+  const result = renderWithQuery(opts.caps ? <ProjectCapsContext.Provider value={opts.caps}>{view}</ProjectCapsContext.Provider> : view, { fetch: f });
   return { ...result, f, user: userEvent.setup() };
 }
 const queries = (f: FakeFetch) => f.calls.filter((r) => r.method === "POST" && r.url.endsWith("/console/query"));
@@ -130,6 +134,18 @@ describe("TablesView", () => {
     await open(user);
     await vi.waitFor(async () => expect(await last(f)).toMatchObject({ database: "analytics" }));
     expect(f.calls.some((r) => r.url.includes("console/schema") && r.url.includes("database=analytics"))).toBe(true);
+  });
+
+  it("a caller with no role to act as gets no owner banner and no schema call", async () => {
+    // A Viewer granted no Postgres roles: nothing to view as, so "Viewing as owner" would be false.
+    const me = {
+      member: { id: "v", status: "active", tenant_admin: false },
+      projects: [{ project_id: "p1", platform_role: "viewer", roles: [], databases: [] }],
+    } as unknown as Me;
+    const { f } = setup({ caps: projectCaps(me, "p1") });
+    expect(await screen.findByText("You can't act as any Postgres role here, so there's nothing to browse.")).toBeInTheDocument();
+    expect(screen.queryByText(/Viewing as owner/)).not.toBeInTheDocument();
+    expect(f.calls.some((r) => r.url.includes("console/schema"))).toBe(false);
   });
 
   it("view_as_a_bypassrls_role_warns_like_the_owner (M3)", async () => {

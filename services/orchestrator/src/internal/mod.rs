@@ -7,7 +7,9 @@ pub mod config;
 mod data;
 mod ddl;
 mod hooks;
+mod invite;
 mod proxy;
+mod signup;
 mod spec;
 
 use axum::extract::{Request, State};
@@ -15,7 +17,7 @@ use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use chelabase_metadata::{
     AppSession, BranchAuthSync, BranchConnectionRow, BranchRecord, DataKeyLookup, MetadataClient,
@@ -174,6 +176,28 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         keep: Option<Uuid>,
         created_before: Option<DateTime<Utc>>,
     ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
+
+    /// What the sign-up gate needs for the tenant of this Zitadel org; `None` when no tenant
+    /// has it.
+    fn signup_facts(
+        &self,
+        zitadel_org_id: &str,
+    ) -> impl Future<Output = Result<Option<SignUpFacts>, MetadataError>> + Send;
+
+    /// What the open invite of this Zitadel user shows (`None` when it has none).
+    fn open_invite_for_user(
+        &self,
+        zitadel_user_id: &str,
+    ) -> impl Future<Output = Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError>> + Send;
+}
+
+/// A tenant's sign-up state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignUpFacts {
+    /// The tenant's open sign-up switch.
+    pub open: bool,
+    /// Whether it has an invited or active member.
+    pub has_members: bool,
 }
 
 // As for `MetadataPort`: each method must call `MetadataClient`'s inherent method by its full
@@ -314,6 +338,21 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Vec<AppSession>, MetadataError> {
         MetadataClient::revoke_user_sessions(self, project, user, keep, created_before).await
     }
+    async fn open_invite_for_user(
+        &self,
+        zitadel_user_id: &str,
+    ) -> Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError> {
+        MetadataClient::open_invite_for_user(self, zitadel_user_id).await
+    }
+    async fn signup_facts(&self, zitadel_org_id: &str) -> Result<Option<SignUpFacts>, MetadataError> {
+        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(SignUpFacts {
+            open: MetadataClient::open_signup(self, tenant).await?,
+            has_members: MetadataClient::tenant_has_members(self, tenant).await?,
+        }))
+    }
 }
 
 pub struct InternalState<M, L> {
@@ -356,6 +395,8 @@ pub struct InternalState<M, L> {
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// Publishes app-user sync jobs.
     pub app_jobs: Arc<dyn app::AppJobPort>,
+    /// What the mode allows (the sign-up gate answers `platform` when it refuses).
+    pub policy: chelabase_types::mode_policy::ModePolicy,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router
@@ -392,6 +433,11 @@ where
             data_keys_token,
             require_bearer,
         ));
+    let signup_token: Arc<str> = state.app_auth_token.as_str().into();
+    let signup = Router::new()
+        .route("/internal/signup/allowed", get(signup::allowed::<M, L>))
+        .route("/internal/invites/describe", post(invite::describe::<M, L>))
+        .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));
     let rest_token: Arc<str> = state.rest_token.as_str().into();
     let rest = Router::new()
         .route(
@@ -415,6 +461,7 @@ where
         .merge(storcon)
         .merge(data_keys)
         .merge(rest)
+        .merge(signup)
         .merge(app::routes(&state))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

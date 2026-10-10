@@ -20,9 +20,12 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use crate::access::{authorize_database, Target};
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::Access;
 use crate::branches::{BranchDatabaseView, conflict, load_branch, parse_body, unprocessable, valid_schema_name};
 use crate::{
-    ApiBytes, AppState, AuthPrincipal, BACKUP_REFUSAL, JobPort, MetadataPort, ResetError, load_owned,
+    ApiBytes, AppState, AuthPrincipal, BACKUP_REFUSAL, JobPort, MetadataPort, ResetError,
 };
 
 /// Most databases one key may name.
@@ -44,14 +47,16 @@ where
 async fn ready_branch<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
+    access: Access,
     id: Uuid,
     branch_id: Uuid,
+    pg_database: &str,
 ) -> Result<BranchRecord, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = load_owned(state, principal, id).await?;
+    let record = authorize_database(state, principal, access, Target::PgDatabase { database: id, branch: branch_id, pg_database }).await?;
     let branch = load_branch(state, &record, branch_id).await?;
     if branch.kind == BranchKind::Backup {
         return Err(conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL));
@@ -179,7 +184,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let branch = match ready_branch(&state, &principal, id, branch_id).await {
+    let branch = match ready_branch(&state, &principal, ep::ENABLE_DATA_API.policy.access, id, branch_id, &name).await {
         Ok(branch) => branch,
         Err(err) => return err.into_response(),
     };
@@ -269,7 +274,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let branch = match ready_branch(&state, &principal, id, branch_id).await {
+    let branch = match ready_branch(&state, &principal, ep::DISABLE_DATA_API.policy.access, id, branch_id, &name).await {
         Ok(branch) => branch,
         Err(err) => return err.into_response(),
     };
@@ -390,7 +395,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let branch = match ready_branch(&state, &principal, id, branch_id).await {
+    let branch = match ready_branch(&state, &principal, ep::UPDATE_PG_DATABASE.policy.access, id, branch_id, &name).await {
         Ok(branch) => branch,
         Err(err) => return err.into_response(),
     };

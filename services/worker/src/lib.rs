@@ -23,6 +23,7 @@ pub mod data_api;
 pub mod delete;
 #[cfg(test)]
 mod fakes;
+pub mod member_roles;
 pub mod merge;
 pub mod names;
 pub mod point;
@@ -80,6 +81,8 @@ pub struct Worker<M, S, C, N, P> {
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// How often every enabled project's users are reconciled (`CHELABASE_APP_USERS_RECONCILE_SECS`).
     pub app_users_reconcile_every: Duration,
+    /// How often the member-role sweep runs (`CHELABASE_MEMBER_ROLES_SWEEP_SECS`).
+    pub member_roles_sweep_every: Duration,
     /// `CHELABASE_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
     /// endpoint row records (off: they're logged and kept).
     pub remove_orphans: bool,
@@ -91,4 +94,7 @@ pub struct Worker<M, S, C, N, P> {
     pub merge_online_step_timeout: Duration,
     /// Branch resync requests (`chelabase.resync.branch`), connected by the process.
     pub resync_requests: resync::ResyncRequests,
+    /// Member-role reconcile requests (`chelabase.member_roles.reconcile`), connected by the
+    /// process.
+    pub member_role_requests: member_roles::MemberRoleRequests,
 }

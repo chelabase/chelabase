@@ -73,6 +73,33 @@ pub fn open_session(key: &SecretKey, sealed: &str, now: u64) -> Option<SessionSt
     (state.exp >= now).then_some(state)
 }
 
+const TICKET_AAD: &str = "chelabase:auth:accept-ticket";
+/// How long an accept ticket lets the remaining steps be retried.
+pub const TICKET_TTL_SECS: u64 = 900;
+
+/// Proof that an invite's code was already verified for `user_id`: the steps after verification
+/// can be retried with it, because the code is spent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptTicket {
+    pub user_id: String,
+    pub exp: u64,
+    /// Random per ticket; a ticket is one-use (see `guard::UsedTickets`).
+    pub nonce: String,
+}
+
+pub fn seal_ticket(key: &SecretKey, ticket: &AcceptTicket) -> String {
+    seal(
+        key,
+        TICKET_AAD,
+        &serde_json::to_string(ticket).expect("serializable"),
+    )
+}
+
+pub fn open_ticket(key: &SecretKey, sealed: &str, now: u64) -> Option<AcceptTicket> {
+    let t: AcceptTicket = serde_json::from_str(&open(key, TICKET_AAD, sealed).ok()?).ok()?;
+    (t.exp >= now).then_some(t)
+}
+
 pub fn set_cookie(name: &str, value: &str, max_age: u64, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
     format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/auth/v1; Max-Age={max_age}{secure}")

@@ -5,7 +5,7 @@ description: Run SQL scripts against a branch from Studio, with a confirmation g
 
 Studio's **SQL** view runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. To open it, choose **SQL** on a database in the project's **Databases** tab.
 
-The editor connects with the database owner's credentials, so it is for people who already own the database. Everything below is also available over the API:
+Running as the owner (the default for an Admin) uses the database owner's credentials. A Developer, who may not act as the owner, runs as one of the Postgres roles their grant lists, through a login role of their own that can only switch into those roles: see [Roles and schema isolation](/docs/using/roles-and-schema-isolation). Saved queries are shared within the project. Everything below is also available over the API:
 
 | Request | What it does |
 |---|---|

@@ -7,27 +7,28 @@ Studio is the web app (`apps/studio`: React, TanStack Router and TanStack Query)
 
 ## Sign-in
 
-Studio has its own sign-in pages: `/login`, `/register`, `/verify`, `/password-reset` and `/logout`. Zitadel v4 sends every sign-in there. The pages call the `auth` service through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login client's token and keeps the step state in encrypted, HttpOnly cookies. The login API is documented from its own OpenAPI document (`openapi/login.json`, published as the [login API](/docs/architecture/login-api/login/signIn) reference); it is for Studio only.
+Studio has its own sign-in pages: `/login`, `/register`, `/accept-invite`, `/verify`, `/password-reset` and `/logout`. Zitadel v4 sends every sign-in there. The pages call the `auth` service through the gateway (`/auth/v1/*`), which talks to Zitadel's Session, User and OIDC v2 APIs with the login client's token and keeps the step state in encrypted, HttpOnly cookies. The login API is documented from its own OpenAPI document (`openapi/login.json`, published as the [login API](/docs/architecture/login-api/login/signIn) reference); it is for Studio only.
 
 Studio itself is an OIDC client of Zitadel (a public app using PKCE, with JWT access tokens). After sign-in it returns to `/callback` and then `/app`, and every Management API call carries the access token. The requested scopes put the user's organization in the token, which the gateway maps to a tenant, and add the Chelabase project to the token's audience.
 
 - In **platform mode**, answers don't reveal whether an account exists. One known limit: signing up and then signing in with the same email and password tells a new email from a taken one.
 - In **self-hosted mode**, a sign-up for a taken email says so and sends you to sign in.
+- Sign-up is gated per mode: platform mode refuses it (until its own design), and self-hosted mode takes it only while the tenant's open sign-up is on (or the tenant has no member yet). The auth request tells Studio whether it is offered (`signUpAllowed`); otherwise the sign-in page keeps the generic error and a standing "No account? Ask your admin for an invite.". Zitadel's own registration page is turned off (`allowRegister: false` in `dev bootstrap`).
 
 ### Mode and email verification
 
-`CHELABASE_MODE` is `self-hosted` (the default, the dev mode) or `platform` (the hosted cloud, not built yet). Email verification follows the mode: off in self-hosted mode (sign-ups are created with the email already verified), required in platform mode. `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true` or `=false` overrides it. When it is on, codes land in Mailpit.
+`CHELABASE_MODE` is `self-hosted` (the default, the dev mode) or `platform` (the hosted cloud, not built yet). Email verification of sign-ups follows the mode: off in self-hosted mode (sign-ups are created with the email already verified), required in platform mode. Invitees verify by accepting the invite. `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true` or `=false` overrides it. When it is on, codes land in Mailpit.
 
 ### One workspace per instance
 
-Everyone who signs up joins the same organization, tenant and project: a shared team workspace, which is by design for self-hosting. The pin is one scope in `apps/studio/src/lib/auth.ts` (`urn:zitadel:iam:org:id:<org>`). Giving each sign-up its own organization means dropping that scope; the [Studio auth spec](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-studio-auth-design.md) sketches it.
+Everyone who joins (by invite, or by sign-up when it is open) is in the same organization and tenant: a shared team workspace, which is by design for self-hosting. The pin is one scope in `apps/studio/src/lib/auth.ts` (`urn:zitadel:iam:org:id:<org>`). Giving each sign-up its own organization means dropping that scope; the [Studio auth spec](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-studio-auth-design.md) sketches it.
 
 `GET /v1/me` returns the caller plus their tenant, projects and databases, or `tenant: null` when the organization has no tenant.
 
 ## Local sign-in flow
 
-1. `just dev`, then open `http://localhost:3000` and choose **Create account** (or **Sign in**).
-2. You land in Studio straight away, because email verification is off in self-hosted mode. Emails such as password resets land in Mailpit at `http://localhost:8025`.
+1. `just dev`, then open `http://localhost:3000` and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost`, or the email you pass it, `just zitadel-bootstrap you@example.com`, the tenant admin).
+2. Emails such as invites and password resets land in Mailpit at `http://localhost:8025`. Without an email provider, invite by link instead.
 3. Studio opens on your projects and their databases; everything goes through the gateway on `:8000` with your Zitadel token.
 
 Open Studio at `http://localhost:3000`: visits to `127.0.0.1:3000` are redirected there, because the Zitadel redirect URI and the gateway's CORS origins are registered for `localhost`. `CHELABASE_STUDIO_PORT` changes the dev server's port, but the redirect URI is registered for `:3000`.

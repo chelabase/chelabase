@@ -164,6 +164,12 @@ pub struct RoleAttributes {
     pub bypass_rls: bool,
     /// The roles it's a direct member of (`neon_superuser` excluded), sorted.
     pub member_of: Vec<String>,
+    /// Those of [`Self::member_of`] without the SET option (the role can't `SET ROLE` to
+    /// them), sorted. The API grants SET, so for its roles this is empty.
+    pub member_no_set: Vec<String>,
+    /// Those of [`Self::member_of`] with the ADMIN option (the role can grant the group on),
+    /// sorted. The API never grants it.
+    pub member_admin: Vec<String>,
 }
 
 impl Default for RoleAttributes {
@@ -174,6 +180,8 @@ impl Default for RoleAttributes {
             valid_until: None,
             bypass_rls: false,
             member_of: Vec::new(),
+            member_no_set: Vec::new(),
+            member_admin: Vec::new(),
         }
     }
 }
@@ -429,6 +437,9 @@ pub struct CopyUpsert {
     /// An `api` row's `api_owner_level` as the catalog shows it (E32); `None` keeps the row's.
     /// Ignored for other rows.
     pub api_owner_level: Option<bool>,
+    /// The role has no password at all (a group role made in SQL): no verifier, and not an
+    /// MD5 role either. Held back for 10 s after a forward, like the verifier.
+    pub no_password: bool,
 }
 
 impl std::fmt::Debug for CopyUpsert {
@@ -443,6 +454,7 @@ impl std::fmt::Debug for CopyUpsert {
             .field("pending", &self.pending)
             .field("attributes", &self.attributes)
             .field("api_owner_level", &self.api_owner_level)
+            .field("no_password", &self.no_password)
             .finish()
     }
 }
@@ -529,6 +541,8 @@ fn attributes_from_row(row: &sqlx::postgres::PgRow) -> Result<RoleAttributes, Me
         valid_until: row.try_get("valid_until")?,
         bypass_rls: row.try_get("bypass_rls")?,
         member_of: row.try_get("member_of")?,
+        member_no_set: row.try_get("member_no_set")?,
+        member_admin: row.try_get("member_admin")?,
     })
 }
 
@@ -585,6 +599,7 @@ mod tests {
         let a = RoleAttributes::default();
         assert!(a.inherit && !a.bypass_rls);
         assert_eq!((a.connection_limit, a.valid_until, a.member_of.len()), (-1, None, 0));
+        assert!(a.member_no_set.is_empty() && a.member_admin.is_empty());
     }
 
     #[test]
@@ -623,6 +638,7 @@ mod tests {
             pending: false,
             attributes: RoleAttributes::default(),
             api_owner_level: None,
+            no_password: false,
         };
         let write = ResyncWrite { upserts: vec![up.clone()], removals: vec![], databases: vec![] };
         for shown in [format!("{up:?}"), format!("{write:?}")] {
@@ -754,12 +770,13 @@ impl MetadataClient {
     /// Owner first, then by name (`COLLATE "C"`).
     pub async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
         let rows = sqlx::query(
-            "SELECT r.name, r.origin, r.level, r.login, r.scram_verifier IS NULL AS md5,
+            "SELECT r.name, r.origin, r.level, r.login, r.scram_verifier IS NULL AS md5, r.no_password,
                     r.password_enc IS NOT NULL AS sealed, r.pending, r.created_at,
                     r.password_unreadable,
                     coalesce((SELECT b.owner_password_enc IS NOT NULL FROM branches b
                               WHERE b.endpoint_id = r.endpoint_id LIMIT 1), false) AS owner_sealed,
-                    r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of
+                    r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of,
+                    r.member_no_set, r.member_admin
              FROM neon_roles r
              WHERE r.endpoint_id = $1
              ORDER BY (r.origin <> 'owner'), r.name COLLATE \"C\"",
@@ -777,11 +794,14 @@ impl MetadataClient {
                     row.try_get("owner_sealed")?,
                 );
                 let login: bool = row.try_get("login")?;
+                let no_password: bool = row.try_get("no_password")?;
                 let password = match origin {
                     RoleOrigin::Owner if owner_sealed => PasswordState::Generated,
                     RoleOrigin::Owner => PasswordState::SetInSql,
                     // A NOLOGIN role made through the API has no password at all.
                     RoleOrigin::Api if !login && md5 && !sealed => PasswordState::None,
+                    // A role with no password at all (a group role made in SQL).
+                    _ if no_password => PasswordState::None,
                     _ if md5 => PasswordState::Md5Unusable,
                     _ if unreadable => PasswordState::Unreadable,
                     _ if sealed => PasswordState::Generated,
@@ -810,7 +830,8 @@ impl MetadataClient {
         let rows = sqlx::query(
             "SELECT e.roles_version, r.name, r.origin, r.scram_verifier, r.password_enc, r.login,
                     r.level, r.api_owner_level, r.pending, r.attributes_pending, r.created_at,
-                    r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of
+                    r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of,
+                    r.member_no_set, r.member_admin
              FROM neon_endpoints e
              LEFT JOIN neon_roles r ON r.endpoint_id = e.id
              WHERE e.id = $1
@@ -1264,9 +1285,10 @@ impl MetadataClient {
             "INSERT INTO neon_roles
                  (endpoint_id, name, scram_verifier, origin, level, api_owner_level, password_enc,
                   pending, attributes_pending, password_unreadable, login, inherit,
-                  connection_limit, valid_until, bypass_rls, member_of, attributes_change_id)
+                  connection_limit, valid_until, bypass_rls, member_of, attributes_change_id,
+                  member_no_set, member_admin)
              VALUES ($1, $2, $3, 'api', $4, $5, $6, true, true, false, $7, $8, $9, $10, $11, $12,
-                     $13)
+                     $13, $14, $15)
              ON CONFLICT DO NOTHING",
         )
         .bind(endpoint_id)
@@ -1282,6 +1304,8 @@ impl MetadataClient {
         .bind(a.bypass_rls)
         .bind(&a.member_of)
         .bind(role.change_id)
+        .bind(&a.member_no_set)
+        .bind(&a.member_admin)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1341,7 +1365,8 @@ impl MetadataClient {
                  scram_verifier = CASE $11::int WHEN 0 THEN scram_verifier ELSE $12 END,
                  password_enc = CASE $11::int WHEN 0 THEN password_enc ELSE $13 END,
                  password_unreadable = CASE $11::int WHEN 0 THEN password_unreadable ELSE false END,
-                 pending = true, attributes_pending = true, attributes_change_id = $14
+                 pending = true, attributes_pending = true, attributes_change_id = $14,
+                 member_no_set = $15, member_admin = $16
              WHERE endpoint_id = $1 AND name = $2 AND origin = 'api'",
         )
         .bind(endpoint_id)
@@ -1358,6 +1383,8 @@ impl MetadataClient {
         .bind(verifier)
         .bind(sealed)
         .bind(change.change_id)
+        .bind(&a.member_no_set)
+        .bind(&a.member_admin)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1408,7 +1435,7 @@ impl MetadataClient {
              VALUES ($1, $2, $3, 'sql', $4, true, true)
              ON CONFLICT (endpoint_id, name) DO UPDATE SET
                  scram_verifier = EXCLUDED.scram_verifier, password_enc = EXCLUDED.password_enc,
-                 login = true, pending = true, password_unreadable = false
+                 login = true, pending = true, password_unreadable = false, no_password = false
              WHERE r.origin <> 'owner'",
         )
         .bind(endpoint_id)
@@ -1442,7 +1469,7 @@ impl MetadataClient {
         }
         let updated = sqlx::query(
             "UPDATE neon_roles SET scram_verifier = $3, password_enc = $4, pending = true,
-                 password_unreadable = false
+                 password_unreadable = false, no_password = false
              WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
         )
         .bind(endpoint_id)
@@ -1717,9 +1744,10 @@ impl MetadataClient {
             let sql = format!(
                 "INSERT INTO neon_roles AS r
                      (endpoint_id, name, scram_verifier, origin, password_enc, login, level, pending,
-                      inherit, connection_limit, valid_until, bypass_rls, member_of)
+                      inherit, connection_limit, valid_until, bypass_rls, member_of,
+                      member_no_set, member_admin, no_password)
                  VALUES ($1, $2, $3, $4, CASE WHEN $7::int = 2 THEN $8 ELSE NULL END, $5, $6, $9,
-                         $10, $11, $12, $13, $14)
+                         $10, $11, $12, $13, $14, $16, $17, $18)
                  ON CONFLICT (endpoint_id, name) DO UPDATE SET
                      scram_verifier = CASE WHEN {held} THEN r.scram_verifier
                                            ELSE EXCLUDED.scram_verifier END,
@@ -1727,6 +1755,7 @@ impl MetadataClient {
                                          ELSE CASE $7::int WHEN 0 THEN r.password_enc
                                                            WHEN 1 THEN NULL ELSE $8 END END,
                      login = CASE WHEN {held} THEN r.login ELSE EXCLUDED.login END,
+                     no_password = CASE WHEN {held} THEN r.no_password ELSE EXCLUDED.no_password END,
                      level = EXCLUDED.level,
                      pending = EXCLUDED.pending,
                      inherit = EXCLUDED.inherit,
@@ -1734,6 +1763,8 @@ impl MetadataClient {
                      valid_until = EXCLUDED.valid_until,
                      bypass_rls = EXCLUDED.bypass_rls,
                      member_of = EXCLUDED.member_of,
+                     member_no_set = EXCLUDED.member_no_set,
+                     member_admin = EXCLUDED.member_admin,
                      attributes_pending = false,
                      api_owner_level = CASE WHEN r.origin = 'api' AND $15::bool IS NOT NULL
                                             THEN $15 ELSE r.api_owner_level END,
@@ -1752,8 +1783,11 @@ impl MetadataClient {
                         OR r.valid_until IS DISTINCT FROM EXCLUDED.valid_until
                         OR r.bypass_rls IS DISTINCT FROM EXCLUDED.bypass_rls
                         OR r.member_of IS DISTINCT FROM EXCLUDED.member_of
+                        OR r.member_no_set IS DISTINCT FROM EXCLUDED.member_no_set
+                        OR r.member_admin IS DISTINCT FROM EXCLUDED.member_admin
                         OR (NOT {held}
                             AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
+                                 OR r.no_password IS DISTINCT FROM EXCLUDED.no_password
                                  OR r.login IS DISTINCT FROM EXCLUDED.login
                                  OR r.password_enc IS DISTINCT FROM
                                     CASE $7::int WHEN 0 THEN r.password_enc WHEN 1 THEN NULL ELSE $8 END)))
@@ -1777,6 +1811,9 @@ impl MetadataClient {
                 .bind(a.bypass_rls)
                 .bind(&a.member_of)
                 .bind(up.api_owner_level)
+                .bind(&a.member_no_set)
+                .bind(&a.member_admin)
+                .bind(up.no_password)
                 .fetch_optional(&mut *tx)
                 .await?;
             changed.extend(name);

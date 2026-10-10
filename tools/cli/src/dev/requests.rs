@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use chelabase_types::mode::Mode;
+use chelabase_types::mode_policy::ModePolicy;
 use serde_json::{Value, json};
 
 pub const KEY_EXPIRY: &str = "2099-01-01T00:00:00Z";
@@ -14,6 +15,69 @@ pub fn default_org_query() -> Value {
 
 pub fn org_id_from(listed: &Value) -> Option<String> {
     listed.pointer("/result/0/id")?.as_str().map(str::to_string)
+}
+
+/// The name of the first organisation in a search result (`result[0].name`).
+pub fn org_name_from(listed: &Value) -> Option<String> {
+    listed
+        .pointer("/result/0/name")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|n| !n.trim().is_empty())
+}
+
+/// The instance login policy path (Zitadel v4.19.1 admin API `GetLoginPolicy` / `UpdateLoginPolicy`).
+pub const LOGIN_POLICY: &str = "/admin/v1/policies/login";
+
+/// The org's own login policy path (`GetLoginPolicy` / `UpdateCustomLoginPolicy`): it overrides
+/// the instance's when the org has set one (`policy.isDefault` is then false).
+pub const ORG_LOGIN_POLICY: &str = "/management/v1/policies/login";
+
+/// Whether the org has no login policy of its own (the instance's applies).
+pub fn policy_is_default(answer: &Value) -> bool {
+    answer
+        .pointer("/policy/isDefault")
+        .or_else(|| answer.get("isDefault"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether Zitadel's own sign-up (`allowRegister`) is on in a `GET` login-policy answer.
+pub fn registration_allowed(answer: &Value) -> bool {
+    answer.pointer("/policy/allowRegister").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The `PUT` body that turns `allowRegister` off and keeps the rest of the policy as read.
+/// `UpdateLoginPolicy` replaces the whole policy (a field left out becomes `false`), so every
+/// updatable field of the answer is sent back; the read-only ones (`details`, `isDefault`, the
+/// factor and IdP lists, which have their own calls) are not.
+pub fn login_policy_without_registration(answer: &Value) -> Value {
+    const FIELDS: [&str; 16] = [
+        "allowUsernamePassword",
+        "allowExternalIdp",
+        "forceMfa",
+        "passwordlessType",
+        "hidePasswordReset",
+        "ignoreUnknownUsernames",
+        "defaultRedirectUri",
+        "passwordCheckLifetime",
+        "externalLoginCheckLifetime",
+        "mfaInitSkipLifetime",
+        "secondFactorCheckLifetime",
+        "multiFactorCheckLifetime",
+        "allowDomainDiscovery",
+        "disableLoginWithEmail",
+        "disableLoginWithPhone",
+        "forceMfaLocalOnly",
+    ];
+    let mut body = serde_json::Map::new();
+    for field in FIELDS {
+        if let Some(v) = answer.pointer(&format!("/policy/{field}")) {
+            body.insert(field.to_string(), v.clone());
+        }
+    }
+    body.insert("allowRegister".into(), json!(false));
+    Value::Object(body)
 }
 
 pub fn project_search(name: &str) -> Value {
@@ -64,7 +128,7 @@ pub fn studio_app_config(mode: Mode) -> Value {
         "accessTokenType": "OIDC_TOKEN_TYPE_JWT",
         "idTokenUserinfoAssertion": true
     });
-    if mode == Mode::SelfHosted {
+    if ModePolicy::new(mode).cli_manages_studio_login() {
         config["loginVersion"] = json!({"loginV2": {"baseUri": format!("{origin}/")}});
     }
     config
@@ -191,6 +255,13 @@ pub fn machine_user_search(username: &str) -> Value {
     json!({"queries": [{"userNameQuery": {"userName": username, "method": "TEXT_QUERY_METHOD_EQUALS"}}]})
 }
 
+/// Users of one org with this email, compared case-insensitively.
+pub fn user_email_search(org_id: &str, email: &str) -> Value {
+    json!({"queries": [
+        {"organizationIdQuery": {"organizationId": org_id}},
+        {"emailQuery": {"emailAddress": email, "method": "TEXT_QUERY_METHOD_EQUALS_IGNORE_CASE"}}]})
+}
+
 pub fn machine_user_create(org_id: &str, username: &str) -> Value {
     json!({"organizationId": org_id, "username": username,
            "machine": {"name": "Chelabase Demo", "accessTokenType": "ACCESS_TOKEN_TYPE_JWT"}})
@@ -292,6 +363,15 @@ mod tests {
             Some("o1")
         );
         assert_eq!(org_id_from(&json!({"result": []})), None);
+    }
+
+    #[test]
+    fn the_org_name_comes_from_the_same_result() {
+        let listed = json!({"result": [{"id": "o1", "name": "ZITADEL"}]});
+        assert_eq!(org_name_from(&listed).as_deref(), Some("ZITADEL"));
+        assert_eq!(org_name_from(&json!({"result": [{"id": "o1"}]})), None);
+        assert_eq!(org_name_from(&json!({"result": [{"id": "o1", "name": "  "}]})), None);
+        assert_eq!(org_name_from(&json!({"result": []})), None);
     }
 
     #[test]

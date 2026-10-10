@@ -99,6 +99,9 @@ pub enum Purpose {
     DataKey,
     /// A login role's password (bound to its branch and name, see [`seal_role_password`]).
     Role,
+    /// A member's hidden login role password (`cb_m_…`, bound to its branch and name, see
+    /// [`seal_member_role_password`]).
+    MemberRole,
 }
 
 impl Purpose {
@@ -108,6 +111,7 @@ impl Purpose {
             Purpose::Authenticator => "authenticator",
             Purpose::DataKey => "data_key",
             Purpose::Role => "role",
+            Purpose::MemberRole => "member_role",
         }
     }
 }
@@ -150,6 +154,31 @@ pub fn open_role_password(
     sealed: &str,
 ) -> Result<String, SecretsError> {
     open(key, &role_aad(branch_id, role), sealed)
+}
+
+/// Seal a member role's password; the AAD is `{branch_id}:member_role:{role}`, so it opens
+/// only for that role on that branch (never on a child branch that inherited the role).
+pub fn seal_member_role_password(
+    key: &SecretKey,
+    branch_id: uuid::Uuid,
+    role: &str,
+    password: &str,
+) -> Result<String, SecretsError> {
+    Ok(seal(key, &member_role_aad(branch_id, role), password))
+}
+
+/// Open a value from [`seal_member_role_password`] for the same branch and role.
+pub fn open_member_role_password(
+    key: &SecretKey,
+    branch_id: uuid::Uuid,
+    role: &str,
+    sealed: &str,
+) -> Result<String, SecretsError> {
+    open(key, &member_role_aad(branch_id, role), sealed)
+}
+
+fn member_role_aad(branch_id: uuid::Uuid, role: &str) -> String {
+    format!("{branch_id}:{}:{role}", Purpose::MemberRole.as_str())
 }
 
 fn role_aad(branch_id: &str, role: &str) -> String {
@@ -329,5 +358,27 @@ mod credential_tests {
         assert!(matches!(open_role_password(&key, "b-2", "app", &sealed), Err(SecretsError::Decrypt)));
         assert!(matches!(open_role_password(&key, "b-1", "other", &sealed), Err(SecretsError::Decrypt)));
         assert_eq!(open(&key, "b-1:role:app", &sealed).unwrap(), "pw");
+    }
+
+    #[test]
+    fn member_role_password_round_trips_and_binds_branch_and_name() {
+        let key = SecretKey::generate();
+        assert_eq!(Purpose::MemberRole.as_str(), "member_role");
+        let (branch, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let sealed = seal_member_role_password(&key, branch, "cb_m_a", "pw").unwrap();
+        assert_eq!(open_member_role_password(&key, branch, "cb_m_a", &sealed).unwrap(), "pw");
+        assert!(matches!(
+            open_member_role_password(&key, other, "cb_m_a", &sealed),
+            Err(SecretsError::Decrypt)
+        ));
+        assert!(matches!(
+            open_member_role_password(&key, branch, "cb_m_b", &sealed),
+            Err(SecretsError::Decrypt)
+        ));
+        assert_eq!(open(&key, &format!("{branch}:member_role:cb_m_a"), &sealed).unwrap(), "pw");
+        // A login role's sealed password never opens as a member role's, nor the reverse.
+        let as_role = seal_role_password(&key, &branch.to_string(), "cb_m_a", "pw");
+        assert!(open_member_role_password(&key, branch, "cb_m_a", &as_role).is_err());
+        assert!(open_role_password(&key, &branch.to_string(), "cb_m_a", &sealed).is_err());
     }
 }

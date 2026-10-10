@@ -14,12 +14,13 @@ use chelabase_metadata::{
 };
 use chelabase_metadata::{ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleWriteOutcome};
 use chelabase_metadata::{MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch};
+use chelabase_metadata::members::{GrantRows, MemberBranchRole, MemberRecord};
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::spec::Placement;
 use chelabase_neon::storcon::LsnAtTime;
 use chelabase_neon::{ComputeSigner, Lsn, NeonId, StorconClient, StorconError};
-use chelabase_types::{BranchId, DatabaseId, ProjectId};
+use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
@@ -405,6 +406,45 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Vec<ServedDatabase>, MetadataError>> + Send;
+
+    // Members (members-and-roles design, part 3: the member-role reconciler).
+
+    /// The tenant's invited and active members.
+    fn list_members(
+        &self,
+        tenant: TenantId,
+    ) -> impl Future<Output = Result<Vec<MemberRecord>, MetadataError>> + Send;
+    /// Every member's stored grant levels on (project, database), in one query.
+    fn database_grant_rows(
+        &self,
+        project: Uuid,
+        database: Uuid,
+    ) -> impl Future<Output = Result<Vec<(Uuid, GrantRows)>, MetadataError>> + Send;
+    /// The branches the member-role sweep visits.
+    fn member_role_branches(&self) -> impl Future<Output = Result<Vec<Uuid>, MetadataError>> + Send;
+    /// Forgets a branch's member-role rows (a reset or restore replaced its catalog).
+    fn delete_branch_member_roles(
+        &self,
+        branch: Uuid,
+    ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
+    fn member_branch_roles(
+        &self,
+        branch: Uuid,
+    ) -> impl Future<Output = Result<Vec<MemberBranchRole>, MetadataError>> + Send;
+    fn upsert_member_branch_role(
+        &self,
+        row: &MemberBranchRole,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// R31: each member's last acted role on `branch`, where one is recorded.
+    fn member_acted_roles(
+        &self,
+        branch: Uuid,
+    ) -> impl Future<Output = Result<Vec<(Uuid, String)>, MetadataError>> + Send;
+    fn delete_member_branch_role(
+        &self,
+        member: Uuid,
+        branch: Uuid,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     /// Ends an enable: `Ok` makes the row `on`, `Err(text)` makes it `error`. Only a row still
     /// `enabling` moves; false otherwise.
     fn finish_enable_data_api(
@@ -1051,6 +1091,45 @@ impl WorkerMetadata for MetadataClient {
         branch: BranchId,
     ) -> Result<Vec<BranchDatabase>, MetadataError> {
         MetadataClient::branch_databases(self, branch).await
+    }
+
+    async fn list_members(&self, tenant: TenantId) -> Result<Vec<MemberRecord>, MetadataError> {
+        MetadataClient::list_members(self, tenant).await
+    }
+
+    async fn database_grant_rows(
+        &self,
+        project: Uuid,
+        database: Uuid,
+    ) -> Result<Vec<(Uuid, GrantRows)>, MetadataError> {
+        MetadataClient::database_grant_rows(self, project, database).await
+    }
+
+    async fn member_role_branches(&self) -> Result<Vec<Uuid>, MetadataError> {
+        MetadataClient::member_role_branches(self).await
+    }
+
+    async fn delete_branch_member_roles(&self, branch: Uuid) -> Result<u64, MetadataError> {
+        MetadataClient::delete_branch_member_roles(self, branch).await
+    }
+
+    async fn member_branch_roles(
+        &self,
+        branch: Uuid,
+    ) -> Result<Vec<MemberBranchRole>, MetadataError> {
+        MetadataClient::member_branch_roles(self, branch).await
+    }
+
+    async fn upsert_member_branch_role(&self, row: &MemberBranchRole) -> Result<(), MetadataError> {
+        MetadataClient::upsert_member_branch_role(self, row).await
+    }
+
+    async fn member_acted_roles(&self, branch: Uuid) -> Result<Vec<(Uuid, String)>, MetadataError> {
+        MetadataClient::member_acted_roles(self, branch).await
+    }
+
+    async fn delete_member_branch_role(&self, member: Uuid, branch: Uuid) -> Result<(), MetadataError> {
+        MetadataClient::delete_member_branch_role(self, member, branch).await
     }
 
     async fn served_databases(

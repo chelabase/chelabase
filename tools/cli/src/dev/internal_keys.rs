@@ -81,6 +81,8 @@ mod tests {
             auth: AuthMethod::ManagementJwt,
             request_id: "r".into(),
             data: None,
+            email: None,
+            name: None,
         };
         let token = signer.sign("orchestrator", &identity).unwrap();
         assert_eq!(verifier.verify(&token, "orchestrator").unwrap().org_id, "o");

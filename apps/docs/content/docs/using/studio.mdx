@@ -11,11 +11,12 @@ Open Studio at `localhost`, not `127.0.0.1`: the sign-in redirect and the gatewa
 
 ## Signing in
 
-Studio has its own sign-in pages: `/login`, `/register`, `/verify`, `/password-reset` and `/logout`. Zitadel sends every sign-in there; the pages call the `auth` service through the gateway (`/auth/v1/*`), and the step state lives in encrypted HttpOnly cookies. The [Quickstart](/docs/using/quickstart) walks through creating an account.
+Studio has its own sign-in pages: `/login`, `/register`, `/accept-invite`, `/verify`, `/password-reset` and `/logout`. Zitadel sends every sign-in there; the pages call the `auth` service through the gateway (`/auth/v1/*`), and the step state lives in encrypted HttpOnly cookies. The [Quickstart](/docs/using/quickstart) walks through signing in as the bootstrap admin.
 
-- In self-hosted mode (the default, `CHELABASE_MODE=self-hosted`) email verification is off: sign-ups are created with the email already verified and you land in Studio straight away. Set `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true` to require it; codes and password-reset emails land in Mailpit at `http://localhost:8025`. `CHELABASE_REQUIRE_EMAIL_VERIFICATION=false` turns it off in any mode.
+- Self-hosted mode (the default, `CHELABASE_MODE=self-hosted`) takes no self-sign-up unless a tenant admin switches it on (`PATCH /v1/instance/settings` with `open_signup`). The first admin is the one `just zitadel-bootstrap` sets up; an admin invites everyone else, by an email, or by a link to hand over when Zitadel has no email provider (`GET /v1/invites/delivery` says). The sign-in page offers **Create account** only while sign-up is open, and always says "No account? Ask your admin for an invite" otherwise. Platform mode takes no self-sign-up yet.
+- With sign-up open, a new person is a pending member who can do nothing until an admin approves them (`approveMember`, with their first grants) or declines them. Sign-ups are created with the email already verified in self-hosted mode; set `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true` to require a code (codes and password-reset emails land in Mailpit at `http://localhost:8025`); `=false` turns it off in any mode.
 - A sign-up for an email that is taken says so and sends you to sign in.
-- Everyone who signs up joins the same organization, tenant and project: a shared team workspace, by design for self-hosting.
+- Everyone who joins is in the same organization and tenant: a shared team workspace, by design for self-hosting. An admin can give the tenant a display name (`PATCH /v1/tenant`); the invite page and `GET /v1/me` use it, falling back to the slug.
 
 ## Projects
 

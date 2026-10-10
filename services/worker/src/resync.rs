@@ -18,7 +18,9 @@ use chelabase_neon::ComputeBackend;
 use chelabase_secrets::seal_role_password;
 use chelabase_types::BranchId;
 use chelabase_types::data_key::DataKeyKind;
-use chelabase_types::role_name::{is_membership_reserved, quote_ident, quote_literal};
+use chelabase_types::role_name::{
+    has_reserved_prefix, is_membership_reserved, is_reserved_for, quote_ident, quote_literal,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use chelabase_types::role_password::{PasswordKind, hash_kind};
 use tracing::{error, info, warn};
@@ -182,14 +184,14 @@ pub struct PendingResyncs {
 
 impl PendingResyncs {
     /// True when the caller now owns the branch's pending run; false when one is waiting.
-    fn claim(&self, branch: BranchId) -> bool {
+    pub(crate) fn claim(&self, branch: BranchId) -> bool {
         self.waiting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(branch)
     }
 
-    fn release(&self, branch: BranchId) {
+    pub(crate) fn release(&self, branch: BranchId) {
         self.waiting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -281,6 +283,10 @@ pub struct ObservedRole {
     pub member_of: Vec<String>,
     /// Those of [`Self::member_of`] the owner granted: the ones an owner's `REVOKE` removes.
     pub owner_granted: Vec<String>,
+    /// Those of [`Self::member_of`] no grantor gave the SET option (I2), sorted.
+    pub member_no_set: Vec<String>,
+    /// Those of [`Self::member_of`] some grantor gave the ADMIN option (I2), sorted.
+    pub member_admin: Vec<String>,
 }
 
 impl ObservedRole {
@@ -300,6 +306,8 @@ impl ObservedRole {
             bypass_rls: false,
             member_of: Vec::new(),
             owner_granted: Vec::new(),
+            member_no_set: Vec::new(),
+            member_admin: Vec::new(),
         }
     }
 
@@ -311,6 +319,8 @@ impl ObservedRole {
             valid_until: self.valid_until,
             bypass_rls: self.bypass_rls,
             member_of: self.member_of.clone(),
+            member_no_set: self.member_no_set.clone(),
+            member_admin: self.member_admin.clone(),
         }
     }
 }
@@ -330,6 +340,8 @@ impl std::fmt::Debug for ObservedRole {
             .field("bypass_rls", &self.bypass_rls)
             .field("member_of", &self.member_of)
             .field("owner_granted", &self.owner_granted)
+            .field("member_no_set", &self.member_no_set)
+            .field("member_admin", &self.member_admin)
             .finish()
     }
 }
@@ -345,7 +357,8 @@ pub struct Observed {
 /// owner's name. Past the owner-attributes column: INHERIT, the connection limit, VALID UNTIL
 /// in microseconds since the epoch (empty when there's none or it's infinite), BYPASSRLS, and
 /// the direct memberships (`neon_superuser` left out) as `hex(name):o` (granted by the owner)
-/// or `hex(name):x`, comma-separated.
+/// or `hex(name):x`, then `n` when the grant lacks the SET option and `a` when it has the ADMIN
+/// option (I2), comma-separated.
 const ROLE_SELECT: &str = "SELECT 'r',
        encode(convert_to(a.rolname, 'UTF8'), 'hex'),
        a.rolcanlogin,
@@ -366,7 +379,9 @@ const ROLE_SELECT: &str = "SELECT 'r',
        coalesce((SELECT string_agg(encode(convert_to(g.rolname, 'UTF8'), 'hex')
                                    || CASE WHEN m.grantor = (SELECT oid FROM pg_roles
                                                              WHERE rolname = $OWNER)
-                                           THEN ':o' ELSE ':x' END,
+                                           THEN ':o' ELSE ':x' END
+                                   || CASE WHEN m.set_option THEN '' ELSE 'n' END
+                                   || CASE WHEN m.admin_option THEN 'a' ELSE '' END,
                                    ',' ORDER BY g.rolname)
                  FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
                  WHERE m.member = a.oid AND g.rolname <> 'neon_superuser'), '')
@@ -380,6 +395,7 @@ WHERE a.oid >= 16384
   AND a.rolname NOT IN ('cloud_admin', 'neon_superuser', 'anon', 'authenticated',
                         'authenticator', 'chelabase_admin', 'chelabase_auth_sync')
   AND a.rolname !~ '^pg_'
+  AND a.rolname !~* '^(cb_m_|chelabase_)'
 UNION ALL
 SELECT 'd',
        encode(convert_to(d.datname, 'UTF8'), 'hex'),
@@ -408,26 +424,55 @@ pub fn role_read_sql(owner: &str, name: &str) -> String {
     )
 }
 
-/// [`ROLE_SELECT`]'s memberships column: `(member_of, owner_granted)`, sorted, once each.
-fn parse_memberships(field: &str) -> Option<(Vec<String>, Vec<String>)> {
+/// What [`parse_memberships`] read.
+struct Memberships {
+    member_of: Vec<String>,
+    owner_granted: Vec<String>,
+    no_set: Vec<String>,
+    admin: Vec<String>,
+}
+
+/// [`ROLE_SELECT`]'s memberships column, sorted, once each. A role granted by several grantors
+/// has the SET (or ADMIN) option when any of them gave it, as Postgres decides.
+fn parse_memberships(field: &str) -> Option<Memberships> {
     let mut member_of = std::collections::BTreeSet::new();
     let mut owner_granted = std::collections::BTreeSet::new();
+    let mut set = std::collections::BTreeSet::new();
+    let mut admin = std::collections::BTreeSet::new();
     for entry in field.split(',').filter(|e| !e.is_empty()) {
         let (name, by) = entry.split_once(':')?;
         let name = unhex(name).filter(|n| !n.is_empty())?;
-        match by {
-            "o" => {
+        let mut flags = by.chars();
+        match flags.next()? {
+            'o' => {
                 owner_granted.insert(name.clone());
             }
-            "x" => {}
+            'x' => {}
             _ => return None,
+        }
+        let rest: String = flags.collect();
+        let (no_set, with_admin) = match rest.as_str() {
+            "" => (false, false),
+            "n" => (true, false),
+            "a" => (false, true),
+            "na" => (true, true),
+            _ => return None,
+        };
+        if !no_set {
+            set.insert(name.clone());
+        }
+        if with_admin {
+            admin.insert(name.clone());
         }
         member_of.insert(name);
     }
-    Some((
-        member_of.into_iter().collect(),
-        owner_granted.into_iter().collect(),
-    ))
+    let no_set = member_of.difference(&set).cloned().collect();
+    Some(Memberships {
+        member_of: member_of.iter().cloned().collect(),
+        owner_granted: owner_granted.into_iter().collect(),
+        no_set,
+        admin: admin.into_iter().collect(),
+    })
 }
 
 /// A VALID UNTIL in microseconds since the epoch; empty is none.
@@ -447,7 +492,9 @@ pub(crate) fn role_line(o: &ObservedRole) -> String {
         .iter()
         .map(|g| {
             let by = if o.owner_granted.contains(g) { "o" } else { "x" };
-            format!("{}:{by}", hex::encode(g))
+            let no_set = if o.member_no_set.contains(g) { "n" } else { "" };
+            let admin = if o.member_admin.contains(g) { "a" } else { "" };
+            format!("{}:{by}{no_set}{admin}", hex::encode(g))
         })
         .collect();
     format!(
@@ -520,7 +567,7 @@ pub fn parse_observed(out: &str) -> anyhow::Result<Observed> {
                     .ok_or_else(|| bad("has a malformed connection limit"))?;
                 let valid_until =
                     parse_valid_until(h).ok_or_else(|| bad("has a malformed expiry"))?;
-                let (member_of, owner_granted) =
+                let Memberships { member_of, owner_granted, no_set, admin } =
                     parse_memberships(j).ok_or_else(|| bad("has malformed memberships"))?;
                 observed.roles.push(ObservedRole {
                     name,
@@ -535,6 +582,8 @@ pub fn parse_observed(out: &str) -> anyhow::Result<Observed> {
                     bypass_rls,
                     member_of,
                     owner_granted,
+                    member_no_set: no_set,
+                    member_admin: admin,
                 });
             }
             "d" => {
@@ -617,6 +666,7 @@ pub fn plan_resync(
         .iter()
         .filter(is_copy)
         .filter(|c| c.origin == RoleOrigin::Api)
+        .filter(|c| !has_reserved_prefix(&c.name))
     {
         let stored = row.scram_verifier.as_deref();
         let o = observed.roles.iter().find(|o| o.name == row.name);
@@ -629,14 +679,25 @@ pub fn plan_resync(
             continue;
         }
         // A wanted group dropped in SQL is gone: the database wins for its existence.
-        let wanted_attributes = RoleAttributes {
-            member_of: row
-                .attributes
-                .member_of
-                .iter()
-                .filter(|g| seen(g.as_str()))
+        let kept: Vec<String> = row
+            .attributes
+            .member_of
+            .iter()
+            .filter(|g| seen(g.as_str()))
+            .cloned()
+            .collect();
+        // I2: the driven change grants plainly (SET, no ADMIN); a membership the catalog
+        // already has keeps the options it has.
+        let options = |observed: Option<&Vec<String>>| -> Vec<String> {
+            kept.iter()
+                .filter(|g| observed.is_some_and(|set| set.contains(g)))
                 .cloned()
-                .collect(),
+                .collect()
+        };
+        let wanted_attributes = RoleAttributes {
+            member_no_set: options(o.map(|o| &o.member_no_set)),
+            member_admin: options(o.map(|o| &o.member_admin)),
+            member_of: kept.clone(),
             ..row.attributes.clone()
         };
         let wanted = WantedRole {
@@ -695,6 +756,7 @@ pub fn plan_resync(
             pending: false,
             attributes,
             api_owner_level,
+            no_password: false,
         });
     }
 
@@ -720,19 +782,25 @@ pub fn plan_resync(
                 pending: false,
                 attributes: o.attributes(),
                 api_owner_level: None,
+                no_password: false,
             });
             continue;
         }
-        let verifier = match o.password.as_deref().map(|p| (hash_kind(p), p)) {
-            Some((PasswordKind::Scram, p)) => Some(p.to_string()),
+        let (verifier, no_password) = match o.password.as_deref().map(|p| (hash_kind(p), p)) {
+            Some((PasswordKind::Scram, p)) => (Some(p.to_string()), false),
             // R9: kept, so Studio can flag it; the proxy treats a NULL verifier as unknown.
-            Some((PasswordKind::Md5, _)) => None,
-            // No password (or none the proxy could ever use): no copy.
+            Some((PasswordKind::Md5, _)) => (None, false),
+            // No password (or none the proxy could ever use): a group role, or one whose
+            // password was removed. It exists, so it's kept (members can be granted it), with no
+            // verifier; Chelabase's reserved names (the data API's roles) are not listed.
             Some((PasswordKind::Other, _)) | None => {
-                if row.is_some() {
-                    write.removals.push(o.name.clone());
+                if is_reserved_for(&o.name, owner) {
+                    if row.is_some() {
+                        write.removals.push(o.name.clone());
+                    }
+                    continue;
                 }
-                continue;
+                (None, true)
             }
         };
         let password_enc = match row {
@@ -749,6 +817,7 @@ pub fn plan_resync(
             pending: false,
             attributes: o.attributes(),
             api_owner_level: None,
+            no_password,
         });
     }
     for row in copies.iter().filter(is_copy) {
@@ -902,6 +971,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     continue;
                 }
             };
+            // T8 I3: roles made, dropped or changed in SQL (attributes, memberships) can change
+            // what member roles may hold (R16) or which names grants find.
+            if !changed.is_empty() {
+                self.member_role_requests.request(branch);
+            }
             // A role re-created or set back in SQL may be cached with its old password too.
             let mut names = changed;
             for row in copies
@@ -1973,6 +2047,26 @@ mod tests {
     }
 
     #[test]
+    fn resync_sql_skips_reserved_prefixes() {
+        let sql = resync_sql("postgres");
+        assert!(sql.contains("AND a.rolname !~* '^(cb_m_|chelabase_)'"), "{sql}");
+    }
+
+    /// A row named with a hidden prefix is never re-created: the catalog read never shows
+    /// such a role, so a repair would fail "already exists" on every resync.
+    #[test]
+    fn resync_never_plans_create_for_hidden_prefix_rows() {
+        for name in ["cb_m_x", "CB_M_Y", "chelabase_x", "Chelabase_Y"] {
+            let copies = [
+                copy(OWNER_ROLE, RoleOrigin::Owner, Some(SCRAM_A)),
+                copy(name, RoleOrigin::Api, Some(SCRAM_A)),
+            ];
+            let (repairs, _write) = plan_resync(OWNER_ROLE, &copies, &observed(vec![]));
+            assert!(flat(&repairs).is_empty(), "{name}: {repairs:?}");
+        }
+    }
+
+    #[test]
     fn parse_observed_decodes_hex_and_refuses_garbage() {
         let odd = "we|ird\nname";
         let out = format!(
@@ -2144,13 +2238,44 @@ mod tests {
             );
         }
         assert_eq!(up("bulk59").verifier.as_deref(), Some(SCRAM_A));
+        // A role without a password (a group role, or one whose password was removed) is kept
+        // as a row with no verifier: it exists, and members can be granted it.
+        for name in ["no_password", "lost_password"] {
+            let u = up(name);
+            assert_eq!(u.verifier, None, "{name}");
+            assert!(u.no_password, "{name}");
+            assert_eq!(u.password_enc, SealedChange::Clear, "{name}");
+        }
+        for name in ["same", "changed", "now_md5", "added", "added_md5"] {
+            assert!(!up(name).no_password, "{name}");
+        }
         let mut removals = write.removals.clone();
         removals.sort();
-        assert_eq!(removals, ["gone", "lost_password"]);
-        assert!(upsert(&write, "no_password").is_none());
+        assert_eq!(removals, ["gone"]);
         assert!(upsert(&write, OWNER_ROLE).is_none());
-        assert_eq!(write.upserts.len(), 6 + 60);
+        assert_eq!(write.upserts.len(), 8 + 60);
         assert_eq!(write.databases, observed(vec![]).databases);
+    }
+
+    /// Group roles made in SQL (no password) reach the metadata, so members can be granted
+    /// them; reserved names (the data API's `anon`, `authenticated`, …) never do.
+    #[test]
+    fn plan_resync_keeps_group_roles_but_not_reserved_ones() {
+        let mut group = role("billing", None);
+        group.login = false;
+        let mut roles = vec![group, role("app_login", None)];
+        for reserved in ["anon", "authenticated", "authenticator", "neon_superuser", "pg_x"] {
+            let mut r = role(reserved, None);
+            r.login = false;
+            roles.push(r);
+        }
+        let (_, write) = plan_resync(OWNER_ROLE, &[], &observed(roles));
+        let billing = upsert(&write, "billing").expect("billing is kept");
+        assert_eq!((billing.verifier.as_deref(), billing.no_password, billing.login), (None, true, false));
+        assert!(upsert(&write, "app_login").is_some_and(|u| u.no_password && u.login));
+        for reserved in ["anon", "authenticated", "authenticator", "neon_superuser", "pg_x"] {
+            assert!(upsert(&write, reserved).is_none(), "{reserved}");
+        }
     }
 
     // T4: an API reset of an `sql` row that couldn't be applied leaves it pending with the new
@@ -2490,6 +2615,8 @@ mod tests {
             valid_until: Some(DateTime::from_timestamp(1_900_000_000, 0).unwrap()),
             bypass_rls: true,
             member_of: vec!["g".into(), "gone".into()],
+            member_no_set: vec![],
+            member_admin: vec![],
         };
         let api = |name: &str| {
             let mut c = copy(name, RoleOrigin::Api, None);
@@ -2571,7 +2698,9 @@ mod tests {
         seen.inherit = false;
         seen.connection_limit = 7;
         seen.bypass_rls = true;
-        seen.member_of = vec!["g".into()];
+        seen.member_of = vec!["g".into(), "h".into()];
+        seen.member_no_set = vec!["h".into()];
+        seen.member_admin = vec!["g".into()];
         let (repairs, write) = plan_resync(OWNER_ROLE, &[], &observed(vec![seen]));
         assert!(repairs.is_empty());
         let u = upsert(&write, "reporter").unwrap();
@@ -2582,7 +2711,9 @@ mod tests {
                 connection_limit: 7,
                 valid_until: None,
                 bypass_rls: true,
-                member_of: vec!["g".into()],
+                member_of: vec!["g".into(), "h".into()],
+                member_no_set: vec!["h".into()],
+                member_admin: vec!["g".into()],
             }
         );
     }
@@ -2598,6 +2729,9 @@ mod tests {
         full.bypass_rls = true;
         full.member_of = vec!["a,b".into(), "g".into()];
         full.owner_granted = vec!["g".into()];
+        // I2: the SET and ADMIN options of a membership travel with it.
+        full.member_no_set = vec!["a,b".into()];
+        full.member_admin = vec!["a,b".into(), "g".into()];
         let o = parse_observed(&role_line(&full)).unwrap();
         assert_eq!(o.roles, [full]);
         let sql = role_read_sql("postgres", "a'b");
@@ -2638,6 +2772,44 @@ mod tests {
 
     fn count(journal: &Journal, entry: &str) -> usize {
         entries(journal).iter().filter(|e| *e == entry).count()
+    }
+
+    // T8 I3: a resync that finds roles changed in SQL (made, dropped, renamed, their
+    // memberships or attributes) asks for a member-role reconcile; one that changes nothing, or
+    // only the databases (R17), doesn't.
+    #[tokio::test]
+    async fn a_role_change_asks_for_a_member_reconcile() {
+        let (w, journal) = worker();
+        let (branch, ep) = ready(&w, &journal).await;
+        let main_db = w.metadata.state().db_rows[&branch]
+            .iter()
+            .find(|r| r.main)
+            .unwrap()
+            .name
+            .clone();
+        let db = d_line(&main_db, OWNER_ROLE, false);
+        w.computes.answer("FROM pg_authid", &db);
+        w.resync(branch).await.unwrap();
+        let base = w.member_role_requests.sent().len();
+        w.resync(branch).await.unwrap();
+        assert_eq!(w.member_role_requests.sent().len(), base, "nothing changed");
+        w.computes.answer_once_at(
+            &ep,
+            "FROM pg_authid",
+            &format!("{db}{}", d_line("extra", OWNER_ROLE, false)),
+        );
+        w.resync(branch).await.unwrap();
+        assert_eq!(w.member_role_requests.sent().len(), base, "a database alone (R17)");
+        w.computes.answer_once_at(
+            &ep,
+            "FROM pg_authid",
+            &format!("{}{db}", r_line("reporter", true, Some(SCRAM_B), false, true, false)),
+        );
+        w.resync(branch).await.unwrap();
+        assert_eq!(w.member_role_requests.sent().len(), base + 1, "a role made in SQL");
+        w.resync(branch).await.unwrap();
+        assert_eq!(w.member_role_requests.sent().len(), base + 2, "and dropped");
+        assert!(w.member_role_requests.sent().iter().all(|b| *b == branch));
     }
 
     #[tokio::test]

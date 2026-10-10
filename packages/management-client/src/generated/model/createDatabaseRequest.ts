@@ -5,10 +5,9 @@
  * OpenAPI spec version: 1
  */
 import type { ProjectId } from './projectId.ts';
-import type { TenantId } from './tenantId.ts';
 
 export interface CreateDatabaseRequest {
   name: string;
+  /** The project to create it in; the caller needs Admin on it. */
   project_id: ProjectId;
-  tenant_id: TenantId;
 }

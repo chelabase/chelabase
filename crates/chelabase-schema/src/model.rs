@@ -390,8 +390,8 @@ pub const OWNER_LEVEL_ROLE: &str = "neon_superuser";
 
 /// Whether the merge makes a membership in `role` (U2, through the roles path): owner-level
 /// (`neon_superuser`), or any role the roles path lets a role join. A membership in the owner,
-/// a reserved role, a `chelabase_…` or a `pg_…` role is refused there (`is_membership_reserved`),
-/// so it's reported, never merged (E30).
+/// a reserved role, a `chelabase_…`, a `cb_m_…` or a `pg_…` role is refused there
+/// (`is_membership_reserved`), so it's reported, never merged (E30).
 pub fn membership_merges(role: &str) -> bool {
     role == OWNER_LEVEL_ROLE || !chelabase_types::role_name::is_membership_reserved(role)
 }

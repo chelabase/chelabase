@@ -1,11 +1,15 @@
 import type { ReactNode } from "react";
 import { useRailBehaviour } from "@/lib/rail-preference";
+import { useMediaQuery } from "@/lib/use-media-query";
 import { AppHeader } from "./app-header";
 import { AppRail } from "./app-rail";
+import type { RailBadges } from "./rail-items";
 
 export interface AppShellProps {
   profile: { name?: string; email?: string };
   onSignOut: () => void;
+  /** Counts on rail items (Members: sign-up requests waiting). */
+  badges?: RailBadges;
   children: ReactNode;
 }
 
@@ -14,9 +18,11 @@ export interface AppShellProps {
  * left, the header and the routed page on the right. Only `expanded` widens the
  * rail's column; in `hover` mode the rail overlays the page instead.
  */
-export function AppShell({ profile, onSignOut, children }: AppShellProps) {
+export function AppShell({ profile, onSignOut, badges, children }: AppShellProps) {
   const [behaviour, setBehaviour] = useRailBehaviour();
-  const railWidth = behaviour === "expanded" ? "232px" : "56px";
+  // Below 40rem an expanded rail opens over the page (see AppRail): its column stays narrow.
+  const narrow = useMediaQuery("(max-width: 40rem)");
+  const railWidth = behaviour === "expanded" && !narrow ? "232px" : "56px";
   return (
     <div
       className="grid min-h-screen bg-background text-foreground transition-[grid-template-columns] duration-200 ease-lagoon motion-reduce:transition-none"
@@ -29,7 +35,7 @@ export function AppShell({ profile, onSignOut, children }: AppShellProps) {
         Skip to content
       </a>
       <div className="sticky top-0 z-30 h-screen">
-        <AppRail behaviour={behaviour} onBehaviourChange={setBehaviour} />
+        <AppRail behaviour={behaviour} onBehaviourChange={setBehaviour} badges={badges} />
       </div>
       <div className="flex min-w-0 flex-col">
         <AppHeader profile={profile} onSignOut={onSignOut} />

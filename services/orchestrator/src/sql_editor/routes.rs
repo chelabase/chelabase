@@ -31,17 +31,25 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::events::{Outcome, RunEvent};
-use super::registry::ReserveError;
+use super::registry::{Canceller, Cancelled, ReserveError};
 use super::run::{self, ConnectError, Connected, Finished, RunSpec, RunTarget};
 use super::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, guard, invalid_sql, schema};
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
 use crate::console::{
-    OWNER_PASSWORD_UNKNOWN, database_not_found, owner_target, pick_database, unavailable,
+    OWNER_PASSWORD_UNKNOWN, compute_addr, database_not_found, owner_target, pick_database,
+    unavailable,
 };
+use crate::access::{authorize, deny_to_api, Authorized, RoleGraph, Target};
 use crate::{
     ApiBytes, AppState, AuthPrincipal, BACKUP_REFUSAL, JobPort, MetadataPort, ResetError,
-    load_owned, roles,
+    roles,
 };
+use chelabase_metadata::members::MemberBranchRole;
+use chelabase_nats::{MemberRoleHandOverRequest, MemberRolesReconcileRequest, MemberRolesReply};
+use chelabase_routes::orchestrator as ep;
+use chelabase_secrets::open_member_role_password;
+use chelabase_types::access::{Access, Deny, PgRole, PlatformRole, Requested};
+use chelabase_types::role_name::member_role_name;
 
 /// The audit log's target.
 const AUDIT_TARGET: &str = "orchestrator::sql_editor::audit";
@@ -51,8 +59,6 @@ const AUDIT_TAGS: usize = 50;
 const RETRY_AFTER_SECS: u32 = 2;
 /// The longest a schema read may take, its settings and 12 queries together.
 const SCHEMA_DEADLINE: Duration = Duration::from_secs(35);
-/// The data API's roles, granted to the owner (SET only) on first use.
-const API_ROLES: [&str; 2] = ["anon", "authenticated"];
 /// Roles the editor never runs as (besides any `pg_` name).
 const RESERVED_ROLES: [&str; 5] = [
     "cloud_admin",
@@ -101,6 +107,9 @@ pub struct RunSqlRequest {
 pub struct SqlSchemaQuery {
     /// The Postgres database; the branch's main database when absent.
     pub database: Option<String>,
+    /// The role to read as (what it may use), as a run with this `role` would; the owner when
+    /// absent.
+    pub role: Option<String>,
 }
 
 /// The value, or the error to answer with instead.
@@ -113,19 +122,21 @@ macro_rules! or_answer {
     };
 }
 
-/// The database, its branch (ready, not a backup) and the Postgres database named
-/// (`None`: the main one; never the system database).
-async fn load_target<M, J>(
+/// What the access check resolved (the caller's grant), the database and its branch (ready,
+/// not a backup).
+async fn load_authorized<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
-    id: Uuid,
+    access: Access,
+    target: Target<'_>,
     branch_id: Uuid,
-) -> Result<(DatabaseRecord, BranchRecord), ApiError>
+) -> Result<(Authorized, DatabaseRecord, BranchRecord), ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = load_owned(state, principal, id).await?;
+    let authorized = authorize(state, principal, access, target).await?;
+    let record = authorized.clone().into_record()?;
     let branch = load_branch(state, &record, branch_id).await?;
     if branch.kind == BranchKind::Backup {
         return Err(conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL));
@@ -133,7 +144,7 @@ where
     if branch.status != BranchStatus::Ready {
         return Err(conflict(ErrorCode::BranchNotReady, "branch is not ready"));
     }
-    Ok((record, branch))
+    Ok((authorized, record, branch))
 }
 
 async fn pick_pg_database<M, J>(
@@ -157,80 +168,318 @@ where
 }
 
 fn is_reserved(role: &str) -> bool {
-    role.to_ascii_lowercase().starts_with("pg_") || RESERVED_ROLES.contains(&role)
+    role.to_ascii_lowercase().starts_with("pg_")
+        || chelabase_types::role_name::has_reserved_prefix(role)
+        || RESERVED_ROLES.contains(&role)
 }
 
-/// Checks `role` may be used on `row`: a role of the branch, or `anon`/`authenticated`
-/// where the data API's machinery was installed. Returns whether the owner needs it granted.
-async fn resolve_role<M, J>(
+/// The 422 for a `role` the editor never takes (empty, or a system role), or `None`.
+fn invalid_role(role: Option<&str>) -> Option<ApiError> {
+    match role {
+        Some("") => Some(unprocessable("`role` must not be empty (null runs as the owner)")),
+        Some(role) if is_reserved(role) => Some(unprocessable(&format!(
+            "the SQL editor can't run as the system role {role:?}"
+        ))),
+        _ => None,
+    }
+}
+
+/// An open editor connection, the role to `SET ROLE` to on it, and, on a member role's
+/// connection, the member (its run is handed over afterwards, R5).
+struct Session {
+    connected: Connected,
+    set_role: Option<String>,
+    member: Option<Uuid>,
+}
+
+/// The role a session `SET ROLE`s to for the requested `role`: none for no role or the owner
+/// (`owner` in any case, or the owner's real name; M2).
+fn set_role_for<'a>(role: Option<&'a str>, owner: &str) -> Option<&'a str> {
+    match role.map(|r| Requested::from_name(r, owner)) {
+        None | Some(Requested::Owner) => None,
+        Some(Requested::Role(name)) => Some(name),
+    }
+}
+
+/// What a refused member-role login means.
+enum MemberLogin {
+    /// The role is stale (28P01: a password Chelabase didn't set; 28000: it may not log in,
+    /// e.g. locked out during a removal): one forced reconcile, then one more try.
+    Retry,
+    /// The answer to give.
+    Refused(ApiError),
+}
+
+fn member_login_refusal(branch: BranchId, err: ConnectError) -> MemberLogin {
+    match &err {
+        ConnectError::Rejected { code, .. } if code == "28P01" || code == "28000" => MemberLogin::Retry,
+        // No CONNECT on this Postgres database: the member's own limit, not a broken role.
+        ConnectError::Rejected { code, .. } if code == "42501" => MemberLogin::Refused(
+            ApiError::new(
+                403,
+                ErrorCode::Forbidden,
+                "your database role may not connect to this Postgres database",
+            )
+            .with_extra("required", serde_json::json!("connect")),
+        ),
+        _ => MemberLogin::Refused(connect_failure(branch, err)),
+    }
+}
+
+/// Opens the connection a run or schema read acting as `role` uses (`authorize` has allowed it):
+/// - no role, or the owner by name: the owner's connection, no `SET ROLE` (Admin);
+/// - any other role: the caller's member role ([`member_session_target`]), then `SET ROLE`.
+///   The member role can only become the roles it was granted and their chains, so a script's
+///   `RESET ROLE` lands on it, never on the owner;
+/// - a role a member role can't hold (LOGIN, owner-level or a chain through a reserved role,
+///   R16, R22, R23; or one the reconciler left out): for an effective Admin, the owner's
+///   connection then `SET ROLE` (I2); below Admin, 403 `forbidden{required: "role:<name>"}`
+///   (without asking the worker when 6a already shows it, M5).
+#[allow(clippy::too_many_arguments)]
+async fn open_session<M, J>(
     state: &AppState<M, J>,
+    authorized: &Authorized,
+    principal: &AuthPrincipal,
+    record: &DatabaseRecord,
     branch: &BranchRecord,
-    row: &BranchDatabase,
-    role: &str,
-) -> Result<bool, ApiError>
+    pg_database: &str,
+    role: Option<&str>,
+    record_acted: bool,
+) -> Result<Session, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    if is_reserved(role) {
-        return Err(unprocessable(&format!(
-            "the SQL editor can't run as the system role {role:?}"
-        )));
+    let owner = roles::owner_name(record);
+    let as_owner = |set_role: Option<&str>| {
+        let set_role = set_role.map(str::to_owned);
+        async move {
+            let connected = connect_as_owner(state, branch, owner, pg_database).await?;
+            Ok::<_, ApiError>(Session { connected, set_role, member: None })
+        }
+    };
+    let Some(role) = set_role_for(role, owner) else {
+        return as_owner(None).await;
+    };
+    let graph = authorized.role_graph(state, record, branch.id.as_uuid()).await?;
+    let admin = authorized
+        .grant
+        .as_ref()
+        .is_some_and(|g| g.platform_role == PlatformRole::Admin);
+    // A role the branch has (or the data API's own): an Admin may always act as it.
+    let admin_may = admin
+        && (graph.as_ref().is_some_and(|g| g.has(role)) || matches!(role, "anon" | "authenticated"));
+    if graph.as_ref().is_some_and(|g| g.refusal(role).is_some()) {
+        return if admin_may { as_owner(Some(role)).await } else { Err(role_forbidden(role)) };
     }
-    if API_ROLES.contains(&role) && row.data_api_bootstrapped {
-        return Ok(true);
+    for force in [false, true] {
+        let target = match member_session_target(
+            state, authorized, principal, graph.as_deref(), branch, pg_database, role, force,
+            record_acted,
+        )
+        .await
+        {
+            Ok(target) => target,
+            Err(err) if admin_may && err.code == ErrorCode::Forbidden => {
+                return as_owner(Some(role)).await;
+            }
+            Err(err) => return Err(err),
+        };
+        let member = principal.member.as_ref().map(|m| m.id);
+        match run::connect(&target).await {
+            Ok(connected) => {
+                return Ok(Session { connected, set_role: Some(role.to_owned()), member });
+            }
+            Err(err) => match member_login_refusal(branch.id, err) {
+                MemberLogin::Retry => {
+                    warn!(branch_id = %branch.id, "member role login refused; reconciling it");
+                }
+                MemberLogin::Refused(api) => return Err(api),
+            },
+        }
     }
+    Err(reconcile_failed())
+}
+
+/// 403 `forbidden{required: "role:<name>"}`.
+fn role_forbidden(role: &str) -> ApiError {
+    deny_to_api(Deny::Forbidden { required: format!("role:{role}") })
+}
+
+/// Asks the worker for an act-as run's hand-over once it's over (R5; the member-role
+/// invariant, `chelabase_types::role_name::member_hand_over_sql`). A failure is logged: what
+/// stays with the member role is dropped by its next narrowing or removal.
+fn hand_over_after<M, J>(
+    state: Arc<AppState<M, J>>,
+    branch: BranchId,
+    member: Uuid,
+    database: String,
+    acted: String,
+    backend: (i32, String),
+) -> run::AfterRun
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    Box::pin(async move {
+        let request = MemberRoleHandOverRequest {
+            branch_id: branch.as_uuid(),
+            member_id: member,
+            database,
+            acted_role: acted,
+            backend_pid: Some(backend.0),
+            backend_start: Some(backend.1),
+        };
+        match state.js.hand_over_member_role(request).await {
+            Ok(MemberRolesReply::Done { .. }) => {}
+            Ok(MemberRolesReply::Failed { message }) => {
+                warn!(branch_id = %branch, %member, "member role hand-over failed: {message}");
+            }
+            Err(err) => warn!(branch_id = %branch, %member, "member role hand-over: {err:?}"),
+        }
+    })
+}
+
+/// 503 `member_role_reconcile_failed`: the caller's member role couldn't be brought up to date.
+fn reconcile_failed() -> ApiError {
+    ApiError::new(
+        503,
+        ErrorCode::MemberRoleReconcileFailed,
+        "your database role on this branch couldn't be prepared; try again",
+    )
+    .retry_after(RETRY_AFTER_SECS)
+}
+
+/// Whether a member role holding `applied` can `SET ROLE` to `role`: one of them, or reached
+/// through one's memberships as 6a records them (R21; Postgres checks the same at `SET ROLE`).
+fn reaches(applied: &[String], graph: Option<&RoleGraph>, role: &str) -> bool {
+    applied
+        .iter()
+        .any(|g| g == role || graph.is_some_and(|gr| gr.closure(g).contains(role)))
+}
+
+/// Where and as whom the caller's member role connects to act as `role` (never the owner) in
+/// `pg_database` on `branch`, after the lazy check (members and roles, part 3):
+/// 1. the member's `member_branch_roles` row is read;
+/// 2. it's stale when missing, when it isn't `member_role_name(member)`, when its password
+///    won't open, when it holds a role the effective grant no longer lists (a revoke the
+///    reconciler hasn't applied yet), or when it can't reach `role`; a stale row (or `force`)
+///    asks the worker to reconcile this member's role now (`chelabase.rpc.member_roles.reconcile`).
+///    A failure or timeout is 503 `member_role_reconcile_failed`;
+/// 3. a role the reconciled member role still can't reach (missing on the branch, or left out
+///    as unsafe) is 403 `forbidden{required: "role:<name>"}`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn member_session_target<M, J>(
+    state: &AppState<M, J>,
+    authorized: &Authorized,
+    principal: &AuthPrincipal,
+    graph: Option<&RoleGraph>,
+    branch: &BranchRecord,
+    pg_database: &str,
+    role: &str,
+    force: bool,
+    record_acted: bool,
+) -> Result<RunTarget, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let (Some(member), Some(grant)) = (principal.member.as_ref(), authorized.grant.as_ref()) else {
+        error!(branch_id = %branch.id, "act-as without a member or a grant");
+        return Err(ApiError::internal());
+    };
+    let member = member.id;
     let Some(endpoint) = branch.endpoint_id.as_deref() else {
         return Err(conflict(ErrorCode::BranchNotReady, "branch is not ready"));
     };
-    let roles = state.metadata.list_roles(endpoint).await.map_err(|err| {
-        error!(branch_id = %branch.id, "list roles: {err}");
-        ApiError::internal()
-    })?;
-    if roles.iter().any(|r| r.name == role) {
-        Ok(false)
-    } else {
-        Err(ApiError::not_found("role not found"))
-    }
-}
-
-/// Grants `role` to the owner (SET only) through the worker, once per five minutes.
-async fn grant_to_owner<M, J>(
-    state: &AppState<M, J>,
-    branch: BranchId,
-    role: &str,
-    owner: &str,
-) -> Result<(), ApiError>
-where
-    M: MetadataPort,
-    J: JobPort,
-{
-    let key = (branch, role.to_owned());
-    if state.sql_editor.granted.contains_key(&key) {
-        return Ok(());
-    }
-    let refusal = match state.js.grant_data_role_to_owner(branch, role, owner).await {
-        Ok(reply) if reply.ok => {
-            state.sql_editor.granted.insert(key, ());
-            return Ok(());
-        }
-        Ok(reply) => match (reply.kind.as_deref(), reply.error) {
-            (Some("refused"), Some(message)) => ApiError::new(403, ErrorCode::RoleRefused, message),
-            (Some("not_ready"), _) => conflict(ErrorCode::BranchNotReady, "branch is not ready"),
-            (kind, message) => {
-                error!(branch_id = %branch, ?kind, "grant role to the owner failed: {message:?}");
+    let role_name = member_role_name(member);
+    let read_row = || async {
+        let rows = state
+            .metadata
+            .member_branch_roles(branch.id.as_uuid())
+            .await
+            .map_err(|err| {
+                error!(branch_id = %branch.id, "read member roles: {err}");
                 ApiError::internal()
+            })?;
+        Ok::<_, ApiError>(rows.into_iter().find(|r| r.member_id == member && r.role_name == role_name))
+    };
+    let open = |row: &MemberBranchRole| {
+        open_member_role_password(&state.secrets, branch.id.as_uuid(), &role_name, &row.password_enc).ok()
+    };
+
+    let row = read_row().await?;
+    let fresh = row.as_ref().filter(|row| {
+        !force
+            && row.applied_roles.iter().all(|r| {
+                grant.roles.contains(&PgRole::Named(r.clone()))
+                    // M1: a role that has become unsafe since (LOGIN, or a chain through an
+                    // owner-level or reserved role) must go.
+                    && !graph.is_some_and(|g| g.refusal(r).is_some())
+            })
+            && reaches(&row.applied_roles, graph, role)
+    });
+    let password = match fresh.and_then(open) {
+        Some(password) => password,
+        None => {
+            let request = MemberRolesReconcileRequest {
+                branch_id: branch.id.as_uuid(),
+                member_id: Some(member),
+            };
+            match state.js.reconcile_member_roles(request).await {
+                Ok(MemberRolesReply::Done { roles }) => {
+                    let mine = roles.into_iter().find(|r| r.member_id == member);
+                    if !mine.is_some_and(|r| reaches(&r.applied_roles, graph, role)) {
+                        return Err(role_forbidden(role));
+                    }
+                }
+                Ok(MemberRolesReply::Failed { message }) => {
+                    warn!(branch_id = %branch.id, %member, "member-role reconcile failed: {message}");
+                    return Err(reconcile_failed());
+                }
+                Err(ResetError::Timeout) => {
+                    warn!(branch_id = %branch.id, %member, "member-role reconcile timed out");
+                    return Err(reconcile_failed());
+                }
+                Err(ResetError::Transport(err)) => {
+                    warn!(branch_id = %branch.id, %member, "member-role reconcile: {err}");
+                    return Err(reconcile_failed());
+                }
             }
-        },
-        Err(ResetError::Timeout) => {
-            ApiError::new(504, ErrorCode::Timeout, "worker did not respond; try again")
-        }
-        Err(ResetError::Transport(err)) => {
-            error!(branch_id = %branch, "grant role to the owner: {err}");
-            ApiError::new(503, ErrorCode::WorkerUnavailable, "worker unavailable")
+            match read_row().await?.as_ref().and_then(open) {
+                Some(password) => password,
+                None => {
+                    warn!(branch_id = %branch.id, %member, "no usable member role after a reconcile");
+                    return Err(reconcile_failed());
+                }
+            }
         }
     };
-    Err(refusal)
+    // R31: a run records the role it acts as before it starts, so a reconcile can hand what
+    // the member role makes to it if this run's hand-over never happens.
+    if record_acted {
+        match state
+            .metadata
+            .record_member_acted_role(member, branch.id.as_uuid(), role)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(branch_id = %branch.id, %member, "no member role row to record the acted role on");
+            }
+            Err(err) => {
+                error!(branch_id = %branch.id, %member, "record the acted role: {err}");
+                return Err(ApiError::internal());
+            }
+        }
+    }
+    let addr = compute_addr(state, branch.id, endpoint).await?;
+    Ok(RunTarget {
+        addr,
+        user: role_name,
+        password,
+        database: pg_database.to_owned(),
+    })
 }
 
 /// A fresh owner connection to `database` on the branch's compute.
@@ -439,7 +688,7 @@ impl Drop for Audit {
     operation_id = "runSql",
     tag = "sql-editor",
     summary = "Run SQL on a branch",
-    description = "Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (or, with `role`, after `SET ROLE` to it: a preview of that role's view, not a security boundary). The script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. Unless `confirm` is true, risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.",
+    description = "Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (Admin only), or, with `role`, as that role: the connection logs in as your own hidden member role on the branch, which can only become the roles you were granted (and what they can become), then runs `SET ROLE` to `role`, so a script that resets its role is never the owner. When the run ends (however it ends), its session is ended, whatever the script made as the member role itself is handed to `role`, and every privilege, default privilege or policy naming the member role is dropped. An Admin acting as a role a member role can't hold (LOGIN, owner-level, or reaching a reserved role) uses the owner's connection and `SET ROLE`; naming the owner runs as the owner. The script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. Unless `confirm` is true, risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -449,14 +698,13 @@ impl Drop for Audit {
         (status = 200, description = "The run's events as NDJSON, ending with `done`", content_type = "application/x-ndjson", body = String),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker couldn't let the owner use `anon` or `authenticated` (the message says why)", body = ErrorEnvelope),
-        (status = 404, description = "`not_found`: the database (or another tenant's), the branch, the Postgres database or the role doesn't exist", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant. Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`sql_confirm_required`: the guard held statements back; `error.statements` lists them (`index`, `kind`: pg_query's node name or `unparsed`, `text_preview`: the first 200 characters, `reason`: `risky` or `protected`); send again with `confirm: true` to run them. `run_id_in_use`: you have a run with this id in flight; `owner_password_unknown`: the owner's password was set in SQL (reset it); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the body isn't the run's shape, `sql` isn't 1 byte to 1 MiB or holds a NUL byte, `timeout_ms` isn't 100 to 900000, `role` is empty, or `role` is a system role", body = ErrorEnvelope),
         (status = 429, description = "`sql_run_limit`: you have 4 runs in flight, or the Postgres database has 4 (`Retry-After`)", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached, is starting up or is out of connections right now (`Retry-After`); `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope),
-        (status = 504, description = "`timeout`: the worker didn't answer in time", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached, is starting up or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your member role on the branch couldn't be brought up to date (`Retry-After`)", body = ErrorEnvelope),
     ),
 )]
 async fn run_sql<M, J>(
@@ -469,7 +717,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (record, branch) = or_answer!(load_target(&state, &principal, id, branch_id).await);
+    // The request is read first: the access check needs the role and the Postgres database.
     let request: RunSqlRequest = or_answer!(parse_body(&body));
     if let Some(message) = invalid_sql(&request.sql) {
         return unprocessable(message).into_response();
@@ -478,14 +726,19 @@ where
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
         return unprocessable("`timeout_ms` must be 100 to 900000").into_response();
     }
-    if request.role.as_deref() == Some("") {
-        return unprocessable("`role` must not be empty (null runs as the owner)").into_response();
+    if let Some(refusal) = invalid_role(request.role.as_deref()) {
+        return refusal.into_response();
     }
-    let row = or_answer!(pick_pg_database(&state, &branch, request.database.as_deref()).await);
-    let needs_grant = match request.role.as_deref() {
-        None => false,
-        Some(role) => or_answer!(resolve_role(&state, &branch, &row, role).await),
+    let target = Target::Role {
+        database: id,
+        branch: branch_id,
+        pg_database: request.database.as_deref().unwrap_or(""),
+        role: request.role.as_deref().map_or(Requested::Owner, Requested::Role),
     };
+    let (authorized, record, branch) = or_answer!(
+        load_authorized(&state, &principal, ep::RUN_SQL.policy.access, target, branch_id).await
+    );
+    let row = or_answer!(pick_pg_database(&state, &branch, request.database.as_deref()).await);
 
     let confirmed = request.confirm == Some(true);
     let sql_sha256 = hex::encode(Sha256::digest(request.sql.as_bytes()));
@@ -526,30 +779,53 @@ where
         }
     }
 
-    let owner = roles::owner_name(&record).to_owned();
-    if needs_grant {
-        let role = request.role.as_deref().unwrap_or_default();
-        or_answer!(grant_to_owner(&state, branch.id, role, &owner).await);
-    }
     let guard = match state.sql_editor.runs.reserve(
         &principal.sub,
         request.run_id,
+        principal.member.as_ref().map(|m| m.id),
         branch.id,
         &row.name,
     ) {
         Ok(guard) => guard,
         Err(err) => return reserve_refusal(err),
     };
-    let connected = or_answer!(connect_as_owner(&state, &branch, &owner, &row.name).await);
+    let session = or_answer!(
+        open_session(
+            &state,
+            &authorized,
+            &principal,
+            &record,
+            &branch,
+            &row.name,
+            request.role.as_deref(),
+            true,
+        )
+        .await
+    );
 
     let mut audit = audit();
+    let after = match (session.member, session.set_role.as_ref()) {
+        (Some(member), Some(acted)) => Some(hand_over_after(
+            state.clone(),
+            branch.id,
+            member,
+            row.name.clone(),
+            acted.clone(),
+            (
+                session.connected.backend_pid(),
+                session.connected.backend_start().to_owned(),
+            ),
+        )),
+        _ => None,
+    };
     let spec = RunSpec {
         sql: request.sql,
-        role: request.role,
+        role: session.set_role,
         timeout: Duration::from_millis(timeout_ms),
+        after,
     };
     let finished = audit.finished.clone();
-    let events = run::run_reporting(connected, spec, guard, finished).map(move |event| {
+    let events = run::run_reporting(session.connected, spec, guard, finished).map(move |event| {
         audit.observe(&event);
         Ok::<_, Infallible>(event.to_line())
     });
@@ -588,7 +864,7 @@ fn reserve_refusal(err: ReserveError) -> Response {
     operation_id = "cancelSqlRun",
     tag = "sql-editor",
     summary = "Cancel a SQL run",
-    description = "Cancels one of your runs in flight: Postgres's cancel request is sent and the run's stream ends with `done` (`outcome: cancelled`). Closing the stream cancels too.",
+    description = "Cancels a run in flight that you started (an Admin may cancel any): Postgres's cancel request is sent and the run's stream ends with `done` (`outcome: cancelled`). Closing the stream cancels too.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -598,7 +874,7 @@ fn reserve_refusal(err: ReserveError) -> Response {
         (status = 202, description = "The cancel was sent", body = Object),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the run was started by someone else and you aren't an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist, or you have no run with this id in flight", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -613,11 +889,25 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    or_answer!(load_target(&state, &principal, id, branch_id).await);
-    if state.sql_editor.runs.cancel(&principal.sub, run_id) {
-        (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response()
-    } else {
-        ApiError::not_found("run not found").into_response()
+    let target = Target::Branch { database: id, branch: branch_id };
+    let (authorized, _, _) = or_answer!(
+        load_authorized(&state, &principal, ep::CANCEL_SQL_RUN.policy.access, target, branch_id).await
+    );
+    let by = match (principal.member.as_ref(), authorized.grant.as_ref()) {
+        (_, Some(grant)) if grant.platform_role == PlatformRole::Admin => Canceller::Admin,
+        (Some(member), _) => Canceller::Member(member.id),
+        (None, _) => return ApiError::internal().into_response(),
+    };
+    match state.sql_editor.runs.cancel(run_id, BranchId(branch_id), by) {
+        Cancelled::Done => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
+        Cancelled::NotYours => ApiError::new(
+            403,
+            ErrorCode::Forbidden,
+            "only the run's starter or an Admin may cancel it",
+        )
+        .with_extra("required", serde_json::json!("admin"))
+        .into_response(),
+        Cancelled::Missing => ApiError::not_found("run not found").into_response(),
     }
 }
 
@@ -627,7 +917,7 @@ where
     operation_id = "getSqlSchema",
     tag = "sql-editor",
     summary = "The schema for the SQL editor's completion",
-    description = "Everything the database's owner sees in one Postgres database of the branch, read on a fresh owner connection with postgres-language-server's own introspection (the version `PGLS_VERSION` pins), as the JSON its WASM build's `setSchema` takes. Not cached on the server.",
+    description = "Everything the database's owner (or, with `role`, that role) can use in one Postgres database of the branch, read on the same kind of fresh connection a run with that `role` uses, with postgres-language-server's own introspection (the version `PGLS_VERSION` pins), as the JSON its WASM build's `setSchema` takes. Not cached on the server.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -637,13 +927,13 @@ where
         (status = 200, description = "postgres-language-server's schema JSON (at most 8 MiB)", body = Object),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant. Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`owner_password_unknown`: the owner's password was set in SQL (reset it); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the query string is malformed; `schema_too_large`: the schema is over 8 MiB (use keyword completion)", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the query string is malformed, `role` is empty or a system role; `schema_too_large`: the schema is over 8 MiB (use keyword completion)", body = ErrorEnvelope),
         (status = 429, description = "`sql_run_limit`: a schema read takes a run slot while it lasts, and you have 4 runs in flight, or the Postgres database has 4 (`Retry-After`)", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached, is starting up or is out of connections right now (`Retry-After`)", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached, is starting up or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your member role on the branch couldn't be brought up to date (`Retry-After`)", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: reading the schema took over 35 s", body = ErrorEnvelope),
     ),
 )]
@@ -657,25 +947,53 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (record, branch) = or_answer!(load_target(&state, &principal, id, branch_id).await);
     let Ok(axum::extract::Query(query)) = query else {
         return unprocessable("the query string is malformed").into_response();
     };
+    if let Some(refusal) = invalid_role(query.role.as_deref()) {
+        return refusal.into_response();
+    }
+    // Read on the same session a run as this role would use.
+    let target = Target::Role {
+        database: id,
+        branch: branch_id,
+        pg_database: query.database.as_deref().unwrap_or(""),
+        role: query.role.as_deref().map_or(Requested::Owner, Requested::Role),
+    };
+    let (authorized, record, branch) = or_answer!(
+        load_authorized(&state, &principal, ep::GET_SQL_SCHEMA.policy.access, target, branch_id).await
+    );
     let row = or_answer!(pick_pg_database(&state, &branch, query.database.as_deref()).await);
-    // A schema read holds an owner connection for up to 35 s: it takes a run slot meanwhile.
+    // A schema read holds a connection for up to 35 s: it takes a run slot meanwhile.
     let _slot = match state.sql_editor.runs.reserve(
         &principal.sub,
         Uuid::new_v4(),
+        principal.member.as_ref().map(|m| m.id),
         branch.id,
         &row.name,
     ) {
         Ok(slot) => slot,
         Err(err) => return reserve_refusal(err),
     };
-    let owner = roles::owner_name(&record);
-    let connected = or_answer!(connect_as_owner(&state, &branch, owner, &row.name).await);
-    let result = or_answer!(within(SCHEMA_DEADLINE, schema::introspect(connected.client())).await);
-    drop(connected);
+    let session = or_answer!(
+        open_session(
+            &state,
+            &authorized,
+            &principal,
+            &record,
+            &branch,
+            &row.name,
+            query.role.as_deref(),
+            false,
+        )
+        .await
+    );
+    // The pgls queries are fixed reads: they make nothing, so a schema read needs no hand-over.
+    let client = session.connected.client();
+    let result = or_answer!(
+        within(SCHEMA_DEADLINE, schema::introspect(client, session.set_role.as_deref())).await
+    );
+    drop(session);
     let json = match result {
         Ok(json) => json,
         Err(schema::SchemaError::TooLarge(bytes)) => {
@@ -685,6 +1003,10 @@ where
                 format!("the schema is {bytes} bytes, over the 8 MiB the editor takes"),
             )
             .into_response();
+        }
+        Err(schema::SchemaError::Role(message)) => {
+            warn!(branch_id = %branch.id, "SQL editor schema: {message}");
+            return role_forbidden(query.role.as_deref().unwrap_or_default()).into_response();
         }
         Err(schema::SchemaError::Query(message)) => {
             error!(branch_id = %branch.id, "SQL editor schema: {message}");
@@ -744,6 +1066,46 @@ mod tests {
             connect_failure(branch, rejected("28P01")).message,
             OWNER_PASSWORD_UNKNOWN
         );
+    }
+
+    // M2 (T9 review): naming the owner (`owner` in any case, or its real name) runs as the owner
+    // with no `SET ROLE`.
+    #[test]
+    fn owner_by_name_sets_no_role() {
+        for (role, want) in [
+            (None, None),
+            (Some("owner"), None),
+            (Some("OWNER"), None),
+            (Some("Owner"), None),
+            (Some("app_owner"), None),
+            (Some("billing"), Some("billing")),
+            (Some("ownerish"), Some("ownerish")),
+        ] {
+            assert_eq!(set_role_for(role, "app_owner"), want, "{role:?}");
+        }
+    }
+
+    // M6 (T9 review): a refused member-role login. A password (28P01) or a login the role may
+    // not make (28000: locked out during a removal) is a stale role: one forced reconcile, then
+    // one more try. No CONNECT on the database (42501) is the member's own limit: 403.
+    #[test]
+    fn member_login_refusals_map() {
+        let rejected = |code: &str| ConnectError::Rejected { code: code.into(), message: "no".into() };
+        let branch = BranchId::new();
+        for code in ["28P01", "28000"] {
+            assert!(matches!(member_login_refusal(branch, rejected(code)), MemberLogin::Retry), "{code}");
+        }
+        let MemberLogin::Refused(api) = member_login_refusal(branch, rejected("42501")) else {
+            panic!("42501 isn't a refusal");
+        };
+        assert_eq!((api.status, api.code), (403, ErrorCode::Forbidden));
+        assert_eq!(api.extra, vec![("required".to_string(), serde_json::json!("connect"))]);
+        for (code, status) in [("3D000", 404), ("57P03", 503), ("XX000", 500)] {
+            let MemberLogin::Refused(api) = member_login_refusal(branch, rejected(code)) else {
+                panic!("{code}");
+            };
+            assert_eq!(api.status, status, "{code}");
+        }
     }
 
     #[test]

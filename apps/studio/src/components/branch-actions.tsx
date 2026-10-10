@@ -26,6 +26,7 @@ import {
   toLocalInput,
   type ActionKey,
 } from "@/lib/branches";
+import { useProjectCaps } from "@/lib/capabilities";
 import { mergeErrorText } from "@/lib/merges";
 import { BranchRoles } from "./branch-roles";
 import { DatabaseActions } from "./database-actions";
@@ -94,7 +95,11 @@ export function BranchActions({
   }, [branch]);
   const mergeDatabase = postgresDatabase ?? undefined;
   const reasons = actionReasons(branch, branches, openMerges, mergeDatabase);
-  const parentName = branches.find((b) => b.id === branch.parent_branch_id)?.name ?? null;
+  const parent = branches.find((b) => b.id === branch.parent_branch_id) ?? null;
+  const parentName = parent?.name ?? null;
+  // Branch routes need Developer on an unprotected branch and Admin on a protected one.
+  const caps = useProjectCaps();
+  const canChange = (b: Branch) => caps.atLeast(b.protected ? "admin" : "developer");
   // The open merge each merge action's reason names, linked next to the reason.
   const blockingMerge: Partial<Record<ActionKey, MergeSummary>> = {};
   for (const [key, direction] of [["mergeInto", "into_parent"], ["updateFrom", "from_parent"]] as const) {
@@ -246,7 +251,7 @@ export function BranchActions({
           )
         }
       >
-        {branch.kind === "normal" &&
+        {branch.kind === "normal" && caps.atLeast("admin") &&
           (branch.protected ? (
             <Button size="sm" variant="outline" disabled={busy} onClick={() => void setProtected(false)}>
               Unprotect
@@ -256,15 +261,19 @@ export function BranchActions({
               Protect
             </Button>
           ))}
-        <Button size="sm" variant="outline" {...gated("resetToParent")} onClick={() => open("reset-to-parent")}>
-          Reset to parent
-        </Button>
-        <Button size="sm" variant="outline" {...gated("restore")} onClick={() => open("restore")}>
-          Restore
-        </Button>
-        <Button size="sm" variant="outline" {...gated("delete")} onClick={() => open("delete")}>
-          Delete branch
-        </Button>
+        {canChange(branch) && (
+          <>
+            <Button size="sm" variant="outline" {...gated("resetToParent")} onClick={() => open("reset-to-parent")}>
+              Reset to parent
+            </Button>
+            <Button size="sm" variant="outline" {...gated("restore")} onClick={() => open("restore")}>
+              Restore
+            </Button>
+            <Button size="sm" variant="outline" {...gated("delete")} onClick={() => open("delete")}>
+              Delete branch
+            </Button>
+          </>
+        )}
         <Button
           size="sm"
           variant="outline"
@@ -275,12 +284,17 @@ export function BranchActions({
         >
           Roles
         </Button>
-        <Button size="sm" variant="outline" {...gated("mergeInto")} onClick={() => void startMerge("into_parent")}>
-          {parentName ? `Merge into ${parentName}` : "Merge into parent"}
-        </Button>
-        <Button size="sm" variant="outline" {...gated("updateFrom")} onClick={() => void startMerge("from_parent")}>
-          {parentName ? `Update from ${parentName}` : "Update from parent"}
-        </Button>
+        {/* A merge is judged by its target: the parent when merging into it, this branch when updating. */}
+        {(parent === null || canChange(parent)) && (
+          <Button size="sm" variant="outline" {...gated("mergeInto")} onClick={() => void startMerge("into_parent")}>
+            {parentName ? `Merge into ${parentName}` : "Merge into parent"}
+          </Button>
+        )}
+        {canChange(branch) && (
+          <Button size="sm" variant="outline" {...gated("updateFrom")} onClick={() => void startMerge("from_parent")}>
+            {parentName ? `Update from ${parentName}` : "Update from parent"}
+          </Button>
+        )}
       </DatabaseActions>
 
       {panel === "roles" && reasons.connect === null && <BranchRoles databaseId={databaseId} branchId={branch.id} />}
@@ -292,7 +306,7 @@ export function BranchActions({
       )}
 
       {panel === "protect" && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <p>
             Children of a protected branch get new passwords for every role. It can&apos;t be deleted or reset to its
             parent until you unprotect it. Restore stays allowed.
@@ -309,7 +323,7 @@ export function BranchActions({
       )}
 
       {panel === "reset-to-parent" && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <p>
             Reset {branch.name} to its parent? Everything written to {branch.name} since it was created is
             discarded, and it gets the parent&apos;s current data.
@@ -326,7 +340,7 @@ export function BranchActions({
       )}
 
       {panel === "restore" && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <label className="flex flex-col gap-1">
             <span>Restore to</span>
             <input
@@ -335,7 +349,7 @@ export function BranchActions({
               min={bounds.min}
               max={bounds.max}
               onChange={(e) => setPoint(e.target.value)}
-              className="h-8 w-64 rounded-lg border border-input bg-background px-2"
+              className="h-8 w-64 border border-input bg-background px-2"
             />
           </label>
           <p className="text-xs text-muted-foreground">
@@ -355,7 +369,7 @@ export function BranchActions({
       )}
 
       {panel === "delete" && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <p>
             Delete {branch.name}? Its backups are deleted with it. This can&apos;t be undone.
           </p>

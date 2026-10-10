@@ -14,7 +14,10 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chelabase_metadata::{MetadataError, RoleCopy, RoleOrigin};
-use chelabase_nats::{ResyncBranchRequest, SUBJECT_RESYNC_BRANCH};
+use chelabase_nats::{
+    MemberRolesReconcileRequest, ResyncBranchRequest, SUBJECT_MEMBER_ROLES_ENQUEUE,
+    SUBJECT_RESYNC_BRANCH,
+};
 use chelabase_neon::ComputeLocator;
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_secrets::{SecretKey, open_role_password, seal_role_password};
@@ -57,6 +60,9 @@ impl CachePort for ProxyCache {
 /// production, a fake in tests.
 pub trait ResyncPort: Send + Sync + 'static {
     fn resync_branch(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>>;
+    /// Asks the worker to reconcile the branch's member roles soon
+    /// (`chelabase.member_roles.reconcile`).
+    fn reconcile_member_roles(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>>;
 }
 
 impl ResyncPort for async_nats::Client {
@@ -64,6 +70,17 @@ impl ResyncPort for async_nats::Client {
         Box::pin(async move {
             let body = serde_json::to_vec(&ResyncBranchRequest { branch_id: branch })?;
             self.publish(SUBJECT_RESYNC_BRANCH, body.into()).await?;
+            Ok(())
+        })
+    }
+
+    fn reconcile_member_roles(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            let body = serde_json::to_vec(&MemberRolesReconcileRequest {
+                branch_id: branch.as_uuid(),
+                member_id: None,
+            })?;
+            self.publish(SUBJECT_MEMBER_ROLES_ENQUEUE, body.into()).await?;
             Ok(())
         })
     }
@@ -106,6 +123,10 @@ pub trait DdlPort: Send + Sized + 'static {
         &mut self,
         name: &str,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    fn upsert_no_password(
+        &mut self,
+        name: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     fn rename_copy(
         &mut self,
         old: &str,
@@ -169,6 +190,9 @@ impl DdlPort for chelabase_metadata::DdlTx {
     }
     async fn remove_copy(&mut self, name: &str) -> Result<bool, MetadataError> {
         chelabase_metadata::DdlTx::remove_copy(self, name).await
+    }
+    async fn upsert_no_password(&mut self, name: &str) -> Result<(), MetadataError> {
+        chelabase_metadata::DdlTx::upsert_no_password(self, name).await
     }
     async fn rename_copy(
         &mut self,
@@ -437,6 +461,9 @@ enum Action<'a> {
         login: bool,
     },
     RemoveCopy(&'a str),
+    /// A role with no password (a group role, or `PASSWORD NULL`): an `sql` row without a
+    /// verifier, inserted or updated (`forwarded_at` set).
+    UpsertNoPassword(&'a str),
     /// `reseal`: the row's sealed password (an `api` row's, or an `sql` row's made revealable
     /// by an API reset) is opened under the old name and sealed under the new one.
     RenameCopy {
@@ -513,8 +540,11 @@ fn decide<'a>(
             }
             reserved(name)?;
             Ok(match facts.row {
-                Some(_) => Action::RemoveCopy(name),
-                None => Action::Nothing,
+                // An `api` row's password is the control plane's: the resync sets it back.
+                Some(row) if row.origin == RoleOrigin::Api => Action::RemoveCopy(name),
+                // A group role, or a password removed in SQL: the role exists, so its row is
+                // kept (or made) without a verifier, and members can be granted it.
+                _ => Action::UpsertNoPassword(name),
             })
         }
         // The owner always logs in, a reserved name has no copy, and a role with no copy
@@ -703,7 +733,10 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
     if plan.is_empty() && delta.dbs.is_empty() {
         if touched(&delta) {
             match state.metadata.endpoint_branch(&id).await {
-                Ok(Some(branch)) => request_resync(state.resync.clone(), branch),
+                Ok(Some(branch)) => {
+                    request_resync(state.resync.clone(), branch);
+                    request_member_reconcile(state.resync.clone(), branch);
+                }
                 // An unknown or deleted endpoint with a step-less delta answers 200 on purpose:
                 // there is nothing to apply and no branch to resync.
                 Ok(None) => {}
@@ -738,6 +771,12 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
     if let (true, Some(branch)) = (touched(&delta), branch) {
         request_resync(state.resync.clone(), branch);
     }
+    // T8 I3: a role made, dropped, renamed or changed in SQL can change what member roles may
+    // hold (R16) or which names grants find. Databases alone don't (R17: member roles are
+    // cluster-wide).
+    if let (false, Some(branch)) = (delta.roles.is_empty(), branch) {
+        request_member_reconcile(state.resync.clone(), branch);
+    }
     publish(state.cache.clone(), id, changed);
     StatusCode::OK.into_response()
 }
@@ -747,6 +786,16 @@ fn request_resync(resync: Arc<dyn ResyncPort>, branch: BranchId) {
     tokio::spawn(async move {
         if let Err(e) = resync.resync_branch(branch).await {
             warn!(%branch, "ddl: resync not requested: {e:#}");
+        }
+    });
+}
+
+/// Asks the worker for a member-role reconcile of `branch`, off the response path. A lost
+/// request is caught by the worker's periodic sweep.
+fn request_member_reconcile(resync: Arc<dyn ResyncPort>, branch: BranchId) {
+    tokio::spawn(async move {
+        if let Err(e) = resync.reconcile_member_roles(branch).await {
+            warn!(%branch, "ddl: member-role reconcile not requested: {e:#}");
         }
     });
 }
@@ -901,6 +950,10 @@ async fn apply<T: DdlPort>(
             }
             Action::RemoveCopy(name) => {
                 tx.remove_copy(name).await?;
+                touch(name);
+            }
+            Action::UpsertNoPassword(name) => {
+                tx.upsert_no_password(name).await?;
                 touch(name);
             }
             Action::RenameCopy { old, new, reseal } => {
@@ -1264,12 +1317,14 @@ mod tests {
             Err("the branch owner's password can't be removed; reset it instead".into()),
             "owner"
         );
+        // The role exists without a password: its row is kept (or made), with no verifier, so
+        // the role can still be granted to members.
         assert_eq!(
             refused("r1", true),
-            Ok("RemoveCopy(\"r1\")".to_string()),
+            Ok("UpsertNoPassword(\"r1\")".to_string()),
             "existing copy"
         );
-        assert_eq!(refused("r1", false), Ok("Nothing".to_string()), "no copy");
+        assert_eq!(refused("r1", false), Ok("UpsertNoPassword(\"r1\")".to_string()), "no copy");
     }
 
     #[test]
@@ -1306,6 +1361,46 @@ mod tests {
                 Step::SetRole { name: "c", password: Some(p) },
             ]
         );
+    }
+
+    /// Create, rename (either side) and drop of `chelabase_…` / `cb_m_…` (any case) are refused.
+    #[test]
+    fn hidden_prefixes_at_the_receiver() {
+        let sh = rules(Mode::SelfHosted, false);
+        let reserved = |n: &str| Err(format!("the role name \"{n}\" is reserved by Chelabase"));
+        let pw = Some(PW);
+        for name in ["chelabase_x", "cb_m_x", "CB_M_X"] {
+            assert_eq!(
+                decide(&Step::SetRole { name, password: pw }, &facts(), &sh),
+                reserved(name),
+                "create {name}"
+            );
+            assert_eq!(
+                decide(&Step::SetRole { name, password: None }, &facts(), &sh),
+                reserved(name),
+                "create group {name}"
+            );
+            assert_eq!(
+                decide(&Step::RenameRole { old: "a", new: name }, &facts(), &sh),
+                reserved(name),
+                "rename to {name}"
+            );
+            assert_eq!(
+                decide(&Step::CheckRecreated { name }, &facts(), &sh),
+                reserved(name),
+                "recreate {name}"
+            );
+            assert_eq!(
+                decide(&Step::DelRole { name }, &facts(), &sh),
+                reserved(name),
+                "drop {name}"
+            );
+            assert_eq!(
+                decide(&Step::RenameRole { old: name, new: "a" }, &facts(), &sh),
+                reserved(name),
+                "rename away {name}"
+            );
+        }
     }
 
     #[test]
@@ -1501,11 +1596,18 @@ mod tests {
                 Ok(Action::RemoveCopy("app")),
             ),
             (
-                "group role",
+                "password null on an sql row: kept, without a password",
+                Step::SetRole { name: "app", password: None },
+                Facts { row: row(RoleOrigin::Sql, true, false), ..facts() },
+                sh,
+                Ok(Action::UpsertNoPassword("app")),
+            ),
+            (
+                "group role: a row without a password",
                 Step::SetRole { name: "grp", password: None },
                 facts(),
                 sh,
-                Ok(Action::Nothing),
+                Ok(Action::UpsertNoPassword("grp")),
             ),
             (
                 "owner password null",

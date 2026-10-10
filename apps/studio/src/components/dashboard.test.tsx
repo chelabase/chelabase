@@ -1,7 +1,7 @@
 import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type DatabaseSummary, type Me, type ProjectStatusView } from "@chelabase/management-client";
+import { type DatabaseSummary, type MeResponse as Me, type ProjectStatusView } from "@chelabase/management-client";
 import { POLL_MS } from "@/lib/query";
 import { createReauthGuard, restartSignInOnce } from "@/lib/reauth";
 import { fakeFetch, jsonResponse, sequence, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
@@ -9,10 +9,18 @@ import { renderWithRouter } from "@/test/render-router";
 import { Dashboard, type DashboardProps } from "./dashboard";
 
 const bound: Me = {
+  sub: "u1",
+  email: "u1@example.test",
+  name: "U1",
+  tenant_id: "t1",
+  member: { id: "m-self", status: "active", tenant_admin: true },
+  instance_admin: true, tenant_admins: [],
+  projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
   user: { sub: "u1", org_id: "org-1" },
   tenant: {
     id: "t1",
     slug: "demo",
+    display_name: null,
     projects: [
       {
         id: "p1",
@@ -186,5 +194,31 @@ describe("Dashboard", () => {
     expect(meCalls(fetch)).toBeGreaterThanOrEqual(3);
     expect(screen.queryByText(/Couldn't load your workspace/)).toBeNull();
     expect(screen.queryByText(/Couldn't refresh/)).toBeNull();
+  });
+
+  it("a member without projects sees the no-access screen; access arriving opens the projects", async () => {
+    const plain: Me = { ...noProjects, member: { id: "m-self", status: "active", tenant_admin: false }, projects: [] };
+    const granted: Me = { ...bound, member: { id: "m-self", status: "active", tenant_admin: false }, projects: [{ project_id: "p1", platform_role: "viewer", roles: [], databases: [] }] };
+    const { fetch } = setup(sequence(ok(plain), ok(granted)), {}, undefined, { "GET /v1/members": () => jsonResponse([]) });
+    expect(await screen.findByRole("heading", { name: "You don't have access to a project yet" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New project" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Check now" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("You now have access to Default.");
+    expect(screen.getByRole("link", { name: "Default" })).toBeInTheDocument();
+    expect(meCalls(fetch)).toBeGreaterThanOrEqual(2);
+  });
+
+  it("a removed member is told so, not shown the no-access screen", async () => {
+    const removed: Me = { ...noProjects, member: { id: "m-self", status: "removed", tenant_admin: false }, projects: [] };
+    setup(ok(removed));
+    expect(await screen.findByText("You're no longer a member of this tenant.")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "You don't have access to a project yet" })).toBeNull();
+  });
+
+  it("only tenant admins get New project", async () => {
+    const plain: Me = { ...bound, member: { id: "m-self", status: "active", tenant_admin: false }, projects: [{ project_id: "p1", platform_role: "admin", roles: [], databases: [] }] };
+    setup(ok(plain));
+    expect(await screen.findByRole("link", { name: "Default" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "New project" })).toBeNull();
   });
 });

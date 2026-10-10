@@ -27,10 +27,13 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::access::{authorize_database, Target};
 use crate::{
     merges, AppState, ApiBytes, AuthPrincipal, BACKUP_REFUSAL, ConnectionDetails, JobPort, MetadataPort, OperationAccepted,
-    load_owned, proxy_address, reset_branch_password, reveal,
+    proxy_address, reset_branch_password, reveal,
 };
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::Requested;
 
 /// Longest branch name, and what a backup's name must fit in.
 const MAX_NAME_LEN: usize = 63;
@@ -362,7 +365,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::LIST_BRANCHES.policy.access, Target::Database(id)).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -431,7 +434,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::CREATE_BRANCH.policy.access, Target::Database(id)).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -572,20 +575,27 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
-        Ok(record) => record,
-        Err(resp) => return resp.into_response(),
-    };
-    let branch = match load_branch(&state, &record, branch_id).await {
-        Ok(branch) => branch,
-        Err(resp) => return resp.into_response(),
-    };
     let Query(ConnectionQuery { role, database }) = match query {
         Ok(query) => query,
         Err(rej) => {
             return ApiError::invalid_request(400, format!("invalid query: {}", rej.body_text()))
                 .into_response();
         }
+    };
+    // Acting as the role (the owner by default) on that database.
+    let target = Target::Role {
+        database: id,
+        branch: branch_id,
+        pg_database: database.as_deref().unwrap_or(""),
+        role: role.as_deref().map_or(Requested::Owner, Requested::Role),
+    };
+    let record = match authorize_database(&state, &principal, ep::BRANCH_CONNECTION.policy.access, target).await {
+        Ok(record) => record,
+        Err(resp) => return resp.into_response(),
+    };
+    let branch = match load_branch(&state, &record, branch_id).await {
+        Ok(branch) => branch,
+        Err(resp) => return resp.into_response(),
     };
     let mut response = reveal(
         &state,
@@ -632,7 +642,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::BRANCH_RESET_PASSWORD.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -767,7 +777,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::BRANCH_RESET_TO_PARENT.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -867,7 +877,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::BRANCH_RESTORE.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -949,7 +959,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::DELETE_BRANCH.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -1098,7 +1108,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::UPDATE_BRANCH.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -1191,7 +1201,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::LIST_BRANCH_DATABASES.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
@@ -1302,7 +1312,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let record = match load_owned(&state, &principal, id).await {
+    let record = match authorize_database(&state, &principal, ep::UPDATE_DATABASE.policy.access, Target::Database(id)).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };

@@ -3,7 +3,7 @@
  * (the merge page links created roles there: `?database=<id>&branch=<id>&panel=connection&role=<name>`).
  */
 export interface ProjectSearch {
-  tab?: "settings" | "users";
+  tab?: "settings" | "users" | "access";
   /** The database whose branches open. */
   database?: string;
   branch?: string;
@@ -24,7 +24,7 @@ const text = (v: unknown): string | undefined => (typeof v === "string" && v !==
 
 export function parseProjectSearch(search: Record<string, unknown>): ProjectSearch {
   const out: ProjectSearch = {};
-  if (search.tab === "settings" || search.tab === "users") out.tab = search.tab;
+  if (search.tab === "settings" || search.tab === "users" || search.tab === "access") out.tab = search.tab;
   const database = text(search.database);
   const branch = text(search.branch);
   const role = text(search.role);

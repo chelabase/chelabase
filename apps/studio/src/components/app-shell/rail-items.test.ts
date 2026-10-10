@@ -21,16 +21,25 @@ describe("isRailItemActive", () => {
     expect(isRailItemActive("api", "/app")).toBe(false);
     expect(isRailItemActive("api", "/app/projects/p1")).toBe(false);
   });
+
+  it("members_item_active_on_members_routes", () => {
+    expect(isRailItemActive("members", "/app/members")).toBe(true);
+    expect(isRailItemActive("members", "/app/members/")).toBe(true);
+    expect(isRailItemActive("members", "/app/members/anything")).toBe(true);
+    expect(isRailItemActive("members", "/app/membersx")).toBe(false);
+    expect(isRailItemActive("members", "/app")).toBe(false);
+    expect(isRailItemActive("projects", "/app/members")).toBe(false);
+  });
 });
 
 describe("RAIL_ENTRIES", () => {
-  it("lists Projects, API reference and two placeholders in order", () => {
+  it("lists Projects, API reference, a placeholder and Members (last) in order", () => {
     expect(RAIL_ENTRIES.map((e) => [e.kind, e.id, e.label])).toEqual([
       ["link", "projects", "Projects"],
       ["link", "api", "API reference"],
       ["placeholder", "placeholder-1", "Placeholder"],
-      ["placeholder", "placeholder-2", "Placeholder"],
+      ["link", "members", "Members"],
     ]);
-    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/api"]);
+    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/api", "/app/members"]);
   });
 });

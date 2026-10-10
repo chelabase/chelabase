@@ -6,11 +6,10 @@ import { errorText } from "@/lib/errors";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";
 
 export interface CreateDatabaseFormProps {
-  tenantId: string;
   projectId: string;
 }
 
-export function CreateDatabaseForm({ tenantId, projectId }: CreateDatabaseFormProps) {
+export function CreateDatabaseForm({ projectId }: CreateDatabaseFormProps) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   /** The database this form last created, followed until it settles. */
@@ -58,7 +57,7 @@ export function CreateDatabaseForm({ tenantId, projectId }: CreateDatabaseFormPr
     if (!trimmed || busy) return;
     setCreated(null);
     setOutcome(null);
-    create.mutate({ data: { tenant_id: tenantId, project_id: projectId, name: trimmed } });
+    create.mutate({ data: { project_id: projectId, name: trimmed } });
   }
 
   const working = create.isPending

@@ -39,7 +39,7 @@ async fn introspection_runs_and_fits() {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let json = schema::introspect(&client).await.map_err(|e| e.to_string())?;
+        let json = schema::introspect(&client, None).await.map_err(|e| e.to_string())?;
         let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
         for key in [
             "schemas", "tables", "functions", "types", "version", "columns", "policies", "extensions",

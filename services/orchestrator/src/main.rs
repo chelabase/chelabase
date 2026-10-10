@@ -5,6 +5,7 @@ use chelabase_nats::{connect, ensure_control_stream, NatsConfig};
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::{DockerLocator, StorconClient};
 use chelabase_types::mode::Mode;
+use chelabase_types::mode_policy::ModePolicy;
 use chelabase_types::role_settings::RoleSettings;
 use chelabase_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
@@ -32,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let internal_config = InternalConfig::from_env()?;
     let signer = internal_config.load_signer()?;
     let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
+    internal_config.check_mode(&ModePolicy::new(mode))?;
     let roles = RoleSettings::from_lookup(
         mode,
         |name| std::env::var(name).ok(),
@@ -82,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
         actions_signing_key: internal_config.actions_signing_key.clone(),
         zitadel: internal_config.load_zitadel(),
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
+        policy: ModePolicy::new(mode),
     });
 
     let state = AppState {
@@ -91,7 +94,11 @@ async fn main() -> anyhow::Result<()> {
         secrets,
         proxy: ProxyAddress::from_lookup(|name| std::env::var(name).ok())?,
         rest,
-        mode,
+        policy: ModePolicy::new(mode),
+        operator_org: std::env::var("CHELABASE_OPERATOR_ORG_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
         proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),
         data_api_database_cap,
         locator: Arc::new(DockerLocator::connect(&internal_config.compute_network)?),
@@ -99,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
         zitadel: zitadel_admin(),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
+        studio_url: env_or("CHELABASE_STUDIO_URL", "http://localhost:3000")
+            .trim_end_matches('/')
+            .to_string(),
     };
 
     let app = build_router(Arc::new(state));

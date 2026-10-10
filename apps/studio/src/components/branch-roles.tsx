@@ -13,6 +13,7 @@ import {
   type RoleInUseKey,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { PASSWORD_STATE_TEXT } from "@/lib/password-state";
 import { CopyButton } from "./copy-button";
@@ -59,6 +60,8 @@ function RoleAttributes({ role }: { role: BranchRole }) {
 }
 
 export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
+  // Revealing, resetting, creating and deleting roles are Admin's; others read the list.
+  const admin = useProjectCaps().atLeast("admin");
   const queryClient = useQueryClient();
   const roles = useListRoles(databaseId, branchId, {
     query: { refetchInterval: (q) => (q.state.data?.some((r) => r.pending) ? 2000 : false) },
@@ -152,10 +155,10 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
     });
   }
 
-  const field = "h-8 rounded-lg border border-input bg-background px-2 text-sm";
-  const badge = "rounded-full border px-2 py-0.5 text-xs";
+  const field = "h-8 border border-input bg-background px-2 text-sm";
+  const badge = "border px-2 py-0.5 text-xs";
   return (
-    <div className="space-y-2 rounded-lg border p-3 text-sm">
+    <div className="space-y-2 border p-3 text-sm">
       <h3 className="font-medium">Roles</h3>
       {roles.isError && (
         <p role="alert" className="text-destructive">
@@ -204,6 +207,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
               </td>
               <td className="py-1">{utc(r.created_at)}</td>
               <td className="py-1">
+                {admin && (
                 <div className="flex gap-2">
                   <Button
                     size="xs"
@@ -235,6 +239,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
                     </Button>
                   )}
                 </div>
+                )}
               </td>
             </tr>
           ))}
@@ -242,7 +247,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
       </table>
 
       {pending && (
-        <div className="space-y-2 rounded-lg border p-3">
+        <div className="space-y-2 border p-3">
           <p>
             {pending.kind === "delete"
               ? `Objects owned by ${pending.role.name} move to ${ownerName}. Its sessions are closed.`
@@ -260,7 +265,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
       )}
 
       {shown && (
-        <section aria-label={`Connection for ${shown.role}`} className="space-y-2 rounded-lg border p-3">
+        <section aria-label={`Connection for ${shown.role}`} className="space-y-2 border p-3">
           {shown.fresh && <p>Copy this password now. You can reveal it again later.</p>}
           {shown.notice && (
             <p role="status" className="text-muted-foreground">
@@ -301,6 +306,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
         </section>
       )}
 
+      {admin && (
       <form onSubmit={submit} className="space-y-2">
         <div className="flex flex-wrap items-end gap-3">
           <div className="flex flex-col gap-1">
@@ -334,6 +340,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
           </label>
         </fieldset>
       </form>
+      )}
       {nameHint && (
         <p id={hintId} className="text-xs text-destructive">
           {nameHint}

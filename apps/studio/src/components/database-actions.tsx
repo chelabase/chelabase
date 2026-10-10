@@ -16,6 +16,7 @@ import {
   type DatabaseSummary,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { PASSWORD_STATE_TEXT } from "@/lib/password-state";
 
@@ -59,6 +60,7 @@ export function DatabaseActions({
   openConnection,
 }: DatabaseActionsProps) {
   const queryClient = useQueryClient();
+  const admin = useProjectCaps().atLeast("admin");
   const resetDatabasePassword = useResetDatabasePassword();
   const resetBranchPassword = useResetBranchPassword();
   const deleteDatabase = useDeleteDatabase({
@@ -199,6 +201,16 @@ export function DatabaseActions({
     }
   }
 
+  // Connection details, password resets and deleting the database are Admin's (owner actions).
+  if (!admin) {
+    return children || below ? (
+      <div className="space-y-2">
+        {children && <div className="flex flex-wrap gap-2">{children}</div>}
+        {below}
+      </div>
+    ) : null;
+  }
+
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap gap-2">
@@ -240,7 +252,7 @@ export function DatabaseActions({
       {below}
 
       {panel === "connection" && details && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           {branch && dbRows.length > 0 && (
             <div className="flex items-center gap-2">
               <label htmlFor={dbPickerId}>Database</label>
@@ -249,7 +261,7 @@ export function DatabaseActions({
                 value={dbName ?? mainDb}
                 disabled={busy}
                 onChange={(e) => void reveal(false, false, role, e.target.value === mainDb ? null : e.target.value)}
-                className="h-8 rounded-lg border border-input bg-background px-2"
+                className="h-8 border border-input bg-background px-2"
               >
                 {dbRows.map((d) => (
                   <option key={d.name} value={d.name}>
@@ -269,7 +281,7 @@ export function DatabaseActions({
                 onChange={(e) =>
                   void reveal(false, false, e.target.value === ownerRole?.name ? null : e.target.value, dbName)
                 }
-                className="h-8 rounded-lg border border-input bg-background px-2"
+                className="h-8 border border-input bg-background px-2"
               >
                 {roles.data.map((r) => (
                   <option key={r.name} value={r.name}>
@@ -332,7 +344,7 @@ export function DatabaseActions({
       )}
 
       {panel === "reset" && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <p>Reset the password for {label}? The current password stops working for new connections.</p>
           <div className="flex gap-2">
             <Button size="sm" disabled={busy} onClick={() => void reset()}>
@@ -346,7 +358,7 @@ export function DatabaseActions({
       )}
 
       {panel === "delete" && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <label className="flex flex-col gap-1">
             <span>
               Type the database name (<code>{database.name}</code>) to delete it and all its data.
@@ -354,7 +366,7 @@ export function DatabaseActions({
             <input
               value={typedName}
               onChange={(e) => setTypedName(e.target.value)}
-              className="h-8 w-64 rounded-lg border border-input bg-background px-2"
+              className="h-8 w-64 border border-input bg-background px-2"
             />
           </label>
           {hasProtected && <p className="text-xs text-muted-foreground">{PROTECTED_DB_REASON}</p>}

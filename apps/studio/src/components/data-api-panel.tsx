@@ -10,6 +10,7 @@ import {
   type BranchDatabaseView,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { pollWhile } from "@/lib/query";
 import { CopyButton } from "./copy-button";
@@ -26,6 +27,8 @@ export interface DataApiPanelProps {
 
 /** One branch's data API: endpoint, public key, secret keys and the RLS warning. */
 export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) {
+  // Rotating the public key is Developer's (rotateKey).
+  const canRotate = useProjectCaps().atLeast("developer");
   const queryClient = useQueryClient();
   const branchId = branch.id;
   const keyList = useListKeys(databaseId, branchId);
@@ -79,7 +82,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
   }
 
   return (
-    <section aria-label={`Data API for ${branch.name}`} className="space-y-3 rounded-lg border p-3 text-sm">
+    <section aria-label={`Data API for ${branch.name}`} className="space-y-3 border p-3 text-sm">
       <h3 className="font-medium">Data API</h3>
       <dl className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1">
         <dt className="text-muted-foreground">Endpoint</dt>
@@ -91,6 +94,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
         <dd className="font-mono break-all">{publicKey ? (publicKey.key ?? `${publicKey.prefix}…`) : "—"}</dd>
         <dd className="flex items-center gap-2">
           {publicKey?.key && <CopyButton value={publicKey.key} label="Copy public key" />}
+          {canRotate && (
           <Button
             size="xs"
             variant="outline"
@@ -100,6 +104,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
           >
             Rotate public key
           </Button>
+          )}
         </dd>
       </dl>
       {rotateReason && (
@@ -108,7 +113,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
         </p>
       )}
       {rotating && (
-        <div className="space-y-2 rounded-lg border p-3">
+        <div className="space-y-2 border p-3">
           <p>Rotate the public key? The current key stops working within 30 seconds.</p>
           <div className="flex gap-2">
             <Button size="sm" disabled={busy} onClick={() => void rotatePublic()}>

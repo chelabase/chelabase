@@ -13,6 +13,11 @@ describe("project page search", () => {
     expect(parseProjectSearch({ tab: "nope", panel: "other", role: 7, database: "" })).toEqual({});
   });
 
+  it("access_tab_round_trips", () => {
+    expect(parseProjectSearch({ tab: "access" })).toEqual({ tab: "access" });
+    expect(parseProjectSearch({ tab: "access", database: "d1" })).toEqual({ tab: "access", database: "d1" });
+  });
+
   it("names the panel to open only when database, branch and panel are all there", () => {
     expect(connectionFocus({ database: "d1", branch: "b1", panel: "connection", role: "reporter" })).toEqual({
       databaseId: "d1",

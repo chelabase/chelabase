@@ -13,7 +13,7 @@ pub const SAVED_QUERY_CAP: i64 = 500;
 const NAME_INDEX: &str = "saved_queries_name";
 macro_rules! columns {
     () => {
-        "id, name, sql, pg_database, role, version, created_at, updated_at"
+        "id, name, sql, pg_database, role, version, created_at, updated_at, author_member_id"
     };
 }
 
@@ -28,6 +28,9 @@ pub struct SavedQuery {
     pub version: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The member who wrote it; `None` for a query saved before members. Not in the API.
+    #[serde(skip)]
+    pub author_member_id: Option<Uuid>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -60,6 +63,14 @@ pub enum SavedQueryWrite {
     NotFound,
 }
 
+/// Who edits or deletes a saved query: its author, or an Admin (any author, none included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedQueryEditor {
+    /// The member who wrote it. A row without an author (saved before members) isn't theirs.
+    Author(Uuid),
+    Admin,
+}
+
 fn saved_from_row(r: &PgRow) -> SavedQuery {
     SavedQuery {
         id: r.get("id"),
@@ -70,6 +81,7 @@ fn saved_from_row(r: &PgRow) -> SavedQuery {
         version: r.get("version"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+        author_member_id: r.get("author_member_id"),
     }
 }
 
@@ -78,18 +90,16 @@ fn is_name_taken(err: &sqlx::Error) -> bool {
 }
 
 impl MetadataClient {
-    /// The user's saved queries for a database, by lower-cased name.
+    /// The saved queries of a database (shared within its project), by lower-cased name.
     pub async fn list_saved_queries(
         &self,
         database: Uuid,
-        user: &str,
     ) -> Result<Vec<SavedQuerySummary>, MetadataError> {
         let rows = sqlx::query(
             "SELECT id, name, pg_database, role, version, updated_at FROM saved_queries
-             WHERE database_id = $1 AND user_id = $2 ORDER BY lower(name), id",
+             WHERE database_id = $1 ORDER BY lower(name), id",
         )
         .bind(database)
-        .bind(user)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -108,17 +118,41 @@ impl MetadataClient {
     pub async fn get_saved_query(
         &self,
         database: Uuid,
-        user: &str,
         id: Uuid,
     ) -> Result<Option<SavedQuery>, MetadataError> {
         Ok(sqlx::query(concat!(
             "SELECT ",
             columns!(),
-            " FROM saved_queries WHERE id = $1 AND database_id = $2 AND user_id = $3"
+            " FROM saved_queries WHERE id = $1 AND database_id = $2"
         ))
         .bind(id)
         .bind(database)
-        .bind(user)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(saved_from_row))
+    }
+
+    /// The row `by` may edit, whoever's it is for an Admin.
+    async fn saved_query_for(
+        &self,
+        database: Uuid,
+        by: SavedQueryEditor,
+        id: Uuid,
+    ) -> Result<Option<SavedQuery>, MetadataError> {
+        let author = match by {
+            SavedQueryEditor::Author(member) => Some(member),
+            SavedQueryEditor::Admin => None,
+        };
+        Ok(sqlx::query(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM saved_queries WHERE id = $1 AND database_id = $2
+              AND ($3::uuid IS NULL OR author_member_id = $3)"
+        ))
+        .bind(id)
+        .bind(database)
+        .bind(author)
         .fetch_optional(&self.pool)
         .await?
         .as_ref()
@@ -132,6 +166,7 @@ impl MetadataClient {
         &self,
         database: Uuid,
         user: &str,
+        author: Option<Uuid>,
         id: Uuid,
         name: &str,
         sql: &str,
@@ -155,8 +190,9 @@ impl MetadataClient {
             return Ok(SavedQueryWrite::CapReached);
         }
         let inserted = sqlx::query(concat!(
-            "INSERT INTO saved_queries (id, database_id, user_id, name, sql, pg_database, role)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ",
+            "INSERT INTO saved_queries
+                 (id, database_id, user_id, name, sql, pg_database, role, author_member_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ",
             columns!()
         ))
         .bind(id)
@@ -166,6 +202,7 @@ impl MetadataClient {
         .bind(sql)
         .bind(pg_database)
         .bind(role)
+        .bind(author)
         .fetch_one(&mut *tx)
         .await;
         match inserted {
@@ -178,12 +215,12 @@ impl MetadataClient {
         }
     }
 
-    /// Applies `patch` when `version` is current: `Saved`, `NameTaken`, `Stale` (with the
+    /// Applies `patch` to a row `by` may edit, when `version` is current: `Saved`, `NameTaken`, `Stale` (with the
     /// current row) or `NotFound`.
     pub async fn update_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
         version: i32,
         patch: &SavedQueryPatch,
@@ -203,12 +240,14 @@ impl MetadataClient {
         }
         q.push(" WHERE id = ").push_bind(id);
         q.push(" AND database_id = ").push_bind(database);
-        q.push(" AND user_id = ").push_bind(user);
+        if let SavedQueryEditor::Author(member) = by {
+            q.push(" AND author_member_id = ").push_bind(member);
+        }
         q.push(" AND version = ").push_bind(version);
         q.push(concat!(" RETURNING ", columns!()));
         match q.build().fetch_optional(&self.pool).await {
             Ok(Some(row)) => Ok(SavedQueryWrite::Saved(saved_from_row(&row))),
-            Ok(None) => Ok(match self.get_saved_query(database, user, id).await? {
+            Ok(None) => Ok(match self.saved_query_for(database, by, id).await? {
                 Some(current) => SavedQueryWrite::Stale(current),
                 None => SavedQueryWrite::NotFound,
             }),
@@ -221,15 +260,19 @@ impl MetadataClient {
     pub async fn delete_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
     ) -> Result<bool, MetadataError> {
         Ok(sqlx::query(
-            "DELETE FROM saved_queries WHERE id = $1 AND database_id = $2 AND user_id = $3",
+            "DELETE FROM saved_queries WHERE id = $1 AND database_id = $2
+             AND ($3::uuid IS NULL OR author_member_id = $3)",
         )
         .bind(id)
         .bind(database)
-        .bind(user)
+        .bind(match by {
+            SavedQueryEditor::Author(member) => Some(member),
+            SavedQueryEditor::Admin => None,
+        })
         .execute(&self.pool)
         .await?
         .rows_affected()

@@ -14,6 +14,7 @@ import {
   rehearseMerge,
   retryMerge,
   updateMerge,
+  useGetMe,
   useGetMerge,
   useListBranches,
   type AfterMerge,
@@ -23,6 +24,7 @@ import {
   type UpdateMergeRequest,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import {
   MERGE_STATUS_LABEL,
@@ -95,6 +97,11 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
   const name = (id: string) =>
     branches.data === undefined ? "…" : (branches.data.find((b) => b.id === id)?.name ?? "a deleted branch");
   const target = merge ? branches.data?.find((b) => b.id === merge.target_branch_id) : undefined;
+  // Every change to a merge is judged by its target: Developer on an open branch, Admin on a
+  // protected one. Others read the merge.
+  const me = useGetMe();
+  const caps = projectCaps(me.data, projectId, databaseId);
+  const canAct = caps.atLeast(target?.protected ? "admin" : "developer");
 
   /** The merge's fields from an action's answer, at once; the refetch brings the rest. */
   function patchCache(next: Partial<Merge>) {
@@ -191,7 +198,7 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
   const targetName = name(merge.target_branch_id);
   const analysis = readAnalysis(merge.analysis);
   const plan = readPlan(merge.plan);
-  const editable = isMergeEditable(merge.status) && !pending;
+  const editable = isMergeEditable(merge.status) && !pending && canAct;
   const busyText = BUSY_TEXT[merge.status]?.(targetName);
   const recomputable =
     merge.status === "draft" || merge.status === "stale" || (merge.status === "failed" && merge.failed_phase !== "online");
@@ -225,12 +232,12 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
         )}
         <EndNotice merge={merge} targetName={targetName} />
         <div className="flex flex-wrap gap-2 pt-1">
-          {recomputable && !gone && (
+          {canAct && recomputable && !gone && (
             <Button size="sm" variant="outline" disabled={pending} onClick={() => void act(() => recomputeMerge(databaseId, mergeId, {}))}>
               Recompute
             </Button>
           )}
-          {isMergeCancellable(merge.status) && (
+          {canAct && isMergeCancellable(merge.status) && (
             <Button size="sm" variant="outline" disabled={pending} onClick={() => void act(() => cancelMerge(databaseId, mergeId))}>
               Cancel merge
             </Button>
@@ -268,14 +275,16 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
             from {sourceName}, so {targetName}&apos;s own changes since the branch point will show as things to undo. Renames
             show as a drop and a create. Drops still need acknowledging one by one before the apply.
           </p>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={pending || !recomputable}
-            onClick={() => void act(() => recomputeMerge(databaseId, mergeId, { rebaseline: true }))}
-          >
-            Re-baseline
-          </Button>
+          {canAct && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={pending || !recomputable}
+              onClick={() => void act(() => recomputeMerge(databaseId, mergeId, { rebaseline: true }))}
+            >
+              Re-baseline
+            </Button>
+          )}
         </section>
       )}
       {merge.rebaselined && (
@@ -314,6 +323,14 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
         <MergePlan key={planKey} databaseId={databaseId} targetName={targetName} merge={merge} plan={plan} editable={editable} save={save} />
       </Section>
 
+      {!canAct && (
+        <p role="note" className="border-t pt-6 text-sm text-muted-foreground">
+          Rehearsing, applying and finishing this merge need {target?.protected ? "Admin (" + targetName + " is protected)" : "Developer"} on this
+          project.
+        </p>
+      )}
+      {canAct && (
+      <>
       <Section title="Rehearsal">
         <MergeRehearsal
           merge={merge}
@@ -354,6 +371,8 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
           onFinish={(after: AfterMerge) => void act(() => finishMerge(databaseId, mergeId, { after }))}
         />
       </Section>
+      </>
+      )}
     </div>
   );
 }

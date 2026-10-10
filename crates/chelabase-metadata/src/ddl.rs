@@ -127,7 +127,7 @@ impl DdlTx {
             "SELECT r.name, r.origin, r.scram_verifier, r.password_enc, r.login, r.level,
                     r.api_owner_level, r.pending, r.attributes_pending, r.created_at, r.inherit,
                     r.connection_limit,
-                    r.valid_until, r.bypass_rls, r.member_of
+                    r.valid_until, r.bypass_rls, r.member_of, r.member_no_set, r.member_admin
              FROM neon_roles r WHERE r.endpoint_id = $1 AND r.name = $2",
         )
         .bind(&self.endpoint_id)
@@ -176,7 +176,7 @@ impl DdlTx {
              VALUES ($1, $2, $3, 'sql', now())
              ON CONFLICT (endpoint_id, name) DO UPDATE
                  SET scram_verifier = EXCLUDED.scram_verifier, password_enc = NULL,
-                     password_unreadable = false, forwarded_at = now()
+                     no_password = false, password_unreadable = false, forwarded_at = now()
                  WHERE neon_roles.origin <> 'owner'",
         )
         .bind(&self.endpoint_id)
@@ -246,6 +246,27 @@ impl DdlTx {
     }
 
     /// Deletes a non-owner row. False when there was none.
+    /// A role with no password (a group role, or `PASSWORD NULL` on an `sql` row): inserts an
+    /// `sql` row without a verifier (login false; a forwarded `LOGIN` follows as its own step),
+    /// or clears an existing `sql` row's verifier and sealed password. `forwarded_at = now()`
+    /// either way. `api` and owner rows are left alone.
+    pub async fn upsert_no_password(&mut self, name: &str) -> Result<(), MetadataError> {
+        sqlx::query(
+            "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin, login, no_password, forwarded_at)
+             VALUES ($1, $2, NULL, 'sql', false, true, now())
+             ON CONFLICT (endpoint_id, name) DO UPDATE
+                 SET scram_verifier = NULL, password_enc = NULL, no_password = true,
+                     password_unreadable = false, forwarded_at = now()
+                 WHERE neon_roles.origin = 'sql'",
+        )
+        .bind(&self.endpoint_id)
+        .bind(name)
+        .execute(&mut *self.tx)
+        .await?;
+        self.wrote = true;
+        Ok(())
+    }
+
     pub async fn remove_copy(&mut self, name: &str) -> Result<bool, MetadataError> {
         let deleted = sqlx::query(
             "DELETE FROM neon_roles WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",

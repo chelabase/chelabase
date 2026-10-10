@@ -253,18 +253,6 @@ pub struct CheckDataRoleRequest {
     pub role: String,
 }
 
-/// Core request/reply: grant `anon` or `authenticated` to the branch's owner (`WITH INHERIT
-/// FALSE, SET TRUE`) so the SQL editor can `SET ROLE` to it. Answers a [`CheckDataRoleReply`].
-pub const SUBJECT_GRANT_DATA_ROLE_TO_OWNER: &str = "chelabase.rpc.grant_data_role_to_owner";
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GrantDataRoleRequest {
-    pub branch_id: BranchId,
-    pub role: String,
-    /// The login role to grant it to (the branch owner's name).
-    pub owner: String,
-}
-
 /// Core publish (no reply awaited): bootstrap the data API in a database the orchestrator just
 /// marked `enabling`. The worker records `on` or `error`; reconcile retries rows left `enabling`.
 pub const SUBJECT_DATA_API_ENABLE: &str = "chelabase.rpc.data_api.enable";
@@ -276,6 +264,58 @@ pub const SUBJECT_RESYNC_BRANCH: &str = "chelabase.resync.branch";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResyncBranchRequest {
     pub branch_id: BranchId,
+}
+
+/// Core request/reply: make a branch's hidden member roles (`cb_m_…`) match the metadata now
+/// (members-and-roles design, part 3). Answers a [`MemberRolesReply`].
+pub const SUBJECT_MEMBER_ROLES_RECONCILE: &str = "chelabase.rpc.member_roles.reconcile";
+/// Core publish (no reply awaited): a branch's member roles need a reconcile soon. The worker
+/// waits a moment and runs it once however many arrived, like the touched-roles resync.
+pub const SUBJECT_MEMBER_ROLES_ENQUEUE: &str = "chelabase.member_roles.reconcile";
+
+/// Core request/reply: after an act-as run, the member role's hand-over in the run's database
+/// (`chelabase_types::role_name::member_hand_over_sql`). Answers a [`MemberRolesReply`]
+/// (`Done` with no roles, or `Failed`).
+pub const SUBJECT_MEMBER_ROLES_HAND_OVER: &str = "chelabase.rpc.member_roles.hand_over";
+
+/// One act-as run's hand-over: the member's role on `branch_id`, the Postgres database it ran
+/// in, the role it acted as and the run's backend (ended first when it's still there).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberRoleHandOverRequest {
+    pub branch_id: Uuid,
+    pub member_id: Uuid,
+    pub database: String,
+    pub acted_role: String,
+    #[serde(default)]
+    pub backend_pid: Option<i32>,
+    /// The backend's `pg_stat_activity.backend_start`, as text: with the pid, it names this
+    /// run's backend only (a pid can be reused).
+    #[serde(default)]
+    pub backend_start: Option<String>,
+}
+
+/// A member-role reconcile of one branch; with `member_id`, only that member's roles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberRolesReconcileRequest {
+    pub branch_id: Uuid,
+    #[serde(default)]
+    pub member_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberRolesReply {
+    /// The reconciled roles as they now are on the branch.
+    Done { roles: Vec<MemberRoleApplied> },
+    Failed { message: String },
+}
+
+/// One member role after a reconcile: the Postgres roles it may `SET ROLE` to, sorted. One per
+/// (member, branch) (R17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberRoleApplied {
+    pub member_id: Uuid,
+    pub role_name: String,
+    pub applied_roles: Vec<String>,
 }
 
 /// Core request/reply: stop serving a database (`remove` also drops the `chelabase` machinery).
@@ -1151,18 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn grant_data_role_to_owner_wire_shapes() {
-        let request = GrantDataRoleRequest { branch_id: BranchId::new(), role: "anon".into(), owner: "postgres".into() };
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["role"], "anon");
-        assert_eq!(json["owner"], "postgres");
-        assert!(json["branch_id"].is_string());
-        assert_eq!(SUBJECT_GRANT_DATA_ROLE_TO_OWNER, "chelabase.rpc.grant_data_role_to_owner");
-        let back: GrantDataRoleRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(back, request);
-    }
-
-    #[test]
     fn check_data_role_wire_shapes() {
         let request = CheckDataRoleRequest {
             branch_id: BranchId::new(),
@@ -1520,5 +1548,61 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "database_id": database_id })).unwrap();
         assert_eq!(back.database_id, database_id);
         assert_eq!(back.branch_id, BranchId::from(database_id));
+    }
+
+    #[test]
+    fn member_role_hand_over_wire_shape() {
+        assert_eq!(SUBJECT_MEMBER_ROLES_HAND_OVER, "chelabase.rpc.member_roles.hand_over");
+        let request = MemberRoleHandOverRequest {
+            branch_id: Uuid::new_v4(),
+            member_id: Uuid::new_v4(),
+            database: "app".into(),
+            acted_role: "billing".into(),
+            backend_pid: Some(77),
+            backend_start: Some("2026-10-09 10:00:00+00".into()),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["backend_start"], "2026-10-09 10:00:00+00");
+        assert_eq!((json["database"].as_str(), json["acted_role"].as_str(), json["backend_pid"].as_i64()), (Some("app"), Some("billing"), Some(77)));
+        assert_eq!(serde_json::from_value::<MemberRoleHandOverRequest>(json).unwrap(), request);
+    }
+
+    #[test]
+    fn member_roles_wire_shapes() {
+        assert_eq!(SUBJECT_MEMBER_ROLES_RECONCILE, "chelabase.rpc.member_roles.reconcile");
+        assert_eq!(SUBJECT_MEMBER_ROLES_ENQUEUE, "chelabase.member_roles.reconcile");
+        let (branch_id, member_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let request = MemberRolesReconcileRequest { branch_id, member_id: Some(member_id) };
+        let back: MemberRolesReconcileRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert_eq!((back.branch_id, back.member_id), (branch_id, Some(member_id)));
+        let whole: MemberRolesReconcileRequest =
+            serde_json::from_value(serde_json::json!({ "branch_id": branch_id, "member_id": null }))
+                .unwrap();
+        assert_eq!(whole.member_id, None);
+        let done = MemberRolesReply::Done {
+            roles: vec![MemberRoleApplied {
+                member_id,
+                role_name: "cb_m_x".into(),
+                applied_roles: vec!["billing".into()],
+            }],
+        };
+        let back: MemberRolesReply =
+            serde_json::from_slice(&serde_json::to_vec(&done).unwrap()).unwrap();
+        assert_eq!(back, done);
+        // R17: one member role per (member, branch), so no Postgres database in the reply.
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "Done": { "roles": [{
+                "member_id": member_id,
+                "role_name": "cb_m_x",
+                "applied_roles": ["billing"],
+            }] } })
+        );
+        let failed = MemberRolesReply::Failed { message: "boom".into() };
+        let back: MemberRolesReply =
+            serde_json::from_slice(&serde_json::to_vec(&failed).unwrap()).unwrap();
+        assert_eq!(back, failed);
     }
 }

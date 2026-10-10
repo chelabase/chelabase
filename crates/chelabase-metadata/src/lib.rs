@@ -12,6 +12,7 @@ mod app_users;
 mod branches;
 mod data_api;
 mod ddl;
+pub mod members;
 mod merges;
 mod neon;
 mod projects;
@@ -30,7 +31,7 @@ pub use branches::{
     merge_busy_refusal,
 };
 pub use saved_queries::{
-    SAVED_QUERY_CAP, SavedQuery, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
+    SAVED_QUERY_CAP, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
 };
 pub use ddl::DdlTx;
 pub use merges::{
@@ -146,6 +147,10 @@ pub enum MetadataError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("tenant not found: {0}")]
     TenantNotFound(TenantId),
+    /// A person with no member row asked in while the tenant takes no sign-ups (R39); no row
+    /// was written.
+    #[error("not a member of tenant {0}, and sign-up is closed")]
+    NotAdmitted(TenantId),
     #[error("project not found: {0}")]
     ProjectNotFound(ProjectId),
     /// The project is `deleting` or `deleted`: nothing may be added to it.
@@ -262,6 +267,8 @@ pub struct LiveDatabase {
 pub struct TenantOverview {
     pub id: TenantId,
     pub slug: String,
+    /// The tenant's chosen name; readers fall back to the slug.
+    pub display_name: Option<String>,
     pub projects: Vec<ProjectOverview>,
 }
 
@@ -279,6 +286,7 @@ pub struct ProjectOverview {
 pub fn group_overview(
     id: TenantId,
     slug: String,
+    display_name: Option<String>,
     projects: Vec<ProjectRecord>,
     databases: Vec<DatabaseRecord>,
 ) -> TenantOverview {
@@ -296,7 +304,7 @@ pub fn group_overview(
                 .collect(),
         })
         .collect();
-    TenantOverview { id, slug, projects }
+    TenantOverview { id, slug, display_name, projects }
 }
 
 #[derive(Debug, Clone)]
@@ -345,7 +353,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261012000001).
+        // this file when adding one (last: 20261014000006).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
@@ -738,7 +746,7 @@ impl MetadataClient {
         &self,
         tenant_id: TenantId,
     ) -> Result<Option<TenantOverview>, MetadataError> {
-        let Some(tenant) = sqlx::query("SELECT slug FROM tenants WHERE id = $1")
+        let Some(tenant) = sqlx::query("SELECT slug, display_name FROM tenants WHERE id = $1")
             .bind(tenant_id.as_uuid())
             .fetch_optional(&self.pool)
             .await?
@@ -776,6 +784,7 @@ impl MetadataClient {
         Ok(Some(group_overview(
             tenant_id,
             tenant.get("slug"),
+            tenant.get("display_name"),
             projects,
             databases,
         )))
@@ -901,10 +910,12 @@ mod tests {
         let overview = group_overview(
             TenantId(DEMO_TENANT_ID),
             "demo".into(),
+            None,
             vec![project(a, "alpha"), project(b, "beta")],
             vec![record(b, "b1"), record(a, "a1"), record(b, "b2")],
         );
         assert_eq!(overview.slug, "demo");
+        assert_eq!(overview.display_name, None);
         let names = |i: usize| -> Vec<String> {
             overview.projects[i]
                 .databases
@@ -925,6 +936,7 @@ mod tests {
         let overview = group_overview(
             TenantId(DEMO_TENANT_ID),
             "demo".into(),
+            None,
             vec![project(a, "alpha")],
             vec![],
         );
@@ -938,6 +950,7 @@ mod tests {
         let overview = group_overview(
             TenantId(DEMO_TENANT_ID),
             "demo".into(),
+            None,
             vec![project(a, "alpha")],
             vec![record(ProjectId::new(), "stray")],
         );

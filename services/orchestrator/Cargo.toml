@@ -63,3 +63,7 @@ chelabase-auth = { workspace = true, features = ["test-support"] }
 hmac = { workspace = true }
 jsonwebtoken = { workspace = true }
 tempfile = { workspace = true }
+# The member API's grant invariant (T7).
+proptest = { workspace = true }
+# The role-rule agreement test (I2): the worker's reconciler rule against this crate's.
+worker = { path = "../worker" }

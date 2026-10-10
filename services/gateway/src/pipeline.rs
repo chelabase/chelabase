@@ -357,6 +357,8 @@ impl Pipeline {
                 project_id: Some(resolved.project_id),
                 role_oid,
             }),
+            email: None,
+            name: None,
         };
         self.signer.sign(service.name(), &identity).map_err(|err| {
             error!("mint internal identity: {err}");
@@ -385,6 +387,8 @@ impl Pipeline {
             auth: AuthMethod::ManagementJwt,
             request_id: request_id.to_string(),
             data: None,
+            email: claims.email,
+            name: claims.name,
         };
         self.signer.sign(service.name(), &identity).map_err(|err| {
             error!("mint internal identity: {err}");
@@ -723,6 +727,43 @@ mod tests {
         assert_eq!(claims.org_id, "org-1");
         assert_eq!(claims.rid, "rid-42");
         assert_eq!(claims.auth, AuthMethod::ManagementJwt);
+    }
+
+    #[tokio::test]
+    async fn identity_carries_the_tokens_email_and_name() {
+        let h = harness(&[]).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let token = h.jwks.sign(json!({
+            "sub": "user-1",
+            "iss": h.jwks.issuer(),
+            "iat": now,
+            "exp": now + 300,
+            (chelabase_auth::CLAIM_ORG_ID): "org-1",
+            "email": "bob@x.com",
+            "name": "Bob",
+        }));
+        let bearer = format!("Bearer {token}");
+        let plan = expect_plan(
+            run(&h.pipeline, "GET", "/v1/me", None, &[("authorization", &bearer)])
+                .await
+                .outcome,
+        );
+        let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "orchestrator").unwrap();
+        assert_eq!(claims.email.as_deref(), Some("bob@x.com"));
+        assert_eq!(claims.name.as_deref(), Some("Bob"));
+
+        // Without the claims, the identity carries none.
+        let bare = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
+        let plan = expect_plan(
+            run(&h.pipeline, "GET", "/v1/me", None, &[("authorization", &bare)])
+                .await
+                .outcome,
+        );
+        let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "orchestrator").unwrap();
+        assert_eq!((claims.email, claims.name), (None, None));
     }
 
     #[tokio::test]

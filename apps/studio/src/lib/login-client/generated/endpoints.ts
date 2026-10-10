@@ -24,6 +24,7 @@ import type {
 } from '@tanstack/react-query';
 
 import type {
+  AcceptInviteBody,
   AppChangePasswordBody,
   AppEmailBody,
   AppJwks,
@@ -40,10 +41,12 @@ import type {
   AuthRequestInfo,
   CodeBody,
   ConfirmBody,
+  DescribeInviteBody,
   EmailBody,
   EmptyRequest,
   EmptyResponse,
   ErrorEnvelope,
+  InviteDescription,
   NextStep,
   SignInBody,
   SignUpBody,
@@ -72,6 +75,91 @@ const withQueryKey = <T extends object, K>(query: T, queryKey: K): T & { queryKe
   }
   return result;
 };
+
+export const getAcceptInviteUrl = () => {
+
+
+
+
+  return `/auth/v1/accept-invite`
+}
+
+/**
+ * Accepts a member invite: checks the emailed code (with `reset`, a password-reset code, which sets the password itself), sets the password, marks the email verified and signs in. Sets the HttpOnly session cookie. If a step after the code check fails, the error is `invite_incomplete` (or `weak_password`) with `error.accept_ticket`: send it back in place of `code` to finish. A pending sign-in that has expired doesn't fail the accept: `redirect` is then Studio's address.
+ */
+export const acceptInvite = async (acceptInviteBody: AcceptInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<SignedIn> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<SignedIn>(getAcceptInviteUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(acceptInviteBody)
+  }
+);}
+
+
+
+
+
+export const getAcceptInviteMutationKey = () => ['acceptInvite'] as const;
+
+export const getAcceptInviteMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof acceptInvite>>, TError,AcceptInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof acceptInvite>>, TError,AcceptInviteMutationVariables, TContext> => {
+
+const mutationKey = getAcceptInviteMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof acceptInvite>>, AcceptInviteMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  acceptInvite(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AcceptInviteMutationResult = NonNullable<Awaited<ReturnType<typeof acceptInvite>>>
+    export type AcceptInviteMutationBody = AcceptInviteBody
+    export type AcceptInviteMutationError = ErrorType<ErrorEnvelope>
+    export type AcceptInviteMutationVariables = {data: AcceptInviteBody}
+
+    export const useAcceptInvite = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof acceptInvite>>, TError,AcceptInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof acceptInvite>>,
+        TError,
+        AcceptInviteMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAcceptInviteMutationOptions(options), queryClient);
+    }
 
 export const getAppChangeEmailUrl = () => {
 
@@ -1128,7 +1216,7 @@ export const getGetAuthRequestUrl = () => {
 }
 
 /**
- * Looks up a pending sign-in and reports whether sign-up is offered. Sets no cookie.
+ * Looks up a pending sign-in and reports whether sign-up is asked for and allowed. Sets no cookie.
  */
 export const getAuthRequest = async (authRequestBody: AuthRequestBody, options?: Parameters<typeof customFetch>[1]): Promise<AuthRequestInfo> => {
 
@@ -1202,6 +1290,91 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
         TContext
       > => {
       return useMutation(getGetAuthRequestMutationOptions(options), queryClient);
+    }
+
+export const getDescribeInviteUrl = () => {
+
+
+
+
+  return `/auth/v1/invite`
+}
+
+/**
+ * Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no Zitadel code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.
+ */
+export const describeInvite = async (describeInviteBody: DescribeInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<InviteDescription> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<InviteDescription>(getDescribeInviteUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(describeInviteBody)
+  }
+);}
+
+
+
+
+
+export const getDescribeInviteMutationKey = () => ['describeInvite'] as const;
+
+export const getDescribeInviteMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof describeInvite>>, TError,DescribeInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof describeInvite>>, TError,DescribeInviteMutationVariables, TContext> => {
+
+const mutationKey = getDescribeInviteMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof describeInvite>>, DescribeInviteMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  describeInvite(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DescribeInviteMutationResult = NonNullable<Awaited<ReturnType<typeof describeInvite>>>
+    export type DescribeInviteMutationBody = DescribeInviteBody
+    export type DescribeInviteMutationError = ErrorType<ErrorEnvelope>
+    export type DescribeInviteMutationVariables = {data: DescribeInviteBody}
+
+    export const useDescribeInvite = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof describeInvite>>, TError,DescribeInviteMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof describeInvite>>,
+        TError,
+        DescribeInviteMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDescribeInviteMutationOptions(options), queryClient);
     }
 
 export const getLogoutUrl = () => {

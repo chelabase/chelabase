@@ -88,10 +88,15 @@ pub enum Cors {
     Any,
 }
 
+pub use chelabase_types::access::{Access, PlatformRole};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     pub auth: Auth,
     pub cors: Cors,
+    /// Who may call it (the members-and-roles design, part 4). Required, so a route without
+    /// an access level doesn't compile.
+    pub access: Access,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,19 +111,16 @@ pub struct Endpoint {
 }
 
 pub mod orchestrator {
-    use super::{Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+    use super::PlatformRole::{Admin, Developer, Viewer};
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
 
-    pub const HEALTH: Endpoint = Endpoint {
-        name: "orchestrator.health",
-        method: Method::Get,
-        path: "/health",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Public,
-            cors: Cors::None,
-        },
+    /// Branch-changing routes: Developer on an unprotected branch, Admin on a protected one.
+    const BRANCH: Access = Access::Branch {
+        unprotected: Developer,
+        protected: Admin,
     };
+
+    pub const HEALTH: Endpoint = public_get("orchestrator.health", "/health");
 
     /// The Management API's OpenAPI document.
     pub const OPENAPI_JSON: Endpoint = public_get("orchestrator.openapi_json", "/v1/openapi.json");
@@ -133,229 +135,144 @@ pub mod orchestrator {
             policy: Policy {
                 auth: Auth::Public,
                 cors: Cors::None,
+                access: Access::Public,
             },
         }
     }
 
-    pub const CREATE_DATABASE: Endpoint = Endpoint {
-        name: "orchestrator.create_database",
-        method: Method::Post,
-        path: "/v1/databases",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    /// Creates a database in a project. The project comes from the request body, not the
+    /// path: the access check resolves it there, and a missing or foreign project is 404.
+    pub const CREATE_DATABASE: Endpoint =
+        key_endpoint("orchestrator.create_database", Method::Post, "/v1/databases", Access::Project(Admin));
 
-    pub const GET_DATABASE: Endpoint = Endpoint {
-        name: "orchestrator.get_database",
-        method: Method::Get,
-        path: "/v1/databases/{id}",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const GET_DATABASE: Endpoint =
+        key_endpoint("orchestrator.get_database", Method::Get, "/v1/databases/{id}", Access::Project(Viewer));
 
     /// Owner credentials of a ready database (re-revealable).
-    pub const DATABASE_CONNECTION: Endpoint = Endpoint {
-        name: "orchestrator.database_connection",
-        method: Method::Get,
-        path: "/v1/databases/{id}/connection",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const DATABASE_CONNECTION: Endpoint = key_endpoint(
+        "orchestrator.database_connection",
+        Method::Get,
+        "/v1/databases/{id}/connection",
+        Access::Project(Admin),
+    );
 
-    pub const RESET_PASSWORD: Endpoint = Endpoint {
-        name: "orchestrator.reset_password",
-        method: Method::Post,
-        path: "/v1/databases/{id}/reset-password",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const RESET_PASSWORD: Endpoint = key_endpoint(
+        "orchestrator.reset_password",
+        Method::Post,
+        "/v1/databases/{id}/reset-password",
+        Access::Project(Admin),
+    );
 
-    pub const DELETE_DATABASE: Endpoint = Endpoint {
-        name: "orchestrator.delete_database",
-        method: Method::Delete,
-        path: "/v1/databases/{id}",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const DELETE_DATABASE: Endpoint =
+        key_endpoint("orchestrator.delete_database", Method::Delete, "/v1/databases/{id}", Access::Project(Admin));
 
     /// The database's branches (a flat list; `parent_branch_id` makes the tree).
-    pub const LIST_BRANCHES: Endpoint = Endpoint {
-        name: "orchestrator.list_branches",
-        method: Method::Get,
-        path: "/v1/databases/{id}/branches",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const LIST_BRANCHES: Endpoint = key_endpoint(
+        "orchestrator.list_branches",
+        Method::Get,
+        "/v1/databases/{id}/branches",
+        Access::Project(Viewer),
+    );
 
-    /// A branch of an existing branch, at a point in its history.
-    pub const CREATE_BRANCH: Endpoint = Endpoint {
-        name: "orchestrator.create_branch",
-        method: Method::Post,
-        path: "/v1/databases/{id}/branches",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    /// A branch of an existing branch, at a point in its history (created unprotected).
+    pub const CREATE_BRANCH: Endpoint = key_endpoint(
+        "orchestrator.create_branch",
+        Method::Post,
+        "/v1/databases/{id}/branches",
+        Access::Project(Developer),
+    );
 
-    /// Owner credentials of a ready branch.
-    pub const BRANCH_CONNECTION: Endpoint = Endpoint {
-        name: "orchestrator.branch_connection",
-        method: Method::Get,
-        path: "/v1/databases/{id}/branches/{branch_id}/connection",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    /// Credentials of a ready branch: the owner or a login role. Admin for every role (R22:
+    /// grants name NOLOGIN group roles, and a login role's connection string is its password).
+    pub const BRANCH_CONNECTION: Endpoint = key_endpoint(
+        "orchestrator.branch_connection",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/connection",
+        Access::Project(Admin),
+    );
 
-    pub const BRANCH_RESET_PASSWORD: Endpoint = Endpoint {
-        name: "orchestrator.branch_reset_password",
-        method: Method::Post,
-        path: "/v1/databases/{id}/branches/{branch_id}/reset-password",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const BRANCH_RESET_PASSWORD: Endpoint = key_endpoint(
+        "orchestrator.branch_reset_password",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/reset-password",
+        Access::Project(Admin),
+    );
 
-    pub const BRANCH_RESET_TO_PARENT: Endpoint = Endpoint {
-        name: "orchestrator.branch_reset_to_parent",
-        method: Method::Post,
-        path: "/v1/databases/{id}/branches/{branch_id}/reset-to-parent",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const BRANCH_RESET_TO_PARENT: Endpoint = key_endpoint(
+        "orchestrator.branch_reset_to_parent",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/reset-to-parent",
+        BRANCH,
+    );
 
     /// Rewinds a branch to a point, keeping the old timeline as a backup branch.
-    pub const BRANCH_RESTORE: Endpoint = Endpoint {
-        name: "orchestrator.branch_restore",
-        method: Method::Post,
-        path: "/v1/databases/{id}/branches/{branch_id}/restore",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const BRANCH_RESTORE: Endpoint = key_endpoint(
+        "orchestrator.branch_restore",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/restore",
+        BRANCH,
+    );
 
-    pub const DELETE_BRANCH: Endpoint = Endpoint {
-        name: "orchestrator.delete_branch",
-        method: Method::Delete,
-        path: "/v1/databases/{id}/branches/{branch_id}",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const DELETE_BRANCH: Endpoint = key_endpoint(
+        "orchestrator.delete_branch",
+        Method::Delete,
+        "/v1/databases/{id}/branches/{branch_id}",
+        BRANCH,
+    );
 
-    /// Marks a branch protected or not.
-    pub const UPDATE_BRANCH: Endpoint = Endpoint {
-        name: "orchestrator.update_branch",
-        method: Method::Patch,
-        path: "/v1/databases/{id}/branches/{branch_id}",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    /// Marks a branch protected or not (protect, unprotect: Admin). A future rename is
+    /// `Branch(Developer, Admin)` in the design, so it needs its own route.
+    pub const UPDATE_BRANCH: Endpoint = key_endpoint(
+        "orchestrator.update_branch",
+        Method::Patch,
+        "/v1/databases/{id}/branches/{branch_id}",
+        Access::Project(Admin),
+    );
 
     /// The branch's Postgres databases: the main one first.
     pub const LIST_BRANCH_DATABASES: Endpoint = key_endpoint(
         "orchestrator.list_branch_databases",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/databases",
+        Access::Project(Viewer),
     );
 
     /// Database settings: the history window and the branch cap.
-    pub const UPDATE_DATABASE: Endpoint = Endpoint {
-        name: "orchestrator.update_database",
-        method: Method::Patch,
-        path: "/v1/databases/{id}",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const UPDATE_DATABASE: Endpoint =
+        key_endpoint("orchestrator.update_database", Method::Patch, "/v1/databases/{id}", Access::Project(Admin));
 
     /// The caller, their tenant, projects and databases (Studio landing page).
-    pub const ME: Endpoint = Endpoint {
-        name: "orchestrator.me",
-        method: Method::Get,
-        path: "/v1/me",
-        scope: Scope::Api,
-        service: Service::Orchestrator,
-        policy: Policy {
-            auth: Auth::Management,
-            cors: Cors::Studio,
-        },
-    };
+    pub const ME: Endpoint = key_endpoint("orchestrator.me", Method::Get, "/v1/me", Access::SignedIn);
 
     /// The branch's live data API keys (the public key in full).
     pub const LIST_KEYS: Endpoint = key_endpoint(
         "orchestrator.list_keys",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/keys",
+        Access::Project(Viewer),
     );
 
-    /// A new secret key, shown once.
+    /// A new secret key, shown once. Keys: Developer for a key bound to an allowed role, Admin
+    /// for any key (the handler refines).
     pub const CREATE_KEY: Endpoint = key_endpoint(
         "orchestrator.create_key",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/keys",
+        Access::Project(Developer),
     );
 
     pub const ROTATE_KEY: Endpoint = key_endpoint(
         "orchestrator.rotate_key",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}/rotate",
+        Access::Project(Developer),
     );
 
     pub const REVOKE_KEY: Endpoint = key_endpoint(
         "orchestrator.revoke_key",
         Method::Delete,
         "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
+        Access::Project(Developer),
     );
 
     /// The branch's schema as the data API sees it, with each table's role privileges.
@@ -363,6 +280,7 @@ pub mod orchestrator {
         "orchestrator.data_api_schema",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/data-api/schema",
+        Access::Project(Viewer),
     );
 
     /// Starts serving one of the branch's Postgres databases through the data API.
@@ -370,6 +288,7 @@ pub mod orchestrator {
         "orchestrator.enable_data_api",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api",
+        Access::Project(Admin),
     );
 
     /// Stops serving a Postgres database (`?remove=true` also drops the machinery).
@@ -377,6 +296,7 @@ pub mod orchestrator {
         "orchestrator.disable_data_api",
         Method::Delete,
         "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/data-api",
+        Access::Project(Admin),
     );
 
     /// Changes a Postgres database's data API settings (its default schema).
@@ -384,62 +304,85 @@ pub mod orchestrator {
         "orchestrator.update_pg_database",
         Method::Patch,
         "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
+        Access::Project(Admin),
     );
 
-    /// Schema merges between a branch and its parent (step 6g).
+    /// Schema merges between a branch and its parent (step 6g). Changing ones need
+    /// `Branch(Developer, Admin)` by the target branch (the one merged into).
+    ///
+    /// For `create_merge`, the path's `{branch_id}` is the source branch: the access check
+    /// must read the protection of its parent (the merge target), not of `{branch_id}`.
     pub const CREATE_MERGE: Endpoint = key_endpoint(
         "orchestrator.create_merge",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/merges",
+        BRANCH,
     );
-    pub const LIST_MERGES: Endpoint =
-        key_endpoint("orchestrator.list_merges", Method::Get, "/v1/databases/{id}/merges");
-    pub const GET_MERGE: Endpoint =
-        key_endpoint("orchestrator.get_merge", Method::Get, "/v1/databases/{id}/merges/{merge_id}");
+    pub const LIST_MERGES: Endpoint = key_endpoint(
+        "orchestrator.list_merges",
+        Method::Get,
+        "/v1/databases/{id}/merges",
+        Access::Project(Viewer),
+    );
+    pub const GET_MERGE: Endpoint = key_endpoint(
+        "orchestrator.get_merge",
+        Method::Get,
+        "/v1/databases/{id}/merges/{merge_id}",
+        Access::Project(Viewer),
+    );
     pub const UPDATE_MERGE: Endpoint = key_endpoint(
         "orchestrator.update_merge",
         Method::Patch,
         "/v1/databases/{id}/merges/{merge_id}",
+        BRANCH,
     );
     pub const REHEARSE_MERGE: Endpoint = key_endpoint(
         "orchestrator.rehearse_merge",
         Method::Post,
         "/v1/databases/{id}/merges/{merge_id}/rehearse",
+        BRANCH,
     );
     pub const APPLY_MERGE: Endpoint = key_endpoint(
         "orchestrator.apply_merge",
         Method::Post,
         "/v1/databases/{id}/merges/{merge_id}/apply",
+        BRANCH,
     );
     pub const RECOMPUTE_MERGE: Endpoint = key_endpoint(
         "orchestrator.recompute_merge",
         Method::Post,
         "/v1/databases/{id}/merges/{merge_id}/recompute",
+        BRANCH,
     );
     pub const RETRY_MERGE: Endpoint = key_endpoint(
         "orchestrator.retry_merge",
         Method::Post,
         "/v1/databases/{id}/merges/{merge_id}/retry",
+        BRANCH,
     );
     pub const CANCEL_MERGE: Endpoint = key_endpoint(
         "orchestrator.cancel_merge",
         Method::Post,
         "/v1/databases/{id}/merges/{merge_id}/cancel",
+        BRANCH,
     );
     pub const ABANDON_MERGE: Endpoint = key_endpoint(
         "orchestrator.abandon_merge",
         Method::Post,
         "/v1/databases/{id}/merges/{merge_id}/abandon",
+        BRANCH,
     );
     pub const FINISH_MERGE: Endpoint = key_endpoint(
         "orchestrator.finish_merge",
         Method::Post,
         "/v1/databases/{id}/merges/{merge_id}/finish",
+        BRANCH,
     );
     pub const EXPORT_MERGE_PLAN: Endpoint = key_endpoint(
         "orchestrator.export_merge_plan",
         Method::Get,
         "/v1/databases/{id}/merges/{merge_id}/plan.sql",
+        Access::Project(Viewer),
     );
 
     /// Studio's console: one data API request on the branch, as the owner or a named role.
@@ -447,45 +390,61 @@ pub mod orchestrator {
         "orchestrator.console_query",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/console/query",
+        Access::ActAs(Viewer),
     );
 
-    /// Studio's SQL editor: each user's saved queries, per database.
-    pub const LIST_SAVED_QUERIES: Endpoint =
-        key_endpoint("orchestrator.list_saved_queries", Method::Get, "/v1/databases/{id}/sql-queries");
-    pub const CREATE_SAVED_QUERY: Endpoint =
-        key_endpoint("orchestrator.create_saved_query", Method::Post, "/v1/databases/{id}/sql-queries");
+    /// Studio's SQL editor: each user's saved queries, per database. Editing and deleting
+    /// one also needs its author or Admin (the handler refines).
+    pub const LIST_SAVED_QUERIES: Endpoint = key_endpoint(
+        "orchestrator.list_saved_queries",
+        Method::Get,
+        "/v1/databases/{id}/sql-queries",
+        Access::Project(Developer),
+    );
+    pub const CREATE_SAVED_QUERY: Endpoint = key_endpoint(
+        "orchestrator.create_saved_query",
+        Method::Post,
+        "/v1/databases/{id}/sql-queries",
+        Access::Project(Developer),
+    );
     pub const GET_SAVED_QUERY: Endpoint = key_endpoint(
         "orchestrator.get_saved_query",
         Method::Get,
         "/v1/databases/{id}/sql-queries/{query_id}",
+        Access::Project(Developer),
     );
     pub const UPDATE_SAVED_QUERY: Endpoint = key_endpoint(
         "orchestrator.update_saved_query",
         Method::Patch,
         "/v1/databases/{id}/sql-queries/{query_id}",
+        Access::Project(Developer),
     );
     pub const DELETE_SAVED_QUERY: Endpoint = key_endpoint(
         "orchestrator.delete_saved_query",
         Method::Delete,
         "/v1/databases/{id}/sql-queries/{query_id}",
+        Access::Project(Developer),
     );
 
-    /// Studio's SQL editor: runs a script on a branch (an NDJSON stream), cancels a run, and
-    /// serves the schema for completion.
+    /// Studio's SQL editor: runs a script on a branch (an NDJSON stream), cancels a run (its
+    /// starter or Admin; the handler refines), and serves the schema for completion.
     pub const RUN_SQL: Endpoint = key_endpoint(
         "orchestrator.run_sql",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/sql",
+        Access::ActAs(Developer),
     );
     pub const CANCEL_SQL_RUN: Endpoint = key_endpoint(
         "orchestrator.cancel_sql_run",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/sql/runs/{run_id}/cancel",
+        Access::Project(Developer),
     );
     pub const GET_SQL_SCHEMA: Endpoint = key_endpoint(
         "orchestrator.get_sql_schema",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/sql/schema",
+        Access::ActAs(Developer),
     );
 
     /// Studio's console: the schema it may show, as the owner or a named role.
@@ -493,6 +452,7 @@ pub mod orchestrator {
         "orchestrator.console_schema",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/console/schema",
+        Access::ActAs(Viewer),
     );
 
     /// Changes which databases a key may reach.
@@ -500,6 +460,7 @@ pub mod orchestrator {
         "orchestrator.update_key",
         Method::Patch,
         "/v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
+        Access::Project(Developer),
     );
 
     /// The branch's roles: the owner first, then the login roles.
@@ -507,24 +468,28 @@ pub mod orchestrator {
         "orchestrator.list_roles",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/roles",
+        Access::Project(Viewer),
     );
 
     pub const CREATE_ROLE: Endpoint = key_endpoint(
         "orchestrator.create_role",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/roles",
+        Access::Project(Admin),
     );
 
     pub const RESET_ROLE: Endpoint = key_endpoint(
         "orchestrator.reset_role_password",
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/roles/{role}/reset-password",
+        Access::Project(Admin),
     );
 
     pub const DELETE_ROLE: Endpoint = key_endpoint(
         "orchestrator.delete_role",
         Method::Delete,
         "/v1/databases/{id}/branches/{branch_id}/roles/{role}",
+        Access::Project(Admin),
     );
 
     /// Changes a role's LOGIN, owner-level, attributes or memberships (step 6g, U1).
@@ -532,6 +497,7 @@ pub mod orchestrator {
         "orchestrator.update_role",
         Method::Patch,
         "/v1/databases/{id}/branches/{branch_id}/roles/{role}",
+        Access::Project(Admin),
     );
 
     /// A role's live sessions on the branch's compute (step 6g, E29a): a read that never
@@ -540,68 +506,263 @@ pub mod orchestrator {
         "orchestrator.list_role_sessions",
         Method::Get,
         "/v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions",
+        Access::Project(Admin),
     );
 
-    /// The tenant's projects.
-    pub const LIST_PROJECTS: Endpoint = key_endpoint("orchestrator.list_projects", Method::Get, "/v1/projects");
+    /// The tenant's projects (filtered to the caller's grants; tenant admins see all).
+    pub const LIST_PROJECTS: Endpoint =
+        key_endpoint("orchestrator.list_projects", Method::Get, "/v1/projects", Access::TenantMember);
 
     pub const CREATE_PROJECT: Endpoint =
-        key_endpoint("orchestrator.create_project", Method::Post, "/v1/projects");
+        key_endpoint("orchestrator.create_project", Method::Post, "/v1/projects", Access::TenantAdmin);
 
     pub const GET_PROJECT: Endpoint =
-        key_endpoint("orchestrator.get_project", Method::Get, "/v1/projects/{id}");
+        key_endpoint("orchestrator.get_project", Method::Get, "/v1/projects/{id}", Access::Project(Viewer));
 
     /// Renames a project (the slug stays).
     pub const UPDATE_PROJECT: Endpoint =
-        key_endpoint("orchestrator.update_project", Method::Patch, "/v1/projects/{id}");
+        key_endpoint("orchestrator.update_project", Method::Patch, "/v1/projects/{id}", Access::Project(Admin));
 
     /// Starts deleting a project and its databases.
     pub const DELETE_PROJECT: Endpoint =
-        key_endpoint("orchestrator.delete_project", Method::Delete, "/v1/projects/{id}");
+        key_endpoint("orchestrator.delete_project", Method::Delete, "/v1/projects/{id}", Access::Project(Admin));
 
-    /// The project's app-users settings.
-    pub const GET_APP_USERS: Endpoint =
-        key_endpoint("orchestrator.get_app_users", Method::Get, "/v1/projects/{id}/app-users");
+    /// The project's app-users settings (a read: Viewers see whether app users are on).
+    pub const GET_APP_USERS: Endpoint = key_endpoint(
+        "orchestrator.get_app_users",
+        Method::Get,
+        "/v1/projects/{id}/app-users",
+        Access::Project(Viewer),
+    );
 
     /// Enables app users, or changes their settings.
-    pub const PUT_APP_USERS: Endpoint =
-        key_endpoint("orchestrator.put_app_users", Method::Put, "/v1/projects/{id}/app-users");
+    pub const PUT_APP_USERS: Endpoint = key_endpoint(
+        "orchestrator.put_app_users",
+        Method::Put,
+        "/v1/projects/{id}/app-users",
+        Access::Project(Admin),
+    );
 
     /// Disables app users (refused while users exist).
-    pub const DISABLE_APP_USERS: Endpoint =
-        key_endpoint("orchestrator.disable_app_users", Method::Delete, "/v1/projects/{id}/app-users");
+    pub const DISABLE_APP_USERS: Endpoint = key_endpoint(
+        "orchestrator.disable_app_users",
+        Method::Delete,
+        "/v1/projects/{id}/app-users",
+        Access::Project(Admin),
+    );
 
     /// The project's users, 50 per page.
-    pub const LIST_APP_USERS: Endpoint =
-        key_endpoint("orchestrator.list_app_users", Method::Get, "/v1/projects/{id}/users");
+    pub const LIST_APP_USERS: Endpoint = key_endpoint(
+        "orchestrator.list_app_users",
+        Method::Get,
+        "/v1/projects/{id}/users",
+        Access::Project(Viewer),
+    );
 
     /// Creates a user.
-    pub const CREATE_APP_USER: Endpoint =
-        key_endpoint("orchestrator.create_app_user", Method::Post, "/v1/projects/{id}/users");
+    pub const CREATE_APP_USER: Endpoint = key_endpoint(
+        "orchestrator.create_app_user",
+        Method::Post,
+        "/v1/projects/{id}/users",
+        Access::Project(Developer),
+    );
 
-    pub const GET_APP_USER: Endpoint =
-        key_endpoint("orchestrator.get_app_user", Method::Get, "/v1/projects/{id}/users/{user_id}");
+    pub const GET_APP_USER: Endpoint = key_endpoint(
+        "orchestrator.get_app_user",
+        Method::Get,
+        "/v1/projects/{id}/users/{user_id}",
+        Access::Project(Viewer),
+    );
 
     /// Changes a user's email, verified flag or password.
-    pub const UPDATE_APP_USER: Endpoint =
-        key_endpoint("orchestrator.update_app_user", Method::Patch, "/v1/projects/{id}/users/{user_id}");
+    pub const UPDATE_APP_USER: Endpoint = key_endpoint(
+        "orchestrator.update_app_user",
+        Method::Patch,
+        "/v1/projects/{id}/users/{user_id}",
+        Access::Project(Developer),
+    );
 
-    pub const DEACTIVATE_APP_USER: Endpoint =
-        key_endpoint("orchestrator.deactivate_app_user", Method::Post, "/v1/projects/{id}/users/{user_id}/deactivate");
+    pub const DEACTIVATE_APP_USER: Endpoint = key_endpoint(
+        "orchestrator.deactivate_app_user",
+        Method::Post,
+        "/v1/projects/{id}/users/{user_id}/deactivate",
+        Access::Project(Developer),
+    );
 
-    pub const REACTIVATE_APP_USER: Endpoint =
-        key_endpoint("orchestrator.reactivate_app_user", Method::Post, "/v1/projects/{id}/users/{user_id}/reactivate");
+    pub const REACTIVATE_APP_USER: Endpoint = key_endpoint(
+        "orchestrator.reactivate_app_user",
+        Method::Post,
+        "/v1/projects/{id}/users/{user_id}/reactivate",
+        Access::Project(Developer),
+    );
 
-    pub const LIST_APP_USER_SESSIONS: Endpoint =
-        key_endpoint("orchestrator.list_app_user_sessions", Method::Get, "/v1/projects/{id}/users/{user_id}/sessions");
+    pub const LIST_APP_USER_SESSIONS: Endpoint = key_endpoint(
+        "orchestrator.list_app_user_sessions",
+        Method::Get,
+        "/v1/projects/{id}/users/{user_id}/sessions",
+        Access::Project(Viewer),
+    );
 
-    pub const REVOKE_APP_USER_SESSIONS: Endpoint =
-        key_endpoint("orchestrator.revoke_app_user_sessions", Method::Delete, "/v1/projects/{id}/users/{user_id}/sessions");
+    pub const REVOKE_APP_USER_SESSIONS: Endpoint = key_endpoint(
+        "orchestrator.revoke_app_user_sessions",
+        Method::Delete,
+        "/v1/projects/{id}/users/{user_id}/sessions",
+        Access::Project(Developer),
+    );
 
-    pub const DELETE_APP_USER: Endpoint =
-        key_endpoint("orchestrator.delete_app_user", Method::Delete, "/v1/projects/{id}/users/{user_id}");
+    pub const DELETE_APP_USER: Endpoint = key_endpoint(
+        "orchestrator.delete_app_user",
+        Method::Delete,
+        "/v1/projects/{id}/users/{user_id}",
+        Access::Project(Developer),
+    );
 
-    const fn key_endpoint(name: &'static str, method: Method, path: &'static str) -> Endpoint {
+    /// The tenant's members (names and emails, for grant pickers).
+    pub const LIST_MEMBERS: Endpoint =
+        key_endpoint("orchestrator.list_members", Method::Get, "/v1/members", Access::TenantMember);
+
+    /// Sets or clears a member's tenant-admin flag.
+    pub const UPDATE_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.update_member",
+        Method::Patch,
+        "/v1/members/{member_id}",
+        Access::TenantAdmin,
+    );
+
+    /// Removes a member: grants gone, Zitadel user deactivated, sessions ended.
+    pub const REMOVE_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.remove_member",
+        Method::Delete,
+        "/v1/members/{member_id}",
+        Access::TenantAdmin,
+    );
+
+    /// Approves a pending sign-up with its first grants (R40).
+    pub const APPROVE_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.approve_member",
+        Method::Post,
+        "/v1/members/{member_id}/approve",
+        Access::TenantAdmin,
+    );
+
+    /// Declines a pending sign-up: removed, its Zitadel user deactivated (R40).
+    pub const DECLINE_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.decline_member",
+        Method::Post,
+        "/v1/members/{member_id}/decline",
+        Access::TenantAdmin,
+    );
+
+    /// Invites a person by email, with grants on any of the tenant's projects.
+    pub const CREATE_INVITE: Endpoint =
+        key_endpoint("orchestrator.create_invite", Method::Post, "/v1/invites", Access::TenantAdmin);
+
+    /// Sends an open invite again with a new code.
+    pub const RESEND_INVITE: Endpoint = key_endpoint(
+        "orchestrator.resend_invite",
+        Method::Post,
+        "/v1/invites/{invite_id}/resend",
+        Access::TenantAdmin,
+    );
+
+    /// Revokes an open invite (the never-activated Zitadel user is deleted).
+    pub const REVOKE_INVITE: Endpoint = key_endpoint(
+        "orchestrator.revoke_invite",
+        Method::Delete,
+        "/v1/invites/{invite_id}",
+        Access::TenantAdmin,
+    );
+
+    /// Invites a person straight into this project.
+    pub const CREATE_PROJECT_INVITE: Endpoint = key_endpoint(
+        "orchestrator.create_project_invite",
+        Method::Post,
+        "/v1/projects/{id}/invites",
+        Access::Project(Admin),
+    );
+
+    /// The project's grants, with their per-database overrides.
+    pub const LIST_PROJECT_GRANTS: Endpoint = key_endpoint(
+        "orchestrator.list_project_grants",
+        Method::Get,
+        "/v1/projects/{id}/grants",
+        Access::Project(Admin),
+    );
+
+    pub const PUT_PROJECT_GRANT: Endpoint = key_endpoint(
+        "orchestrator.put_project_grant",
+        Method::Put,
+        "/v1/projects/{id}/grants/{member_id}",
+        Access::Project(Admin),
+    );
+
+    pub const DELETE_PROJECT_GRANT: Endpoint = key_endpoint(
+        "orchestrator.delete_project_grant",
+        Method::Delete,
+        "/v1/projects/{id}/grants/{member_id}",
+        Access::Project(Admin),
+    );
+
+    /// Narrows a member's grant on one of the project's databases.
+    pub const PUT_GRANT_OVERRIDE: Endpoint = key_endpoint(
+        "orchestrator.put_grant_override",
+        Method::Put,
+        "/v1/projects/{id}/grants/{member_id}/overrides",
+        Access::Project(Admin),
+    );
+
+    pub const DELETE_GRANT_OVERRIDE: Endpoint = key_endpoint(
+        "orchestrator.delete_grant_override",
+        Method::Delete,
+        "/v1/projects/{id}/grants/{member_id}/overrides",
+        Access::Project(Admin),
+    );
+
+    /// The tenant's access log, newest first.
+    pub const LIST_ACCESS_EVENTS: Endpoint = key_endpoint(
+        "orchestrator.list_access_events",
+        Method::Get,
+        "/v1/access-events",
+        Access::TenantAdmin,
+    );
+
+    /// One project's access log, newest first.
+    pub const LIST_PROJECT_ACCESS_EVENTS: Endpoint = key_endpoint(
+        "orchestrator.list_project_access_events",
+        Method::Get,
+        "/v1/projects/{id}/access-events",
+        Access::Project(Admin),
+    );
+
+    /// The instance's settings (open sign-up).
+    pub const GET_INSTANCE_SETTINGS: Endpoint = key_endpoint(
+        "orchestrator.get_instance_settings",
+        Method::Get,
+        "/v1/instance/settings",
+        Access::Instance,
+    );
+
+    pub const UPDATE_INSTANCE_SETTINGS: Endpoint = key_endpoint(
+        "orchestrator.update_instance_settings",
+        Method::Patch,
+        "/v1/instance/settings",
+        Access::Instance,
+    );
+
+    /// Whether Zitadel can email invites (an active email provider).
+    pub const GET_INVITE_DELIVERY: Endpoint = key_endpoint(
+        "orchestrator.get_invite_delivery",
+        Method::Get,
+        "/v1/invites/delivery",
+        Access::TenantMember,
+    );
+
+    /// Renames the tenant (its display name).
+    pub const UPDATE_TENANT: Endpoint =
+        key_endpoint("orchestrator.update_tenant", Method::Patch, "/v1/tenant", Access::TenantAdmin);
+
+    /// A management route callable from Studio.
+    const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
         Endpoint {
             name,
             method,
@@ -611,6 +772,7 @@ pub mod orchestrator {
             policy: Policy {
                 auth: Auth::Management,
                 cors: Cors::Studio,
+                access,
             },
         }
     }
@@ -618,7 +780,7 @@ pub mod orchestrator {
 
 /// The data API, served by `rest`.
 pub mod rest {
-    use super::{Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
 
     pub const QUERY: Endpoint = Endpoint {
         name: "rest.query",
@@ -629,6 +791,7 @@ pub mod rest {
         policy: Policy {
             auth: Auth::DataKey,
             cors: Cors::Any,
+            access: Access::DataKey,
         },
     };
 
@@ -641,17 +804,19 @@ pub mod rest {
         policy: Policy {
             auth: Auth::SecretDataKey,
             cors: Cors::Any,
+            access: Access::DataKey,
         },
     };
 }
 
 /// Studio's sign-in pages, served by `auth`.
 pub mod auth {
-    use super::{Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
 
     const POLICY: Policy = Policy {
         auth: Auth::Public,
         cors: Cors::StudioCredentials,
+        access: Access::Public,
     };
 
     const fn post(name: &'static str, path: &'static str) -> Endpoint {
@@ -665,9 +830,20 @@ pub mod auth {
         }
     }
 
+    const fn get(name: &'static str, path: &'static str) -> Endpoint {
+        Endpoint {
+            method: Method::Get,
+            ..post(name, path)
+        }
+    }
+
     pub const AUTH_REQUEST: Endpoint = post("auth.auth_request", "/auth/v1/auth-request");
     pub const SIGN_IN: Endpoint = post("auth.sign_in", "/auth/v1/sign-in");
     pub const SIGN_UP: Endpoint = post("auth.sign_up", "/auth/v1/sign-up");
+    pub const ACCEPT_INVITE: Endpoint = post("auth.accept_invite", "/auth/v1/accept-invite");
+    /// Who invited the visitor and to what, for the accept page (`{user, t}` in the body, never a URL). Public: the link's
+    /// token is the credential.
+    pub const DESCRIBE_INVITE: Endpoint = post("auth.describe_invite", "/auth/v1/invite");
     pub const VERIFY_EMAIL: Endpoint = post("auth.verify_email", "/auth/v1/verify-email");
     pub const RESEND_CODE: Endpoint = post("auth.resend_code", "/auth/v1/resend-code");
     pub const PASSWORD_RESET: Endpoint = post("auth.password_reset", "/auth/v1/password-reset");
@@ -679,6 +855,7 @@ pub mod auth {
     const APP_POLICY: Policy = Policy {
         auth: Auth::PublicDataKey,
         cors: Cors::Any,
+        access: Access::DataKey,
     };
 
     const fn app(name: &'static str, method: Method, path: &'static str) -> Endpoint {
@@ -723,6 +900,7 @@ pub mod auth {
         policy: Policy {
             auth: Auth::Public,
             cors: Cors::Any,
+            access: Access::Public,
         },
     };
 }
@@ -801,11 +979,33 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::LIST_APP_USER_SESSIONS,
     orchestrator::REVOKE_APP_USER_SESSIONS,
     orchestrator::DELETE_APP_USER,
+    orchestrator::LIST_MEMBERS,
+    orchestrator::UPDATE_MEMBER,
+    orchestrator::REMOVE_MEMBER,
+    orchestrator::APPROVE_MEMBER,
+    orchestrator::DECLINE_MEMBER,
+    orchestrator::CREATE_INVITE,
+    orchestrator::RESEND_INVITE,
+    orchestrator::REVOKE_INVITE,
+    orchestrator::CREATE_PROJECT_INVITE,
+    orchestrator::LIST_PROJECT_GRANTS,
+    orchestrator::PUT_PROJECT_GRANT,
+    orchestrator::DELETE_PROJECT_GRANT,
+    orchestrator::PUT_GRANT_OVERRIDE,
+    orchestrator::DELETE_GRANT_OVERRIDE,
+    orchestrator::LIST_ACCESS_EVENTS,
+    orchestrator::LIST_PROJECT_ACCESS_EVENTS,
+    orchestrator::GET_INSTANCE_SETTINGS,
+    orchestrator::UPDATE_INSTANCE_SETTINGS,
+    orchestrator::GET_INVITE_DELIVERY,
+    orchestrator::UPDATE_TENANT,
     rest::QUERY,
     rest::SCHEMA,
     auth::AUTH_REQUEST,
     auth::SIGN_IN,
     auth::SIGN_UP,
+    auth::ACCEPT_INVITE,
+    auth::DESCRIBE_INVITE,
     auth::VERIFY_EMAIL,
     auth::RESEND_CODE,
     auth::PASSWORD_RESET,
@@ -1074,7 +1274,7 @@ mod tests {
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))
                 .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
-            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio), "{name}");
             assert_eq!(ep.service, Service::Orchestrator, "{name}");
         }
     }
@@ -1126,7 +1326,7 @@ mod tests {
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))
                 .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
-            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio), "{name}");
             assert_eq!(ep.service, Service::Orchestrator, "{name}");
         }
     }
@@ -1177,7 +1377,7 @@ mod tests {
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))
                 .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
-            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio), "{name}");
             assert_eq!(ep.service, Service::Orchestrator, "{name}");
         }
     }
@@ -1186,12 +1386,14 @@ mod tests {
     fn auth_endpoints_are_public_posts_with_credentialed_cors() {
         let platform = |e: &&Endpoint| e.service == Service::Auth && !e.path.starts_with("/auth/v1/app/");
         for ep in ENDPOINTS.iter().filter(platform) {
+            // All posts, the accept page's invite description included (M8: its user id and
+            // token go in the body, never a URL).
             assert_eq!(ep.method, Method::Post, "{}", ep.path);
             assert_eq!(ep.policy.auth, Auth::Public, "{}", ep.path);
             assert_eq!(ep.policy.cors, Cors::StudioCredentials, "{}", ep.path);
             assert!(ep.path.starts_with("/auth/v1/"), "{}", ep.path);
         }
-        assert_eq!(ENDPOINTS.iter().filter(platform).count(), 8);
+        assert_eq!(ENDPOINTS.iter().filter(platform).count(), 10);
         assert!(matches!(match_endpoint(Scope::Api, "POST", "/auth/v1/password-reset/confirm"),
             Match::Found(ep) if ep.name == "auth.password_reset_confirm"));
     }
@@ -1223,7 +1425,7 @@ mod tests {
             assert_eq!(ep.service, Service::Auth, "{name}");
             assert_eq!(ep.scope, Scope::Api, "{name}");
             let auth = if name == "auth.app_jwks" { Auth::Public } else { Auth::PublicDataKey };
-            assert_eq!(ep.policy, Policy { auth, cors: Cors::Any }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (auth, Cors::Any), "{name}");
         }
     }
 
@@ -1233,8 +1435,14 @@ mod tests {
     fn rest_endpoints_match_and_are_listed() {
         assert_eq!(found("POST", "/data/v1/query"), "rest.query");
         assert_eq!(found("GET", "/data/v1/schema"), "rest.schema");
-        assert_eq!(rest::QUERY.policy, Policy { auth: Auth::DataKey, cors: Cors::Any });
-        assert_eq!(rest::SCHEMA.policy, Policy { auth: Auth::SecretDataKey, cors: Cors::Any });
+        assert_eq!(
+            rest::QUERY.policy,
+            Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey }
+        );
+        assert_eq!(
+            rest::SCHEMA.policy,
+            Policy { auth: Auth::SecretDataKey, cors: Cors::Any, access: Access::DataKey }
+        );
         for ep in [rest::QUERY, rest::SCHEMA] {
             assert_eq!(ep.service, Service::Rest);
             assert_eq!(ep.scope, Scope::Api);
@@ -1253,7 +1461,7 @@ mod tests {
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))
                 .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
-            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio), "{name}");
         }
     }
 
@@ -1269,7 +1477,7 @@ mod tests {
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))
                 .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
-            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio), "{name}");
             assert_eq!(ep.service, Service::Orchestrator, "{name}");
         }
     }
@@ -1282,7 +1490,7 @@ mod tests {
             .iter()
             .find(|e| e.name == "orchestrator.console_schema")
             .expect("console_schema is in ENDPOINTS");
-        assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio });
+        assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio));
         assert_eq!(ep.service, Service::Orchestrator);
     }
 
@@ -1299,7 +1507,7 @@ mod tests {
         ] {
             assert_eq!(found(method, &path), name);
             let ep = ENDPOINTS.iter().find(|e| e.name == name).expect(name);
-            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio), "{name}");
             assert_eq!(ep.service, Service::Orchestrator);
         }
         assert_eq!(
@@ -1319,7 +1527,7 @@ mod tests {
         ] {
             assert_eq!(found(method, &path), name);
             let ep = ENDPOINTS.iter().find(|e| e.name == name).expect(name);
-            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio }, "{name}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio), "{name}");
             assert_eq!(ep.service, Service::Orchestrator);
         }
         assert_eq!(
@@ -1344,7 +1552,7 @@ mod tests {
             .iter()
             .find(|e| e.name == "orchestrator.console_query")
             .expect("console_query is in ENDPOINTS");
-        assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio });
+        assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio));
         assert_eq!(ep.service, Service::Orchestrator);
     }
 
@@ -1367,5 +1575,175 @@ mod tests {
     #[test]
     fn service_rest_name_is_rest() {
         assert_eq!(Service::Rest.name(), "rest");
+    }
+
+    #[test]
+    fn auth_and_access_agree() {
+        for ep in ENDPOINTS {
+            let access = ep.policy.access;
+            match ep.policy.auth {
+                Auth::Public => assert_eq!(access, Access::Public, "{}", ep.name),
+                Auth::DataKey | Auth::SecretDataKey | Auth::PublicDataKey => {
+                    assert_eq!(access, Access::DataKey, "{}", ep.name)
+                }
+                Auth::Management => assert!(
+                    !matches!(access, Access::Public | Access::DataKey),
+                    "{}: a management route needs a member access level, not {access:?}",
+                    ep.name
+                ),
+            }
+        }
+    }
+
+    /// The design's per-route table (members and roles, part 4), one row per endpoint.
+    #[test]
+    fn spec_table() {
+        use PlatformRole::{Admin, Developer, Viewer};
+        const BRANCH: Access = Access::Branch { unprotected: Developer, protected: Admin };
+        let table: &[(&str, Access)] = &[
+            ("orchestrator.health", Access::Public),
+            ("orchestrator.openapi_json", Access::Public),
+            ("orchestrator.me", Access::SignedIn),
+            // Console.
+            ("orchestrator.console_query", Access::ActAs(Viewer)),
+            ("orchestrator.console_schema", Access::ActAs(Viewer)),
+            // SQL editor (cancel: the starter or Admin, refined in the handler).
+            ("orchestrator.run_sql", Access::ActAs(Developer)),
+            ("orchestrator.get_sql_schema", Access::ActAs(Developer)),
+            ("orchestrator.cancel_sql_run", Access::Project(Developer)),
+            // Saved queries (edit, delete: the author or Admin, refined in the handler).
+            ("orchestrator.list_saved_queries", Access::Project(Developer)),
+            ("orchestrator.get_saved_query", Access::Project(Developer)),
+            ("orchestrator.create_saved_query", Access::Project(Developer)),
+            ("orchestrator.update_saved_query", Access::Project(Developer)),
+            ("orchestrator.delete_saved_query", Access::Project(Developer)),
+            // Connections.
+            ("orchestrator.database_connection", Access::Project(Admin)),
+            ("orchestrator.reset_password", Access::Project(Admin)),
+            ("orchestrator.branch_connection", Access::Project(Admin)),
+            ("orchestrator.branch_reset_password", Access::Project(Admin)),
+            // Roles.
+            ("orchestrator.list_roles", Access::Project(Viewer)),
+            ("orchestrator.create_role", Access::Project(Admin)),
+            ("orchestrator.update_role", Access::Project(Admin)),
+            ("orchestrator.delete_role", Access::Project(Admin)),
+            ("orchestrator.reset_role_password", Access::Project(Admin)),
+            ("orchestrator.list_role_sessions", Access::Project(Admin)),
+            // Data keys (Admin for a key not bound to an allowed role, refined in the handler).
+            ("orchestrator.list_keys", Access::Project(Viewer)),
+            ("orchestrator.data_api_schema", Access::Project(Viewer)),
+            ("orchestrator.create_key", Access::Project(Developer)),
+            ("orchestrator.rotate_key", Access::Project(Developer)),
+            ("orchestrator.update_key", Access::Project(Developer)),
+            ("orchestrator.revoke_key", Access::Project(Developer)),
+            // Data API per Postgres database.
+            ("orchestrator.enable_data_api", Access::Project(Admin)),
+            ("orchestrator.disable_data_api", Access::Project(Admin)),
+            ("orchestrator.update_pg_database", Access::Project(Admin)),
+            // Branches.
+            ("orchestrator.list_branches", Access::Project(Viewer)),
+            ("orchestrator.list_branch_databases", Access::Project(Viewer)),
+            ("orchestrator.create_branch", Access::Project(Developer)),
+            ("orchestrator.branch_reset_to_parent", BRANCH),
+            ("orchestrator.branch_restore", BRANCH),
+            ("orchestrator.delete_branch", BRANCH),
+            ("orchestrator.update_branch", Access::Project(Admin)),
+            // Databases.
+            ("orchestrator.get_database", Access::Project(Viewer)),
+            ("orchestrator.create_database", Access::Project(Admin)),
+            ("orchestrator.update_database", Access::Project(Admin)),
+            ("orchestrator.delete_database", Access::Project(Admin)),
+            // Merges (by the target branch).
+            ("orchestrator.list_merges", Access::Project(Viewer)),
+            ("orchestrator.get_merge", Access::Project(Viewer)),
+            ("orchestrator.export_merge_plan", Access::Project(Viewer)),
+            ("orchestrator.create_merge", BRANCH),
+            ("orchestrator.update_merge", BRANCH),
+            ("orchestrator.rehearse_merge", BRANCH),
+            ("orchestrator.recompute_merge", BRANCH),
+            ("orchestrator.retry_merge", BRANCH),
+            ("orchestrator.cancel_merge", BRANCH),
+            ("orchestrator.abandon_merge", BRANCH),
+            ("orchestrator.apply_merge", BRANCH),
+            ("orchestrator.finish_merge", BRANCH),
+            // Projects.
+            ("orchestrator.list_projects", Access::TenantMember),
+            ("orchestrator.create_project", Access::TenantAdmin),
+            ("orchestrator.get_project", Access::Project(Viewer)),
+            ("orchestrator.update_project", Access::Project(Admin)),
+            ("orchestrator.delete_project", Access::Project(Admin)),
+            // App users: settings changes Admin, management Developer, reads Viewer.
+            ("orchestrator.get_app_users", Access::Project(Viewer)),
+            ("orchestrator.put_app_users", Access::Project(Admin)),
+            ("orchestrator.disable_app_users", Access::Project(Admin)),
+            ("orchestrator.list_app_users", Access::Project(Viewer)),
+            ("orchestrator.get_app_user", Access::Project(Viewer)),
+            ("orchestrator.list_app_user_sessions", Access::Project(Viewer)),
+            ("orchestrator.create_app_user", Access::Project(Developer)),
+            ("orchestrator.update_app_user", Access::Project(Developer)),
+            ("orchestrator.deactivate_app_user", Access::Project(Developer)),
+            ("orchestrator.reactivate_app_user", Access::Project(Developer)),
+            ("orchestrator.revoke_app_user_sessions", Access::Project(Developer)),
+            ("orchestrator.delete_app_user", Access::Project(Developer)),
+            // Members (part 4, "Members (new)").
+            ("orchestrator.list_members", Access::TenantMember),
+            ("orchestrator.update_member", Access::TenantAdmin),
+            ("orchestrator.remove_member", Access::TenantAdmin),
+            ("orchestrator.approve_member", Access::TenantAdmin),
+            ("orchestrator.decline_member", Access::TenantAdmin),
+            ("orchestrator.create_invite", Access::TenantAdmin),
+            ("orchestrator.resend_invite", Access::TenantAdmin),
+            ("orchestrator.revoke_invite", Access::TenantAdmin),
+            ("orchestrator.create_project_invite", Access::Project(Admin)),
+            ("orchestrator.list_project_grants", Access::Project(Admin)),
+            ("orchestrator.put_project_grant", Access::Project(Admin)),
+            ("orchestrator.delete_project_grant", Access::Project(Admin)),
+            ("orchestrator.put_grant_override", Access::Project(Admin)),
+            ("orchestrator.delete_grant_override", Access::Project(Admin)),
+            ("orchestrator.list_access_events", Access::TenantAdmin),
+            ("orchestrator.list_project_access_events", Access::Project(Admin)),
+            ("orchestrator.get_instance_settings", Access::Instance),
+            ("orchestrator.update_instance_settings", Access::Instance),
+            ("orchestrator.get_invite_delivery", Access::TenantMember),
+            ("orchestrator.update_tenant", Access::TenantAdmin),
+            // Data API.
+            ("rest.query", Access::DataKey),
+            ("rest.schema", Access::DataKey),
+            // Studio sign-in.
+            ("auth.auth_request", Access::Public),
+            ("auth.sign_in", Access::Public),
+            ("auth.sign_up", Access::Public),
+            ("auth.accept_invite", Access::Public),
+            ("auth.describe_invite", Access::Public),
+            ("auth.verify_email", Access::Public),
+            ("auth.resend_code", Access::Public),
+            ("auth.password_reset", Access::Public),
+            ("auth.password_reset_confirm", Access::Public),
+            ("auth.logout", Access::Public),
+            // App users' own flows.
+            ("auth.app_sign_up", Access::DataKey),
+            ("auth.app_sign_in", Access::DataKey),
+            ("auth.app_refresh", Access::DataKey),
+            ("auth.app_sign_out", Access::DataKey),
+            ("auth.app_user", Access::DataKey),
+            ("auth.app_verify_email", Access::DataKey),
+            ("auth.app_resend_code", Access::DataKey),
+            ("auth.app_password_reset", Access::DataKey),
+            ("auth.app_password_reset_confirm", Access::DataKey),
+            ("auth.app_change_email", Access::DataKey),
+            ("auth.app_change_password", Access::DataKey),
+            ("auth.app_jwks", Access::Public),
+        ];
+        for (name, access) in table {
+            let ep = ENDPOINTS
+                .iter()
+                .find(|e| e.name == *name)
+                .unwrap_or_else(|| panic!("{name} is not in ENDPOINTS"));
+            assert_eq!(ep.policy.access, *access, "{name}");
+        }
+        for ep in ENDPOINTS {
+            assert!(table.iter().any(|(n, _)| *n == ep.name), "{} has no row in the table", ep.name);
+        }
+        assert_eq!(table.len(), ENDPOINTS.len());
     }
 }

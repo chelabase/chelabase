@@ -1099,6 +1099,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     async fn finish_reset_inner(&self, target: &Target, superseded: &NeonId) -> Result<(), String> {
+        if let Err(err) = self.forget_member_roles(target).await {
+            return self.fail_after_switch(target, err).await;
+        }
         if let Err(err) = self
             .recreate_compute_with(target.id, &target.ep, Catalog::Replaced)
             .await
@@ -1127,6 +1130,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Steps 6-7 of restore: the compute on the restored timeline.
     async fn finish_restore(&self, target: &Target) -> Result<(), String> {
+        if let Err(err) = self.forget_member_roles(target).await {
+            return self.fail_after_switch(target, err).await;
+        }
         if let Err(err) = self
             .recreate_compute_with(target.id, &target.ep, Catalog::Replaced)
             .await
@@ -1139,8 +1145,22 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.finish_ready(target).await
     }
 
-    /// resetting → ready, clearing any old error.
+    /// T8 C2: the new timeline's catalog has other member roles and passwords (a restore's
+    /// past ones, or the parent's), so the branch's member-role rows go before its compute
+    /// serves: the next act-as finds no row and reconciles, and every role gets a fresh
+    /// password. Idempotent.
+    async fn forget_member_roles(&self, target: &Target) -> Result<(), String> {
+        self.metadata
+            .delete_branch_member_roles(target.id.as_uuid())
+            .await
+            .map(drop)
+            .map_err(|e| format!("forgetting the member roles: {e}"))
+    }
+
+    /// resetting → ready, clearing any old error. The member roles are forgotten first (a run
+    /// resumed after the switch may not have), and reconciled once ready.
     async fn finish_ready(&self, target: &Target) -> Result<(), String> {
+        self.forget_member_roles(target).await?;
         self.metadata
             .set_branch_error(target.id, None)
             .await
@@ -1155,6 +1175,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return Ok(());
         }
         info!(branch_id = %target.id, "branch ready on its new timeline");
+        self.member_role_requests.request(target.id);
         Ok(())
     }
 
@@ -1482,6 +1503,44 @@ mod tests {
                 !fixes.iter().any(|f| matches!(f, KeyRoleFix::Follow { .. })),
                 "{flow:?}: never followed across a switch"
             );
+        }
+    }
+
+    // T8 C2: a reset or restore replaces the catalog, member roles and their passwords
+    // included. The branch's member-role rows go before the compute serves on the new timeline
+    // (so the next act-as reconciles and every role gets a fresh password), and a reconcile is
+    // asked for once the branch is ready.
+    #[tokio::test]
+    async fn a_switch_forgets_member_roles_and_asks_for_a_reconcile() {
+        for flow in [Flow::Reset, Flow::Restore] {
+            let (w, journal) = worker();
+            let s = setup(&w, &journal).await;
+            for (branch, name) in [(s.dev, "cb_m_dev"), (s.main, "cb_m_main")] {
+                w.metadata.state().member_roles.push(chelabase_metadata::members::MemberBranchRole {
+                    member_id: uuid::Uuid::new_v4(),
+                    branch_id: branch.as_uuid(),
+                    role_name: name.into(),
+                    password_enc: "sealed".into(),
+                    applied_roles: vec!["billing".into()],
+                });
+            }
+            claim(&w, s.dev);
+            let asked = w.member_role_requests.sent().len();
+
+            run(&w, flow, s.dev).await.unwrap();
+
+            assert_eq!(w.metadata.branch(s.dev).status, BranchStatus::Ready, "{flow:?}");
+            let rows = w.metadata.state().member_roles.clone();
+            assert_eq!(rows.len(), 1, "{flow:?}: only the other branch's row stays");
+            assert_eq!(rows[0].branch_id, s.main.as_uuid());
+            let sent = w.member_role_requests.sent();
+            assert_eq!(sent.len(), asked + 1, "{flow:?}");
+            assert_eq!(sent.last(), Some(&s.dev));
+            let order = [
+                pos(&journal, "metadata.delete_branch_member_roles"),
+                pos(&journal, &format!("compute.create {}", s.dev_ep)),
+            ];
+            assert!(order.is_sorted(), "{flow:?}: {:?}", entries(&journal));
         }
     }
 

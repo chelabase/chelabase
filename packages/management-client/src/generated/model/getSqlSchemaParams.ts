@@ -10,4 +10,9 @@ export type GetSqlSchemaParams = {
  * The Postgres database; the branch's main database when absent.
  */
 database?: string;
+/**
+ * The role to read as (what it may use), as a run with this `role` would; the owner when
+ * absent.
+ */
+role?: string;
 };

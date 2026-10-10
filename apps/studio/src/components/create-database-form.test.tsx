@@ -31,7 +31,7 @@ const accepted = () => jsonResponse({ job_id: "j", database_id: "d1", status: "p
 
 function setup(routes: Record<string, FakeHandler>) {
   const f = fakeFetch(routes);
-  const result = renderWithQuery(<CreateDatabaseForm tenantId="t1" projectId="p1" />, { fetch: f });
+  const result = renderWithQuery(<CreateDatabaseForm projectId="p1" />, { fetch: f });
   return { ...result, fetch: f };
 }
 const calls = (f: ReturnType<typeof fakeFetch>, key: string) =>
@@ -59,7 +59,7 @@ describe("CreateDatabaseForm", () => {
 
     expect(await screen.findByText("web1 is ready")).toBeInTheDocument();
     const [post] = calls(fetch, "POST /v1/databases");
-    expect(await post.json()).toEqual({ tenant_id: "t1", project_id: "p1", name: "web1" });
+    expect(await post.json()).toEqual({ project_id: "p1", name: "web1" });
     expect(calls(fetch, "GET /v1/databases/d1")).toHaveLength(2);
 
     // Settled: no more polling.

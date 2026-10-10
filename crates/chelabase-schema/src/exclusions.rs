@@ -40,6 +40,10 @@ pub const RESERVED_ROLE_PREFIX: &str = "pg_";
 /// reserves every `chelabase_…` name, so the merge never reads one (T14 M7).
 pub const CHELABASE_ROLE_PREFIX: &str = "chelabase_";
 
+/// The hidden per-member login roles (any case): never read as roles, and grants to them never
+/// appear in any ACL. Equals `chelabase_types::role_name::MEMBER_ROLE_PREFIX`.
+pub const MEMBER_ROLE_PREFIX: &str = "cb_m_";
+
 /// The owner role the data API's default privileges are written for (`FOR ROLE <owner>`):
 /// `plan::OWNER_ROLE`.
 pub const DATA_API_DEFAULT_ACL_ROLE: &str = "postgres";

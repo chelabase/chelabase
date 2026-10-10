@@ -10,6 +10,8 @@ export interface SqlToolbarProps {
   onDatabase: (name: string) => void;
   /** Role names offered after Owner. */
   roles: string[];
+  /** Whether Owner is offered (Admin only); default true. */
+  ownerAllowed?: boolean;
   role: string;
   onRole: (role: string) => void;
   timeoutMs: number;
@@ -21,7 +23,7 @@ export interface SqlToolbarProps {
   onRefreshSchema: () => void;
 }
 
-const field = "h-8 rounded-lg border border-input bg-background px-2 text-sm";
+const field = "h-8 border border-input bg-background px-2 text-sm";
 const TIMEOUT_LABEL: Record<number, string> = { 60_000: "60 s", 300_000: "5 min", 900_000: "15 min" };
 
 export function SqlToolbar(p: SqlToolbarProps) {
@@ -48,7 +50,7 @@ export function SqlToolbar(p: SqlToolbarProps) {
       <label className="flex flex-col gap-1">
         <span>Run as</span>
         <select value={p.role} onChange={(e) => p.onRole(e.target.value)} className={field}>
-          <option value="">Owner</option>
+          {p.ownerAllowed !== false && <option value="">Owner</option>}
           {p.roles.map((r) => (
             <option key={r} value={r}>
               {r}

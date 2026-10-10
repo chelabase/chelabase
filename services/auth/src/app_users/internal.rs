@@ -79,6 +79,22 @@ pub struct SyncRequest {
     pub origin_branch_id: Option<Uuid>,
 }
 
+/// An open invite as the accept page shows it (`GET /internal/invites/describe`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteDescription {
+    pub inviter_name: String,
+    pub inviter_email: Option<String>,
+    pub tenant_name: String,
+}
+
+/// The sign-up gate's answer (`GET /internal/signup/allowed`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SignUpAnswer {
+    pub allowed: bool,
+    /// `open`, `first_member`, `closed` or `platform`.
+    pub reason: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InternalError {
     /// The orchestrator answered with a 4xx; `code` is the envelope's error code.
@@ -123,12 +139,12 @@ impl InternalClient {
         let response = request
             .send()
             .await
-            .map_err(|e| InternalError::Unavailable(e.to_string()))?;
+            .map_err(|e| InternalError::Unavailable(e.without_url().to_string()))?;
         let status = response.status();
         let text = response
             .text()
             .await
-            .map_err(|e| InternalError::Unavailable(e.to_string()))?;
+            .map_err(|e| InternalError::Unavailable(e.without_url().to_string()))?;
         if status.is_server_error() {
             return Err(InternalError::Unavailable(status.to_string()));
         }
@@ -158,6 +174,38 @@ impl InternalClient {
         let (_, text) = self.call(method, path, body).await?;
         serde_json::from_str(&text)
             .map_err(|e| InternalError::Unavailable(format!("bad answer: {e}")))
+    }
+
+    /// Whether the tenant of this Zitadel org lets a visitor create an account.
+    pub async fn signup_allowed(&self, org_id: &str) -> Result<SignUpAnswer, InternalError> {
+        self.json(
+            Method::GET,
+            &format!("/internal/signup/allowed?org={}", percent_encode(org_id)),
+            None,
+        )
+        .await
+    }
+
+    /// The open invite of this Zitadel user whose token hashes to `token_hash` (hex SHA-256);
+    /// `None` for anything else (the orchestrator answers every mismatch the same 404).
+    pub async fn describe_invite(
+        &self,
+        user: &str,
+        token_hash: &str,
+    ) -> Result<Option<InviteDescription>, InternalError> {
+        // A POST body, not a query: the hash stays out of request logs and trace spans.
+        match self
+            .json(
+                Method::POST,
+                "/internal/invites/describe",
+                Some(serde_json::json!({ "user": user, "token_hash": token_hash })),
+            )
+            .await
+        {
+            Ok(found) => Ok(Some(found)),
+            Err(InternalError::Refused { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// `None` when the branch is unknown or its project has no app users.
@@ -239,6 +287,30 @@ impl InternalClient {
     }
 }
 
+/// Everything but RFC 3986 unreserved characters, as `%XX`.
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 fn v<T: Serialize>(body: &T) -> Value {
     serde_json::to_value(body).expect("request body serialises")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_encode;
+
+    #[test]
+    fn org_ids_are_percent_encoded() {
+        assert_eq!(percent_encode("2999"), "2999");
+        assert_eq!(percent_encode("a b&c=d/é"), "a%20b%26c%3Dd%2F%C3%A9");
+    }
 }

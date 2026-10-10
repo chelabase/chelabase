@@ -1,0 +1,76 @@
+---
+title: Members and invites
+description: Who can do what in a tenant, how people join (invites, open sign-up and approval), project grants and per-database overrides, and the access log.
+---
+
+A tenant is one team's workspace. Everyone in it is a **member**, and what a member can do is decided by two things: the tenant-admin flag, and **grants** on projects. Studio's **Members** page (last in the rail) shows and edits all of it; every action is also an API route, listed in [Access per route](/docs/reference/access).
+
+## Roles
+
+**Tenant admin** is a flag on a member. A tenant admin sees every project, creates projects, manages members and invites, and counts as **Admin with every Postgres role (the database owner included)** on every project. A tenant always keeps at least one active tenant admin: demoting or removing the last one is refused with 409 `last_tenant_admin`, and an admin can't remove themselves.
+
+A grant gives a member a **platform role** on one project:
+
+| Platform role | Can |
+|---|---|
+| Viewer | Read: projects, databases, branches, schemas, merges, the Tables console (select only), data keys' list. |
+| Developer | Everything a Viewer can, plus: create branches; change unprotected branches (reset, restore, delete, rename); run SQL as an allowed Postgres role; start and run schema merges (merges don't run as a Postgres role); create and block app users; save and run queries; create data keys bound to an allowed role. |
+| Admin | Everything on the project: protected branches, connection strings and passwords, login roles, the Data API settings, grants and invites, and acting as the database owner. |
+
+A grant also lists the **Postgres roles** the member may act as in the SQL editor and the console. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation). The rules, in short:
+
+- **Admin implies owner.** An Admin on a project can act as the database owner. Developers and Viewers can't, and `owner` is never listed in a grant: the Admin role includes it.
+- **A granted role includes its chain.** If you grant `billing_admin` and it can `SET ROLE billing`, the member may act as both. Studio shows the expanded set.
+- **Some roles are Admin-only**, whether you grant them, act as them or bind a data key to them: owner-level roles (superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`, or a path to `neon_superuser`), roles that can log in (`LOGIN`), reserved roles, and any role whose chain reaches one of those. A Developer can't be given such a role, and can't create a key for one. A role whose chain holds `ADMIN` on another role is refused at grant time (422), whatever the grant's level. Permissions go on `NOLOGIN` group roles, which is the Postgres convention.
+- **Saved queries are shared within the project.** Any Developer can read them; only the author or an Admin edits or deletes one.
+
+### Per-database overrides
+
+A project grant applies to every database in the project. An **override** narrows it for one Chelabase database. Overrides are per Chelabase database only, never per Postgres database inside it: to restrict within a database, use Postgres privileges. In Studio, a project's Access tab has **Per database**, where each line offers **Narrow** (and **Stop narrowing** once narrowed). `GET /v1/me` lists the narrowed databases per project (`projects[].databases`). The effective grant is the project grant intersected with the override: the platform role is the lower of the two and the role set is the overlap. An override can never widen access, even after the project grant changes later. Narrowing an Admin to Developer takes the owner away in that database.
+
+### What a member without a grant sees
+
+A member with no grants anywhere gets 403 `no_access_yet` on project routes, and Studio shows "You don't have access to a project yet" in place of the projects. A member with a grant on some project gets 404 `not_found` for projects they have no grant on, so a project's existence isn't revealed. A removed member is refused at once, even with a still-valid token.
+
+## How people join
+
+Self-hosted mode has three ways in. Platform mode has no self-sign-up yet: see [Self-hosted vs platform](/docs/using/self-hosted-vs-platform).
+
+### Invites
+
+A tenant admin invites from Members › People (`POST /v1/invites`, with the grants to start from); a project Admin invites from the project's Access tab with **Add people** (`POST /v1/projects/{id}/invites`, one grant). The grants are stored up front and count once the invitee accepts.
+
+- **By email.** Zitadel mails a one-time link to Studio's `/accept-invite`. The page names the inviter and the tenant (by its display name, falling back to its slug), and the invitee sets their own password.
+- **By link, without SMTP.** When Zitadel has no active email provider (`GET /v1/invites/delivery` says), pick **One-time link** under "How they get the invite" (`delivery: "link"`). The response carries `invite_url` **once**; hand it over yourself. It is never stored or logged, and the response is `Cache-Control: no-store`. A resend with `delivery: "link"` replaces the earlier link. A link invite is refused (409) for a person who already has a way to sign in; invite them by email instead.
+- **Someone who is already in the organization** is added as an active member at once, with no mail. An existing member just gets the grants.
+- **Describe.** The `/accept-invite` page asks `POST /auth/v1/invite` with the `user` and `t` (token) from the link for the inviter and the tenant's name. It answers only for an open, unexpired invite whose token matches; anything else is the same 404 `not_found`.
+- **An invited member is activated only by an open, unexpired invite.**
+- **Resend** (in Studio, **New invite link** for a link invite) makes a new code and a new token, and the old link stops working; **revoke** invalidates the open invite and removes the never-activated user. An expired or revoked link answers 410 `invite_expired` or `invite_revoked`. If a step after the code check fails, 503 `invite_incomplete` carries an `accept_ticket` so the page can retry without the spent code.
+- **Re-inviting** a person who was removed or deactivated brings them back as `invited` with a fresh code, never straight to active. Zitadel makes no invite code for someone who already has a password (or another way to sign in), so they get Zitadel's password-reset email instead, with the same `/accept-invite` link (marked `reset=1`); setting the password with that code accepts the invite. Their old password signs nobody in meanwhile: the account stays deactivated until they accept. Any inviter may do it, and the access log records who.
+- **An inviter with no name** (a machine user, like the dev bootstrap's demo user) is shown by their email, or as "An admin" without one.
+
+### Open sign-up
+
+Off by default. A tenant admin turns it on on the Members page's Instance tab (`PATCH /v1/instance/settings` with `open_signup`). While it is on, the sign-in page offers **Create account**, and a person who signs up becomes a **pending** member: they can do nothing and see "Waiting for approval". `GET /v1/me` still answers 200 for them, with `member.status: "pending"`; every other route answers 403 `pending_approval`.
+
+### Approval
+
+Pending sign-ups appear under Members › People › **Requests**, with a badge on Members. A tenant admin **approves** one with its first project access (`POST /v1/members/{id}/approve`) or **declines** it (`POST /v1/members/{id}/decline`: removed, their Zitadel user deactivated). Both are logged. With open sign-up off, a sign-up is refused with 403 `sign_up_closed`.
+
+Zitadel's own registration page is turned off (`allowRegister: false`), so these routes are the only way in.
+
+<Callout type="warn">
+**The fresh-install window.** While a tenant has no member at all, sign-up is open, and the first person to sign in claims the tenant admin. Set the bootstrap admin before you expose Studio to anyone: run `just zitadel-bootstrap you@example.com` (positional; without an address the admin is `zitadel-admin@zitadel.localhost`) first, and the window never opens. The window exists until the first `just zitadel-bootstrap`. If two people race for it, only one claims the admin and the other is admitted as `pending`. Also, `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential on self-hosted dev: keep it private.
+</Callout>
+
+### Removing a member
+
+Removing a member (`DELETE /v1/members/{id}`) deletes their grants and overrides, drops their Postgres roles on every branch of their projects, deactivates their Zitadel user and ends their sessions. Anything they created in a run and left behind goes to the role they last acted as; if that is gone, it is dropped. It never goes to the owner.
+
+## The tenant's name
+
+An admin gives the tenant a display name on the Members page (**Tenant name**, then **Rename**; `PATCH /v1/tenant`, up to 80 characters; empty clears it). The invite page and `GET /v1/me` use it and fall back to the slug.
+
+## The access log
+
+Every access change writes one append-only event in the same transaction: invites, accepts, grants, overrides, admin changes, approvals, removals, open sign-up switches and bootstrap. Tenant admins read the whole log in Members › **Activity** (`GET /v1/access-events`, which answers `{events, next_before}`); a project Admin reads that project's events under Access › **Access changes** (`GET /v1/projects/{id}/access-events`). Events name the actor and the person they touched, and keep the before and after of the change, never secrets.

@@ -29,7 +29,6 @@ pub const APPLICATION_NAME: &str = "chelabase-sql-editor";
 pub const PGLS_VERSION: &str = "0.26.0";
 pub const MAX_SCHEMA_BYTES: usize = 8 * 1_048_576;
 pub use chelabase_metadata::SAVED_QUERY_CAP;
-pub const DATA_ROLE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Why a script can't be run or saved, or `None`: 1 byte to 1 MiB, and no NUL byte (the
 /// wire protocol can't carry one).
@@ -44,27 +43,15 @@ pub(crate) fn invalid_sql(sql: &str) -> Option<&'static str> {
 }
 
 /// The editor's state on `AppState`.
+#[derive(Default)]
 pub struct SqlEditor {
     pub(crate) runs: registry::RunRegistry,
-    pub(crate) granted: moka::sync::Cache<(chelabase_types::BranchId, String), ()>,
 }
 
 impl SqlEditor {
     /// The runs in flight. Public for the integration tests, which hold slots directly.
     pub fn runs(&self) -> &registry::RunRegistry {
         &self.runs
-    }
-}
-
-impl Default for SqlEditor {
-    fn default() -> Self {
-        Self {
-            runs: registry::RunRegistry::default(),
-            granted: moka::sync::Cache::builder()
-                .max_capacity(10_000)
-                .time_to_live(DATA_ROLE_GRANT_TTL)
-                .build(),
-        }
     }
 }
 

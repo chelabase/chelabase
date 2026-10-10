@@ -16,7 +16,7 @@ use chelabase_metadata::{
     DataApiState, EnableStart, ServedDatabase,
     BeginEnable, BeginProjectDelete, NewAppSession, NewProjectAuth, OnDelete, ProjectStatus, RefreshNext,
     RefreshOutcome, RenameProject, AppUsersStatus,
-    SAVED_QUERY_CAP, SavedQuery, SavedQueryPatch, SavedQueryWrite,
+    SAVED_QUERY_CAP, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQueryWrite,
     BaseSource, BranchBusy, MergeCreate, MergeDirection, MergeDraftPatch, MergeEvent, MergeState, MergeStatus, MergeStatusPatch,
     MergeWrite, NewMerge, NewStaticEndpoint, SchemaBase,
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
@@ -2810,6 +2810,7 @@ fn upsert(name: &str, origin: RoleOrigin, verifier: &str) -> CopyUpsert {
         pending: false,
         attributes: RoleAttributes::default(),
         api_owner_level: None,
+        no_password: false,
     }
 }
 
@@ -3055,6 +3056,8 @@ async fn api_role_attributes_insert_and_update() {
         valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
         bypass_rls: true,
         member_of: vec![],
+        member_no_set: vec![],
+        member_admin: vec![],
     };
     let role = NewApiRole {
         name: "readers",
@@ -3068,7 +3071,13 @@ async fn api_role_attributes_insert_and_update() {
     let inserted = client.insert_api_role_with(&ep, &role, 10).await.unwrap();
     let rows = client.list_roles(&ep).await.unwrap();
     let (_, before) = client.role_copies(&ep).await.unwrap();
-    let member = RoleAttributes { member_of: vec!["readers".into()], ..RoleAttributes::default() };
+    // I2: the options of a membership are stored with it.
+    let member = RoleAttributes {
+        member_of: vec!["readers".into()],
+        member_no_set: vec!["readers".into()],
+        member_admin: vec!["readers".into()],
+        ..RoleAttributes::default()
+    };
     let change = ApiRoleChange {
         owner_level: false,
         login: true,
@@ -3341,6 +3350,8 @@ async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
         valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
         bypass_rls: true,
         member_of: vec!["grp".into()],
+        member_no_set: vec!["grp".into()],
+        member_admin: vec![],
     };
     row.attributes = wanted.clone();
     let write = ResyncWrite {
@@ -3359,6 +3370,44 @@ async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
     assert!(!app.login, "the forwarded login is kept");
     assert_eq!(app.password_enc, None, "the forwarded sealed password is kept");
     assert_eq!(app.attributes, wanted, "inherit, connection_limit, valid_until, bypass_rls and member_of follow the catalog");
+}
+
+/// A group role with no password is listed with password `none`, an MD5 one as unusable, and
+/// a forwarded verifier later turns the no-password row back into a plain one.
+#[tokio::test]
+#[ignore]
+async fn resync_lists_roles_without_a_password() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let mut group = upsert("billing", RoleOrigin::Sql, "x");
+    group.verifier = None;
+    group.password_enc = SealedChange::Clear;
+    group.login = false;
+    group.no_password = true;
+    let mut md5 = upsert("legacy", RoleOrigin::Sql, "x");
+    md5.verifier = None;
+    let write = ResyncWrite { upserts: vec![group, md5], removals: vec![], databases: vec![observed("db", "postgres", false)] };
+    client.apply_resync(&ep, branch, v, &write).await.unwrap();
+    let listed = client.list_roles(&ep).await.unwrap();
+    let state = |n: &str| listed.iter().find(|r| r.name == n).map(|r| (r.password, r.login));
+    let billing = state("billing");
+    let legacy = state("legacy");
+    // A password set later in SQL: the row is a plain one again.
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    let mut with_password = upsert("billing", RoleOrigin::Sql, "SCRAM-SHA-256$set");
+    with_password.login = false;
+    client
+        .apply_resync(&ep, branch, v, &ResyncWrite { upserts: vec![with_password], removals: vec![], databases: vec![observed("db", "postgres", false)] })
+        .await
+        .unwrap();
+    let after = client.list_roles(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(billing, Some((PasswordState::None, false)));
+    assert_eq!(legacy, Some((PasswordState::Md5Unusable, true)));
+    assert_eq!(after.iter().find(|r| r.name == "billing").map(|r| r.password), Some(PasswordState::SetInSql));
 }
 
 #[tokio::test]
@@ -3814,6 +3863,8 @@ async fn branch_copy_writes_role_copies_and_main_database() {
         valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
         bypass_rls: true,
         member_of: vec!["readers".into()],
+        member_no_set: vec![],
+        member_admin: vec!["readers".into()],
     };
     let copies = [
         NewRoleCopy { name: "reader", origin: RoleOrigin::Api, verifier: Some("SCRAM-SHA-256$r"), password_enc: Some("v1:reader"), login: true, level: RoleLevel::Plain, api_owner_level: false, pending: true, attributes: &plain },
@@ -5436,7 +5487,7 @@ fn saved(write: SavedQueryWrite) -> SavedQuery {
 
 async fn create_saved(client: &MetadataClient, db: DatabaseId, user: &str, name: &str) -> SavedQueryWrite {
     client
-        .create_saved_query(db.as_uuid(), user, uuid::Uuid::new_v4(), name, "select 1", None, None)
+        .create_saved_query(db.as_uuid(), user, None, uuid::Uuid::new_v4(), name, "select 1", None, None)
         .await
         .unwrap()
 }
@@ -5448,28 +5499,46 @@ async fn saved_query_round_trip() {
     let db = insert_pending(&client).await;
     let d = db.as_uuid();
     let id = uuid::Uuid::new_v4();
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let author = client
+        .ensure_member(TenantId(DEMO_TENANT_ID), &format!("saved-{tag}"), &format!("saved-{tag}@example.test"), "Author", chelabase_metadata::members::Admission::Active)
+        .await
+        .unwrap()
+        .id;
     let created = saved(
-        client.create_saved_query(d, "u1", id, "Beta", "select 2", Some("app"), Some("anon")).await.unwrap(),
+        client.create_saved_query(d, "u1", Some(author), id, "Beta", "select 2", Some("app"), Some("anon")).await.unwrap(),
     );
     saved(create_saved(&client, db, "u1", "alpha").await);
     assert_eq!((created.version, created.pg_database.as_deref(), created.role.as_deref()), (1, Some("app"), Some("anon")));
 
-    let list = client.list_saved_queries(d, "u1").await.unwrap();
+    let list = client.list_saved_queries(d).await.unwrap();
     assert_eq!(list.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(), ["alpha", "Beta"]);
-    assert_eq!(client.get_saved_query(d, "u1", id).await.unwrap(), Some(created.clone()));
-    assert_eq!(client.get_saved_query(d, "u2", id).await.unwrap(), None);
-    assert!(client.list_saved_queries(d, "u2").await.unwrap().is_empty());
+    assert_eq!(created.author_member_id, Some(author));
+    // Shared in the project: not tied to the user who saved it.
+    assert_eq!(client.get_saved_query(d, id).await.unwrap(), Some(created.clone()));
+    assert_eq!(client.get_saved_query(d, uuid::Uuid::new_v4()).await.unwrap(), None);
 
     // null clears a hint, an absent field stays.
     let patch = SavedQueryPatch { sql: Some("select 3".into()), role: Some(None), ..Default::default() };
-    let updated = saved(client.update_saved_query(d, "u1", id, 1, &patch).await.unwrap());
+    // Not the author's: another member can't change it; an Admin can; a row without an author
+    // is Admin-only.
+    let stranger = SavedQueryEditor::Author(uuid::Uuid::new_v4());
+    assert_eq!(client.update_saved_query(d, stranger, id, 1, &patch).await.unwrap(), SavedQueryWrite::NotFound);
+    let no_author = saved(create_saved(&client, db, "u1", "orphan").await);
+    assert_eq!(
+        client.update_saved_query(d, SavedQueryEditor::Author(author), no_author.id, 1, &patch).await.unwrap(),
+        SavedQueryWrite::NotFound
+    );
+    assert!(!client.delete_saved_query(d, SavedQueryEditor::Author(author), no_author.id).await.unwrap());
+    assert!(client.delete_saved_query(d, SavedQueryEditor::Admin, no_author.id).await.unwrap());
+    let updated = saved(client.update_saved_query(d, SavedQueryEditor::Author(author), id, 1, &patch).await.unwrap());
     assert_eq!((updated.version, updated.sql.as_str(), updated.role.clone()), (2, "select 3", None));
     assert_eq!((updated.pg_database.as_deref(), updated.name.as_str()), (Some("app"), "Beta"));
     assert!(updated.updated_at >= created.updated_at);
 
-    assert!(!client.delete_saved_query(d, "u2", id).await.unwrap());
-    assert!(client.delete_saved_query(d, "u1", id).await.unwrap());
-    assert!(!client.delete_saved_query(d, "u1", id).await.unwrap());
+    assert!(!client.delete_saved_query(d, stranger, id).await.unwrap());
+    assert!(client.delete_saved_query(d, SavedQueryEditor::Author(author), id).await.unwrap());
+    assert!(!client.delete_saved_query(d, SavedQueryEditor::Admin, id).await.unwrap());
     cleanup(&client, db).await;
 }
 
@@ -5483,7 +5552,7 @@ async fn saved_query_names_are_unique_per_user_case_insensitive() {
     saved(create_saved(&client, db, "u2", "report").await);
     let other = saved(create_saved(&client, db, "u1", "other").await);
     let patch = SavedQueryPatch { name: Some("rePort".into()), ..Default::default() };
-    let renamed = client.update_saved_query(db.as_uuid(), "u1", other.id, 1, &patch).await.unwrap();
+    let renamed = client.update_saved_query(db.as_uuid(), SavedQueryEditor::Admin, other.id, 1, &patch).await.unwrap();
     assert_eq!(renamed, SavedQueryWrite::NameTaken);
     cleanup(&client, db).await;
 }
@@ -5496,12 +5565,12 @@ async fn saved_query_update_detects_stale_versions() {
     let d = db.as_uuid();
     let q = saved(create_saved(&client, db, "u1", "q").await);
     let patch = SavedQueryPatch { sql: Some("select 2".into()), ..Default::default() };
-    let first = saved(client.update_saved_query(d, "u1", q.id, 1, &patch).await.unwrap());
-    let again = client.update_saved_query(d, "u1", q.id, 1, &patch).await.unwrap();
+    let first = saved(client.update_saved_query(d, SavedQueryEditor::Admin, q.id, 1, &patch).await.unwrap());
+    let again = client.update_saved_query(d, SavedQueryEditor::Admin, q.id, 1, &patch).await.unwrap();
     assert_eq!(again, SavedQueryWrite::Stale(first));
-    let missing = client.update_saved_query(d, "u1", uuid::Uuid::new_v4(), 1, &patch).await.unwrap();
+    let missing = client.update_saved_query(d, SavedQueryEditor::Admin, uuid::Uuid::new_v4(), 1, &patch).await.unwrap();
     assert_eq!(missing, SavedQueryWrite::NotFound);
-    let foreign = client.update_saved_query(d, "u2", q.id, 2, &patch).await.unwrap();
+    let foreign = client.update_saved_query(d, SavedQueryEditor::Author(uuid::Uuid::new_v4()), q.id, 2, &patch).await.unwrap();
     assert_eq!(foreign, SavedQueryWrite::NotFound);
     cleanup(&client, db).await;
 }

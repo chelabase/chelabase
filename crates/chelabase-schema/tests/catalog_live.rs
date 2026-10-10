@@ -727,6 +727,56 @@ async fn chelabase_roles_are_never_read() {
     assert!(names.contains(&kept.as_str()), "{names:?}");
 }
 
+/// Members and roles T2: a hidden `cb_m_*` member role, its membership and its table grant
+/// are invisible to the catalog read (no role, no ACL entry, no `member_of`).
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn member_roles_and_their_grants_are_invisible() {
+    let s = Scratch::new().await;
+    let lower = format!("cb_m_test_{}", s.name);
+    let upper = format!("CB_M_TEST_{}", s.name);
+    let probe = format!("chelabase_probe_{}", s.name);
+    let hidden = [lower.clone(), upper.clone(), probe.clone()];
+    let group = s.role("group");
+    let mut sql = format!(
+        "CREATE ROLE \"{group}\" NOLOGIN;
+         CREATE ROLE \"{lower}\" LOGIN NOINHERIT; CREATE ROLE \"{upper}\" LOGIN NOINHERIT;
+         CREATE ROLE \"{probe}\" NOLOGIN;
+         GRANT \"{group}\" TO \"{lower}\" WITH INHERIT FALSE, SET TRUE, ADMIN FALSE;
+         CREATE TABLE public.member_probe (id int, note text);
+         CREATE SEQUENCE public.member_seq;
+         CREATE TABLE public.member_ident (id int GENERATED ALWAYS AS IDENTITY);
+         GRANT \"{probe}\" TO \"{group}\";"
+    );
+    for role in &hidden {
+        sql.push_str(&format!(
+            "GRANT SELECT ON public.member_probe TO \"{role}\";
+             GRANT SELECT (note) ON public.member_probe TO \"{role}\";
+             GRANT USAGE ON SEQUENCE public.member_seq TO \"{role}\";
+             GRANT USAGE ON SEQUENCE public.member_ident_id_seq TO \"{role}\";
+             GRANT USAGE ON SCHEMA public TO \"{role}\";
+             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO \"{role}\";
+             ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO \"{role}\";"
+        ));
+    }
+    s.sql(&sql).await;
+    let m = s.model().await;
+    s.finish().await;
+    let meta = connect(&url()).await;
+    for role in &hidden {
+        // Best effort: the default privileges name the role until the database is gone.
+        let _ = meta
+            .batch_execute(&format!("DROP ROLE IF EXISTS \"{role}\""))
+            .await;
+    }
+    let names: Vec<&str> = m.roles.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&group.as_str()), "{names:?}");
+    let dump = format!("{m:?}");
+    for role in &hidden {
+        assert!(!dump.contains(role.as_str()), "{role} leaked: {dump}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs the metadata Postgres (just deps-up)"]
 async fn merge_leftovers_are_reported() {

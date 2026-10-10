@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! A stateful stand-in for Zitadel v4's Session, User and OIDC v2 REST APIs.
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -26,6 +26,8 @@ pub struct User {
     pub locked: bool,
     pub org_id: String,
     pub username: String,
+    /// `human.profile.displayName`; empty when unset.
+    pub display_name: String,
     pub inactive: bool,
     pub created_at: String,
 }
@@ -49,6 +51,34 @@ pub struct Inner {
     pub allow_duplicate_emails: bool,
     /// Every `DELETE /v2/sessions/{id}` waits this long first (a slow Zitadel).
     pub session_delete_delay: std::time::Duration,
+    /// Pending invite codes: user id -> (code, expired).
+    pub invites: HashMap<String, (String, bool)>,
+    /// The URL template and application name of each user's last invite mail.
+    pub invite_mails: HashMap<String, (String, String)>,
+    /// Users in Zitadel's Initial state (`USER_STATE_INITIAL`).
+    pub initial_users: Vec<String>,
+    /// At most this many sessions per `sessions/search` page (0: no limit).
+    pub session_page: usize,
+    /// Forced answers: a request whose `"METHOD path"` contains the pattern gets this error
+    /// (`status`, Zitadel error key) while `remaining` is above zero.
+    pub faults: Vec<Fault>,
+    /// The login client's token is refused on the calls it can't make in a real instance:
+    /// invite verification, user update, and a password set with neither code nor current password.
+    pub strict_login: bool,
+    /// The email providers `POST /admin/v1/email/_search` lists: (id, active).
+    pub email_providers: Vec<(String, bool)>,
+    /// Authentication methods besides a password, by user (`AUTHENTICATION_METHOD_TYPE_*`).
+    pub auth_methods: HashMap<String, Vec<String>>,
+    /// The URL template of each user's last password-reset mail (`sendLink`).
+    pub reset_mails: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Fault {
+    pub pattern: String,
+    pub status: u16,
+    pub key: String,
+    pub remaining: u32,
 }
 
 #[derive(Clone)]
@@ -65,6 +95,24 @@ fn err(status: StatusCode, message: &str) -> Reply {
     (
         status,
         Json(json!({"code": status.as_u16(), "message": message})),
+    )
+}
+
+/// Zitadel v4's error shape: a gRPC `code`, a localized `message` ending in the error id, and
+/// `details[]` carrying the id and the message key.
+fn zerr(status: StatusCode, key: &str) -> Reply {
+    let id = "COMMAND-Dg2z3";
+    (
+        status,
+        Json(json!({
+            "code": 9,
+            "message": format!("Der Fehler ist aufgetreten ({id})"),
+            "details": [{
+                "@type": "type.googleapis.com/zitadel.v1.ErrorDetail",
+                "id": id,
+                "message": key,
+            }],
+        })),
     )
 }
 
@@ -87,14 +135,19 @@ impl MockZitadel {
                 "/v2/users/{id}",
                 get(get_user).delete(delete_user).patch(update_user),
             )
+            .route("/v2/users/{id}/authentication_methods", get(authentication_methods))
             .route("/v2/users/{id}/deactivate", post(deactivate))
             .route("/v2/users/{id}/reactivate", post(reactivate))
             .route("/v2/users/{id}/email", post(set_email))
             .route("/v2/users/{id}/email/verify", post(verify_email))
             .route("/v2/users/{id}/email/resend", post(resend))
+            .route("/v2/users/{id}/invite_code", post(create_invite_code))
+            .route("/admin/v1/email/_search", post(search_email_providers))
+            .route("/v2/users/{id}/invite_code/verify", post(verify_invite_code))
             .route("/v2/users/{id}/password_reset", post(password_reset))
             .route("/v2/users/{id}/password", post(set_password))
             .route("/v2/sessions", post(create_session))
+            .route("/v2/sessions/search", post(search_sessions))
             .route("/v2/sessions/{id}", delete(delete_session))
             .layer(middleware::from_fn_with_state(inner.clone(), journal))
             .with_state(inner.clone());
@@ -126,10 +179,80 @@ impl MockZitadel {
             locked: false,
             org_id: org.into(),
             username: email.into(),
+            display_name: String::new(),
             inactive: false,
             created_at: NOW.into(),
         });
         id
+    }
+    /// Sets a user's `human.profile.displayName`.
+    pub fn set_display_name(&self, user_id: &str, name: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(u) = inner.users.iter_mut().find(|u| u.id == user_id) {
+            u.display_name = name.into();
+        }
+    }
+    /// The next `times` requests whose `"METHOD path"` contains `pattern` fail with this error.
+    pub fn fail(&self, pattern: &str, status: u16, key: &str, times: u32) {
+        self.inner.lock().unwrap().faults.push(Fault {
+            pattern: pattern.into(),
+            status,
+            key: key.into(),
+            remaining: times,
+        });
+    }
+    /// Refuse the login client's token on admin-only calls (see `Inner::strict_login`).
+    pub fn set_strict_login(&self, on: bool) {
+        self.inner.lock().unwrap().strict_login = on;
+    }
+    /// A passwordless, unverified user with a pending invite code: `(user id, code)`.
+    pub fn add_invited_user(&self, email: &str) -> (String, String) {
+        let id = self.add_user_in("o1", email, "", false);
+        let mut inner = self.inner.lock().unwrap();
+        let code = format!("INV{}", inner.next);
+        inner.invites.insert(id.clone(), (code.clone(), false));
+        (id, code)
+    }
+    /// Puts the user in Zitadel's Initial state.
+    pub fn set_initial(&self, user_id: &str) {
+        self.inner.lock().unwrap().initial_users.push(user_id.into());
+    }
+    /// Pages `sessions/search` answers at `n` sessions.
+    pub fn set_session_page(&self, n: usize) {
+        self.inner.lock().unwrap().session_page = n;
+    }
+    /// Sets the email providers `POST /admin/v1/email/_search` lists, as (id, active).
+    pub fn set_email_providers(&self, providers: &[(&str, bool)]) {
+        self.inner.lock().unwrap().email_providers =
+            providers.iter().map(|(id, active)| (id.to_string(), *active)).collect();
+    }
+    /// The user's pending invite code, if any.
+    pub fn invite_code(&self, user_id: &str) -> Option<String> {
+        self.inner.lock().unwrap().invites.get(user_id).map(|(c, _)| c.clone())
+    }
+    /// The URL template of the user's last invite mail.
+    pub fn invite_template(&self, user_id: &str) -> Option<String> {
+        self.inner.lock().unwrap().invite_mails.get(user_id).map(|(t, _)| t.clone())
+    }
+    /// The URL template of the user's last password-reset mail.
+    pub fn reset_template(&self, user_id: &str) -> Option<String> {
+        self.inner.lock().unwrap().reset_mails.get(user_id).cloned()
+    }
+    /// The application name of the user's last invite mail.
+    pub fn invite_application(&self, user_id: &str) -> Option<String> {
+        self.inner.lock().unwrap().invite_mails.get(user_id).map(|(_, a)| a.clone())
+    }
+    /// The invite's code is now past its lifetime.
+    pub fn expire_invite(&self, user_id: &str) {
+        if let Some(i) = self.inner.lock().unwrap().invites.get_mut(user_id) {
+            i.1 = true;
+        }
+    }
+    /// Deletes a user without a request (as revoking an invite does).
+    pub fn remove_user(&self, user_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.users.retain(|u| u.id != user_id);
+        inner.invites.remove(user_id);
     }
     /// Registers an organization without any request (the default `o1` exists from the start).
     pub fn add_org(&self, id: &str) {
@@ -160,6 +283,22 @@ impl MockZitadel {
             .filter(|u| u.id == user_id)
             .for_each(|u| u.locked = true);
     }
+    /// Gives a user an authentication method (`AUTHENTICATION_METHOD_TYPE_PASSKEY`, `_TOTP`, ...).
+    pub fn add_auth_method(&self, user_id: &str, method: &str) {
+        self.inner.lock().unwrap().auth_methods.entry(user_id.into()).or_default().push(method.into());
+    }
+    /// Deactivates or reactivates a user without a request.
+    pub fn set_inactive(&self, user_id: &str, inactive: bool) {
+        for u in self.inner.lock().unwrap().users.iter_mut().filter(|u| u.id == user_id) {
+            u.inactive = inactive;
+        }
+    }
+    /// Gives a user a password without a request (as setting one outside an invite would).
+    pub fn set_password(&self, user_id: &str, password: &str) {
+        for u in self.inner.lock().unwrap().users.iter_mut().filter(|u| u.id == user_id) {
+            u.password = password.into();
+        }
+    }
     pub fn add_auth_request(&self, sign_up: bool) -> String {
         let mut inner = self.inner.lock().unwrap();
         let id = Self::id(&mut inner, "V2_");
@@ -168,6 +307,11 @@ impl MockZitadel {
     }
     pub fn emails(&self) -> Vec<(String, String)> {
         self.inner.lock().unwrap().emails.clone()
+    }
+    /// Hides an existing user from session creation for this many attempts (Zitadel's
+    /// projections catching up after a write).
+    pub fn hide_user(&self, user_id: &str, attempts: u32) {
+        self.inner.lock().unwrap().hidden.insert(user_id.into(), attempts);
     }
     pub fn set_new_user_lag(&self, attempts: u32) {
         self.inner.lock().unwrap().new_user_lag = attempts;
@@ -209,11 +353,31 @@ const NOW: &str = "2026-10-03T10:00:00Z";
 type S = State<Arc<Mutex<Inner>>>;
 
 async fn journal(State(s): S, req: Request, next: Next) -> Response {
-    s.lock()
-        .unwrap()
-        .calls
-        .push(format!("{} {}", req.method(), req.uri().path()));
-    next.run(req).await
+    use axum::response::IntoResponse;
+    let call = format!("{} {}", req.method(), req.uri().path());
+    let forced = {
+        let mut inner = s.lock().unwrap();
+        inner.calls.push(call.clone());
+        let strict_denied = inner.strict_login
+            && !is_admin(req.headers())
+            && (call.ends_with("/invite_code/verify") || call.starts_with("PATCH /v2/users/"));
+        if strict_denied {
+            Some(zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied"))
+        } else {
+            inner
+                .faults
+                .iter_mut()
+                .find(|f| f.remaining > 0 && call.contains(&f.pattern))
+                .map(|f| {
+                    f.remaining -= 1;
+                    zerr(StatusCode::from_u16(f.status).unwrap(), &f.key)
+                })
+        }
+    };
+    match forced {
+        Some(reply) => reply.into_response(),
+        None => next.run(req).await,
+    }
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -282,15 +446,23 @@ async fn create_callback(
     ok(json!({"callbackUrl": format!("http://localhost:3000/callback?code=code-{id}&state=s")}))
 }
 
-fn user_json(u: &User) -> Value {
-    json!({"userId": u.id, "state": state_name(u),
+/// A user as Zitadel v4.19.1 answers it; `human.passwordChanged` only once a password is set.
+fn user_json(u: &User, inner: &Inner) -> Value {
+    let mut v = json!({"userId": u.id, "state": state_name(u, inner),
         "details": {"resourceOwner": u.org_id, "creationDate": u.created_at},
         "username": u.username,
-        "human": {"email": {"email": u.email, "isVerified": u.verified}}})
+        "human": {"email": {"email": u.email, "isVerified": u.verified},
+                  "profile": {"displayName": u.display_name}}});
+    if !u.password.is_empty() {
+        v["human"]["passwordChanged"] = json!(NOW);
+    }
+    v
 }
 
-fn state_name(u: &User) -> &'static str {
-    if u.locked {
+fn state_name(u: &User, inner: &Inner) -> &'static str {
+    if inner.initial_users.contains(&u.id) {
+        "USER_STATE_INITIAL"
+    } else if u.locked {
         "USER_STATE_LOCKED"
     } else if u.inactive {
         "USER_STATE_INACTIVE"
@@ -344,7 +516,7 @@ async fn list_users(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -> Re
         .iter()
         .skip(offset)
         .take(limit)
-        .map(|u| user_json(u))
+        .map(|u| user_json(u, &inner))
         .collect();
     ok(json!({"details": {"totalResult": matching.len().to_string()}, "result": result}))
 }
@@ -355,9 +527,43 @@ async fn get_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Re
         return e;
     }
     match inner.users.iter().find(|u| u.id == id) {
-        Some(u) => ok(json!({"user": user_json(u)})),
+        Some(u) => ok(json!({"user": user_json(u, &inner)})),
         None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
     }
+}
+
+/// `GET /v2/users/{id}/authentication_methods` (Zitadel v4.19.1 ListAuthenticationMethodTypes):
+/// `authMethodTypes`, the password (when the user has one) and any other method. As the real
+/// one, a `domainQuery` (any `domainQuery.*` parameter) needs a `domainQuery.domain` of 1 to 200
+/// characters; without one every method counts, whatever its domain.
+async fn authentication_methods(
+    State(s): S,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Reply {
+    let inner = s.lock().unwrap();
+    if let Some(e) = guard(&headers, &inner) {
+        return e;
+    }
+    let domain = query.get("domainQuery.domain").map(|d| d.chars().count()).unwrap_or(0);
+    if query.keys().any(|k| k.starts_with("domainQuery.")) && !(1..=200).contains(&domain) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid ListAuthenticationMethodTypesRequest.DomainQuery: embedded message failed \
+             validation | caused by: invalid DomainQuery.Domain: value length must be between 1 \
+             and 200 runes, inclusive",
+        );
+    }
+    let Some(u) = inner.users.iter().find(|u| u.id == id) else {
+        return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
+    };
+    let mut types: Vec<String> = Vec::new();
+    if !u.password.is_empty() {
+        types.push("AUTHENTICATION_METHOD_TYPE_PASSWORD".into());
+    }
+    types.extend(inner.auth_methods.get(&id).cloned().unwrap_or_default());
+    ok(json!({"details": {"totalResult": types.len().to_string()}, "authMethodTypes": types}))
 }
 
 async fn delete_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
@@ -567,6 +773,11 @@ async fn create_user(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -> R
         .pointer("/human/email/isVerified")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let display_name = b
+        .pointer("/human/profile/displayName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let id = match wanted_id {
         Some(id) => id,
         None => MockZitadel::id(&mut inner, "3000"),
@@ -584,6 +795,7 @@ async fn create_user(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -> R
         locked: false,
         org_id,
         username,
+        display_name,
         inactive: false,
         created_at: NOW.into(),
     });
@@ -667,6 +879,123 @@ async fn verify_email(
     ok(json!({}))
 }
 
+/// `POST /v2/users/{id}/invite_code` (Zitadel v4.19.1 CreateInviteCode): a fresh code replaces
+/// any pending one. `sendCode` mails it (journaled as an `invite` email with its template and
+/// application name); `returnCode` returns it as `inviteCode`. As the real one, a user who
+/// already has a way to sign in (a password, or another method) gets none: 400 "User is already
+/// initialized".
+async fn create_invite_code(
+    State(s): S,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<Value>,
+) -> Reply {
+    let mut inner = s.lock().unwrap();
+    if let Some(e) = guard(&headers, &inner) {
+        return e;
+    }
+    let Some(user) = inner.users.iter().find(|u| u.id == id) else {
+        return zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound");
+    };
+    if !user.password.is_empty() || inner.auth_methods.get(&id).is_some_and(|m| !m.is_empty()) {
+        return zerr(StatusCode::BAD_REQUEST, "Errors.User.AlreadyInitialised");
+    }
+    inner.next += 1;
+    let code = format!("INV{}", inner.next);
+    inner.invites.insert(id.clone(), (code.clone(), false));
+    if b.get("returnCode").is_some() {
+        return ok(json!({"details": {}, "inviteCode": code}));
+    }
+    let text = |key: &str| {
+        b.pointer(&format!("/sendCode/{key}"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mail = (text("urlTemplate"), text("applicationName"));
+    inner.invite_mails.insert(id.clone(), mail);
+    inner.emails.push((id, "invite".into()));
+    ok(json!({"details": {}}))
+}
+
+/// `POST /admin/v1/email/_search` (Zitadel v4.19.1 ListEmailProviders; admin only): each
+/// provider with its `state`, `EMAIL_PROVIDER_ACTIVE` or `EMAIL_PROVIDER_INACTIVE`.
+async fn search_email_providers(State(s): S, headers: HeaderMap, Json(_): Json<Value>) -> Reply {
+    let inner = s.lock().unwrap();
+    if let Some(e) = guard(&headers, &inner) {
+        return e;
+    }
+    if let Some(e) = admin_only(&headers) {
+        return e;
+    }
+    let result: Vec<Value> = inner
+        .email_providers
+        .iter()
+        .map(|(id, active)| {
+            json!({
+                "id": id,
+                "state": if *active { "EMAIL_PROVIDER_ACTIVE" } else { "EMAIL_PROVIDER_INACTIVE" },
+                "smtp": {"host": "smtp.example.com:587"},
+            })
+        })
+        .collect();
+    ok(json!({"details": {"totalResult": result.len().to_string()}, "result": result}))
+}
+
+/// `POST /v2/sessions/search`: the sessions of the `userIdQuery`'s user (all without one).
+async fn search_sessions(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -> Reply {
+    let inner = s.lock().unwrap();
+    if let Some(e) = guard(&headers, &inner) {
+        return e;
+    }
+    let user = b
+        .get("queries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|q| q.pointer("/userIdQuery/id")?.as_str());
+    let mut ids: Vec<&String> = inner
+        .sessions
+        .iter()
+        .filter(|(_, (uid, _))| user.is_none_or(|u| u == uid))
+        .map(|(sid, _)| sid)
+        .collect();
+    ids.sort();
+    let total = ids.len();
+    let limit = num(b.pointer("/query/limit")).unwrap_or(100);
+    let page = if inner.session_page > 0 { limit.min(inner.session_page) } else { limit };
+    let sessions: Vec<Value> = ids.iter().take(page).map(|id| json!({"id": id})).collect();
+    ok(json!({"details": {"totalResult": total.to_string()}, "sessions": sessions}))
+}
+
+/// `POST /v2/users/{id}/invite_code/verify` with `{"verificationCode": …}`: a right code is
+/// consumed.
+async fn verify_invite_code(
+    State(s): S,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<Value>,
+) -> Reply {
+    let mut inner = s.lock().unwrap();
+    if let Some(e) = guard(&headers, &inner) {
+        return e;
+    }
+    if !inner.users.iter().any(|u| u.id == id) {
+        return zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound");
+    }
+    let Some((code, expired)) = inner.invites.get(&id).cloned() else {
+        return zerr(StatusCode::BAD_REQUEST, "Errors.User.Code.NotFound");
+    };
+    if b.get("verificationCode").and_then(Value::as_str) != Some(code.as_str()) {
+        return zerr(StatusCode::BAD_REQUEST, "Errors.User.Code.Invalid");
+    }
+    if expired {
+        return zerr(StatusCode::PRECONDITION_FAILED, "Errors.User.Code.Expired");
+    }
+    inner.invites.remove(&id);
+    ok(json!({"details": {}}))
+}
+
 async fn resend(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
     let mut inner = s.lock().unwrap();
     if let Some(e) = guard(&headers, &inner) {
@@ -676,10 +1005,20 @@ async fn resend(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Repl
     ok(json!({}))
 }
 
-async fn password_reset(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
+/// `POST /v2/users/{id}/password_reset`: the code is always `RESET_CODE`; `sendLink`'s
+/// `urlTemplate` is journaled with the `reset` email. A deactivated user gets one too.
+async fn password_reset(
+    State(s): S,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Reply {
     let mut inner = s.lock().unwrap();
     if let Some(e) = guard(&headers, &inner) {
         return e;
+    }
+    if let Some(t) = body.as_ref().and_then(|b| b.pointer("/sendLink/urlTemplate")).and_then(Value::as_str) {
+        inner.reset_mails.insert(id.clone(), t.to_string());
     }
     inner.emails.push((id, "reset".into()));
     ok(json!({}))
@@ -710,7 +1049,11 @@ async fn set_password(
         (None, Some(_)) => {}
         // Neither: an administrator sets it.
         // (the login client holds user.credential.write, so either token may)
-        (None, None) => {}
+        (None, None) => {
+            if inner.strict_login && !is_admin(&headers) {
+                return zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied");
+            }
+        }
     }
     let pw = b
         .pointer("/newPassword/password")

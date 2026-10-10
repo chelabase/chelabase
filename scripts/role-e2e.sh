@@ -6,8 +6,9 @@
 # - listRoles shows its login roles with origin sql and password set_in_sql; the reveal
 #   ?role= gives no password; the migration's password logs in;
 # - a reset makes the role's password revealable; the old one is refused, the new one works;
-# - a secret key on it reads through the data API; ALTER ROLE … BYPASSRLS in SQL makes the key
-#   answer 403 role_not_allowed, and listRoles shows the key under blocked_keys;
+# - a secret key on it reads through the data API; ALTER ROLE … CREATEROLE in SQL makes the key
+#   answer 403 role_not_allowed, and listRoles shows the key under blocked_keys (E33: BYPASSRLS
+#   alone is allowed, so the step escalates with CREATEROLE);
 # - a protected branch can't be deleted (409 branch_protected) until it's unprotected;
 # - a restore to before the migration removes its roles, and the migration runs again.
 # KEEP=1 leaves the database in place.
@@ -190,16 +191,17 @@ done
 grep -q 'from-the-owner' "$tmp/data" || die "the data API read didn't return the row: $(cat "$tmp/data")"
 pass "a secret key on $ROLE reads orders through the data API"
 
-# 6. ALTER ROLE … BYPASSRLS in SQL: the key answers 403 role_not_allowed (rest's cache: 30 s).
-sql_as postgres "$owner_pw" -c "ALTER ROLE $ROLE BYPASSRLS" >/dev/null
+# 6. ALTER ROLE … CREATEROLE in SQL: the key answers 403 role_not_allowed (rest's cache: 30 s).
+# BYPASSRLS alone would not do: a secret key may use a BYPASSRLS role (E33).
+sql_as postgres "$owner_pw" -c "ALTER ROLE $ROLE CREATEROLE" >/dev/null
 for _ in $(seq 40); do
   code="$(read_orders)"
   [[ "$code" == 403 ]] && break
   sleep 1
 done
-[[ "$code" == 403 ]] || die "the key still answers $code after BYPASSRLS: $(cat "$tmp/data")"
+[[ "$code" == 403 ]] || die "the key still answers $code after CREATEROLE: $(cat "$tmp/data")"
 jq -e '.error.code == "role_not_allowed"' "$tmp/data" >/dev/null || die "unexpected refusal: $(cat "$tmp/data")"
-# listRoles' level comes from the resync (an ALTER ROLE … BYPASSRLS forwards nothing to
+# listRoles' level comes from the resync (an ALTER ROLE … CREATEROLE forwards nothing to
 # record): reconcile's next pass, every 30 s.
 blocked() {
   ok GET "$branch/roles" 200
@@ -212,7 +214,7 @@ for _ in $(seq 60); do
   sleep 1
 done
 blocked || die "listRoles doesn't show the blocked key after 60 s: $(cat "$tmp/body")"
-pass "ALTER ROLE $ROLE BYPASSRLS: the key gets 403 role_not_allowed; listRoles shows it blocked"
+pass "ALTER ROLE $ROLE CREATEROLE: the key gets 403 role_not_allowed; listRoles shows it blocked"
 ok DELETE "$branch/keys/$key_id" 204
 
 # 7. A protected branch can't be deleted until it's unprotected.

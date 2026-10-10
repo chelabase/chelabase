@@ -27,9 +27,6 @@ export function SignIn({ auth, signup }: SignInProps) {
         <Button disabled={isLoading} onClick={() => void signinRedirect()}>
           Sign in
         </Button>
-        <Button variant="outline" disabled={isLoading} onClick={() => void signinRedirect({ prompt: "create" })}>
-          Create account
-        </Button>
       </div>
       {error && (
         <p role="alert" className="text-sm text-destructive">

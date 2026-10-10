@@ -98,6 +98,22 @@ describe("AppShell", () => {
     expect(grid).toHaveStyle({ gridTemplateColumns: `${width} 1fr` });
   });
 
+  // Below 40rem "Expanded" opens over the page (the rail's own test), so the grid keeps 56px:
+  // a 232px column at 375px pushed the page past the viewport.
+  it("expanded below 40rem keeps a 56px rail column", async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) =>
+      ({ matches: query.includes("max-width: 40rem"), media: query, onchange: null, addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false }) as MediaQueryList);
+    try {
+      window.localStorage.setItem(RAIL_STORAGE_KEY, "expanded");
+      await renderShell();
+      const grid = screen.getByRole("navigation", { name: "Studio" }).closest("[style*='grid-template-columns']");
+      expect(grid).toHaveStyle({ gridTemplateColumns: "56px 1fr" });
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
   it("starts in the stored behaviour", async () => {
     window.localStorage.setItem(RAIL_STORAGE_KEY, "collapsed");
     await renderShell();

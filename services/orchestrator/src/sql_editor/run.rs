@@ -1,13 +1,14 @@
 //! One script run on a branch's database.
 //!
-//! [`connect`] opens a fresh connection as the branch's owner; [`run`] sends the script in one
+//! [`connect`] opens a fresh connection (as the owner, or as the caller's member role for an
+//! act-as run); [`run`] sends the script in one
 //! simple-protocol query (so multi-statement scripts and explicit transactions work) and turns
 //! the server's messages into [`RunEvent`]s. The run task sends Postgres's cancel request
 //! whenever it stops early: cancelled, deadline passed, response cap hit or client gone.
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -101,7 +102,8 @@ pub fn tag_rows(tag: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Where to run: the compute's address, the owner's credentials and the Postgres database.
+/// Where to run: the compute's address, the credentials (the owner's or the member role's) and
+/// the Postgres database.
 pub struct RunTarget {
     pub addr: SocketAddr,
     pub user: String,
@@ -112,21 +114,49 @@ pub struct RunTarget {
 /// What to run.
 pub struct RunSpec {
     pub sql: String,
-    /// `SET ROLE` to this role first; `None` runs as the owner.
+    /// `SET ROLE` to this role first; `None` runs as whoever connected (the owner).
     pub role: Option<String>,
     pub timeout: Duration,
+    /// Awaited once the run is over, however it ended (finished, failed, cancelled, timed out
+    /// or its client gone), after `done` was sent and the connection closed. An act-as run's
+    /// hand-over (R5: the worker's `member_hand_over_sql`, which ends this backend first) goes
+    /// here, so nothing runs in the script's own session.
+    pub after: Option<AfterRun>,
 }
 
-/// An open editor connection: the client and the notices its connection task receives.
+/// The run itself, without what comes after it.
+struct Script {
+    sql: String,
+    role: Option<String>,
+    timeout: Duration,
+}
+
+/// Work for after a run ([`RunSpec::after`]).
+pub type AfterRun = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// An open editor connection: the client, the notices its connection task receives and its
+/// backend's process id.
 pub struct Connected {
     client: Client,
     notices: mpsc::Receiver<DbError>,
+    pid: i32,
+    started: String,
 }
 
 impl Connected {
     /// The connection's client (the schema read runs on it before a run would).
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// The backend's process id (`pg_backend_pid()`), for ending it after an act-as run.
+    pub fn backend_pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// The backend's `backend_start` (text): with the pid, it names this backend only.
+    pub fn backend_start(&self) -> &str {
+        &self.started
     }
 }
 
@@ -187,7 +217,38 @@ pub async fn connect(target: &RunTarget) -> Result<Connected, ConnectError> {
             }
         }
     });
-    Ok(Connected { client, notices })
+    let backend = backend_of(&client).await.map_err(|err| match err.as_db_error() {
+        Some(db) => ConnectError::Rejected {
+            code: db.code().code().to_string(),
+            message: db.message().to_string(),
+        },
+        None => ConnectError::Unreachable(err.to_string()),
+    })?;
+    let (pid, started) = parse_backend(backend).ok_or_else(|| {
+        ConnectError::Unreachable("the server didn't say which backend this is".into())
+    })?;
+    Ok(Connected { client, notices, pid, started })
+}
+
+/// This connection's backend: its pid and `backend_start`, as the server sent them.
+async fn backend_of(client: &Client) -> Result<Option<(String, String)>, tokio_postgres::Error> {
+    let sql = "SELECT pg_catalog.pg_backend_pid()::text, s.backend_start::text \
+               FROM pg_catalog.pg_stat_activity s WHERE s.pid = pg_catalog.pg_backend_pid()";
+    for message in client.simple_query(sql).await? {
+        if let SimpleQueryMessage::Row(row) = message
+            && let (Some(pid), Some(started)) = (row.get(0), row.get(1))
+        {
+            return Ok(Some((pid.to_owned(), started.to_owned())));
+        }
+    }
+    Ok(None)
+}
+
+/// M-a: a pid above 0 and a start time, or `None` (no usable backend: an error, never pid 0).
+fn parse_backend(backend: Option<(String, String)>) -> Option<(i32, String)> {
+    let (pid, started) = backend?;
+    let pid: i32 = pid.parse().ok().filter(|p| *p > 0)?;
+    (!started.is_empty()).then_some((pid, started))
 }
 
 /// How a run ended (`done`'s outcome and duration), set before `done` is sent: the audit's
@@ -274,7 +335,15 @@ async fn drive(
     let Connected {
         client,
         mut notices,
+        ..
     } = connected;
+    let RunSpec {
+        sql,
+        role,
+        timeout,
+        after,
+    } = spec;
+    let spec = Script { sql, role, timeout };
     let mut out = Emitter {
         tx,
         token: guard.token(),
@@ -283,31 +352,39 @@ async fn drive(
         last: started,
     };
     let outcome = match execute(&client, &mut notices, &spec, &mut out).await {
-        Ok(outcome) => outcome,
+        Ok(outcome) => Some(outcome),
         Err(stop) => {
             // The backend may still be busy: stop it before the connection goes.
             let cancel = client.cancel_token();
             let _ = tokio::time::timeout(CONNECT_TIMEOUT, cancel.cancel_query(NoTls)).await;
             match stop {
-                Stop::Gone => return,
-                Stop::Cancelled => Outcome::Cancelled,
-                Stop::Timeout => Outcome::Timeout,
-                Stop::Cap => Outcome::TruncatedResponse,
+                Stop::Gone => None,
+                Stop::Cancelled => Some(Outcome::Cancelled),
+                Stop::Timeout => Some(Outcome::Timeout),
+                Stop::Cap => Some(Outcome::TruncatedResponse),
             }
         }
     };
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let _ = finished.set((outcome, duration_ms));
-    let done = RunEvent::Done {
-        outcome,
-        duration_ms,
-    };
     // Free the connection and the registry slot first: a client that stopped reading must
-    // not pin them. `done` goes out past the cap, but only waits so long for a slow reader.
+    // not pin them.
     drop(client);
     drop(notices);
     drop(guard);
-    let _ = tokio::time::timeout(HEARTBEAT, out.tx.send(done)).await;
+    if let Some(outcome) = outcome {
+        let _ = finished.set((outcome, duration_ms));
+        let done = RunEvent::Done {
+            outcome,
+            duration_ms,
+        };
+        // `done` goes out past the cap, but only waits so long for a slow reader.
+        let _ = tokio::time::timeout(HEARTBEAT, out.tx.send(done)).await;
+    }
+    drop(out);
+    // R5: however the run ended (its client gone too), once `done` is out.
+    if let Some(after) = after {
+        after.await;
+    }
 }
 
 enum Next {
@@ -319,7 +396,7 @@ enum Next {
 async fn execute(
     client: &Client,
     notices: &mut mpsc::Receiver<DbError>,
-    spec: &RunSpec,
+    spec: &Script,
     out: &mut Emitter,
 ) -> Result<Outcome, Stop> {
     let mut setup = vec![format!(
@@ -587,6 +664,17 @@ mod tests {
             buffer.push(vec![Some("1".into())]);
         }
         assert!(buffer.full(0));
+    }
+
+    // M-a: the hand-over ends this backend by pid and start; pid 0, a bad pid or no start is
+    // an error, never a backend to end.
+    #[test]
+    fn a_backend_needs_a_pid_and_a_start() {
+        let b = |pid: &str, started: &str| Some((pid.to_string(), started.to_string()));
+        assert_eq!(parse_backend(b("42", "2026-10-09 10:00:00+00")), Some((42, "2026-10-09 10:00:00+00".into())));
+        for backend in [None, b("0", "t"), b("-1", "t"), b("x", "t"), b("42", "")] {
+            assert_eq!(parse_backend(backend.clone()), None, "{backend:?}");
+        }
     }
 
     #[test]

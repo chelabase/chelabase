@@ -30,6 +30,28 @@ pub fn verifier_with_salt(password: &str, salt: &[u8], iterations: u32) -> Strin
     )
 }
 
+/// Whether `stored` (a `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` verifier,
+/// as `pg_authid.rolpassword` holds it) is `password`'s: the password is hashed again with the
+/// verifier's own salt and iteration count. Anything else never matches.
+pub fn verifies(stored: &str, password: &str) -> bool {
+    let Some(rest) = stored.strip_prefix("SCRAM-SHA-256$") else {
+        return false;
+    };
+    let Some((params, _keys)) = rest.split_once('$') else {
+        return false;
+    };
+    let Some((iterations, salt)) = params.split_once(':') else {
+        return false;
+    };
+    let (Ok(iterations), Ok(salt)) = (iterations.parse::<u32>(), STANDARD.decode(salt)) else {
+        return false;
+    };
+    if iterations == 0 || salt.is_empty() {
+        return false;
+    }
+    verifier_with_salt(password, &salt, iterations) == stored
+}
+
 fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut mac =
         <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key size");
@@ -78,6 +100,20 @@ mod tests {
             verifier_with_salt("bell", &salt, 4096)
         );
         assert!(verifier_with_salt(raw, &salt, 4096).starts_with("SCRAM-SHA-256$4096:"));
+    }
+
+    /// A stored verifier is checked against a password with its own salt and iteration count;
+    /// anything that isn't a SCRAM-SHA-256 verifier never matches.
+    #[test]
+    fn a_verifier_matches_only_its_password() {
+        let v = verifier("pw");
+        assert!(verifies(&v, "pw"));
+        assert!(!verifies(&v, "pw2"));
+        let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
+        assert!(verifies(&verifier_with_salt("pencil", &salt, 1000), "pencil"));
+        for bad in ["", "md5abc", "SCRAM-SHA-256$x", "SCRAM-SHA-256$4096:!!$a:b", "SCRAM-SHA-256$0:AA==$a:b"] {
+            assert!(!verifies(bad, "pw"), "{bad}");
+        }
     }
 
     #[test]

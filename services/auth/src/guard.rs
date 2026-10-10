@@ -6,6 +6,33 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Accept tickets already used, by nonce, each kept until the ticket would have expired.
+///
+/// In memory, so it assumes one auth process (like [`RateLimiter`]); a second instance would
+/// need a shared store, or a replay could land on the other one.
+#[derive(Default)]
+pub struct UsedTickets {
+    used: Mutex<HashMap<String, u64>>,
+}
+
+impl UsedTickets {
+    const CAP: usize = 100_000;
+
+    /// Marks the ticket used. False when it already was, or when the set is full of live
+    /// entries (refusing is the safe side).
+    pub fn claim(&self, nonce: &str, exp: u64, now: u64) -> bool {
+        let mut used = self.used.lock().expect("tickets lock");
+        if used.len() >= Self::CAP / 2 {
+            used.retain(|_, e| *e >= now);
+        }
+        if used.len() >= Self::CAP || used.get(nonce).is_some_and(|e| *e >= now) {
+            return false;
+        }
+        used.insert(nonce.to_string(), exp);
+        true
+    }
+}
+
 /// Fixed-window counters in memory (one auth process).
 #[derive(Default)]
 pub struct RateLimiter {

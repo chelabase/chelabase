@@ -5,6 +5,7 @@
  * OpenAPI spec version: 1
  */
 
+export * from './acceptInviteBody.ts';
 export * from './appChangePasswordBody.ts';
 export * from './appEmailBody.ts';
 export * from './appJwk.ts';
@@ -24,6 +25,7 @@ export * from './authRequestBody.ts';
 export * from './authRequestInfo.ts';
 export * from './codeBody.ts';
 export * from './confirmBody.ts';
+export * from './describeInviteBody.ts';
 export * from './doneTag.ts';
 export * from './emailBody.ts';
 export * from './emptyRequest.ts';
@@ -31,6 +33,7 @@ export * from './emptyResponse.ts';
 export * from './errorBody.ts';
 export * from './errorCode.ts';
 export * from './errorEnvelope.ts';
+export * from './inviteDescription.ts';
 export * from './nextStep.ts';
 export * from './signedIn.ts';
 export * from './signInBody.ts';

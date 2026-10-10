@@ -8,6 +8,7 @@ import {
   type MergeSummary,
 } from "@chelabase/management-client";
 import { isTransitional } from "@/lib/branches";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { isMergeBusy, isMergeOpen } from "@/lib/merges";
 import type { ConnectionFocus } from "@/lib/project-search";
@@ -28,6 +29,7 @@ const DEFAULT_WINDOW = 7 * 86400;
 /** One database's branches: the tree, the new-branch form and the settings. */
 export function DatabaseBranches({ projectId, database, focus = null }: DatabaseBranchesProps) {
   const id = database.database_id;
+  const caps = useProjectCaps();
   // While a branch is being created, reset, restored or deleted, keep the list fresh.
   const list = useListBranches(id, { query: { refetchInterval: pollWhile<Branch[]>((bs) => bs.some(isTransitional)) } });
   const detail = useGetDatabase(id);
@@ -79,7 +81,8 @@ export function DatabaseBranches({ projectId, database, focus = null }: Database
             openMerges={openMerges}
             focus={focus}
           />
-          <NewBranchForm databaseId={id} branches={branches} historyWindow={window} />
+          {/* Creating a branch is Developer's (createBranch). */}
+          {caps.atLeast("developer") && <NewBranchForm databaseId={id} branches={branches} historyWindow={window} />}
         </>
       )}
       {settings && (

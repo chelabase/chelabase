@@ -4,6 +4,7 @@ use crate::dev::requests::*;
 use crate::dev::zitadel::ZitadelApi;
 use anyhow::{Context, Result, bail};
 use chelabase_types::mode::Mode;
+use chelabase_types::mode_policy::ModePolicy;
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -16,7 +17,8 @@ const PROJECTS: &str = "zitadel.project.v2.ProjectService";
 const APPS: &str = "zitadel.application.v2.ApplicationService";
 const FEATURES: &str = "zitadel.feature.v2.FeatureService";
 
-pub async fn ensure_org(api: &impl ZitadelApi) -> Result<String> {
+/// The default organisation's id and name.
+pub async fn ensure_org(api: &impl ZitadelApi) -> Result<(String, Option<String>)> {
     let listed = api
         .rest(
             Method::POST,
@@ -24,7 +26,8 @@ pub async fn ensure_org(api: &impl ZitadelApi) -> Result<String> {
             default_org_query(),
         )
         .await?;
-    org_id_from(&listed).with_context(|| format!("no default organization: {listed}"))
+    let id = org_id_from(&listed).with_context(|| format!("no default organization: {listed}"))?;
+    Ok((id, org_name_from(&listed)))
 }
 
 pub async fn ensure_project(api: &impl ZitadelApi, org_id: &str) -> Result<String> {
@@ -113,7 +116,7 @@ pub async fn ensure_studio_login(
     project_id: &str,
     mode: Mode,
 ) -> Result<()> {
-    if mode == Mode::Platform {
+    if !ModePolicy::new(mode).cli_manages_studio_login() {
         return Ok(());
     }
     // Checked against what Zitadel stores, before the instance stops forcing its login.
@@ -144,6 +147,26 @@ pub async fn ensure_studio_login(
     Ok(())
 }
 
+/// Zitadel's own registration page is off (R38): sign-up goes only through Chelabase's own
+/// rules (the tenant's open sign-up, invites), never around them. Reads the instance login
+/// policy and writes it back only when `allowRegister` is on; the same for the org's own login
+/// policy when it has one (it overrides the instance's).
+pub async fn ensure_zitadel_registration_off(api: &impl ZitadelApi) -> Result<()> {
+    let policy = api.rest(Method::GET, LOGIN_POLICY, Value::Null).await?;
+    if registration_allowed(&policy) {
+        api.rest(Method::PUT, LOGIN_POLICY, login_policy_without_registration(&policy))
+            .await?;
+        info!("Zitadel's own registration is off (instance policy)");
+    }
+    let org = api.rest(Method::GET, ORG_LOGIN_POLICY, Value::Null).await?;
+    if !policy_is_default(&org) && registration_allowed(&org) {
+        api.rest(Method::PUT, ORG_LOGIN_POLICY, login_policy_without_registration(&org))
+            .await?;
+        info!("Zitadel's own registration is off (the org's policy)");
+    }
+    Ok(())
+}
+
 pub async fn ensure_demo_user(api: &impl ZitadelApi, org_id: &str) -> Result<String> {
     let listed = api
         .rest(Method::POST, "/v2/users", machine_user_search(DEMO_USER))
@@ -160,6 +183,18 @@ pub async fn ensure_demo_user(api: &impl ZitadelApi, org_id: &str) -> Result<Str
         .await?;
     info!("created machine user {DEMO_USER}");
     user_id_from(&created).with_context(|| format!("CreateUser: {created}"))
+}
+
+/// The id of the org's user with this email, if any.
+pub async fn find_user_by_email(
+    api: &impl ZitadelApi,
+    org_id: &str,
+    email: &str,
+) -> Result<Option<String>> {
+    let listed = api
+        .rest(Method::POST, "/v2/users", user_email_search(org_id, email))
+        .await?;
+    Ok(user_id_from(&listed))
 }
 
 /// Keeps `path` if it is a key for `user_id`; otherwise adds a key and writes it (0600).
@@ -340,6 +375,93 @@ mod tests {
         }
     }
 
+    const GET_POLICY: &str = "GET /admin/v1/policies/login";
+    const PUT_POLICY: &str = "PUT /admin/v1/policies/login";
+
+    const GET_ORG_POLICY: &str = "GET /management/v1/policies/login";
+    const PUT_ORG_POLICY: &str = "PUT /management/v1/policies/login";
+
+    fn login_policy(allow_register: bool) -> Value {
+        json!({"policy": {
+            "details": {"sequence": "3"},
+            "allowUsernamePassword": true,
+            "allowRegister": allow_register,
+            "allowExternalIdp": true,
+            "forceMfa": false,
+            "passwordlessType": "PASSWORDLESS_TYPE_ALLOWED",
+            "hidePasswordReset": false,
+            "isDefault": true,
+            "passwordCheckLifetime": "864000s",
+            "secondFactors": ["SECOND_FACTOR_TYPE_OTP"],
+            "idps": [],
+            "disableLoginWithEmail": true,
+        }})
+    }
+
+    // R38: Zitadel's own registration page would let anyone in around Chelabase's sign-up rules.
+    // The PUT replaces the whole policy, so everything else is sent back as it was read.
+    #[tokio::test]
+    async fn zitadel_registration_is_turned_off_keeping_the_rest_of_the_policy() {
+        let fake = Fake::default()
+            .with(GET_POLICY, login_policy(true))
+            .with(PUT_POLICY, json!({}))
+            .with(GET_ORG_POLICY, org_policy(true, true));
+        ensure_zitadel_registration_off(&fake).await.unwrap();
+        let put = fake.bodies(PUT_POLICY);
+        assert_eq!(put.len(), 1);
+        let body = &put[0];
+        assert_eq!(body["allowRegister"], false);
+        assert_eq!(body["allowUsernamePassword"], true);
+        assert_eq!(body["allowExternalIdp"], true);
+        assert_eq!(body["passwordlessType"], "PASSWORDLESS_TYPE_ALLOWED");
+        assert_eq!(body["passwordCheckLifetime"], "864000s");
+        assert_eq!(body["disableLoginWithEmail"], true);
+        for read_only in ["details", "isDefault", "secondFactors", "idps"] {
+            assert!(body.get(read_only).is_none(), "{read_only} is not sent back");
+        }
+    }
+
+    #[tokio::test]
+    async fn zitadel_registration_already_off_writes_nothing() {
+        let fake = Fake::default()
+            .with(GET_POLICY, login_policy(false))
+            .with(GET_ORG_POLICY, org_policy(true, false));
+        ensure_zitadel_registration_off(&fake).await.unwrap();
+        assert_eq!(fake.calls(), vec![GET_POLICY.to_string(), GET_ORG_POLICY.to_string()]);
+    }
+
+    /// The org's login policy as `GET /management/v1/policies/login` answers it.
+    fn org_policy(is_default: bool, allow_register: bool) -> Value {
+        let mut answer = login_policy(allow_register);
+        answer["policy"]["isDefault"] = json!(is_default);
+        answer
+    }
+
+    // An org policy of its own overrides the instance's, so it needs `allowRegister: false` too.
+    #[tokio::test]
+    async fn an_org_login_policy_with_registration_on_is_turned_off_too() {
+        let fake = Fake::default()
+            .with(GET_POLICY, login_policy(false))
+            .with(GET_ORG_POLICY, org_policy(false, true))
+            .with(PUT_ORG_POLICY, json!({}));
+        ensure_zitadel_registration_off(&fake).await.unwrap();
+        assert_eq!(fake.calls(), vec![GET_POLICY, GET_ORG_POLICY, PUT_ORG_POLICY]);
+        let body = &fake.bodies(PUT_ORG_POLICY)[0];
+        assert_eq!(body["allowRegister"], false);
+        assert_eq!(body["allowUsernamePassword"], true);
+        assert!(body.get("isDefault").is_none() && body.get("details").is_none());
+    }
+
+    // The default policy shown for the org is the instance's, already handled: no org write.
+    #[tokio::test]
+    async fn an_org_without_its_own_login_policy_is_left_alone() {
+        let fake = Fake::default()
+            .with(GET_POLICY, login_policy(false))
+            .with(GET_ORG_POLICY, org_policy(true, true));
+        ensure_zitadel_registration_off(&fake).await.unwrap();
+        assert!(fake.bodies(PUT_ORG_POLICY).is_empty());
+    }
+
     const LIST: &str = "ApplicationService/ListApplications";
     const UPDATE: &str = "ApplicationService/UpdateApplication";
     const GET_FEATURES: &str = "FeatureService/GetInstanceFeatures";
@@ -367,9 +489,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_user_is_found_by_email_within_the_org() {
+        let fake = existing();
+        assert_eq!(
+            find_user_by_email(&fake, "o1", "a@b.co").await.unwrap(),
+            Some("u1".to_string())
+        );
+        let body = &fake.bodies("POST /v2/users")[0];
+        assert_eq!(body["queries"][0]["organizationIdQuery"]["organizationId"], "o1");
+        assert_eq!(body["queries"][1]["emailQuery"]["emailAddress"], "a@b.co");
+        let none = Fake::default().with("POST /v2/users", json!({"result": []}));
+        assert_eq!(find_user_by_email(&none, "o1", "a@b.co").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn a_second_run_creates_nothing() {
         let fake = existing();
-        assert_eq!(ensure_org(&fake).await.unwrap(), "o1");
+        assert_eq!(ensure_org(&fake).await.unwrap().0, "o1");
         assert_eq!(ensure_project(&fake, "o1").await.unwrap(), "p1");
         assert_eq!(ensure_api_app(&fake, "p1").await.unwrap(), "c-api");
         assert_eq!(

@@ -28,7 +28,7 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 ## What is not a boundary
 
 - **The SQL editor's guard** is a confirmation step. A client that sends `confirm: true` skips it, and it looks at statements, not at what they call.
-- **The SQL editor's "run as"** is a preview of a role's view under RLS. The connection is the owner's.
+- **The SQL editor's "run as"**, for an Admin, is a preview of a role's view under RLS: the connection is the owner's. A Developer's run is held to the roles their grant lists (see [Roles and schema isolation](/docs/using/roles-and-schema-isolation)).
 - **A protected branch** holds non-read statements for confirmation; it is not a safety boundary against functions that write.
 - **`X-Forwarded-For`** is appended by the gateway and must never be used for authorization.
 
@@ -36,8 +36,8 @@ See [SQL editor](/docs/architecture/sql-editor) for the details.
 
 ## Local-only defaults
 
-- Email verification is off in self-hosted mode (`CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides it).
-- Everyone who signs up to Studio joins one shared workspace.
+- Email verification of sign-ups is off in self-hosted mode (`CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides it); self-sign-up itself is off unless a tenant admin switches it on, except on a fresh install: while a tenant has no member at all, anyone who can reach Studio can sign up and becomes its admin. Set the bootstrap admin (`just zitadel-bootstrap you@example.com`) before exposing Studio, and the window never opens; it stays open until the first bootstrap, and of two people racing for it only one claims the admin (the other is admitted as `pending`). On self-hosted dev, `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential: keep it private.
+- Everyone who joins Studio shares one workspace.
 - The Zitadel Actions target needs Zitadel's HTTP client denylist relaxed so it can call the host.
 - Key material under `.chelabase/` is created once and never overwritten.
 

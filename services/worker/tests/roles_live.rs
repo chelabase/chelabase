@@ -185,6 +185,18 @@ impl Fx {
         rows
     }
 
+    /// The non-owner rows that can log in through the proxy (with a verifier), by name.
+    async fn verifiers(&self, ep: &str) -> Vec<String> {
+        let (copies, _) = self.metadata.role_copies(ep).await.unwrap();
+        let mut names: Vec<String> = copies
+            .into_iter()
+            .filter(|c| c.origin != RoleOrigin::Owner && c.scram_verifier.is_some())
+            .map(|c| c.name)
+            .collect();
+        names.sort();
+        names
+    }
+
     /// `rolname|super|createrole|createdb|bypassrls|replication|login` of `role` on `ep`.
     async fn attributes(&self, ep: &str, role: &str) -> String {
         self.value(
@@ -1173,8 +1185,9 @@ async fn protected_child_at_a_past_point_refuses_a_dropped_roles_password() {
 
 // M7, revised in round 2 (user, 2026-10-08): an empty password means no password, as in plain
 // Postgres (`PASSWORD ''` is taken as PASSWORD NULL, with a notice). The role is made without a
-// password, so it has no copy and can't log in through the proxy; `ALTER ROLE … PASSWORD ''`
-// clears a password and removes the copy. Setting a password again restores the login.
+// password, so its row has no verifier and it can't log in through the proxy; `ALTER ROLE …
+// PASSWORD ''` clears a password and the row's verifier (the role is still listed, so members
+// can be granted it). Setting a password again restores the login.
 // (Refusing '' explicitly in the fork is parked until the next fork work.)
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
@@ -1182,13 +1195,18 @@ async fn empty_password_means_no_password() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE blank LOGIN PASSWORD ''").await;
         assert_eq!(fx.role_count(&fx.ep, "blank").await, "1");
-        assert_eq!(fx.copies(&fx.ep).await, []);
+        assert_eq!(fx.copies(&fx.ep).await, [("blank".to_string(), RoleOrigin::Sql)]);
+        assert!(fx.verifiers(&fx.ep).await.is_empty());
 
         fx.owner_ok("CREATE ROLE later LOGIN PASSWORD 'later-pass-12345'")
             .await;
         assert_logs_in(&fx.ep, &fx.database, "later", "later-pass-12345").await;
         fx.owner_ok("ALTER ROLE later PASSWORD ''").await;
-        assert_eq!(fx.copies(&fx.ep).await, []);
+        assert!(fx.verifiers(&fx.ep).await.is_empty());
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [("blank".to_string(), RoleOrigin::Sql), ("later".to_string(), RoleOrigin::Sql)]
+        );
         assert!(
             psql(&fx.ep, &fx.database, "later", "later-pass-12345", "SELECT 1")
                 .await
@@ -1198,7 +1216,7 @@ async fn empty_password_means_no_password() {
 
         fx.owner_ok("ALTER ROLE later PASSWORD 'later-pass-67890'")
             .await;
-        assert_eq!(fx.copies(&fx.ep).await, [("later".to_string(), RoleOrigin::Sql)]);
+        assert_eq!(fx.verifiers(&fx.ep).await, ["later"]);
         assert_logs_in(&fx.ep, &fx.database, "later", "later-pass-67890").await;
     })
     .await;
@@ -1320,8 +1338,8 @@ async fn key_role_drop_refused() {
     .await;
 }
 
-// C1: the usual role behind a secret key is NOLOGIN without a password, so it has no
-// `neon_roles` row. Create and rotate check it on the compute; the key works; a drop is
+// C1: the usual role behind a secret key is NOLOGIN without a password, so its `neon_roles`
+// row has no verifier. Create and rotate check it on the compute; the key works; a drop is
 // refused while it lives; and a just-dropped name is refused a key.
 #[tokio::test]
 #[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
@@ -1332,7 +1350,9 @@ async fn nologin_role_backs_a_secret_key() {
              CREATE ROLE api_reader NOLOGIN; GRANT SELECT ON notes TO api_reader",
         )
         .await;
-        assert_eq!(fx.copies(&fx.ep).await, [], "no row for a role without a password");
+        // Listed (members can be granted it), with no verifier: it never logs in.
+        assert_eq!(fx.copies(&fx.ep).await, [("api_reader".to_string(), RoleOrigin::Sql)]);
+        assert!(fx.verifiers(&fx.ep).await.is_empty());
         let (key_id, key) = fx.secret_key("reader-key", "api_reader").await;
         let body = wait_for_data_status(&key, "notes", 200, Duration::from_secs(30)).await;
         assert!(body.to_string().contains('1'), "{body}");

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Me, ProjectInfo } from "@chelabase/management-client";
+import type { MeResponse as Me, ProjectInfo } from "@chelabase/management-client";
 import { POLL_MS } from "@/lib/query";
 import { fakeFetch, jsonResponse, sequence, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithRouter } from "@/test/render-router";
@@ -10,10 +10,18 @@ import { ProjectPage, type ProjectPageProps, type ProjectTab } from "./project-p
 
 const database = { database_id: "d1", name: "web1", postgres_database: "web1", status: "ready", host: "127.0.0.1", port: 49153, branch_count: 1 } as const;
 const me: Me = {
+  sub: "u1",
+  email: "u1@example.test",
+  name: "U1",
+  tenant_id: "t1",
+  member: { id: "m-self", status: "active", tenant_admin: true },
+  instance_admin: true, tenant_admins: [],
+  projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
   user: { sub: "u1", org_id: "org-1" },
   tenant: {
     id: "t1",
     slug: "demo",
+    display_name: null,
     projects: [{ id: "p1", slug: "default", name: "Default", status: "active", databases: [database] }],
   },
 };
@@ -76,6 +84,12 @@ describe("ProjectPage", () => {
     expect(screen.getByText("web1")).toBeInTheDocument();
     expect(screen.getByText("127.0.0.1:49153")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create database" })).toBeInTheDocument();
+  });
+
+  it("create_form_shows_before_me_loads", async () => {
+    // /v1/me never answers: the form needs no tenant, so it is there anyway.
+    setup({ "GET /v1/me": () => new Promise<Response>(() => {}) });
+    expect(await screen.findByRole("button", { name: "Create database" })).toBeInTheDocument();
   });
 
   it("users_tab_hidden_when_disabled", async () => {
@@ -220,5 +234,23 @@ describe("ProjectPage", () => {
     await userEvent.click(await screen.findByRole("button", { name: "SQL" }));
     expect(await screen.findByLabelText("Run as", {}, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.getByText("Running as owner: row-level security is bypassed.")).toBeInTheDocument();
+  });
+
+  it("access_tab_is_in_the_strip", async () => {
+    setup({
+      "GET /v1/members": ok([]),
+      "GET /v1/projects/p1/grants": ok([]),
+      "GET /v1/projects/p1/access-events": ok({ events: [], next_before: null }),
+    });
+    await userEvent.click(await screen.findByRole("tab", { name: "Access" }));
+    expect(await screen.findByRole("heading", { name: "People with access" })).toBeInTheDocument();
+  });
+
+  it("access_tab_says_when_the_project_is_not_in_the_workspace", async () => {
+    const stranger: Me = { ...me, tenant: { ...me.tenant!, projects: [] } };
+    const f = fakeFetch({ "GET /v1/me": ok(stranger), "GET /v1/projects/p1": ok(info), ...databaseRoutes });
+    renderWithRouter(<ProjectPage projectId="p1" apiUrl="http://gw" tab="access" onTabChange={() => {}} onGone={() => {}} />, { fetch: f });
+    expect(await screen.findByText("Default isn't in your workspace, or you can't see it. Go back to All projects and open it from there.")).toBeInTheDocument();
+    expect(screen.queryByText("Loading access…")).toBeNull();
   });
 });

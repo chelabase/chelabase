@@ -14,7 +14,7 @@ const EXPIRED_BODY = { error: { code: "sign_in_expired", message: "This sign-in 
 
 /** Renders a login form against fake auth routes, with the login client pointed at them. */
 function renderLogin(ui: ReactElement, routes: Record<string, FakeHandler> = {}) {
-  const f = fakeFetch({ "POST /auth/v1/auth-request": () => jsonResponse({ signUp: false }), ...routes });
+  const f = fakeFetch({ "POST /auth/v1/auth-request": () => jsonResponse({ signUp: false, signUpAllowed: false }), ...routes });
   configureLoginClient({ baseUrl: "http://studio.test", fetchImpl: f });
   return { ...renderWithQuery(ui, { fetch: f }), f };
 }
@@ -102,10 +102,48 @@ describe("SignInForm", () => {
   it("forwards to sign-up when the pending sign-in asked for it", async () => {
     const toRegister = vi.fn();
     const { f } = renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />, {
-      "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true }),
+      "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true, signUpAllowed: true }),
     });
     await waitFor(() => expect(toRegister).toHaveBeenCalled());
     expect(await call(f, "/auth/v1/auth-request")!.clone().json()).toEqual({ authRequest: "V2_1" });
+  });
+
+  it("closed_sign_up_offers_no_account_creation_only_the_invite_line", async () => {
+    const toRegister = vi.fn();
+    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />);
+    expect(await screen.findByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByRole("button", { name: "Create account" })).toBeNull();
+    expect(toRegister).not.toHaveBeenCalled();
+  });
+
+  it("sign_in_hides_create_account_when_closed", async () => {
+    // The pending sign-in asked for account creation (prompt=create), but sign-up is closed: stay on
+    // sign-in, offer no "Create account", and keep the generic error plus the invite line.
+    const toRegister = vi.fn();
+    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />, {
+      "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true, signUpAllowed: false }),
+      "POST /auth/v1/sign-in": () =>
+        jsonResponse({ error: { code: "invalid_credentials", message: "Email or password is incorrect" } }, 401),
+    });
+    expect(await screen.findByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Email"), "nobody@example.com");
+    await userEvent.type(screen.getByLabelText("Password"), "Secret-pass1");
+    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Email or password is incorrect");
+    expect(screen.getByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create account" })).toBeNull();
+    expect(toRegister).not.toHaveBeenCalled();
+  });
+
+  it("open_sign_up_offers_account_creation", async () => {
+    const toRegister = vi.fn();
+    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />, {
+      "POST /auth/v1/auth-request": () => jsonResponse({ signUp: false, signUpAllowed: true }),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Create account" }));
+    expect(toRegister).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("No account? Ask your admin for an invite.")).toBeNull();
   });
 
   it("goes to the code step when the email isn't verified", async () => {
@@ -310,7 +348,7 @@ describe("taken email (self-hosted)", () => {
     const toRegister = vi.fn();
     renderLogin(
       <SignInForm authRequest="V2_1" notice="An account with this email already exists" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />,
-      { "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true }) },
+      { "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true, signUpAllowed: true }) },
     );
     expect(screen.getByRole("status")).toHaveTextContent("An account with this email already exists");
     await new Promise((r) => setTimeout(r, 20));

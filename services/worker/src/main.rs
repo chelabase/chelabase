@@ -2,11 +2,13 @@ use axum::{Json, Router, routing::get};
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
-    DataApiDatabaseRequest, GrantDataRoleRequest, JobEnvelope, NatsConfig,
+    DataApiDatabaseRequest, JobEnvelope, MemberRolesReconcileRequest,
+    MemberRolesReply, NatsConfig, SUBJECT_MEMBER_ROLES_ENQUEUE,
+    SUBJECT_MEMBER_ROLES_HAND_OVER, SUBJECT_MEMBER_ROLES_RECONCILE,
     RESET_NOT_APPLIED, ResetPasswordReply, ResetPasswordRequest, ResyncBranchRequest, RoleReply,
     RoleRequest, RoleSessionsReply, SUBJECT_ROLE_SESSIONS,
     SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
-    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_GRANT_DATA_ROLE_TO_OWNER,
+    SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP,
     SUBJECT_RESET_PASSWORD, SUBJECT_RESYNC_BRANCH, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE,
     SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE, connect, ensure_control_stream, publish_merge,
     run_app_users_consumer, run_app_users_sync_consumer, run_branch_consumer,
@@ -14,7 +16,6 @@ use chelabase_nats::{
     run_provision_consumer, run_settings_consumer,
 };
 use chelabase_secrets::{SecretKey, key_check_value, verify_key_check};
-use chelabase_types::mode::Mode;
 use futures_util::StreamExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,6 +23,10 @@ use std::time::Duration;
 use tracing::{info, warn};
 use worker::branch_job::Attempt;
 use worker::config::{RealWorker, WorkerConfig, build};
+use chelabase_types::BranchId;
+use worker::member_roles::{
+    MEMBER_ROLES_DEADLINE, MEMBER_ROLES_ENQUEUE_DELAY, member_hand_over_reply, member_roles_reply,
+};
 use worker::resync::{PendingResyncs, TOUCHED_RESYNC_DELAY};
 
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
@@ -59,12 +64,13 @@ async fn main() -> anyhow::Result<()> {
 
     let worker = Arc::new(build(&config, metadata, key)?);
     worker.resync_requests.connect(nats.clone());
+    worker.member_role_requests.connect(nats.clone());
     // E33a: the secret keys' BYPASSRLS marks, right from the start.
     tokio::spawn({
         let worker = worker.clone();
         async move { worker.sync_key_marks_at_start().await }
     });
-    if config.owner_superuser_requested && config.mode == Mode::Platform {
+    if config.owner_superuser_requested && !config.policy.owner_superuser_allowed() {
         warn!("CHELABASE_DB_OWNER_SUPERUSER is ignored in platform mode");
     }
     if worker.owner_superuser {
@@ -85,7 +91,6 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(serve_reset_password(worker.clone(), nats.clone()));
     tokio::spawn(serve_check_data_role(worker.clone(), nats.clone()));
-    tokio::spawn(serve_grant_data_role_to_owner(worker.clone(), nats.clone()));
     tokio::spawn(serve_enable_data_api(worker.clone(), nats.clone()));
     for subject in [SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_REBOOTSTRAP] {
         tokio::spawn(serve_data_api_rpc(worker.clone(), nats.clone(), subject));
@@ -95,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
     }
     tokio::spawn(serve_role_sessions(worker.clone(), nats.clone()));
     tokio::spawn(serve_resync_branch(worker.clone(), nats.clone()));
+    tokio::spawn(serve_member_roles_reconcile(worker.clone(), nats.clone()));
+    tokio::spawn(serve_member_roles_hand_over(worker.clone(), nats.clone()));
+    tokio::spawn(serve_member_roles_enqueue(worker.clone(), nats.clone()));
+    tokio::spawn(member_roles_sweep_loop(worker.clone()));
     tokio::spawn(reconcile_loop(worker.clone(), js.clone()));
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
@@ -447,49 +456,6 @@ async fn serve_check_data_role(worker: Arc<RealWorker>, client: async_nats::Clie
     }
 }
 
-async fn serve_grant_data_role_to_owner(worker: Arc<RealWorker>, client: async_nats::Client) {
-    let mut requests = match client
-        .queue_subscribe(SUBJECT_GRANT_DATA_ROLE_TO_OWNER, RESET_QUEUE_GROUP.to_string())
-        .await
-    {
-        Ok(sub) => sub,
-        Err(err) => {
-            warn!("grant-data-role-to-owner subscribe failed: {err}");
-            return;
-        }
-    };
-    info!(subject = SUBJECT_GRANT_DATA_ROLE_TO_OWNER, "serving grant-data-role-to-owner requests");
-    while let Some(message) = requests.next().await {
-        let worker = worker.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            let reply = match serde_json::from_slice::<GrantDataRoleRequest>(&message.payload) {
-                Ok(request) => {
-                    match tokio::time::timeout(
-                        CHECK_ROLE_DEADLINE,
-                        worker.grant_data_role_to_owner_reply(&request),
-                    )
-                    .await
-                    {
-                        Ok(reply) => reply,
-                        Err(_) => {
-                            warn!(branch_id = %request.branch_id, "grant data role to owner timed out");
-                            CheckDataRoleReply::not_ready()
-                        }
-                    }
-                }
-                Err(err) => CheckDataRoleReply::failed(format!("bad request: {err}")),
-            };
-            if let Some(reply_to) = message.reply {
-                let body = serde_json::to_vec(&reply).unwrap_or_default();
-                if let Err(err) = client.publish(reply_to, body.into()).await {
-                    warn!("grant-data-role-to-owner reply failed: {err}");
-                }
-            }
-        });
-    }
-}
-
 // --- The data API per database (core NATS) ---------------------------------------
 
 /// Serves the enable publish (no reply): the orchestrator already set the row `enabling`.
@@ -611,6 +577,118 @@ async fn serve_resync_branch(worker: Arc<RealWorker>, client: async_nats::Client
                     }
                 }
                 Err(err) => warn!("bad resync-branch request: {err}"),
+            }
+        });
+    }
+}
+
+// --- Member roles (core NATS) ----------------------------------------------------
+
+/// Serves the synchronous member-role reconcile (request/reply with a [`MemberRolesReply`]):
+/// the act-as check before a member's connection (T9) and the orchestrator's calls.
+async fn serve_member_roles_reconcile(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_MEMBER_ROLES_RECONCILE, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("member-roles subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_MEMBER_ROLES_RECONCILE, "serving member-role reconciles");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply: MemberRolesReply =
+                member_roles_reply(worker, &message.payload, MEMBER_ROLES_DEADLINE).await;
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("member-roles reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+/// Serves the hand-over after an act-as run (request/reply with a [`MemberRolesReply`]).
+async fn serve_member_roles_hand_over(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_MEMBER_ROLES_HAND_OVER, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("member-role hand-over subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_MEMBER_ROLES_HAND_OVER, "serving member-role hand-overs");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply: MemberRolesReply =
+                member_hand_over_reply(worker, &message.payload, MEMBER_ROLES_DEADLINE).await;
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("member-role hand-over reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+/// T8 I2: every `CHELABASE_MEMBER_ROLES_SWEEP_SECS`, every branch of a tenant with members is
+/// reconciled: the backstop for reconcile publishes that were lost (core NATS, no redelivery)
+/// or whose retries all failed.
+async fn member_roles_sweep_loop(worker: Arc<RealWorker>) {
+    let every = worker.member_roles_sweep_every;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let (done, failed) = worker.sweep_member_roles_once().await;
+        if failed > 0 {
+            warn!(done, failed, "member-role sweep: some branches failed; the next sweep retries");
+        }
+    }
+}
+
+/// Serves the enqueued member-role reconciles (no reply): each branch gets one run a moment
+/// after its first message, however many arrived, retried with backoff.
+async fn serve_member_roles_enqueue(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_MEMBER_ROLES_ENQUEUE, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("member-roles enqueue subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_MEMBER_ROLES_ENQUEUE, "serving enqueued member-role reconciles");
+    let pending = Arc::new(PendingResyncs::default());
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let pending = pending.clone();
+        tokio::spawn(async move {
+            match serde_json::from_slice::<MemberRolesReconcileRequest>(&message.payload) {
+                Ok(request) => {
+                    let branch = BranchId::from(request.branch_id);
+                    if let MemberRolesReply::Failed { message } = worker
+                        .reconcile_member_roles_soon(&pending, branch, MEMBER_ROLES_ENQUEUE_DELAY)
+                        .await
+                    {
+                        warn!(branch_id = %branch, "member-role reconcile: {message}");
+                    }
+                }
+                Err(err) => warn!("bad member-roles request: {err}"),
             }
         });
     }

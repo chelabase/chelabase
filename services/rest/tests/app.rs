@@ -91,6 +91,8 @@ fn identity(kind: Option<DataKeyKind>, databases: Option<Vec<String>>) -> Identi
             project_id: None,
             role_oid: None,
         }),
+        email: None,
+        name: None,
     }
 }
 

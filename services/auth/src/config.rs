@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use chelabase_secrets::SecretKey;
 pub use chelabase_types::mode::Mode;
+use chelabase_types::mode_policy::ModePolicy;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -50,7 +51,7 @@ fn flag(name: &str) -> bool {
 fn requires_email_verification(mode: Mode, overridden: Option<&str>) -> bool {
     match overridden.map(str::trim).filter(|v| !v.is_empty()) {
         Some(value) => truthy(Some(value)),
-        None => mode == Mode::Platform,
+        None => ModePolicy::new(mode).email_verification_default(),
     }
 }
 
@@ -59,7 +60,7 @@ fn requires_email_verification(mode: Mode, overridden: Option<&str>) -> bool {
 fn secure_cookies(mode: Mode, overridden: Option<&str>) -> bool {
     match overridden.map(str::trim).filter(|v| !v.is_empty()) {
         Some(value) => truthy(Some(value)),
-        None => mode == Mode::Platform,
+        None => ModePolicy::new(mode).secure_cookies_default(),
     }
 }
 
@@ -170,9 +171,58 @@ pub struct AppConfig {
 
 pub const DEFAULT_APP_ACCESS_TTL_SECS: u64 = 900;
 pub const DEFAULT_INTERNAL_URL: &str = "http://127.0.0.1:8083";
-pub const DEFAULT_APP_AUTH_INTERNAL_TOKEN: &str = "chelabase-dev-app-auth";
+pub const DEFAULT_APP_AUTH_INTERNAL_TOKEN: &str = chelabase_types::mode_policy::DEV_APP_AUTH_INTERNAL_TOKEN;
 
 impl AppConfig {
+    /// `(url, bearer)` of the orchestrator's internal listener, for the sign-up gate; it needs
+    /// none of the app-user keys.
+    ///
+    /// Each falls back to its development default, with a warning, because a deployment that
+    /// forgets them would otherwise talk to the wrong address or use a publicly known bearer.
+    pub fn internal_from_env() -> (String, String) {
+        let get = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let url = get("CHELABASE_INTERNAL_URL").unwrap_or_else(|| {
+            tracing::warn!("CHELABASE_INTERNAL_URL is not set; the sign-up gate uses {DEFAULT_INTERNAL_URL}");
+            DEFAULT_INTERNAL_URL.into()
+        });
+        let token = get("CHELABASE_APP_AUTH_INTERNAL_TOKEN").unwrap_or_else(|| {
+            tracing::warn!(
+                "CHELABASE_APP_AUTH_INTERNAL_TOKEN is not set; the sign-up gate uses the development token"
+            );
+            DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()
+        });
+        (url, token)
+    }
+
+    /// M9: a platform instance doesn't start with the development bearer (the variable unset).
+    pub fn check_internal_token(mode: Mode, token: &str) -> Result<()> {
+        ModePolicy::new(mode)
+            .check_internal_token(token)
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// The admin Zitadel client from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`, independent of the app
+    /// keys; `None` (with a warning) when the variable is unset. Accept-invite needs it.
+    pub fn admin_from_env(issuer: &str) -> Result<Option<crate::zitadel::Zitadel>> {
+        let Some(path) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        else {
+            tracing::warn!(
+                "CHELABASE_ZITADEL_ADMIN_PAT_FILE is not set: accepting invites answers 503"
+            );
+            return Ok(None);
+        };
+        let pat = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+        Ok(Some(crate::zitadel::Zitadel::new(issuer, pat.trim())))
+    }
+
     pub fn from_env() -> Result<Option<Self>> {
         Self::from_vars(|name| std::env::var(name).ok())
     }
@@ -240,6 +290,16 @@ mod tests {
         ("CHELABASE_INTERNAL_VERIFY_KEY", "/k/internal.pub"),
         ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/k/admin.pat"),
     ];
+
+    // M9: a platform instance refuses the development internal bearer; self-hosted allows it.
+    #[test]
+    fn platform_refuses_the_default_internal_token() {
+        assert!(AppConfig::check_internal_token(Mode::SelfHosted, DEFAULT_APP_AUTH_INTERNAL_TOKEN).is_ok());
+        assert!(AppConfig::check_internal_token(Mode::Platform, DEFAULT_APP_AUTH_INTERNAL_TOKEN).is_err());
+        assert!(AppConfig::check_internal_token(Mode::Platform, "a-long-random-secret").is_ok());
+        let c = AppConfig::from_vars(vars(&FULL)).unwrap().unwrap();
+        assert!(AppConfig::check_internal_token(Mode::Platform, &c.internal_token).is_err(), "unset means the default");
+    }
 
     #[test]
     fn app_config_defaults() {

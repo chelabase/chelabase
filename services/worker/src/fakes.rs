@@ -230,6 +230,14 @@ pub struct FakeState {
     pub before_merge_write: Option<StateHook>,
     /// `merges.handed_back_at` (T14 M10).
     pub handed_back: HashMap<uuid::Uuid, DateTime<Utc>>,
+    /// Members of every tenant, their project grants by `(member, project)`, their overrides by
+    /// `(member, database)`, and the reconciler's `member_branch_roles`.
+    pub members: Vec<chelabase_metadata::members::MemberRecord>,
+    pub grants: HashMap<(uuid::Uuid, uuid::Uuid), chelabase_metadata::members::GrantRow>,
+    pub overrides: HashMap<(uuid::Uuid, uuid::Uuid), chelabase_metadata::members::OverrideRow>,
+    pub member_roles: Vec<chelabase_metadata::members::MemberBranchRole>,
+    /// R31: the last acted role by (member, branch).
+    pub acted_roles: HashMap<(uuid::Uuid, uuid::Uuid), String>,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -2107,6 +2115,134 @@ impl WorkerMetadata for FakeMetadata {
             .collect())
     }
 
+    async fn list_members(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<chelabase_metadata::members::MemberRecord>, MetadataError> {
+        let state = self.read("list_members")?;
+        Ok(state
+            .members
+            .iter()
+            .filter(|m| {
+                m.tenant_id == tenant
+                    && m.status != chelabase_metadata::members::MemberStatus::Removed
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn database_grant_rows(
+        &self,
+        project: uuid::Uuid,
+        database: uuid::Uuid,
+    ) -> Result<Vec<(uuid::Uuid, chelabase_metadata::members::GrantRows)>, MetadataError> {
+        let state = self.read("database_grant_rows")?;
+        let mut ids: Vec<uuid::Uuid> = state
+            .grants
+            .keys()
+            .filter(|(_, p)| *p == project)
+            .map(|(m, _)| *m)
+            .chain(state.overrides.keys().filter(|(_, d)| *d == database).map(|(m, _)| *m))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids
+            .into_iter()
+            .map(|m| {
+                (
+                    m,
+                    chelabase_metadata::members::GrantRows {
+                        project: state.grants.get(&(m, project)).cloned(),
+                        database: state.overrides.get(&(m, database)).cloned(),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn member_role_branches(&self) -> Result<Vec<uuid::Uuid>, MetadataError> {
+        let state = self.read("member_role_branches")?;
+        let mut out: Vec<uuid::Uuid> = state
+            .branches
+            .values()
+            .filter(|b| b.status == BranchStatus::Ready && b.kind == BranchKind::Normal)
+            .filter(|b| {
+                let Some(db) = state.databases.get(&b.database_id) else {
+                    return false;
+                };
+                live(db.status)
+                    && (state.members.iter().any(|m| {
+                        m.tenant_id == db.tenant_id
+                            && m.status == chelabase_metadata::members::MemberStatus::Active
+                    }) || state.member_roles.iter().any(|r| r.branch_id == b.id.as_uuid()))
+            })
+            .map(|b| b.id.as_uuid())
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn delete_branch_member_roles(&self, branch: uuid::Uuid) -> Result<u64, MetadataError> {
+        let mut state = self.write("delete_branch_member_roles")?;
+        let before = state.member_roles.len();
+        state.member_roles.retain(|r| r.branch_id != branch);
+        Ok((before - state.member_roles.len()) as u64)
+    }
+
+    async fn member_branch_roles(
+        &self,
+        branch: uuid::Uuid,
+    ) -> Result<Vec<chelabase_metadata::members::MemberBranchRole>, MetadataError> {
+        let state = self.read("member_branch_roles")?;
+        let mut rows: Vec<_> = state
+            .member_roles
+            .iter()
+            .filter(|r| r.branch_id == branch)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.member_id);
+        Ok(rows)
+    }
+
+    async fn upsert_member_branch_role(
+        &self,
+        row: &chelabase_metadata::members::MemberBranchRole,
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("upsert_member_branch_role")?;
+        state
+            .member_roles
+            .retain(|r| (r.member_id, r.branch_id) != (row.member_id, row.branch_id));
+        state.member_roles.push(row.clone());
+        Ok(())
+    }
+
+    async fn member_acted_roles(
+        &self,
+        branch: uuid::Uuid,
+    ) -> Result<Vec<(uuid::Uuid, String)>, MetadataError> {
+        let state = self.read("member_acted_roles")?;
+        let mut rows: Vec<_> = state
+            .acted_roles
+            .iter()
+            .filter(|((_, b), _)| *b == branch)
+            .map(|((m, _), r)| (*m, r.clone()))
+            .collect();
+        rows.sort();
+        Ok(rows)
+    }
+
+    async fn delete_member_branch_role(
+        &self,
+        member: uuid::Uuid,
+        branch: uuid::Uuid,
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("delete_member_branch_role")?;
+        state
+            .member_roles
+            .retain(|r| (r.member_id, r.branch_id) != (member, branch));
+        Ok(())
+    }
+
     async fn served_databases(
         &self,
         branch: BranchId,
@@ -3465,10 +3601,12 @@ pub fn worker() -> (FakeWorker, Journal) {
         enabling_seen: Mutex::default(),
         zitadel: None,
         app_users_reconcile_every: Duration::from_secs(300),
+        member_roles_sweep_every: Duration::from_secs(300),
         remove_orphans: true,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
+        member_role_requests: Default::default(),
     };
     (worker, journal)
 }

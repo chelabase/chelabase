@@ -24,9 +24,11 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use crate::app_users::{app_users_disabled, load_live_project, read_auth};
+use crate::app_users::{app_users_disabled, load_live_project, read_auth, read_auth_checked};
 use crate::branches::{conflict, unprocessable};
 use crate::{AppState, AuthPrincipal, JobPort, MetadataPort, load_main};
+use chelabase_routes::orchestrator as ep;
+use chelabase_types::access::Access;
 
 /// Users per page (P26).
 const PAGE_SIZE: u32 = 50;
@@ -197,13 +199,13 @@ struct Ctx {
     org: String,
 }
 
-async fn ctx<M, J>(state: &AppState<M, J>, principal: &AuthPrincipal, id: Uuid) -> Result<Ctx, ApiError>
+async fn ctx<M, J>(state: &AppState<M, J>, principal: &AuthPrincipal, access: Access, id: Uuid) -> Result<Ctx, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    let project = load_live_project(state, principal, id).await?;
-    let auth = match read_auth(state, &project).await? {
+    let project = load_live_project(state, principal, access, id).await?;
+    let auth = match read_auth_checked(state, principal, access, &project).await? {
         Some(auth) if auth.status == AppUsersStatus::Enabled => auth,
         _ => return Err(app_users_disabled(409)),
     };
@@ -356,7 +358,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let ctx = match ctx(&state, &principal, id).await {
+    let ctx = match ctx(&state, &principal, ep::LIST_APP_USERS.policy.access, id).await {
         Ok(ctx) => ctx,
         Err(err) => return err.into_response(),
     };
@@ -486,7 +488,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let ctx = ctx(state, principal, id).await?;
+    let ctx = ctx(state, principal, ep::CREATE_APP_USER.policy.access, id).await?;
     let email = checked_email(&body.email)?;
     checked_password(&body.password)?;
     let verified = body.email_verified.unwrap_or(true);
@@ -578,7 +580,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let ctx = ctx(&state, &principal, id).await?;
+        let ctx = ctx(&state, &principal, ep::GET_APP_USER.policy.access, id).await?;
         let user = user_in_org(zitadel(&state)?, &ctx.org, user_id).await?;
         AppUser::from_zitadel(&user).ok_or_else(ApiError::internal)
     }
@@ -639,7 +641,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let ctx = ctx(state, principal, id).await?;
+    let ctx = ctx(state, principal, ep::UPDATE_APP_USER.policy.access, id).await?;
     if body.email.is_none() && body.email_verified.is_none() && body.password.is_none() {
         return Err(unprocessable("nothing to change: send email, email_verified or password"));
     }
@@ -776,7 +778,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let ctx = ctx(state, principal, id).await?;
+    let ctx = ctx(state, principal, if active { ep::REACTIVATE_APP_USER } else { ep::DEACTIVATE_APP_USER }.policy.access, id).await?;
     let z = zitadel(state)?;
     user_in_org(z, &ctx.org, user_id).await?;
     let uid = user_id.to_string();
@@ -826,7 +828,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let ctx = ctx(&state, &principal, id).await?;
+        let ctx = ctx(&state, &principal, ep::LIST_APP_USER_SESSIONS.policy.access, id).await?;
         user_in_org(zitadel(&state)?, &ctx.org, user_id).await?;
         state.metadata.list_user_sessions(ctx.project.id, user_id).await.map_err(|err| {
             error!("list user sessions: {err}");
@@ -879,7 +881,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let ctx = ctx(&state, &principal, id).await?;
+        let ctx = ctx(&state, &principal, ep::REVOKE_APP_USER_SESSIONS.policy.access, id).await?;
         let z = zitadel(&state)?;
         user_in_org(z, &ctx.org, user_id).await?;
         revoke_sessions(&state, z, &ctx.project, user_id).await
@@ -920,7 +922,7 @@ where
     J: JobPort,
 {
     let result = async {
-        let ctx = ctx(&state, &principal, id).await?;
+        let ctx = ctx(&state, &principal, ep::DELETE_APP_USER.policy.access, id).await?;
         let z = zitadel(&state)?;
         user_in_org(z, &ctx.org, user_id).await?;
         z.delete_user(&user_id.to_string()).await.map_err(|err| zitadel_failed("delete user", &err))?;

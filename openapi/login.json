@@ -8,6 +8,107 @@
     "version": "1"
   },
   "paths": {
+    "/auth/v1/accept-invite": {
+      "post": {
+        "tags": [
+          "login"
+        ],
+        "description": "Accepts a member invite: checks the emailed code (with `reset`, a password-reset code, which sets the password itself), sets the password, marks the email verified and signs in. Sets the HttpOnly session cookie. If a step after the code check fails, the error is `invite_incomplete` (or `weak_password`) with `error.accept_ticket`: send it back in place of `code` to finish. A pending sign-in that has expired doesn't fail the accept: `redirect` is then Studio's address.",
+        "operationId": "acceptInvite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptInviteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in: `next` is `done`, the session cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedIn"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is malformed, the code or ticket is wrong (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The invite expired (`invite_expired`) or was revoked (`invite_revoked`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is over 8 KiB: `too_large`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not JSON (wrong content type): `invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but has the wrong fields: `invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts: `rate_limited`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Zitadel is unavailable (`unavailable`), or a step after the code check failed (`invite_incomplete`, with `accept_ticket`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/auth/v1/app/change-email": {
       "post": {
         "tags": [
@@ -1163,7 +1264,7 @@
         "tags": [
           "login"
         ],
-        "description": "Looks up a pending sign-in and reports whether sign-up is offered. Sets no cookie.",
+        "description": "Looks up a pending sign-in and reports whether sign-up is asked for and allowed. Sets no cookie.",
         "operationId": "getAuthRequest",
         "requestBody": {
           "content": {
@@ -1248,6 +1349,97 @@
           },
           "503": {
             "description": "Zitadel is unavailable: `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/v1/invite": {
+      "post": {
+        "tags": [
+          "login"
+        ],
+        "description": "Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no Zitadel code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.",
+        "operationId": "describeInvite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DescribeInviteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The invite is open and the token matches",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteDescription"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not well-formed JSON: `invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no open invite with this user and token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is over 8 KiB: `too_large`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not JSON (wrong content type): `invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts: `rate_limited`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1732,6 +1924,16 @@
               }
             }
           },
+          "403": {
+            "description": "Sign-up is closed for this instance (`sign_up_closed`), or not available in platform mode (`not_available_in_platform_mode`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "409": {
             "description": "An account with this email exists (`email_taken`); only when email verification is off",
             "content": {
@@ -1793,7 +1995,7 @@
             }
           },
           "503": {
-            "description": "Zitadel is unavailable: `unavailable`",
+            "description": "Zitadel or the sign-up gate is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1909,6 +2111,47 @@
   },
   "components": {
     "schemas": {
+      "AcceptInviteBody": {
+        "type": "object",
+        "required": [
+          "user",
+          "password"
+        ],
+        "properties": {
+          "acceptTicket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "From an `invite_incomplete` error: retries the steps after the (spent) code."
+          },
+          "authRequest": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pending sign-in to finish; without it the answer sends the browser to Studio."
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The invite code from the link. Send this or `acceptTicket`."
+          },
+          "password": {
+            "type": "string"
+          },
+          "reset": {
+            "type": "boolean",
+            "description": "The link's `reset=1`: `code` is a password-reset code (a person who already had a way to\nsign in, whom Zitadel gives no invite code). It sets the password itself."
+          },
+          "user": {
+            "type": "string",
+            "description": "The Zitadel user id from the invite link."
+          }
+        }
+      },
       "AppChangePasswordBody": {
         "type": "object",
         "required": [
@@ -2176,13 +2419,19 @@
       },
       "AuthRequestInfo": {
         "type": "object",
-        "description": "Whether the pending sign-in's instance allows sign-up.",
+        "description": "What the sign-in page needs to know about the pending sign-in.",
         "required": [
-          "signUp"
+          "signUp",
+          "signUpAllowed"
         ],
         "properties": {
           "signUp": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "The visitor asked to create an account (`prompt=create`) and this instance allows it:\nStudio goes to its sign-up page. `false` for a refused sign-up request too, which then\nlands on the plain sign-in page."
+          },
+          "signUpAllowed": {
+            "type": "boolean",
+            "description": "This instance takes sign-ups (open sign-up is on, or the tenant has no member yet): the\nsign-in page may offer \"Create account\". Always `false` in platform mode."
           }
         }
       },
@@ -2213,6 +2462,20 @@
           },
           "userId": {
             "type": "string"
+          }
+        }
+      },
+      "DescribeInviteBody": {
+        "type": "object",
+        "description": "Both fields default to empty, so a missing one is a `not_found` like a wrong one.",
+        "properties": {
+          "t": {
+            "type": "string",
+            "description": "The invite token from the invite link."
+          },
+          "user": {
+            "type": "string",
+            "description": "The Zitadel user id from the invite link."
           }
         }
       },
@@ -2334,7 +2597,21 @@
           "merge_confirm_required",
           "branch_merge_busy",
           "role_attribute_not_allowed",
-          "role_membership_not_allowed"
+          "role_membership_not_allowed",
+          "no_access_yet",
+          "not_available_in_platform_mode",
+          "sign_up_closed",
+          "pending_approval",
+          "last_tenant_admin",
+          "invite_expired",
+          "invite_revoked",
+          "invite_incomplete",
+          "member_role_reconcile_failed",
+          "link_not_allowed",
+          "signup_pending",
+          "email_ambiguous",
+          "email_in_use_elsewhere",
+          "invite_closed"
         ]
       },
       "ErrorEnvelope": {
@@ -2346,6 +2623,31 @@
         "properties": {
           "error": {
             "$ref": "#/components/schemas/ErrorBody"
+          }
+        }
+      },
+      "InviteDescription": {
+        "type": "object",
+        "description": "Who invited the visitor and to what.",
+        "required": [
+          "inviter_name",
+          "inviter_email",
+          "tenant_name"
+        ],
+        "properties": {
+          "inviter_email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inviter_name": {
+            "type": "string",
+            "description": "The inviter's display name; their email's local part when they have none; `An admin` with\nneither (a machine user)."
+          },
+          "tenant_name": {
+            "type": "string",
+            "description": "The workspace the invite is to."
           }
         }
       },

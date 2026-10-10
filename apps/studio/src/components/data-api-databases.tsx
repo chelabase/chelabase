@@ -10,6 +10,7 @@ import {
   type BranchDatabaseView,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 
 /** The names a key's allow-list may hold: the branch's databases except the system one. */
@@ -53,7 +54,7 @@ export function DataApiDatabases({ databaseId, branchId, databases, picked, onPi
         <select
           value={current?.name ?? ""}
           onChange={(e) => onPick(e.target.value)}
-          className="h-8 rounded-lg border border-input bg-background px-2 text-sm"
+          className="h-8 border border-input bg-background px-2 text-sm"
         >
           {databases.map((d) => (
             <option key={d.name} value={d.name}>
@@ -87,6 +88,8 @@ function DatabaseControls({
   database: BranchDatabaseView;
 }) {
   const queryClient = useQueryClient();
+  // Enabling, disabling and changing a Postgres database are Admin's; others see the state.
+  const admin = useProjectCaps().atLeast("admin");
   const [confirm, setConfirm] = useState<Confirm>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -136,7 +139,7 @@ function DatabaseControls({
   }
 
   return (
-    <div className="space-y-2 rounded-lg border p-3">
+    <div className="space-y-2 border p-3">
       <p>
         <span className="font-medium">{name}</span> · {stateLabel(database)}
       </p>
@@ -150,6 +153,8 @@ function DatabaseControls({
       {!system && database.data_api === "enabling" && (
         <p className="text-muted-foreground">Enabling the data API…</p>
       )}
+      {!admin && !system && <p className="text-muted-foreground">Only project Admins change the data API.</p>}
+      {admin && (
       <div className="flex flex-wrap gap-2">
         {!system && (database.data_api === "off" || database.data_api === "error") && (
           <Button size="sm" disabled={busy} onClick={() => void run(() => enableDataApi(databaseId, branchId, name))}>
@@ -167,8 +172,9 @@ function DatabaseControls({
           </>
         )}
       </div>
-      {confirm && (
-        <div className="space-y-2 rounded-lg border p-3">
+      )}
+      {admin && confirm && (
+        <div className="space-y-2 border p-3">
           <p>
             {confirm === "disable"
               ? `Disable the data API for ${name}? Requests for it stop at once. Its grants and the chelabase schema stay.`
@@ -192,7 +198,7 @@ function DatabaseControls({
           </div>
         </div>
       )}
-      {!system && (
+      {!system && admin && (
         <div className="space-y-1">
           <div className="flex flex-wrap items-end gap-2">
             <label className="flex flex-col gap-1">
@@ -200,7 +206,7 @@ function DatabaseControls({
               <input
                 value={schema}
                 onChange={(e) => setSchema(e.target.value)}
-                className="h-8 w-40 rounded-lg border border-input bg-background px-2 text-sm"
+                className="h-8 w-40 border border-input bg-background px-2 text-sm"
               />
             </label>
             <Button
@@ -299,6 +305,8 @@ export interface KeyDatabasesProps {
 
 /** A key's allow-list as chips, with an editor (both key kinds). */
 export function KeyDatabases({ databaseId, branchId, keyId, value, databases }: KeyDatabasesProps) {
+  // Changing a key is Developer's (updateKey).
+  const canEdit = useProjectCaps().atLeast("developer");
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<string[] | null>(value);
@@ -327,16 +335,16 @@ export function KeyDatabases({ databaseId, branchId, keyId, value, databases }: 
     <div className="space-y-1">
       <div className="flex flex-wrap items-center gap-1">
         {value === null ? (
-          <span className="rounded-full border px-2 py-0.5 text-xs">All served databases</span>
+          <span className="border px-2 py-0.5 text-xs">All served databases</span>
         ) : (
           value.map((n) => (
-            <span key={n} className="rounded-full border px-2 py-0.5 text-xs">
+            <span key={n} className="border px-2 py-0.5 text-xs">
               {n}
               {databases.length > 0 && !served.has(n) && <span className="text-muted-foreground"> (not served)</span>}
             </span>
           ))
         )}
-        {!editing && (
+        {!editing && canEdit && (
           <Button
             size="xs"
             variant="outline"
@@ -350,7 +358,7 @@ export function KeyDatabases({ databaseId, branchId, keyId, value, databases }: 
         )}
       </div>
       {editing && (
-        <div className="space-y-2 rounded-lg border p-2">
+        <div className="space-y-2 border p-2">
           <DatabaseSelector databases={databases} value={draft} onChange={setDraft} />
           <div className="flex gap-2">
             <Button

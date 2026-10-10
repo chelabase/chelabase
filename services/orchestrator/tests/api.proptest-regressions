@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d9cd4eab4655d53f5222e7ee45eeb0197ddc1e8165e77176ccb10a4006b77886 # shrinks to ops = [PutGrant { member: 0, role: Viewer, roles: ["login"] }]

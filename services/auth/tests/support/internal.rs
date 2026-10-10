@@ -34,6 +34,16 @@ pub struct FakeState {
     /// Answer refreshes with 401 and this code.
     pub refresh_error: Option<String>,
     pub next: u64,
+    /// The sign-up gate's answer (`allowed`, `reason`); open when unset.
+    pub signup: Option<(bool, String)>,
+    /// Answer the gate with this status instead.
+    pub signup_status: Option<u16>,
+    /// `(method path, query)` of every call.
+    pub queries: Vec<(String, String)>,
+    /// `(user id, token hash hex)` → the invite description JSON to answer.
+    pub invites: HashMap<(String, String), Value>,
+    /// Answer the invite description with this status instead.
+    pub describe_status: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -64,10 +74,13 @@ async fn journal(State(s): S, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    s.lock()
-        .unwrap()
-        .calls
-        .push((format!("{} {}", parts.method, parts.uri.path()), value));
+    {
+        let mut st = s.lock().unwrap();
+        let call = format!("{} {}", parts.method, parts.uri.path());
+        st.queries
+            .push((call.clone(), parts.uri.query().unwrap_or("").to_string()));
+        st.calls.push((call, value));
+    }
     next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
         .await
 }
@@ -161,6 +174,30 @@ async fn revoke_user(State(s): S, Path(user): Path<Uuid>, Json(b): Json<Value>) 
     StatusCode::NO_CONTENT
 }
 
+async fn signup_allowed(State(s): S) -> Response {
+    let st = s.lock().unwrap();
+    if let Some(status) = st.signup_status {
+        return error(StatusCode::from_u16(status).unwrap(), "unavailable");
+    }
+    let (allowed, reason) = st.signup.clone().unwrap_or((true, "open".into()));
+    Json(json!({"allowed": allowed, "reason": reason})).into_response()
+}
+
+async fn describe_invite(State(s): S, Json(q): Json<HashMap<String, String>>) -> Response {
+    let st = s.lock().unwrap();
+    if let Some(status) = st.describe_status {
+        return error(StatusCode::from_u16(status).unwrap(), "unavailable");
+    }
+    let key = (
+        q.get("user").cloned().unwrap_or_default(),
+        q.get("token_hash").cloned().unwrap_or_default(),
+    );
+    match st.invites.get(&key) {
+        Some(v) => Json(v.clone()).into_response(),
+        None => error(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
 async fn sync() -> StatusCode {
     StatusCode::ACCEPTED
 }
@@ -182,6 +219,8 @@ impl FakeInternal {
                 post(revoke_user),
             )
             .route("/internal/app/sync", post(sync))
+            .route("/internal/signup/allowed", get(signup_allowed))
+            .route("/internal/invites/describe", post(describe_invite))
             .layer(middleware::from_fn_with_state(inner.clone(), journal))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -191,6 +230,39 @@ impl FakeInternal {
             base: format!("http://{addr}"),
             inner,
         }
+    }
+
+    pub fn set_signup(&self, allowed: bool, reason: &str) {
+        self.inner.lock().unwrap().signup = Some((allowed, reason.into()));
+    }
+
+    /// An open invite for this user, whose link token hashes to `token_hash` (hex).
+    pub fn set_invite(&self, user: &str, token_hash: &str, description: Value) {
+        self.inner
+            .lock()
+            .unwrap()
+            .invites
+            .insert((user.into(), token_hash.into()), description);
+    }
+
+    pub fn set_describe_status(&self, status: Option<u16>) {
+        self.inner.lock().unwrap().describe_status = status;
+    }
+
+    pub fn set_signup_status(&self, status: Option<u16>) {
+        self.inner.lock().unwrap().signup_status = status;
+    }
+
+    /// The query strings of calls to `call` (`"GET /internal/signup/allowed"`).
+    pub fn queries(&self, call: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .queries
+            .iter()
+            .filter(|(c, _)| c == call)
+            .map(|(_, q)| q.clone())
+            .collect()
     }
 
     pub fn set_branch(&self, branch: Uuid, info: Value) {

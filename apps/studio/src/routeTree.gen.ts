@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AcceptInviteRouteImport } from './routes/accept-invite'
 import { Route as AppRouteImport } from './routes/app'
 import { Route as CallbackRouteImport } from './routes/callback'
 import { Route as LoginRouteImport } from './routes/login'
@@ -19,12 +20,18 @@ import { Route as RegisterRouteImport } from './routes/register'
 import { Route as VerifyRouteImport } from './routes/verify'
 import { Route as AppIndexRouteImport } from './routes/app.index'
 import { Route as AppApiRouteImport } from './routes/app.api'
+import { Route as AppMembersRouteImport } from './routes/app.members'
 import { Route as AppProjectsProjectIdRouteImport } from './routes/app.projects.$projectId'
 import { Route as AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRouteImport } from './routes/app.projects.$projectId_.databases.$databaseId.merges.$mergeId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AcceptInviteRoute = AcceptInviteRouteImport.update({
+  id: '/accept-invite',
+  path: '/accept-invite',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AppRoute = AppRouteImport.update({
@@ -72,6 +79,11 @@ const AppApiRoute = AppApiRouteImport.update({
   path: '/api',
   getParentRoute: () => AppRoute,
 } as any)
+const AppMembersRoute = AppMembersRouteImport.update({
+  id: '/members',
+  path: '/members',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppProjectsProjectIdRoute = AppProjectsProjectIdRouteImport.update({
   id: '/projects/$projectId',
   path: '/projects/$projectId',
@@ -86,6 +98,7 @@ const AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/accept-invite': typeof AcceptInviteRoute
   '/app': typeof AppRouteWithChildren
   '/callback': typeof CallbackRoute
   '/login': typeof LoginRoute
@@ -94,12 +107,14 @@ export interface FileRoutesByFullPath {
   '/register': typeof RegisterRoute
   '/verify': typeof VerifyRoute
   '/app/api': typeof AppApiRoute
+  '/app/members': typeof AppMembersRoute
   '/app/': typeof AppIndexRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
   '/app/projects/$projectId/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/accept-invite': typeof AcceptInviteRoute
   '/callback': typeof CallbackRoute
   '/login': typeof LoginRoute
   '/logout': typeof LogoutRoute
@@ -107,6 +122,7 @@ export interface FileRoutesByTo {
   '/register': typeof RegisterRoute
   '/verify': typeof VerifyRoute
   '/app/api': typeof AppApiRoute
+  '/app/members': typeof AppMembersRoute
   '/app': typeof AppIndexRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
   '/app/projects/$projectId/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
@@ -114,6 +130,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/accept-invite': typeof AcceptInviteRoute
   '/app': typeof AppRouteWithChildren
   '/callback': typeof CallbackRoute
   '/login': typeof LoginRoute
@@ -122,6 +139,7 @@ export interface FileRoutesById {
   '/register': typeof RegisterRoute
   '/verify': typeof VerifyRoute
   '/app/api': typeof AppApiRoute
+  '/app/members': typeof AppMembersRoute
   '/app/': typeof AppIndexRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
   '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
@@ -130,6 +148,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/accept-invite'
     | '/app'
     | '/callback'
     | '/login'
@@ -138,12 +157,14 @@ export interface FileRouteTypes {
     | '/register'
     | '/verify'
     | '/app/api'
+    | '/app/members'
     | '/app/'
     | '/app/projects/$projectId'
     | '/app/projects/$projectId/databases/$databaseId/merges/$mergeId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/accept-invite'
     | '/callback'
     | '/login'
     | '/logout'
@@ -151,12 +172,14 @@ export interface FileRouteTypes {
     | '/register'
     | '/verify'
     | '/app/api'
+    | '/app/members'
     | '/app'
     | '/app/projects/$projectId'
     | '/app/projects/$projectId/databases/$databaseId/merges/$mergeId'
   id:
     | '__root__'
     | '/'
+    | '/accept-invite'
     | '/app'
     | '/callback'
     | '/login'
@@ -165,6 +188,7 @@ export interface FileRouteTypes {
     | '/register'
     | '/verify'
     | '/app/api'
+    | '/app/members'
     | '/app/'
     | '/app/projects/$projectId'
     | '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId'
@@ -172,6 +196,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AcceptInviteRoute: typeof AcceptInviteRoute
   AppRoute: typeof AppRouteWithChildren
   CallbackRoute: typeof CallbackRoute
   LoginRoute: typeof LoginRoute
@@ -188,6 +213,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/accept-invite': {
+      id: '/accept-invite'
+      path: '/accept-invite'
+      fullPath: '/accept-invite'
+      preLoaderRoute: typeof AcceptInviteRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/app': {
@@ -253,6 +285,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppApiRouteImport
       parentRoute: typeof AppRoute
     }
+    '/app/members': {
+      id: '/app/members'
+      path: '/members'
+      fullPath: '/app/members'
+      preLoaderRoute: typeof AppMembersRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/app/projects/$projectId': {
       id: '/app/projects/$projectId'
       path: '/projects/$projectId'
@@ -272,6 +311,7 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppApiRoute: typeof AppApiRoute
+  AppMembersRoute: typeof AppMembersRoute
   AppIndexRoute: typeof AppIndexRoute
   AppProjectsProjectIdRoute: typeof AppProjectsProjectIdRoute
   AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute: typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
@@ -279,6 +319,7 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppApiRoute: AppApiRoute,
+  AppMembersRoute: AppMembersRoute,
   AppIndexRoute: AppIndexRoute,
   AppProjectsProjectIdRoute: AppProjectsProjectIdRoute,
   AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute:
@@ -289,6 +330,7 @@ const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AcceptInviteRoute: AcceptInviteRoute,
   AppRoute: AppRouteWithChildren,
   CallbackRoute: CallbackRoute,
   LoginRoute: LoginRoute,

@@ -63,7 +63,89 @@ pub fn openapi() -> OpenApi {
             )]);
         }
     }
+    document_access(&mut doc);
     doc
+}
+
+/// Adds each operation's access answers (from its endpoint's `Access` in `chelabase_routes`,
+/// the one table of who may call what) to its 403 and 404 descriptions.
+fn document_access(doc: &mut OpenApi) {
+    use chelabase_types::access::Access;
+    const ADMISSION: &str = "`no_access_yet`: you have no grant on any project yet (ask a tenant admin); \
+`pending_approval`: you signed up and an admin hasn't approved you yet; \
+`not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant";
+    for (path, item) in doc.paths.paths.iter_mut() {
+        let ops = [
+            ("GET", item.get.as_mut()),
+            ("POST", item.post.as_mut()),
+            ("PUT", item.put.as_mut()),
+            ("PATCH", item.patch.as_mut()),
+            ("DELETE", item.delete.as_mut()),
+        ];
+        for (method, op) in ops {
+            let Some(op) = op else { continue };
+            let Some(endpoint) = chelabase_routes::ENDPOINTS.iter().find(|e| {
+                e.service == Service::Orchestrator && e.method.as_str() == method && e.path == path
+            }) else {
+                continue;
+            };
+            let (forbidden, not_found) = match endpoint.policy.access {
+                Access::Public | Access::DataKey | Access::SignedIn => continue,
+                Access::TenantMember => (
+                    ADMISSION.to_string(),
+                    "you were removed from the tenant".to_string(),
+                ),
+                Access::TenantAdmin => (
+                    format!("`forbidden`: only a tenant admin may (`required`: `tenant admin`); {ADMISSION}"),
+                    "you were removed from the tenant".to_string(),
+                ),
+                Access::Instance => (
+                    format!("`forbidden`: only an instance admin may (`required`: `instance admin`); {ADMISSION}"),
+                    "you were removed from the tenant".to_string(),
+                ),
+                Access::Project(min) => (
+                    format!(
+                        "`forbidden`: your role on the project is below `{}` (`required` names it); {ADMISSION}",
+                        min.as_str()
+                    ),
+                    "you have no access to it".to_string(),
+                ),
+                Access::Branch { unprotected, protected } => (
+                    format!(
+                        "`forbidden`: your role on the project is below `{}`, or `{}` on a protected branch (for a merge, the branch merged into; `required` names it); {ADMISSION}",
+                        unprotected.as_str(),
+                        protected.as_str()
+                    ),
+                    "you have no access to it".to_string(),
+                ),
+                Access::ActAs(min) => (
+                    format!(
+                        "`forbidden`: your role on the project is below `{}`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); {ADMISSION}",
+                        min.as_str()
+                    ),
+                    "you have no access to it".to_string(),
+                ),
+            };
+            let responses = &mut op.responses.responses;
+            // Every operation documents its 401 with the error envelope: a missing 403 or 404
+            // starts from it.
+            let template = responses.get("401").cloned();
+            for (status, text) in [("403", forbidden), ("404", format!("`not_found`: {not_found}"))] {
+                match responses.get_mut(status) {
+                    Some(utoipa::openapi::RefOr::T(response)) => {
+                        response.description = format!("{}; {text}", response.description);
+                    }
+                    Some(utoipa::openapi::RefOr::Ref(_)) => {}
+                    None => {
+                        if let Some(utoipa::openapi::RefOr::T(mut response)) = template.clone() {
+                            response.description = text;
+                            responses.insert(status.to_string(), utoipa::openapi::RefOr::T(response));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn operations_mut(item: &mut PathItem) -> impl Iterator<Item = &mut Operation> {
@@ -214,6 +296,20 @@ impl MetadataPort for Doc {
         match *self {}
     }
     async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
+        match *self {}
+    }
+    async fn member_branch_roles(
+        &self,
+        branch: Uuid,
+    ) -> Result<Vec<chelabase_metadata::members::MemberBranchRole>, MetadataError> {
+        match *self {}
+    }
+    async fn record_member_acted_role(
+        &self,
+        member: Uuid,
+        branch: Uuid,
+        role: &str,
+    ) -> Result<bool, MetadataError> {
         match *self {}
     }
     async fn role_password(
@@ -370,7 +466,6 @@ impl MetadataPort for Doc {
     async fn list_saved_queries(
         &self,
         database: Uuid,
-        user: &str,
     ) -> Result<Vec<SavedQuerySummary>, MetadataError> {
         match *self {}
     }
@@ -378,7 +473,6 @@ impl MetadataPort for Doc {
     async fn get_saved_query(
         &self,
         database: Uuid,
-        user: &str,
         id: Uuid,
     ) -> Result<Option<SavedQuery>, MetadataError> {
         match *self {}
@@ -388,6 +482,7 @@ impl MetadataPort for Doc {
         &self,
         database: Uuid,
         user: &str,
+        author: Option<Uuid>,
         id: Uuid,
         name: &str,
         sql: &str,
@@ -400,7 +495,7 @@ impl MetadataPort for Doc {
     async fn update_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
         version: i32,
         patch: &SavedQueryPatch,
@@ -411,7 +506,7 @@ impl MetadataPort for Doc {
     async fn delete_saved_query(
         &self,
         database: Uuid,
-        user: &str,
+        by: SavedQueryEditor,
         id: Uuid,
     ) -> Result<bool, MetadataError> {
         match *self {}
@@ -455,6 +550,37 @@ impl MetadataPort for Doc {
     async fn branch_has_busy_merge(&self, branch: BranchId) -> Result<Option<chelabase_metadata::BranchBusy>, MetadataError> {
         match *self {}
     }
+    async fn member_by_zitadel(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<Option<MemberRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn ensure_member(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: chelabase_metadata::members::Admission,
+    ) -> Result<MemberRecord, MetadataError> {
+        match *self {}
+    }
+    async fn grant_rows(
+        &self,
+        member: Uuid,
+        project: Uuid,
+        database: Option<Uuid>,
+    ) -> Result<GrantRows, MetadataError> {
+        match *self {}
+    }
+    async fn member_projects(&self, member: Uuid) -> Result<Vec<(Uuid, GrantRow)>, MetadataError> {
+        match *self {}
+    }
+    async fn member_overrides(&self, member: Uuid) -> Result<Vec<(Uuid, Uuid, chelabase_metadata::members::OverrideRow)>, MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -487,12 +613,16 @@ impl JobPort for Doc {
     ) -> Result<CheckDataRoleReply, ResetError> {
         match *self {}
     }
-    async fn grant_data_role_to_owner(
+    async fn reconcile_member_roles(
         &self,
-        branch: BranchId,
-        role: &str,
-        owner: &str,
-    ) -> Result<CheckDataRoleReply, ResetError> {
+        request: chelabase_nats::MemberRolesReconcileRequest,
+    ) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
+        match *self {}
+    }
+    async fn hand_over_member_role(
+        &self,
+        request: chelabase_nats::MemberRoleHandOverRequest,
+    ) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
         match *self {}
     }
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
@@ -552,6 +682,162 @@ impl JobPort for Doc {
         match *self {}
     }
 }
+
+#[allow(unused_variables)]
+impl members::MemberRolesQueue for Doc {
+    async fn enqueue_member_roles(&self, branch: BranchId) -> Result<(), BoxError> {
+        match *self {}
+    }
+}
+
+#[allow(unused_variables)]
+impl members::MembersPort for Doc {
+    async fn member(&self, member: Uuid) -> Result<Option<MemberRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn member_by_email(&self, tenant: TenantId, email: &str) -> Result<Option<MemberRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn list_members(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<chelabase_metadata::members::MemberListing>, MetadataError> {
+        match *self {}
+    }
+    async fn member_listing(
+        &self,
+        member: Uuid,
+    ) -> Result<Option<chelabase_metadata::members::MemberListing>, MetadataError> {
+        match *self {}
+    }
+    async fn open_invites(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<chelabase_metadata::members::OpenInvite>, MetadataError> {
+        match *self {}
+    }
+    async fn invite(
+        &self,
+        invite: Uuid,
+    ) -> Result<Option<(Uuid, chrono::DateTime<chrono::Utc>, DocStamp, DocStamp)>, MetadataError> {
+        match *self {}
+    }
+    async fn project_access(
+        &self,
+        project: Uuid,
+    ) -> Result<chelabase_metadata::members::ProjectAccess, MetadataError> {
+        match *self {}
+    }
+    async fn project_branches(&self, project: Uuid) -> Result<Vec<Uuid>, MetadataError> {
+        match *self {}
+    }
+    async fn open_signup(&self, tenant: TenantId) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn admin_claimed_since(&self, tenant: TenantId, since: chrono::DateTime<chrono::Utc>) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn access_events(
+        &self,
+        tenant: TenantId,
+        project: Option<Uuid>,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<chelabase_metadata::members::AccessEvent>, MetadataError> {
+        match *self {}
+    }
+    async fn set_tenant_admin(&self, actor: Option<Uuid>, member: Uuid, admin: bool) -> Result<(), DocWriteError> {
+        match *self {}
+    }
+    async fn remove_member(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, DocWriteError> {
+        match *self {}
+    }
+    async fn put_project_grant(&self, actor: Uuid, member: Uuid, project: Uuid, grant: &GrantRow, expect: &chelabase_metadata::members::Observed) -> Result<bool, DocWriteError> {
+        match *self {}
+    }
+    async fn put_project_grants(&self, actor: Uuid, member: Uuid, grants: &[(Uuid, GrantRow)], expect: &[chelabase_metadata::members::Observed]) -> Result<Vec<Uuid>, DocWriteError> {
+        match *self {}
+    }
+    async fn delete_project_grant(&self, actor: Uuid, member: Uuid, project: Uuid) -> Result<(), DocWriteError> {
+        match *self {}
+    }
+    async fn put_override(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        database: Uuid,
+        o: &chelabase_metadata::members::OverrideRow,
+        expect: &chelabase_metadata::members::Observed,
+    ) -> Result<bool, DocWriteError> {
+        match *self {}
+    }
+    async fn delete_override(&self, actor: Uuid, member: Uuid, database: Uuid, expect: &chelabase_metadata::members::Observed) -> Result<(), DocWriteError> {
+        match *self {}
+    }
+    async fn create_invited_member(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+        email: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        token_hash: [u8; 32],
+        grants: &[(Uuid, GrantRow)],
+    ) -> Result<(chelabase_metadata::members::MemberListing, Uuid), DocWriteError> {
+        match *self {}
+    }
+    async fn add_existing_user(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+        email: &str,
+        name: &str,
+        grants: &[(Uuid, chelabase_metadata::members::GrantRow)],
+    ) -> Result<chelabase_metadata::members::MemberListing, DocWriteError> {
+        match *self {}
+    }
+    async fn resend_invite(
+        &self,
+        actor: Uuid,
+        invite: Uuid,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        token_hash: [u8; 32],
+    ) -> Result<(), DocWriteError> {
+        match *self {}
+    }
+    async fn revoke_invite(&self, actor: Uuid, invite: Uuid) -> Result<String, DocWriteError> {
+        match *self {}
+    }
+    async fn revoke_undelivered_invite(&self, actor: Uuid, invite: Uuid) -> Result<String, DocWriteError> {
+        match *self {}
+    }
+    async fn set_open_signup(&self, actor: Uuid, tenant: TenantId, on: bool) -> Result<(), DocWriteError> {
+        match *self {}
+    }
+    async fn approve_member(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        grants: &[(Uuid, GrantRow)],
+    ) -> Result<chelabase_metadata::members::MemberListing, DocWriteError> {
+        match *self {}
+    }
+    async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, DocWriteError> {
+        match *self {}
+    }
+    async fn set_tenant_display_name(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        display_name: Option<&str>,
+    ) -> Result<(), DocWriteError> {
+        match *self {}
+    }
+}
+
+type DocStamp = Option<chrono::DateTime<chrono::Utc>>;
+type DocWriteError = chelabase_metadata::members::AccessWriteError;
 
 #[cfg(test)]
 mod tests {
@@ -649,10 +935,18 @@ mod tests {
                 "deleteRole",
             ),
             ("DELETE /v1/databases/{id}/sql-queries/{query_id}", "deleteSavedQuery"),
+            ("DELETE /v1/invites/{invite_id}", "revokeInvite"),
+            ("DELETE /v1/members/{member_id}", "removeMember"),
             ("DELETE /v1/projects/{id}", "deleteProject"),
             ("DELETE /v1/projects/{id}/app-users", "disableAppUsers"),
+            ("DELETE /v1/projects/{id}/grants/{member_id}", "deleteProjectGrant"),
+            (
+                "DELETE /v1/projects/{id}/grants/{member_id}/overrides",
+                "deleteGrantOverride",
+            ),
             ("DELETE /v1/projects/{id}/users/{user_id}", "deleteAppUser"),
             ("DELETE /v1/projects/{id}/users/{user_id}/sessions", "revokeAppUserSessions"),
+            ("GET /v1/access-events", "listAccessEvents"),
             ("GET /v1/databases/{id}", "getDatabase"),
             ("GET /v1/databases/{id}/branches", "listBranches"),
             (
@@ -693,10 +987,15 @@ mod tests {
             ("GET /v1/databases/{id}/merges/{merge_id}/plan.sql", "exportMergePlan"),
             ("GET /v1/databases/{id}/sql-queries", "listSavedQueries"),
             ("GET /v1/databases/{id}/sql-queries/{query_id}", "getSavedQuery"),
+            ("GET /v1/instance/settings", "getInstanceSettings"),
+            ("GET /v1/invites/delivery", "getInviteDelivery"),
             ("GET /v1/me", "getMe"),
+            ("GET /v1/members", "listMembers"),
             ("GET /v1/projects", "listProjects"),
             ("GET /v1/projects/{id}", "getProject"),
+            ("GET /v1/projects/{id}/access-events", "listProjectAccessEvents"),
             ("GET /v1/projects/{id}/app-users", "getAppUsers"),
+            ("GET /v1/projects/{id}/grants", "listProjectGrants"),
             ("GET /v1/projects/{id}/users", "listAppUsers"),
             ("GET /v1/projects/{id}/users/{user_id}", "getAppUser"),
             ("GET /v1/projects/{id}/users/{user_id}/sessions", "listAppUserSessions"),
@@ -719,8 +1018,11 @@ mod tests {
             ),
             ("PATCH /v1/databases/{id}/merges/{merge_id}", "updateMerge"),
             ("PATCH /v1/databases/{id}/sql-queries/{query_id}", "updateSavedQuery"),
+            ("PATCH /v1/instance/settings", "updateInstanceSettings"),
+            ("PATCH /v1/members/{member_id}", "updateMember"),
             ("PATCH /v1/projects/{id}", "updateProject"),
             ("PATCH /v1/projects/{id}/users/{user_id}", "updateAppUser"),
+            ("PATCH /v1/tenant", "updateTenant"),
             ("POST /v1/databases", "createDatabase"),
             ("POST /v1/databases/{id}/branches", "createBranch"),
             (
@@ -780,11 +1082,21 @@ mod tests {
                 "resetDatabasePassword",
             ),
             ("POST /v1/databases/{id}/sql-queries", "createSavedQuery"),
+            ("POST /v1/invites", "createInvite"),
+            ("POST /v1/invites/{invite_id}/resend", "resendInvite"),
+            ("POST /v1/members/{member_id}/approve", "approveMember"),
+            ("POST /v1/members/{member_id}/decline", "declineMember"),
             ("POST /v1/projects", "createProject"),
+            ("POST /v1/projects/{id}/invites", "createProjectInvite"),
             ("POST /v1/projects/{id}/users", "createAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/deactivate", "deactivateAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/reactivate", "reactivateAppUser"),
             ("PUT /v1/projects/{id}/app-users", "putAppUsers"),
+            ("PUT /v1/projects/{id}/grants/{member_id}", "putProjectGrant"),
+            (
+                "PUT /v1/projects/{id}/grants/{member_id}/overrides",
+                "putGrantOverride",
+            ),
         ];
         let expected: Vec<(String, String)> = expected
             .iter()
@@ -813,7 +1125,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -893,7 +1205,10 @@ mod tests {
             .map(String::as_str)
             .collect();
         let expected = [
+            "AccessEvent",
+            "AccessEventPage",
             "AfterMerge",
+            "AllRoles",
             "AppUser",
             "AppUserPage",
             "AppUserSession",
@@ -902,6 +1217,7 @@ mod tests {
             "AppUsersStatusView",
             "AppUsersTable",
             "ApplyRequest",
+            "ApproveMemberRequest",
             "ArgDesc",
             "Branch",
             "BranchDatabaseView",
@@ -917,8 +1233,10 @@ mod tests {
             "CreateBranchRequest",
             "CreateDatabaseAccepted",
             "CreateDatabaseRequest",
+            "CreateInviteRequest",
             "CreateKeyRequest",
             "CreateMergeRequest",
+            "CreateProjectInviteRequest",
             "CreateProjectRequest",
             "CreateRoleRequest",
             "CreateSavedQueryRequest",
@@ -934,14 +1252,30 @@ mod tests {
             "DatabaseStatus",
             "DatabaseSummary",
             "DeleteProjectRequest",
+            "Delivery",
+            "DeliveryReason",
             "Direction",
             "ErrorBody",
             "ErrorCode",
             "ErrorEnvelope",
             "FinishRequest",
             "FunctionDesc",
-            "Me",
+            "GrantOverride",
+            "InstanceSettings",
+            "Invite",
+            "InviteDelivery",
+            "InviteGrant",
+            "InviteOutcome",
+            "InviteResult",
+            "MeAdmin",
+            "MeDatabase",
+            "MeMember",
+            "MeProject",
+            "MeResponse",
+            "MeRoles",
             "MeUser",
+            "Member",
+            "MemberStatusView",
             "Merge",
             "MergeDetail",
             "MergeLogEntry",
@@ -951,15 +1285,21 @@ mod tests {
             "OnDelete",
             "OperationAccepted",
             "PasswordState",
+            "PlatformRole",
             "PointInTime",
             "Privilege",
             "Project",
+            "ProjectGrant",
             "ProjectId",
             "ProjectInfo",
             "ProjectStatusView",
             "PutAppUsersRequest",
+            "PutGrantOverrideRequest",
+            "PutGrantRequest",
             "RecomputeRequest",
             "RehearseRequest",
+            "ResendInviteRequest",
+            "ResentInvite",
             "ResolutionBody",
             "RestoreAccepted",
             "RestoreRequest",
@@ -977,15 +1317,19 @@ mod tests {
             "TableKind",
             "Tenant",
             "TenantId",
+            "TenantName",
             "UpdateAppUserRequest",
             "UpdateBranchRequest",
             "UpdateDatabaseRequest",
+            "UpdateInstanceSettingsRequest",
             "UpdateKeyRequest",
+            "UpdateMemberRequest",
             "UpdateMergeRequest",
             "UpdatePgDatabaseRequest",
             "UpdateProjectRequest",
             "UpdateRoleRequest",
             "UpdateSavedQueryRequest",
+            "UpdateTenantRequest",
             "UserStepBody",
         ];
         // The names are map keys, so a clash between two types would drop one from this list.

@@ -1,0 +1,46 @@
+---
+title: Roles and schema isolation
+description: Give a team its own schema by letting its members act as a group role, with the billing example, and what each platform role can reach.
+---
+
+A grant doesn't hand a Developer the database owner. It names the **Postgres roles** they may act as, and Postgres' own privileges decide the rest. That makes a schema per team easy: a group role owns the schema, and only the members granted that role can change it.
+
+## The billing example
+
+As the project Admin (or the owner, over `psql`), in the SQL editor:
+
+```sql
+CREATE ROLE billing NOLOGIN;
+CREATE SCHEMA billing AUTHORIZATION billing;
+SET ROLE billing;
+CREATE TABLE billing.invoices (id bigint PRIMARY KEY, amount numeric NOT NULL);
+```
+
+Now grant Dana the **Developer** role on the project, with the Postgres role `billing` (the project's Access tab, or `PUT /v1/projects/{id}/grants/{member_id}` with `platform_role: "developer"` and `pg_roles: ["billing"]`). Then, as Dana:
+
+| What Dana does | Result |
+|---|---|
+| SQL editor, **Run as** `billing`, `INSERT INTO billing.invoices …` | Works: `billing` owns the schema. |
+| Same, `CREATE TABLE public.t …` or a write to another schema | Refused by Postgres (`permission denied`): `billing` owns nothing there. |
+| **Run as** the owner (`postgres`) | 403 `forbidden` with `required: "owner"`. Only an Admin acts as the owner, so Studio's **Run as** list leaves **Owner** out for a Developer. |
+| **Run as** a role that isn't in Dana's grant (`sales`) | 403 `forbidden` with `required: "role:sales"`. |
+| Tables console as `billing` | Browses and edits the tables `billing` can reach. |
+
+Another Developer granted no `billing` role gets a 403 for `billing`, so only the people you named can change that schema. A Viewer granted `billing` can read through the console as `billing` (select only) but can't run SQL: the SQL editor needs Developer.
+
+## How it works
+
+A Developer or Viewer never gets the owner's connection; an Admin may use it (the Admin role includes the owner). Each other member who acts as a role on a branch has a login role of their own, `cb_m_<id>`, that holds no privileges and can only `SET ROLE` into the roles in their effective grant. A run connects as that role, switches to the one you picked and can't switch back to anything wider: `RESET ROLE` returns to the empty member role, not the owner. When the run ends, whatever the member role was left holding is handed to the role the member last acted as (and dropped if that role is gone), never to the owner.
+
+Member roles are created, updated and dropped by a reconciler on the branch whenever a grant, an override, a branch or a role changes. They are hidden from Studio's role lists, from schema merges and from the Data API, and can't log in through the public proxy. A revoke takes effect on the very next request, and the reconciler then cuts the member's open sessions.
+
+## What to put in a grant
+
+- **Grant `NOLOGIN` group roles.** A role that can log in is an application's identity, so acting as it is Admin-only. Make a group that owns or is granted the privileges, and grant that.
+- **A role carries its chain.** Granting `billing_admin` that can `SET ROLE billing` lets the member act as `billing` too. If any role in the chain is owner-level (superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), a `LOGIN` role, a reserved role, it can be held only with the Admin platform role: a grant below Admin that includes it is refused (422), and a member role never receives that part of a chain. A chain that holds `ADMIN` on another role is different: it is refused with 422 at grant time at every level, Admin included.
+- **Data keys follow the same rule.** A Developer creates a data key for a role they may act as; a key bound to an owner-level, `LOGIN` or reserved role (or a chain reaching one) needs an Admin.
+- **Narrow per database with Postgres privileges**, or with a grant override on a single Chelabase database. Overrides only narrow. See [Members and invites](/docs/using/members-and-invites#per-database-overrides).
+
+`anon` and `authenticated`, the Data API's own roles, can be granted like any other role; the console and SQL editor run as them without a special case.
+
+For the roles the Roles API manages, see [Login roles](/docs/using/login-roles). Every route's required level is in [Access per route](/docs/reference/access).

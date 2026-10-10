@@ -5,17 +5,17 @@ description: Sign up, create a database and connect to it.
 
 This takes you from a running stack to a database you can connect to. It uses self-hosted mode, the dev mode, and needs Docker (the worker starts each database's compute container).
 
-## 1. Start the stack and sign up
+## 1. Start the stack and sign in
 
-1. Run `just dev`, then open [http://localhost:3000](http://localhost:3000) and choose **Create account** (or **Sign in**).
-2. You land in Studio straight away: email verification is off in self-hosted mode. Emails such as password resets land in Mailpit at [http://localhost:8025](http://localhost:8025).
+1. Run `just dev`, then open [http://localhost:3000](http://localhost:3000) and choose **Sign in** as the bootstrap admin: `just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost` (or the email you pass to it, `just zitadel-bootstrap you@example.com`) the tenant admin.
+2. You land in Studio. Set the bootstrap admin before you expose Studio to anyone: until a tenant has its first member, the first person to sign in claims the admin, so run `just zitadel-bootstrap you@example.com` (positional) first; that fresh-install window exists until the first bootstrap. `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential on self-hosted dev: keep it private. Emails such as invites and password resets land in Mailpit at [http://localhost:8025](http://localhost:8025).
 3. On `/app` you see your project, its databases, and a form to create one.
 
 <Callout type="info">
-Everyone who signs up joins the same organization, tenant and project, a shared team workspace. Use `http://localhost:3000`; visits to `127.0.0.1:3000` are redirected there, because the sign-in redirect and the gateway's CORS settings are registered for `localhost`.
+Self-sign-up is off by default: an admin invites everyone else (an email, or a link to hand over when Zitadel has no email provider), and they join the same organization and tenant, a shared team workspace. An admin can switch open sign-up on; people who then sign up wait for approval. Use `http://localhost:3000`; visits to `127.0.0.1:3000` are redirected there, because the sign-in redirect and the gateway's CORS settings are registered for `localhost`.
 </Callout>
 
-To require a verification code (it lands in Mailpit), set `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true`; `=false` turns it off. Without it the default follows the mode: off when self-hosted, required in platform mode.
+When sign-up is open, the sign-up's email verification follows `CHELABASE_REQUIRE_EMAIL_VERIFICATION` (`true` requires a code, which lands in Mailpit; `false` turns it off); without it the default follows the mode: off when self-hosted, required in platform mode. Invitees verify their email by accepting the invite.
 
 ## 2. Create a database
 
@@ -46,4 +46,5 @@ Delete the database in Studio (it asks you to type the name) or with `DELETE /v1
 ## Next
 
 - Query the database from your app with the [data API](/docs/using/data-api) and its [TypeScript client](/docs/using/client).
+- Bring in your team with [members and invites](/docs/using/members-and-invites), and scope what each person can reach with [roles and schema isolation](/docs/using/roles-and-schema-isolation).
 - Learn how [projects and databases](/docs/using/projects-and-databases) and [branches](/docs/using/branches) work.

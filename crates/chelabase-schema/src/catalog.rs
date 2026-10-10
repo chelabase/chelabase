@@ -20,7 +20,7 @@ pub const CATALOG_SQL: &str = include_str!("catalog_sql.sql");
 /// [`CATALOG_SQL`]'s filter on the data API's per-schema default-privilege grants to `anon` and
 /// `authenticated` (P6), on the owner's rows only (T14 M5: a user's own `FOR ROLE other … TO
 /// authenticated` row stays).
-const DATA_API_DEFAULT_ACL_FILTER: &str = "WHERE NOT (d.defaclnamespace <> 0 AND dr.rolname = 'postgres'\n                       AND coalesce(ge.rolname, '') IN ('anon', 'authenticated'))";
+const DATA_API_DEFAULT_ACL_FILTER: &str = "\n              AND NOT (d.defaclnamespace <> 0 AND dr.rolname = 'postgres'\n                       AND coalesce(ge.rolname, '') IN ('anon', 'authenticated'))";
 
 /// [`CATALOG_SQL`] keeping the data API's per-schema default-privilege rows: the `default_acl`
 /// model [`crate::compare::expected_model`] simulates new objects' grants with (P7). The tables a
@@ -930,6 +930,24 @@ mod tests {
             "lower(r.rolname) LIKE '{}%'",
             exclusions::CHELABASE_ROLE_PREFIX.replace('_', "\\_")
         ));
+        // Both the `reserved` and the `hidden` CTE carry both prefixes (checked per CTE below).
+        let cte = |start: &str| {
+            let from = CATALOG_SQL.find(start).unwrap_or_else(|| panic!("no {start}"));
+            let len = CATALOG_SQL[from..].find("\n),").unwrap();
+            &CATALOG_SQL[from..from + len]
+        };
+        for slice in [cte("reserved AS ("), cte("hidden AS (")] {
+            for prefix in [
+                exclusions::CHELABASE_ROLE_PREFIX,
+                exclusions::MEMBER_ROLE_PREFIX,
+            ] {
+                let like = format!("lower(r.rolname) LIKE '{}%'", prefix.replace('_', "\\_"));
+                assert!(slice.contains(&like), "{like} missing in {slice}");
+            }
+        }
+        // Memberships of or by a hidden role are not read.
+        assert!(CATALOG_SQL.contains("AND mr.oid NOT IN (SELECT oid FROM hidden)"));
+        assert!(CATALOG_SQL.contains("AND mg.oid NOT IN (SELECT oid FROM hidden)"));
         // E16, and M5: the data API's per-schema filter only for the owner's rows.
         names.push(exclusions::DATA_API_FUNCTIONS_DEFAULT_ACL.to_string());
         names.push(format!(
@@ -953,6 +971,11 @@ mod tests {
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL search_path = pg_catalog;\n"
         ));
         assert!(CATALOG_SQL.trim_end().ends_with("COMMIT;"));
+        // Every aclexplode (one per ACL read) has its grantee filter against the hidden roles.
+        assert_eq!(
+            CATALOG_SQL.matches("aclexplode(").count(),
+            CATALOG_SQL.matches("grantee NOT IN (SELECT oid FROM hidden)").count()
+        );
         assert!(
             !CATALOG_SQL.contains("pg_authid "),
             "roles come from pg_roles"

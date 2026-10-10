@@ -11,7 +11,7 @@ export function studioScopes(env: StudioEnv): string[] {
     "urn:zitadel:iam:user:resourceowner",
     // Adds the project to `aud`, matching the gateway's CHELABASE_ZITADEL_AUDIENCES.
     `urn:zitadel:iam:org:project:id:${env.projectId}:aud`,
-    // Pins sign-in and sign-up to the bootstrapped org (single-org mode).
+    // Pins sign-in and sign-up (when the tenant allows it) to the bootstrapped org (single-org mode).
     // Drop this to let each signup create its own organization.
     `urn:zitadel:iam:org:id:${env.orgId}`,
   ];

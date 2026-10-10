@@ -600,6 +600,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return self.abandon_branch_gone(id, rec).await;
         }
         info!(branch_id = %id, endpoint_id = %rec.endpoint_id, %lsn, elapsed_ms = elapsed_ms(started), "branch ready");
+        // The child inherited its parent's member roles and their passwords: the reconcile
+        // gives them fresh passwords and this branch's memberships.
+        self.member_role_requests.request(id);
         Ok(())
     }
 
@@ -1689,7 +1692,8 @@ mod tests {
         assert!(!row(&w, &dev_ep, "grp").unwrap().login);
         assert!(!script.contains("\"admin\""), "{script}");
         assert!(!script.contains("nopass"), "{script}");
-        assert!(row(&w, &dev_ep, "nopass").is_none());
+        // A role without a password gets no fresh one; it's still listed (no verifier).
+        assert_eq!(row(&w, &dev_ep, "nopass").map(|r| r.verifier), Some(None));
         // The missing API role is re-created with its fresh password.
         let admin = row(&w, &dev_ep, "admin").unwrap();
         let admin_verifier = admin.verifier.unwrap();

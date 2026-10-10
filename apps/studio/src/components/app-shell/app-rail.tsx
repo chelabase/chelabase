@@ -12,10 +12,11 @@ import {
 } from "react";
 import { ClawMark, Wordmark } from "@chelabase/lagoon/crab-marks";
 import type { RailBehaviour } from "@/lib/rail-preference";
+import { useMediaQuery } from "@/lib/use-media-query";
 import { cn } from "@/lib/utils";
 import { RailBehaviourMenu } from "./rail-behaviour-menu";
 import { RailItem } from "./rail-item";
-import { RAIL_ENTRIES } from "./rail-items";
+import { RAIL_ENTRIES, type RailBadges } from "./rail-items";
 
 /** Hover mode: how long the pointer must rest on the rail before it widens. */
 export const HOVER_OPEN_DELAY_MS = 150;
@@ -25,6 +26,8 @@ export const HOVER_CLOSE_DELAY_MS = 200;
 export interface AppRailProps {
   behaviour: RailBehaviour;
   onBehaviourChange: (next: RailBehaviour) => void;
+  /** Counts on rail items (Members: sign-up requests waiting). */
+  badges?: RailBadges;
 }
 
 /**
@@ -53,7 +56,12 @@ function HomeLink({ children }: { children: ReactNode }) {
  * rail keeps a 56px slot in the grid and its panel widens over the page when the
  * pointer rests on it, focus enters it, or its behaviour menu is open.
  */
-export function AppRail({ behaviour, onBehaviourChange }: AppRailProps) {
+export function AppRail({ behaviour: chosen, onBehaviourChange, badges }: AppRailProps) {
+  // Below 40rem a pinned-open rail would take most of the width (and scroll the page sideways):
+  // it keeps the narrow slot and opens over the page, as in hover mode. The menu still shows
+  // the chosen setting.
+  const narrow = useMediaQuery("(max-width: 40rem)");
+  const behaviour: RailBehaviour = narrow && chosen === "expanded" ? "hover" : chosen;
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navRef = useRef<HTMLElement>(null);
   const openTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -186,6 +194,7 @@ export function AppRail({ behaviour, onBehaviourChange }: AppRailProps) {
           pathname={pathname}
           expanded={expanded}
           tooltip={behaviour === "collapsed"}
+          badge={entry.kind === "link" ? badges?.[entry.id] : undefined}
         />
       ))}
     </ul>
@@ -225,7 +234,7 @@ export function AppRail({ behaviour, onBehaviourChange }: AppRailProps) {
         </div>
         <div className="shrink-0 border-t border-line py-2">
           <RailBehaviourMenu
-            behaviour={behaviour}
+            behaviour={chosen}
             onBehaviourChange={onBehaviourChange}
             onOpenChange={handleMenuOpenChange}
             labelsVisible={expanded}

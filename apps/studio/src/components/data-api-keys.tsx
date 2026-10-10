@@ -11,6 +11,7 @@ import {
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { OWNER_LEVEL_TRAITS } from "@/lib/console";
+import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { CopyButton } from "./copy-button";
 import { DatabaseSelector, KeyDatabases, selectionReason } from "./data-api-databases";
@@ -29,6 +30,8 @@ type Pending = { kind: "revoke" | "rotate"; key: DataKey } | null;
 const utc = (iso: string) => `${new Date(iso).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 
 export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKeysProps) {
+  // Creating, rotating and revoking keys are Developer's; Viewers see the list.
+  const canChange = useProjectCaps().atLeast("developer");
   const queryClient = useQueryClient();
   const refreshKeys = (id: string, branch: string) =>
     queryClient.invalidateQueries({ queryKey: getListKeysQueryKey(id, branch) });
@@ -90,7 +93,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
     }
   }
 
-  const field = "h-8 rounded-lg border border-input bg-background px-2 text-sm";
+  const field = "h-8 border border-input bg-background px-2 text-sm";
   return (
     <div className="space-y-2">
       <h3 className="text-sm font-medium">Secret keys</h3>
@@ -115,7 +118,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
                   {k.name}
                   {k.role_blocked && (
                     <span className="mt-0.5 flex flex-col gap-0.5">
-                      <span className="w-fit rounded-full border border-destructive px-2 py-0.5 text-xs text-destructive">
+                      <span className="w-fit border border-destructive px-2 py-0.5 text-xs text-destructive">
                         Blocked
                       </span>
                       <span className="text-xs text-muted-foreground">
@@ -125,7 +128,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
                   )}
                   {k.bypasses_rls && !k.role_blocked && (
                     <span className="mt-0.5 flex flex-col gap-0.5">
-                      <span className="w-fit rounded-full border border-destructive px-2 py-0.5 text-xs text-destructive">
+                      <span className="w-fit border border-destructive px-2 py-0.5 text-xs text-destructive">
                         Bypasses RLS
                       </span>
                       <span className="text-xs text-muted-foreground">it reads and writes past row-level security</span>
@@ -139,6 +142,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
                 </td>
                 <td className="py-1">{k.last_used_at ? utc(k.last_used_at) : "never"}</td>
                 <td className="py-1">
+                  {canChange && (
                   <div className="flex gap-2">
                     <Button
                       size="xs"
@@ -161,6 +165,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
                       Revoke
                     </Button>
                   </div>
+                  )}
                 </td>
               </tr>
             ))}
@@ -174,7 +179,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
         </p>
       )}
       {pending && (
-        <div className="space-y-2 rounded-lg border p-3 text-sm">
+        <div className="space-y-2 border p-3 text-sm">
           <p>
             {pending.kind === "revoke"
               ? `Revoke ${pending.key.name}? Anything using it stops working within 30 seconds.`
@@ -192,10 +197,10 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
       )}
 
       {shown && (
-        <section aria-label="New key" className="space-y-2 rounded-lg border p-3 text-sm">
+        <section aria-label="New key" className="space-y-2 border p-3 text-sm">
           <p>Copy this key now. It won&apos;t be shown again.</p>
           <div className="flex flex-wrap items-center gap-2">
-            <code className="rounded bg-muted px-1.5 py-0.5 text-xs break-all">{shown.key}</code>
+            <code className="bg-muted px-1.5 py-0.5 text-xs break-all">{shown.key}</code>
             <CopyButton value={shown.key} label="Copy key" />
           </div>
           <Button size="sm" variant="outline" onClick={() => setShown(null)}>
@@ -204,6 +209,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
         </section>
       )}
 
+      {canChange && (
       <form onSubmit={create} className="flex flex-wrap items-end gap-3 text-sm">
         <label className="flex flex-col gap-1">
           <span>Key name</span>
@@ -223,6 +229,7 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
           Create key
         </Button>
       </form>
+      )}
       {nameReason && (
         <p id={reasonId} className="text-xs text-muted-foreground">
           {nameReason}

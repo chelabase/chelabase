@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     Unauthorized,
+    /// 403: the caller is known but lacks the access; may carry `extra.required` (the level needed).
     Forbidden,
     TenantNotBound,
     NotFound,
@@ -87,9 +88,133 @@ pub enum ErrorCode {
     /// A membership in a role the API may not grant: Chelabase's own roles, the owner, `pg_…`,
     /// a role that doesn't exist or one the owner can't administer.
     RoleMembershipNotAllowed,
+    /// A member with no grants anywhere.
+    NoAccessYet,
+    /// A platform-mode gap: the feature is not available yet.
+    NotAvailableInPlatformMode,
+    /// Self-sign-up is closed.
+    SignUpClosed,
+    /// The caller signed up and waits for an admin to approve them.
+    PendingApproval,
+    /// The change would leave the tenant without an active admin.
+    LastTenantAdmin,
+    /// The invitation has expired.
+    InviteExpired,
+    /// The invitation was revoked.
+    InviteRevoked,
+    /// The invite's code was accepted but a later step failed; the body carries
+    /// `accept_ticket` to retry without the (spent) code.
+    InviteIncomplete,
+    /// Reconciling a member's Postgres roles failed.
+    MemberRoleReconcileFailed,
+    /// A link invite for someone who already has a way to sign in: send it by email. The body
+    /// carries `email_available`.
+    LinkNotAllowed,
+    /// An invite for someone whose own sign-up waits for approval: approve or decline it. The
+    /// body carries `member_id`.
+    SignupPending,
+    /// More than one user of the organisation has the email.
+    EmailAmbiguous,
+    /// A user outside the tenant's organisation already has the email.
+    EmailInUseElsewhere,
+    /// The invite was revoked, accepted or replaced since.
+    InviteClosed,
 }
 
 impl ErrorCode {
+    /// Every code, in declaration order (the docs check that each has a row).
+    pub const ALL: [ErrorCode; 89] = [
+        Self::Unauthorized,
+        Self::Forbidden,
+        Self::TenantNotBound,
+        Self::NotFound,
+        Self::MethodNotAllowed,
+        Self::InvalidRequest,
+        Self::TooLarge,
+        Self::RateLimited,
+        Self::Unavailable,
+        Self::Timeout,
+        Self::Internal,
+        Self::DatabaseNotReady,
+        Self::BranchNotReady,
+        Self::CredentialsUnavailable,
+        Self::BackupBranch,
+        Self::HasChildren,
+        Self::BranchCapReached,
+        Self::MainBranch,
+        Self::NameTaken,
+        Self::AlreadyDeleting,
+        Self::PublicKeyExists,
+        Self::PublicKeyNotRevocable,
+        Self::RoleRefused,
+        Self::NotApplied,
+        Self::WorkerUnavailable,
+        Self::InvalidCredentials,
+        Self::EmailTaken,
+        Self::InvalidCode,
+        Self::WeakPassword,
+        Self::SignInExpired,
+        Self::InvalidRoleName,
+        Self::ReservedRoleName,
+        Self::RoleExists,
+        Self::RoleCapReached,
+        Self::RoleInUse,
+        Self::RolePrivilegeMismatch,
+        Self::BranchProtected,
+        Self::Conflict,
+        Self::DataApiDisabled,
+        Self::OwnerPasswordUnknown,
+        Self::ProjectDeleting,
+        Self::AppUsersDisabled,
+        Self::AppUsersLocationFixed,
+        Self::AppUsersHasUsers,
+        Self::AppUsersTableExists,
+        Self::DataApiNotEnabled,
+        Self::UnknownColumn,
+        Self::ConstraintViolation,
+        Self::EmailNotVerified,
+        Self::UserInactive,
+        Self::RefreshTokenInvalid,
+        Self::RefreshTokenReused,
+        Self::UserTokenInvalid,
+        Self::UserTokenExpired,
+        Self::UserSessionRevoked,
+        Self::UserTokenWithSecretKey,
+        Self::RunIdInUse,
+        Self::SqlConfirmRequired,
+        Self::SqlRunLimit,
+        Self::SchemaTooLarge,
+        Self::SavedQueryNameTaken,
+        Self::SavedQueryConflict,
+        Self::SavedQueryCap,
+        Self::MergeConflictsOpen,
+        Self::MergeDropsUnacknowledged,
+        Self::MergeNotRehearsed,
+        Self::MergeStale,
+        Self::MergeBusy,
+        Self::MergeOpenExists,
+        Self::MergeBaseUnavailable,
+        Self::MergeVersionConflict,
+        Self::MergeConfirmRequired,
+        Self::BranchMergeBusy,
+        Self::RoleAttributeNotAllowed,
+        Self::RoleMembershipNotAllowed,
+        Self::NoAccessYet,
+        Self::NotAvailableInPlatformMode,
+        Self::SignUpClosed,
+        Self::PendingApproval,
+        Self::LastTenantAdmin,
+        Self::InviteExpired,
+        Self::InviteRevoked,
+        Self::InviteIncomplete,
+        Self::MemberRoleReconcileFailed,
+        Self::LinkNotAllowed,
+        Self::SignupPending,
+        Self::EmailAmbiguous,
+        Self::EmailInUseElsewhere,
+        Self::InviteClosed,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
@@ -167,6 +292,20 @@ impl ErrorCode {
             Self::BranchMergeBusy => "branch_merge_busy",
             Self::RoleAttributeNotAllowed => "role_attribute_not_allowed",
             Self::RoleMembershipNotAllowed => "role_membership_not_allowed",
+            Self::NoAccessYet => "no_access_yet",
+            Self::NotAvailableInPlatformMode => "not_available_in_platform_mode",
+            Self::SignUpClosed => "sign_up_closed",
+            Self::PendingApproval => "pending_approval",
+            Self::LastTenantAdmin => "last_tenant_admin",
+            Self::InviteExpired => "invite_expired",
+            Self::InviteRevoked => "invite_revoked",
+            Self::InviteIncomplete => "invite_incomplete",
+            Self::MemberRoleReconcileFailed => "member_role_reconcile_failed",
+            Self::LinkNotAllowed => "link_not_allowed",
+            Self::SignupPending => "signup_pending",
+            Self::EmailAmbiguous => "email_ambiguous",
+            Self::EmailInUseElsewhere => "email_in_use_elsewhere",
+            Self::InviteClosed => "invite_closed",
         }
     }
 }
@@ -269,7 +408,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 75] = [
+    const ALL: [(ErrorCode, &str); 89] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -345,7 +484,27 @@ mod tests {
         (ErrorCode::BranchMergeBusy, "branch_merge_busy"),
         (ErrorCode::RoleAttributeNotAllowed, "role_attribute_not_allowed"),
         (ErrorCode::RoleMembershipNotAllowed, "role_membership_not_allowed"),
+        (ErrorCode::NoAccessYet, "no_access_yet"),
+        (ErrorCode::NotAvailableInPlatformMode, "not_available_in_platform_mode"),
+        (ErrorCode::SignUpClosed, "sign_up_closed"),
+        (ErrorCode::PendingApproval, "pending_approval"),
+        (ErrorCode::LastTenantAdmin, "last_tenant_admin"),
+        (ErrorCode::InviteExpired, "invite_expired"),
+        (ErrorCode::InviteRevoked, "invite_revoked"),
+        (ErrorCode::InviteIncomplete, "invite_incomplete"),
+        (ErrorCode::MemberRoleReconcileFailed, "member_role_reconcile_failed"),
+        (ErrorCode::LinkNotAllowed, "link_not_allowed"),
+        (ErrorCode::SignupPending, "signup_pending"),
+        (ErrorCode::EmailAmbiguous, "email_ambiguous"),
+        (ErrorCode::EmailInUseElsewhere, "email_in_use_elsewhere"),
+        (ErrorCode::InviteClosed, "invite_closed"),
     ];
+
+    #[test]
+    fn all_lists_every_code_in_order() {
+        let listed: Vec<ErrorCode> = ALL.iter().map(|(c, _)| *c).collect();
+        assert_eq!(listed, ErrorCode::ALL.to_vec());
+    }
 
     #[test]
     fn every_code_serialises_snake_case() {

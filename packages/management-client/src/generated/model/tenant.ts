@@ -8,6 +8,11 @@ import type { Project } from './project.ts';
 import type { TenantId } from './tenantId.ts';
 
 export interface Tenant {
+  /**
+     * The tenant's chosen name; `null` means show the slug.
+     * @nullable
+     */
+  display_name: string | null;
   id: TenantId;
   projects: Project[];
   slug: string;

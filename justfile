@@ -154,9 +154,9 @@ up: deps-up
 # Alias: stop Compose only (does not stop host apps from `just dev`)
 down: deps-down
 
-# Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind)
-zitadel-bootstrap: _live-check
-    cargo run -q -p chelabase -- dev bootstrap
+# Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind, tenant admin)
+zitadel-bootstrap admin_email="zitadel-admin@zitadel.localhost": _live-check
+    cargo run -q -p chelabase -- dev bootstrap --admin-email {{admin_email}}
 
 # Wipe Zitadel volume only so FirstInstance rewrites admin.pat
 zitadel-reset: _live-check
@@ -333,8 +333,8 @@ dev: _live-check deps-up
     echo "Worker health:   http://127.0.0.1:8082/health"
     echo "rest:            http://127.0.0.1:8085  (data API; via the gateway at /data/v1; internal on :8086)"
     echo "auth:            http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
-    echo "Studio:          http://localhost:3000  (sign in / create account)"
-    echo "Mailpit (email): http://localhost:8025  (signup verification codes)"
+    echo "Studio:          http://localhost:3000  (sign in)"
+    echo "Mailpit (email): http://localhost:8025  (emails: invites, resets, verification codes)"
     echo "Zitadel console: http://localhost:8080/ui/console"
     echo "Demo IAM:        .chelabase/zitadel/ (cargo run -p chelabase -- dev token)"
     echo "Logs:            {{dev_dir}}/*.log"
@@ -492,6 +492,7 @@ check:
     cargo check --workspace
     cargo test -p orchestrator -p auth -p rest openapi::tests
     cargo test -p chelabase-query --test openapi_fidelity
+    cargo test -p chelabase-routes --test docs_tables
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
     test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
@@ -628,6 +629,12 @@ merge-e2e: _live-check
 role-e2e: _live-check
     scripts/role-e2e.sh
 
+# Live members story: an email invite (link from Mailpit) and a link invite, a grant, the SQL editor
+# acting as a group role, revoke, open sign-up and approval (needs just deps-up and just dev, with
+# Mailpit as Zitadel's SMTP provider)
+members-e2e: _live-check
+    scripts/members-e2e.sh
+
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:
     infra/neon/tests/run.sh
@@ -635,6 +642,22 @@ neon-test:
 # Round trip through the Rust storage-controller client (needs just deps-up and just dev: attach notifies the internal listener)
 neon-test-live: _live-check
     cargo test -p chelabase-neon --test storcon_live -- --ignored
+
+# One worker live test file with the worker's dev env (demo.env, the compute image), one test at a
+# time, e.g. `just live worker-live roles_live` or `just live worker-live member_roles_live <filter>`
+# (needs just dev)
+worker-live test *args: _live-check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -f .chelabase/zitadel/demo.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source .chelabase/zitadel/demo.env
+      set +a
+    fi
+    eval "$(scripts/neon-images.sh)"
+    export CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
+    cargo test -p worker --test {{test}} -- --ignored --test-threads=1 {{args}}
 
 # Live sign-up/sign-in/reset/logout through the gateway and auth (needs just dev)
 auth-e2e: _live-check

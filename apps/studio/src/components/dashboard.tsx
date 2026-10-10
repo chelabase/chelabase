@@ -1,10 +1,12 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useGetMe, type Me, type Project } from "@chelabase/management-client";
+import { useGetMe, type MeResponse as Me, type Project } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { pollWhile, TRANSITIONAL } from "@/lib/query";
 import { NewProjectDialog } from "./new-project-dialog";
+import { NO_ACCESS_POLL_MS, NoAccess } from "./no-access";
+import { noAccess } from "@/lib/capabilities";
 
 export interface DashboardProps {
   /** Called on the first successful `getMe` (and again after a failed one recovers): re-arms the re-auth guard. */
@@ -13,8 +15,18 @@ export interface DashboardProps {
 
 export function Dashboard({ onLoaded }: DashboardProps) {
   // While anything is being created or deleted, keep the list fresh.
-  const me = useGetMe({ query: { refetchInterval: pollWhile<Me>(hasTransitional) } });
+  // While the caller has no project, check every 30 s so access shows up without a reload.
+  const me = useGetMe({ query: { refetchInterval: (q) => (q.state.data && noAccess(q.state.data) ? NO_ACCESS_POLL_MS : pollTransitional(q)) } });
   const loaded = me.isSuccess;
+  // "You now have access to …" once, when the no-access screen gives way.
+  const [arrived, setArrived] = useState<string | null>(null);
+  const wasWaiting = useRef(false);
+  useEffect(() => {
+    if (!me.data) return;
+    const waiting = noAccess(me.data);
+    if (wasWaiting.current && !waiting) setArrived(me.data.tenant?.projects[0]?.name ?? null);
+    wasWaiting.current = waiting;
+  }, [me.data]);
   // Once per transition into success (not per poll): re-arm the re-auth guard.
   useEffect(() => {
     if (loaded) onLoaded?.();
@@ -43,16 +55,32 @@ export function Dashboard({ onLoaded }: DashboardProps) {
           {me.error && (
             <p className="text-sm text-muted-foreground">Couldn't refresh ({errorText(me.error)}); retrying…</p>
           )}
-          <Workspace me={me.data} />
+          {arrived && (
+            <p role="status" className="text-sm text-chalk">
+              You now have access to {arrived}.
+            </p>
+          )}
+          {me.data.member?.status === "removed" ? (
+            <p role="alert" className="text-sm text-coral">
+              You're no longer a member of this tenant.
+            </p>
+          ) : noAccess(me.data) ? (
+            <NoAccess me={me.data} checking={me.isFetching} onCheck={() => void me.refetch()} />
+          ) : (
+            <Workspace me={me.data} />
+          )}
         </>
       )}
     </div>
   );
 }
 
+const pollTransitional = pollWhile<Me>(hasTransitional);
+
 function Workspace({ me }: { me: Me }) {
   const navigate = useNavigate();
   const { tenant } = me;
+  const tenantAdmin = me.member?.tenant_admin === true;
   if (tenant === null) {
     return (
       <section className="space-y-2">
@@ -68,9 +96,11 @@ function Workspace({ me }: { me: Me }) {
     <section className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">{tenant.slug}</h1>
-        <NewProjectDialog
-          onCreated={(project) => void navigate({ to: "/app/projects/$projectId", params: { projectId: project.id } })}
-        />
+        {tenantAdmin && (
+          <NewProjectDialog
+            onCreated={(project) => void navigate({ to: "/app/projects/$projectId", params: { projectId: project.id } })}
+          />
+        )}
       </div>
       {tenant.projects.length === 0 ? (
         <p className="text-muted-foreground">This tenant has no projects yet.</p>

@@ -83,7 +83,7 @@ If bootstrap fails with a missing `admin.pat` (an old Zitadel volume from before
 just zitadel-reset && just zitadel-bootstrap
 ```
 
-`zitadel-bootstrap` binds the demo tenant to the Zitadel org only when the metadata database is up, so run `just deps-up` first, or rerun the bootstrap afterwards (`just dev` also rebinds). A Zitadel reset leaves no human account: sign up on :3000 ("Create account").
+`zitadel-bootstrap` binds the demo tenant to the Zitadel org only when the metadata database is up, so run `just deps-up` first, or rerun the bootstrap afterwards (`just dev` also rebinds). A Zitadel reset leaves no account in the tenant but the bootstrap admin that `zitadel-bootstrap` sets (pass `admin_email` to pick the user): sign in as that user. Self-sign-up is off by default, so everyone else is invited.
 
 Logs for detached processes: `.chelabase/dev/*.log`. IAM artifacts: `.chelabase/zitadel/` (gitignored). Zitadel PATs are opaque, so demo calls use JWT-profile access tokens from `chelabase dev token`.
 
@@ -181,7 +181,7 @@ The live recipes need `just deps-up` and `just dev` (several say so in their des
 | `neon-e2e` | Create a database, then psql, SQL over HTTP and the serverless driver through the proxy, query cancel, a password reset that works at once, delete |
 | `branch-e2e` | Branch at a time, reset to parent, restore with a backup, a point outside the history window, delete |
 | `storage-leak-e2e` | Deleting a database, a branch or a superseded timeline reclaims the safekeeper's WAL and S3 backup |
-| `auth-e2e` | Sign-up, sign-in, reset and logout through the gateway and auth |
+| `auth-e2e` | Closed sign-up, a link invite and accepting it, sign-in, reset and logout through the gateway and auth |
 | `role-e2e` | Login roles: create a plain role, connect, back a secret key, refused delete, reset, revoke, delete |
 | `data-e2e` | Data API story (below) |
 | `console-e2e` | Data API across databases and Studio's console (below) |

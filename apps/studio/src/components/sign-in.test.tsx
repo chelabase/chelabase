@@ -56,13 +56,13 @@ describe("SignIn", () => {
     expect(screen.getByRole("alert")).toBeInTheDocument();
   });
 
-  it("buttons_still_sign_in_and_create", async () => {
+  it("sign_in_button_signs_in_and_account_creation_waits_for_the_login_page", async () => {
+    // Whether sign-up is open is only known once Zitadel hands over a pending sign-in, so the
+    // landing page offers just "Sign in"; the login page offers "Create account" when allowed.
     const auth = fakeAuth();
     render(<SignIn auth={auth} signup={false} />);
     await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    expect(auth.signinRedirect).toHaveBeenLastCalledWith();
-    await userEvent.click(screen.getByRole("button", { name: "Create account" }));
-    expect(auth.signinRedirect).toHaveBeenLastCalledWith({ prompt: "create" });
-    expect(auth.signinRedirect).toHaveBeenCalledTimes(2);
+    expect(auth.signinRedirect).toHaveBeenCalledExactlyOnceWith();
+    expect(screen.queryByRole("button", { name: /create account/i })).toBeNull();
   });
 });

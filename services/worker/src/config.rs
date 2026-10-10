@@ -11,6 +11,7 @@ use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::{ComputeSettings, DockerBackend, StorconClient};
 use chelabase_secrets::SecretKey;
 use chelabase_types::mode::Mode;
+use chelabase_types::mode_policy::ModePolicy;
 use chelabase_types::role_settings::RoleSettings;
 
 use crate::Worker;
@@ -37,7 +38,8 @@ pub struct WorkerConfig {
     pub control_plane_uri: String,
     pub valkey_url: String,
     pub compute_image: String,
-    pub mode: chelabase_types::mode::Mode,
+    pub mode: Mode,
+    pub policy: ModePolicy,
     pub owner_superuser_requested: bool,
     /// `CHELABASE_BRANCH_ROLE_CAP`, `CHELABASE_BRANCH_DATABASE_CAP` and
     /// `CHELABASE_PASSWORD_STRENGTH` (platform mode forces strength on).
@@ -49,6 +51,9 @@ pub struct WorkerConfig {
     pub zitadel_admin_pat_file: Option<PathBuf>,
     /// `CHELABASE_APP_USERS_RECONCILE_SECS` (default 300, 30 to 86,400).
     pub app_users_reconcile_every: Duration,
+    /// `CHELABASE_MEMBER_ROLES_SWEEP_SECS` (default 300, 30 to 86,400): how often every branch's
+    /// member roles are reconciled, the backstop for lost or failed reconcile publishes.
+    pub member_roles_sweep_every: Duration,
     /// `CHELABASE_WORKER_REMOVE_ORPHANS` (default on): reconcile removes compute containers no
     /// endpoint row records. Off for a worker on its own metadata database that shares the
     /// machine's Docker with another stack (a branch's separate dev database).
@@ -97,15 +102,20 @@ impl WorkerConfig {
             valkey_url: or_default("CHELABASE_VALKEY_URL", "redis://127.0.0.1:6379"),
             compute_image,
             mode,
+            policy: ModePolicy::new(mode),
             owner_superuser_requested,
             roles,
             zitadel_issuer: non_blank(&get, "CHELABASE_ZITADEL_ISSUER"),
             zitadel_admin_pat_file: non_blank(&get, "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .map(PathBuf::from),
-            app_users_reconcile_every: reconcile_every(non_blank(
-                &get,
+            app_users_reconcile_every: reconcile_every(
                 "CHELABASE_APP_USERS_RECONCILE_SECS",
-            ))?,
+                non_blank(&get, "CHELABASE_APP_USERS_RECONCILE_SECS"),
+            )?,
+            member_roles_sweep_every: reconcile_every(
+                "CHELABASE_MEMBER_ROLES_SWEEP_SECS",
+                non_blank(&get, "CHELABASE_MEMBER_ROLES_SWEEP_SECS"),
+            )?,
             remove_orphans: remove_orphans(non_blank(&get, "CHELABASE_WORKER_REMOVE_ORPHANS"))?,
         };
         check_control_plane_uri(&config.control_plane_uri)?;
@@ -114,7 +124,7 @@ impl WorkerConfig {
 
     /// Requested, and in self-hosted mode: platform mode ignores the switch.
     pub fn owner_superuser(&self) -> bool {
-        self.owner_superuser_requested && self.mode == Mode::SelfHosted
+        self.owner_superuser_requested && self.policy.owner_superuser_allowed()
     }
 }
 
@@ -144,15 +154,15 @@ fn safekeeper_http(value: Option<String>) -> anyhow::Result<Vec<(u64, reqwest::U
     Ok(out)
 }
 
-/// `CHELABASE_APP_USERS_RECONCILE_SECS`: whole seconds from 30 to 86,400; 300 when unset.
-fn reconcile_every(value: Option<String>) -> anyhow::Result<Duration> {
-    const NAME: &str = "CHELABASE_APP_USERS_RECONCILE_SECS";
+/// `CHELABASE_APP_USERS_RECONCILE_SECS` or `CHELABASE_MEMBER_ROLES_SWEEP_SECS` (`name`): whole
+/// seconds from 30 to 86,400; 300 when unset.
+fn reconcile_every(name: &str, value: Option<String>) -> anyhow::Result<Duration> {
     let Some(value) = value else {
         return Ok(Duration::from_secs(300));
     };
     match value.parse::<u64>() {
         Ok(secs) if (30..=86_400).contains(&secs) => Ok(Duration::from_secs(secs)),
-        _ => Err(anyhow!("{NAME}={value:?}: expected whole seconds from 30 to 86400")),
+        _ => Err(anyhow!("{name}={value:?}: expected whole seconds from 30 to 86400")),
     }
 }
 
@@ -256,10 +266,12 @@ pub fn build(
         enabling_seen: Default::default(),
         zitadel: zitadel_client(config),
         app_users_reconcile_every: config.app_users_reconcile_every,
+        member_roles_sweep_every: config.member_roles_sweep_every,
         remove_orphans: config.remove_orphans,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
+        member_role_requests: Default::default(),
     })
 }
 
@@ -485,6 +497,24 @@ mod tests {
         .unwrap();
         assert_eq!(c.app_users_reconcile_every, Duration::from_secs(300));
         assert_eq!(c.zitadel_admin_pat_file, None);
+    }
+
+    /// T8 fix round (I2): the member-role sweep, the backstop for lost reconcile publishes.
+    #[test]
+    fn config_reads_member_roles_sweep_interval() {
+        const VAR: &str = "CHELABASE_MEMBER_ROLES_SWEEP_SECS";
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert_eq!(c.member_roles_sweep_every, Duration::from_secs(300));
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, "60")])).unwrap();
+        assert_eq!(c.member_roles_sweep_every, Duration::from_secs(60));
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, " ")])).unwrap();
+        assert_eq!(c.member_roles_sweep_every, Duration::from_secs(300));
+        for bad in ["29", "86401", "x"] {
+            let err = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(VAR), "{bad}: {err}");
+        }
     }
 
     /// `CHELABASE_WORKER_REMOVE_ORPHANS`: on unless explicitly false (a worker sharing the

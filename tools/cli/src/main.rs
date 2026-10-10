@@ -58,7 +58,11 @@ enum GenCommands {
 #[derive(Subcommand, Debug)]
 enum DevCommands {
     /// Idempotent ensure: project, API app, demo machine key, tenant org bind
-    Bootstrap,
+    Bootstrap {
+        /// Email of the Zitadel user to make the demo tenant's first admin (default: the dev user)
+        #[arg(long)]
+        admin_email: Option<String>,
+    },
     /// Mint a short-lived JWT access token (stdout) via JWT profile
     Token,
 }
@@ -83,6 +87,31 @@ enum NeonCommands {
     },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_accepts_admin_email() {
+        let cli = Cli::try_parse_from(["chelabase", "dev", "bootstrap", "--admin-email", "a@b.co"])
+            .unwrap();
+        let Commands::Dev {
+            command: DevCommands::Bootstrap { admin_email },
+        } = cli.command
+        else {
+            panic!("not dev bootstrap");
+        };
+        assert_eq!(admin_email.as_deref(), Some("a@b.co"));
+        let cli = Cli::try_parse_from(["chelabase", "dev", "bootstrap"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Dev {
+                command: DevCommands::Bootstrap { admin_email: None }
+            }
+        ));
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -96,7 +125,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Dev { command } => match command {
-            DevCommands::Bootstrap => dev::bootstrap::run().await,
+            DevCommands::Bootstrap { admin_email } => {
+                dev::bootstrap::run(admin_email.as_deref()).await
+            }
             DevCommands::Token => dev::token::run().await,
         },
         Commands::Gen { command } => match command {
