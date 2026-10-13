@@ -58,7 +58,7 @@ The storage APIs (storcon `:1234`, pageserver `:9898`, safekeeper `:7676`) are u
 Copy [`infra/compose/.env.example`](https://github.com/chelabase/chelabase/blob/main/infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer the values in `.chelabase/zitadel/demo.env` after bootstrap.
 
 <Callout type="info" title="Native Linux Docker">
-  `host.docker.internal` resolves to the bridge gateway, which can't reach a listener on `127.0.0.1`. On native Linux Docker, set `CHELABASE_INTERNAL_ADDR` to the bridge address (for example `172.17.0.1:8083`). Only the host part may change: the port stays 8083, because Compose and the compute use it. The scripts derive their internal URL from the same variable. Docker Desktop (WSL2) works as is.
+  On native Linux Docker, `host.docker.internal` resolves to the bridge gateway, which can't reach a listener on `127.0.0.1`. The `just` recipes that start the apps or run live tests (`scripts/internal-addr.sh`) pick the address for you: the bridge gateway (for example `172.17.0.1:8083`) on native Linux Docker, `127.0.0.1:8083` on Docker Desktop (WSL2, macOS) or when Docker doesn't answer. To override it, export `CHELABASE_INTERNAL_ADDR` (the URL follows it) or `CHELABASE_INTERNAL_URL` before running a recipe. Keep the port 8083 unless you also change Compose and the compute's control-plane URI.
 </Callout>
 
 ## Checks

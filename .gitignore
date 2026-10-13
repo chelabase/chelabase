@@ -45,3 +45,6 @@ infra/neon/.cache/
 
 # Claude
 .claude/settings.local.json
+
+# Cursor
+.cursor/

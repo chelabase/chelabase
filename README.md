@@ -22,11 +22,11 @@ docs/                design specs, plans, roadmap and security notes
 
 ## Prerequisites
 
-- [proto](https://moonrepo.dev/docs/proto), which installs moon, node, pnpm and just from `.prototools`
+- [proto](https://moonrepo.dev/docs/proto), which installs Rust, moon, node, pnpm and just from `.prototools`
 - Docker (Compose runs the dependencies, and the worker starts each database's compute container)
-- Rust toolchain
 - cmake: `sudo apt-get install -y cmake`
 - clang and protoc: `sudo apt-get install -y clang protobuf-compiler`
+- psql (PostgreSQL client): `sudo apt-get install -y postgresql-client`
 
 ## Quickstart
 

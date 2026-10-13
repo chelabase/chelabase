@@ -65,6 +65,7 @@ live-status:
 # Offline checks for the live queue (scripts/live.sh)
 live-test:
     scripts/tests/live.sh
+    scripts/tests/internal-addr.sh
 
 # Offline tests for the old-name -> Chelabase rename script (scripts/rename-chelabase.sh)
 rename-test:
@@ -183,6 +184,7 @@ orchestrator:
       source .chelabase/zitadel/actions.env
       set +a
     fi
+    eval "$(scripts/internal-addr.sh)"
     cargo run -p orchestrator
 
 worker:
@@ -207,6 +209,7 @@ gateway:
       source .chelabase/zitadel/demo.env
       set +a
     fi
+    eval "$(scripts/internal-addr.sh)"
     cargo run -p gateway
 
 rest:
@@ -218,6 +221,7 @@ rest:
       source .chelabase/zitadel/demo.env
       set +a
     fi
+    eval "$(scripts/internal-addr.sh)"
     cargo run -p rest
 
 auth:
@@ -229,6 +233,7 @@ auth:
       source .chelabase/zitadel/demo.env
       set +a
     fi
+    eval "$(scripts/internal-addr.sh)"
     cargo run -p auth
 
 studio:
@@ -308,6 +313,8 @@ dev: _live-check deps-up
     # The worker starts computes from this image (a local neon-build if present).
     eval "$(scripts/neon-images.sh)"
     export CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
+    # Where the internal listener binds, so containers reach it (scripts/internal-addr.sh)
+    eval "$(scripts/internal-addr.sh)"
 
     cargo build -p orchestrator -p worker -p gateway -p rest -p auth -p chelabase
 
@@ -329,7 +336,7 @@ dev: _live-check deps-up
     echo "Seed project_id: {{demo_project_id}}"
     echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
     echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
-    echo "Internal:        http://127.0.0.1:8083  (internal; proxy / compute_ctl / storage controller)"
+    echo "Internal:        ${CHELABASE_INTERNAL_URL}  (internal; proxy / compute_ctl / storage controller)"
     echo "Worker health:   http://127.0.0.1:8082/health"
     echo "rest:            http://127.0.0.1:8085  (data API; via the gateway at /data/v1; internal on :8086)"
     echo "auth:            http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
@@ -641,6 +648,9 @@ neon-test:
 
 # Round trip through the Rust storage-controller client (needs just deps-up and just dev: attach notifies the internal listener)
 neon-test-live: _live-check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$(scripts/internal-addr.sh)"
     cargo test -p chelabase-neon --test storcon_live -- --ignored
 
 # One worker live test file with the worker's dev env (demo.env, the compute image), one test at a
@@ -657,6 +667,7 @@ worker-live test *args: _live-check
     fi
     eval "$(scripts/neon-images.sh)"
     export CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"
+    eval "$(scripts/internal-addr.sh)"
     cargo test -p worker --test {{test}} -- --ignored --test-threads=1 {{args}}
 
 # Live sign-up/sign-in/reset/logout through the gateway and auth (needs just dev)

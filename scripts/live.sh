@@ -216,6 +216,10 @@ cmd_run() {
   rm -f "$QUEUE/$TICKET"; TICKET=""
   printf 'worktree=%s\nbranch=%s\ncommand=%s\npid=%s\nstarted=%s\n' "$wt" "$br" "$cmdline" "$$" "$(date -Is)" > "$HOLDER"
 
+  # Where the internal listener binds (the bridge gateway on native Linux Docker): the stack swap
+  # and the command both inherit it. An explicit CHELABASE_INTERNAL_ADDR/URL wins.
+  eval "$("$(dirname "${BASH_SOURCE[0]}")/internal-addr.sh")"
+
   tty_detect
   local rc=0
   if [ -n "${LIVE_SWAP_DEV:-}" ]; then
