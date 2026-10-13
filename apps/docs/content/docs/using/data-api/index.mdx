@@ -12,10 +12,10 @@ Apps read and write a branch's tables over `POST /data/v1/query` with per-branch
 | `POST /data/v1/query` | Runs one operation (or a batch) from a JSON tree. See [Query language](/docs/using/data-api/query-language). |
 | `GET /data/v1/schema` | Describes what the key's role can reach. `?database=<name>` picks another served database; the response's `databases` lists the served databases the key reaches. |
 
-Both take the key in the `Authorization: Bearer <key>` header. Requests go to the gateway (`http://localhost:8000` in development).
+Both take the key in the `Authorization: Bearer <key>` header. Requests go to the gateway (`http://api.chelabase.localhost:8000` in development).
 
 ```bash
-curl -s http://localhost:8000/data/v1/query \
+curl -s http://api.chelabase.localhost:8000/data/v1/query \
   -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "v": 1, "op": "select", "from": "orders", "limit": 10 }'

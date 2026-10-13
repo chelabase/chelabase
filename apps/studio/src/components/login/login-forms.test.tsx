@@ -9,7 +9,7 @@ import { SignInForm } from "./sign-in-form";
 import { SignUpForm } from "./sign-up-form";
 import { VerifyEmailForm } from "./verify-email-form";
 
-const DONE = { next: "done", redirect: "http://localhost:3000/callback?code=c" };
+const DONE = { next: "done", redirect: "http://studio.chelabase.localhost:8000/callback?code=c" };
 const EXPIRED_BODY = { error: { code: "sign_in_expired", message: "This sign-in has expired, start again" } };
 
 /** Renders a login form against fake auth routes, with the login client pointed at them. */
@@ -30,7 +30,7 @@ describe("SignInForm", () => {
     await userEvent.type(await screen.findByLabelText("Email"), "ada@example.com");
     await userEvent.type(screen.getByLabelText("Password"), "Secret-pass1");
     await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://localhost:3000/callback?code=c"));
+    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/callback?code=c"));
     expect(await call(f, "/auth/v1/sign-in")!.clone().json()).toEqual({ authRequest: "V2_1", email: "ada@example.com", password: "Secret-pass1" });
     expect(call(f, "/auth/v1/sign-in")!.credentials).toBe("include");
   });
@@ -274,7 +274,7 @@ describe("VerifyEmailForm", () => {
     });
     expect(screen.getByLabelText("Code")).toHaveValue("123456");
     await userEvent.click(screen.getByRole("button", { name: "Verify" }));
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://localhost:3000/callback?code=c"));
+    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/callback?code=c"));
     expect(await call(f, "/auth/v1/verify-email")!.clone().json()).toEqual({ code: "123456" });
   });
 

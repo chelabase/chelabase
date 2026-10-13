@@ -296,7 +296,7 @@ function Setup() {
               <span className="text-seafoam">proto</span> install{"\n"}
               <span className="text-seafoam">pnpm</span> install{"\n"}
               <span className="text-seafoam">just</span> dev{"\n\n"}
-              <span className="text-chalk-dim italic"># then open http://localhost:3000</span>
+              <span className="text-chalk-dim italic"># then open http://studio.chelabase.localhost:8000</span>
               {"\n"}
               <span className="text-chalk-dim italic"># stop everything with: just stop</span>
             </code>

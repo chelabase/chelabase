@@ -5,7 +5,6 @@ import { routeTree } from "./routeTree.gen";
 import { buildOidcConfig } from "./lib/auth";
 import { readEnv, type StudioEnv } from "./lib/env";
 import { EnvContext } from "./lib/env-context";
-import { canonicalRedirect } from "./lib/origin";
 import { parseSearch, stringifySearch } from "./lib/search";
 
 const router = createRouter({
@@ -23,11 +22,8 @@ declare module "@tanstack/react-router" {
 }
 
 const rootElement = document.getElementById("app")!;
-const redirect = canonicalRedirect(new URL(window.location.href));
 
-if (redirect) {
-  window.location.replace(redirect);
-} else if (!rootElement.innerHTML) {
+if (!rootElement.innerHTML) {
   const root = ReactDOM.createRoot(rootElement);
   let env: StudioEnv;
   try {

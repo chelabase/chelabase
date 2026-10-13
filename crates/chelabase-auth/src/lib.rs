@@ -27,7 +27,7 @@ pub const CLAIM_RESOURCE_OWNER_ID: &str = "urn:zitadel:iam:user:resourceowner:id
 /// Issuer / JWKS settings for local JWT verification.
 #[derive(Debug, Clone)]
 pub struct ZitadelAuthConfig {
-    /// OIDC issuer URL, e.g. `http://localhost:8080`.
+    /// OIDC issuer URL, e.g. `http://auth.chelabase.localhost:8000`.
     pub issuer: String,
     /// JWKS URL (usually `{issuer}/oauth/v2/keys`).
     pub jwks_url: String,
@@ -37,11 +37,20 @@ pub struct ZitadelAuthConfig {
 
 impl ZitadelAuthConfig {
     pub fn from_env() -> Result<Self, AuthError> {
-        let issuer = std::env::var("CHELABASE_ZITADEL_ISSUER")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
-        let jwks_url = std::env::var("CHELABASE_ZITADEL_JWKS_URL")
-            .unwrap_or_else(|_| format!("{issuer}/oauth/v2/keys"));
-        let audiences = std::env::var("CHELABASE_ZITADEL_AUDIENCES")
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// The issuer comes from `CHELABASE_AUTH_HOST` (and the public scheme); the JWKS URL from
+    /// `CHELABASE_ZITADEL_JWKS_URL`, else `{issuer}/oauth/v2/keys`.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, AuthError> {
+        let issuer = chelabase_types::entry::issuer_from_lookup(&get)
+            .map_err(|e| AuthError::Config(e.to_string()))?
+            .ok_or_else(|| AuthError::Config("CHELABASE_AUTH_HOST is not set".into()))?;
+        let jwks_url = get("CHELABASE_ZITADEL_JWKS_URL")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| format!("{issuer}/oauth/v2/keys"));
+        let audiences = get("CHELABASE_ZITADEL_AUDIENCES")
             .unwrap_or_default()
             .split(',')
             .map(str::trim)

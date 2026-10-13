@@ -102,7 +102,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// The admin Zitadel client; its absence fails the job, which is retried (P2).
     fn admin_zitadel(&self) -> Result<&Zitadel, String> {
         self.zitadel.as_ref().ok_or_else(|| {
-            "Zitadel admin access isn't configured (CHELABASE_ZITADEL_ISSUER and CHELABASE_ZITADEL_ADMIN_PAT_FILE)"
+            "Zitadel admin access isn't configured (CHELABASE_AUTH_HOST and CHELABASE_ZITADEL_ADMIN_PAT_FILE)"
                 .to_string()
         })
     }

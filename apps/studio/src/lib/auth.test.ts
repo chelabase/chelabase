@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import { buildOidcConfig, studioScopes } from "./auth";
 
 const env = {
-  issuer: "http://localhost:8080",
+  issuer: "http://auth.chelabase.localhost:8000",
   clientId: "client-1",
   projectId: "project-1",
   orgId: "org-1",
-  apiUrl: "http://127.0.0.1:8000",
+  apiUrl: "http://api.chelabase.localhost:8000",
 };
 
 describe("studioScopes", () => {
@@ -27,16 +27,16 @@ describe("studioScopes", () => {
 
 describe("buildOidcConfig", () => {
   it("uses PKCE code flow with redirects on the Studio origin", () => {
-    const config = buildOidcConfig(env, "http://localhost:3000");
-    expect(config.authority).toBe("http://localhost:8080");
+    const config = buildOidcConfig(env, "http://studio.chelabase.localhost:8000");
+    expect(config.authority).toBe("http://auth.chelabase.localhost:8000");
     expect(config.client_id).toBe("client-1");
     expect(config.response_type).toBe("code");
-    expect(config.redirect_uri).toBe("http://localhost:3000/callback");
-    expect(config.post_logout_redirect_uri).toBe("http://localhost:3000/");
+    expect(config.redirect_uri).toBe("http://studio.chelabase.localhost:8000/callback");
+    expect(config.post_logout_redirect_uri).toBe("http://studio.chelabase.localhost:8000/");
     expect(config.scope).toContain("urn:zitadel:iam:org:id:org-1");
   });
 
   it("revokes tokens on sign-out so a refresh token can't outlive the session", () => {
-    expect(buildOidcConfig(env, "http://localhost:3000").revokeTokensOnSignout).toBe(true);
+    expect(buildOidcConfig(env, "http://studio.chelabase.localhost:8000").revokeTokensOnSignout).toBe(true);
   });
 });

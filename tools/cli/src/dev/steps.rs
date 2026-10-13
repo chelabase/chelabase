@@ -83,14 +83,15 @@ pub async fn ensure_studio_app(
     api: &impl ZitadelApi,
     project_id: &str,
     mode: Mode,
+    origin: &str,
 ) -> Result<String> {
     if let Some(app) = existing_app(api, project_id, STUDIO_APP).await? {
-        let drift = studio_app_drift(&app.raw, mode);
+        let drift = studio_app_drift(&app.raw, mode, origin);
         if !drift.is_empty() {
             api.connect(
                 APPS,
                 "UpdateApplication",
-                studio_app_update(project_id, &app.id, mode),
+                studio_app_update(project_id, &app.id, mode, origin),
             )
             .await?;
             info!(?drift, "updated the Studio app {STUDIO_APP}");
@@ -101,7 +102,7 @@ pub async fn ensure_studio_app(
         .connect(
             APPS,
             "CreateApplication",
-            studio_app_create(project_id, mode),
+            studio_app_create(project_id, mode, origin),
         )
         .await?;
     info!("created Studio app {STUDIO_APP}");
@@ -115,6 +116,7 @@ pub async fn ensure_studio_login(
     api: &impl ZitadelApi,
     project_id: &str,
     mode: Mode,
+    origin: &str,
 ) -> Result<()> {
     if !ModePolicy::new(mode).cli_manages_studio_login() {
         return Ok(());
@@ -127,7 +129,7 @@ pub async fn ensure_studio_login(
         bail!(
             "the Studio app {STUDIO_APP} has no login v2 base URI. It would fall back to \
              Zitadel's v1 login; fix it in the console (Login version: v2, base URI \
-             {STUDIO_ORIGIN}/) or run `just zitadel-reset`, then re-run bootstrap"
+             {origin}/) or run `just zitadel-reset`, then re-run bootstrap"
         );
     }
     let features = api
@@ -135,7 +137,7 @@ pub async fn ensure_studio_login(
         .await?;
     let (required, base_uri) = login_v2_from(&features);
     if required {
-        let base_uri = base_uri.unwrap_or_else(|| format!("{STUDIO_ORIGIN}/"));
+        let base_uri = base_uri.unwrap_or_else(|| format!("{origin}/"));
         api.connect(
             FEATURES,
             "SetInstanceFeatures",
@@ -316,6 +318,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    const ORIGIN: &str = "http://studio.chelabase.localhost:8000";
+
     /// Answers by call key (`"POST /v2/organizations/_search"` or `"Service/Method"`), records
     /// calls and their bodies.
     #[derive(Default)]
@@ -468,7 +472,7 @@ mod tests {
     const SET_FEATURES: &str = "FeatureService/SetInstanceFeatures";
 
     fn studio(id: &str, mode: Mode) -> Value {
-        let mut config = studio_app_config(mode);
+        let mut config = studio_app_config(mode, ORIGIN);
         config["clientId"] = json!("c-spa");
         json!({"applicationId": id, "name": "chelabase-studio", "oidcConfiguration": config})
     }
@@ -480,10 +484,11 @@ mod tests {
             .with("ApplicationService/ListApplications", json!({"applications": [
                 {"applicationId": "a1", "name": "chelabase-orchestrator", "apiConfiguration": {"clientId": "c-api"}},
                 {"applicationId": "a2", "name": "chelabase-studio", "oidcConfiguration": {
-                    "clientId": "c-spa", "redirectUris": studio_app_config(Mode::SelfHosted)["redirectUris"],
-                    "postLogoutRedirectUris": studio_app_config(Mode::SelfHosted)["postLogoutRedirectUris"],
+                    "clientId": "c-spa", "redirectUris": studio_app_config(Mode::SelfHosted, ORIGIN)["redirectUris"],
+                    "postLogoutRedirectUris": studio_app_config(Mode::SelfHosted, ORIGIN)["postLogoutRedirectUris"],
                     "accessTokenType": "OIDC_TOKEN_TYPE_JWT", "developmentMode": true,
-                    "loginVersion": {"loginV2": {"baseUri": "http://localhost:3000/"}}}}]}))
+                    "loginVersion": {"loginV2": {
+                        "baseUri": "http://studio.chelabase.localhost:8000/"}}}}]}))
             .with("POST /v2/users", json!({"result": [{"userId": "u1"}]}))
             .with("POST /admin/v1/smtp/_search", json!({"result": [{"id": "s1", "host": "mailpit:1025", "state": "SMTP_CONFIG_ACTIVE"}]}))
     }
@@ -509,7 +514,7 @@ mod tests {
         assert_eq!(ensure_project(&fake, "o1").await.unwrap(), "p1");
         assert_eq!(ensure_api_app(&fake, "p1").await.unwrap(), "c-api");
         assert_eq!(
-            ensure_studio_app(&fake, "p1", Mode::SelfHosted)
+            ensure_studio_app(&fake, "p1", Mode::SelfHosted, ORIGIN)
                 .await
                 .unwrap(),
             "c-spa"
@@ -572,7 +577,7 @@ mod tests {
                 {"applicationId": "a2", "name": "chelabase-studio", "oidcConfiguration": {"clientId": "c-spa", "redirectUris": ["http://old/callback"]}}]}))
             .with("ApplicationService/UpdateApplication", json!({}));
         assert_eq!(
-            ensure_studio_app(&fake, "p1", Mode::SelfHosted)
+            ensure_studio_app(&fake, "p1", Mode::SelfHosted, ORIGIN)
                 .await
                 .unwrap(),
             "c-spa"
@@ -590,7 +595,7 @@ mod tests {
             "ApplicationService/ListApplications",
             json!({"applications": [{"applicationId": "a2", "name": "chelabase-studio"}]}),
         );
-        let err = ensure_studio_app(&fake, "p1", Mode::SelfHosted)
+        let err = ensure_studio_app(&fake, "p1", Mode::SelfHosted, ORIGIN)
             .await
             .unwrap_err()
             .to_string();
@@ -617,10 +622,10 @@ mod tests {
             .with(
                 GET_FEATURES,
                 json!({"loginV2": {"required": true,
-                "baseUri": "http://localhost:3000/", "source": "SOURCE_INSTANCE"}}),
+                "baseUri": "http://studio.chelabase.localhost:8000/", "source": "SOURCE_INSTANCE"}}),
             )
             .with(SET_FEATURES, json!({}));
-        ensure_studio_login(&fake, "p1", Mode::SelfHosted)
+        ensure_studio_login(&fake, "p1", Mode::SelfHosted, ORIGIN)
             .await
             .unwrap();
         assert_eq!(
@@ -629,7 +634,10 @@ mod tests {
         );
         assert_eq!(
             fake.bodies(SET_FEATURES),
-            vec![json!({"loginV2": {"required": false, "baseUri": "http://localhost:3000/"}})]
+            vec![json!({"loginV2": {
+                "required": false,
+                "baseUri": "http://studio.chelabase.localhost:8000/"
+            }})]
         );
     }
 
@@ -643,10 +651,10 @@ mod tests {
             )
             .with(
                 GET_FEATURES,
-                json!({"loginV2": {"baseUri": "http://localhost:3000/",
+                json!({"loginV2": {"baseUri": "http://studio.chelabase.localhost:8000/",
                 "source": "SOURCE_INSTANCE"}}),
             );
-        ensure_studio_login(&fake, "p1", Mode::SelfHosted)
+        ensure_studio_login(&fake, "p1", Mode::SelfHosted, ORIGIN)
             .await
             .unwrap();
         let calls = fake.calls();
@@ -670,12 +678,15 @@ mod tests {
                 json!({"loginV2": {"required": true, "source": "SOURCE_SYSTEM"}}),
             )
             .with(SET_FEATURES, json!({}));
-        ensure_studio_login(&fake, "p1", Mode::SelfHosted)
+        ensure_studio_login(&fake, "p1", Mode::SelfHosted, ORIGIN)
             .await
             .unwrap();
         assert_eq!(
             fake.bodies(SET_FEATURES),
-            vec![json!({"loginV2": {"required": false, "baseUri": "http://localhost:3000/"}})]
+            vec![json!({"loginV2": {
+                "required": false,
+                "baseUri": "http://studio.chelabase.localhost:8000/"
+            }})]
         );
     }
 
@@ -688,7 +699,7 @@ mod tests {
             .with(LIST, missing)
             .with(GET_FEATURES, json!({"loginV2": {"required": true}}))
             .with(SET_FEATURES, json!({}));
-        let err = ensure_studio_login(&fake, "p1", Mode::SelfHosted)
+        let err = ensure_studio_login(&fake, "p1", Mode::SelfHosted, ORIGIN)
             .await
             .unwrap_err()
             .to_string();
@@ -707,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn platform_mode_leaves_the_logins_alone() {
         let fake = Fake::default();
-        ensure_studio_login(&fake, "p1", Mode::Platform)
+        ensure_studio_login(&fake, "p1", Mode::Platform, ORIGIN)
             .await
             .unwrap();
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());

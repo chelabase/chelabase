@@ -13,7 +13,7 @@ cd "$root"
 LOG_PREFIX=bench-data-api
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
+GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 INTERNAL_URL="${CHELABASE_INTERNAL_URL:-http://127.0.0.1:8083}"
 INTERNAL_TOKEN="${CHELABASE_REST_INTERNAL_TOKEN:-chelabase-dev-rest-internal}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"

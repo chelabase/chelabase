@@ -44,6 +44,9 @@ if [[ "$main" != /* || ! -e "$main/.git" ]]; then
   exit 2
 fi
 compose_dir="$here/infra/compose"
+# The entry values Compose interpolates.
+# shellcheck source=lib/entry.sh
+. "$here/scripts/lib/entry.sh"
 compose=(docker compose -f "$compose_dir/docker-compose.yml" --env-file "$compose_dir/.env.example")
 say_apps=()
 say() { echo "[stack-reset-slots] $*"; }

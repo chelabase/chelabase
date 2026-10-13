@@ -7,12 +7,12 @@ This takes you from a running stack to a database you can connect to. It uses se
 
 ## 1. Start the stack and sign in
 
-1. Run `just dev`, then open [http://localhost:3000](http://localhost:3000) and choose **Sign in** as the bootstrap admin: `just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost` (or the email you pass to it, `just zitadel-bootstrap you@example.com`) the tenant admin.
-2. You land in Studio. Set the bootstrap admin before you expose Studio to anyone: until a tenant has its first member, the first person to sign in claims the admin, so run `just zitadel-bootstrap you@example.com` (positional) first; that fresh-install window exists until the first bootstrap. `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential on self-hosted dev: keep it private. Emails such as invites and password resets land in Mailpit at [http://localhost:8025](http://localhost:8025).
+1. Run `just dev`, then open [http://studio.chelabase.localhost:8000](http://studio.chelabase.localhost:8000) and choose **Sign in** as the bootstrap admin: `just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost` (or the email you pass to it, `just zitadel-bootstrap you@example.com`) the tenant admin.
+2. You land in Studio. Set the bootstrap admin before you expose Studio to anyone: until a tenant has its first member, the first person to sign in claims the admin, so run `just zitadel-bootstrap you@example.com` (positional) first; that fresh-install window exists until the first bootstrap. `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential on self-hosted dev: keep it private. Emails such as invites and password resets land in Mailpit at [http://mail.chelabase.localhost:8000](http://mail.chelabase.localhost:8000).
 3. On `/app` you see your project, its databases, and a form to create one.
 
 <Callout type="info">
-Self-sign-up is off by default: an admin invites everyone else (an email, or a link to hand over when Zitadel has no email provider), and they join the same organization and tenant, a shared team workspace. An admin can switch open sign-up on; people who then sign up wait for approval. Use `http://localhost:3000`; visits to `127.0.0.1:3000` are redirected there, because the sign-in redirect and the gateway's CORS settings are registered for `localhost`.
+Self-sign-up is off by default: an admin invites everyone else (an email, or a link to hand over when Zitadel has no email provider), and they join the same organization and tenant, a shared team workspace. An admin can switch open sign-up on; people who then sign up wait for approval. Use `http://studio.chelabase.localhost:8000`: the sign-in redirect and the gateway's CORS settings are registered for that host.
 </Callout>
 
 When sign-up is open, the sign-up's email verification follows `CHELABASE_REQUIRE_EMAIL_VERIFICATION` (`true` requires a code, which lands in Mailpit; `false` turns it off); without it the default follows the mode: off when self-hosted, required in platform mode. Invitees verify their email by accepting the invite.
@@ -21,7 +21,7 @@ When sign-up is open, the sign-up's email verification follows `CHELABASE_REQUIR
 
 Enter a name in the form on `/app` and create it. The database shows as provisioning while its Neon tenant, timeline and compute are made, then as ready. Studio polls every 2 seconds until the status settles.
 
-From a terminal, `just create-db-demo demo1` creates one through the gateway (give the name positionally: `name=demo1` would become the literal name). `GET http://127.0.0.1:8000/v1/databases/<id>` reports its `status`.
+From a terminal, `just create-db-demo demo1` creates one through the gateway (give the name positionally: `name=demo1` would become the literal name). `GET http://api.chelabase.localhost:8000/v1/databases/<id>` reports its `status`.
 
 ## 3. Connect
 

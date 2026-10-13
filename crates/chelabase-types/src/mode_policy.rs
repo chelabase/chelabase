@@ -28,7 +28,6 @@ impl ModePolicy {
         ("sign_up", "Whether a visitor may create their own account."),
         ("open_signup_switchable", "Whether the tenant may switch open sign-up on."),
         ("email_verification_default", "Whether sign-ups must verify their email by default."),
-        ("secure_cookies_default", "Whether session cookies are marked Secure by default."),
         ("owner_superuser_allowed", "Whether a database's owner role may be a superuser."),
         ("password_strength_forced", "Whether role passwords must pass the strength check."),
         ("prehashed_passwords_allowed", "Whether role passwords may be supplied pre-hashed."),
@@ -75,10 +74,6 @@ impl ModePolicy {
     }
 
     pub fn email_verification_default(&self) -> bool {
-        !self.self_hosted()
-    }
-
-    pub fn secure_cookies_default(&self) -> bool {
         !self.self_hosted()
     }
 
@@ -152,7 +147,6 @@ impl ModePolicy {
             .to_string(),
             "open_signup_switchable" => b(self.open_signup_switchable()),
             "email_verification_default" => b(self.email_verification_default()),
-            "secure_cookies_default" => b(self.secure_cookies_default()),
             "owner_superuser_allowed" => b(self.owner_superuser_allowed()),
             "password_strength_forced" => b(self.password_strength_forced()),
             "prehashed_passwords_allowed" => b(self.prehashed_passwords_allowed()),
@@ -172,11 +166,10 @@ mod tests {
     #[test]
     fn every_rule_per_mode() {
         type Rule = fn(&ModePolicy) -> bool;
-        let table: [(&str, Rule, bool, bool); 10] = [
+        let table: [(&str, Rule, bool, bool); 9] = [
             ("default_internal_token_allowed", ModePolicy::default_internal_token_allowed, true, false),
             ("open_signup_switchable", ModePolicy::open_signup_switchable, true, false),
             ("email_verification_default", ModePolicy::email_verification_default, false, true),
-            ("secure_cookies_default", ModePolicy::secure_cookies_default, false, true),
             ("owner_superuser_allowed", ModePolicy::owner_superuser_allowed, true, false),
             ("password_strength_forced", ModePolicy::password_strength_forced, false, true),
             ("prehashed_passwords_allowed", ModePolicy::prehashed_passwords_allowed, true, false),

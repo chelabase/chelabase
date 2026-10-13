@@ -14,7 +14,7 @@ your app's `package.json`. Write the types with `chelabase gen types` (see below
 import { createClient } from "@chelabase/client";
 import { type Database, types } from "./db"; // written by `chelabase gen types`
 
-const db = createClient<Database>({ url: "http://localhost:8000", key: PUBLIC_KEY, types });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: PUBLIC_KEY, types });
 
 const rows = await db.from("orders").select("id", "total").where({ status: "paid" }).limit(50);
 await db.from("orders").insert([{ total: "12.50", vip: false, history: [] }]).returning("id");
@@ -32,4 +32,4 @@ const [order, points] = await db.batch((tx) => [
 
 The guide covers filters, errors, big numbers (`int8`, `numeric`), generated types,
 other databases and app users (`db.auth`). Run the docs site (`just docs`, on
-http://localhost:3001) and open `/docs/using/client`.
+http://docs.chelabase.localhost:8000) and open `/docs/using/client`.

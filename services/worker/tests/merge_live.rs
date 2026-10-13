@@ -633,7 +633,7 @@ async fn proxy_login(
 }
 
 fn gateway() -> String {
-    std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into())
+    std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://api.chelabase.localhost:8000".into())
 }
 
 /// A data API select of `t` on the gateway with `key`: the status (0 when curl fails). The key

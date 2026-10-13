@@ -2,9 +2,11 @@
 //! decisions live in `pipeline`.
 
 use crate::pipeline::{error_json, GatewayResponse, Outcome, Pipeline, ProxyPlan, RequestParts, REQUEST_ID_HEADER};
+use crate::registry::Site;
 use crate::upstreams::Upstreams;
 use async_trait::async_trait;
 use bytes::Bytes;
+use chelabase_types::entry::Scheme;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -14,19 +16,30 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// A site websocket's idle limit, both ways: long enough for a quiet socket (Vite's hot
+/// reload). Every other request, API or site, uses the configured upstream read timeout.
+const WEBSOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub struct Gateway {
     pipeline: Pipeline,
     upstreams: Upstreams,
+    /// The upstream read timeout of every request but a site websocket
+    /// ([`WEBSOCKET_READ_TIMEOUT`]).
     read_timeout: Duration,
+    /// `X-Forwarded-Proto`: the public scheme (`CHELABASE_PUBLIC_SCHEME`), never the client's.
+    forwarded_proto: &'static str,
 }
 
 impl Gateway {
-    pub fn new(pipeline: Pipeline, upstreams: Upstreams, read_timeout: Duration) -> Self {
+    pub fn new(pipeline: Pipeline, upstreams: Upstreams, read_timeout: Duration, scheme: Scheme) -> Self {
         Self {
             pipeline,
             upstreams,
             read_timeout,
+            forwarded_proto: match scheme {
+                Scheme::Http => "http",
+                Scheme::Https => "https",
+            },
         }
     }
 }
@@ -36,6 +49,8 @@ pub struct RequestCtx {
     request_id: String,
     host: Option<String>,
     plan: Option<ProxyPlan>,
+    /// Set when the host is a pass-through site.
+    site: Option<Site>,
     /// Resolved upstream addresses, and the one currently being tried.
     candidates: Vec<SocketAddr>,
     attempt: usize,
@@ -51,6 +66,7 @@ impl ProxyHttp for Gateway {
             request_id: String::new(),
             host: None,
             plan: None,
+            site: None,
             candidates: Vec::new(),
             attempt: 0,
         }
@@ -91,6 +107,15 @@ impl ProxyHttp for Gateway {
                 ctx.plan = Some(plan);
                 Ok(false)
             }
+            Outcome::Site(site) => {
+                ctx.site = Some(site);
+                // An upgraded connection (a websocket) reads the client through the body
+                // reader, whose default idle limit is 60 s.
+                if session.is_upgrade_req() {
+                    session.set_read_timeout(Some(WEBSOCKET_READ_TIMEOUT));
+                }
+                Ok(false)
+            }
             Outcome::Respond(resp) => {
                 write_gateway_response(session, &resp, &ctx.request_id).await?;
                 Ok(true)
@@ -98,13 +123,25 @@ impl ProxyHttp for Gateway {
         }
     }
 
-    async fn upstream_peer(&self, _session: &mut Session, ctx: &mut RequestCtx) -> Result<Box<HttpPeer>> {
-        let plan = ctx
-            .plan
-            .as_ref()
-            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no proxy plan"))?;
+    async fn upstream_peer(&self, session: &mut Session, ctx: &mut RequestCtx) -> Result<Box<HttpPeer>> {
+        let (addr, read_timeout) = match (ctx.site, &ctx.plan) {
+            (Some(site), _) => {
+                let addr = self.upstreams.site_addr(site).ok_or_else(|| {
+                    Error::explain(ErrorType::ConnectError, format!("no upstream for the {} site", site.name()))
+                })?;
+                // Spec §2: only a websocket may sit idle up to an hour; a plain site request
+                // that gets no answer times out like the API's (504).
+                let timeout = if session.is_upgrade_req() {
+                    WEBSOCKET_READ_TIMEOUT
+                } else {
+                    self.read_timeout
+                };
+                (addr, timeout)
+            }
+            (None, Some(plan)) => (self.upstreams.addr(plan.endpoint.service), self.read_timeout),
+            (None, None) => return Err(Error::explain(ErrorType::InternalError, "no proxy plan")),
+        };
         if ctx.candidates.is_empty() {
-            let addr = self.upstreams.addr(plan.endpoint.service);
             ctx.candidates = resolve_upstream(addr).await;
             if ctx.candidates.is_empty() {
                 return Err(Error::explain(
@@ -116,7 +153,7 @@ impl ProxyHttp for Gateway {
         let socket = ctx.candidates[ctx.attempt.min(ctx.candidates.len() - 1)];
         let mut peer = HttpPeer::new(socket, false, String::new());
         peer.options.connection_timeout = Some(CONNECT_TIMEOUT);
-        peer.options.read_timeout = Some(self.read_timeout);
+        peer.options.read_timeout = Some(read_timeout);
         Ok(Box::new(peer))
     }
 
@@ -142,42 +179,34 @@ impl ProxyHttp for Gateway {
         upstream: &mut RequestHeader,
         ctx: &mut RequestCtx,
     ) -> Result<()> {
-        let plan = ctx
-            .plan
-            .as_ref()
-            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no proxy plan"))?;
-        let edits = plan.upstream_headers(&ctx.request_id);
-        for name in edits.remove {
-            upstream.remove_header(*name);
-        }
-        for (name, value) in edits.set {
-            upstream.insert_header(name, value)?;
+        // A site gets the client's request as it came (Host, Authorization, cookies,
+        // Upgrade/Connection); the API gets the plan's edits.
+        if ctx.site.is_none() {
+            let plan = ctx
+                .plan
+                .as_ref()
+                .ok_or_else(|| Error::explain(ErrorType::InternalError, "no proxy plan"))?;
+            let edits = plan.upstream_headers(&ctx.request_id);
+            for name in edits.remove {
+                upstream.remove_header(*name);
+            }
+            for (name, value) in edits.set {
+                upstream.insert_header(name, value)?;
+            }
         }
 
-        // X-Forwarded-For is appended, never trusted: it carries whatever the
-        // client (or an operator proxy) sent before us. Don't authorize on it.
-        if let Some(ip) = session
+        // P4, on every target: the forwarded headers are the gateway's own, never the client's.
+        let client_ip = session
             .client_addr()
             .and_then(|a| a.as_inet())
-            .map(|a| a.ip().to_string())
-        {
-            let forwarded_for = match upstream
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-            {
-                Some(previous) => format!("{previous}, {ip}"),
-                None => ip,
-            };
-            upstream.insert_header("x-forwarded-for", forwarded_for)?;
-        }
-        // Keep a scheme set by an operator's TLS-terminating proxy; the gateway
-        // itself only speaks plain HTTP.
-        if !upstream.headers.contains_key("x-forwarded-proto") {
-            upstream.insert_header("x-forwarded-proto", "http")?;
-        }
-        if let Some(host) = &ctx.host {
-            upstream.insert_header("x-forwarded-host", host.as_str())?;
+            .map(|a| a.ip().to_string());
+        for (name, value) in forwarded_headers(self.forwarded_proto, client_ip, ctx.host.as_deref()) {
+            match value {
+                Some(value) => upstream.insert_header(name, value)?,
+                None => {
+                    upstream.remove_header(name);
+                }
+            }
         }
         Ok(())
     }
@@ -206,7 +235,11 @@ impl ProxyHttp for Gateway {
         // Once the upstream response has started (headers sent, or a websocket
         // upgraded), writing our own error would splice JSON into it. Let the
         // connection close so the client sees a truncated response instead.
-        if status > 0 && session.response_written().is_none() {
+        let can_answer = status > 0 && session.response_written().is_none();
+        if can_answer && ctx.site.is_some() {
+            // A site is a web page, not the API: a plain-text error, no JSON.
+            let _ = write_plain_response(session, status, &ctx.request_id).await;
+        } else if can_answer {
             let (code, message) = match status {
                 502 => ("unavailable", "upstream unavailable"),
                 504 => ("timeout", "upstream timed out"),
@@ -236,10 +269,11 @@ impl ProxyHttp for Gateway {
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut RequestCtx) {
         let req = session.req_header();
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
-        let (route, service) = ctx
-            .plan
-            .as_ref()
-            .map_or(("-", "-"), |p| (p.endpoint.name, p.endpoint.service.name()));
+        let (route, service) = match (ctx.site, &ctx.plan) {
+            (Some(site), _) => ("-", site.name()),
+            (None, Some(p)) => (p.endpoint.name, p.endpoint.service.name()),
+            (None, None) => ("-", "-"),
+        };
         info!(
             request_id = %ctx.request_id,
             method = %req.method,
@@ -292,6 +326,41 @@ async fn write_gateway_response(session: &mut Session, resp: &GatewayResponse, r
         session.write_response_body(Some(b), true).await?;
     }
     Ok(())
+}
+
+/// A site's own error page: `<status> <reason>\n` as `text/plain`.
+async fn write_plain_response(session: &mut Session, status: u16, request_id: &str) -> Result<()> {
+    let body = Bytes::from(plain_error_body(status));
+    let mut header = ResponseHeader::build(status, None)?;
+    header.insert_header(REQUEST_ID_HEADER, request_id)?;
+    header.insert_header("content-type", "text/plain; charset=utf-8")?;
+    header.set_content_length(body.len())?;
+    session.write_response_header(Box::new(header), false).await?;
+    session.write_response_body(Some(body), true).await?;
+    Ok(())
+}
+
+fn plain_error_body(status: u16) -> String {
+    let reason = http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("error")
+        .to_ascii_lowercase();
+    format!("{status} {reason}\n")
+}
+
+/// P4: `X-Forwarded-Proto` (the public scheme), `-For` (the client's address only) and `-Host`
+/// (the request's `Host`), each replacing whatever the client sent; None removes the header.
+fn forwarded_headers(
+    proto: &'static str,
+    client_ip: Option<String>,
+    host: Option<&str>,
+) -> [(&'static str, Option<String>); 3] {
+    [
+        ("x-forwarded-proto", Some(proto.to_string())),
+        ("x-forwarded-for", client_ip),
+        ("x-forwarded-host", host.map(str::to_string)),
+    ]
 }
 
 /// Resolve `host:port` without blocking the runtime; every address, in
@@ -383,6 +452,28 @@ mod tests {
             assert_eq!(failure_status(&ErrorSource::Unset, &etype), 502);
         }
         assert_eq!(failure_status(&ErrorSource::Upstream, &ErrorType::H1Error), 502);
+    }
+
+    #[test]
+    fn site_errors_are_plain_text_status_lines() {
+        assert_eq!(plain_error_body(502), "502 bad gateway\n");
+        assert_eq!(plain_error_body(504), "504 gateway timeout\n");
+    }
+
+    #[test]
+    fn forwarded_headers_are_the_gateways_own() {
+        let set = forwarded_headers("https", Some("10.0.0.7".into()), Some("studio.acme.com"));
+        assert_eq!(
+            set,
+            [
+                ("x-forwarded-proto", Some("https".to_string())),
+                ("x-forwarded-for", Some("10.0.0.7".to_string())),
+                ("x-forwarded-host", Some("studio.acme.com".to_string())),
+            ]
+        );
+        // Unknown values remove the client's rather than keep them.
+        let unset = forwarded_headers("http", None, None);
+        assert_eq!((unset[1].1.as_deref(), unset[2].1.as_deref()), (None, None));
     }
 
     #[test]

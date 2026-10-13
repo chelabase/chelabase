@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use chelabase_secrets::SecretKey;
+use chelabase_types::entry::Scheme;
 pub use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
 use std::path::PathBuf;
@@ -55,12 +56,12 @@ fn requires_email_verification(mode: Mode, overridden: Option<&str>) -> bool {
     }
 }
 
-/// Cookies get `Secure` on platform (served over TLS), not in self-hosted local dev; a non-blank
+/// Cookies get `Secure` when the public entry is https, in every mode; a non-blank
 /// `CHELABASE_AUTH_SECURE_COOKIES` overrides.
-fn secure_cookies(mode: Mode, overridden: Option<&str>) -> bool {
+fn secure_cookies(scheme: Scheme, overridden: Option<&str>) -> bool {
     match overridden.map(str::trim).filter(|v| !v.is_empty()) {
         Some(value) => truthy(Some(value)),
-        None => ModePolicy::new(mode).secure_cookies_default(),
+        None => scheme == Scheme::Https,
     }
 }
 
@@ -113,13 +114,20 @@ impl Config {
         warn_if_open(&cookie_key_file);
         let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file))
             .map_err(|e| anyhow::anyhow!("cookie key: {e}"))?;
-        let studio_url = std::env::var("CHELABASE_STUDIO_ORIGINS")
-            .unwrap_or_else(|_| "http://localhost:3000".into())
-            .split(',')
-            .map(str::trim)
-            .find(|o| !o.is_empty() && *o != "*")
-            .unwrap_or("http://localhost:3000")
-            .to_string();
+        let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
+        entry.check_mode(mode).map_err(anyhow::Error::new)?;
+        let secure_cookies = secure_cookies(
+            entry.scheme(),
+            std::env::var("CHELABASE_AUTH_SECURE_COOKIES")
+                .ok()
+                .as_deref(),
+        );
+        if entry.scheme() == Scheme::Https && !secure_cookies {
+            tracing::warn!(
+                "CHELABASE_AUTH_SECURE_COOKIES turns Secure off although the entry is https; \
+                 session cookies may then travel over plain http"
+            );
+        }
         let min_ms: u64 = std::env::var("CHELABASE_AUTH_MIN_RESPONSE_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -129,11 +137,11 @@ impl Config {
         check_listen(&listen, flag("CHELABASE_AUTH_TRUSTED_PROXY"))?;
         Ok(Self {
             listen,
-            issuer: var("CHELABASE_ZITADEL_ISSUER")?,
+            issuer: entry.issuer(),
             token: token.trim().to_string(),
             cookie_key,
             org_id: var("CHELABASE_ZITADEL_ORG_ID")?,
-            studio_url,
+            studio_url: entry.studio_origin(),
             skip_email_verification: !requires_email_verification(
                 mode,
                 std::env::var("CHELABASE_REQUIRE_EMAIL_VERIFICATION")
@@ -141,12 +149,7 @@ impl Config {
                     .as_deref(),
             ),
             mode,
-            secure_cookies: secure_cookies(
-                mode,
-                std::env::var("CHELABASE_AUTH_SECURE_COOKIES")
-                    .ok()
-                    .as_deref(),
-            ),
+            secure_cookies,
             min_response: Duration::from_millis(min_ms),
         })
     }
@@ -328,12 +331,16 @@ mod tests {
         assert!(AppConfig::from_vars(vars(&bad)).is_err());
     }
 
+    // End-of-step review (user, 2026-10-13): Secure follows the public scheme in every mode;
+    // CHELABASE_AUTH_SECURE_COOKIES still overrides.
     #[test]
-    fn cookies_are_secure_on_platform_unless_overridden() {
-        assert!(!secure_cookies(Mode::SelfHosted, None));
-        assert!(secure_cookies(Mode::Platform, None));
-        assert!(secure_cookies(Mode::SelfHosted, Some("true")));
-        assert!(!secure_cookies(Mode::Platform, Some("false")));
+    fn cookies_are_secure_when_the_entry_is_https_unless_overridden() {
+        use chelabase_types::entry::Scheme;
+        assert!(secure_cookies(Scheme::Https, None));
+        assert!(!secure_cookies(Scheme::Http, None));
+        assert!(secure_cookies(Scheme::Http, Some("true")));
+        assert!(!secure_cookies(Scheme::Https, Some("false")));
+        assert!(secure_cookies(Scheme::Https, Some(" ")));
     }
 
     // X-Forwarded-For is only trustworthy when the gateway is the only way in.

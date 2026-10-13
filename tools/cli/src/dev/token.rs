@@ -41,10 +41,8 @@ pub async fn run() -> Result<()> {
     }
 
     let env = load_dotenv_file(&env_path);
-    let iss = env
-        .get("CHELABASE_ZITADEL_ISSUER")
-        .cloned()
-        .unwrap_or_else(issuer);
+    // The issuer comes from the entry, never from demo.env (a copy that can be stale).
+    let iss = issuer()?;
     let project_id = env
         .get("CHELABASE_ZITADEL_PROJECT_ID")
         .context("missing CHELABASE_ZITADEL_PROJECT_ID in demo.env — run auth bootstrap")?;

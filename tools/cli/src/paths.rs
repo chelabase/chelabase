@@ -96,8 +96,14 @@ pub fn compose_env() -> PathBuf {
         .unwrap_or_else(|_| repo_root().join("infra/compose/.env.example"))
 }
 
-pub fn issuer() -> String {
-    env::var("CHELABASE_ZITADEL_ISSUER").unwrap_or_else(|_| "http://localhost:8080".into())
+/// The public entry (hosts, scheme) from the `CHELABASE_*_HOST` variables.
+pub fn entry() -> anyhow::Result<chelabase_types::entry::Entry> {
+    Ok(chelabase_types::entry::Entry::from_env()?)
+}
+
+/// The Zitadel issuer, derived from the entry (the auth host and the scheme).
+pub fn issuer() -> anyhow::Result<String> {
+    Ok(entry()?.issuer())
 }
 
 pub fn demo_tenant_id() -> String {

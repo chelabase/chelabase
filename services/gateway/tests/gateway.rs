@@ -11,10 +11,12 @@ use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const E2E_PROJECT: &str = "33333333-3333-4333-8333-333333333333";
-const STUDIO: &str = "http://localhost:3000";
+const STUDIO: &str = "http://127.0.0.1:3999";
+const STUDIO_HOST: &str = "127.0.0.1:3999";
 
 /// The most recent request the mock upstream received: headers plus `:uri`.
 type Seen = Arc<Mutex<Option<HashMap<String, String>>>>;
@@ -128,18 +130,20 @@ async fn spawn_gateway_with(
 
         let port = free_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_gateway"));
-        command.envs(extra_env.iter().copied());
         let child = command
             .current_dir(workdir.path())
-            .env("CHELABASE_GATEWAY_ADDR", format!("127.0.0.1:{port}"))
+            .env("CHELABASE_GATEWAY_LISTEN", format!("127.0.0.1:{port}"))
+            .env("CHELABASE_PUBLIC_SCHEME", "http")
+            .env("CHELABASE_API_HOST", "127.0.0.1")
+            .env("CHELABASE_STUDIO_HOST", STUDIO_HOST)
+            .env("CHELABASE_AUTH_HOST", jwks.issuer().trim_start_matches("http://"))
             .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
-            .env("CHELABASE_API_HOSTS", "")
-            .env("CHELABASE_STUDIO_ORIGINS", STUDIO)
             .env("CHELABASE_ZITADEL_ISSUER", jwks.issuer())
             .env("CHELABASE_ZITADEL_JWKS_URL", jwks.jwks_url())
             .env("CHELABASE_ZITADEL_AUDIENCES", "")
             .env("CHELABASE_INTERNAL_SIGNING_KEY", &signing_key)
             .env("RUST_LOG", "warn")
+            .envs(extra_env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -516,21 +520,133 @@ async fn upstream_failure_after_response_started_does_not_inject_error_body() {
     }
 }
 
-// TLS terminates at the operator's proxy in front of the gateway; its
-// X-Forwarded-Proto must survive rather than being overwritten with `http`.
+// P4: forwarded headers are the gateway's own, never the client's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn incoming_forwarded_proto_is_preserved() {
+async fn forwarded_headers_are_replaced_not_trusted() {
     let stack = start_stack().await;
     let resp = reqwest::Client::new()
         .get(format!("{}/health", stack.base))
         .header("x-forwarded-proto", "https")
+        .header("x-forwarded-for", "203.0.113.9")
+        .header("x-forwarded-host", "evil.example")
         .send()
         .await
         .unwrap();
-    let status = resp.status();
-    let body = resp.text().await.unwrap();
-    assert_eq!(status, 200, "gateway answered {body:?}");
-    assert_eq!(stack.upstream_saw().unwrap()["x-forwarded-proto"], "https");
+    assert_eq!(resp.status(), 200);
+    let seen = stack.upstream_saw().unwrap();
+    assert_eq!(seen["x-forwarded-proto"], "http");
+    assert_eq!(seen["x-forwarded-for"], "127.0.0.1");
+    assert_eq!(seen["x-forwarded-host"], stack.base.trim_start_matches("http://"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_host_is_404_with_an_empty_body() {
+    let stack = start_stack().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/health", stack.base))
+        .header(reqwest::header::HOST, "nope.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.text().await.unwrap(), "");
+    assert!(stack.upstream_saw().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_auth_host_reaches_zitadel_with_host_and_bearer_unchanged() {
+    let jwks = MockJwks::start().await;
+    let (api, _) = spawn_upstream().await;
+    let (zitadel, seen) = spawn_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&api, &jwks, &[("CHELABASE_ZITADEL_UPSTREAM", zitadel.as_str())]).await;
+    let auth_host = jwks.issuer().trim_start_matches("http://").to_string();
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/management/v1/orgs/me"))
+        .header(reqwest::header::HOST, &auth_host)
+        .header("authorization", "Bearer zitadel-pat")
+        .header("origin", STUDIO)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+    let seen = seen.lock().unwrap().clone().expect("the Zitadel upstream was reached");
+    assert_eq!(seen["host"], auth_host);
+    assert_eq!(seen["authorization"], "Bearer zitadel-pat");
+    assert_eq!(seen[":uri"], "/management/v1/orgs/me");
+    assert!(!seen.contains_key(IDENTITY_HEADER));
+    assert_eq!(seen["x-forwarded-proto"], "http");
+    assert_eq!(seen["x-forwarded-host"], auth_host);
+}
+
+async fn read_head(sock: &mut tokio::net::TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        sock.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    String::from_utf8(head).unwrap()
+}
+
+/// A raw upstream that answers one websocket upgrade with 101, then echoes 4 bytes.
+async fn spawn_upgrade_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let head = read_head(&mut sock).await.to_ascii_lowercase();
+        assert!(head.contains("upgrade: websocket"), "{head}");
+        sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        sock.read_exact(&mut buf).await.unwrap();
+        sock.write_all(&buf).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_studio_host_passes_websocket_upgrades() {
+    let jwks = MockJwks::start().await;
+    let (api, _) = spawn_upstream().await;
+    let studio = spawn_upgrade_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&api, &jwks, &[("CHELABASE_STUDIO_UPSTREAM", studio.as_str())]).await;
+    let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let request = format!(
+        "GET /@vite/client HTTP/1.1\r\nHost: {STUDIO_HOST}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    sock.write_all(request.as_bytes()).await.unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(10), read_head(&mut sock)).await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    sock.write_all(b"ping").await.unwrap();
+    let mut echo = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut echo)).await.unwrap().unwrap();
+    assert_eq!(&echo, b"ping");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_site_upstream_down_is_502_plain_text() {
+    let jwks = MockJwks::start().await;
+    let (api, _) = spawn_upstream().await;
+    let (down, _socket) = refused_upstream();
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&api, &jwks, &[("CHELABASE_STUDIO_UPSTREAM", down.as_str())]).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/"))
+        .header(reqwest::header::HOST, STUDIO_HOST)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let content_type = resp.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(content_type.starts_with("text/plain"), "{content_type}");
 }
 
 /// An upstream that accepts connections and never answers.
@@ -760,4 +876,29 @@ async fn chelabase_user_header_is_stripped_upstream() {
         .unwrap();
     assert_eq!(resp.status(), 401);
     assert!(seen.lock().unwrap().is_none());
+}
+
+// Spec §2: a site request that gets no answer times out like the API's; only websocket
+// upgrades may stay open up to an hour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_site_request_times_out_like_the_api() {
+    let jwks = MockJwks::start().await;
+    let (api, _) = spawn_upstream().await;
+    let silent = spawn_silent_upstream().await;
+    let (base, _verify, _gateway) = spawn_gateway_with(
+        &api,
+        &jwks,
+        &[("CHELABASE_STUDIO_UPSTREAM", silent.as_str()), ("CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS", "1")],
+    )
+    .await;
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+        .get(format!("{base}/"))
+        .header(reqwest::header::HOST, STUDIO_HOST)
+        .send()
+        .await
+        .expect("the gateway answers before the client gives up");
+    assert_eq!(resp.status(), 504);
 }

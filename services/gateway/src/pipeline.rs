@@ -1,11 +1,11 @@
 //! The fixed request pipeline:
-//! request id → scope → route → CORS → auth → internal identity.
+//! request id → host → (a site passes through) → route → CORS → auth → internal identity.
 //!
 //! Pure over request parts; `proxy.rs` adapts it to Pingora. Nothing here is
 //! configurable per route except the typed `Policy` from `chelabase-routes`.
 
 use crate::data_keys::{DataKeyResolver, KeyError};
-use crate::registry::SharedRegistry;
+use crate::registry::{SharedRegistry, Site, Target};
 use crate::user_tokens::{UserTokenError, UserTokens};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
 use chelabase_auth::{AuthError, JwtVerifier};
@@ -84,6 +84,8 @@ impl ProxyPlan {
 pub enum Outcome {
     Respond(GatewayResponse),
     Proxy(ProxyPlan),
+    /// Pass the request through to the site's upstream unchanged (no routes, CORS or auth).
+    Site(Site),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +96,8 @@ pub struct Handled {
 
 pub struct Pipeline {
     registry: Arc<SharedRegistry>,
-    studio_origins: Vec<String>,
+    /// The one origin Studio CORS allows (`<scheme>://<studio host>`).
+    studio_origin: String,
     verifier: JwtVerifier,
     signer: InternalSigner,
     keys: Arc<DataKeyResolver>,
@@ -104,7 +107,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(
         registry: Arc<SharedRegistry>,
-        studio_origins: Vec<String>,
+        studio_origin: String,
         verifier: JwtVerifier,
         signer: InternalSigner,
         keys: Arc<DataKeyResolver>,
@@ -112,7 +115,7 @@ impl Pipeline {
     ) -> Self {
         Self {
             registry,
-            studio_origins,
+            studio_origin,
             verifier,
             signer,
             keys,
@@ -134,9 +137,15 @@ impl Pipeline {
             return respond(200, Vec::new(), json!({ "status": "ok" }));
         }
 
-        let Some(scope) = self.registry.load().scope_for(req.host) else {
-            return respond(404, Vec::new(), error_json("not_found", "unknown host"));
-        };
+        if req.host.is_none() {
+            return empty_response(400);
+        }
+        match self.registry.load().target_for(req.host) {
+            None => return empty_response(404),
+            Some(Target::Site(site)) => return Outcome::Site(site),
+            Some(Target::Api) => {}
+        }
+        let scope = Scope::Api;
 
         if let Some(preflight) = self.preflight(scope, req) {
             return Outcome::Respond(preflight);
@@ -244,7 +253,7 @@ impl Pipeline {
         }
         let credentials = endpoint.policy.cors == Cors::StudioCredentials;
         let mut headers = vec![("vary", "Origin".to_string())];
-        if self.origin_allowed(origin) && !(credentials && self.wildcard()) {
+        if self.origin_allowed(origin) {
             headers.extend([
                 ("access-control-allow-origin", origin.to_string()),
                 ("access-control-allow-methods", requested.to_string()),
@@ -273,9 +282,7 @@ impl Pipeline {
         }
         let credentials = endpoint.policy.cors == Cors::StudioCredentials;
         let mut cors = vec![("vary", "Origin".to_string())];
-        if let Some(origin) = header_str(headers, "origin")
-            .filter(|o| self.origin_allowed(o) && !(credentials && self.wildcard()))
-        {
+        if let Some(origin) = header_str(headers, "origin").filter(|o| self.origin_allowed(o)) {
             cors.push(("access-control-allow-origin", origin.to_string()));
             if credentials {
                 cors.push(("access-control-allow-credentials", "true".to_string()));
@@ -284,15 +291,9 @@ impl Pipeline {
         cors
     }
 
-    /// Credentialed CORS needs an explicit origin list; a "*" entry disables it.
-    fn wildcard(&self) -> bool {
-        self.studio_origins.iter().any(|o| o == "*")
-    }
-
+    /// Studio CORS allows exactly Studio's origin (P8).
     fn origin_allowed(&self, origin: &str) -> bool {
-        self.studio_origins
-            .iter()
-            .any(|allowed| allowed == "*" || allowed == origin)
+        origin == self.studio_origin
     }
 
     /// Resolve the data API key from `Authorization: Bearer` and mint an
@@ -419,6 +420,15 @@ fn respond(status: u16, headers: Vec<(&'static str, String)>, body: Value) -> Ou
     })
 }
 
+/// A bodiless answer (no `Host`, an unknown host): nothing that names the gateway or its hosts.
+fn empty_response(status: u16) -> Outcome {
+    Outcome::Respond(GatewayResponse {
+        status,
+        headers: Vec::new(),
+        body: None,
+    })
+}
+
 fn json_response(status: u16, body: Value) -> GatewayResponse {
     GatewayResponse {
         status,
@@ -500,7 +510,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::Registry;
+    use crate::registry::{Registry, Site};
     use chelabase_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
     use chelabase_auth::test_support::{BrokenJwks, MockJwks};
     use crate::user_tokens::test_support as ut;
@@ -523,7 +533,8 @@ mod tests {
         assert!(key_kind_refusal(false, false, DataKeyKind::Public).is_none());
     }
 
-    const STUDIO: &str = "http://localhost:3000";
+    const STUDIO: &str = "http://studio.test";
+    const API: &str = "api.test";
 
     struct Harness {
         pipeline: Pipeline,
@@ -543,10 +554,14 @@ mod tests {
     }
 
     fn pipeline_with(api_hosts: &[&str], verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
+        pipeline_with_registry(Registry::new(api_hosts), verifier)
+    }
+
+    fn pipeline_with_registry(registry: Registry, verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
         let (private_pem, public_pem) = generate_keypair_pem();
         let pipeline = Pipeline::new(
-            Arc::new(SharedRegistry::new(Registry::new(api_hosts))),
-            vec![STUDIO.to_string()],
+            Arc::new(SharedRegistry::new(registry)),
+            STUDIO.to_string(),
             verifier,
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
             Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
@@ -566,16 +581,24 @@ mod tests {
         map
     }
 
+    /// `host: None` means the API host; [`run_without_host`] sends none.
     async fn run(pipeline: &Pipeline, method: &str, path: &str, host: Option<&str>, pairs: &[(&str, &str)]) -> Handled {
         let headers = headers(pairs);
         pipeline
             .handle(&RequestParts {
                 method,
                 path,
-                host,
+                host: host.or(Some(API)),
                 headers: &headers,
                 client_ip: None,
             })
+            .await
+    }
+
+    async fn run_without_host(pipeline: &Pipeline, method: &str, path: &str) -> Handled {
+        let headers = headers(&[]);
+        pipeline
+            .handle(&RequestParts { method, path, host: None, headers: &headers, client_ip: None })
             .await
     }
 
@@ -583,6 +606,7 @@ mod tests {
         match outcome {
             Outcome::Respond(resp) => resp,
             Outcome::Proxy(plan) => panic!("expected a gateway response, got proxy plan {plan:?}"),
+            Outcome::Site(site) => panic!("expected a gateway response, got site {site:?}"),
         }
     }
 
@@ -590,6 +614,7 @@ mod tests {
         match outcome {
             Outcome::Proxy(plan) => plan,
             Outcome::Respond(resp) => panic!("expected a proxy plan, got response {resp:?}"),
+            Outcome::Site(site) => panic!("expected a proxy plan, got site {site:?}"),
         }
     }
 
@@ -630,17 +655,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_host_is_404_when_api_hosts_are_configured() {
-        let h = harness(&["api.example.com"]).await;
-        let handled = run(&h.pipeline, "GET", "/health", Some("other.example.com"), &[]).await;
-        let resp = expect_response(handled.outcome);
+    async fn an_unknown_host_is_404_with_no_body() {
+        let h = harness(&[API]).await;
+        let resp = expect_response(run(&h.pipeline, "GET", "/health", Some("other.example.com"), &[]).await.outcome);
         assert_eq!(resp.status, 404);
-        assert_eq!(resp.body, Some(shape("not_found", "unknown host")));
+        assert_eq!(resp.body, None);
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_host_is_400() {
+        let h = harness(&[API]).await;
+        let resp = expect_response(run_without_host(&h.pipeline, "GET", "/health").await.outcome);
+        assert_eq!(resp.status, 400);
+    }
+
+    async fn site_harness() -> Harness {
+        let jwks = MockJwks::start().await;
+        let registry = Registry::new([API])
+            .with_site("studio.test", Site::Studio)
+            .with_site("auth.test:8000", Site::Auth);
+        let (pipeline, verify) = pipeline_with_registry(registry, JwtVerifier::new(jwks.config(vec![])));
+        Harness { pipeline, jwks, verify }
+    }
+
+    #[tokio::test]
+    async fn site_hosts_pass_through_before_routes_auth_and_cors() {
+        let h = site_harness().await;
+        for (host, site) in [("studio.test", Site::Studio), ("studio.test:8000", Site::Studio), ("auth.test:8000", Site::Auth)] {
+            for method in ["GET", "POST", "OPTIONS"] {
+                let handled = run(
+                    &h.pipeline,
+                    method,
+                    "/v1/no-such-route",
+                    Some(host),
+                    &[("authorization", "Bearer not-a-jwt"), ("origin", STUDIO), ("access-control-request-method", "GET")],
+                )
+                .await;
+                assert!(matches!(handled.outcome, Outcome::Site(s) if s == site), "{host} {method}");
+            }
+        }
+        let resp = expect_response(run(&h.pipeline, "GET", "/", Some("auth.test:9000"), &[]).await.outcome);
+        assert_eq!(resp.status, 404);
     }
 
     #[tokio::test]
     async fn undeclared_path_is_404() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(run(&h.pipeline, "GET", "/v1/other", None, &[]).await.outcome);
         assert_eq!(resp.status, 404);
         assert_eq!(resp.body, Some(shape("not_found", "no route")));
@@ -648,7 +708,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_method_is_405_with_allow_header() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(run(&h.pipeline, "DELETE", "/v1/databases", None, &[]).await.outcome);
         assert_eq!(resp.status, 405);
         assert_eq!(header(&resp.headers, "allow"), Some("POST"));
@@ -658,7 +718,7 @@ mod tests {
     /// Under /data/ the gateway's own 404 and 405 use the data API's error body.
     #[tokio::test]
     async fn data_routes_answer_404_and_405_with_the_data_api_body() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(run(&h.pipeline, "POST", "/data/v1/nope", None, &[]).await.outcome);
         assert_eq!(resp.status, 404);
         let body = resp.body.unwrap();
@@ -677,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_endpoint_is_proxied_without_identity() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let plan = expect_plan(run(&h.pipeline, "GET", "/health", None, &[]).await.outcome);
         assert_eq!(plan.endpoint.service, Service::Orchestrator);
         assert_eq!(plan.identity, None);
@@ -685,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn management_endpoint_without_bearer_is_401() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(run(&h.pipeline, "POST", "/v1/databases", None, &[]).await.outcome);
         assert_eq!(resp.status, 401);
         assert_eq!(error_code(&resp), Some("unauthorized"));
@@ -693,7 +753,7 @@ mod tests {
 
     #[tokio::test]
     async fn management_endpoint_with_invalid_bearer_is_401() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", "Bearer not-a-jwt")])
                 .await
@@ -705,7 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_bearer_mints_identity_for_the_target_service() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let token = h.jwks.token_for_org("user-1", "org-1", 300);
         let bearer = format!("Bearer {token}");
         let handled = run(
@@ -731,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn identity_carries_the_tokens_email_and_name() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -768,7 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn lowercase_bearer_scheme_is_accepted() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let token = h.jwks.token_for_org("user-1", "org-1", 300);
         let bearer = format!("bearer {token}");
         let plan = expect_plan(
@@ -787,7 +847,7 @@ mod tests {
             jwks_url: broken.jwks_url().to_string(),
             audiences: vec![],
         });
-        let (pipeline, _) = pipeline_with(&[], verifier);
+        let (pipeline, _) = pipeline_with(&[API], verifier);
         // Any well-formed JWT with a kid triggers a JWKS fetch, which fails.
         let signer = MockJwks::start().await;
         let bearer = format!("Bearer {}", signer.token_for_org("user-1", "org-1", 300));
@@ -803,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_for_studio_endpoint_is_answered_with_cors_headers() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(
             run(
                 &h.pipeline,
@@ -824,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_from_disallowed_origin_gets_no_cors_headers() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(
             run(
                 &h.pipeline,
@@ -843,14 +903,14 @@ mod tests {
 
     #[tokio::test]
     async fn options_without_preflight_headers_is_405() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(run(&h.pipeline, "OPTIONS", "/v1/databases", None, &[]).await.outcome);
         assert_eq!(resp.status, 405);
     }
 
     #[tokio::test]
     async fn preflight_for_non_cors_endpoint_is_405() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(
             run(
                 &h.pipeline,
@@ -867,7 +927,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxied_studio_request_from_allowed_origin_gets_cors_headers() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
         let plan = expect_plan(
             run(
@@ -886,7 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxied_request_from_disallowed_origin_gets_no_cors_headers() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
         let plan = expect_plan(
             run(
@@ -906,7 +966,7 @@ mod tests {
     // A cache must not reuse an origin-less response for a CORS request.
     #[tokio::test]
     async fn studio_endpoint_varies_on_origin_even_without_origin() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
         let plan = expect_plan(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", &bearer)])
@@ -919,14 +979,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_cors_endpoint_never_gets_cors_headers() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let plan = expect_plan(run(&h.pipeline, "GET", "/health", None, &[("origin", STUDIO)]).await.outcome);
         assert!(plan.response_headers.is_empty());
     }
 
     #[tokio::test]
     async fn upstream_headers_strip_credentials_even_on_public_routes() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let plan = expect_plan(run(&h.pipeline, "GET", "/health", None, &[]).await.outcome);
         let edits = plan.upstream_headers("rid-1");
         assert!(edits.remove.contains(&IDENTITY_HEADER));
@@ -936,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_headers_set_the_minted_identity_on_management_routes() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
         let plan = expect_plan(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", &bearer)])
@@ -957,7 +1017,7 @@ mod tests {
     // Review Focus 1: browsers hide non-CORS error responses from Studio.
     #[tokio::test]
     async fn unauthorized_response_on_studio_endpoint_carries_cors_headers() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("origin", STUDIO)]).await.outcome,
         );
@@ -967,7 +1027,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_allows_credentials_for_studio_only() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let plan = expect_plan(run(&h.pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", STUDIO)]).await.outcome);
         assert_eq!(plan.endpoint.service, Service::Auth);
         assert_eq!(plan.identity, None);
@@ -981,28 +1041,11 @@ mod tests {
 
     #[tokio::test]
     async fn auth_preflight_allows_credentials() {
-        let h = harness(&[]).await;
+        let h = harness(&[API]).await;
         let resp = expect_response(run(&h.pipeline, "OPTIONS", "/auth/v1/sign-in", None,
             &[("origin", STUDIO), ("access-control-request-method", "POST")]).await.outcome);
         assert_eq!(resp.status, 204);
         assert_eq!(header(&resp.headers, "access-control-allow-credentials"), Some("true"));
-    }
-
-    #[tokio::test]
-    async fn a_wildcard_origin_setting_never_allows_credentials() {
-        let jwks = MockJwks::start().await;
-        let (private_pem, _) = generate_keypair_pem();
-        let pipeline = Pipeline::new(
-            Arc::new(SharedRegistry::new(Registry::new(Vec::<String>::new()))),
-            vec!["*".to_string()],
-            JwtVerifier::new(jwks.config(vec![])),
-            InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
-            Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
-            Arc::new(UserTokens::new(None, "http://127.0.0.1:1", "unused")),
-        );
-        let plan = expect_plan(run(&pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", STUDIO)]).await.outcome);
-        assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), None);
-        assert_eq!(header(&plan.response_headers, "access-control-allow-credentials"), None);
     }
 
     // ---- data API keys (Task 4) ----
@@ -1025,8 +1068,8 @@ mod tests {
         let jwks = MockJwks::start().await;
         let (private_pem, public_pem) = generate_keypair_pem();
         let pipeline = Pipeline::new(
-            Arc::new(SharedRegistry::new(Registry::new(Vec::<String>::new()))),
-            vec![STUDIO.to_string()],
+            Arc::new(SharedRegistry::new(Registry::new([API]))),
+            STUDIO.to_string(),
             JwtVerifier::new(jwks.config(vec![])),
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
             Arc::new(DataKeyResolver::new(&url, dk::BEARER)),
@@ -1182,7 +1225,7 @@ mod tests {
                 .handle(&RequestParts {
                     method: "POST",
                     path: "/data/v1/query",
-                    host: None,
+                    host: Some(API),
                     headers: &headers,
                     client_ip: Some("203.0.113.9".parse().unwrap()),
                 })

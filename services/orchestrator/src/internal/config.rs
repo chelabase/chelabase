@@ -33,7 +33,7 @@ pub struct InternalConfig {
     pub actions_signing_key: Option<String>,
     /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT that deletes Zitadel sessions.
     pub zitadel_admin_pat_file: Option<PathBuf>,
-    /// `CHELABASE_ZITADEL_ISSUER`: Zitadel's base URL.
+    /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
     pub zitadel_issuer: Option<String>,
 }
 
@@ -79,9 +79,8 @@ impl InternalConfig {
             zitadel_admin_pat_file: get("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),
-            zitadel_issuer: get("CHELABASE_ZITADEL_ISSUER")
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty()),
+            zitadel_issuer: chelabase_types::entry::issuer_from_lookup(&get)
+                .map_err(anyhow::Error::new)?,
         })
     }
 
@@ -97,7 +96,7 @@ impl InternalConfig {
         let (Some(file), Some(issuer)) = (&self.zitadel_admin_pat_file, &self.zitadel_issuer)
         else {
             tracing::warn!(
-                "CHELABASE_ZITADEL_ADMIN_PAT_FILE or CHELABASE_ZITADEL_ISSUER is unset: \
+                "CHELABASE_ZITADEL_ADMIN_PAT_FILE or CHELABASE_AUTH_HOST is unset: \
                  revoked app sessions keep their Zitadel sessions"
             );
             return None;
@@ -309,7 +308,8 @@ mod tests {
             "CHELABASE_APP_REFRESH_TTL_SECS" => Some("3600".into()),
             "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key".into()),
             "CHELABASE_ZITADEL_ADMIN_PAT_FILE" => Some(".chelabase/zitadel/admin.pat".into()),
-            "CHELABASE_ZITADEL_ISSUER" => Some("http://127.0.0.1:8080".into()),
+            "CHELABASE_PUBLIC_SCHEME" => Some("http".into()),
+            "CHELABASE_AUTH_HOST" => Some("auth.chelabase.localhost:8000".into()),
             _ => None,
         })
         .unwrap();
@@ -321,7 +321,7 @@ mod tests {
             c.zitadel_admin_pat_file,
             Some(PathBuf::from(".chelabase/zitadel/admin.pat"))
         );
-        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
         let blank = InternalConfig::from_lookup(|name| {
             (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY").then(|| "  ".to_string())
         })
@@ -417,5 +417,23 @@ mod tests {
             ..InternalConfig::from_lookup(|_| None).unwrap()
         };
         assert!(c.load_signer().is_ok());
+    }
+
+    #[test]
+    fn the_zitadel_issuer_comes_from_the_auth_host() {
+        let c = InternalConfig::from_lookup(|name| match name {
+            "CHELABASE_PUBLIC_SCHEME" => Some("http".into()),
+            "CHELABASE_AUTH_HOST" => Some("auth.chelabase.localhost:8000".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
+        assert_eq!(InternalConfig::from_lookup(|_| None).unwrap().zitadel_issuer, None);
+        let err = InternalConfig::from_lookup(|name| {
+            (name == "CHELABASE_ZITADEL_ISSUER").then(|| "http://old-issuer.example".to_string())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CHELABASE_AUTH_HOST"), "{err}");
     }
 }

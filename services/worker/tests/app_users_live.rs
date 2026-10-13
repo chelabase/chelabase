@@ -414,7 +414,7 @@ async fn psql(conn: &str, user: &str, password: &str, sql: &str) -> Result<Strin
 }
 
 fn gateway() -> String {
-    std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into())
+    std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://api.chelabase.localhost:8000".into())
 }
 
 /// The built `chelabase` CLI, next to this test's own binary's directory.

@@ -62,7 +62,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let zitadel = match (&org, &self.zitadel) {
             (Some(_), None) => {
                 return Err(
-                    "the project has a Zitadel organization but Zitadel admin access isn't configured (CHELABASE_ZITADEL_ISSUER and CHELABASE_ZITADEL_ADMIN_PAT_FILE)"
+                    "the project has a Zitadel organization but Zitadel admin access isn't configured (CHELABASE_AUTH_HOST and CHELABASE_ZITADEL_ADMIN_PAT_FILE)"
                         .to_string(),
                 );
             }

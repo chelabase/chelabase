@@ -4,13 +4,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/entry.sh
+. "$ROOT/scripts/lib/entry.sh"
 set -a; source "$ROOT/.chelabase/zitadel/demo.env"; set +a
 # Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in Studio's .env.local.
 CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$ROOT/apps/studio/.env.local")}"
-ISS="$CHELABASE_ZITADEL_ISSUER"
-GW="${GATEWAY_URL:-http://localhost:8000}"
-MAILPIT="${MAILPIT_URL:-http://localhost:8025}"
-STUDIO="${CHELABASE_STUDIO_URL:-http://localhost:3000}"
+ISS="$CHELABASE_ENTRY_AUTH_URL" # the issuer, derived from the entry
+GW="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
+MAILPIT="${MAILPIT_URL:-$CHELABASE_ENTRY_MAIL_URL}"
+STUDIO="$CHELABASE_ENTRY_STUDIO_URL"
 JAR="$(mktemp)"; STATUS_FILE="$(mktemp)"; trap 'rm -f "$JAR" "$STATUS_FILE"' EXIT
 EMAIL="e2e-$(date +%s)-$RANDOM@example.com"
 PASSWORD="E2e-pass-$(openssl rand -hex 4)A!"

@@ -9,6 +9,7 @@ pub mod mode_policy;
 pub mod access;
 pub mod api_error;
 pub mod table_api;
+pub mod entry;
 #[cfg(feature = "axum")]
 pub mod api_extract;
 pub use api_error::{ErrorBody, ErrorCode, ErrorEnvelope};

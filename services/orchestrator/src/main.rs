@@ -30,9 +30,11 @@ async fn main() -> anyhow::Result<()> {
     });
     let nats_config = NatsConfig::from_env().expect("nats config");
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
+    let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
     let internal_config = InternalConfig::from_env()?;
     let signer = internal_config.load_signer()?;
     let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
+    entry.check_mode(mode).map_err(anyhow::Error::new)?;
     internal_config.check_mode(&ModePolicy::new(mode))?;
     let roles = RoleSettings::from_lookup(
         mode,
@@ -107,13 +109,11 @@ async fn main() -> anyhow::Result<()> {
         data_api_database_cap,
         locator: Arc::new(DockerLocator::connect(&internal_config.compute_network)?),
         console: Console::default(),
-        zitadel: zitadel_admin(),
+        zitadel: zitadel_admin(&entry.issuer()),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
-        studio_url: env_or("CHELABASE_STUDIO_URL", "http://localhost:3000")
-            .trim_end_matches('/')
-            .to_string(),
+        studio_url: entry.studio_origin(),
     };
 
     let app = build_router(Arc::new(state));
@@ -155,17 +155,19 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
     }
 }
 
-/// Zitadel's admin API with the admin PAT from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`; `None`
-/// (warned) when that or `CHELABASE_ZITADEL_ISSUER` is missing or the file can't be read.
-fn zitadel_admin() -> Option<chelabase_zitadel::client::Zitadel> {
-    let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    let (Some(file), Some(issuer)) = (var("CHELABASE_ZITADEL_ADMIN_PAT_FILE"), var("CHELABASE_ZITADEL_ISSUER"))
+/// Zitadel's admin API (at `issuer`) with the admin PAT from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`;
+/// `None` (warned) when that is unset or the file can't be read.
+fn zitadel_admin(issuer: &str) -> Option<chelabase_zitadel::client::Zitadel> {
+    let Some(file) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
     else {
-        warn!("CHELABASE_ZITADEL_ADMIN_PAT_FILE or CHELABASE_ZITADEL_ISSUER is not set; app users can't be enabled");
+        warn!("CHELABASE_ZITADEL_ADMIN_PAT_FILE is not set; app users can't be enabled");
         return None;
     };
     match std::fs::read_to_string(&file) {
-        Ok(pat) if !pat.trim().is_empty() => Some(chelabase_zitadel::client::Zitadel::new(&issuer, pat.trim())),
+        Ok(pat) if !pat.trim().is_empty() => Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim())),
         Ok(_) => {
             warn!("{file} is empty; app users can't be enabled");
             None

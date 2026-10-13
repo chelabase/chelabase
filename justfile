@@ -93,6 +93,8 @@ _live-swap-dev:
     fi
     "{{just_executable()}}" dev-down
     CHELABASE_LIVE_HOLDER=1 "{{just_executable()}}" dev
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     wait_for() { # wait_for <name> <url> <log>: up to 3 min
       for _ in $(seq 180); do
         if curl -fsS -o /dev/null "$2" 2>/dev/null; then return 0; fi
@@ -101,8 +103,8 @@ _live-swap-dev:
       echo "[live] $1 isn't answering after 3 min: see {{dev_dir}}/$3" >&2
       exit 1
     }
-    wait_for "the gateway" http://127.0.0.1:8000/health gateway.log
-    wait_for "Studio" http://localhost:3000/ studio.log
+    wait_for "the gateway" "$CHELABASE_ENTRY_API_URL/_gateway/health" gateway.log
+    wait_for "Studio" "$CHELABASE_ENTRY_STUDIO_URL/" studio.log
 
 # Once per machine, after pulling the change that removed the worktree slots: removes the slot
 # projects, the hook relay, the slot files and databases, then just deps-up. Asks first unless
@@ -121,6 +123,9 @@ deps-up: _live-check
     images="$(scripts/neon-images.sh)"
     # shellcheck disable=SC2086
     export $images
+    # The derived auth host name, public port and https flag compose interpolates.
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     compose=(docker compose -f {{compose_file}} --env-file {{compose_env}})
     "${compose[@]}" up -d
     # Provisioning needs an active safekeeper: fail here if registering one failed. Read from
@@ -143,11 +148,11 @@ deps-up: _live-check
 # Stop control-plane infrastructure containers, the Neon storage stack and any compute containers
 deps-down: _live-check
     docker ps -aq --filter name=^chelabase-compute- | xargs -r docker rm -f
-    docker compose -f {{compose_file}} --env-file {{compose_env}} down
+    . scripts/lib/entry.sh && docker compose -f {{compose_file}} --env-file {{compose_env}} down
 
 # Show Compose service status
 deps-ps:
-    docker compose -f {{compose_file}} --env-file {{compose_env}} ps
+    . scripts/lib/entry.sh && docker compose -f {{compose_file}} --env-file {{compose_env}} ps
 
 # Alias: start deps
 up: deps-up
@@ -157,6 +162,10 @@ down: deps-down
 
 # Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind, tenant admin)
 zitadel-bootstrap admin_email="zitadel-admin@zitadel.localhost": _live-check
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     cargo run -q -p chelabase -- dev bootstrap --admin-email {{admin_email}}
 
 # Wipe Zitadel volume only so FirstInstance rewrites admin.pat
@@ -165,13 +174,20 @@ zitadel-reset: _live-check
 
 # Mint a short-lived demo access token (stdout)
 auth-token:
-    @cargo run -q -p chelabase -- dev token
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
+    cargo run -q -p chelabase -- dev token
 
 # --- Individual processes (foreground) ---
 
 orchestrator:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The host settings (scripts/lib/entry.sh): the gateway routes by host
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
@@ -190,6 +206,9 @@ orchestrator:
 worker:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The host settings (scripts/lib/entry.sh): the gateway routes by host
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
@@ -203,6 +222,9 @@ worker:
 gateway:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The host settings (scripts/lib/entry.sh): the gateway routes by host
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
@@ -215,6 +237,9 @@ gateway:
 rest:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The host settings (scripts/lib/entry.sh): the gateway routes by host
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
@@ -227,6 +252,9 @@ rest:
 auth:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The host settings (scripts/lib/entry.sh): the gateway routes by host
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
@@ -237,14 +265,27 @@ auth:
     cargo run -p auth
 
 studio:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     pnpm --filter @chelabase/studio dev
 
-# The docs site (apps/docs) on http://localhost:3001; needs no stack
+# The docs site (apps/docs), at the docs host through the gateway (run just dev first)
 docs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     pnpm --filter @chelabase/docs dev
 
-# The landing page (apps/landing) on http://localhost:3002; needs no stack
+# The landing page (apps/landing), at the landing host through the gateway (run just dev first)
 landing:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
+    export VITE_STUDIO_URL="${VITE_STUDIO_URL:-$CHELABASE_ENTRY_STUDIO_URL}"
     pnpm --filter @chelabase/landing dev
 
 # Pixel check of the landing page against committed baselines; `--update-snapshots` re-records; not part of just check
@@ -265,6 +306,11 @@ dev: _live-check deps-up
     # Which worktree runs the apps (the dev dir is shared through the .chelabase symlink): just live
     # moves them when another worktree takes the stack.
     echo "{{justfile_directory()}}" >"{{dev_dir}}/worktree"
+
+    # The host settings: Compose, bootstrap and the apps read the same ones (a value already
+    # exported wins)
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
 
     echo "waiting for metadata postgres…"
     for i in $(seq 1 30); do
@@ -287,6 +333,7 @@ dev: _live-check deps-up
       fi
     fi
 
+    # Zitadel at its upstream with the auth host (the gateway isn't running yet).
     echo "bootstrapping Zitadel IAM…"
     if ! cargo run -q -p chelabase -- dev bootstrap; then
       echo ""
@@ -334,15 +381,16 @@ dev: _live-check deps-up
     echo "=== Chelabase dev stack (detached) ==="
     echo "Seed tenant_id:  {{demo_tenant_id}}"
     echo "Seed project_id: {{demo_project_id}}"
-    echo "Gateway:         http://127.0.0.1:8000  (front door — call the API here)"
+    echo "Gateway:         http://127.0.0.1:8000  (front door; reached by host name, see below)"
+    echo "API:             $CHELABASE_ENTRY_API_URL  (call the API here)"
     echo "Orchestrator:    http://127.0.0.1:8081  (internal; requires gateway identity)"
     echo "Internal:        ${CHELABASE_INTERNAL_URL}  (internal; proxy / compute_ctl / storage controller)"
     echo "Worker health:   http://127.0.0.1:8082/health"
     echo "rest:            http://127.0.0.1:8085  (data API; via the gateway at /data/v1; internal on :8086)"
     echo "auth:            http://127.0.0.1:8084  (sign-in backend; via the gateway at /auth/v1)"
-    echo "Studio:          http://localhost:3000  (sign in)"
-    echo "Mailpit (email): http://localhost:8025  (emails: invites, resets, verification codes)"
-    echo "Zitadel console: http://localhost:8080/ui/console"
+    echo "Studio:          $CHELABASE_ENTRY_STUDIO_URL  (sign in)"
+    echo "Mailpit (email): $CHELABASE_ENTRY_MAIL_URL  (emails: invites, resets, verification codes)"
+    echo "Zitadel console: $CHELABASE_ENTRY_AUTH_URL/ui/console"
     echo "Demo IAM:        .chelabase/zitadel/ (cargo run -p chelabase -- dev token)"
     echo "Logs:            {{dev_dir}}/*.log"
     echo ""
@@ -392,7 +440,12 @@ _cleanup:
     set -euo pipefail
     # Keeps secrets.key, the gateway and cookie keys, the seeded demo tenant/project and the
     # Neon storage stack.
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     just="{{just_executable()}}"
+    # Mailpit is reached through the gateway: empty it while the apps still run (a stack that
+    # isn't up only leaves a note).
+    if [[ -n "$CHELABASE_ENTRY_MAIL_URL" ]]; then curl -fsS -X DELETE "$CHELABASE_ENTRY_MAIL_URL/api/v1/messages" >/dev/null && echo "emptied Mailpit" || echo "Mailpit isn't reachable through the gateway (the stack isn't up): not emptied" >&2; fi
     "$just" dev-down
     # Anything still on the dev ports (e.g. an app started by hand) would keep old code running.
     for port in 8000 8081 8082 8084 8085 8086 3000; do
@@ -407,7 +460,6 @@ _cleanup:
     "$just" deps-up
     "$just" sweep-dbs
     "$just" zitadel-reset
-    curl -fsS -X DELETE http://localhost:8025/api/v1/messages >/dev/null && echo "emptied Mailpit"
     for _ in $(seq 60); do [[ -s .chelabase/zitadel/login-client.pat ]] && break; sleep 1; done
     "$just" zitadel-bootstrap
     echo ""
@@ -422,6 +474,9 @@ _cleanup:
 create-db-demo name="demo1":
     #!/usr/bin/env bash
     set -euo pipefail
+    # The host settings (scripts/lib/entry.sh): the gateway routes by host
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091
@@ -429,7 +484,7 @@ create-db-demo name="demo1":
       set +a
     fi
     TOKEN="$(cargo run -q -p chelabase -- dev token)"
-    curl -sS -X POST "http://127.0.0.1:8000/v1/databases" \
+    curl -sS -X POST "$CHELABASE_ENTRY_API_URL/v1/databases" \
       -H "content-type: application/json" \
       -H "Authorization: Bearer ${TOKEN}" \
       -d "{\"tenant_id\":\"{{demo_tenant_id}}\",\"project_id\":\"{{demo_project_id}}\",\"name\":\"{{name}}\"}"
@@ -471,6 +526,8 @@ sweep-dbs: _live-check
       echo "removed $(echo "${ids}" | wc -w | tr -d ' ') compute container(s)"
     fi
 
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if docker compose -f "{{compose_file}}" --env-file "{{compose_env}}" exec -T metadata-db \
          pg_isready -U chelabase -d chelabase_metadata >/dev/null 2>&1; then
       LOG_PREFIX=sweep-dbs
@@ -496,6 +553,9 @@ api-gen:
     pnpm --filter @chelabase/studio generate:login
 
 check:
+    scripts/tests/entry-urls.sh
+    scripts/tests/entry-sh.sh
+    scripts/tests/dev-recipes.sh
     cargo check --workspace
     cargo test -p orchestrator -p auth -p rest openapi::tests
     cargo test -p chelabase-query --test openapi_fidelity
@@ -583,7 +643,7 @@ neon-build:
 
 # Show the Neon storage containers
 neon-ps:
-    docker compose -f {{compose_file}} --env-file {{compose_env}} ps -a {{neon_services}}
+    . scripts/lib/entry.sh && docker compose -f {{compose_file}} --env-file {{compose_env}} ps -a {{neon_services}}
 
 # Check the running Neon storage stack (creates and deletes a throwaway tenant)
 neon-smoke: _live-check
@@ -659,6 +719,9 @@ neon-test-live: _live-check
 worker-live test *args: _live-check
     #!/usr/bin/env bash
     set -euo pipefail
+    # The host settings (scripts/lib/entry.sh): the gateway routes by host
+    # shellcheck disable=SC1091
+    . scripts/lib/entry.sh
     if [[ -f .chelabase/zitadel/demo.env ]]; then
       set -a
       # shellcheck disable=SC1091

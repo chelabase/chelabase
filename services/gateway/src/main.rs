@@ -26,9 +26,7 @@ fn main() -> anyhow::Result<()> {
     let config = GatewayConfig::from_env()?;
     let verifier = JwtVerifier::from_env()?;
     let signer = InternalSigner::from_env()?;
-    let registry = Arc::new(SharedRegistry::new(
-        Registry::from_config(&config.api_hosts).map_err(anyhow::Error::msg)?,
-    ));
+    let registry = Arc::new(SharedRegistry::new(Registry::from_entry(&config.entry)));
     let keys = Arc::new(DataKeyResolver::new(&config.internal_url, &config.data_keys_token));
     let app_verifier = config
         .app_jwt_public_key
@@ -40,7 +38,7 @@ fn main() -> anyhow::Result<()> {
         &config.internal_url,
         &config.app_sessions_token,
     ));
-    let pipeline = Pipeline::new(registry, config.studio_origins.clone(), verifier, signer, keys, users);
+    let pipeline = Pipeline::new(registry, config.entry.studio_origin(), verifier, signer, keys, users);
 
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
     // periods. Under `just dev`, Compose, or k8s a process manager restarts us,
@@ -56,11 +54,18 @@ fn main() -> anyhow::Result<()> {
     server.bootstrap();
     let mut service = pingora_proxy::http_proxy_service(
         &server.configuration,
-        Gateway::new(pipeline, config.upstreams.clone(), config.upstream_timeout),
+        Gateway::new(
+            pipeline,
+            config.upstreams.clone(),
+            config.upstream_timeout,
+            config.entry.scheme(),
+        ),
     );
-    service.add_tcp(&config.listen);
+    for addr in &config.listen {
+        service.add_tcp(addr);
+    }
     server.add_service(service);
 
-    info!(listen = %config.listen, "gateway listening");
+    info!(listen = %config.listen.join(","), "gateway listening");
     server.run_forever();
 }

@@ -45,7 +45,7 @@ pub async fn harness_full(
         token: TOKEN.into(),
         cookie_key: cookie_key.clone(),
         org_id: "o1".into(),
-        studio_url: "http://localhost:3000".into(),
+        studio_url: "http://studio.chelabase.localhost:8000".into(),
         skip_email_verification: skip,
         secure_cookies: false,
         min_response: Duration::from_millis(min_ms),
@@ -232,7 +232,7 @@ async fn sign_in_finishes_and_sets_the_session_cookie() {
         a.body["redirect"]
             .as_str()
             .unwrap()
-            .starts_with("http://localhost:3000/callback?code=")
+            .starts_with("http://studio.chelabase.localhost:8000/callback?code=")
     );
     assert!(a.cookie("chelabase_session").is_some());
     assert!(a.cookies.iter().any(|c| c.starts_with("chelabase_session=")
@@ -1744,7 +1744,7 @@ async fn an_expired_sign_in_still_completes_the_accept() {
         )
         .await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body, json!({"next": "done", "redirect": "http://localhost:3000"}));
+    assert_eq!(a.body, json!({"next": "done", "redirect": "http://studio.chelabase.localhost:8000"}));
     assert!(a.cookie("chelabase_session").is_some());
     assert_eq!(h.mock.user_by_id(&id).unwrap().password, "Secret-pass1");
 }

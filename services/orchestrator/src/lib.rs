@@ -1497,7 +1497,7 @@ pub struct AppState<M, J> {
     /// Studio's console: owner pools, the owner's query caches, checked roles.
     pub console: Console,
     /// Zitadel's admin API (admin PAT); `None` when `CHELABASE_ZITADEL_ADMIN_PAT_FILE` or
-    /// `CHELABASE_ZITADEL_ISSUER` isn't set.
+    /// `CHELABASE_AUTH_HOST` isn't set.
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// The one write path to a project's users table.
     pub users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
@@ -1506,7 +1506,7 @@ pub struct AppState<M, J> {
     /// `CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES`: a table API dry run doesn't run a statement that
     /// may rewrite a table larger than this ([`table_api_dry_run_max_bytes`]).
     pub table_api_dry_run_max_bytes: i64,
-    /// `CHELABASE_STUDIO_URL` (no trailing `/`): invite links go to its `/accept-invite`.
+    /// `CHELABASE_STUDIO_HOST` with the public scheme (no trailing `/`): invite links go to its `/accept-invite`.
     pub studio_url: String,
 }
 

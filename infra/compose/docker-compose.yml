@@ -85,7 +85,7 @@ services:
   zitadel:
     image: ghcr.io/zitadel/zitadel:v4.19.1@sha256:f98935f56505ec6fa3e6523261cd1b8ace0c622e16da4a45acd493cb472f003f
     restart: unless-stopped
-    command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode disabled
+    command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode ${CHELABASE_ZITADEL_TLS_MODE:?set by scripts/lib/entry.sh (just deps-up)}
     environment:
       ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
       ZITADEL_DATABASE_POSTGRES_PORT: 5432
@@ -96,9 +96,12 @@ services:
       ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
       ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
       ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
-      ZITADEL_EXTERNALSECURE: "false"
-      ZITADEL_EXTERNALDOMAIN: localhost
-      ZITADEL_EXTERNALPORT: "8080"
+      # Zitadel's public address is the gateway's auth host (CHELABASE_AUTH_HOST), set apart here:
+      # its name, the public port and whether the scheme is https. scripts/lib/entry.sh derives
+      # them (and the TLS mode above) from the entry settings; there are no defaults here.
+      ZITADEL_EXTERNALSECURE: "${CHELABASE_PUBLIC_SECURE:?set by scripts/lib/entry.sh (just deps-up)}"
+      ZITADEL_EXTERNALDOMAIN: "${CHELABASE_AUTH_HOST_NAME:?set by scripts/lib/entry.sh (just deps-up)}"
+      ZITADEL_EXTERNALPORT: "${CHELABASE_PUBLIC_PORT:?set by scripts/lib/entry.sh (just deps-up)}"
       # Zitadel's own registration is off: sign-up goes only through Chelabase's rules. (A volume
       # made before this setting gets it from `chelabase dev bootstrap`.)
       ZITADEL_DEFAULTINSTANCE_LOGINPOLICY_ALLOWREGISTER: "false"
@@ -112,9 +115,10 @@ services:
       ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Chelabase auth
       ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
       ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
-      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: http://localhost:3000/
-      ZITADEL_OIDC_DEFAULTLOGINURLV2: "http://localhost:3000/login?authRequest="
-      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "http://localhost:3000/logout?post_logout_redirect="
+      # The login UI is Studio, at its public origin (scheme and CHELABASE_STUDIO_HOST).
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: "${CHELABASE_PUBLIC_SCHEME:?set by scripts/lib/entry.sh (just deps-up)}://${CHELABASE_STUDIO_HOST:?set by scripts/lib/entry.sh (just deps-up)}/"
+      ZITADEL_OIDC_DEFAULTLOGINURLV2: "${CHELABASE_PUBLIC_SCHEME:?set by scripts/lib/entry.sh (just deps-up)}://${CHELABASE_STUDIO_HOST:?set by scripts/lib/entry.sh (just deps-up)}/login?authRequest="
+      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "${CHELABASE_PUBLIC_SCHEME:?set by scripts/lib/entry.sh (just deps-up)}://${CHELABASE_STUDIO_HOST:?set by scripts/lib/entry.sh (just deps-up)}/logout?post_logout_redirect="
       # self-hosted dev only: lets Actions call the host's internal listener (R11)
       ZITADEL_HTTPCLIENT_DENYLIST: "localhost,0.0.0.0/8,127.0.0.0/8,169.254.0.0/16,::1/128"
     # self-hosted dev only: lets Actions call the host's internal listener (R11)

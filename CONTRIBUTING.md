@@ -1,6 +1,6 @@
 # Contributing
 
-How to set up a machine, run the stack, test, and commit. For what the system is and how it works, run `just docs` and open http://localhost:3001/docs/architecture.
+How to set up a machine, run the stack, test, and commit. For what the system is and how it works, run `just docs` and open http://docs.chelabase.localhost:8000/docs/architecture (with the stack up: the docs host is reached through the gateway, which `just dev` starts).
 
 ## Prerequisites
 
@@ -62,7 +62,7 @@ Run `just` to list them all.
 | `just check` | Rust check, the OpenAPI freshness checks (`just api-gen` if they fail), and typecheck plus tests for the TypeScript packages; it also typechecks, builds and tests the docs site |
 | `just test` | Rust tests with nextest, then doctests |
 | `just api-gen` | Regenerate `openapi/*.json` and the generated clients. Never edit those by hand |
-| `just docs` | The docs site on http://localhost:3001 (needs no stack) |
+| `just docs` | The docs site on http://docs.chelabase.localhost:8000 (reached through the gateway: run `just dev` first) |
 | `just sweep-builds [days=N]` | Delete build artifacts older than 14 days (or `N`) from the main and every worktree's `target/` |
 | `just wt-add <branch> [base]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/` (see below) |
 | `just live <recipe or command>` | Queue your command on the machine's one stack; run when it's your turn |
@@ -79,7 +79,7 @@ just create-db-demo      # 202 and a database_id
 # poll with a minted token:
 #   TOKEN=$(cargo run -q -p chelabase -- dev token)
 #   curl -sS -H "Authorization: Bearer $TOKEN" \
-#     http://127.0.0.1:8000/v1/databases/<database_id>
+#     http://api.chelabase.localhost:8000/v1/databases/<database_id>
 just stop
 ```
 
@@ -97,9 +97,9 @@ Logs for detached processes: `.chelabase/dev/*.log`. IAM artifacts: `.chelabase/
 
 1. `just dev` (needs Docker; the worker starts each database's compute container).
 2. `just create-db-demo demo1` (positional; `name=demo1` would become the literal name).
-3. Poll `GET http://127.0.0.1:8000/v1/databases/<id>` with a minted Bearer token until `status` is `ready`.
-4. `GET http://127.0.0.1:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.chelabase/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). `CHELABASE_PROXY_CA_FILE` (default `.chelabase/neon/proxy-ca.crt`) only sets the path reported in `ca_file`; it doesn't change which CA the proxy uses.
-5. `DELETE http://127.0.0.1:8000/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset.
+3. Poll `GET http://api.chelabase.localhost:8000/v1/databases/<id>` with a minted Bearer token until `status` is `ready`.
+4. `GET http://api.chelabase.localhost:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.chelabase/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). `CHELABASE_PROXY_CA_FILE` (default `.chelabase/neon/proxy-ca.crt`) only sets the path reported in `ca_file`; it doesn't change which CA the proxy uses.
+5. `DELETE http://api.chelabase.localhost:8000/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset.
 
 ## Seed tenant and project
 
@@ -110,24 +110,44 @@ Logs for detached processes: `.chelabase/dev/*.log`. IAM artifacts: `.chelabase/
 
 Bootstrap sets `tenants.zitadel_org_id` for the demo tenant from the local Zitadel org.
 
+## Workbench URLs
+
+Everything a browser or a script reaches goes through the gateway on port 8000, by host name:
+
+| URL | What |
+| --- | --- |
+| http://studio.chelabase.localhost:8000 | Studio |
+| http://api.chelabase.localhost:8000 | The management API, the data API and the app-user sign-in routes |
+| http://auth.chelabase.localhost:8000 | Zitadel (console at `/ui/console`) |
+| http://docs.chelabase.localhost:8000 | The docs site (`just docs`) |
+| http://landing.chelabase.localhost:8000 | The landing page (`just landing`) |
+| http://mail.chelabase.localhost:8000 | Mailpit |
+
+`chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and the hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, whose workbench values live in [`infra/compose/.env.example`](infra/compose/.env.example); the rules are in the docs page "Self-hosting → Hosts".
+
+`scripts/lib/entry.sh` is the one place scripts and recipes get these URLs: `source` it and use `CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL` (and the derived `CHELABASE_AUTH_HOST_NAME`, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE`, `CHELABASE_ZITADEL_TLS_MODE`, which Compose requires: every recipe that runs `docker compose` sources it). Never write a URL literal in a script; `scripts/tests/entry-urls.sh` (run by `just check`) fails on them.
+
 ## Local dependencies
+
+The upstream ports below are loopback only. Reach the apps through the gateway at the URLs above; a port is for the gateway itself, for debugging, or for services that aren't web apps.
 
 | Service | Host port | Notes |
 | --- | --- | --- |
 | metadata Postgres | 5433 | Control-plane metadata |
 | NATS (+ JetStream) | 4222 (monitor 8222) | Provision queue |
-| Zitadel | 8080 | Console: http://localhost:8080/ui/console |
+| Zitadel | 8080 | Upstream of the auth host (`CHELABASE_ZITADEL_UPSTREAM`) |
 | Zitadel Postgres | 5434 | Zitadel's own database |
-| Mailpit | 8025 | Local email inbox (verification codes, password resets) |
-| Gateway | 8000 | HTTP front door (Pingora) |
+| Mailpit | 8025 | Upstream of the mail host (`CHELABASE_MAIL_UPSTREAM`) |
+| Gateway | 8000 | HTTP front door (Pingora); the only port to open in a browser |
 | Orchestrator | 8081 | Internal HTTP API (reached through the gateway) |
 | Worker health | 8082 | `/health` |
 | Orchestrator internal | 8083 | Internal listener (proxy, compute_ctl, storage controller) |
 | auth | 8084 | Sign-in backend (through the gateway at `/auth/v1`) |
 | rest | 8085 | Data API engine (through the gateway at `/data/v1`) |
 | rest internal | 8086 | The orchestrator's schema calls to rest |
-| Studio | 3000 | Open it at `http://localhost:3000`, not `127.0.0.1` |
-| Docs site | 3001 | `just docs` only |
+| Studio | 3000 | Upstream of the Studio host; its sign-in fails on this port, use the Studio URL |
+| Docs site | 3001 | Upstream of the docs host (`just docs`) |
+| Landing page | 3002 | Upstream of the landing host |
 | Neon storage controller | 1234 | Tenants and timelines |
 | Neon proxy | 4432, 4444 | Postgres wire; WebSocket and SQL over HTTP |
 | Valkey | 6379 | Proxy cache invalidation and query cancel |

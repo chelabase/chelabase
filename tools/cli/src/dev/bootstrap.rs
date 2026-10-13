@@ -5,7 +5,7 @@ use crate::dev::zitadel::HttpZitadel;
 use crate::dev::{app_keys, internal_keys, secrets_key, steps, tenant};
 use crate::neon::compute_jwt;
 use crate::paths::{
-    auth_dir, demo_tenant_id, gateway_dir, issuer, neon_dir, secrets_dir, studio_env_file,
+    auth_dir, demo_tenant_id, entry, gateway_dir, neon_dir, secrets_dir, studio_env_file,
     zitadel_dir,
 };
 use anyhow::{Context, Result, bail};
@@ -13,8 +13,6 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 use tracing::{info, warn};
-
-const GATEWAY_URL: &str = "http://localhost:8000";
 
 /// Zitadel's first-instance human admin, the dev stack's sign-in.
 pub const DEV_USER_EMAIL: &str = "zitadel-admin@zitadel.localhost";
@@ -34,7 +32,9 @@ fn demo_admin(mode: chelabase_types::mode::Mode) -> bool {
 }
 
 pub async fn run(admin_email: Option<&str>) -> Result<()> {
-    let iss = issuer();
+    let entry = entry()?;
+    let iss = entry.issuer();
+    let studio_origin = entry.studio_origin();
     let zdir = zitadel_dir();
     fs::create_dir_all(&zdir).with_context(|| format!("mkdir {}", zdir.display()))?;
 
@@ -57,13 +57,16 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
     wait_for_file(&login_client, "login-client.pat", 45, TOKEN_POLL).await?;
 
     let mode = chelabase_types::mode::Mode::from_env().map_err(anyhow::Error::msg)?;
-    let api = HttpZitadel::new(&iss, &admin_pat);
+    // Zitadel at its upstream with the auth host as Host: the bootstrap runs before the gateway.
+    let upstream = chelabase_types::entry::zitadel_upstream(|name| std::env::var(name).ok());
+    let api = HttpZitadel::via_upstream(&upstream, entry.auth_host(), &admin_pat);
     let (org_id, org_name) = wait_ready(|| steps::ensure_org(&api)).await?;
     let project_id = steps::ensure_project(&api, &org_id).await?;
     let api_client_id = steps::ensure_api_app(&api, &project_id).await?;
-    let studio_client_id = steps::ensure_studio_app(&api, &project_id, mode).await?;
+    let studio_client_id =
+        steps::ensure_studio_app(&api, &project_id, mode, &studio_origin).await?;
     // W8: self-hosted mode only, sign-ins go to Studio's own login.
-    steps::ensure_studio_login(&api, &project_id, mode).await?;
+    steps::ensure_studio_login(&api, &project_id, mode, &studio_origin).await?;
     let demo_user_id = steps::ensure_demo_user(&api, &org_id).await?;
     steps::ensure_demo_key(&api, &demo_user_id, &zdir.join("demo-sa.json")).await?;
     steps::ensure_smtp(&api).await?;
@@ -128,7 +131,14 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
     }
     fs::write(
         studio_env_file(),
-        render_studio_env(&iss, &studio_client_id, &project_id, &org_id, GATEWAY_URL),
+        render_studio_env(
+            &iss,
+            &studio_client_id,
+            &project_id,
+            &org_id,
+            &entry.api_base(),
+            entry.studio_host(),
+        ),
     )?;
     info!("bootstrap complete (idempotent)");
     Ok(())
@@ -172,13 +182,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev::requests::STUDIO_ORIGIN;
-
-    fn host(url: &str) -> &str {
-        let rest = url.split_once("://").unwrap().1;
-        rest.split(['/', ':']).next().unwrap()
-    }
-
     // Zitadel writes admin.pat and login-client.pat moments apart on a fresh instance:
     // both are waited for, not just the first.
     #[tokio::test]
@@ -271,12 +274,5 @@ mod tests {
         for var in [":'tenant'", ":'zuid'", ":'email'"] {
             assert!(sql.contains(var), "{var} missing");
         }
-    }
-
-    // auth's SameSite=Strict cookies are dropped on cross-site fetches: Studio and the
-    // gateway must be the same site (localhost vs 127.0.0.1 are different sites).
-    #[test]
-    fn studio_and_the_gateway_are_the_same_site() {
-        assert_eq!(host(STUDIO_ORIGIN), host(GATEWAY_URL));
     }
 }

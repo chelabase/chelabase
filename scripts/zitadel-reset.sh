@@ -7,6 +7,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/infra/compose/docker-compose.yml}"
 COMPOSE_ENV="${COMPOSE_ENV:-$ROOT/infra/compose/.env.example}"
 ZDIR="${CHELABASE_ZITADEL_DIR:-$ROOT/.chelabase/zitadel}"
+# The entry values Compose interpolates (Zitadel's external domain, port, TLS mode).
+# shellcheck source=lib/entry.sh
+. "$ROOT/scripts/lib/entry.sh"
 
 echo "[zitadel-reset] stopping Zitadel services and removing zitadel_pg_data…"
 docker compose -f "$COMPOSE_FILE" --env-file "$COMPOSE_ENV" stop zitadel zitadel-db >/dev/null 2>&1 || true

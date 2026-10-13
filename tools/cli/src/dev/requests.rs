@@ -106,16 +106,12 @@ pub fn api_app_create(project_id: &str, name: &str) -> Value {
            "apiConfiguration": {"authMethodType": "API_AUTH_METHOD_TYPE_PRIVATE_KEY_JWT"}})
 }
 
-/// Where Studio's dev server runs (the app's redirect URIs and login).
-pub const STUDIO_ORIGIN: &str = "http://localhost:3000";
-
 /// Studio: a public SPA using PKCE, issuing JWT access tokens the gateway verifies via JWKS.
 /// `developmentMode` allows the plain-http localhost redirects. In self-hosted mode the app sends
 /// sign-ins to Studio's /login itself (login v2 `baseUri`): the instance doesn't force its own
 /// login URL there (W8), and an app without a base URI would get Zitadel's v1 login. Platform
 /// mode leaves the login to the instance default.
-pub fn studio_app_config(mode: Mode) -> Value {
-    let origin = STUDIO_ORIGIN;
+pub fn studio_app_config(mode: Mode, origin: &str) -> Value {
     let mut config = json!({
         "redirectUris": [format!("{origin}/callback")],
         "postLogoutRedirectUris": [format!("{origin}/")],
@@ -134,15 +130,15 @@ pub fn studio_app_config(mode: Mode) -> Value {
     config
 }
 
-pub fn studio_app_create(project_id: &str, mode: Mode) -> Value {
+pub fn studio_app_create(project_id: &str, mode: Mode, origin: &str) -> Value {
     json!({"projectId": project_id, "name": STUDIO_APP,
-           "oidcConfiguration": studio_app_config(mode)})
+           "oidcConfiguration": studio_app_config(mode, origin)})
 }
 
 /// No `name`: the app is found by it, and Zitadel refuses an unchanged name (COMMAND-2m8vx).
-pub fn studio_app_update(project_id: &str, app_id: &str, mode: Mode) -> Value {
+pub fn studio_app_update(project_id: &str, app_id: &str, mode: Mode, origin: &str) -> Value {
     json!({"projectId": project_id, "applicationId": app_id,
-           "oidcConfiguration": studio_app_config(mode)})
+           "oidcConfiguration": studio_app_config(mode, origin)})
 }
 
 /// Whether a `ListApplications` result has the Studio app without a login v2 base URI.
@@ -226,8 +222,8 @@ pub fn app_id_named(listed: &Value, name: &str) -> Option<String> {
 }
 
 /// Fields of the existing Studio app that differ from what bootstrap wants.
-pub fn studio_app_drift(app: &Value, mode: Mode) -> Vec<&'static str> {
-    let want = studio_app_config(mode);
+pub fn studio_app_drift(app: &Value, mode: Mode, origin: &str) -> Vec<&'static str> {
+    let want = studio_app_config(mode, origin);
     [
         "redirectUris",
         "postLogoutRedirectUris",
@@ -352,6 +348,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const ORIGIN: &str = "http://studio.chelabase.localhost:8000";
+
     #[test]
     fn the_default_org_comes_from_a_default_query() {
         assert_eq!(
@@ -410,24 +408,27 @@ mod tests {
     // The app's shape; platform mode keeps the login on the instance default.
     #[test]
     fn the_studio_app_is_a_pkce_spa_with_jwt_access_tokens() {
-        let c = studio_app_config(Mode::Platform);
-        assert_eq!(c["redirectUris"], json!(["http://localhost:3000/callback"]));
+        let c = studio_app_config(Mode::Platform, ORIGIN);
+        assert_eq!(
+            c["redirectUris"],
+            json!(["http://studio.chelabase.localhost:8000/callback"])
+        );
         assert_eq!(
             c["postLogoutRedirectUris"],
-            json!(["http://localhost:3000/"])
+            json!(["http://studio.chelabase.localhost:8000/"])
         );
         assert_eq!(c["applicationType"], "OIDC_APP_TYPE_USER_AGENT");
         assert_eq!(c["authMethodType"], "OIDC_AUTH_METHOD_TYPE_NONE");
         assert_eq!(c["accessTokenType"], "OIDC_TOKEN_TYPE_JWT");
         assert_eq!(c["developmentMode"], true);
         assert!(c.get("loginVersion").is_none(), "{c}");
-        let create = studio_app_create("p1", Mode::Platform);
+        let create = studio_app_create("p1", Mode::Platform, ORIGIN);
         assert_eq!(create["oidcConfiguration"], c);
         assert_eq!(create["name"], "chelabase-studio");
         for mode in [Mode::SelfHosted, Mode::Platform] {
-            let update = studio_app_update("p1", "a2", mode);
+            let update = studio_app_update("p1", "a2", mode, ORIGIN);
             assert_eq!(update["applicationId"], "a2");
-            assert_eq!(update["oidcConfiguration"], studio_app_config(mode));
+            assert_eq!(update["oidcConfiguration"], studio_app_config(mode, ORIGIN));
             // Zitadel refuses an UpdateApplication whose name hasn't changed
             // (COMMAND-2m8vx "No changes") before it looks at the OIDC settings.
             assert!(update.get("name").is_none(), "{update}");
@@ -438,26 +439,26 @@ mod tests {
     // own login (otherwise it falls back to Zitadel's v1 login).
     #[test]
     fn the_self_hosted_studio_app_names_its_own_login() {
-        let c = studio_app_config(Mode::SelfHosted);
+        let c = studio_app_config(Mode::SelfHosted, ORIGIN);
         assert_eq!(
             c["loginVersion"],
-            json!({"loginV2": {"baseUri": "http://localhost:3000/"}})
+            json!({"loginV2": {"baseUri": "http://studio.chelabase.localhost:8000/"}})
         );
         assert_eq!(
-            studio_app_create("p1", Mode::SelfHosted)["oidcConfiguration"],
+            studio_app_create("p1", Mode::SelfHosted, ORIGIN)["oidcConfiguration"],
             c
         );
     }
 
     #[test]
     fn studio_app_drift_names_what_changed() {
-        let good = json!({"oidcConfiguration": studio_app_config(Mode::Platform)});
-        assert!(studio_app_drift(&good, Mode::Platform).is_empty());
+        let good = json!({"oidcConfiguration": studio_app_config(Mode::Platform, ORIGIN)});
+        assert!(studio_app_drift(&good, Mode::Platform, ORIGIN).is_empty());
         let mut bad = good.clone();
         bad["oidcConfiguration"]["redirectUris"] = json!(["http://old/callback"]);
         bad["oidcConfiguration"]["accessTokenType"] = json!("OIDC_TOKEN_TYPE_BEARER");
         assert_eq!(
-            studio_app_drift(&bad, Mode::Platform),
+            studio_app_drift(&bad, Mode::Platform, ORIGIN),
             vec!["redirectUris", "accessTokenType"]
         );
     }
@@ -465,14 +466,14 @@ mod tests {
     // W8: an app from before W8 (no loginVersion) is updated in self-hosted mode only.
     #[test]
     fn login_drift_counts_only_in_self_hosted_mode() {
-        let before = json!({"oidcConfiguration": studio_app_config(Mode::Platform)});
+        let before = json!({"oidcConfiguration": studio_app_config(Mode::Platform, ORIGIN)});
         assert_eq!(
-            studio_app_drift(&before, Mode::SelfHosted),
+            studio_app_drift(&before, Mode::SelfHosted, ORIGIN),
             vec!["loginVersion"]
         );
-        assert!(studio_app_drift(&before, Mode::Platform).is_empty());
-        let after = json!({"oidcConfiguration": studio_app_config(Mode::SelfHosted)});
-        assert!(studio_app_drift(&after, Mode::SelfHosted).is_empty());
+        assert!(studio_app_drift(&before, Mode::Platform, ORIGIN).is_empty());
+        let after = json!({"oidcConfiguration": studio_app_config(Mode::SelfHosted, ORIGIN)});
+        assert!(studio_app_drift(&after, Mode::SelfHosted, ORIGIN).is_empty());
     }
 
     // The app would fall back to Zitadel's v1 login once the instance no longer forces login v2.
@@ -493,7 +494,10 @@ mod tests {
             json!({"clientId": "c0", "loginVersion": {"loginV1": {}}})
         )));
         assert!(!studio_app_lacks_login(&listed(
-            json!({"clientId": "c0", "loginVersion": login("http://localhost:3000/")})
+            json!({
+                "clientId": "c0",
+                "loginVersion": login("http://studio.chelabase.localhost:8000/")
+            })
         )));
         // No Studio app at all: nothing lacks a login (ensure_studio_app creates it first).
         assert!(!studio_app_lacks_login(&json!({})));
@@ -505,13 +509,24 @@ mod tests {
     fn the_login_v2_feature_is_read_with_inheritance() {
         assert_eq!(instance_features_get(), json!({"inheritance": true}));
         assert_eq!(
-            login_v2_from(&json!({"loginV2": {"required": true,
-                "baseUri": "http://localhost:3000/", "source": "SOURCE_INSTANCE"}})),
-            (true, Some("http://localhost:3000/".to_string()))
+            login_v2_from(&json!({"loginV2": {
+                "required": true,
+                "baseUri": "http://studio.chelabase.localhost:8000/",
+                "source": "SOURCE_INSTANCE"
+            }})),
+            (
+                true,
+                Some("http://studio.chelabase.localhost:8000/".to_string())
+            )
         );
         assert_eq!(
-            login_v2_from(&json!({"loginV2": {"baseUri": "http://localhost:3000/"}})),
-            (false, Some("http://localhost:3000/".to_string()))
+            login_v2_from(&json!({"loginV2": {
+                "baseUri": "http://studio.chelabase.localhost:8000/"
+            }})),
+            (
+                false,
+                Some("http://studio.chelabase.localhost:8000/".to_string())
+            )
         );
         assert_eq!(
             login_v2_from(&json!({"loginV2": {"source": "SOURCE_SYSTEM"}})),
@@ -523,8 +538,11 @@ mod tests {
     #[test]
     fn turning_login_v2_required_off_keeps_its_base_uri() {
         assert_eq!(
-            login_v2_optional("http://localhost:3000/"),
-            json!({"loginV2": {"required": false, "baseUri": "http://localhost:3000/"}})
+            login_v2_optional("http://studio.chelabase.localhost:8000/"),
+            json!({"loginV2": {
+                "required": false,
+                "baseUri": "http://studio.chelabase.localhost:8000/"
+            }})
         );
     }
 
@@ -570,5 +588,22 @@ mod tests {
         );
         assert_eq!(smtp_payload("mailpit:1025")["host"], "mailpit:1025");
         assert_eq!(smtp_payload("mailpit:1025")["password"], "chelabase");
+    }
+
+    #[test]
+    fn the_studio_app_follows_the_studio_origin() {
+        let origin = "https://studio.acme.com";
+        let c = studio_app_config(Mode::SelfHosted, origin);
+        assert_eq!(c["redirectUris"], json!(["https://studio.acme.com/callback"]));
+        assert_eq!(c["postLogoutRedirectUris"], json!(["https://studio.acme.com/"]));
+        assert_eq!(c["loginVersion"]["loginV2"]["baseUri"], "https://studio.acme.com/");
+        assert_eq!(studio_app_create("p1", Mode::SelfHosted, origin)["oidcConfiguration"], c);
+        assert_eq!(studio_app_update("p1", "a2", Mode::SelfHosted, origin)["oidcConfiguration"], c);
+        // An app registered for another Studio origin drifts, so bootstrap updates it.
+        let old = json!({"oidcConfiguration": studio_app_config(Mode::SelfHosted, "http://old-studio.example")});
+        let drift = studio_app_drift(&old, Mode::SelfHosted, origin);
+        assert!(drift.contains(&"redirectUris") && drift.contains(&"postLogoutRedirectUris"), "{drift:?}");
+        let same = json!({"oidcConfiguration": c});
+        assert!(studio_app_drift(&same, Mode::SelfHosted, origin).is_empty());
     }
 }

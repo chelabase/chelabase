@@ -58,7 +58,7 @@ Enabling needs:
 - no table at `schema.table` on any branch (409 `app_users_table_exists`).
 
 <Callout type="info">
-Without `CHELABASE_ZITADEL_ADMIN_PAT_FILE` (and `CHELABASE_ZITADEL_ISSUER`) set on the orchestrator, the app-user admin routes answer 503 and enabling can't start. `just dev` sets this up. See [Settings](/docs/using/app-users/settings).
+Without `CHELABASE_ZITADEL_ADMIN_PAT_FILE` (and `CHELABASE_AUTH_HOST`, which gives the issuer) set on the orchestrator, the app-user admin routes answer 503 and enabling can't start. `just dev` sets this up. See [Settings](/docs/using/app-users/settings).
 </Callout>
 
 What enabling does:

@@ -6,7 +6,7 @@ description: The app-user sign-in flows, the access and refresh tokens, and how 
 ```ts twoslash
 import { createClient } from '@chelabase/client';
 
-const db = createClient({ url: 'http://127.0.0.1:8000', key: 'chk_pub_…' });
+const db = createClient({ url: 'http://api.chelabase.localhost:8000', key: 'chk_pub_…' });
 await db.auth.signUp({ email: 'ann@example.com', password: 'Str0ng!pass', data: { display_name: 'Ann' } });
 const mine = await db.from('users').select('id', 'display_name'); // only the signed-in user's row
 ```
@@ -37,7 +37,7 @@ import { createClient } from '@chelabase/client';
 const values = new Map<string, string>();
 
 const db = createClient({
-  url: 'http://127.0.0.1:8000',
+  url: 'http://api.chelabase.localhost:8000',
   key: 'chk_pub_…',
   auth: {
     storage: {

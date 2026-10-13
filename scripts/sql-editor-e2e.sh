@@ -16,7 +16,7 @@ cd "$root"
 LOG_PREFIX=sql-editor-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
+GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"

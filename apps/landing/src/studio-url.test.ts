@@ -6,10 +6,10 @@ describe('studioUrl', () => {
     expect(studioUrl('https://a.test/')).toBe('https://a.test');
     expect(studioUrl('https://a.test//')).toBe('https://a.test');
     expect(studioUrl('https://a.test')).toBe('https://a.test');
-    expect(studioUrl(undefined)).toBe('http://localhost:3000');
-    expect(studioUrl()).toBe('http://localhost:3000');
-    expect(studioUrl('')).toBe('http://localhost:3000');
-    expect(studioUrl('   ')).toBe('http://localhost:3000');
+    expect(studioUrl(undefined)).toBe('http://studio.chelabase.localhost:8000');
+    expect(studioUrl()).toBe('http://studio.chelabase.localhost:8000');
+    expect(studioUrl('')).toBe('http://studio.chelabase.localhost:8000');
+    expect(studioUrl('   ')).toBe('http://studio.chelabase.localhost:8000');
     expect(studioUrl(' https://a.test/ ')).toBe('https://a.test');
   });
 });

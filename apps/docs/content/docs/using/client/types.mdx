@@ -7,7 +7,7 @@ description: Generate Database and types with chelabase gen types, and use other
 
 ```bash
 export CHELABASE_DATA_KEY=chk_sec_…
-cargo run -p chelabase -- gen types --url http://localhost:8000 --out db.ts
+cargo run -p chelabase -- gen types --url http://api.chelabase.localhost:8000 --out db.ts
 ```
 
 | Flag | Meaning |
@@ -48,6 +48,6 @@ const types = {
   analytics: { defaultSchema: "app", schemas: { app: { tables: { events: {} }, functions: {} } } },
 } as const satisfies Record<string, TypeMap>;
 // ---cut---
-const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_sec_…", types: types.main });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_sec_…", types: types.main });
 const analytics = db.database<Databases["analytics"]>("analytics", types.analytics);
 ```

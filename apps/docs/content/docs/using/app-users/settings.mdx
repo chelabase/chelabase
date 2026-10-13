@@ -7,7 +7,7 @@ These are service settings for a self-hosted stack. `just dev` and `chelabase de
 
 | Variable | Default | Read by |
 |---|---|---|
-| `CHELABASE_ZITADEL_ADMIN_PAT_FILE` | from `.chelabase/zitadel/demo.env` (`.chelabase/zitadel/admin.pat`) | orchestrator, worker, auth. Organization and user administration (the orchestrator and worker also need `CHELABASE_ZITADEL_ISSUER`). Without it the app-user routes answer 503 and the worker's jobs wait. |
+| `CHELABASE_ZITADEL_ADMIN_PAT_FILE` | from `.chelabase/zitadel/demo.env` (`.chelabase/zitadel/admin.pat`) | orchestrator, worker, auth. Organization and user administration (the orchestrator and worker also need `CHELABASE_AUTH_HOST`, from which they derive the issuer; see [Hosts](/docs/self-hosting/hosts)). Without it the app-user routes answer 503 and the worker's jobs wait. |
 | `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | from `demo.env` (`.chelabase/auth/app-jwt.{key,pub}`, made once by bootstrap, never overwritten) | auth signs, the gateway verifies. Without them app users are off. |
 | `CHELABASE_APP_AUTH_INTERNAL_TOKEN` | `chelabase-dev-app-auth` | auth to the orchestrator's internal app routes |
 | `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | gateway to the orchestrator, for session liveness |

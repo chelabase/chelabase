@@ -1,6 +1,8 @@
 //! Where each service lives (`host:port`, plain HTTP).
 
+use crate::registry::Site;
 use chelabase_routes::Service;
+use std::collections::HashMap;
 
 const DEFAULT_REST: &str = "127.0.0.1:8085";
 
@@ -9,6 +11,8 @@ pub struct Upstreams {
     orchestrator: String,
     auth: String,
     rest: String,
+    /// The pass-through sites that have an upstream.
+    sites: HashMap<Site, String>,
 }
 
 impl Upstreams {
@@ -17,6 +21,7 @@ impl Upstreams {
             orchestrator: authority_from_url(orchestrator_url)?,
             auth: authority_from_url(auth_url)?,
             rest: DEFAULT_REST.to_string(),
+            sites: HashMap::new(),
         })
     }
 
@@ -26,12 +31,23 @@ impl Upstreams {
         Ok(self)
     }
 
+    /// Where `site` lives.
+    pub fn with_site(mut self, site: Site, url: &str) -> Result<Self, String> {
+        self.sites.insert(site, authority_from_url(url)?);
+        Ok(self)
+    }
+
     pub fn addr(&self, service: Service) -> &str {
         match service {
             Service::Orchestrator => &self.orchestrator,
             Service::Auth => &self.auth,
             Service::Rest => &self.rest,
         }
+    }
+
+    /// `host:port` of `site`'s upstream; None when it has none.
+    pub fn site_addr(&self, site: Site) -> Option<&str> {
+        self.sites.get(&site).map(String::as_str)
     }
 }
 
@@ -88,5 +104,22 @@ mod tests {
     fn auth_has_its_own_upstream() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
         assert_eq!(upstreams.addr(Service::Auth), "127.0.0.1:8084");
+    }
+
+    #[test]
+    fn sites_have_no_upstream_until_one_is_set() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        assert_eq!(upstreams.site_addr(Site::Studio), None);
+        let upstreams = upstreams.with_site(Site::Studio, "http://studio:3000/").unwrap();
+        assert_eq!(upstreams.site_addr(Site::Studio), Some("studio:3000"));
+        assert_eq!(upstreams.site_addr(Site::Auth), None);
+    }
+
+    #[test]
+    fn a_site_upstream_is_checked_like_the_others() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        for bad in ["https://studio:3000", "http://studio", "http://studio:3000/app"] {
+            assert!(upstreams.clone().with_site(Site::Studio, bad).is_err(), "{bad}");
+        }
     }
 }

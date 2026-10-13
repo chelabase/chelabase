@@ -443,7 +443,7 @@ async fn create_callback(
         return err(StatusCode::NOT_FOUND, "Errors.AuthRequest.NotFound");
     }
     inner.auth_requests.remove(&id);
-    ok(json!({"callbackUrl": format!("http://localhost:3000/callback?code=code-{id}&state=s")}))
+    ok(json!({"callbackUrl": format!("http://studio.chelabase.localhost:8000/callback?code=code-{id}&state=s")}))
 }
 
 /// A user as Zitadel v4.19.1 answers it; `human.passwordChanged` only once a password is set.

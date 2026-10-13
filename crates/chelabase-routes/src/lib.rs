@@ -59,7 +59,7 @@ impl Service {
 /// Which family of hostnames an endpoint is served on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
-    /// The API hostname family (`CHELABASE_API_HOSTS`): management, login and data routes.
+    /// The API hostname family (the gateway's host registry, `CHELABASE_API_HOST`): management, login and data routes.
     Api,
 }
 
@@ -80,7 +80,7 @@ pub enum Auth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cors {
     None,
-    /// Callable from the Studio origins (`CHELABASE_STUDIO_ORIGINS`).
+    /// Callable from the Studio origin (the gateway's host registry, `CHELABASE_STUDIO_HOST`).
     Studio,
     /// Callable from the Studio origins with cookies (credentials); never for a "*" setting.
     StudioCredentials,

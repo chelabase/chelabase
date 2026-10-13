@@ -15,7 +15,7 @@ Calling `where` again adds its conditions with `and`.
 ```ts twoslash
 import { createClient } from "@chelabase/client";
 import { type Database, types } from "./db";
-const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
 // ---cut---
 const tree = db
   .from("orders")
@@ -33,7 +33,7 @@ A column named `and`, `or` or `not` can't be a key, because those keys are the c
 ```ts twoslash
 import { createClient } from "@chelabase/client";
 import { type Database, types } from "./db";
-const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
 // ---cut---
 const tree = db.from("orders").where({ and: [{ col: "and", eq: "x" }, { status: "paid" }] }).toTree();
 ```
@@ -47,7 +47,7 @@ A json or jsonb value that looks like operators (`{ meta: { eq: 1 } }`) is read 
 ```ts twoslash
 import { createClient } from "@chelabase/client";
 import { type Database, types } from "./db";
-const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
 // ---cut---
 const tree = db.from("orders").where({ and: [{ col: "meta", eq: { eq: 1 } }] }).toTree();
 ```

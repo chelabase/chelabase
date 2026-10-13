@@ -8,7 +8,7 @@ A failed request throws `DataApiError` with `status`, `code` (`invalid_query`, `
 ```ts twoslash
 import { createClient, DataApiError } from "@chelabase/client";
 import { type Database, types } from "./db";
-const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
 // ---cut---
 try {
   await db.from("orders").insert({ total: "1.00", vip: false, history: [] });

@@ -76,7 +76,7 @@ pub struct Worker<M, S, C, N, P> {
     /// When reconcile first saw each `enabling` database row: one still there after
     /// [`reconcile::ENABLING_RETRY_SECS`] has its enable bootstrap run again.
     pub enabling_seen: Mutex<std::collections::HashMap<(BranchId, String), std::time::Instant>>,
-    /// Zitadel with the admin PAT (`CHELABASE_ZITADEL_ADMIN_PAT_FILE`, `CHELABASE_ZITADEL_ISSUER`):
+    /// Zitadel with the admin PAT (`CHELABASE_ZITADEL_ADMIN_PAT_FILE`, `CHELABASE_AUTH_HOST`):
     /// org create/delete, user reads and session deletes. `None` when either is unset; app
     /// users jobs that need it then fail and are retried (P2).
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,

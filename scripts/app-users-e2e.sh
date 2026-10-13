@@ -21,7 +21,7 @@ cd "$root"
 LOG_PREFIX=app-users-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
+GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 tmp="$(mktemp -d)"
@@ -55,7 +55,7 @@ ca="$root/.chelabase/neon/proxy-ca.crt"
 [[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
 [[ -n "${CHELABASE_ZITADEL_ADMIN_PAT_FILE:-}" && -s "${CHELABASE_ZITADEL_ADMIN_PAT_FILE}" ]] ||
   die "CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset or empty (run just dev: its bootstrap writes demo.env)"
-ZITADEL="${CHELABASE_ZITADEL_ISSUER:-http://localhost:8080}"
+ZITADEL="${CHELABASE_ZITADEL_ISSUER:-$CHELABASE_ENTRY_AUTH_URL}"
 command -v pnpm >/dev/null || die "pnpm is missing"
 trap cleanup EXIT
 

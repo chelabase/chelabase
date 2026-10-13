@@ -44,7 +44,7 @@ pub struct WorkerConfig {
     /// `CHELABASE_BRANCH_ROLE_CAP`, `CHELABASE_BRANCH_DATABASE_CAP` and
     /// `CHELABASE_PASSWORD_STRENGTH` (platform mode forces strength on).
     pub roles: RoleSettings,
-    /// `CHELABASE_ZITADEL_ISSUER`: Zitadel's base URL.
+    /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
     pub zitadel_issuer: Option<String>,
     /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT (org create/delete, user reads,
     /// session deletes). Read by [`build`].
@@ -105,7 +105,8 @@ impl WorkerConfig {
             policy: ModePolicy::new(mode),
             owner_superuser_requested,
             roles,
-            zitadel_issuer: non_blank(&get, "CHELABASE_ZITADEL_ISSUER"),
+            zitadel_issuer: chelabase_types::entry::issuer_from_lookup(&get)
+                .map_err(anyhow::Error::new)?,
             zitadel_admin_pat_file: non_blank(&get, "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .map(PathBuf::from),
             app_users_reconcile_every: reconcile_every(
@@ -203,7 +204,7 @@ pub fn zitadel_client(config: &WorkerConfig) -> Option<chelabase_zitadel::client
     let (Some(issuer), Some(file)) = (&config.zitadel_issuer, &config.zitadel_admin_pat_file)
     else {
         tracing::warn!(
-            "CHELABASE_ZITADEL_ISSUER or CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset: app users jobs wait until both are set"
+            "CHELABASE_AUTH_HOST or CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset: app users jobs wait until both are set"
         );
         return None;
     };
@@ -461,12 +462,13 @@ mod tests {
         let c = WorkerConfig::from_lookup(lookup(&[
             IMAGE,
             ("CHELABASE_APP_USERS_RECONCILE_SECS", "45"),
-            ("CHELABASE_ZITADEL_ISSUER", "http://localhost:8080"),
+            ("CHELABASE_PUBLIC_SCHEME", "http"),
+            ("CHELABASE_AUTH_HOST", "auth.chelabase.localhost:8000"),
             ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", ".chelabase/zitadel/admin.pat"),
         ]))
         .unwrap();
         assert_eq!(c.app_users_reconcile_every, Duration::from_secs(45));
-        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
         assert_eq!(
             c.zitadel_admin_pat_file,
             Some(PathBuf::from(".chelabase/zitadel/admin.pat"))
@@ -543,7 +545,7 @@ mod tests {
         std::fs::write(&pat, "secret-pat\n").unwrap();
         let mut c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
         assert!(zitadel_client(&c).is_none());
-        c.zitadel_issuer = Some("http://localhost:8080".into());
+        c.zitadel_issuer = Some("http://auth.chelabase.localhost:8000".into());
         assert!(zitadel_client(&c).is_none());
         c.zitadel_admin_pat_file = Some(dir.path().join("missing.pat"));
         assert!(zitadel_client(&c).is_none());
@@ -574,5 +576,13 @@ mod tests {
             Err(err) => format!("{err:#}"),
         };
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
+    }
+
+    #[test]
+    fn a_lone_zitadel_issuer_is_refused() {
+        let err = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_ZITADEL_ISSUER", "http://old-issuer.example")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CHELABASE_AUTH_HOST"), "{err}");
     }
 }

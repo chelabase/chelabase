@@ -90,8 +90,9 @@ check "COMPUTE_NODE_IMAGE defaults to a digest-pinned GHCR image" \
   grep -Eq '\$\{COMPUTE_NODE_IMAGE:-ghcr\.io/chelabase/neon-compute-v17:[^@}]+@sha256:[0-9a-f]{64}\}' "$compose_file"
 
 if command -v docker >/dev/null; then
-  # env -u: the check must hold with nothing set, as for a plain `just deps-up`.
-  compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -f "$compose_file")
+  # env -u: the check must hold with nothing set, as for a plain `just deps-up`, which sources
+  # scripts/lib/entry.sh for the entry values Compose requires.
+  compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE bash -c '. "$0/scripts/lib/entry.sh" && exec docker compose "$@"' "$root" -f "$compose_file")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
   check "the stack has every service (NATS, Valkey and the proxy too; no hook relay)" \
     test "$(services)" = "create-bucket mailpit metadata-db nats pageserver proxy proxy-tls register-safekeepers safekeeper1 seaweedfs storage-broker storage-controller storcon-db valkey zitadel zitadel-db "
@@ -114,7 +115,7 @@ if command -v docker >/dev/null; then
   check "zitadel is v4.19.1, pinned by digest" \
     grep -Eq '"ghcr\.io/zitadel/zitadel:v4\.19\.1@sha256:[0-9a-f]{64}"' <<<"$zitadel"
   check "zitadel sends sign-ins to Studio's /login" \
-    test "$(jq -r '.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2' <<<"$zitadel")" = "http://localhost:3000/login?authRequest="
+    test "$(jq -r '.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2' <<<"$zitadel")" = "http://studio.chelabase.localhost:8000/login?authRequest="
   check "zitadel writes the login-client token" \
     test "$(jq -r '.environment.ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH' <<<"$zitadel")" = "/zitadel-bootstrap/login-client.pat"
   token="$(CHELABASE_STORCON_HOOK_TOKEN=from-env "${compose[@]}" config --format json |
@@ -497,7 +498,7 @@ check "the dev swap stops just dev from another worktree" \
   bash -c 'test ! -e "$1" && grep -q "moving it to" "$2"' _ "$sandbox/.chelabase/dev/pids" "$lock/out"
 check "then starts just dev here (deps-up first)" grep -q "^touched: docker" "$lock/log"
 check "the dev swap waits for the gateway and Studio" \
-  bash -c 'grep -q "127.0.0.1:8000/health" <<<"$1" && grep -q "localhost:3000" <<<"$1"' _ "$(show _live-swap-dev)"
+  bash -c 'grep -qF "\$CHELABASE_ENTRY_API_URL/_gateway/health" <<<"$1" && grep -qF "\$CHELABASE_ENTRY_STUDIO_URL/" <<<"$1"' _ "$(show _live-swap-dev)"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

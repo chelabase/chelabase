@@ -441,13 +441,13 @@ mod tests {
             roles: vec![],
             databases: vec![],
             jwks: json!({}),
-            console_url: Some("http://localhost:3000".into()),
+            console_url: Some("http://studio.chelabase.localhost:8000".into()),
             mode: ComputeMode::Primary,
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting = settings.iter().find(|s| s["name"] == "neon.console_url");
         assert!(console_setting.is_some(), "console_url setting should be present");
-        assert_eq!(console_setting.unwrap()["value"], "http://localhost:3000");
+        assert_eq!(console_setting.unwrap()["value"], "http://studio.chelabase.localhost:8000");
 
         // Without console_url
         let v2 = config_response(&SpecInputs {

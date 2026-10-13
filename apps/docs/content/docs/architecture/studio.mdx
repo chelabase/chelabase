@@ -27,11 +27,11 @@ Everyone who joins (by invite, or by sign-up when it is open) is in the same org
 
 ## Local sign-in flow
 
-1. `just dev`, then open `http://localhost:3000` and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost`, or the email you pass it, `just zitadel-bootstrap you@example.com`, the tenant admin).
-2. Emails such as invites and password resets land in Mailpit at `http://localhost:8025`. Without an email provider, invite by link instead.
+1. `just dev`, then open `http://studio.chelabase.localhost:8000` and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost`, or the email you pass it, `just zitadel-bootstrap you@example.com`, the tenant admin).
+2. Emails such as invites and password resets land in Mailpit at `http://mail.chelabase.localhost:8000`. Without an email provider, invite by link instead.
 3. Studio opens on your projects and their databases; everything goes through the gateway on `:8000` with your Zitadel token.
 
-Open Studio at `http://localhost:3000`: visits to `127.0.0.1:3000` are redirected there, because the Zitadel redirect URI and the gateway's CORS origins are registered for `localhost`. `CHELABASE_STUDIO_PORT` changes the dev server's port, but the redirect URI is registered for `:3000`.
+Open Studio at `http://studio.chelabase.localhost:8000`, through the gateway: the Zitadel redirect URI and the gateway's CORS origin are registered for that host. The dev server itself listens on loopback port 3000 (`CHELABASE_STUDIO_PORT` changes it; set the gateway's `CHELABASE_STUDIO_UPSTREAM` to match) and is reached only through the gateway.
 
 ## What the dev bootstrap does
 

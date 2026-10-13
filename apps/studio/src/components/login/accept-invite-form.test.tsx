@@ -8,7 +8,7 @@ import { fakeFetch, jsonResponse, sequence, type FakeHandler } from "@/test/fake
 import { renderWithQuery } from "@/test/render";
 import { AcceptInviteForm } from "./accept-invite-form";
 
-const DONE = { next: "done", redirect: "http://localhost:3000/app" };
+const DONE = { next: "done", redirect: "http://studio.chelabase.localhost:8000/app" };
 const err = (code: string, message: string, status: number, extra: Record<string, unknown> = {}) => () =>
   jsonResponse({ error: { code, message, ...extra } }, status);
 
@@ -43,7 +43,7 @@ describe("AcceptInviteForm", () => {
     expect(screen.getByLabelText("Password")).toHaveFocus();
     expect(await screen.findByText(/Ana/)).toHaveTextContent("Ana (ana@example.test) invited you to Acme.");
     await submit("Secret-pass1");
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://localhost:3000/app"));
+    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/app"));
     expect(await bodies(f)).toEqual([{ user: "z1", code: "c1", password: "Secret-pass1", authRequest: "V2_1" }]);
     // M8: the user and the token go in a POST body, never in the URL.
     const describe = f.calls.find((r) => new URL(r.url).pathname === "/auth/v1/invite")!;
@@ -59,7 +59,7 @@ describe("AcceptInviteForm", () => {
       "POST /auth/v1/accept-invite": () => jsonResponse(DONE),
     });
     await submit("Secret-pass1");
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://localhost:3000/app"));
+    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/app"));
     expect(await bodies(f)).toEqual([{ user: "z1", code: "c1", reset: true, password: "Secret-pass1", authRequest: "V2_1" }]);
   });
 
@@ -106,7 +106,7 @@ describe("AcceptInviteForm", () => {
     );
     // The password is kept: "Try again" resubmits with the newest ticket.
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://localhost:3000/app"));
+    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/app"));
     expect(await bodies(f)).toEqual([
       { user: "z1", code: "c1", password: "short", authRequest: "V2_1" },
       { user: "z1", acceptTicket: "tk1", password: "Secret-pass1", authRequest: "V2_1" },
@@ -178,7 +178,7 @@ describe("AcceptInviteForm", () => {
     expect(await screen.findByText(/invited you to Acme/)).toBeInTheDocument();
     expect(peekPendingInvite()).toBeNull();
     await submit("Secret-pass1");
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://localhost:3000/app"));
+    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/app"));
     expect(startSignIn).not.toHaveBeenCalled();
     expect(await bodies(f)).toEqual([{ user: "z1", code: "c1", password: "Secret-pass1", authRequest: "V2_9" }]);
     expect(window.location.search).toBe("?user=z1");

@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
     if worker.zitadel.is_none() {
-        warn!("Zitadel admin access isn't configured: app users and project delete jobs wait (CHELABASE_ZITADEL_ISSUER, CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
+        warn!("Zitadel admin access isn't configured: app users and project delete jobs wait (CHELABASE_AUTH_HOST, CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
     }
 
     let project_delete_worker = worker.clone();

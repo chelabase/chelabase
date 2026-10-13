@@ -3,7 +3,7 @@
 // and these ids are small, so they read as numbers.
 //   node scripts/e2e.mjs queries   the secret key inserts, the public key reads, a batch rolls back
 //   node scripts/e2e.mjs rls       a row the policy hides is absent for the public key only
-// Env: GATEWAY_URL, PUBLIC_KEY, SECRET_KEY.
+// Env: GATEWAY_URL (default http://api.chelabase.localhost:8000), PUBLIC_KEY, SECRET_KEY.
 //
 // App users, for `just app-users-e2e` (scripts/app-users-e2e.sh); each user's refresh token is
 // kept in a file under STATE_DIR between phases:
@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createClient, DataApiError } from "../src/index.ts";
 
-const url = process.env.GATEWAY_URL;
+const url = process.env.GATEWAY_URL ?? "http://api.chelabase.localhost:8000";
 const pub = createClient({ url, key: process.env.PUBLIC_KEY });
 const sec = createClient({ url, key: process.env.SECRET_KEY ?? "unused" });
 const PASSWORD = "Sup3r-Secret-pw!";

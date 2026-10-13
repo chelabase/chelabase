@@ -28,10 +28,10 @@ cd "$root"
 LOG_PREFIX=members-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-GATEWAY="${GATEWAY_URL:-http://127.0.0.1:8000}"
+GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 GW="$GATEWAY"
-MAILPIT="${MAILPIT_URL:-http://localhost:8025}"
-STUDIO="${CHELABASE_STUDIO_URL:-http://localhost:3000}"
+MAILPIT="${MAILPIT_URL:-$CHELABASE_ENTRY_MAIL_URL}"
+STUDIO="$CHELABASE_ENTRY_STUDIO_URL"
 tmp="$(mktemp -d)"
 JAR="$tmp/jar"
 STATUS_FILE="$tmp/ui-status"
@@ -76,7 +76,7 @@ source .chelabase/zitadel/demo.env
 set +a
 # Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in Studio's .env.local.
 CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$root/apps/studio/.env.local")}"
-ISS="$CHELABASE_ZITADEL_ISSUER"
+ISS="$CHELABASE_ENTRY_AUTH_URL" # the issuer, derived from the entry
 suffix="$(date +%s)-$RANDOM"
 DEV_EMAIL="members-dev-$suffix@example.com"
 LINK_EMAIL="members-link-$suffix@example.com"

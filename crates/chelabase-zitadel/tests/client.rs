@@ -39,7 +39,7 @@ async fn signs_in_and_finishes() {
         z.finish(&ar, &session)
             .await
             .unwrap()
-            .starts_with("http://localhost:3000/callback?code=")
+            .starts_with("http://studio.chelabase.localhost:8000/callback?code=")
     );
     assert!(matches!(
         z.create_session(&user, "wrong").await,
@@ -60,7 +60,7 @@ async fn creates_and_verifies_a_user() {
         username: None,
         send_code: true,
         verified: false,
-        url_template: "http://localhost:3000/verify?code={{.Code}}",
+        url_template: "http://studio.chelabase.localhost:8000/verify?code={{.Code}}",
     };
     let id = z.create_user(&new).await.unwrap();
     assert_eq!(mock.emails(), vec![(id.clone(), "verify".to_string())]);
@@ -82,7 +82,7 @@ async fn resets_a_password() {
     let id = mock.add_user("cy@example.com", "Old-pass-1", true);
     z.send_password_reset(
         &id,
-        "http://localhost:3000/password-reset?userId={{.UserID}}&code={{.Code}}",
+        "http://studio.chelabase.localhost:8000/password-reset?userId={{.UserID}}&code={{.Code}}",
     )
     .await
     .unwrap();

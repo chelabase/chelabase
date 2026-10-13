@@ -1,5 +1,9 @@
 # Helpers shared by scripts/neon-smoke.sh, neon-e2e.sh and the justfile's sweep-dbs. Sourced, not run.
-# Set LOG_PREFIX (the script's name) before sourcing.
+# Set LOG_PREFIX (the script's name) before sourcing. Also sources entry.sh: the public entry
+# (CHELABASE_ENTRY_{STUDIO,API,AUTH,MAIL}_URL), which the e2e scripts use instead of port literals.
+
+# shellcheck source=entry.sh
+. "$(dirname "${BASH_SOURCE[0]}")/entry.sh"
 
 # delete_tenant <tenant id>: deletes it from the storage controller ($STORCON, default
 # http://127.0.0.1:1234). Deletion is asynchronous (202): polls until the tenant is gone, 60 s at most.

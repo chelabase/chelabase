@@ -55,11 +55,12 @@ pub fn render_studio_env(
     project_id: &str,
     org_id: &str,
     api_url: &str,
+    studio_host: &str,
 ) -> String {
     format!(
         "# Written by `chelabase dev bootstrap`; regenerate instead of editing.\n\
 VITE_ZITADEL_ISSUER={issuer}\nVITE_ZITADEL_CLIENT_ID={client_id}\nVITE_ZITADEL_PROJECT_ID={project_id}\n\
-VITE_ZITADEL_ORG_ID={org_id}\nVITE_API_URL={api_url}\n"
+VITE_ZITADEL_ORG_ID={org_id}\nVITE_API_URL={api_url}\nVITE_STUDIO_HOST={studio_host}\n"
     )
 }
 
@@ -70,7 +71,7 @@ mod tests {
     #[test]
     fn demo_env_names_the_auth_files() {
         let text = render_demo_env(&DemoEnv {
-            issuer: "http://localhost:8080",
+            issuer: "http://auth.chelabase.localhost:8000",
             audiences: "p1,c1",
             org_id: "o1",
             project_id: "p1",
@@ -89,13 +90,15 @@ mod tests {
         });
         assert!(text.contains("CHELABASE_AUTH_TOKEN_FILE=/z/login-client.pat\n"));
         assert!(text.contains("CHELABASE_AUTH_COOKIE_KEY=/u/cookie.key\n"));
-        assert!(text.contains("CHELABASE_ZITADEL_JWKS_URL=http://localhost:8080/oauth/v2/keys\n"));
+        assert!(text.contains(
+            "CHELABASE_ZITADEL_JWKS_URL=http://auth.chelabase.localhost:8000/oauth/v2/keys\n"
+        ));
     }
 
     #[test]
     fn demo_env_has_the_data_api_wiring() {
         let text = render_demo_env(&DemoEnv {
-            issuer: "http://localhost:8080",
+            issuer: "http://auth.chelabase.localhost:8000",
             audiences: "p1,c1",
             org_id: "o",
             project_id: "p1",
@@ -131,18 +134,20 @@ mod tests {
     #[test]
     fn studio_env_has_every_key_studio_reads() {
         let text = render_studio_env(
-            "http://localhost:8080",
+            "http://auth.chelabase.localhost:8000",
             "c",
             "p",
             "o",
-            "http://127.0.0.1:8000",
+            "http://api.chelabase.localhost:8000",
+            "studio.chelabase.localhost:8000",
         );
         for key in [
-            "VITE_ZITADEL_ISSUER=",
-            "VITE_ZITADEL_CLIENT_ID=c",
-            "VITE_ZITADEL_PROJECT_ID=p",
-            "VITE_ZITADEL_ORG_ID=o",
-            "VITE_API_URL=http://127.0.0.1:8000",
+            "VITE_ZITADEL_ISSUER=http://auth.chelabase.localhost:8000\n",
+            "VITE_ZITADEL_CLIENT_ID=c\n",
+            "VITE_ZITADEL_PROJECT_ID=p\n",
+            "VITE_ZITADEL_ORG_ID=o\n",
+            "VITE_API_URL=http://api.chelabase.localhost:8000\n",
+            "VITE_STUDIO_HOST=studio.chelabase.localhost:8000\n",
         ] {
             assert!(text.contains(key), "{key}");
         }
@@ -151,7 +156,7 @@ mod tests {
     #[test]
     fn demo_env_names_the_compute_jwt_dir() {
         let text = render_demo_env(&DemoEnv {
-            issuer: "http://localhost:8080",
+            issuer: "http://auth.chelabase.localhost:8000",
             audiences: "p1,c1",
             org_id: "o",
             project_id: "p1",
@@ -177,7 +182,7 @@ mod tests {
     #[test]
     fn demo_env_has_app_settings() {
         let text = render_demo_env(&DemoEnv {
-            issuer: "http://localhost:8080",
+            issuer: "http://auth.chelabase.localhost:8000",
             audiences: "p1,c1",
             org_id: "o",
             project_id: "p1",

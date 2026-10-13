@@ -538,7 +538,7 @@ async fn assert_refused(ep: &str, database: &str, user: &str, password: &str) {
 }
 
 fn gateway() -> String {
-    std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into())
+    std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://api.chelabase.localhost:8000".into())
 }
 
 fn env_port(var: &str, default: u16) -> u16 {

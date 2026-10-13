@@ -14,7 +14,7 @@ Postgres writes `int8` and `numeric` as JSON numbers with every digit. JavaScrip
 import { createClient } from "@chelabase/client";
 import { type Database } from "./db";
 
-const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…" });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…" });
 ```
 
 The check is compile-time only, since the generic is erased at run time. `bigint: true` also throws at run time when `types` is missing. The untyped `createClient({ url, key })` needs no `types`.
@@ -33,7 +33,7 @@ Use `bigint: true` together with `types` to get `bigint` for all `int8` columns,
 import { createClient } from "@chelabase/client";
 import { type Database, types } from "./db";
 // ---cut---
-const db = createClient<Database>({ url: "http://localhost:8000", key: "chk_pub_…", types, bigint: true });
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types, bigint: true });
 
 const row = await db.from("orders").select("id", "total").limit(1);
 //    ^?

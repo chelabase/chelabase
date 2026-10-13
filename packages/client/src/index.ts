@@ -47,7 +47,7 @@ export type {
 } from "./types.ts";
 
 export interface ClientOptions {
-  /** The gateway's base URL, e.g. `http://localhost:8000`. */
+  /** The gateway's base URL, e.g. `http://api.chelabase.localhost:8000`. */
   url: string;
   /** A public (`chk_pub_…`) or secret (`chk_sec_…`) data key, sent as a bearer token. */
   key: string;

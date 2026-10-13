@@ -42,22 +42,22 @@ just dev
 
 `just dev` starts the Compose dependencies, bootstraps Zitadel, builds the Rust services and runs them and Studio in the background. The first run builds a lot and takes a while.
 
-Open http://localhost:3000 and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` sets it). Self-sign-up is off by default: an admin invites everyone else (or switches open sign-up on and approves requests). Emails such as invites and password resets land in Mailpit at http://localhost:8025.
+Open http://studio.chelabase.localhost:8000 and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` sets it). Self-sign-up is off by default: an admin invites everyone else (or switches open sign-up on and approves requests). Emails such as invites and password resets land in Mailpit at http://mail.chelabase.localhost:8000.
 
 Stop everything with `just stop`. `just` lists every recipe.
 
 ## Documentation
 
-The docs site runs locally and needs no stack:
+The docs site runs locally, reached through the gateway (start the stack with `just dev` first):
 
 ```bash
 just docs
 ```
 
-Then open http://localhost:3001/docs. It has three sections:
+Then open http://docs.chelabase.localhost:8000/docs. It has three sections:
 
-- [Using Chelabase](http://localhost:3001/docs/using/quickstart): projects, databases, branches, the data API, the TypeScript client, app users
-- [Reference](http://localhost:3001/docs/reference/errors): the management and data API references and the error codes (the internal login API is under Architecture)
-- [Architecture](http://localhost:3001/docs/architecture): how the gateway, Studio, data API, Neon storage and security fit together
+- [Using Chelabase](http://docs.chelabase.localhost:8000/docs/using/quickstart): projects, databases, branches, the data API, the TypeScript client, app users
+- [Reference](http://docs.chelabase.localhost:8000/docs/reference/errors): the management and data API references and the error codes (the internal login API is under Architecture)
+- [Architecture](http://docs.chelabase.localhost:8000/docs/architecture): how the gateway, Studio, data API, Neon storage and security fit together
 
 Working on the repo: see [CONTRIBUTING.md](CONTRIBUTING.md) (worktrees, the live queue, tests, code generation). Product direction: [PRODUCT.md](PRODUCT.md).
