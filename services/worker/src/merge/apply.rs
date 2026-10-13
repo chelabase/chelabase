@@ -769,10 +769,10 @@ mod tests {
         assert!(order.is_sorted(), "{all:?}");
         // Phase 1 runs once, with its guard and marker, before the online step.
         let main = s.main_ep();
-        assert_eq!(ran(&w, main, "chelabase_guard"), 1);
+        assert_eq!(ran(&w, main, "$chelabase_guard$"), 1);
         assert_eq!(ran(&w, main, "INSERT INTO chelabase_merge.applied"), 1);
         assert!(
-            first_sql(&w, main, "chelabase_guard")
+            first_sql(&w, main, "$chelabase_guard$")
                 < first_sql(&w, main, "CREATE INDEX CONCURRENTLY")
         );
         // Status lines in the log, beside the steps.
@@ -833,7 +833,7 @@ mod tests {
             "{:?}",
             m.error
         );
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 0);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 0);
 
         acknowledge_all(&w, id);
         move_to(&w, id, MergeStatus::Applying);
@@ -860,7 +860,7 @@ mod tests {
         let (w, _journal) = worker();
         let (s, id) = applying(&w).await;
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             "psql:<stdin>:4: ERROR:  chelabase_merge_stale".into(),
         ));
 
@@ -886,7 +886,7 @@ mod tests {
         let (w, _journal) = worker();
         let (s, id) = applying(&w).await;
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             "psql:<stdin>:3: ERROR:  out of shared memory".into(),
         ));
 
@@ -934,7 +934,7 @@ mod tests {
         assert_eq!(m.status, MergeStatus::Done, "{:?}", m.error);
         let main = s.main_ep();
         assert_eq!(
-            ran(&w, main, "chelabase_guard"),
+            ran(&w, main, "$chelabase_guard$"),
             0,
             "phase 1 isn't run again"
         );
@@ -962,7 +962,7 @@ mod tests {
         let m = w.metadata.merge_row(id);
         assert_eq!(m.status, MergeStatus::Done, "{:?}", m.error);
         let main = s.main_ep();
-        assert_eq!(ran(&w, main, "chelabase_guard"), 0);
+        assert_eq!(ran(&w, main, "$chelabase_guard$"), 0);
         assert!(
             !entries(&journal)
                 .iter()
@@ -993,7 +993,7 @@ mod tests {
         assert!(super::INTERRUPTED.contains("transaction"), "{}", super::INTERRUPTED);
         assert!(!super::INTERRUPTED.contains("nothing applied"));
         assert_eq!(m.claimed_at, None);
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 0);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 0);
         // A marker table that doesn't exist yet reads as no marker too.
         move_to(&w, id, MergeStatus::Applying);
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
@@ -1015,7 +1015,7 @@ mod tests {
         job(&w, MergeJob::Resume { merge_id: id }, 1).await;
 
         assert_eq!(w.metadata.merge_row(id).status, MergeStatus::Done);
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 1);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 1);
     }
 
     // T10 minor: both branches must be ready; the merge stays rehearsed with the reason.
@@ -1035,7 +1035,7 @@ mod tests {
         let m = w.metadata.merge_row(id);
         assert_eq!(m.status, MergeStatus::Rehearsed);
         assert!(m.error.unwrap_or_default().starts_with("branch_not_ready"));
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 0);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 0);
     }
 
     // A merge that moved on (an earlier delivery finished it) is left alone.
@@ -1068,7 +1068,7 @@ mod tests {
         for needle in [
             "CREATE ROLE",
             "ADD VALUE",
-            "chelabase_guard",
+            "$chelabase_guard$",
             "CONCURRENTLY",
         ] {
             assert_eq!(ran(w, main, needle), 0, "{needle}");
@@ -1215,7 +1215,7 @@ mod tests {
         let (w, _journal) = worker();
         let (s, id) = applying(&w).await;
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             "psql:<stdin>:3: ERROR:  out of shared memory".into(),
         ));
         apply(&w, id).await;
@@ -1236,7 +1236,7 @@ mod tests {
 
         let m = w.metadata.merge_row(id);
         assert_eq!(m.status, MergeStatus::Done, "{:?}", m.error);
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 1);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 1);
         assert_eq!(
             ran(&w, s.main_ep(), CATALOG_READ),
             2,
@@ -1244,7 +1244,7 @@ mod tests {
         );
         assert!(
             first_sql(&w, s.main_ep(), CATALOG_READ)
-                < first_sql(&w, s.main_ep(), "chelabase_guard")
+                < first_sql(&w, s.main_ep(), "$chelabase_guard$")
         );
     }
 
@@ -1269,14 +1269,14 @@ mod tests {
     async fn a_phase1_timeout_after_commit_goes_on_to_online() {
         let (w, _journal) = worker();
         let (s, id) = applying(&w).await;
-        w.computes.time_out_when("chelabase_guard", true);
+        w.computes.time_out_when("$chelabase_guard$", true);
         w.computes.answer_at(s.main_ep(), MARKER_READ, "1\n");
 
         apply(&w, id).await;
 
         let m = w.metadata.merge_row(id);
         assert_eq!(m.status, MergeStatus::Done, "{:?}", m.error);
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 1);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 1);
         // The marker is read once the merge's statements are gone.
         assert!(first_sql(&w, s.main_ep(), "pg_cancel_backend") < first_sql(&w, s.main_ep(), MARKER_READ));
     }
@@ -1286,7 +1286,7 @@ mod tests {
     async fn a_phase1_failure_without_the_marker_stays_failed_in_tx() {
         let (w, _journal) = worker();
         let (s, id) = applying(&w).await;
-        w.computes.time_out_when("chelabase_guard", false);
+        w.computes.time_out_when("$chelabase_guard$", false);
         w.computes.answer_at(s.main_ep(), MARKER_READ, "0\n");
         apply(&w, id).await;
         let m = w.metadata.merge_row(id);
@@ -1300,7 +1300,7 @@ mod tests {
         let (w, _journal) = worker();
         let (s, id) = applying(&w).await;
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             "psql:<stdin>:3: ERROR:  out of shared memory".into(),
         ));
         w.computes.answer_once_at(s.main_ep(), MARKER_READ, "0\n");
@@ -1316,7 +1316,7 @@ mod tests {
 
         let m = w.metadata.merge_row(id);
         assert_eq!(m.status, MergeStatus::Done, "{:?}", m.error);
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 0, "phase 1 isn't run again");
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 0, "phase 1 isn't run again");
         assert_eq!(ran(&w, s.main_ep(), DIGEST_READ), 0, "no pre-check");
     }
 
@@ -1433,7 +1433,7 @@ mod tests {
 
         let m = w.metadata.merge_row(id);
         assert_eq!(m.status, MergeStatus::Done, "{:?}", m.error);
-        assert_eq!(ran(&w, s.main_ep(), "chelabase_guard"), 1);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 1);
     }
 
     // E27: a Resume in `online` whose transaction isn't on the target any more (it was reset or
@@ -1501,7 +1501,7 @@ mod tests {
         let (w, _journal) = worker();
         let (s, id) = applying(&w).await;
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             "psql:<stdin>:3: ERROR:  out of shared memory".into(),
         ));
         apply(&w, id).await;

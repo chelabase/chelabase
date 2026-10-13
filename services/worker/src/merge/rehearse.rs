@@ -578,7 +578,7 @@ mod tests {
         assert!(order.is_sorted(), "{all:?}");
         // The plan ran on the rehearsal, never on main; a rehearsal logs nothing.
         let on_rehearsal = sql_on(&w, &ep);
-        assert!(on_rehearsal.iter().any(|q| q.contains("chelabase_guard")));
+        assert!(on_rehearsal.iter().any(|q| q.contains("$chelabase_guard$")));
         assert!(
             on_rehearsal
                 .iter()
@@ -587,7 +587,7 @@ mod tests {
         assert!(
             !sql_on(&w, s.main_ep())
                 .iter()
-                .any(|q| q.contains("chelabase_guard") || q.contains("CONCURRENTLY"))
+                .any(|q| q.contains("$chelabase_guard$") || q.contains("CONCURRENTLY"))
         );
         assert!(
             !all.iter()
@@ -671,7 +671,7 @@ mod tests {
         let (w, _journal) = worker();
         let (s, id) = rehearsing(&w).await;
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             "psql:<stdin>:4: ERROR:  chelabase_merge_stale".into(),
         ));
 

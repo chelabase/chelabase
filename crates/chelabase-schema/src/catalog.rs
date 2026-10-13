@@ -1,10 +1,26 @@
 //! The catalog reader (T2): one SQL script that returns the database's catalog as one JSON
-//! document, and its parser into a normalized [`SchemaModel`].
+//! document, and its parser into a normalized [`SchemaModel`]. And the table API's scoped reads
+//! (TE-A T4): one table ([`table_sql`]), the object list ([`objects_sql`]) and the type catalog
+//! ([`types_sql`]), which run as the database owner (a non-superuser).
 
+use chelabase_types::table_api::{ObjectSummary, TypeEntry};
 use serde::Deserialize;
 
 use crate::error::SchemaError;
 use crate::model::*;
+
+/// Every read's start: `BEGIN … READ ONLY`, the `SET LOCAL`s, the users-table `DO` block and the
+/// `WITH` list's shared CTEs (`users_tab`, `ext`, `ns`, `hidden`), ending in a comma.
+const HEAD_SQL: &str = include_str!("catalog_parts/head.sql");
+/// The `tabs` CTE without its closing parenthesis: the tables the model reads (the `tabs` rules).
+const TABS_SQL: &str = include_str!("catalog_parts/tabs.sql");
+/// One table's JSON object over `tabs t JOIN pg_roles o`: shared by [`CATALOG_SQL`]'s `tables`
+/// and [`table_sql`].
+const TABLE_OBJECT_SQL: &str = include_str!("catalog_parts/table.sql");
+/// The object list's CTE and SELECT (after [`HEAD_SQL`] and the closed [`TABS_SQL`]).
+const OBJECTS_SQL: &str = include_str!("catalog_parts/objects.sql");
+/// The type catalog's CTE and SELECT (after [`HEAD_SQL`]).
+const TYPES_SQL: &str = include_str!("catalog_parts/types.sql");
 
 /// `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL search_path = pg_catalog;
 /// SET LOCAL DateStyle/TimeZone; DO <users table lookup>; SELECT <one json document>; COMMIT;`:
@@ -14,8 +30,99 @@ use crate::model::*;
 /// The P6 exclusions ([`crate::exclusions`]) are applied inside the SQL. The `DO` block reads the
 /// users table named in `chelabase.app_users_table` only when that table exists (one SELECT
 /// can't name a table that may be missing) and passes its OID on in a transaction-local
-/// setting; it writes nothing, so it runs in the read-only transaction.
-pub const CATALOG_SQL: &str = include_str!("catalog_sql.sql");
+/// setting; it writes nothing, so it runs in the read-only transaction. A role that can't read
+/// the pointer finds the users table from `pg_catalog` alone (its guard trigger), so the
+/// owner-run reads below raise nothing and hide what this read hides.
+pub const CATALOG_SQL: &str = concat!(
+    include_str!("catalog_parts/head.sql"),
+    include_str!("catalog_parts/tabs.sql"),
+    "),\n",
+    include_str!("catalog_sql.sql"),
+    include_str!("catalog_parts/table.sql"),
+    " AS j\n  FROM tabs t JOIN pg_roles o ON o.oid = t.relowner\n)\n",
+    include_str!("catalog_parts/catalog_select.sql"),
+);
+
+/// A name as an SQL literal for the scoped reads. No Postgres name holds a NUL, so one that does
+/// becomes `NULL`, which matches nothing (a NUL would cut the query text short).
+fn name_literal(name: &str) -> String {
+    if name.contains('\0') {
+        "NULL".to_string()
+    } else {
+        crate::sql::literal(name)
+    }
+}
+
+/// One table as [`CATALOG_SQL`] reads it (the same per-table object, the same `tabs` rules and
+/// exclusions): `{"server_version_num": …, "table": <object or null>}`, `null` when `schema.name`
+/// isn't a table the model reads. Its own read-only transaction (`BEGIN … COMMIT`), so it is never
+/// run inside another. Runs as the database owner, a non-superuser: it reads `pg_catalog` only,
+/// and the users-table pointer only when the role may ([`HEAD_SQL`]).
+pub fn table_sql(schema: &str, name: &str) -> String {
+    format!(
+        "{HEAD_SQL}{TABS_SQL}    AND n.nspname = {} AND c.relname = {}\n),\n\
+         tables_j AS (\n  SELECT {TABLE_OBJECT_SQL} AS j\n  FROM tabs t JOIN pg_roles o ON o.oid = t.relowner\n)\n\
+         SELECT jsonb_build_object(\n  'server_version_num', current_setting('server_version_num')::int,\n  \
+         'table', (SELECT j FROM tables_j)\n)::text;\nCOMMIT;\n",
+        name_literal(schema),
+        name_literal(name),
+    )
+}
+
+/// Parses [`table_sql`]'s output (normalized as [`parse_catalog`] normalizes a table); refuses a
+/// server major other than [`crate::SUPPORTED_SERVER_MAJOR`].
+pub fn parse_table(json: &str) -> Result<Option<Table>, SchemaError> {
+    let major = server_major(json)?;
+    let raw: RawTableDocument = serde_json::from_str(json).map_err(parse_error)?;
+    let Some(raw) = raw.table else {
+        return Ok(None);
+    };
+    let mut m = SchemaModel::empty(major);
+    m.tables.push(table(raw)?);
+    m.normalize();
+    Ok(m.tables.pop())
+}
+
+/// The table API's object list: `{"server_version_num": …, "objects": [ObjectSummary…]}`. Runs as
+/// the database owner.
+pub fn objects_sql() -> String {
+    format!("{HEAD_SQL}{TABS_SQL}),\n{OBJECTS_SQL}")
+}
+
+/// Parses [`objects_sql`]'s output, sorted by `(schema, name)`.
+pub fn parse_objects(json: &str) -> Result<Vec<ObjectSummary>, SchemaError> {
+    server_major(json)?;
+    let raw: RawObjects = serde_json::from_str(json).map_err(parse_error)?;
+    let mut objects = raw.objects;
+    objects.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    Ok(objects)
+}
+
+/// The table API's type catalog: `{"server_version_num": …, "types": [TypeEntry…]}`. Runs as the
+/// database owner.
+pub fn types_sql() -> String {
+    format!("{HEAD_SQL}{TYPES_SQL}")
+}
+
+/// Parses [`types_sql`]'s output, sorted by `(schema, name)`.
+pub fn parse_types(json: &str) -> Result<Vec<TypeEntry>, SchemaError> {
+    server_major(json)?;
+    let raw: RawTypes = serde_json::from_str(json).map_err(parse_error)?;
+    let mut types = raw.types;
+    types.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    Ok(types)
+}
+
+/// The document's server major, refused unless it is [`crate::SUPPORTED_SERVER_MAJOR`]; read
+/// before anything else.
+fn server_major(json: &str) -> Result<u32, SchemaError> {
+    let version: RawVersion = serde_json::from_str(json).map_err(parse_error)?;
+    let major = version.server_version_num / 10000;
+    if major != crate::SUPPORTED_SERVER_MAJOR {
+        return Err(SchemaError::UnsupportedServer(major));
+    }
+    Ok(major)
+}
 
 /// [`CATALOG_SQL`]'s filter on the data API's per-schema default-privilege grants to `anon` and
 /// `authenticated` (P6), on the owner's rows only (T14 M5: a user's own `FOR ROLE other … TO
@@ -33,11 +140,7 @@ pub fn default_acl_sql() -> String {
 /// Parses [`CATALOG_SQL`]'s output; refuses a server major other than
 /// [`crate::SUPPORTED_SERVER_MAJOR`]; normalizes and sorts.
 pub fn parse_catalog(json: &str) -> Result<SchemaModel, SchemaError> {
-    let version: RawVersion = serde_json::from_str(json).map_err(parse_error)?;
-    let major = version.server_version_num / 10000;
-    if major != crate::SUPPORTED_SERVER_MAJOR {
-        return Err(SchemaError::UnsupportedServer(major));
-    }
+    let major = server_major(json)?;
     let raw: RawCatalog = serde_json::from_str(json).map_err(parse_error)?;
     let mut m = SchemaModel::empty(major);
     m.schemas = raw
@@ -385,6 +488,21 @@ struct RawCatalog {
     roles: Vec<Role>,
     default_privileges: Vec<RawDefaultPrivilege>,
     reported: Vec<RawReported>,
+}
+
+#[derive(Deserialize)]
+struct RawTableDocument {
+    table: Option<RawTable>,
+}
+
+#[derive(Deserialize)]
+struct RawObjects {
+    objects: Vec<ObjectSummary>,
+}
+
+#[derive(Deserialize)]
+struct RawTypes {
+    types: Vec<TypeEntry>,
 }
 
 #[derive(Deserialize)]
@@ -980,5 +1098,147 @@ mod tests {
             !CATALOG_SQL.contains("pg_authid "),
             "roles come from pg_roles"
         );
+    }
+
+    #[test]
+    fn table_sql_names_its_target_safely() {
+        let sql = table_sql("we'ird", "Na\"me");
+        assert!(sql.contains("'we''ird'"), "{sql}");
+        assert!(sql.contains("'Na\"me'"), "{sql}");
+        assert!(!sql.contains("chelabase.app_users_table") || sql.contains("has_table_privilege"), "the owner can't read the users-table pointer: {sql}");
+    }
+
+    #[test]
+    fn a_missing_table_parses_to_none() {
+        assert_eq!(parse_table(r#"{"server_version_num": 170004, "table": null}"#).unwrap(), None);
+        assert!(parse_table(r#"{"server_version_num": 160000, "table": null}"#).is_err(), "only 17");
+    }
+
+    #[test]
+    fn objects_and_types_parse_sorted() {
+        let objects = parse_objects(r#"{"server_version_num": 170004, "objects": [
+            {"schema":"public","name":"z","kind":"view","oid":2,"owner":"o","comment":null,"rls_enabled":false,"rls_forced":false,"data_api_exposed":false,"row_estimate":null,"total_bytes":0,"editable":false},
+            {"schema":"public","name":"a","kind":"table","oid":1,"owner":"o","comment":"c","rls_enabled":true,"rls_forced":false,"data_api_exposed":true,"row_estimate":10,"total_bytes":8192,"editable":true}
+        ]}"#)
+        .unwrap();
+        assert_eq!(objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["a", "z"]);
+        assert_eq!(objects[1].kind, chelabase_types::table_api::ObjectKind::View);
+        let types = parse_types(r#"{"server_version_num": 170004, "types": [
+            {"oid":20,"schema":"pg_catalog","name":"int8","kind":"base","category":"N","preferred":false,"takes_modifiers":false,"array_oid":1016,"labels":[],"base_type_oid":null},
+            {"oid":9,"schema":"app","name":"mood","kind":"enum","category":"E","preferred":false,"takes_modifiers":false,"array_oid":10,"labels":["sad","ok"],"base_type_oid":null}
+        ]}"#)
+        .unwrap();
+        assert_eq!(types.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["mood", "int8"]);
+    }
+
+    /// T4: each scoped read is one transaction of the catalog read's shape (BEGIN, 3 × SET, DO,
+    /// SELECT, COMMIT), valid SQL to Postgres's own parser.
+    #[test]
+    fn scoped_reads_parse() {
+        for (what, sql) in [
+            ("table", table_sql("public", "t")),
+            ("objects", objects_sql()),
+            ("types", types_sql()),
+        ] {
+            let parsed = pg_query::parse(&sql).unwrap_or_else(|e| panic!("{what}: {e}\n{sql}"));
+            assert_eq!(parsed.protobuf.stmts.len(), 7, "{what}");
+            assert!(
+                sql.starts_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL search_path = pg_catalog;\n"),
+                "{what}"
+            );
+            assert!(sql.trim_end().ends_with("COMMIT;"), "{what}");
+        }
+    }
+
+    /// T4: the one-table read and the whole catalog read share their table rules and per-table
+    /// object, so one table reads as the whole catalog reads it.
+    #[test]
+    fn table_sql_shares_the_catalog_reads_table_fragment() {
+        let sql = table_sql("public", "t");
+        for part in [HEAD_SQL, TABS_SQL, TABLE_OBJECT_SQL] {
+            assert!(CATALOG_SQL.contains(part));
+            assert!(sql.contains(part));
+        }
+        assert!(sql.contains("AND n.nspname = 'public' AND c.relname = 't'\n),"), "{sql}");
+        // Every exclusion in the table object (users-table columns, policies, grantees, the
+        // email index, the merge's own constraints and indexes) is in the shared fragment.
+        for name in exclusions::USERS_MANAGED_COLUMNS
+            .iter()
+            .chain(exclusions::USERS_POLICIES.iter())
+            .chain(exclusions::USERS_GRANTEES.iter())
+            .chain([exclusions::USERS_EMAIL_INDEX].iter())
+        {
+            assert!(TABLE_OBJECT_SQL.contains(&format!("'{name}'")), "{name}");
+        }
+        // The object list's `editable` is exactly "read as a table".
+        assert!(objects_sql().contains(TABS_SQL));
+        assert!(OBJECTS_SQL.contains("'editable', c.oid IN (SELECT oid FROM tabs)"));
+    }
+
+    /// T4: the owner can't read the users-table pointer: the head reads it only behind the
+    /// privilege checks, and finds its table through `pg_catalog` (`to_regclass` on a schema
+    /// without USAGE raises), falling back to Chelabase's guard trigger.
+    #[test]
+    fn the_users_table_pointer_is_read_only_when_permitted() {
+        let guard = HEAD_SQL
+            .find("IF has_schema_privilege('chelabase', 'USAGE') AND has_table_privilege(pointer, 'SELECT') THEN")
+            .expect("guard");
+        let read = HEAD_SQL.find("FROM chelabase.app_users_table u").expect("read");
+        let fallback = HEAD_SQL.find("ELSE").expect("fallback");
+        assert!(guard < read && read < fallback);
+        assert!(!HEAD_SQL.contains("to_regclass"), "{HEAD_SQL}");
+        assert!(HEAD_SQL.contains("tg.tgname = 'chelabase_users_guard'"));
+        assert!(HEAD_SQL.contains("HAVING count(DISTINCT tg.tgrelid) = 1"));
+    }
+
+    /// No Postgres name holds a NUL: such a name matches nothing instead of cutting the query
+    /// text short.
+    #[test]
+    fn a_name_with_a_nul_matches_nothing() {
+        let sql = table_sql("pub\0lic", "t");
+        assert!(sql.contains("AND n.nspname = NULL AND c.relname = 't'"), "{sql}");
+        assert!(!sql.contains('\0'));
+        let sql = table_sql("a\\b", "t");
+        assert!(sql.contains("n.nspname = E'a\\\\b'"), "{sql}");
+    }
+
+    #[test]
+    fn scoped_documents_refuse_other_servers() {
+        assert_eq!(
+            parse_objects(r#"{"server_version_num": 180001, "objects": []}"#),
+            Err(SchemaError::UnsupportedServer(18))
+        );
+        assert_eq!(
+            parse_types(r#"{"server_version_num": 160004, "types": []}"#),
+            Err(SchemaError::UnsupportedServer(16))
+        );
+        assert_eq!(
+            parse_table(r#"{"server_version_num": 160004}"#),
+            Err(SchemaError::UnsupportedServer(16))
+        );
+        assert!(matches!(
+            parse_objects(r#"{"server_version_num": 170004, "objects": [{"schema": "x"}]}"#),
+            Err(SchemaError::Parse(_))
+        ));
+    }
+
+    /// One table parses (and normalizes) as the whole catalog's table does.
+    #[test]
+    fn one_table_parses_as_in_the_whole_catalog() {
+        let doc = document(170005);
+        let whole = parse_catalog(&doc.to_string()).unwrap();
+        let one = json!({ "server_version_num": 170005, "table": doc["tables"][0] });
+        assert_eq!(parse_table(&one.to_string()).unwrap().as_ref(), whole.tables.first());
+    }
+
+    /// The type catalog leaves out pseudo-types, arrays and relations' row types.
+    #[test]
+    fn types_sql_names_its_exclusions() {
+        assert!(TYPES_SQL.contains("ty.typtype IN ('b', 'e', 'd', 'c', 'r', 'm')"));
+        assert!(TYPES_SQL.contains("NOT EXISTS (SELECT FROM pg_type el WHERE el.typarray = ty.oid)"));
+        assert!(TYPES_SQL.contains("WHERE rc.oid = ty.typrelid) = 'c')"));
+        assert!(TYPES_SQL.contains("n.nspname = 'pg_catalog' OR n.oid IN (SELECT oid FROM ns)"));
+        // `ns` leaves out information_schema and Chelabase's schemas.
+        assert!(HEAD_SQL.contains("'information_schema'"));
     }
 }

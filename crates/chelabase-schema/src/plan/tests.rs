@@ -862,6 +862,10 @@ fn phase1_script_has_guard_marker_and_timeouts() {
     for excluded in ["'chelabase'", "'chelabase_merge'", "deptype = 'e'"] {
         assert!(TARGET_DIGEST_SQL.contains(excluded), "{excluded}");
     }
+    // Same schema exclusions as the catalog reader.
+    for schema in crate::exclusions::EXCLUDED_SCHEMAS {
+        assert!(TARGET_DIGEST_SQL.contains(&format!("'{schema}'")), "{schema}");
+    }
 }
 
 #[test]

@@ -19,7 +19,7 @@ chelabase-metadata = { workspace = true, features = ["openapi"] }
 chelabase-nats = { workspace = true }
 chelabase-query = { workspace = true }
 chelabase-routes = { workspace = true }
-chelabase-schema = { workspace = true }
+chelabase-schema = { workspace = true, features = ["openapi"] }
 chelabase-secrets = { workspace = true }
 chelabase-zitadel = { workspace = true }
 async-nats = { workspace = true }

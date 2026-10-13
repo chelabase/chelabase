@@ -2562,6 +2562,154 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/objects": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "The database's tables, views and other relations",
+        "description": "Every relation the table API shows in one Postgres database of a branch (system schemas and Chelabase's own objects left out), with its kind, estimated rows, size and whether the table API edits it (`editable`: ordinary tables only).",
+        "operationId": "listObjects",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database; the branch's main database when absent.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The objects, sorted by schema and name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObjectList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the query string is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the read took over 15 s",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}": {
       "patch": {
         "tags": [
@@ -4268,6 +4416,155 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/schema-changes": {
+      "post": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Change tables, columns, constraints, indexes, policies, grants and enums",
+        "description": "Renders the operations to SQL (names quoted, expressions as given, each exactly one SQL expression) and runs them on one of the branch's Postgres databases as the owner (Admin only) or, with `role`, as that role (the SQL editor's session: your member role, then `SET ROLE`), in one transaction with `lock_timeout` (`lock_timeout_ms`, default 5000) and `statement_timeout` (60 s; 15 s for a dry run). A dry run runs the same statements and always rolls back; it evaluates your expressions (defaults, checks, `USING`), so their non-transactional side effects (e.g. `nextval`) remain. A statement that may rewrite a table over `CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES` (default 256 MiB), and every one after it, is only rendered in a dry run (`skipped`), and then `would_succeed` is null. A table the request names that doesn't exist (and no earlier operation creates) is 404 with its `op_index`. Drops end `RESTRICT` and a request with drops returns `dependents`: what `CASCADE` would also remove beyond the request's own drop targets and their parts, and their `hash`. When something depends on a drop and the request confirms no cascade, the dry run and the real run alike answer 409 `has_dependents` with `dependents`, and change nothing. To cascade, send that hash as `cascade.dependents_hash`: the run (dry or real) locks the drop targets' tables, reads the dependents again, and refuses with 409 `dependents_changed` when they differ or when Postgres reports dropping anything but them and the parts of the request's other drop targets (drops that reach each other, e.g. a parent table and its child, need the hash of no dependents); a drop whose target an earlier drop of the request already removed is `skipped` (`already_dropped`). A `CONCURRENTLY` index operation must be the request's only operation: it runs outside a transaction (`statement_timeout` 900 s; a dry run only checks it), can't cascade, and when its build fails after creating its index, that INVALID index is dropped (another index of the same name never is). Postgres errors keep their fields (`op_index`, `sqlstate`, `message`, `detail`, `hint`, `position`; `dry_run: true` on a dry run). Each request is logged with its operation count, never its SQL.",
+        "operationId": "applySchemaChanges",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SchemaChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The statements (executed or skipped, with their notices, rewrite flag and lock), the dependents of the request's drops, whether the dry run would succeed (`null` when something was skipped) and whether the change was committed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaChangeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, the body isn't well-formed JSON, or the renderer refuses an operation (`op_index`; e.g. an expression that isn't exactly one SQL expression); `schema_change_failed`: Postgres refused a statement; `constraint_violation`: existing rows break a constraint (SQLSTATE 23502, 23514, 22xxx). Postgres's failures carry `op_index`, `sqlstate`, `message`, `detail`, `hint`, `position`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `permission_denied`: the role may not make this change (SQLSTATE 42501, with `op_index`). Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database; `forbidden`: your role on the project is below `developer` on an unprotected branch, below `admin` on a protected one, or the requested role isn't in your set (the owner, a LOGIN role or an owner-level role need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; or a table the request names or a drop target doesn't exist (`op_index`); `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`has_dependents`: a drop has dependents and the request confirms no cascade, dry run or not; nothing was changed (`error.dependents`: what a cascade would also drop and its hash); `dependents_changed`: the dependents differ from the confirmed hash, or a cascading drop removed other objects (`error.dependents`: the current list and hash); `index_build_failed`: the concurrent build failed after creating its index, and that INVALID index was dropped (`invalid_index_dropped`); `lock_timeout`: a lock wasn't granted within `lock_timeout_ms`, while reading the tables or running a statement (retry); `conflict`: existing rows break a unique, foreign-key or exclusion constraint, or a deadlock or serialization failure (40P01, 40001; retry); `branch_protected`: the branch is protected and DDL needs Admin; `owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body isn't the request's shape, `operations` is empty, `lock_timeout_ms` isn't 1 to 60000, `cascade.dependents_hash` isn't 64 lowercase hex characters, `role` is empty, or `role` is a system role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute isn't running, can't be reached, is starting up or is out of connections right now, or the connection broke (`Retry-After`); `member_role_reconcile_failed`: your member role on the branch couldn't be brought up to date (`Retry-After`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: a statement ran past `statement_timeout`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/sql": {
       "post": {
         "tags": [
@@ -4687,6 +4984,664 @@
           },
           "504": {
             "description": "`timeout`: reading the schema took over 35 s",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "One ordinary table's structure",
+        "description": "The table's columns, constraints, indexes, triggers, policies, privileges and comment, as the schema merge reads them. Only ordinary tables are returned: a view, a partition child or a missing table is 404 (the object list's `editable` says why).",
+        "operationId": "getTable",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "schema",
+            "in": "path",
+            "description": "Schema name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database; the branch's main database when absent.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The table",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Table"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the Postgres database or the table doesn't exist, or it isn't an ordinary table; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the query string is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the read took over 15 s",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}/cell": {
+      "post": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "One cell's full value",
+        "description": "The whole value of one column of the row with the given primary key, as text (a grid's preview cuts long values). `key` names exactly the primary key's columns; strings bind as given, numbers and booleans as their JSON text, compared at the column's type without its length or precision (never cut or rounded to fit). A value over 64 MiB is 413.",
+        "operationId": "getCell",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "schema",
+            "in": "path",
+            "description": "Schema name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CellRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The value (`null` for a SQL NULL), its stored size in bytes and its type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CellValue"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, the table has no primary key, `key` doesn't name exactly the primary key's columns or has a value that isn't a string, number or boolean; `unknown_column`: `column` isn't one of the table's; `constraint_violation`: a key value can't be read as its column's type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Viewer on the project, or the role isn't in your set; `permission_denied`: the role may not read the column (SQLSTATE 42501); `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the Postgres database, the table or the row doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`owner_password_unknown`; `backup_branch`; `branch_not_ready`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the value is over 64 MiB",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body isn't the request's shape, or `role` is empty or a system role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the read ran past 15 s",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}/rows/default": {
+      "post": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Insert a row of all defaults",
+        "description": "Runs `INSERT INTO <table> DEFAULT VALUES` in one committed transaction (as the owner, or as `role`) and returns the inserted row as JSON. A table whose columns have no defaults fails with the constraint's error (`constraint_violation`).",
+        "operationId": "insertDefaultRow",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "schema",
+            "in": "path",
+            "description": "Schema name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DefaultRowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The inserted row",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DefaultRow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID; `constraint_violation`: a default breaks a NOT NULL, check or data rule (SQLSTATE 23502, 23514, 22xxx); `schema_change_failed`: Postgres refused the statement (e.g. the relation isn't a table)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Developer on the project, or the role isn't in your set; `permission_denied`: the role may not insert (SQLSTATE 42501); `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the Postgres database or the table doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: a unique, foreign-key or exclusion constraint refuses the row, or a deadlock or serialization failure (40P01, 40001; retry);`owner_password_unknown`; `backup_branch`; `branch_not_ready`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body isn't the request's shape, or `role` is empty or a system role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the insert ran past 15 s",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/types": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "The database's types",
+        "description": "Every type a column can take in one Postgres database of a branch (base, enum, domain, composite, range and multirange types, with their oids), for a type picker and for joining a table's columns by `type_oid`.",
+        "operationId": "listTypes",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database; the branch's main database when absent.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The types, sorted by schema and name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TypeCatalog"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the query string is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the read took over 15 s",
             "content": {
               "application/json": {
                 "schema": {
@@ -11713,6 +12668,69 @@
           "deleted"
         ]
       },
+      "CascadeConfirm": {
+        "type": "object",
+        "required": [
+          "dependents_hash"
+        ],
+        "properties": {
+          "dependents_hash": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CellRequest": {
+        "type": "object",
+        "required": [
+          "key",
+          "column"
+        ],
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "object"
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CellValue": {
+        "type": "object",
+        "required": [
+          "bytes",
+          "data_type"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "data_type": {
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "ChoiceBody": {
         "oneOf": [
           {
@@ -11752,6 +12770,168 @@
         ],
         "description": "How the user settles one conflict."
       },
+      "CollationRef": {
+        "type": "object",
+        "required": [
+          "schema",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Column": {
+        "type": "object",
+        "required": [
+          "attnum",
+          "name",
+          "data_type",
+          "type_oid",
+          "not_null",
+          "grants"
+        ],
+        "properties": {
+          "attnum": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "collation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Qualified collation name, only when it isn't the type's default."
+          },
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data_type": {
+            "type": "string",
+            "description": "`format_type(atttypid, atttypmod)`."
+          },
+          "default": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`pg_get_expr(adbin, adrelid)`; `None` for a generated column (see `generated`)."
+          },
+          "generated": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `GENERATED ALWAYS AS (…) STORED` expression."
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            },
+            "description": "Column privileges (`attacl`, only when non-NULL)."
+          },
+          "identity": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "not_null": {
+            "type": "boolean",
+            "description": "PG17's `attnotnull`."
+          },
+          "type_oid": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`atttypid`: lets the analysis follow a renamed user type (an enum) that existed at the base.",
+            "minimum": 0
+          }
+        }
+      },
+      "ColumnChange": {
+        "type": "object",
+        "properties": {
+          "collation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CollationRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "comment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CommentChange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "data_type": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TypeSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "default": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DefaultChange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "identity": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IdentityChange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "not_null": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "using": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "ColumnDesc": {
         "type": "object",
         "required": [
@@ -11785,6 +12965,84 @@
             "type": "string"
           }
         }
+      },
+      "ColumnSpec": {
+        "type": "object",
+        "required": [
+          "name",
+          "data_type"
+        ],
+        "properties": {
+          "collation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CollationRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data_type": {
+            "$ref": "#/components/schemas/TypeSpec"
+          },
+          "default": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generated": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "identity": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IdentityKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "not_null": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CommentChange": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "set"
+            ],
+            "properties": {
+              "set": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "string",
+            "enum": [
+              "clear"
+            ]
+          }
+        ]
       },
       "ConnectionDetails": {
         "type": "object",
@@ -11866,6 +13124,243 @@
           "tree": {
             "type": "object",
             "description": "A data API request: the same JSON `POST /data/v1/query` takes."
+          }
+        },
+        "additionalProperties": false
+      },
+      "Constraint": {
+        "type": "object",
+        "required": [
+          "oid",
+          "name",
+          "kind",
+          "definition",
+          "columns",
+          "deferrable",
+          "initially_deferred",
+          "validated"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "description": "`conkey`, in order (empty for a table-level check without columns)."
+          },
+          "deferrable": {
+            "type": "boolean"
+          },
+          "definition": {
+            "type": "string",
+            "description": "`pg_get_constraintdef(oid, true)`."
+          },
+          "initially_deferred": {
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ConstraintKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "references": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ForeignKeyTarget",
+                "description": "A foreign key's referenced table and columns."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "validated": {
+            "type": "boolean",
+            "description": "`convalidated`: `false` for a `NOT VALID` constraint."
+          }
+        }
+      },
+      "ConstraintKind": {
+        "type": "string",
+        "enum": [
+          "primary_key",
+          "unique",
+          "foreign_key",
+          "check",
+          "exclusion"
+        ]
+      },
+      "ConstraintKindSpec": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "primary_key"
+            ],
+            "properties": {
+              "primary_key": {
+                "type": "object",
+                "required": [
+                  "columns"
+                ],
+                "properties": {
+                  "columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "unique"
+            ],
+            "properties": {
+              "unique": {
+                "type": "object",
+                "required": [
+                  "columns"
+                ],
+                "properties": {
+                  "columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "nulls_not_distinct": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "foreign_key"
+            ],
+            "properties": {
+              "foreign_key": {
+                "type": "object",
+                "required": [
+                  "columns",
+                  "references",
+                  "referenced_columns"
+                ],
+                "properties": {
+                  "columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "deferrable": {
+                    "type": "boolean"
+                  },
+                  "initially_deferred": {
+                    "type": "boolean"
+                  },
+                  "on_delete": {
+                    "$ref": "#/components/schemas/FkAction"
+                  },
+                  "on_update": {
+                    "$ref": "#/components/schemas/FkAction"
+                  },
+                  "referenced_columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "references": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "check"
+            ],
+            "properties": {
+              "check": {
+                "type": "object",
+                "required": [
+                  "expression"
+                ],
+                "properties": {
+                  "expression": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "exclusion"
+            ],
+            "properties": {
+              "exclusion": {
+                "type": "object",
+                "required": [
+                  "method",
+                  "elements"
+                ],
+                "properties": {
+                  "elements": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/ExclusionElement"
+                    }
+                  },
+                  "method": {
+                    "type": "string"
+                  },
+                  "predicate": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ConstraintSpec": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ConstraintKindSpec"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "not_valid": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -12150,6 +13645,71 @@
           "sql": {
             "type": "string",
             "description": "1 byte to 1 MiB."
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateTable": {
+        "type": "object",
+        "required": [
+          "table",
+          "columns"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnSpec"
+            }
+          },
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "constraints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConstraintSpec"
+            }
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableGrant"
+            }
+          },
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicySpec"
+            }
+          },
+          "primary_key": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rls": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RlsSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "table": {
+            "$ref": "#/components/schemas/TableRef"
           }
         },
         "additionalProperties": false
@@ -12522,6 +14082,57 @@
           }
         }
       },
+      "DefaultChange": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "set"
+            ],
+            "properties": {
+              "set": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "string",
+            "enum": [
+              "drop"
+            ]
+          }
+        ]
+      },
+      "DefaultRow": {
+        "type": "object",
+        "required": [
+          "row"
+        ],
+        "properties": {
+          "row": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DefaultRowRequest": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "DeleteProjectRequest": {
         "type": "object",
         "required": [
@@ -12551,12 +14162,89 @@
           "zitadel_not_configured"
         ]
       },
+      "Dependent": {
+        "type": "object",
+        "required": [
+          "kind",
+          "name",
+          "description"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Postgres's own description (`pg_describe_object`), the text its\n`drop cascades to …` notices print."
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "Dependents": {
+        "type": "object",
+        "required": [
+          "hash"
+        ],
+        "properties": {
+          "hash": {
+            "type": "string"
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Dependent"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "Direction": {
         "type": "string",
         "description": "Which way a merge goes.",
         "enum": [
           "into_parent",
           "from_parent"
+        ]
+      },
+      "EnumPosition": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "before"
+            ],
+            "properties": {
+              "before": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "after"
+            ],
+            "properties": {
+              "after": {
+                "type": "string"
+              }
+            }
+          }
         ]
       },
       "ErrorBody": {
@@ -12667,7 +14355,13 @@
           "signup_pending",
           "email_ambiguous",
           "email_in_use_elsewhere",
-          "invite_closed"
+          "invite_closed",
+          "permission_denied",
+          "dependents_changed",
+          "index_build_failed",
+          "lock_timeout",
+          "schema_change_failed",
+          "has_dependents"
         ]
       },
       "ErrorEnvelope": {
@@ -12682,6 +14376,22 @@
           }
         }
       },
+      "ExclusionElement": {
+        "type": "object",
+        "required": [
+          "column",
+          "operator"
+        ],
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "operator": {
+            "$ref": "#/components/schemas/OperatorRef"
+          }
+        },
+        "additionalProperties": false
+      },
       "FinishRequest": {
         "type": "object",
         "description": "The after-merge choice run by hand on a merge applied with drift (E21).",
@@ -12694,6 +14404,46 @@
           }
         },
         "additionalProperties": false
+      },
+      "FkAction": {
+        "type": "string",
+        "enum": [
+          "no_action",
+          "restrict",
+          "cascade",
+          "set_null",
+          "set_default"
+        ]
+      },
+      "ForeignKeyTarget": {
+        "type": "object",
+        "required": [
+          "table_oid",
+          "schema",
+          "table",
+          "columns"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "description": "`confkey`, in order."
+          },
+          "schema": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "table_oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
       },
       "FunctionDesc": {
         "type": "object",
@@ -12710,6 +14460,31 @@
           },
           "returns": {
             "$ref": "#/components/schemas/ReturnDesc"
+          }
+        }
+      },
+      "Grant": {
+        "type": "object",
+        "description": "One privilege from an ACL (`aclexplode`). Column privileges live on the column\n([`Column::grants`]), so a column's identity (table OID + attnum) carries them through renames.",
+        "required": [
+          "grantor",
+          "grantee",
+          "privilege",
+          "grantable"
+        ],
+        "properties": {
+          "grantable": {
+            "type": "boolean"
+          },
+          "grantee": {
+            "$ref": "#/components/schemas/RoleRef"
+          },
+          "grantor": {
+            "$ref": "#/components/schemas/NamedRole"
+          },
+          "privilege": {
+            "type": "string",
+            "description": "Upper case, as `aclexplode` gives it: `SELECT`, `INSERT`, `USAGE`, …"
           }
         }
       },
@@ -12745,6 +14520,228 @@
             ]
           }
         }
+      },
+      "Grantee": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "public"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "role"
+            ],
+            "properties": {
+              "role": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "JSON: `\"public\"` or `{\"role\": \"anon\"}`."
+      },
+      "Identity": {
+        "type": "object",
+        "description": "An identity column's generation and its sequence (`pg_depend` type `i`).",
+        "required": [
+          "generation",
+          "sequence_oid",
+          "sequence_name",
+          "params",
+          "grants"
+        ],
+        "properties": {
+          "generation": {
+            "$ref": "#/components/schemas/IdentityGeneration"
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            },
+            "description": "Privileges on the identity sequence (its `relacl`, or the default when NULL)."
+          },
+          "params": {
+            "$ref": "#/components/schemas/SequenceParams"
+          },
+          "sequence_name": {
+            "type": "string",
+            "description": "The sequence's name (in the table's schema)."
+          },
+          "sequence_oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "IdentityChange": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "add"
+            ],
+            "properties": {
+              "add": {
+                "$ref": "#/components/schemas/IdentityKind"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "set"
+            ],
+            "properties": {
+              "set": {
+                "$ref": "#/components/schemas/IdentityKind"
+              }
+            }
+          },
+          {
+            "type": "string",
+            "enum": [
+              "drop"
+            ]
+          }
+        ]
+      },
+      "IdentityGeneration": {
+        "type": "string",
+        "enum": [
+          "always",
+          "by_default"
+        ]
+      },
+      "IdentityKind": {
+        "type": "string",
+        "enum": [
+          "always",
+          "by_default"
+        ]
+      },
+      "IndexKey": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "column"
+            ],
+            "properties": {
+              "column": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "descending": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "nulls": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NullsOrder"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "expression"
+            ],
+            "properties": {
+              "expression": {
+                "type": "object",
+                "required": [
+                  "sql"
+                ],
+                "properties": {
+                  "descending": {
+                    "type": "boolean"
+                  },
+                  "nulls": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NullsOrder"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "sql": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "IndexSpec": {
+        "type": "object",
+        "required": [
+          "table"
+        ],
+        "properties": {
+          "concurrently": {
+            "type": "boolean"
+          },
+          "include": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IndexKey"
+            }
+          },
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nulls_not_distinct": {
+            "type": "boolean"
+          },
+          "predicate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "table": {
+            "$ref": "#/components/schemas/TableRef"
+          },
+          "unique": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
       },
       "InstanceSettings": {
         "type": "object",
@@ -12859,6 +14856,16 @@
             "$ref": "#/components/schemas/InviteOutcome"
           }
         }
+      },
+      "LockLevel": {
+        "type": "string",
+        "enum": [
+          "none",
+          "share_update_exclusive",
+          "share",
+          "share_row_exclusive",
+          "access_exclusive"
+        ]
       },
       "MeAdmin": {
         "type": "object",
@@ -13487,12 +15494,849 @@
           }
         }
       },
+      "NamedRole": {
+        "type": "object",
+        "description": "A role named by OID and name (owners, grantors, memberships).",
+        "required": [
+          "oid",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "NullsOrder": {
+        "type": "string",
+        "enum": [
+          "first",
+          "last"
+        ]
+      },
+      "ObjectKind": {
+        "type": "string",
+        "enum": [
+          "table",
+          "partitioned_table",
+          "view",
+          "materialized_view",
+          "foreign_table"
+        ]
+      },
+      "ObjectList": {
+        "type": "object",
+        "properties": {
+          "objects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectSummary"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ObjectSummary": {
+        "type": "object",
+        "required": [
+          "schema",
+          "name",
+          "kind",
+          "oid",
+          "owner",
+          "rls_enabled",
+          "rls_forced",
+          "data_api_exposed",
+          "total_bytes",
+          "editable"
+        ],
+        "properties": {
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data_api_exposed": {
+            "type": "boolean"
+          },
+          "editable": {
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ObjectKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "owner": {
+            "type": "string"
+          },
+          "rls_enabled": {
+            "type": "boolean"
+          },
+          "rls_forced": {
+            "type": "boolean"
+          },
+          "row_estimate": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "additionalProperties": false
+      },
       "OnDelete": {
         "type": "string",
         "description": "What deleting an app user does to their row in the users table.",
         "enum": [
           "delete",
           "mark"
+        ]
+      },
+      "Operation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "create_table"
+            ],
+            "properties": {
+              "create_table": {
+                "$ref": "#/components/schemas/CreateTable"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "rename_table"
+            ],
+            "properties": {
+              "rename_table": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "to"
+                ],
+                "properties": {
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "set_table_schema"
+            ],
+            "properties": {
+              "set_table_schema": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "schema"
+                ],
+                "properties": {
+                  "schema": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "drop_table"
+            ],
+            "properties": {
+              "drop_table": {
+                "type": "object",
+                "required": [
+                  "table"
+                ],
+                "properties": {
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "set_table_comment"
+            ],
+            "properties": {
+              "set_table_comment": {
+                "type": "object",
+                "required": [
+                  "table"
+                ],
+                "properties": {
+                  "comment": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "set_table_owner"
+            ],
+            "properties": {
+              "set_table_owner": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "owner"
+                ],
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "add_column"
+            ],
+            "properties": {
+              "add_column": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "column"
+                ],
+                "properties": {
+                  "column": {
+                    "$ref": "#/components/schemas/ColumnSpec"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "alter_column"
+            ],
+            "properties": {
+              "alter_column": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "column",
+                  "change"
+                ],
+                "properties": {
+                  "change": {
+                    "$ref": "#/components/schemas/ColumnChange"
+                  },
+                  "column": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "rename_column"
+            ],
+            "properties": {
+              "rename_column": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "column",
+                  "to"
+                ],
+                "properties": {
+                  "column": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "drop_column"
+            ],
+            "properties": {
+              "drop_column": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "column"
+                ],
+                "properties": {
+                  "column": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "add_constraint"
+            ],
+            "properties": {
+              "add_constraint": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "constraint"
+                ],
+                "properties": {
+                  "constraint": {
+                    "$ref": "#/components/schemas/ConstraintSpec"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "validate_constraint"
+            ],
+            "properties": {
+              "validate_constraint": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "rename_constraint"
+            ],
+            "properties": {
+              "rename_constraint": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "name",
+                  "to"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "drop_constraint"
+            ],
+            "properties": {
+              "drop_constraint": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "create_index"
+            ],
+            "properties": {
+              "create_index": {
+                "$ref": "#/components/schemas/IndexSpec"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "drop_index"
+            ],
+            "properties": {
+              "drop_index": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name"
+                ],
+                "properties": {
+                  "concurrently": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "rename_index"
+            ],
+            "properties": {
+              "rename_index": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name",
+                  "to"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "set_rls"
+            ],
+            "properties": {
+              "set_rls": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "enabled",
+                  "forced"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "forced": {
+                    "type": "boolean"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "create_policy"
+            ],
+            "properties": {
+              "create_policy": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "policy"
+                ],
+                "properties": {
+                  "policy": {
+                    "$ref": "#/components/schemas/PolicySpec"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "alter_policy"
+            ],
+            "properties": {
+              "alter_policy": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "roles": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  },
+                  "using": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "with_check": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "rename_policy"
+            ],
+            "properties": {
+              "rename_policy": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "name",
+                  "to"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "drop_policy"
+            ],
+            "properties": {
+              "drop_policy": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "grant"
+            ],
+            "properties": {
+              "grant": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "grant"
+                ],
+                "properties": {
+                  "grant": {
+                    "$ref": "#/components/schemas/TableGrant"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "revoke"
+            ],
+            "properties": {
+              "revoke": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "grant"
+                ],
+                "properties": {
+                  "grant": {
+                    "$ref": "#/components/schemas/TableGrant"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "create_enum"
+            ],
+            "properties": {
+              "create_enum": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name",
+                  "values"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "add_enum_value"
+            ],
+            "properties": {
+              "add_enum_value": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name",
+                  "value"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "position": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/EnumPosition"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "rename_enum_value"
+            ],
+            "properties": {
+              "rename_enum_value": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name",
+                  "from",
+                  "to"
+                ],
+                "properties": {
+                  "from": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "rename_enum"
+            ],
+            "properties": {
+              "rename_enum": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name",
+                  "to"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "drop_enum"
+            ],
+            "properties": {
+              "drop_enum": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
         ]
       },
       "OperationAccepted": {
@@ -13506,6 +16350,22 @@
             "type": "string"
           }
         }
+      },
+      "OperatorRef": {
+        "type": "object",
+        "required": [
+          "schema",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "PasswordState": {
         "type": "string",
@@ -13556,6 +16416,116 @@
           }
         ],
         "description": "Where in a branch's history: exactly one of a time or an LSN."
+      },
+      "Policy": {
+        "type": "object",
+        "required": [
+          "oid",
+          "name",
+          "command",
+          "permissive",
+          "roles"
+        ],
+        "properties": {
+          "command": {
+            "$ref": "#/components/schemas/PolicyCommand"
+          },
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "T14 minor 14. Absent in a snapshot stored before it was read: `None`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "permissive": {
+            "type": "boolean",
+            "description": "`false` for `AS RESTRICTIVE`."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RoleRef"
+            },
+            "description": "Sorted; `[Public]` for `polroles = {0}`."
+          },
+          "using": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "with_check": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PolicyCommand": {
+        "type": "string",
+        "enum": [
+          "all",
+          "select",
+          "insert",
+          "update",
+          "delete"
+        ]
+      },
+      "PolicyCommandSpec": {
+        "type": "string",
+        "enum": [
+          "all",
+          "select",
+          "insert",
+          "update",
+          "delete"
+        ]
+      },
+      "PolicySpec": {
+        "type": "object",
+        "description": "`roles` empty means PUBLIC.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "command": {
+            "$ref": "#/components/schemas/PolicyCommandSpec"
+          },
+          "name": {
+            "type": "string"
+          },
+          "permissive": {
+            "type": "boolean"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "using": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "with_check": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
       },
       "Privilege": {
         "type": "string",
@@ -13927,6 +16897,18 @@
           }
         }
       },
+      "RlsSpec": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "forced": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
       "RoleInUseKey": {
         "type": "object",
         "description": "A data API key that names an owner-level role; also the `keys` extra of `role_in_use`.",
@@ -13960,6 +16942,42 @@
           "sql",
           "api"
         ]
+      },
+      "RoleRef": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "public"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "role"
+            ],
+            "properties": {
+              "role": {
+                "type": "object",
+                "required": [
+                  "oid",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "oid": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "description": "A grantee or policy role: `PUBLIC` (grantee 0, `polroles = {0}`) or a role."
       },
       "RoleSessionView": {
         "type": "object",
@@ -14150,6 +17168,89 @@
           }
         }
       },
+      "SchemaChangeRequest": {
+        "type": "object",
+        "properties": {
+          "cascade": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CascadeConfirm"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "lock_timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Operation"
+            }
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "SchemaChangeResponse": {
+        "type": "object",
+        "required": [
+          "dry_run",
+          "committed"
+        ],
+        "properties": {
+          "committed": {
+            "type": "boolean"
+          },
+          "dependents": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Dependents"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "statements": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatementResult"
+            }
+          },
+          "would_succeed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "SchemaEntry": {
         "type": "object",
         "description": "One schema's tables, functions (overloads by name) and enums (labels by name).",
@@ -14191,6 +17292,192 @@
             "propertyNames": {
               "type": "string"
             }
+          }
+        }
+      },
+      "SequenceParams": {
+        "type": "object",
+        "description": "A sequence's parameters (`pg_sequence`).",
+        "required": [
+          "data_type",
+          "start",
+          "increment",
+          "min",
+          "max",
+          "cache",
+          "cycle"
+        ],
+        "properties": {
+          "cache": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cycle": {
+            "type": "boolean"
+          },
+          "data_type": {
+            "type": "string",
+            "description": "`format_type(seqtypid, NULL)`: `smallint`, `integer` or `bigint`."
+          },
+          "increment": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "max": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "min": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "start": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "SkipReason": {
+        "type": "string",
+        "enum": [
+          "large_table_rewrite",
+          "concurrently",
+          "after_skipped",
+          "already_dropped"
+        ]
+      },
+      "StatementResult": {
+        "type": "object",
+        "required": [
+          "sql",
+          "op_index",
+          "executed",
+          "lock"
+        ],
+        "properties": {
+          "executed": {
+            "type": "boolean"
+          },
+          "lock": {
+            "$ref": "#/components/schemas/LockLevel"
+          },
+          "notices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "op_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rewrites_table": {
+            "type": "boolean"
+          },
+          "skipped": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SkipReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sql": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Table": {
+        "type": "object",
+        "required": [
+          "oid",
+          "schema",
+          "name",
+          "owner",
+          "rls_enabled",
+          "rls_forced",
+          "unlogged",
+          "options",
+          "columns",
+          "constraints",
+          "indexes",
+          "policies",
+          "grants"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Column"
+            },
+            "description": "In `attnum` order (dropped columns excluded)."
+          },
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "constraints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Constraint"
+            },
+            "description": "Every `pg_constraint` row of the table (PG17 has no NOT NULL constraints there)."
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            },
+            "description": "Table-level privileges (`relacl`, or `acldefault('r', relowner)` when NULL)."
+          },
+          "indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableIndex"
+            },
+            "description": "Indexes that don't back a constraint (`conindid`)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`reloptions` (`fillfactor=70`, …), sorted."
+          },
+          "owner": {
+            "$ref": "#/components/schemas/NamedRole"
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Policy"
+            }
+          },
+          "rls_enabled": {
+            "type": "boolean"
+          },
+          "rls_forced": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "unlogged": {
+            "type": "boolean",
+            "description": "`relpersistence = 'u'`."
           }
         }
       },
@@ -14246,6 +17533,106 @@
           }
         }
       },
+      "TableGrant": {
+        "type": "object",
+        "required": [
+          "grantee"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "grantee": {
+            "$ref": "#/components/schemas/Grantee"
+          },
+          "privileges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TablePrivilege"
+            }
+          },
+          "with_grant_option": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TableIndex": {
+        "type": "object",
+        "description": "An index, in normalized parts so its name isn't part of its definition (a rename is only a\nname change).",
+        "required": [
+          "oid",
+          "name",
+          "method",
+          "unique",
+          "nulls_not_distinct",
+          "keys",
+          "include",
+          "options",
+          "valid"
+        ],
+        "properties": {
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`INCLUDE` columns, in order."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Key columns or expressions, in order, each as in `CREATE INDEX` (with collation,\noperator class and ordering when not the default)."
+          },
+          "method": {
+            "type": "string",
+            "description": "Access method: `btree`, `gin`, …"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nulls_not_distinct": {
+            "type": "boolean"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Storage parameters (`fillfactor=70`, …), sorted."
+          },
+          "predicate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `WHERE` predicate."
+          },
+          "unique": {
+            "type": "boolean"
+          },
+          "valid": {
+            "type": "boolean",
+            "description": "`indisvalid`: an interrupted `CREATE INDEX CONCURRENTLY` leaves `false`."
+          }
+        }
+      },
       "TableKind": {
         "type": "string",
         "enum": [
@@ -14254,6 +17641,36 @@
           "materialized_view",
           "foreign_table"
         ]
+      },
+      "TablePrivilege": {
+        "type": "string",
+        "description": "A table or column privilege. Its OpenAPI name is `TablePrivilege`: the data API's schema\nhas a `Privilege` of its own.",
+        "enum": [
+          "select",
+          "insert",
+          "update",
+          "delete",
+          "truncate",
+          "references",
+          "trigger",
+          "maintain"
+        ]
+      },
+      "TableRef": {
+        "type": "object",
+        "required": [
+          "schema",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "Tenant": {
         "type": "object",
@@ -14305,6 +17722,115 @@
             "description": "`null` when it has none: show the slug."
           }
         }
+      },
+      "TypeCatalog": {
+        "type": "object",
+        "properties": {
+          "types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TypeEntry"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "TypeEntry": {
+        "type": "object",
+        "required": [
+          "oid",
+          "schema",
+          "name",
+          "kind",
+          "category",
+          "preferred",
+          "takes_modifiers"
+        ],
+        "properties": {
+          "array_oid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "base_type_oid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "category": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TypeKind"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "preferred": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "takes_modifiers": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TypeKind": {
+        "type": "string",
+        "enum": [
+          "base",
+          "enum",
+          "domain",
+          "composite",
+          "range",
+          "multirange"
+        ]
+      },
+      "TypeSpec": {
+        "type": "object",
+        "required": [
+          "schema",
+          "name"
+        ],
+        "properties": {
+          "array": {
+            "type": "boolean"
+          },
+          "modifiers": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateAppUserRequest": {
         "type": "object",

@@ -193,6 +193,13 @@ pub enum Access {
     /// Effective platform role at least this, and the requested Postgres role in the
     /// effective set. The owner needs Admin.
     ActAs(PlatformRole),
+    /// [`Access::Branch`] and [`Access::ActAs`] together: the minimum depends on the target
+    /// branch's protection, and the requested Postgres role must be in the effective set (the
+    /// owner needs Admin).
+    ActAsBranch {
+        unprotected: PlatformRole,
+        protected: PlatformRole,
+    },
 }
 
 /// The caller's membership in the tenant.
@@ -302,7 +309,7 @@ pub fn decide(
         Access::Instance => return forbidden("instance admin"),
         Access::TenantAdmin => return if tenant_admin { Ok(()) } else { forbidden("tenant admin") },
         Access::Project(min) | Access::ActAs(min) => min,
-        Access::Branch { unprotected, protected } => {
+        Access::Branch { unprotected, protected } | Access::ActAsBranch { unprotected, protected } => {
             if branch_protected.unwrap_or(true) {
                 protected
             } else {
@@ -323,7 +330,7 @@ pub fn decide(
     if grant.platform_role < min {
         return forbidden(min.as_str());
     }
-    if !matches!(access, Access::ActAs(_)) {
+    if !matches!(access, Access::ActAs(_) | Access::ActAsBranch { .. }) {
         return Ok(());
     }
     let requested = match requested {
@@ -593,6 +600,10 @@ mod tests {
                 level(level_column(m))?;
                 outcome(k.requests.as_bytes()[req_index], req)
             }
+            Access::ActAsBranch { unprotected, protected: p } => {
+                level(level_column(if protected == Some(false) { unprotected } else { p }))?;
+                outcome(k.requests.as_bytes()[req_index], req)
+            }
         }
     }
 
@@ -611,6 +622,11 @@ mod tests {
         for unprotected in roles {
             for protected in roles {
                 all.push(Access::Branch { unprotected, protected });
+            }
+        }
+        for unprotected in roles {
+            for protected in roles {
+                all.push(Access::ActAsBranch { unprotected, protected });
             }
         }
         all.extend(roles.map(Access::ActAs));
@@ -644,7 +660,27 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cases, 21 * 2 * kinds.len() * 3 * REQUESTS.len());
+        assert_eq!(cases, 30 * 2 * kinds.len() * 3 * REQUESTS.len());
+    }
+
+    #[test]
+    fn act_as_branch_needs_the_branch_level_and_the_role() {
+        use PlatformRole::*;
+        let policy = ModePolicy::new(Mode::SelfHosted);
+        let caller = CallerFacts { member: active(false, true), in_operator_org: false };
+        let dev = grant(Developer, &["billing"]);
+        let access = Access::ActAsBranch { unprotected: Developer, protected: Admin };
+        let billing = Some(Requested::Role("billing"));
+        let admin = Err(Deny::Forbidden { required: "admin".into() });
+        assert_eq!(decide(&policy, &caller, Some(&dev), Some(false), billing, Some("postgres"), access), Ok(()));
+        assert_eq!(decide(&policy, &caller, Some(&dev), Some(true), billing, Some("postgres"), access), admin);
+        assert_eq!(decide(&policy, &caller, Some(&dev), None, billing, Some("postgres"), access), admin);
+        assert_eq!(
+            decide(&policy, &caller, Some(&dev), Some(false), Some(Requested::Role("sales")), Some("postgres"), access),
+            Err(Deny::Forbidden { required: "role:sales".into() })
+        );
+        let boss = grant(Admin, &["billing"]);
+        assert_eq!(decide(&policy, &caller, Some(&boss), Some(true), billing, Some("postgres"), access), Ok(()));
     }
 
     #[test]

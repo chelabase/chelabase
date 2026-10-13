@@ -54,22 +54,30 @@ pub struct SchemaModel {
 
 /// A role named by OID and name (owners, grantors, memberships).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NamedRole {
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub oid: Oid,
     pub name: String,
 }
 
 /// A grantee or policy role: `PUBLIC` (grantee 0, `polroles = {0}`) or a role.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RoleRef {
     Public,
-    Role { oid: Oid, name: String },
+    Role {
+        #[cfg_attr(feature = "openapi", schema(value_type = u32))]
+        oid: Oid,
+        name: String,
+    },
 }
 
 /// One privilege from an ACL (`aclexplode`). Column privileges live on the column
 /// ([`Column::grants`]), so a column's identity (table OID + attnum) carries them through renames.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Grant {
     pub grantor: NamedRole,
     pub grantee: RoleRef,
@@ -100,7 +108,9 @@ impl Schema {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Table {
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub oid: Oid,
     pub schema: String,
     pub name: String,
@@ -148,12 +158,14 @@ impl Table {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Column {
     pub attnum: i16,
     pub name: String,
     /// `format_type(atttypid, atttypmod)`.
     pub data_type: String,
     /// `atttypid`: lets the analysis follow a renamed user type (an enum) that existed at the base.
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub type_oid: Oid,
     /// Qualified collation name, only when it isn't the type's default.
     pub collation: Option<String>,
@@ -183,6 +195,7 @@ impl Column {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityGeneration {
     /// `attidentity = 'a'`.
@@ -193,8 +206,10 @@ pub enum IdentityGeneration {
 
 /// An identity column's generation and its sequence (`pg_depend` type `i`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Identity {
     pub generation: IdentityGeneration,
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub sequence_oid: Oid,
     /// The sequence's name (in the table's schema).
     pub sequence_name: String,
@@ -205,6 +220,7 @@ pub struct Identity {
 
 /// A sequence's parameters (`pg_sequence`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SequenceParams {
     /// `format_type(seqtypid, NULL)`: `smallint`, `integer` or `bigint`.
     pub data_type: String,
@@ -217,6 +233,7 @@ pub struct SequenceParams {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintKind {
     /// `p`
@@ -232,7 +249,9 @@ pub enum ConstraintKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Constraint {
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub oid: Oid,
     pub name: String,
     pub kind: ConstraintKind,
@@ -249,7 +268,9 @@ pub struct Constraint {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ForeignKeyTarget {
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub table_oid: Oid,
     pub schema: String,
     pub table: String,
@@ -260,7 +281,9 @@ pub struct ForeignKeyTarget {
 /// An index, in normalized parts so its name isn't part of its definition (a rename is only a
 /// name change).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(as = TableIndex))]
 pub struct Index {
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub oid: Oid,
     pub name: String,
     /// Access method: `btree`, `gin`, …
@@ -282,6 +305,7 @@ pub struct Index {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyCommand {
     /// `*`
@@ -297,7 +321,9 @@ pub enum PolicyCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Policy {
+    #[cfg_attr(feature = "openapi", schema(value_type = u32))]
     pub oid: Oid,
     pub name: String,
     pub command: PolicyCommand,
@@ -1271,5 +1297,22 @@ mod tests {
         let m = sample::full_model();
         assert!(m.roles[0].owner_level());
         assert!(!m.roles[1].owner_level());
+    }
+
+    /// TE-A P2: the table API answers with `Table` itself; its OpenAPI schema shows OIDs as
+    /// plain integers, as the JSON carries them.
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn table_has_an_openapi_schema_with_integer_oids() {
+        use utoipa::PartialSchema;
+        let schema = serde_json::to_value(Table::schema()).unwrap();
+        let props = &schema["properties"];
+        assert_eq!(props["oid"]["type"], "integer", "{schema}");
+        assert_eq!(props["oid"]["format"], "int32", "{schema}");
+        for field in ["columns", "constraints", "indexes", "policies", "grants", "owner"] {
+            assert!(props.get(field).is_some(), "{field}: {schema}");
+        }
+        let column = serde_json::to_value(Column::schema()).unwrap();
+        assert_eq!(column["properties"]["type_oid"]["type"], "integer", "{column}");
     }
 }

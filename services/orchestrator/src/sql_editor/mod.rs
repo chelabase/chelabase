@@ -14,6 +14,10 @@ pub mod run;
 pub mod saved;
 pub mod schema;
 mod routes;
+pub(crate) use routes::{
+    Session, connect_as_owner, hand_over_after, invalid_role, load_authorized, open_session,
+    pick_pg_database,
+};
 
 pub const MAX_SQL_BYTES: usize = 1_048_576;
 pub const MIN_TIMEOUT_MS: u64 = 100;

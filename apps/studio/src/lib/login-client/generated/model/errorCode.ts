@@ -101,4 +101,10 @@ export const ErrorCode = {
   email_ambiguous: 'email_ambiguous',
   email_in_use_elsewhere: 'email_in_use_elsewhere',
   invite_closed: 'invite_closed',
+  permission_denied: 'permission_denied',
+  dependents_changed: 'dependents_changed',
+  index_build_failed: 'index_build_failed',
+  lock_timeout: 'lock_timeout',
+  schema_change_failed: 'schema_change_failed',
+  has_dependents: 'has_dependents',
 } as const;

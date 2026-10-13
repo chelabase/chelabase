@@ -67,6 +67,11 @@ fn access_text(a: Access) -> String {
             format!("Branch: {} unprotected, {} protected", role(unprotected), role(protected))
         }
         Access::ActAs(r) => format!("Act as: {} and the role in your set", role(r)),
+        Access::ActAsBranch { unprotected, protected } => format!(
+            "Act as, by branch: {} unprotected, {} protected, and the role in your set",
+            role(unprotected),
+            role(protected)
+        ),
     }
 }
 

@@ -120,15 +120,26 @@ fn plan(e: &Endpoint, caller: Caller, mode: Mode) -> Call {
             Some(lower) => call(sub_of(lower), Some("app"), forbidden(min.as_str())),
             None => call("viewer", None, forbidden("owner")),
         },
+        (Caller::TooLow, Access::ActAsBranch { unprotected, .. }) => match below(unprotected) {
+            Some(lower) => call(sub_of(lower), Some("app"), forbidden(unprotected.as_str())),
+            None => call("viewer", None, forbidden("owner")),
+        },
 
         (Caller::TooLowProtected, Access::Branch { protected, .. }) => match below(protected) {
             Some(lower) => call(sub_of(lower), None, forbidden(protected.as_str())),
+            None => call("viewer", None, Skip),
+        },
+        (Caller::TooLowProtected, Access::ActAsBranch { protected, .. }) => match below(protected) {
+            Some(lower) => call(sub_of(lower), Some("app"), forbidden(protected.as_str())),
             None => call("viewer", None, Skip),
         },
         (Caller::TooLowProtected, _) => call("viewer", None, Skip),
 
         (Caller::OutsideSet, Access::ActAs(min)) => {
             call(sub_of(min), Some("other"), forbidden("role:other"))
+        }
+        (Caller::OutsideSet, Access::ActAsBranch { unprotected, .. }) => {
+            call(sub_of(unprotected), Some("other"), forbidden("role:other"))
         }
         (Caller::OutsideSet, _) => call("viewer", None, Skip),
 
@@ -143,6 +154,9 @@ fn plan(e: &Endpoint, caller: Caller, mode: Mode) -> Call {
             call(sub_of(unprotected), None, Pass)
         }
         (Caller::AtMinimum, Access::ActAs(min)) => call(sub_of(min), Some("app"), Pass),
+        (Caller::AtMinimum, Access::ActAsBranch { unprotected, .. }) => {
+            call(sub_of(unprotected), Some("app"), Pass)
+        }
     }
 }
 
@@ -228,7 +242,9 @@ fn path_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> String {
         .replace("{run_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{user_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{member_id}", &uuid::Uuid::new_v4().to_string())
-        .replace("{invite_id}", &uuid::Uuid::new_v4().to_string());
+        .replace("{invite_id}", &uuid::Uuid::new_v4().to_string())
+        .replace("{schema}", "public")
+        .replace("{table}", "notes");
     match (role, e.method, e.policy.access) {
         (Some(role), chelabase_routes::Method::Get, Access::ActAs(_)) => {
             format!("{path}?role={role}")
@@ -271,6 +287,9 @@ fn body_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> Option<Value> {
             r::RUN_SQL.name,
             json!({ "run_id": uuid::Uuid::new_v4(), "role": role, "sql": "select 1" }),
         ),
+        (r::APPLY_SCHEMA_CHANGES.name, json!({ "role": role, "dry_run": true, "operations": [{ "set_table_comment": { "table": { "schema": "public", "name": "notes" }, "comment": null } }] })),
+        (r::INSERT_DEFAULT_ROW.name, json!({ "role": role })),
+        (r::GET_CELL.name, json!({ "role": role, "key": { "id": 1 }, "column": "body" })),
         (r::CREATE_ROLE.name, json!({ "name": "walked" })),
         (r::PUT_APP_USERS.name, json!({ "database_id": w.db })),
         (

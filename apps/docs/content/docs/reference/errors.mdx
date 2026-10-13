@@ -83,12 +83,25 @@ Two more refusals use general codes. A grant or override below Admin that lists 
 | 409 | `backup_branch` | A restore backup can't take this operation (no compute, can't be protected or rewritten). |
 | 409 | `main_branch` | Main can't be deleted and has no parent to reset to. |
 | 409 | `has_children` | The branch (or one of its backups) has child branches. |
-| 409 | `branch_protected` | The branch is protected; unprotect it first. |
+| 409 | `branch_protected` | The branch is protected. On a branch route (reset, restore, delete): unprotect it first. From the table API, and the SQL editor's guard refusal on a protected branch (Postgres error 42501 with hint `chelabase:branch_protected`): schema changes there need an Admin; ask one, or make the change on a branch of your own and merge it. |
 | 409 | `branch_cap_reached` | The database has `max_branches`. |
 | 409 | `credentials_unavailable` | The branch has no endpoint, or its owner credentials are missing. |
 | 500 | `credentials_unavailable` | Stored credentials can't be opened with the current secrets key. |
 | 409 | `owner_password_unknown` | The owner's password was set in SQL; reset it first. |
 | 409 | `branch_merge_busy` | A schema merge holds this branch as its source or target (it is rehearsing, applying, finishing, or failed half applied in its online phase), or a rehearsal's throwaway branch still hangs off it, so reset, restore and delete are refused. `error.merge_id` names the merge; `error.rehearsal_branch_id` names the throwaway branch. |
+
+### Table API
+
+| Status | Code | Meaning |
+|---|---|---|
+| 403 | `permission_denied` | Postgres refused a statement for the role you act as (SQLSTATE 42501); the same code as the data API's. |
+| 409 | `has_dependents` | A drop has dependents and the request doesn't confirm a cascade (dry run or not); nothing was changed. `error.dependents` lists what a cascade would also drop and its `hash`, to send as `cascade.dependents_hash`. |
+| 409 | `dependents_changed` | The objects a cascade would drop changed since the dry run. |
+| 409 | `index_build_failed` | A concurrent index build failed after creating its index; that invalid index was dropped. |
+| 409 | `lock_timeout` | A lock the change needs was held past `lock_timeout_ms`. |
+| 409 | `conflict` | Existing rows break a unique, foreign-key or exclusion constraint (23505, 23503, 23P01), or a deadlock or serialization failure (40P01, 40001; safe to retry). |
+| 400 | `constraint_violation` | Rows break NOT NULL or a check, or a value is out of range or can't be read as its type (23502, 23514, class 22). Not the app users' 422 `constraint_violation`, which is another endpoint's. |
+| 400 | `schema_change_failed` | Postgres refused a table API statement (any SQLSTATE not mapped to another code); the error carries `sqlstate`, `message`, `detail`, `hint` and `position`. |
 
 ### Schema merges
 
@@ -203,7 +216,7 @@ The data API (`POST /data/v1/query`, `GET /data/v1/schema`) answers with:
 | 401 | `user_token_invalid` | The `Chelabase-User` token is invalid. |
 | 401 | `user_token_expired` | The `Chelabase-User` token has expired. |
 | 401 | `user_session_revoked` | The user's session was revoked. |
-| 403 | `permission_denied` | Postgres refused the role (42501). |
+| 403 | `permission_denied` | Postgres refused the role (42501); the same code as the table API's. |
 | 403 | `role_not_allowed` | A secret key's role is owner-level or has system privileges: superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin` or the `pg_*_server_*` roles: what key creation refuses. Take those away, or use another role (`BYPASSRLS` alone is allowed). |
 | 404 | `unknown_table` | A table or view that doesn't exist or that the key's role can't reach. |
 | 404 | `unknown_function` | A function that doesn't exist, can't be called through the API, or that the key's role can't execute. |

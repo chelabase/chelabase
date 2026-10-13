@@ -65,7 +65,7 @@ pub const ROLE_CHECK_TTL: Duration = Duration::from_secs(300);
 /// The owner's connections, as `pg_stat_activity` shows them.
 pub const APPLICATION_NAME: &str = "chelabase-console";
 /// Seconds a 503 asks the client to wait (the data API's value).
-const RETRY_AFTER_SECS: u32 = 2;
+pub(crate) const RETRY_AFTER_SECS: u32 = 2;
 /// Run on an owner connection before and after every request (`RunSettings::reset_sql`): the
 /// next request starts as the owner with the connection's defaults, holding no advisory lock
 /// and no temporary table (a function the owner called may have left any of them). A reset
@@ -525,7 +525,7 @@ where
 }
 
 /// The owner pool of `row`'s database on `branch`; errors as [`owner_target`].
-async fn owner_pool_for<M, J>(
+pub(crate) async fn owner_pool_for<M, J>(
     state: &AppState<M, J>,
     branch: &chelabase_metadata::BranchRecord,
     row: &BranchDatabase,
@@ -556,7 +556,7 @@ where
 /// A pooled connection failure as the data API answers it: a pool that timed out or was
 /// closed under the request is a 503 (`Retry-After`), like any moment the database is out of
 /// reach; a driver error from connecting or recycling goes through [`QueryFailure::from_pg`].
-fn pool_failure(err: PoolError, request_id: &str) -> QueryFailure {
+pub(crate) fn pool_failure(err: PoolError, request_id: &str) -> QueryFailure {
     match err {
         PoolError::Backend(e) => QueryFailure::from_pg(&e, request_id),
         PoolError::Timeout(_) | PoolError::Closed => QueryFailure::unreachable(request_id, err),

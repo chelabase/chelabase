@@ -124,7 +124,7 @@ macro_rules! or_answer {
 
 /// What the access check resolved (the caller's grant), the database and its branch (ready,
 /// not a backup).
-async fn load_authorized<M, J>(
+pub(crate) async fn load_authorized<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
     access: Access,
@@ -147,7 +147,7 @@ where
     Ok((authorized, record, branch))
 }
 
-async fn pick_pg_database<M, J>(
+pub(crate) async fn pick_pg_database<M, J>(
     state: &AppState<M, J>,
     branch: &BranchRecord,
     name: Option<&str>,
@@ -174,7 +174,7 @@ fn is_reserved(role: &str) -> bool {
 }
 
 /// The 422 for a `role` the editor never takes (empty, or a system role), or `None`.
-fn invalid_role(role: Option<&str>) -> Option<ApiError> {
+pub(crate) fn invalid_role(role: Option<&str>) -> Option<ApiError> {
     match role {
         Some("") => Some(unprocessable("`role` must not be empty (null runs as the owner)")),
         Some(role) if is_reserved(role) => Some(unprocessable(&format!(
@@ -186,10 +186,10 @@ fn invalid_role(role: Option<&str>) -> Option<ApiError> {
 
 /// An open editor connection, the role to `SET ROLE` to on it, and, on a member role's
 /// connection, the member (its run is handed over afterwards, R5).
-struct Session {
-    connected: Connected,
-    set_role: Option<String>,
-    member: Option<Uuid>,
+pub(crate) struct Session {
+    pub(crate) connected: Connected,
+    pub(crate) set_role: Option<String>,
+    pub(crate) member: Option<Uuid>,
 }
 
 /// The role a session `SET ROLE`s to for the requested `role`: none for no role or the owner
@@ -236,7 +236,7 @@ fn member_login_refusal(branch: BranchId, err: ConnectError) -> MemberLogin {
 ///   connection then `SET ROLE` (I2); below Admin, 403 `forbidden{required: "role:<name>"}`
 ///   (without asking the worker when 6a already shows it, M5).
 #[allow(clippy::too_many_arguments)]
-async fn open_session<M, J>(
+pub(crate) async fn open_session<M, J>(
     state: &AppState<M, J>,
     authorized: &Authorized,
     principal: &AuthPrincipal,
@@ -309,7 +309,7 @@ fn role_forbidden(role: &str) -> ApiError {
 /// Asks the worker for an act-as run's hand-over once it's over (R5; the member-role
 /// invariant, `chelabase_types::role_name::member_hand_over_sql`). A failure is logged: what
 /// stays with the member role is dropped by its next narrowing or removal.
-fn hand_over_after<M, J>(
+pub(crate) fn hand_over_after<M, J>(
     state: Arc<AppState<M, J>>,
     branch: BranchId,
     member: Uuid,
@@ -483,7 +483,7 @@ where
 }
 
 /// A fresh owner connection to `database` on the branch's compute.
-async fn connect_as_owner<M, J>(
+pub(crate) async fn connect_as_owner<M, J>(
     state: &AppState<M, J>,
     branch: &BranchRecord,
     owner: &str,

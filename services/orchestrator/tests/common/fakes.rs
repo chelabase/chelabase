@@ -2267,6 +2267,7 @@ async fn spawn_app_custom(
         zitadel,
         users_db,
         sql_editor: Default::default(),
+        table_api_dry_run_max_bytes: orchestrator::DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES,
         studio_url: STUDIO_URL.into(),
     });
     let probe: Router = Router::new()

@@ -237,7 +237,7 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
     // 0. Admission.
     let needs_project = matches!(
         access,
-        Access::Project(_) | Access::Branch { .. } | Access::ActAs(_)
+        Access::Project(_) | Access::Branch { .. } | Access::ActAs(_) | Access::ActAsBranch { .. }
     );
     let mut member = member_facts(principal.member.as_ref());
     match member {
@@ -309,7 +309,7 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
 
     // 2. The branch's protection, for routes whose minimum depends on it.
     let mut branch_protected = None;
-    if let (Access::Branch { .. }, Some(branch), Some(r)) =
+    if let (Access::Branch { .. } | Access::ActAsBranch { .. }, Some(branch), Some(r)) =
         (access, target.branch(), record.as_ref())
     {
         branch_protected = match state.metadata.get_branch(BranchId(branch)).await {
@@ -345,7 +345,7 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
         in_operator_org: principal.in_operator_org,
     };
     let owner_role = match (access, record.as_ref()) {
-        (Access::ActAs(_), Some(r)) => Some(roles::owner_name(r)),
+        (Access::ActAs(_) | Access::ActAsBranch { .. }, Some(r)) => Some(roles::owner_name(r)),
         _ => None,
     };
     let decided = decide(
@@ -358,7 +358,7 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
         access,
     );
     let act_as_role = match (access, target.requested()) {
-        (Access::ActAs(_), Some(Requested::Role(name))) => Some(name),
+        (Access::ActAs(_) | Access::ActAsBranch { .. }, Some(Requested::Role(name))) => Some(name),
         _ => None,
     };
     // The roles of the branch, read once for the checks that need them.

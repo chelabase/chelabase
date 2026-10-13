@@ -53,6 +53,10 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CHELABASE_BRANCH_DATA_API_DATABASE_CAP").ok().as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
+    let table_api_dry_run_max_bytes = orchestrator::table_api_dry_run_max_bytes(
+        std::env::var("CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES").ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let rest = RestInternal {
         url: env_or("CHELABASE_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
         token: internal_config.rest_token.clone(),
@@ -106,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         zitadel: zitadel_admin(),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
+        table_api_dry_run_max_bytes,
         studio_url: env_or("CHELABASE_STUDIO_URL", "http://localhost:3000")
             .trim_end_matches('/')
             .to_string(),

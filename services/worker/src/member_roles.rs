@@ -30,6 +30,12 @@
 //!   row that won't open, or a catalog verifier that isn't the row's password (a reset, a
 //!   restore, a password the member changed itself) gets a fresh password, and its sessions
 //!   end. Passwords reach SQL only as SCRAM verifiers, on psql's stdin.
+//! - **Protected branches (TE-A P5–P7):** every member role of a non-Admin holds the DDL
+//!   guard's marker role (`chelabase_schema_locked`, granted with no option: it gives
+//!   nothing), and [`crate::schema_guard::schema_guard_sql`] runs first in every database
+//!   where [`crate::schema_guard::schema_guard_check_sql`] doesn't find it current. The marker
+//!   is never a granted role: [`MemberRoleStep::Lock`] / [`MemberRoleStep::Unlock`] alone
+//!   manage it, and `Lock` comes before any grant of the role (fail closed).
 //! - **Order (I1):** each role's revocations (and the end of its sessions) run first, as their
 //!   own script, so a failing grant never skips a revoke; then creates, passwords and grants;
 //!   then drops.
@@ -53,14 +59,17 @@ use chelabase_schema::sql::{ident, literal};
 use chelabase_secrets::{open_member_role_password, seal_member_role_password};
 use chelabase_types::BranchId;
 use chelabase_types::access::{
-    Grant, Narrowing, PgRole, RoleSet, act_as_reserved, effective, tenant_admin_grant,
+    Grant, Narrowing, PgRole, PlatformRole, RoleSet, act_as_reserved, effective,
+    tenant_admin_grant,
 };
 use chelabase_types::role_name::MEMBER_ROLE_PREFIX;
+use chelabase_types::table_api::SCHEMA_LOCKED_ROLE;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::resync::{PendingResyncs, SYSTEM_DATABASE};
+use crate::schema_guard::{schema_guard_check_sql, schema_guard_sql};
 use crate::{OWNER_ROLE, Worker, credentials};
 
 /// How long an enqueued reconcile waits before it runs: a burst of changes is one run.
@@ -98,6 +107,9 @@ pub struct DesiredMemberRole {
     pub verifier: String,
     /// The existing role's password is replaced (and its sessions end).
     pub rotate: bool,
+    /// It holds the DDL guard's marker role ([`SCHEMA_LOCKED_ROLE`], TE-A P7): the branch is
+    /// protected and the member isn't an Admin on the project.
+    pub locked: bool,
 }
 
 /// One `pg_auth_members` row of a member role.
@@ -158,6 +170,16 @@ pub enum MemberRoleStep {
     Drop {
         role: String,
     },
+    /// The DDL guard's marker ([`SCHEMA_LOCKED_ROLE`], P7), created on first use and granted
+    /// with no option: it gives nothing, the guard's event triggers only look for it. Planned
+    /// straight after `Create` (first, for an existing role), before any `Grant`.
+    Lock {
+        role: String,
+    },
+    /// The marker revoked. Runs with the revokes.
+    Unlock {
+        role: String,
+    },
 }
 
 impl MemberRoleStep {
@@ -169,15 +191,25 @@ impl MemberRoleStep {
             | Self::SetPassword { role, .. }
             | Self::Reshape { role, .. }
             | Self::Grant { role, .. }
-            | Self::Drop { role } => role,
+            | Self::Drop { role }
+            | Self::Lock { role }
+            | Self::Unlock { role } => role,
         }
     }
 }
 
 /// A name a member role may ever be granted: not the owner, nor any reserved name or prefix
-/// (`cb_m_`, `chelabase_`, `pg_`, `postgres`, …; `anon` and `authenticated` are allowed).
+/// (`cb_m_`, `chelabase_`, `pg_`, `postgres`, …; `anon` and `authenticated` are allowed). The
+/// DDL guard's marker is reserved too: only [`MemberRoleStep::Lock`] grants it.
 pub fn grantable(role: &str) -> bool {
     role != OWNER_ROLE && !act_as_reserved(role)
+}
+
+/// The reconciler's own marker membership (no other grantor): [`plan_member_roles`] keeps or
+/// removes it with [`MemberRoleStep::Lock`] / [`MemberRoleStep::Unlock`], never as a granted
+/// role.
+fn is_marker(m: &ActualMembership) -> bool {
+    m.role == SCHEMA_LOCKED_ROLE && m.grantor.is_none()
 }
 
 /// The steps that make `actual` equal `desired` (pure). A converged pair plans nothing.
@@ -195,12 +227,20 @@ pub fn plan_member_roles(
         let wanted: BTreeSet<&String> = d.roles.iter().filter(|r| grantable(r)).collect();
         let role = d.role_name.clone();
         let have = actual.iter().find(|a| a.role_name == d.role_name);
+        let marked = have.is_some_and(|a| a.memberships.iter().any(is_marker));
+        // Fail closed (T7 review): the marker comes straight after the role exists (first, for
+        // an existing role), so a later step that fails can't leave grants without it.
+        let lock = (d.locked && !marked).then(|| MemberRoleStep::Lock { role: role.clone() });
         match have {
-            None => creates.push(MemberRoleStep::Create {
-                role: role.clone(),
-                verifier: d.verifier.clone(),
-            }),
+            None => {
+                creates.push(MemberRoleStep::Create {
+                    role: role.clone(),
+                    verifier: d.verifier.clone(),
+                });
+                creates.extend(lock);
+            }
             Some(a) => {
+                creates.extend(lock);
                 if d.rotate {
                     creates.push(MemberRoleStep::SetPassword {
                         role: role.clone(),
@@ -222,7 +262,10 @@ pub fn plan_member_roles(
             .map(|a| a.memberships.iter().collect())
             .unwrap_or_default();
         memberships.sort_by(|a, b| (&a.role, &a.grantor).cmp(&(&b.role, &b.grantor)));
-        for m in &memberships {
+        if marked && !d.locked {
+            revokes.push(MemberRoleStep::Unlock { role: role.clone() });
+        }
+        for m in memberships.iter().filter(|m| !is_marker(m)) {
             // Another grantor's membership never stays; one of ours stays while it's wanted
             // (a re-grant fixes its options).
             if m.grantor.is_some() || !wanted.contains(&m.role) {
@@ -318,6 +361,17 @@ pub fn render_step(step: &MemberRoleStep) -> String {
                 terminate_sql(role)
             )
         }
+        MemberRoleStep::Lock { role } => format!(
+            "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) {marker_literal}) THEN CREATE ROLE {marker} NOLOGIN; END IF; END$$;\nGRANT {marker} TO {} WITH INHERIT FALSE, SET FALSE, ADMIN FALSE;",
+            ident(role),
+            marker = ident(SCHEMA_LOCKED_ROLE),
+            marker_literal = literal(SCHEMA_LOCKED_ROLE),
+        ),
+        MemberRoleStep::Unlock { role } => format!(
+            "REVOKE {} FROM {};",
+            ident(SCHEMA_LOCKED_ROLE),
+            ident(role)
+        ),
     }
 }
 
@@ -947,6 +1001,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 })
             };
             let Some(grant) = grant else { continue };
+            // P7: on a protected branch, everyone but an Admin (tenant admins are) is marked.
+            let locked = record.protected && grant.platform_role != PlatformRole::Admin;
             let (roles, skipped) = granted_roles(&grant, &catalog);
             for (role, why) in skipped {
                 debug!(branch_id = %branch, member_id = %m.id, role, ?why, "member roles: a granted role is left out");
@@ -1014,6 +1070,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     roles,
                     verifier,
                     rotate,
+                    locked,
                 },
                 sealed,
                 write_row,
@@ -1035,13 +1092,35 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // role's failure stops only that script.
         let mut failures: Vec<String> = Vec::new();
         let mut failed_roles: BTreeSet<String> = BTreeSet::new();
+        // P6: on a protected branch the DDL guard goes into every database before the role
+        // steps: checked on every run, installed wherever the check doesn't answer that the
+        // current guard is in place (a database made since gets it; a dropped or changed
+        // trigger comes back). An unprotected branch keeps whatever triggers it has: nobody
+        // holds the marker there.
+        if record.protected {
+            let check = schema_guard_check_sql();
+            let guard = schema_guard_sql();
+            for (db, _) in &catalog.databases {
+                match self.computes.admin_sql(&ep, db, &check).await {
+                    Ok(out) if out.lines().any(|l| l.trim() == "t") => continue,
+                    Ok(_) => {}
+                    Err(e) => {
+                        debug!(branch_id = %branch, database = db, "member roles: checking the DDL guard failed ({e:#}); installing it");
+                    }
+                }
+                if let Err(e) = self.computes.admin_sql(&ep, db, &guard).await {
+                    warn!(branch_id = %branch, database = db, "member roles: installing the DDL guard failed: {e:#}");
+                    failures.push(format!("guarding {db}: {e:#}"));
+                }
+            }
+        }
         let mut revokes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         let mut changes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         let mut drops: Vec<&str> = Vec::new();
         for step in &steps {
             match step {
                 MemberRoleStep::Drop { role } => drops.push(role),
-                MemberRoleStep::Revoke { .. } => revokes
+                MemberRoleStep::Revoke { .. } | MemberRoleStep::Unlock { .. } => revokes
                     .entry(step.role())
                     .or_default()
                     .push(render_step(step)),

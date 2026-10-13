@@ -11,7 +11,7 @@ How to set up a machine, run the stack, test, and commit. For what the system is
 - clang and protoc (`pg_query` builds Postgres's parser for the SQL editor's guard): `sudo apt-get install -y clang protobuf-compiler`
 
 ```bash
-proto install   # moon, node, pnpm, just from .prototools
+proto install   # rust, moon, node, pnpm, just, sccache from .prototools
 pnpm install
 ```
 
@@ -19,14 +19,20 @@ pnpm install
 
 ## Machine setup (one time)
 
-Install sccache (build cache) and cargo-sweep (cleanup):
+`proto install` provides sccache (build cache). Install cargo-sweep (cleanup):
 
 ```bash
-cargo install sccache --locked
 cargo install cargo-sweep --locked
 ```
 
-Add this to `~/.cargo/config.toml` (create it if it doesn't exist):
+Cargo runs rustc from outside the repo, where the proto shim can't see this repo's `.prototools`, so register sccache globally once:
+
+```bash
+proto plugin add sccache https://raw.githubusercontent.com/appthrust/proto-toml-plugins/main/sccache/plugin.toml --to global
+proto pin sccache 0.18.0 --to global
+```
+
+Then make sccache cargo's wrapper by adding this to `~/.cargo/config.toml` (create it if it doesn't exist; cargo comes from rustup, not a proto shim, so `.prototools` can't set it):
 
 ```toml
 [build]

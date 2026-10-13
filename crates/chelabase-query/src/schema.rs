@@ -32,6 +32,8 @@ use crate::sql::{Catalog, ColumnInfo, FnLookupError, FunctionInfo, TableInfo, qu
 /// Neon's own. `pg_temp_*` and `pg_toast_temp_*` are hidden too ([`is_reserved`]).
 pub const RESERVED_SCHEMAS: &[&str] = &[
     "chelabase",
+    // The protected-branch DDL guard (worker `schema_guard`).
+    "chelabase_guard",
     "pg_catalog",
     "information_schema",
     "pg_toast",
@@ -816,6 +818,11 @@ pub async fn role_view(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_guard_schema_is_reserved() {
+        assert!(is_reserved("chelabase_guard"));
+    }
 
     fn td(name: &str, array: bool, enum_ref: Option<&str>) -> TypeDesc {
         TypeDesc {

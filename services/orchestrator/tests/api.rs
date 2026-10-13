@@ -7241,6 +7241,87 @@ async fn schema_route_returns_pgls_json() {
     scratch.drop().await;
 }
 
+// --- Table API: reads (TE-A, T5) ----------------------------------------------------------
+
+impl Branching {
+    async fn table_get(&self, branch: BranchId, rest: &str) -> reqwest::Response {
+        self.send(Method::GET, &format!("{}/{rest}", self.branch(branch)), None).await
+    }
+}
+
+// T5 review, Minor: the access check comes before the query string, so a caller with no
+// access learns nothing from a malformed one (404, not 422); a Viewer gets the 422.
+#[tokio::test]
+async fn table_reads_check_access_before_the_query_string() {
+    let w = member_world(Mode::SelfHosted).await;
+    let elsewhere = w.metadata.create_project(w.tenant, "Elsewhere").await.unwrap().id;
+    w.metadata.add_granted(w.tenant, "outsider", elsewhere, PlatformRole::Viewer, &["app"]);
+    w.metadata.add_granted(w.tenant, "vic", w.project, PlatformRole::Viewer, &["app"]);
+    let path = format!(
+        "/v1/databases/{}/branches/{}/objects?database=a&database=b",
+        w.db.as_uuid(),
+        w.dev.as_uuid()
+    );
+    let err = error_of(w.app.send_as("outsider", "org-1", Method::GET, &path, None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(w.app.send_as("vic", "org-1", Method::GET, &path, None).await.status(), 422);
+}
+
+#[tokio::test]
+async fn table_reads_check_the_database_before_any_compute() {
+    let t = sql_app().await;
+    let main = t.main();
+    for rest in ["objects?database=nope", "types?database=postgres", "tables/public/notes?database=nope"] {
+        assert_eq!(code_of(&error_of(t.table_get(main, rest).await, 404).await), "not_found", "{rest}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+    for rest in ["objects", "types", "tables/public/notes", "tables/we%22ird/na%20me?database=analytics"] {
+        assert_eq!(code_of(&error_of(t.table_get(main, rest).await, 503).await), "unavailable", "{rest}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn table_reads_over_http() {
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password("read-pass").await;
+    scratch.exec_in(&format!(
+        "CREATE VIEW public.notes_v AS SELECT id FROM public.notes; ALTER VIEW public.notes_v OWNER TO {o}; \
+         CREATE TYPE public.mood AS ENUM ('sad', 'ok'); ALTER TYPE public.mood OWNER TO {o};",
+        o = scratch.owner
+    ))
+    .await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some("read-pass"));
+    let main = t.main();
+    let resp = t.table_get(main, "objects").await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let objects = body["objects"].as_array().unwrap();
+    let notes = objects.iter().find(|o| o["name"] == "notes").unwrap_or_else(|| panic!("{body}"));
+    assert_eq!((notes["kind"].as_str(), notes["editable"].as_bool()), (Some("table"), Some(true)));
+    let view = objects.iter().find(|o| o["name"] == "notes_v").unwrap();
+    assert_eq!((view["kind"].as_str(), view["editable"].as_bool()), (Some("view"), Some(false)));
+    assert!(objects.iter().all(|o| o["schema"] != "chelabase"), "{body}");
+    let resp = t.table_get(main, "tables/public/notes").await;
+    assert_eq!(resp.status(), 200);
+    let table: Value = resp.json().await.unwrap();
+    let columns: Vec<&str> = table["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(columns, ["id", "body"]);
+    assert!(table["constraints"].as_array().unwrap().iter().any(|c| c["kind"] == "primary_key"), "{table}");
+    for rest in ["tables/public/notes_v", "tables/public/nope"] {
+        assert_eq!(code_of(&error_of(t.table_get(main, rest).await, 404).await), "not_found", "{rest}");
+    }
+    let resp = t.table_get(main, "types").await;
+    assert_eq!(resp.status(), 200);
+    let types: Value = resp.json().await.unwrap();
+    let types = types["types"].as_array().unwrap();
+    assert!(types.iter().any(|t| t["schema"] == "pg_catalog" && t["name"] == "int8" && t["kind"] == "base"));
+    assert!(types.iter().any(|t| t["name"] == "mood" && t["labels"] == json!(["sad", "ok"])));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
 // --- Schema merges (step 6g, T10) ------------------------------------------------------------
 
 impl Branching {
@@ -11558,4 +11639,606 @@ async fn rename_needs_tenant_admin() {
     let err = error_of(t.send("stranger", Method::PATCH, "/v1/tenant", body()).await, 403).await;
     assert_eq!(code_of(&err), "no_access_yet", "a stranger has no row while sign-up is closed");
     assert!(t.actions().is_empty());
+}
+
+// --- Protection reconciles member roles (TE-A, T7) ---------------------------------------
+
+#[tokio::test]
+async fn protecting_a_branch_reconciles_its_member_roles() {
+    let t = branching().await;
+    let main = t.main();
+    for protected in [true, false] {
+        let resp = t.send(Method::PATCH, &t.branch(main), Some(json!({ "protected": protected }))).await;
+        assert_eq!(resp.status(), 200);
+    }
+    assert_eq!(*t.jobs.member_role_enqueues.lock().unwrap(), vec![main, main]);
+}
+
+// --- Table API: schema changes (TE-A, T6) -------------------------------------------------
+
+impl Branching {
+    async fn changes(&self, branch: BranchId, body: Value) -> reqwest::Response {
+        self.send(Method::POST, &format!("{}/schema-changes", self.branch(branch)), Some(body)).await
+    }
+}
+
+fn comment_op(table: &str) -> Value {
+    json!({ "set_table_comment": { "table": { "schema": "public", "name": table }, "comment": "c" } })
+}
+
+fn create_memos() -> Value {
+    json!({ "create_table": {
+        "table": { "schema": "public", "name": "memos" },
+        "columns": [
+            { "name": "id", "data_type": { "schema": "pg_catalog", "name": "int8" }, "identity": "always", "not_null": true },
+            { "name": "body", "data_type": { "schema": "pg_catalog", "name": "text" }, "default": "''", "not_null": true }
+        ],
+        "primary_key": ["id"],
+        "rls": { "enabled": true }
+    }})
+}
+
+#[tokio::test]
+async fn schema_changes_validate_before_any_compute() {
+    let t = sql_app().await;
+    let main = t.main();
+    let mut concurrent = json!({ "create_index": { "table": { "schema": "public", "name": "notes" }, "keys": [{ "column": { "name": "body" } }], "concurrently": true } });
+    for body in [
+        json!({ "operations": [] }),
+        json!({ "operations": [comment_op("notes")], "lock_timeout_ms": 0 }),
+        json!({ "operations": [comment_op("notes")], "lock_timeout_ms": 60_001 }),
+        json!({ "operations": [comment_op("notes")], "cascade": { "dependents_hash": "abc" } }),
+        json!({ "operations": [concurrent.clone(), comment_op("notes")] }),
+        json!({ "operations": [{ "rename_table": { "table": { "schema": "public", "name": "notes" }, "to": "" } }] }),
+        json!({ "operations": [comment_op("notes")], "surprise": 1 }),
+    ] {
+        let resp = t.changes(main, body.clone()).await;
+        let status = resp.status().as_u16();
+        let err = error_of(resp, status).await;
+        assert!(status == 400 || status == 422, "{status} {body}");
+        assert_eq!(code_of(&err), "invalid_request", "{body}");
+    }
+    let err = error_of(t.changes(main, json!({ "operations": [concurrent.clone(), comment_op("notes")] })).await, 400).await;
+    assert_eq!(err["error"]["op_index"], 0, "{err}");
+    assert_eq!(t.compute_lookups(), 0);
+    // Valid requests get past validation (the fake has no compute).
+    concurrent["create_index"]["name"] = json!("notes_body_idx");
+    for body in [json!({ "operations": [concurrent] }), json!({ "dry_run": true, "operations": [create_memos()] })] {
+        assert_eq!(code_of(&error_of(t.changes(main, body).await, 503).await), "unavailable");
+    }
+}
+
+#[tokio::test]
+async fn schema_changes_on_a_protected_branch_need_admin() {
+    let (t, dev) = act_as_app().await;
+    let main = t.main();
+    t.set_protected(main);
+    let body = json!({ "role": "sales", "operations": [comment_op("notes")] });
+    let err = error_of(t.send_as("dev", Method::POST, &format!("{}/schema-changes", t.branch(main)), Some(body.clone())).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")));
+    // Unprotected: a Developer acting as a role in their set passes the check (with the
+    // member role a reconcile would have made).
+    t.put_member_role(t.member_role_row(dev, main, &["billing_admin", "sales"]));
+    t.metadata.branches.lock().unwrap().get_mut(&main).unwrap().protected = false;
+    let resp = t.send_as("dev", Method::POST, &format!("{}/schema-changes", t.branch(main)), Some(body)).await;
+    assert_ne!(resp.status(), 403);
+    // A reserved role is refused as the SQL editor refuses it.
+    let reserved = json!({ "role": "cb_m_x", "operations": [comment_op("notes")] });
+    assert_eq!(t.changes(main, reserved).await.status(), 422);
+}
+
+impl ScratchCompute {
+    /// One boolean from `sql`, run in the scratch database as the cluster's admin.
+    async fn yes(&self, sql: &str) -> bool {
+        let opts: sqlx::postgres::PgConnectOptions = (*self.admin.connect_options()).clone();
+        let pool = sqlx::PgPool::connect_with(opts.database(&self.database)).await.unwrap();
+        let v: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned())).fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        v
+    }
+}
+
+async fn changes_app(password: &str) -> (ScratchCompute, Branching) {
+    let scratch = ScratchCompute::new().await;
+    scratch.set_password(password).await;
+    let t = owner_console_app(&scratch).await;
+    t.seal_owner_password(Some(password));
+    (scratch, t)
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn a_dry_run_leaves_no_trace_and_the_real_run_runs_the_same_sql() {
+    let (scratch, t) = changes_app("chg-pass").await;
+    let main = t.main();
+    let resp = t.changes(main, json!({ "dry_run": true, "operations": [create_memos()] })).await;
+    assert_eq!(resp.status(), 200);
+    let dry: Value = resp.json().await.unwrap();
+    assert_eq!((dry["dry_run"].as_bool(), dry["committed"].as_bool(), dry["would_succeed"].as_bool()), (Some(true), Some(false), Some(true)), "{dry}");
+    assert!(dry["statements"].as_array().unwrap().iter().all(|s| s["executed"] == true), "{dry}");
+    assert!(!scratch.yes("SELECT to_regclass('public.memos') IS NOT NULL").await, "the dry run rolled back");
+    let resp = t.changes(main, json!({ "operations": [create_memos()] })).await;
+    assert_eq!(resp.status(), 200);
+    let real: Value = resp.json().await.unwrap();
+    assert_eq!(real["committed"], true);
+    let sql = |v: &Value| v["statements"].as_array().unwrap().iter().map(|s| s["sql"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(sql(&dry), sql(&real));
+    assert!(scratch.yes("SELECT relrowsecurity FROM pg_class WHERE oid = 'public.memos'::regclass").await);
+    // A second create fails as Postgres says, typed.
+    let err = error_of(t.changes(main, json!({ "operations": [create_memos()] })).await, 400).await;
+    assert_eq!((code_of(&err), err["error"]["sqlstate"].as_str(), err["error"]["op_index"].as_u64()), ("schema_change_failed", Some("42P07"), Some(0)));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn cascade_needs_the_hash_the_dry_run_returned() {
+    let (scratch, t) = changes_app("cas-pass").await;
+    let main = t.main();
+    scratch.exec_in(&format!("CREATE VIEW public.notes_v AS SELECT id, body FROM public.notes; ALTER VIEW public.notes_v OWNER TO {};", scratch.owner)).await;
+    let drop = json!({ "drop_table": { "table": { "schema": "public", "name": "notes" } } });
+    // Without cascade (user, 2026-10-13): the dry run and the real run both answer 409
+    // has_dependents with what a cascade would drop and its hash, and drop nothing.
+    let mut hashes = Vec::new();
+    for dry_run in [true, false] {
+        let err = error_of(t.changes(main, json!({ "dry_run": dry_run, "operations": [drop.clone()] })).await, 409).await;
+        assert_eq!(code_of(&err), "has_dependents", "{err}");
+        let objects = err["error"]["dependents"]["objects"].as_array().unwrap_or_else(|| panic!("{err}"));
+        assert!(objects.iter().any(|o| o["name"] == "notes_v" && o["kind"] == "view" && o["description"] == "view notes_v"), "{err}");
+        hashes.push(err["error"]["dependents"]["hash"].as_str().unwrap().to_string());
+        assert!(scratch.yes("SELECT to_regclass('public.notes') IS NOT NULL").await, "nothing dropped");
+    }
+    assert_eq!(hashes[0], hashes[1], "the same answer from both runs");
+    let hash = hashes.remove(0);
+    // A dry run with the hash: 200, executed and rolled back.
+    let dry: Value = t.changes(main, json!({ "dry_run": true, "operations": [drop.clone()], "cascade": { "dependents_hash": hash } })).await.json().await.unwrap();
+    assert_eq!((dry["would_succeed"].as_bool(), dry["dependents"]["hash"].as_str()), (Some(true), Some(hash.as_str())), "{dry}");
+    assert!(scratch.yes("SELECT to_regclass('public.notes_v') IS NOT NULL").await, "the dry run rolled back");
+    let wrong = "0".repeat(64);
+    let err = error_of(t.changes(main, json!({ "operations": [drop.clone()], "cascade": { "dependents_hash": wrong } })).await, 409).await;
+    assert_eq!(code_of(&err), "dependents_changed");
+    assert!(scratch.yes("SELECT to_regclass('public.notes') IS NOT NULL").await, "nothing dropped");
+    let resp = t.changes(main, json!({ "operations": [drop], "cascade": { "dependents_hash": hash } })).await;
+    assert_eq!(resp.status(), 200);
+    assert!(scratch.yes("SELECT to_regclass('public.notes') IS NULL AND to_regclass('public.notes_v') IS NULL").await);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn a_failed_concurrent_index_leaves_no_invalid_index() {
+    let (scratch, t) = changes_app("idx-pass").await;
+    let main = t.main();
+    scratch.exec_in("INSERT INTO public.notes (body) VALUES ('same'), ('same')").await;
+    let op = json!({ "create_index": { "table": { "schema": "public", "name": "notes" }, "name": "notes_body_uq", "unique": true, "keys": [{ "column": { "name": "body" } }], "concurrently": true } });
+    let dry: Value = t.changes(main, json!({ "dry_run": true, "operations": [op.clone()] })).await.json().await.unwrap();
+    assert_eq!((dry["statements"][0]["executed"].as_bool(), dry["statements"][0]["skipped"].as_str(), dry["would_succeed"].clone()), (Some(false), Some("concurrently"), Value::Null), "{dry}");
+    let err = error_of(t.changes(main, json!({ "operations": [op] })).await, 409).await;
+    assert_eq!((code_of(&err), err["error"]["sqlstate"].as_str()), ("index_build_failed", Some("23505")));
+    assert!(scratch.yes("SELECT NOT EXISTS (SELECT FROM pg_class WHERE relname = 'notes_body_uq')").await);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn a_held_lock_times_out_typed() {
+    let (scratch, t) = changes_app("lock-pass").await;
+    let main = t.main();
+    let opts: sqlx::postgres::PgConnectOptions = (*scratch.admin.connect_options()).clone();
+    let holder = sqlx::PgPool::connect_with(opts.database(&scratch.database)).await.unwrap();
+    let mut tx = holder.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.notes IN ACCESS SHARE MODE").execute(&mut *tx).await.unwrap();
+    let add = json!({ "add_column": { "table": { "schema": "public", "name": "notes" }, "column": { "name": "x", "data_type": { "schema": "pg_catalog", "name": "int4" } } } });
+    let err = error_of(t.changes(main, json!({ "operations": [add], "lock_timeout_ms": 200 })).await, 409).await;
+    assert_eq!(code_of(&err), "lock_timeout");
+    tx.rollback().await.unwrap();
+    holder.close().await;
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn a_role_without_rights_is_permission_denied() {
+    let (scratch, t) = changes_app("perm-pass").await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    let group = format!("{}_grp", scratch.owner);
+    t.metadata.add_group_role(&ep, &group, &[]);
+    let a = t.grant_member("dev-a", PlatformRole::Developer, &[&group]);
+    let row = t.member_role_row(a, main, &[&group]);
+    let member_role = row.role_name.clone();
+    scratch.exec_in(&format!("CREATE ROLE {group} NOLOGIN; CREATE ROLE {member_role} LOGIN NOINHERIT PASSWORD 'pw'; GRANT {group} TO {member_role} WITH INHERIT FALSE, SET TRUE; REVOKE CREATE ON SCHEMA public FROM PUBLIC;")).await;
+    t.put_member_role(row);
+    let body = json!({ "role": group, "operations": [create_memos()] });
+    let err = error_of(t.send_as("dev-a", Method::POST, &format!("{}/schema-changes", t.branch(main)), Some(body)).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["op_index"].as_u64()), ("permission_denied", Some(0)));
+    wait_no_editor_sessions(&scratch).await;
+    let admin = scratch.admin.clone();
+    scratch.drop().await;
+    use sqlx::Executor;
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {member_role}; DROP ROLE {group}"))).await.unwrap();
+}
+
+// --- T6 review, fix round ------------------------------------------------------------------
+
+/// The `has_dependents` hash of nothing: a cascade whose drops reach only each other.
+fn no_dependents_hash() -> String {
+    chelabase_schema::ddl::dependents_hash(&[])
+}
+
+// Finding 1: a failed concurrent build cleans up only an index it created itself; an older
+// INVALID index of the same name (a leftover, or another session's build) stays.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn a_failed_concurrent_build_leaves_other_invalid_indexes_alone() {
+    let (scratch, t) = changes_app("left-pass").await;
+    let main = t.main();
+    // A leftover INVALID index `notes_left` (as a failed concurrent build leaves one).
+    scratch.exec_in("CREATE INDEX notes_left ON public.notes (body)").await;
+    scratch.exec_in("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.notes_left'::regclass").await;
+    for keys in [json!([{ "column": { "name": "nope" } }]), json!([{ "column": { "name": "body" } }])] {
+        let op = json!({ "create_index": { "table": { "schema": "public", "name": "notes" }, "name": "notes_left", "keys": keys, "concurrently": true } });
+        let resp = t.changes(main, json!({ "operations": [op] })).await;
+        assert!(resp.status().is_client_error(), "{}", resp.status());
+        assert!(scratch.yes("SELECT EXISTS (SELECT FROM pg_class WHERE relname = 'notes_left')").await, "the leftover stays: {keys}");
+    }
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// Finding 2: drops that reach only each other aren't a cascade beyond the request.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn dropping_a_parent_and_its_child_together_works_in_both_orders() {
+    let (scratch, t) = changes_app("pair-pass").await;
+    let main = t.main();
+    let tables = |o: &str| {
+        format!(
+            "CREATE TABLE public.parent (id int PRIMARY KEY); CREATE TABLE public.child (pid int REFERENCES public.parent); \
+             ALTER TABLE public.parent OWNER TO {o}; ALTER TABLE public.child OWNER TO {o};"
+        )
+    };
+    let drop = |n: &str| json!({ "drop_table": { "table": { "schema": "public", "name": n } } });
+    // Child first: no cascade needed.
+    scratch.exec_in(&tables(&scratch.owner)).await;
+    let resp = t.changes(main, json!({ "operations": [drop("child"), drop("parent")] })).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    assert!(scratch.yes("SELECT to_regclass('public.parent') IS NULL AND to_regclass('public.child') IS NULL").await);
+    // Parent first: the cascade reaches only the child, which the request drops too.
+    scratch.exec_in(&tables(&scratch.owner)).await;
+    let ops = json!([drop("parent"), drop("child")]);
+    let resp = t.changes(main, json!({ "operations": ops, "cascade": { "dependents_hash": no_dependents_hash() } })).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    assert!(scratch.yes("SELECT to_regclass('public.parent') IS NULL AND to_regclass('public.child') IS NULL").await);
+    // An enum and the one column of its type.
+    scratch.exec_in(&format!("CREATE TYPE public.mood AS ENUM ('ok'); ALTER TYPE public.mood OWNER TO {o}; ALTER TABLE public.notes ADD COLUMN m public.mood;", o = scratch.owner)).await;
+    let ops = json!([
+        { "drop_enum": { "schema": "public", "name": "mood" } },
+        { "drop_column": { "table": { "schema": "public", "name": "notes" }, "column": "m" } },
+    ]);
+    let resp = t.changes(main, json!({ "operations": ops, "cascade": { "dependents_hash": no_dependents_hash() } })).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// Minor: the context read before the transaction honours `lock_timeout_ms` too.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn the_context_read_times_out_on_a_held_lock() {
+    let (scratch, t) = changes_app("ctx-pass").await;
+    let main = t.main();
+    let opts: sqlx::postgres::PgConnectOptions = (*scratch.admin.connect_options()).clone();
+    let holder = sqlx::PgPool::connect_with(opts.database(&scratch.database)).await.unwrap();
+    let mut tx = holder.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.notes IN ACCESS EXCLUSIVE MODE").execute(&mut *tx).await.unwrap();
+    let retype = json!({ "alter_column": { "table": { "schema": "public", "name": "notes" }, "column": "body",
+        "change": { "data_type": { "schema": "pg_catalog", "name": "varchar" } } } });
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        t.changes(main, json!({ "dry_run": true, "operations": [retype], "lock_timeout_ms": 200 })),
+    )
+    .await
+    .expect("answered, not hung");
+    assert_eq!(code_of(&error_of(resp, 409).await), "lock_timeout");
+    tx.rollback().await.unwrap();
+    holder.close().await;
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// Minor: a table the request names that doesn't exist is 404 whatever the path (concurrent or
+// not, dry run or not).
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn a_missing_table_is_not_found_on_every_path() {
+    let (scratch, t) = changes_app("ghost-pass").await;
+    let main = t.main();
+    let ghost = json!({ "schema": "public", "name": "ghost" });
+    let add = json!({ "add_column": { "table": ghost, "column": { "name": "x", "data_type": { "schema": "pg_catalog", "name": "int4" } } } });
+    let index = json!({ "create_index": { "table": ghost, "name": "ghost_x", "keys": [{ "column": { "name": "x" } }], "concurrently": true } });
+    for (op, dry_run) in [(add.clone(), true), (add, false), (index.clone(), true), (index, false)] {
+        let err = error_of(t.changes(main, json!({ "dry_run": dry_run, "operations": [op.clone()] })).await, 404).await;
+        assert_eq!((code_of(&err), err["error"]["op_index"].as_u64()), ("not_found", Some(0)), "{op} dry_run={dry_run}");
+    }
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// T6 fix round (the implementer's): an enum dropped with the table that has a column of its
+// type, or with that column. The enum's cascade reaches only the request's own targets.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn dropping_an_enum_with_its_columns_table_or_column() {
+    let (scratch, t) = changes_app("enum-pass").await;
+    let main = t.main();
+    let make = |table: bool| {
+        let o = &scratch.owner;
+        let column = if table {
+            format!("CREATE TABLE public.moods (m public.mood); ALTER TABLE public.moods OWNER TO {o};")
+        } else {
+            "ALTER TABLE public.notes ADD COLUMN m public.mood;".to_string()
+        };
+        format!("CREATE TYPE public.mood AS ENUM ('ok'); ALTER TYPE public.mood OWNER TO {o}; {column}")
+    };
+    let drop_enum = json!({ "drop_enum": { "schema": "public", "name": "mood" } });
+    let none = no_dependents_hash();
+    // [drop_enum, drop_table]: without cascade, the enum's drop reaches the table's column (a
+    // part of the request's other target): a cascade of nothing beyond the request.
+    scratch.exec_in(&make(true)).await;
+    let ops = json!([drop_enum.clone(), { "drop_table": { "table": { "schema": "public", "name": "moods" } } }]);
+    for dry_run in [true, false] {
+        let err = error_of(t.changes(main, json!({ "dry_run": dry_run, "operations": ops.clone() })).await, 409).await;
+        assert_eq!((code_of(&err), err["error"]["dependents"]["hash"].as_str()), ("has_dependents", Some(none.as_str())), "{err}");
+    }
+    let dry: Value = t.changes(main, json!({ "dry_run": true, "operations": ops.clone(), "cascade": { "dependents_hash": none } })).await.json().await.unwrap();
+    assert_eq!(dry["would_succeed"], true, "{dry}");
+    let resp = t.changes(main, json!({ "operations": ops, "cascade": { "dependents_hash": none } })).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    assert!(scratch.yes("SELECT to_regclass('public.moods') IS NULL AND to_regtype('public.mood') IS NULL").await);
+    // [drop_enum, drop_column]: the enum's cascade drops the column; its own drop is skipped.
+    scratch.exec_in(&make(false)).await;
+    let ops = json!([drop_enum, { "drop_column": { "table": { "schema": "public", "name": "notes" }, "column": "m" } }]);
+    let resp = t.changes(main, json!({ "operations": ops, "cascade": { "dependents_hash": none } })).await;
+    assert_eq!(resp.status(), 200);
+    let real: Value = resp.json().await.unwrap();
+    assert_eq!((real["statements"][1]["executed"].as_bool(), real["statements"][1]["skipped"].as_str()), (Some(false), Some("already_dropped")), "{real}");
+    assert!(scratch.yes("SELECT NOT EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'public.notes'::regclass AND attname = 'm' AND NOT attisdropped)").await);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// --- Table API: rows (TE-A, T8) -----------------------------------------------------------
+
+impl Branching {
+    async fn table_post(&self, branch: BranchId, rest: &str, body: Value) -> reqwest::Response {
+        self.send(Method::POST, &format!("{}/tables/{rest}", self.branch(branch)), Some(body)).await
+    }
+}
+
+#[tokio::test]
+async fn row_routes_validate_before_any_compute() {
+    let t = sql_app().await;
+    let main = t.main();
+    assert_eq!(t.table_post(main, "public/notes/cell", json!({ "key": { "id": 1 } })).await.status(), 422);
+    assert_eq!(t.table_post(main, "public/notes/rows/default", json!({ "database": "nope" })).await.status(), 404);
+    assert_eq!(t.compute_lookups(), 0);
+    assert_eq!(code_of(&error_of(t.table_post(main, "public/notes/rows/default", json!({})).await, 503).await), "unavailable");
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn default_rows_and_full_cells_over_http() {
+    let (scratch, t) = changes_app("rows-pass").await;
+    let main = t.main();
+    scratch.exec_in(&format!(
+        "CREATE TABLE public.d (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, n int DEFAULT 7, at timestamptz DEFAULT now()); ALTER TABLE public.d OWNER TO {o}; \
+         CREATE TABLE public.strict (id int PRIMARY KEY, must text NOT NULL); ALTER TABLE public.strict OWNER TO {o}; \
+         CREATE TABLE public.nokey (v text); ALTER TABLE public.nokey OWNER TO {o}; \
+         INSERT INTO public.notes (body) VALUES (repeat('x', 100000));",
+        o = scratch.owner
+    ))
+    .await;
+    let resp = t.table_post(main, "public/d/rows/default", json!({})).await;
+    assert_eq!(resp.status(), 200);
+    let row: Value = resp.json().await.unwrap();
+    assert_eq!((row["row"]["id"].as_i64(), row["row"]["n"].as_i64()), (Some(1), Some(7)), "{row}");
+    assert!(row["row"]["at"].is_string());
+    let err = error_of(t.table_post(main, "public/strict/rows/default", json!({})).await, 400).await;
+    assert_eq!(code_of(&err), "constraint_violation");
+    let resp = t.table_post(main, "public/notes/cell", json!({ "key": { "id": 1 }, "column": "body" })).await;
+    assert_eq!(resp.status(), 200);
+    let cell: Value = resp.json().await.unwrap();
+    assert_eq!(cell["value"].as_str().map(str::len), Some(100_000));
+    assert_eq!(cell["data_type"], "text");
+    assert!(cell["bytes"].as_i64().unwrap() > 0);
+    let resp = t.table_post(main, "public/notes/cell", json!({ "key": { "id": "1" }, "column": "id" })).await;
+    assert_eq!(resp.json::<Value>().await.unwrap()["value"], "1");
+    for (rest, body, status, code) in [
+        ("public/notes/cell", json!({ "key": { "id": 99 }, "column": "body" }), 404, "not_found"),
+        ("public/notes/cell", json!({ "key": { "body": "x" }, "column": "body" }), 400, "invalid_request"),
+        ("public/notes/cell", json!({ "key": { "id": 1 }, "column": "nope" }), 400, "unknown_column"),
+        ("public/nokey/cell", json!({ "key": { "v": "x" }, "column": "v" }), 400, "invalid_request"),
+        ("public/ghost/cell", json!({ "key": { "id": 1 }, "column": "v" }), 404, "not_found"),
+        ("public/notes/cell", json!({ "key": { "id": [1] }, "column": "body" }), 400, "invalid_request"),
+    ] {
+        assert_eq!(code_of(&error_of(t.table_post(main, rest, body.clone()).await, status).await), code, "{rest} {body}");
+    }
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// --- T8 review, fix round ------------------------------------------------------------------
+
+// Important: the 64 MiB cap is on the value's text, so a compressible value stored small but
+// over the cap as text answers 413 without being fetched.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn a_compressible_cell_over_the_cap_is_too_large() {
+    let (scratch, t) = changes_app("cap-pass").await;
+    let main = t.main();
+    scratch.exec_in("INSERT INTO public.notes (body) VALUES (repeat('x', 70 * 1024 * 1024))").await;
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        t.table_post(main, "public/notes/cell", json!({ "key": { "id": 1 }, "column": "body" })),
+    )
+    .await
+    .expect("answered");
+    assert_eq!(code_of(&error_of(resp, 413).await), "too_large");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// Minor 4: the all-defaults insert, like the cell fetch, works on ordinary tables only.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn default_rows_only_go_into_ordinary_tables() {
+    let (scratch, t) = changes_app("kind-pass").await;
+    let main = t.main();
+    scratch
+        .exec_in(&format!(
+            "CREATE VIEW public.notes_v AS SELECT * FROM public.notes; ALTER VIEW public.notes_v OWNER TO {o}; \
+             CREATE TABLE public.p (id int DEFAULT 1) PARTITION BY RANGE (id); CREATE TABLE public.p1 PARTITION OF public.p FOR VALUES FROM (0) TO (10); \
+             ALTER TABLE public.p OWNER TO {o}; ALTER TABLE public.p1 OWNER TO {o};",
+            o = scratch.owner
+        ))
+        .await;
+    for rest in ["public/notes_v/rows/default", "public/p/rows/default"] {
+        assert_eq!(code_of(&error_of(t.table_post(main, rest, json!({})).await, 404).await), "not_found", "{rest}");
+    }
+    assert!(scratch.yes("SELECT NOT EXISTS (SELECT FROM public.notes) AND NOT EXISTS (SELECT FROM public.p)").await, "nothing inserted");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// --- End-of-step review, fix round ---------------------------------------------------------
+
+// Finding 4: a key is compared as given, never truncated or rounded to the column's typmod.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn cell_keys_are_not_truncated_by_the_column_type() {
+    let (scratch, t) = changes_app("key-pass").await;
+    let main = t.main();
+    scratch
+        .exec_in(&format!(
+            "CREATE TABLE public.codes (code varchar(5) PRIMARY KEY, v text); ALTER TABLE public.codes OWNER TO {o}; \
+             INSERT INTO public.codes VALUES ('abcde', 'five'); \
+             CREATE TABLE public.prices (p numeric(10,2) PRIMARY KEY, v text); ALTER TABLE public.prices OWNER TO {o}; \
+             INSERT INTO public.prices VALUES (1.25, 'one quarter');",
+            o = scratch.owner
+        ))
+        .await;
+    for (rest, key) in [("public/codes/cell", json!({ "code": "abcdefg" })), ("public/prices/cell", json!({ "p": 1.249 }))] {
+        let body = json!({ "key": key, "column": "v" });
+        assert_eq!(code_of(&error_of(t.table_post(main, rest, body.clone()).await, 404).await), "not_found", "{rest} {body}");
+    }
+    let resp = t.table_post(main, "public/codes/cell", json!({ "key": { "code": "abcde" }, "column": "v" })).await;
+    assert_eq!(resp.json::<Value>().await.unwrap()["value"], "five");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// Finding 5: the inserted row comes back as Postgres wrote it: numeric digits kept exactly.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn default_rows_keep_numeric_digits() {
+    let (scratch, t) = changes_app("num-pass").await;
+    let main = t.main();
+    scratch
+        .exec_in(&format!(
+            "CREATE TABLE public.nums (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, a numeric DEFAULT 1.10, \
+             b numeric DEFAULT 12345678901234567890123.000001); ALTER TABLE public.nums OWNER TO {};",
+            scratch.owner
+        ))
+        .await;
+    let resp = t.table_post(main, "public/nums/rows/default", json!({})).await;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("1.10"), "{text}");
+    assert!(text.contains("12345678901234567890123.000001"), "{text}");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// --- T10 (user rulings R10, R12): the table API's reads require CONNECT --------------------
+
+// R12: a member's reads are checked as Postgres checks their login: the member's own login
+// (`cb_m_*`, NOINHERIT, its roles granted WITH INHERIT FALSE) must hold CONNECT on the
+// database, through PUBLIC or a grant to it. A group's CONNECT doesn't reach it, as the SQL
+// editor's login would find. The tenant admin reads as the owner.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn table_reads_need_connect_for_the_members_login() {
+    let (scratch, t) = changes_app("conn-pass").await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    let group = format!("{}_grp", scratch.owner);
+    t.metadata.add_group_role(&ep, &group, &[]);
+    let vic = t.grant_member("vic", PlatformRole::Viewer, &[&group]);
+    let login = chelabase_types::role_name::member_role_name(vic);
+    scratch
+        .exec_in(&format!(
+            "CREATE ROLE {group} NOLOGIN; CREATE ROLE {login} LOGIN NOINHERIT; \
+             GRANT {group} TO {login} WITH INHERIT FALSE, SET TRUE; \
+             REVOKE CONNECT ON DATABASE {db} FROM PUBLIC; GRANT CONNECT ON DATABASE {db} TO {group};",
+            db = scratch.database
+        ))
+        .await;
+    let get = |sub: &'static str, rest: &'static str| {
+        let path = format!("{}/{rest}", t.branch(main));
+        let t = &t;
+        async move { t.send_as(sub, Method::GET, &path, None).await }
+    };
+    for rest in ["objects", "types", "tables/public/notes"] {
+        let err = error_of(get("vic", rest).await, 403).await;
+        assert_eq!(code_of(&err), "permission_denied", "{rest}");
+        assert_eq!(get("user-1", rest).await.status(), 200, "{rest}");
+    }
+    scratch.exec_in(&format!("GRANT CONNECT ON DATABASE {db} TO {login};", db = scratch.database)).await;
+    for rest in ["objects", "types", "tables/public/notes"] {
+        assert_eq!(get("vic", rest).await.status(), 200, "{rest}");
+    }
+    wait_no_editor_sessions(&scratch).await;
+    let admin = scratch.admin.clone();
+    scratch.drop().await;
+    use sqlx::Executor;
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {login}"))).await.unwrap();
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {group}"))).await.unwrap();
+}
+
+// R12: a member with no login on the branch yet (not reconciled, or no roles to act as) can't
+// connect, so their reads are refused even while PUBLIC holds CONNECT.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn table_reads_refuse_a_member_with_no_login_on_the_branch() {
+    let (scratch, t) = changes_app("conn-login").await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    let group = format!("{}_grp", scratch.owner);
+    t.metadata.add_group_role(&ep, &group, &[]);
+    let vic = t.grant_member("vic", PlatformRole::Viewer, &[&group]);
+    let login = chelabase_types::role_name::member_role_name(vic);
+    scratch.exec_in(&format!("CREATE ROLE {group} NOLOGIN;")).await;
+    for rest in ["objects", "types", "tables/public/notes"] {
+        let path = format!("{}/{rest}", t.branch(main));
+        let err = error_of(t.send_as("vic", Method::GET, &path, None).await, 403).await;
+        assert_eq!(code_of(&err), "permission_denied", "{rest}");
+    }
+    scratch
+        .exec_in(&format!("CREATE ROLE {login} LOGIN NOINHERIT; GRANT {group} TO {login} WITH INHERIT FALSE, SET TRUE;"))
+        .await;
+    for rest in ["objects", "types", "tables/public/notes"] {
+        let path = format!("{}/{rest}", t.branch(main));
+        assert_eq!(t.send_as("vic", Method::GET, &path, None).await.status(), 200, "{rest}");
+    }
+    wait_no_editor_sessions(&scratch).await;
+    let admin = scratch.admin.clone();
+    scratch.drop().await;
+    use sqlx::Executor;
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {login}"))).await.unwrap();
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {group}"))).await.unwrap();
 }

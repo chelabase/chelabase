@@ -24,6 +24,7 @@ pub mod delete;
 #[cfg(test)]
 mod fakes;
 pub mod member_roles;
+pub mod schema_guard;
 pub mod merge;
 pub mod names;
 pub mod point;

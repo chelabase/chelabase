@@ -2611,7 +2611,13 @@
           "signup_pending",
           "email_ambiguous",
           "email_in_use_elsewhere",
-          "invite_closed"
+          "invite_closed",
+          "permission_denied",
+          "dependents_changed",
+          "index_build_failed",
+          "lock_timeout",
+          "schema_change_failed",
+          "has_dependents"
         ]
       },
       "ErrorEnvelope": {

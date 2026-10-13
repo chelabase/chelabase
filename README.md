@@ -22,11 +22,13 @@ docs/                design specs, plans, roadmap and security notes
 
 ## Prerequisites
 
-- [proto](https://moonrepo.dev/docs/proto), which installs Rust, moon, node, pnpm and just from `.prototools`
+- [proto](https://moonrepo.dev/docs/proto), which installs Rust, moon, node, pnpm, just and sccache from `.prototools`
 - Docker (Compose runs the dependencies, and the worker starts each database's compute container)
 - cmake: `sudo apt-get install -y cmake`
 - clang and protoc: `sudo apt-get install -y clang protobuf-compiler`
 - psql (PostgreSQL client): `sudo apt-get install -y postgresql-client`
+- sccache as the Rust compiler wrapper: proto installs it, but the global registration and the `rustc-wrapper = "sccache"` line in `~/.cargo/config.toml` are one-time machine setup (see CONTRIBUTING.md, "Machine setup")
+- [cargo-nextest](https://nexte.st), the Rust test runner behind `just test`: `cargo install --locked cargo-nextest`
 
 ## Quickstart
 

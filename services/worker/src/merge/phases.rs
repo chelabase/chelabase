@@ -1047,7 +1047,7 @@ mod tests {
         let (build_at, _) = first(&w, "CREATE INDEX CONCURRENTLY");
         assert!(!runs(&w)[build_at].0.contains("lock_timeout"));
         let (setup_at, setup_opts) = first(&w, "CREATE SCHEMA IF NOT EXISTS chelabase_merge");
-        let (tx_at, tx_opts) = first(&w, "chelabase_guard");
+        let (tx_at, tx_opts) = first(&w, "$chelabase_guard$");
         // The guard's digest names `indisvalid` too: the check is the one naming the index.
         let (check_at, check_opts) = first(&w, "'ix_a'");
         let (online_at, online_opts) = first(&w, "CREATE INDEX CONCURRENTLY");
@@ -1183,7 +1183,7 @@ mod tests {
             index_step("o1", "ix_a"),
         ]);
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             "psql in compute ep exited with 3: psql:<stdin>:9: ERROR:  chelabase_merge_stale"
                 .into(),
         ));
@@ -1216,7 +1216,7 @@ mod tests {
             .unwrap()
             + 1;
         *w.computes.fail_sql_containing.lock().unwrap() = Some((
-            "chelabase_guard".into(),
+            "$chelabase_guard$".into(),
             format!(
                 "psql in compute ep exited with 3: psql:<stdin>:{line}: ERROR:  type \"nope\" does not exist"
             ),
@@ -1419,7 +1419,7 @@ mod tests {
             let (t, opts) = target(&w).await;
             let script = phase1_script(&plan, &opts, DIGEST);
             *w.computes.fail_sql_containing.lock().unwrap() =
-                Some(("chelabase_guard".into(), psql_error(line_of(&script, at), text)));
+                Some(("$chelabase_guard$".into(), psql_error(line_of(&script, at), text)));
             let failure = w
                 .run_phases(&t, &plan, &opts, DIGEST, RunMode::Rehearsal)
                 .await
@@ -1431,7 +1431,7 @@ mod tests {
         let (w, _journal) = worker();
         let (t, opts) = target(&w).await;
         *w.computes.fail_sql_containing.lock().unwrap() =
-            Some(("chelabase_guard".into(), format!("connection reset: {STALE_ERROR}")));
+            Some(("$chelabase_guard$".into(), format!("connection reset: {STALE_ERROR}")));
         let failure = w
             .run_phases(&t, &plan, &opts, DIGEST, RunMode::Rehearsal)
             .await
@@ -1483,7 +1483,7 @@ mod tests {
             .unwrap_err();
         assert_eq!((failure.kind, failure.phase, failure.step), (FailureKind::Failed, Phase::Tx, None));
         assert!(failure.error.contains("setting up the merge marker"), "{}", failure.error);
-        assert_eq!(ran(&w, "chelabase_guard"), 0);
+        assert_eq!(ran(&w, "$chelabase_guard$"), 0);
     }
 
     // T14 M12 (test gap): a validated constraint and a NOT NULL already set are done.

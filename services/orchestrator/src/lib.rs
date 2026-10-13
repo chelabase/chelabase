@@ -51,6 +51,8 @@ mod openapi;
 pub mod projects;
 mod roles;
 pub mod sql_editor;
+mod table_api;
+pub use table_api::{DEFAULT_DRY_RUN_MAX_BYTES as DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES, dry_run_max_bytes as table_api_dry_run_max_bytes};
 pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, RestReply};
 pub use openapi::openapi;
 use access::{authorize, authorize_database, Target};
@@ -1501,6 +1503,9 @@ pub struct AppState<M, J> {
     pub users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
     /// Studio's SQL editor: runs in flight and the data-role grant cache.
     pub sql_editor: sql_editor::SqlEditor,
+    /// `CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES`: a table API dry run doesn't run a statement that
+    /// may rewrite a table larger than this ([`table_api_dry_run_max_bytes`]).
+    pub table_api_dry_run_max_bytes: i64,
     /// `CHELABASE_STUDIO_URL` (no trailing `/`): invite links go to its `/accept-invite`.
     pub studio_url: String,
 }
@@ -2214,6 +2219,7 @@ where
         .merge(data_api_databases::routes())
         .merge(console::routes())
         .merge(sql_editor::routes())
+        .merge(table_api::routes())
         .merge(roles::routes())
         .merge(projects::routes())
         .merge(app_users::routes())

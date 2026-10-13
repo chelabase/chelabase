@@ -3,6 +3,10 @@ moon = "2.5.5"
 node = "24.21.0"
 pnpm = "12.6.0"
 just = "1.45.0"
+sccache = "0.18.0"
 
 [tools.just]
 plugin = "github://muuvmuuv/proto-plugins/just_tool"
+
+[tools.sccache]
+plugin = "https://raw.githubusercontent.com/appthrust/proto-toml-plugins/main/sccache/plugin.toml"

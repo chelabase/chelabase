@@ -1,0 +1,82 @@
+---
+title: "Table API"
+description: "How the table API works: one renderer shared with schema merges, scoped catalog reads, the session, the order of a change, the cascade check and the DDL guard."
+---
+
+The table API reads a branch's schema and changes it with structured operations. It backs Studio's table editor. For how to call it, see the [Table API guide](/docs/using/table-api).
+
+The routes are in `services/orchestrator/src/table_api/` (`read.rs`, `changes.rs`, `rows.rs`); the renderer is `chelabase_schema::ddl`; the request and response types are `chelabase_types::table_api`; the guard is `services/worker/src/schema_guard.rs`.
+
+## One renderer
+
+An operation (`create_table`, `alter_column`, `grant`, …) is a typed value, not SQL text. `chelabase_schema::ddl::render` turns a list of them into statements, each with the operation it came from, the lock it takes, whether it may rewrite its table and whether it is `CONCURRENTLY`. It is pure: what it needs to know about existing tables comes in through a `RenderContext` (the tables' models and sizes, and whether the request cascades).
+
+The renderer shares code with the [schema merge](/docs/architecture/schema-merge): column definitions, policies, grants and comments go through the merge planner's own renderers, so a merge and the table editor produce the same SQL for the same object. Grants render one statement per privilege and per column, as the merge does.
+
+- Names (tables, columns, constraints, roles, types, collations) are quoted by `sql::ident`. Data types are structured (`schema`, `name`, `modifiers`, `array`) and rendered fully qualified.
+- Expressions (defaults, checks, `USING`, predicates, policy clauses) are the caller's SQL, used as given, and run as the acting role. Each must be exactly one expression (`InvalidExpression` otherwise): it scans with no comment, no `;`, no top-level comma and brackets that never close one opened outside it, and `SELECT (<expr>)` parses as one plain `SELECT` with one target, so it can't add clauses to the statement around it. The statements go through the extended protocol, one statement per call, so a value that holds a `;` can't add a second one.
+- The renderer knows the catalog as it was **before** the request. A drop whose target an earlier operation of the same request created, renamed, moved, retyped or dropped is refused (`ChangedEarlier`), and a type change on a column an earlier operation changed counts as rewriting.
+- A `CONCURRENTLY` operation must be alone in its request.
+
+## Catalog reads
+
+`GET /objects`, `/tables/{schema}/{table}` and `/types` run `chelabase-schema`'s scoped catalog queries on the database owner's pooled connection, with a 15 s `statement_timeout`. They need only Viewer on the project: they read the catalog, never row data. The queries read `pg_catalog`, plus `chelabase.app_users_table` when the owner may read it, hide system schemas and Chelabase's own objects (including the guard's schema), and return the same model the schema merge compares, so a table's structure is exactly what a merge would see. Only ordinary tables have that model: anything else is 404 on the structure route, and the object list's `editable` says why.
+
+## The session
+
+Routes that run as a caller (`schema-changes`, `rows/default`, `cell`) open the SQL editor's session:
+
+- No `role`, or the owner by name: the owner's connection. Admin only.
+- Any other role: a login as the caller's own member role on that branch, then `SET ROLE`. The member role can only become the roles it was granted, so a `RESET ROLE` lands on the member role, never on the owner. Postgres itself decides what the role may do.
+- An Admin acting as a role the member role can't hold (a login role, an owner-level role) gets the owner's connection and `SET ROLE`.
+
+After an act-as request the connection is closed and the worker is asked to hand over what the member role owns from that run (the member-role invariant); the response doesn't wait for it. The access decision is `Access::ActAsBranch { unprotected: Developer, protected: Admin }` for schema changes: the minimum level depends on the branch's protection, and the requested role must be in the caller's effective set.
+
+## The order of a change
+
+1. Everything that needs no compute: the body parses, `operations` is not empty, `lock_timeout_ms` is in range, `role` is valid, a `cascade` hash is well-formed, the operations render, a concurrent index has a name.
+2. Access.
+3. The session opens. `lock_timeout` and `statement_timeout` are set, then the context is read: each table the request names is read through the scoped catalog (with its `pg_total_relation_size`). A table the catalog doesn't have, and no earlier operation creates, is 404. The operations are rendered again with that context.
+4. A `CONCURRENTLY` operation takes step 5. Otherwise one transaction: `BEGIN`, `SET LOCAL lock_timeout`, `statement_timeout` and `client_min_messages = notice`, `SET LOCAL ROLE` if acting as a role. Then `LOCK TABLE` on every table the request drops from, which closes the window in which a dependent could appear on it. Then the dependents of the drops are read and checked (below). Then the statements run in order, each with its notices.
+5. A single `CONCURRENTLY` index operation runs outside a transaction, with the same limits set per session and a 900 s `statement_timeout`. A `CREATE INDEX CONCURRENTLY` whose name was free before it ran, and that failed while building (classes 22, 23 except the name taken, 53, 54, 58 and XX, or 40P01 and 57014), left an INVALID index of its own on its table; a separate owner connection drops it (`DROP INDEX CONCURRENTLY IF EXISTS`) and the answer is `index_build_failed`. A failure before the catalog entry exists (a lock timeout, 55P03; the name taken, 42P07; a missing column or permission, 42xxx) drops nothing: an INVALID index of that name is then another session's.
+6. A dry run `ROLLBACK`s; a real run `COMMIT`s. Any error rolls back and answers the typed error, classified by SQLSTATE and the guard's hint (`chelabase_types::table_api::classify_failure`).
+
+The dry run uses `ddl::dry_run_plan`, a pure function: a `CONCURRENTLY` statement, a rewriting statement on a table over the size threshold and everything after the first such statement are skipped.
+
+Each request writes one audit line on `orchestrator::table_api::audit` with counts and outcome, never SQL or values.
+
+## The cascade check
+
+The dependents query reads the objects that depend on each drop target (`pg_depend` normal dependencies, each with `pg_describe_object`'s text) and hashes the list. Without a confirmed cascade a drop with dependents is 409 `has_dependents`. With one:
+
+1. After locking the tables, the dependents are read again; a different hash is `dependents_changed`.
+2. Before each cascading drop, its own target's dependents are read. The statement runs with `client_min_messages = notice`.
+3. The drop's `drop cascades to …` notices are parsed (`cascaded_objects`). Postgres prints one object in the message, several as `N other objects` with one line each in the detail, and at most 100 lines. The list must be readable and complete and must equal the target's dependents just read, each confirmed or a part of another drop target of the request.
+4. When all drops are done, everything reported, less the request's own targets' parts, must equal the confirmed set exactly.
+
+Any mismatch rolls the transaction back with `dependents_changed`. Postgres doesn't lock objects that depend on a table, so the notices are what close the window between the check and the drop. A change to the wording of Postgres's notice would refuse cascades until the parser follows it, rather than allow one unchecked.
+
+## The DDL guard
+
+On a protected branch, a Developer can't call the schema-change route, but could run DDL through the SQL editor or a login role. The guard refuses it inside Postgres.
+
+- **Marker role.** `chelabase_schema_locked` is a `NOLOGIN` role. On a protected branch the member-roles reconciler grants it to the member role of every member who isn't an Admin (`WITH INHERIT FALSE, SET FALSE, ADMIN FALSE`, so it gives no privilege and can't be left by `SET ROLE`), before any other grant of that member's roles. Unprotecting revokes it.
+- **Event triggers.** Two `ENABLE ALWAYS` event triggers in every Postgres database of the branch: `chelabase_schema_guard_ddl` on `ddl_command_end` and `chelabase_schema_guard_drop` on `sql_drop`. They test `session_user`, not the current role, so `SET ROLE` doesn't escape them, and `session_replication_role = replica` doesn't skip them. Superusers and sessions without the marker return at once. A command is refused (`42501`, hint `chelabase:branch_protected`) when any object it touched is outside a `pg_temp*` schema, or a temporary relation it touched inherits from a permanent one. A command that touched nothing is refused unless it is a `DROP` other than `DROP OWNED`. `REFRESH MATERIALIZED VIEW` and `REINDEX` pass. Using `ddl_command_end` and `sql_drop` rather than a start trigger is what lets temporary objects stay allowed.
+- **Functions.** `chelabase_guard.refuse_ddl()` and `refuse_drop()`, owned by a superuser in a schema nobody else has rights on. That schema is excluded from schema merges and reserved from the data API. They pin `search_path` and schema-qualify every catalog function and operator.
+- **Reconciler.** The member-roles reconciler checks the guard in every database of a protected branch (`catalog.databases`) on each run and installs it where the check doesn't pass. The periodic sweep reconciles every branch, so a database made later has it within a sweep. Protecting or unprotecting a branch enqueues a reconcile. The install script is one transaction and safe to repeat: it drops the triggers and functions and makes them again, takes back an existing schema, and drops a schema holding anything else (so nothing planted can block or shadow the guard).
+- **The check that reinstalls a stale guard.** The functions carry a comment with a stamp of the script's text, and the check compares their bodies as well as the stamp, because a `CREATE OR REPLACE` keeps the comment. It also verifies owners, grants, `search_path`, no `SECURITY DEFINER`, and that exactly two event triggers point at them, enabled always and unfiltered. A worker built from an older commit therefore can't leave an old guard in place.
+
+### What isn't covered yet
+
+`REASSIGN OWNED` fires no event trigger, so a Developer holding two roles where one inherits the other can still move ownership on a protected branch. Making it fire the DDL event triggers, as `DROP OWNED` does, is scheduled for the next Postgres fork round.
+
+The guard also can't tell a trigger or SECURITY DEFINER function planted while the branch was unprotected from the DDL of whoever later fires it. No in-database scheduler can run DDL as another session today (pg_cron and the like need `shared_preload_libraries`, which is `neon` only); if a preload is ever added, the guard must cover it.
+
+## Dependencies
+
+- The table API doesn't parse caller SQL: expressions reach Postgres as given, and Postgres is the only parser.
+- The session reuses the SQL editor's forked `tokio-postgres` (`chelabase/rust-postgres`) for connection status and notices.
+
+## Tests
+
+Pure tests cover the renderer (including a property test over hostile names), the dry-run plan, the cascade matching (exhaustively over a small universe) and the guard's text. `just live` recipes run the catalog, orchestrator and `member_roles_live` suites against a running stack.

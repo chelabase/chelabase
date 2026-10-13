@@ -201,6 +201,10 @@ pub fn config_response(inputs: &SpecInputs<'_>) -> Value {
         setting("synchronous_standby_names", "walproposer", "string"),
         setting("password_encryption", "scram-sha-256", "enum"),
         setting("createrole_self_grant", "set, inherit", "string"),
+        // Server messages in English, whatever the image's locale: the table API's cascade
+        // check (R4) reads Postgres's `drop cascades to …` notices by their English text.
+        // `lc_messages` is superuser-only, so no role of the branch can change it.
+        setting("lc_messages", "C", "string"),
     ];
 
     if let Some(ref console_url) = inputs.console_url {
@@ -292,6 +296,8 @@ mod tests {
             Some("walproposer")
         );
         assert_eq!(get("password_encryption").as_deref(), Some("scram-sha-256"));
+        // TE-A R4: the cascade check reads Postgres's English `drop cascades to` notices.
+        assert_eq!(get("lc_messages").as_deref(), Some("C"));
     }
 
     struct FakePlacement {

@@ -568,12 +568,14 @@ fn proxy_http_port() -> u16 {
     env_port("CHELABASE_PROXY_HTTP_PORT", 4444)
 }
 
-fn internal_port() -> u16 {
-    addr_port("CHELABASE_INTERNAL_ADDR", 8083)
+/// Where the orchestrator's internal listener binds: `CHELABASE_INTERNAL_ADDR` (the docker
+/// bridge on native Linux, which `just` derives; see scripts/internal-addr.sh), else loopback.
+fn internal_addr() -> String {
+    std::env::var("CHELABASE_INTERNAL_ADDR").unwrap_or_else(|_| format!("127.0.0.1:{}", addr_port("CHELABASE_INTERNAL_ADDR", 8083)))
 }
 
-fn orchestrator_port() -> u16 {
-    addr_port("CHELABASE_ORCHESTRATOR_ADDR", 8081)
+fn orchestrator_addr() -> String {
+    format!("127.0.0.1:{}", addr_port("CHELABASE_ORCHESTRATOR_ADDR", 8081))
 }
 
 /// The built `chelabase` CLI, next to this test's own binary's directory.
@@ -684,8 +686,8 @@ fn pids_file() -> std::path::PathBuf {
     dev_dir().join("pids")
 }
 
-async fn port_open(port: u16) -> bool {
-    tokio::net::TcpStream::connect(("127.0.0.1", port))
+async fn port_open(addr: String) -> bool {
+    tokio::net::TcpStream::connect(addr)
         .await
         .is_ok()
 }
@@ -712,7 +714,7 @@ async fn stop_orchestrator() {
     assert!(found, "no orchestrator in {}", path.display());
     std::fs::write(&path, kept.join("\n") + "\n").unwrap();
     for _ in 0..100 {
-        if !port_open(internal_port()).await && !port_open(orchestrator_port()).await {
+        if !port_open(internal_addr()).await && !port_open(orchestrator_addr()).await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -765,7 +767,7 @@ async fn start_orchestrator(env: &[(&str, &str)]) {
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     std::fs::write(&path, format!("{pid}\n{old}")).unwrap();
     for _ in 0..600 {
-        if port_open(internal_port()).await && port_open(orchestrator_port()).await {
+        if port_open(internal_addr()).await && port_open(orchestrator_addr()).await {
             println!("orchestrator up with {env:?}");
             return;
         }

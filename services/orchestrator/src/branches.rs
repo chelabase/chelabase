@@ -1130,6 +1130,11 @@ where
                 protected = request.protected,
                 "branch protection changed"
             );
+            // The DDL guard follows protection: the member-role reconciler locks (or unlocks)
+            // the branch's non-Admin member roles and installs the guard.
+            if let Err(err) = state.js.enqueue_member_roles(branch.id).await {
+                warn!(branch_id = %branch.id, "member roles: enqueue failed; the sweep will reconcile it: {err}");
+            }
             Json(branch_view(&state, updated).await).into_response()
         }
         // The branch started deleting between the load and the update.

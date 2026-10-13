@@ -913,3 +913,92 @@ async fn create_everything_round_trip() {
     );
     assert_eq!(rebuilt.tables.len(), source.tables.len());
 }
+
+/// Runs `sql` (one JSON row) on `s`'s connection as `role` (a non-superuser), then resets.
+async fn read_as(s: &Scratch, role: &str, sql: &str) -> String {
+    s.sql(&format!("SET ROLE \"{role}\"")).await;
+    let rows = s.client.simple_query(sql).await.unwrap();
+    s.sql("RESET ROLE").await;
+    rows.into_iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+            _ => None,
+        })
+        .expect("one row")
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn one_table_reads_as_the_whole_catalog_does() {
+    let mut s = Scratch::new().await;
+    s.fixture().await;
+    let owner = s.role("owner");
+    s.sql(&format!("CREATE ROLE \"{owner}\" NOLOGIN; GRANT CREATE, USAGE ON SCHEMA public TO \"{owner}\"")).await;
+    let whole = s.model().await;
+    for t in &whole.tables {
+        let json = read_as(&s, &owner, &chelabase_schema::catalog::table_sql(&t.schema, &t.name)).await;
+        let one = chelabase_schema::catalog::parse_table(&json).unwrap().unwrap_or_else(|| panic!("{}.{} missing", t.schema, t.name));
+        assert_eq!(&one, t, "{}.{}", t.schema, t.name);
+    }
+    let json = read_as(&s, &owner, &chelabase_schema::catalog::table_sql("public", "no_such_table")).await;
+    assert_eq!(chelabase_schema::catalog::parse_table(&json).unwrap(), None);
+    s.sql(&format!("DROP OWNED BY \"{owner}\"")).await;
+    s.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn objects_and_types_list_what_the_editor_needs() {
+    use chelabase_types::table_api::{ObjectKind, TypeKind};
+    let s = Scratch::new().await;
+    let owner = s.role("owner");
+    s.sql(&format!(
+        "CREATE ROLE \"{owner}\" NOLOGIN; GRANT CREATE, USAGE ON SCHEMA public TO \"{owner}\"; \
+         DO $$ BEGIN CREATE ROLE anon NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+         CREATE TYPE public.mood AS ENUM ('sad', 'ok'); \
+         CREATE TABLE public.notes (id int PRIMARY KEY, m public.mood); ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY; \
+         GRANT SELECT ON public.notes TO anon; GRANT USAGE ON SCHEMA public TO anon; \
+         CREATE VIEW public.v AS SELECT id FROM public.notes; \
+         CREATE MATERIALIZED VIEW public.mv AS SELECT 1 AS x; \
+         CREATE TABLE public.p (id int) PARTITION BY RANGE (id); CREATE TABLE public.p1 PARTITION OF public.p FOR VALUES FROM (0) TO (10); \
+         CREATE DOMAIN public.posint AS int CHECK (VALUE > 0);"
+    ))
+    .await;
+    let objects = chelabase_schema::catalog::parse_objects(&read_as(&s, &owner, &chelabase_schema::catalog::objects_sql()).await).unwrap();
+    let find = |n: &str| objects.iter().find(|o| o.schema == "public" && o.name == n).unwrap_or_else(|| panic!("{n}: {objects:?}"));
+    assert_eq!((find("notes").kind, find("notes").editable, find("notes").rls_enabled, find("notes").data_api_exposed), (ObjectKind::Table, true, true, true));
+    assert_eq!((find("v").kind, find("v").editable), (ObjectKind::View, false));
+    assert_eq!(find("mv").kind, ObjectKind::MaterializedView);
+    assert_eq!((find("p").kind, find("p").editable), (ObjectKind::PartitionedTable, false));
+    assert!(objects.iter().all(|o| o.name != "p1"), "partition children are not listed");
+    assert!(objects.iter().all(|o| !o.schema.starts_with("chelabase") && o.schema != "pg_catalog"));
+    let types = chelabase_schema::catalog::parse_types(&read_as(&s, &owner, &chelabase_schema::catalog::types_sql()).await).unwrap();
+    let ty = |sch: &str, n: &str| types.iter().find(|t| t.schema == sch && t.name == n).unwrap_or_else(|| panic!("{sch}.{n}"));
+    assert_eq!((ty("pg_catalog", "int8").kind, ty("pg_catalog", "int8").array_oid), (TypeKind::Base, Some(1016)));
+    assert!(ty("pg_catalog", "varchar").takes_modifiers);
+    assert_eq!((ty("public", "mood").kind, ty("public", "mood").labels.clone()), (TypeKind::Enum, vec!["sad".to_string(), "ok".to_string()]));
+    assert_eq!((ty("public", "posint").kind, ty("public", "posint").base_type_oid), (TypeKind::Domain, Some(23)));
+    assert!(types.iter().all(|t| t.name != "_int8" && t.name != "notes" && t.name != "record" && t.schema != "information_schema"));
+    // `anon` is cluster-wide and may be shared with other runs: it stays.
+    s.sql(&format!("DROP OWNED BY \"{owner}\"")).await;
+    s.finish().await;
+}
+
+// T4 review, minor 1: a shell type (`CREATE TYPE x;`, not yet defined) can't be a column's
+// type, so the catalog never lists it.
+#[tokio::test]
+#[ignore = "needs the metadata Postgres (just deps-up)"]
+async fn shell_types_are_not_listed() {
+    let s = Scratch::new().await;
+    let owner = s.role("owner");
+    s.sql(&format!(
+        "CREATE ROLE \"{owner}\" NOLOGIN; GRANT CREATE, USAGE ON SCHEMA public TO \"{owner}\"; \
+         CREATE TYPE public.not_yet; CREATE TYPE public.mood AS ENUM ('ok');"
+    ))
+    .await;
+    let types = chelabase_schema::catalog::parse_types(&read_as(&s, &owner, &chelabase_schema::catalog::types_sql()).await).unwrap();
+    assert!(types.iter().all(|t| t.name != "not_yet"), "{types:?}");
+    assert!(types.iter().any(|t| t.schema == "public" && t.name == "mood"));
+    s.sql(&format!("DROP OWNED BY \"{owner}\"")).await;
+    s.finish().await;
+}

@@ -761,6 +761,55 @@ pub mod orchestrator {
     pub const UPDATE_TENANT: Endpoint =
         key_endpoint("orchestrator.update_tenant", Method::Patch, "/v1/tenant", Access::TenantAdmin);
 
+    /// The database's tables, views and other relations (kind, size, whether the table API edits
+    /// them).
+    pub const LIST_OBJECTS: Endpoint = key_endpoint(
+        "orchestrator.list_objects",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/objects",
+        Access::Project(Viewer),
+    );
+
+    /// One ordinary table's structure.
+    pub const GET_TABLE: Endpoint = key_endpoint(
+        "orchestrator.get_table",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}",
+        Access::Project(Viewer),
+    );
+
+    /// The database's types (for a column type picker).
+    pub const LIST_TYPES: Endpoint = key_endpoint(
+        "orchestrator.list_types",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/types",
+        Access::Project(Viewer),
+    );
+
+    /// DDL and enum changes through the table API (dry run or real).
+    pub const APPLY_SCHEMA_CHANGES: Endpoint = key_endpoint(
+        "orchestrator.apply_schema_changes",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/schema-changes",
+        Access::ActAsBranch { unprotected: Developer, protected: Admin },
+    );
+
+    /// A row of all defaults (`INSERT … DEFAULT VALUES`) in one table.
+    pub const INSERT_DEFAULT_ROW: Endpoint = key_endpoint(
+        "orchestrator.insert_default_row",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}/rows/default",
+        Access::ActAs(Developer),
+    );
+
+    /// One cell's full value, found by the table's primary key.
+    pub const GET_CELL: Endpoint = key_endpoint(
+        "orchestrator.get_cell",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}/cell",
+        Access::ActAs(Viewer),
+    );
+
     /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
         Endpoint {
@@ -999,6 +1048,12 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::UPDATE_INSTANCE_SETTINGS,
     orchestrator::GET_INVITE_DELIVERY,
     orchestrator::UPDATE_TENANT,
+    orchestrator::LIST_OBJECTS,
+    orchestrator::GET_TABLE,
+    orchestrator::LIST_TYPES,
+    orchestrator::APPLY_SCHEMA_CHANGES,
+    orchestrator::INSERT_DEFAULT_ROW,
+    orchestrator::GET_CELL,
     rest::QUERY,
     rest::SCHEMA,
     auth::AUTH_REQUEST,
@@ -1611,6 +1666,13 @@ mod tests {
             ("orchestrator.run_sql", Access::ActAs(Developer)),
             ("orchestrator.get_sql_schema", Access::ActAs(Developer)),
             ("orchestrator.cancel_sql_run", Access::Project(Developer)),
+            // Table API (TE-A).
+            ("orchestrator.list_objects", Access::Project(Viewer)),
+            ("orchestrator.get_table", Access::Project(Viewer)),
+            ("orchestrator.list_types", Access::Project(Viewer)),
+            ("orchestrator.apply_schema_changes", Access::ActAsBranch { unprotected: Developer, protected: Admin }),
+            ("orchestrator.insert_default_row", Access::ActAs(Developer)),
+            ("orchestrator.get_cell", Access::ActAs(Viewer)),
             // Saved queries (edit, delete: the author or Admin, refined in the handler).
             ("orchestrator.list_saved_queries", Access::Project(Developer)),
             ("orchestrator.get_saved_query", Access::Project(Developer)),

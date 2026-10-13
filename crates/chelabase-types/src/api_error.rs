@@ -119,11 +119,23 @@ pub enum ErrorCode {
     EmailInUseElsewhere,
     /// The invite was revoked, accepted or replaced since.
     InviteClosed,
+    /// Postgres refused the statement for the role you act as (SQLSTATE 42501).
+    PermissionDenied,
+    /// The objects a cascade would drop changed since the dry run.
+    DependentsChanged,
+    /// A concurrent index build failed; its invalid index was dropped.
+    IndexBuildFailed,
+    /// A lock the change needs was held past `lock_timeout_ms`.
+    LockTimeout,
+    /// Postgres refused a schema change.
+    SchemaChangeFailed,
+    /// A drop has dependents and the request doesn't confirm a cascade.
+    HasDependents,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 89] = [
+    pub const ALL: [ErrorCode; 95] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantNotBound,
@@ -213,6 +225,12 @@ impl ErrorCode {
         Self::EmailAmbiguous,
         Self::EmailInUseElsewhere,
         Self::InviteClosed,
+        Self::PermissionDenied,
+        Self::DependentsChanged,
+        Self::IndexBuildFailed,
+        Self::LockTimeout,
+        Self::SchemaChangeFailed,
+        Self::HasDependents,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -306,6 +324,12 @@ impl ErrorCode {
             Self::EmailAmbiguous => "email_ambiguous",
             Self::EmailInUseElsewhere => "email_in_use_elsewhere",
             Self::InviteClosed => "invite_closed",
+            Self::PermissionDenied => "permission_denied",
+            Self::DependentsChanged => "dependents_changed",
+            Self::IndexBuildFailed => "index_build_failed",
+            Self::LockTimeout => "lock_timeout",
+            Self::SchemaChangeFailed => "schema_change_failed",
+            Self::HasDependents => "has_dependents",
         }
     }
 }
@@ -408,7 +432,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 89] = [
+    const ALL: [(ErrorCode, &str); 95] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -498,6 +522,12 @@ mod tests {
         (ErrorCode::EmailAmbiguous, "email_ambiguous"),
         (ErrorCode::EmailInUseElsewhere, "email_in_use_elsewhere"),
         (ErrorCode::InviteClosed, "invite_closed"),
+        (ErrorCode::PermissionDenied, "permission_denied"),
+        (ErrorCode::DependentsChanged, "dependents_changed"),
+        (ErrorCode::IndexBuildFailed, "index_build_failed"),
+        (ErrorCode::LockTimeout, "lock_timeout"),
+        (ErrorCode::SchemaChangeFailed, "schema_change_failed"),
+        (ErrorCode::HasDependents, "has_dependents"),
     ];
 
     #[test]

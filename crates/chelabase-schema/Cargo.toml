@@ -19,8 +19,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# The table API's OpenAPI schemas for the model's `Table` (the `openapi` feature).
+utoipa = { workspace = true, optional = true }
 # A plan's merge id (the phase 1 recovery marker).
 uuid = { workspace = true }
+
+[features]
+openapi = ["dep:utoipa", "chelabase-types/openapi"]
 
 [dev-dependencies]
 # Live catalog tests' scratch database names.
@@ -28,3 +33,5 @@ getrandom = { workspace = true }
 tokio = { workspace = true }
 # Live catalog tests' own admin sessions.
 tokio-postgres = { workspace = true }
+# The renderer's hostile-name property tests.
+proptest = { workspace = true }

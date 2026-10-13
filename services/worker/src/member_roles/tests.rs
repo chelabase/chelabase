@@ -23,6 +23,7 @@ fn desired(role_name: &str, roles: &[&str], rotate: bool) -> DesiredMemberRole {
         roles: set(roles),
         verifier: format!("SCRAM-{role_name}"),
         rotate,
+        locked: false,
     }
 }
 
@@ -612,6 +613,11 @@ proptest! {
                     state.remove(role);
                 }
                 MemberRoleStep::SetPassword { .. } | MemberRoleStep::Reshape { .. } => {}
+                // T7: the marker (never planned here: nothing is locked).
+                MemberRoleStep::Lock { role } => state.get_mut(role).unwrap().push(marker(None)),
+                MemberRoleStep::Unlock { role } => {
+                    state.get_mut(role).unwrap().retain(|m| !(m.role == "chelabase_schema_locked" && m.grantor.is_none()));
+                }
             }
         }
         // The included granted roles, computed apart from `safe_roles`.
@@ -1735,4 +1741,304 @@ async fn the_sweep_reconciles_every_branch_with_members() {
     let mut expected = vec![branch.as_uuid(), child.as_uuid()];
     expected.sort();
     assert_eq!(branches, expected);
+}
+
+fn locked(role_name: &str, roles: &[&str]) -> DesiredMemberRole {
+    DesiredMemberRole { locked: true, ..desired(role_name, roles, false) }
+}
+
+#[test]
+fn a_locked_member_role_gets_the_marker_and_keeps_it() {
+    use MemberRoleStep::*;
+    let have = vec![actual("cb_m_a", vec![ours("billing")])];
+    assert_eq!(plan_member_roles(&[locked("cb_m_a", &["billing"])], &have), vec![Lock { role: "cb_m_a".into() }]);
+    let marked = vec![actual("cb_m_a", vec![ours("billing"), ours("chelabase_schema_locked")])];
+    assert_eq!(plan_member_roles(&[locked("cb_m_a", &["billing"])], &marked), vec![]);
+    assert_eq!(plan_member_roles(&[desired("cb_m_a", &["billing"], false)], &marked), vec![Unlock { role: "cb_m_a".into() }]);
+    // A new locked role: created, granted, then marked.
+    let steps = plan_member_roles(&[locked("cb_m_b", &["billing"])], &[]);
+    assert!(matches!(steps.first(), Some(Create { .. })), "{steps:?}");
+    // T7 review, finding 3: the marker comes straight after Create.
+    assert_eq!(steps.get(1), Some(&Lock { role: "cb_m_b".into() }), "{steps:?}");
+    // The marker is never granted through the normal path.
+    assert!(!steps.iter().any(|s| matches!(s, Grant { granted, .. } if granted == "chelabase_schema_locked")));
+}
+
+#[test]
+fn lock_and_unlock_render() {
+    let lock = render_step(&MemberRoleStep::Lock { role: "cb_m_a".into() });
+    assert!(lock.contains("CREATE ROLE chelabase_schema_locked NOLOGIN"), "{lock}");
+    assert!(lock.ends_with("GRANT chelabase_schema_locked TO cb_m_a WITH INHERIT FALSE, SET FALSE, ADMIN FALSE;"), "{lock}");
+    assert_eq!(render_step(&MemberRoleStep::Unlock { role: "cb_m_a".into() }).lines().next(), Some("REVOKE chelabase_schema_locked FROM cb_m_a;"));
+}
+
+#[tokio::test]
+async fn a_protected_branch_locks_developers_and_guards_every_database() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    let answer = Cat { roles: &["!postgres", "billing"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres"), ("analytics", "postgres")] }.answer();
+    w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+    assert!(done(&w.reconcile_member_roles(branch, None).await));
+    let all = all_scripts(&w);
+    let guarded: Vec<&str> = all.iter().filter(|(_, s)| s.contains("chelabase_schema_guard_ddl")).map(|(db, _)| db.as_str()).collect();
+    assert_eq!(guarded, ["analytics", "app"], "every database, in the catalog's order");
+    let role = member_role_name(member);
+    assert!(texts(&w).iter().any(|s| s.contains(&format!("GRANT chelabase_schema_locked TO {role}"))), "{:?}", texts(&w));
+}
+
+#[tokio::test]
+async fn an_unprotected_branch_runs_no_guard() {
+    let (w, _journal) = worker();
+    let (branch, ep, _member) = setup(&w, &["billing"]).await;
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
+    assert!(done(&w.reconcile_member_roles(branch, None).await));
+    assert!(all_scripts(&w).iter().all(|(_, s)| !s.contains("chelabase_schema_guard") && !s.contains("chelabase_schema_locked")));
+}
+
+// --- T7, the implementer's own -----------------------------------------------------------
+
+/// The marker membership as the catalog shows it (`SET FALSE`: never shaped).
+fn marker(grantor: Option<&str>) -> ActualMembership {
+    ActualMembership {
+        role: "chelabase_schema_locked".into(),
+        grantor: grantor.map(str::to_string),
+        shaped: false,
+    }
+}
+
+#[test]
+fn the_marker_is_never_a_usable_role() {
+    let catalog = parse_member_catalog(
+        &Cat {
+            roles: &["!postgres", "billing", "chelabase_schema_locked"],
+            memberships: &[],
+            edges: &[],
+            passwords: &[],
+            databases: &[("app", "postgres")],
+        }
+        .answer(),
+    )
+    .unwrap();
+    let marker_set = set(&["chelabase_schema_locked", "billing"]);
+    assert_eq!(safe_roles(&marker_set, &catalog), set(&["billing"]));
+    let all = Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All };
+    assert!(!granted_roles(&all, &catalog).0.contains("chelabase_schema_locked"));
+    // A grant naming it skips it as unsafe-or-reserved, never grants it.
+    let named = Grant {
+        platform_role: PlatformRole::Developer,
+        roles: RoleSet::Only([PgRole::Named("chelabase_schema_locked".into())].into_iter().collect()),
+    };
+    assert!(granted_roles(&named, &catalog).0.is_empty());
+    // Desired roles naming it never reach the normal grant path; an unlocked role holding it
+    // only loses it through Unlock.
+    let steps = plan_member_roles(&[desired("cb_m_a", &["billing", "chelabase_schema_locked"], false)], &[actual("cb_m_a", vec![ours("billing"), marker(None)])]);
+    assert_eq!(steps, vec![MemberRoleStep::Unlock { role: "cb_m_a".into() }]);
+}
+
+#[test]
+fn another_grantors_marker_is_revoked_as_that_grantor_and_ours_granted() {
+    use MemberRoleStep::*;
+    let have = vec![actual("cb_m_a", vec![ours("billing"), marker(Some("postgres"))])];
+    assert_eq!(
+        plan_member_roles(&[locked("cb_m_a", &["billing"])], &have),
+        vec![
+            Revoke { role: "cb_m_a".into(), granted: "chelabase_schema_locked".into(), grantor: Some("postgres".into()) },
+            Lock { role: "cb_m_a".into() },
+        ]
+    );
+    // Unlocked: only the foreign one goes (there is no marker of ours to unlock).
+    assert_eq!(
+        plan_member_roles(&[desired("cb_m_a", &["billing"], false)], &have),
+        vec![Revoke { role: "cb_m_a".into(), granted: "chelabase_schema_locked".into(), grantor: Some("postgres".into()) }]
+    );
+}
+
+#[test]
+fn a_dropped_role_drops_with_its_marker() {
+    let have = vec![actual("cb_m_a", vec![ours("billing"), marker(None)])];
+    assert_eq!(plan_member_roles(&[], &have), vec![MemberRoleStep::Drop { role: "cb_m_a".into() }]);
+}
+
+#[test]
+fn unlock_renders_alone_and_lock_quotes_its_role() {
+    assert_eq!(render_step(&MemberRoleStep::Unlock { role: "cb_m_a".into() }), "REVOKE chelabase_schema_locked FROM cb_m_a;");
+    let lock = render_step(&MemberRoleStep::Lock { role: "Odd Name".into() });
+    assert_eq!(
+        lock,
+        "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_schema_locked') THEN CREATE ROLE chelabase_schema_locked NOLOGIN; END IF; END$$;\nGRANT chelabase_schema_locked TO \"Odd Name\" WITH INHERIT FALSE, SET FALSE, ADMIN FALSE;"
+    );
+    assert_eq!(MemberRoleStep::Lock { role: "r".into() }.role(), "r");
+    assert_eq!(MemberRoleStep::Unlock { role: "r".into() }.role(), "r");
+}
+
+#[tokio::test]
+async fn a_protected_branch_leaves_an_admin_unlocked_and_unlocks_one_who_became_admin() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    // The member is an Admin now; its role still holds our marker.
+    let db = w.metadata.state().branches.get(&branch).unwrap().database_id;
+    let project = w.metadata.database(db).project_id.as_uuid();
+    w.metadata.state().grants.get_mut(&(member, project)).unwrap().platform_role = PlatformRole::Admin;
+    let role = member_role_name(member);
+    let answer = Cat {
+        roles: &["!postgres", "billing", "chelabase_schema_locked", &role],
+        memberships: &[(&role, "billing"), (&role, "chelabase_schema_locked")],
+        edges: &[],
+        passwords: &[],
+        databases: &[("app", "postgres")],
+    }
+    .answer();
+    w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+    assert!(done(&w.reconcile_member_roles(branch, None).await));
+    let texts = texts(&w);
+    assert!(texts.iter().any(|s| s.contains(&format!("REVOKE chelabase_schema_locked FROM {role};"))), "{texts:?}");
+    assert!(!texts.iter().any(|s| s.contains("GRANT chelabase_schema_locked")), "{texts:?}");
+    // Still guarded: the branch is protected.
+    assert!(all_scripts(&w).iter().any(|(db, s)| db == "app" && s.contains("chelabase_schema_guard_ddl")));
+}
+
+#[tokio::test]
+async fn a_failed_guard_fails_the_run_but_the_roles_still_apply() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
+    w.computes.fail_when("CREATE EVENT TRIGGER chelabase_schema_guard_ddl");
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert!(matches!(&reply, MemberRolesReply::Failed { message } if message.contains("guarding app")), "{reply:?}");
+    let role = member_role_name(member);
+    assert!(texts(&w).iter().any(|s| s.contains(&format!("GRANT chelabase_schema_locked TO {role}"))));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// T7, P7: whatever a member role holds (our marker, another grantor's, granted roles of
+    /// either kind), after the plan's steps it holds our marker exactly when it is locked, its
+    /// other memberships are exactly its roles (ours, shaped), the marker never goes through
+    /// `Grant`/our `Revoke`, `Unlock` runs with the revokes and `Lock` after the role's creation
+    /// and grants; and planning again changes nothing.
+    #[test]
+    fn the_marker_follows_locked_and_nothing_else(
+        roles in proptest::collection::vec(proptest::collection::btree_set(0..3usize, 1..3), 3),
+        locked_flags in proptest::collection::vec(any::<bool>(), 3),
+        wanted in proptest::collection::vec(any::<bool>(), 3),
+        exists in proptest::collection::vec(any::<bool>(), 3),
+        held in proptest::collection::vec(proptest::collection::vec((0..4usize, any::<bool>(), any::<bool>()), 0..6), 3),
+    ) {
+        let name = |i: usize| if i == 3 { "chelabase_schema_locked".to_string() } else { format!("r{i}") };
+        let mut want = Vec::new();
+        let mut have = Vec::new();
+        for m in 0..3 {
+            let role_name = format!("cb_m_{m}");
+            if wanted[m] {
+                let set: Vec<String> = roles[m].iter().map(|i| name(*i)).collect();
+                let mut d = desired(&role_name, &set.iter().map(String::as_str).collect::<Vec<_>>(), false);
+                d.locked = locked_flags[m];
+                want.push(d);
+            }
+            if exists[m] {
+                let mut memberships: Vec<ActualMembership> = Vec::new();
+                for (i, foreign, shaped) in &held[m] {
+                    let membership = ActualMembership {
+                        role: name(*i),
+                        grantor: foreign.then(|| "postgres".to_string()),
+                        shaped: *shaped && *i != 3,
+                    };
+                    if !memberships.iter().any(|h| (&h.role, &h.grantor) == (&membership.role, &membership.grantor)) {
+                        memberships.push(membership);
+                    }
+                }
+                have.push(actual(&role_name, memberships));
+            }
+        }
+        let steps = plan_member_roles(&want, &have);
+        let first_change = steps.iter().position(|s| !matches!(s, MemberRoleStep::Revoke { .. } | MemberRoleStep::Unlock { .. })).unwrap_or(steps.len());
+        let mut state: BTreeMap<String, Vec<ActualMembership>> =
+            have.iter().map(|a| (a.role_name.clone(), a.memberships.clone())).collect();
+        for (at, step) in steps.iter().enumerate() {
+            match step {
+                MemberRoleStep::Create { role, .. } => {
+                    prop_assert!(state.insert(role.clone(), Vec::new()).is_none());
+                }
+                MemberRoleStep::Grant { role, granted } => {
+                    prop_assert_ne!(granted.as_str(), "chelabase_schema_locked");
+                    let held = state.get_mut(role).unwrap();
+                    held.retain(|m| !(m.role == *granted && m.grantor.is_none()));
+                    held.push(ours(granted));
+                }
+                MemberRoleStep::Revoke { role, granted, grantor } => {
+                    prop_assert!(!(granted == "chelabase_schema_locked" && grantor.is_none()), "{step:?}");
+                    state.get_mut(role).unwrap().retain(|m| !(m.role == *granted && m.grantor == *grantor));
+                }
+                MemberRoleStep::Unlock { role } => {
+                    prop_assert!(at < first_change, "Unlock with the revokes: {steps:?}");
+                    state.get_mut(role).unwrap().retain(|m| !(m.role == "chelabase_schema_locked" && m.grantor.is_none()));
+                }
+                MemberRoleStep::Lock { role } => {
+                    // After the role's creation, before any of its grants (T7 review, finding 3:
+                    // a failed grant must not leave the role granted but unlocked).
+                    prop_assert!(!steps[at + 1..].iter().any(|s| s.role() == role && matches!(s, MemberRoleStep::Create { .. })), "{steps:?}");
+                    prop_assert!(!steps[..at].iter().any(|s| s.role() == role && matches!(s, MemberRoleStep::Grant { .. })), "{steps:?}");
+                    let held = state.get_mut(role).expect("locked a role that exists");
+                    prop_assert!(!held.iter().any(|m| m.role == "chelabase_schema_locked" && m.grantor.is_none()), "locked twice");
+                    held.push(marker(None));
+                }
+                MemberRoleStep::Drop { role } => {
+                    state.remove(role);
+                }
+                MemberRoleStep::SetPassword { .. } | MemberRoleStep::Reshape { .. } => {}
+            }
+        }
+        prop_assert_eq!(state.keys().cloned().collect::<BTreeSet<_>>(), want.iter().map(|d| d.role_name.clone()).collect::<BTreeSet<_>>());
+        for d in &want {
+            let held = &state[&d.role_name];
+            prop_assert!(held.iter().all(|m| m.grantor.is_none()), "{held:?}");
+            let marked = held.iter().filter(|m| m.role == "chelabase_schema_locked").count();
+            prop_assert_eq!(marked, usize::from(d.locked), "{:?}", held);
+            let others: BTreeSet<String> = held.iter().filter(|m| m.role != "chelabase_schema_locked").map(|m| m.role.clone()).collect();
+            let expected: BTreeSet<String> = d.roles.iter().filter(|r| *r != "chelabase_schema_locked").cloned().collect();
+            prop_assert_eq!(others, expected);
+            prop_assert!(held.iter().filter(|m| m.role != "chelabase_schema_locked").all(|m| m.shaped));
+        }
+        let after: Vec<ActualMemberRole> = state.iter().map(|(r, m)| actual(r, m.clone())).collect();
+        prop_assert_eq!(plan_member_roles(&want, &after), vec![]);
+    }
+}
+
+// T7 review, finding 3: the marker comes straight after `Create`, before any grant, so a grant
+// that fails can't leave a role with its grants but without the marker (fail closed).
+#[test]
+fn the_marker_comes_before_any_grant() {
+    use MemberRoleStep::*;
+    let steps = plan_member_roles(&[locked("cb_m_b", &["billing", "sales"])], &[]);
+    assert!(matches!(steps.first(), Some(Create { .. })), "{steps:?}");
+    assert_eq!(steps.get(1), Some(&Lock { role: "cb_m_b".into() }), "{steps:?}");
+    // An existing role missing a grant: the marker still comes first.
+    let have = vec![actual("cb_m_a", vec![ours("billing")])];
+    let steps = plan_member_roles(&[locked("cb_m_a", &["billing", "sales"])], &have);
+    assert_eq!(
+        steps,
+        vec![Lock { role: "cb_m_a".into() }, Grant { role: "cb_m_a".into(), granted: "sales".into() }]
+    );
+}
+
+// T7 review, finding 7: the guard is reinstalled only where its check says it isn't current.
+#[tokio::test]
+async fn the_guard_is_installed_only_where_it_is_not_current() {
+    let (w, _journal) = worker();
+    let (branch, ep, _member) = setup(&w, &["billing"]).await;
+    w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    let answer = Cat { roles: &["!postgres", "billing"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres"), ("analytics", "postgres")] }.answer();
+    w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+    w.computes.answer_in("app", "chelabase: schema guard check", "t");
+    w.computes.answer_in("analytics", "chelabase: schema guard check", "f");
+    assert!(done(&w.reconcile_member_roles(branch, None).await));
+    let all = all_scripts(&w);
+    let checked: Vec<&str> = all.iter().filter(|(_, s)| s.contains("chelabase: schema guard check")).map(|(db, _)| db.as_str()).collect();
+    assert_eq!(checked, ["analytics", "app"]);
+    let installed: Vec<&str> = all.iter().filter(|(_, s)| s.contains("chelabase_schema_guard_ddl") && !s.contains("chelabase: schema guard check")).map(|(db, _)| db.as_str()).collect();
+    assert_eq!(installed, ["analytics"], "app's guard is current");
 }

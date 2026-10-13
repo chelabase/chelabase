@@ -1,0 +1,159 @@
+---
+title: Table API
+description: List a branch's tables, read a table's structure and the type catalog, change the schema with structured operations (dry runs, drops with dependents, concurrent indexes), insert a row of defaults and fetch a full cell.
+---
+
+The table API is what Studio's table editor is built on. It reads the structure of a branch's Postgres databases and changes it with structured operations instead of SQL text: you send `create_table`, `add_column` or `drop_index`, and the server renders the statements, runs them in one transaction and answers with what ran. Two small row helpers (a row of all defaults, one cell's full value) sit beside them. For how it works inside, see [Table API internals](/docs/architecture/table-api).
+
+All routes are under `/v1/databases/{id}/branches/{branch_id}`. The Postgres database defaults to the branch's main one; pick another with `?database=` (reads) or `database` in the body.
+
+| Request | What it is for | Minimum access |
+|---|---|---|
+| `GET /objects` | The object list: every table, view, materialized view and foreign table with its kind, owner, comment, row estimate, size, row-level security flags, whether the data API can reach it (`data_api_exposed`) and whether the table API edits it (`editable`: ordinary tables only). System schemas and Chelabase's own objects are left out. | Viewer |
+| `GET /tables/{schema}/{table}` | The table structure: columns (with type oid, default, identity, generated expression, collation, comment), constraints, indexes, triggers, policies, privileges and the comment, as the [schema merge](/docs/using/merging-schema) reads them. Only ordinary tables; a view, a partition child or a missing table is 404. | Viewer |
+| `GET /types` | The type catalog: base, enum (with `labels`), domain, composite, range and multirange types with their oids, array oids and whether they take modifiers. For a type picker, and to join a column's `type_oid`. | Viewer |
+| `POST /schema-changes` | Schema changes: tables, columns, constraints, indexes, row-level security, policies, grants and enums. A dry run previews them. | Developer on an unprotected branch, Admin on a protected one |
+| `POST /tables/{schema}/{table}/rows/default` | Inserts a row of all defaults (`INSERT … DEFAULT VALUES`) and returns it as JSON. Ordinary tables only (404 otherwise). | Developer |
+| `POST /tables/{schema}/{table}/cell` | The whole value of one column of the row with a given primary key, as text with its stored size and type. A grid previews long values; this fetches one in full, up to 64 MiB (413 `too_large` beyond). Key values are compared as given, at the column's type without its length or precision: `"abcdefg"` doesn't find a `varchar(5)` key `abcde`, nor `1.249` a `numeric(10,2)` key `1.25`. | Viewer |
+
+## Who may call
+
+The three reads use the database owner's connection and need Viewer on the project. They also need your own Postgres login (`cb_m_…`, the one the [SQL editor](/docs/using/sql-editor) connects as) to hold `CONNECT` on the database, checked at the time of the read, as Postgres decides it when you log in. PUBLIC's default `CONNECT` is enough. After `REVOKE CONNECT … FROM PUBLIC`, an Admin grants `CONNECT` to your login, exactly as for the SQL editor; a group's `CONNECT` doesn't reach it. Without it, or with no login on the branch yet, the read is 403 `permission_denied` ("your login may not connect to this database"). An Admin, a member with every role, or a tenant admin is checked as the database owner, who may connect unless its `CONNECT` was revoked. The other three run SQL as you:
+
+- With no `role`, as the database owner. That needs Admin.
+- With `role`, as that Postgres role. You log in with your own member role and `SET ROLE` to it, as in the [SQL editor](/docs/using/sql-editor), so the role must be in your grant's set (403 `forbidden` with `required: "role:<name>"` otherwise) and Postgres checks every statement against what that role may do (403 `permission_denied`). See [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
+- System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`) and an empty `role` are refused (422).
+
+Schema changes need Developer on an unprotected branch and Admin on a protected one (see [Protected branches](#protected-branches)). The per-route levels are in [Access per route](/docs/reference/access).
+
+## A schema change
+
+`POST /schema-changes` takes a list of `operations`, each an object with one key naming the operation. This request creates a table:
+
+```json
+{
+  "operations": [
+    {
+      "create_table": {
+        "table": { "schema": "public", "name": "notes" },
+        "columns": [
+          { "name": "id", "data_type": { "schema": "pg_catalog", "name": "int8" }, "not_null": true },
+          { "name": "body", "data_type": { "schema": "pg_catalog", "name": "text" } }
+        ],
+        "primary_key": ["id"]
+      }
+    }
+  ]
+}
+```
+
+The answer:
+
+```json
+{
+  "dry_run": false,
+  "committed": true,
+  "statements": [
+    {
+      "sql": "CREATE TABLE public.notes (id pg_catalog.int8 NOT NULL, body pg_catalog.text, PRIMARY KEY (id))",
+      "op_index": 0,
+      "executed": true,
+      "skipped": null,
+      "notices": [],
+      "rewrites_table": false,
+      "lock": "none"
+    }
+  ],
+  "dependents": null,
+  "would_succeed": null
+}
+```
+
+Each statement says which operation it came from (`op_index`), the lock it takes (`none`, `share_update_exclusive`, `share`, `share_row_exclusive` or `access_exclusive`) and whether it may rewrite the table. Names are quoted by the server and data types are structured (`schema`, `name`, `modifiers`, `array`), never SQL text. Expressions (column defaults and generated columns, checks, `USING`, `SET DEFAULT`, index predicates and key expressions, exclusion predicates, policy `USING` and `WITH CHECK`) are SQL text and used as given, but each must be exactly one SQL expression: an empty one, a comment (`--`, `/*`), a `;`, a top-level comma or a bracket that closes outside the expression is refused with 400 `invalid_request` and the `op_index`, before anything runs. `;` and `--` inside a string literal are fine.
+
+The operations: `create_table`, `rename_table`, `set_table_schema`, `drop_table`, `set_table_comment`, `set_table_owner`, `add_column`, `alter_column`, `rename_column`, `drop_column`, `add_constraint`, `validate_constraint`, `rename_constraint`, `drop_constraint`, `create_index`, `drop_index`, `rename_index`, `set_rls`, `create_policy`, `alter_policy`, `rename_policy`, `drop_policy`, `grant`, `revoke`, `create_enum`, `add_enum_value`, `rename_enum_value`, `rename_enum` and `drop_enum`. The request's field shapes are in the generated management client.
+
+- All operations run in order in one transaction: a failure rolls the request back and nothing is committed (`committed: false`).
+- `lock_timeout_ms` (1 to 60000, default 5000) bounds how long a statement waits for a lock (409 `lock_timeout`, safe to retry). The transaction's `statement_timeout` is 60 s (15 s for a dry run); beyond it, 504 `timeout`.
+- A table the request names that doesn't exist, and that no earlier operation creates, is 404 with its `op_index`. An operation the renderer refuses (an invalid name, an empty column list, an expression that isn't exactly one expression) is 400 `invalid_request` with its `op_index`.
+- Postgres errors keep their fields: `op_index`, `sqlstate`, `message`, `detail`, `hint` and `position`.
+- Grants render one statement per privilege (and per column).
+- Exposing a table to the data API is an ordinary `grant` to `anon` or `authenticated`: there is no separate flag.
+
+## Dry runs
+
+`"dry_run": true` runs the same statements the same way and always rolls back. The response has `dry_run: true` and `committed: false`.
+
+- A dry run evaluates your expressions, so their effects outside a transaction remain (for example `nextval` advances a sequence).
+- A statement that may rewrite a table (`rewrites_table`) whose `pg_total_relation_size` is over the threshold is **not executed**, and neither is any statement after it (it may depend on it). Such statements come back with `executed: false` and `skipped` set to `large_table_rewrite` for the first and `after_skipped` for the rest. The threshold is `CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES` on the orchestrator: 268435456 (256 MiB) by default, a whole number of bytes from 0.
+- `would_succeed` is `true` when every statement ran, and `null` when any was skipped (an unexecuted statement proves nothing). A dry run that hits a Postgres error answers with the same typed error as the real run, plus `dry_run: true`.
+- A `CONCURRENTLY` operation is never executed in a dry run (`skipped: "concurrently"`); a catalog check stands in for it (see [Concurrent indexes](#concurrent-indexes)).
+- A drop whose target an earlier drop of the same request already removed is `skipped: "already_dropped"`. That isn't a failure: `would_succeed` can still be `true`.
+
+## Drops and cascade
+
+Drops run `RESTRICT`, and a request with drops returns `dependents`: the objects a `CASCADE` would also remove (views, foreign keys from other tables, policies that read the dropped column, and so on) beyond the request's own drop targets and their parts, each with Postgres's own description, and a `hash` of the list.
+
+A drop that has dependents is refused when the request confirms no cascade, in a dry run as in a real one: **409 `has_dependents`**, nothing changed, with `error.dependents` holding the list and its hash. To drop them too:
+
+1. Review `dependents`.
+2. Send the request again with `"cascade": { "dependents_hash": "<hash>" }`. The drops then end `CASCADE`.
+
+The run (dry or real) locks the drop targets' tables, reads the dependents again and compares. **409 `dependents_changed`** means they differ from the confirmed hash (`error.dependents` has the current list and hash to review and confirm). The hash must be 64 lowercase hex characters (422 otherwise).
+
+Postgres doesn't lock the objects that depend on a table, so a dependent can still appear between that check and the drop. Each cascading drop's own `drop cascades to …` report is therefore compared with the confirmed list after the drop runs; any difference, or a report that can't be read as a complete list, rolls the request back with `dependents_changed` and nothing changes. Drops that reach each other (a parent table and its child) need no dependents of their own beyond the request's.
+
+A drop of a table, column or enum the request created, renamed, moved or retyped earlier is refused, because the dependents were read before the request: see [Renames and drops in one request](#renames-and-drops-in-one-request).
+
+## Concurrent indexes
+
+`create_index` and `drop_index` take `concurrently: true`.
+
+- It must be the request's **only** operation (400 otherwise). It runs outside a transaction with a `statement_timeout` of 900 s, and can't cascade: a `drop_index` with dependents is 409 `has_dependents`.
+- A concurrent `create_index` needs a `name` (400 otherwise), because a failed build leaves an INVALID index that is dropped by name.
+- If the build fails after creating its index, that INVALID index is dropped and the answer is 409 `index_build_failed` with `invalid_index_dropped`. Only the index this build created is dropped: an index of the same name that existed before, or that another session made meanwhile, is never touched, and neither are other INVALID indexes. A failure that comes before the build creates its index (a lock timeout taking the table's lock, the name taken, a missing column, a permission) drops nothing.
+- A dry run only checks it: the table exists (404), its columns exist and the name is free (400 with the SQLSTATE Postgres would answer). `would_succeed` stays `null`.
+
+## Renames and drops in one request
+
+The catalog is read once, before the request runs. A `drop_table`, `drop_column` or `drop_enum` whose target an earlier operation of the same request created, renamed, moved, retyped or dropped is refused (400 `invalid_request` with the `op_index`, "the drop's target was changed by operation N of the same request; drop it in a separate request"), because its dependents would describe a different object. Send the drop in a request of its own.
+
+Only those three drops are refused this way. A `drop_constraint` or `drop_index` of a constraint or index created earlier in the same request isn't caught up front: it fails, with 404 (the dependents, read before the request, find no such object) or 400 `schema_change_failed`, and the request rolls back. Drop it in a separate request too.
+
+## Protected branches
+
+A [protected branch](/docs/using/branches) allows schema changes only by an Admin. The API enforces that (Developer is not enough to call the route), and a Postgres guard enforces it for members' own sessions that reach the database another way, such as the SQL editor.
+
+The guard applies to every session logged in as a member role (`cb_m_*`) of a non-Admin, and only to those. A session that logs in directly as another Postgres [login role](/docs/using/login-roles), with that role's password, isn't a member session and isn't guarded: anyone holding such a login can change the schema as far as the role's own privileges allow.
+
+In a member session, the guard refuses (409 `branch_protected` from the table API; Postgres error 42501 with hint `chelabase:branch_protected` elsewhere) any DDL that touches a permanent object, whatever role the session `SET ROLE`s to: `CREATE`, `ALTER` and `DROP` of tables, indexes, views, functions, schemas and the rest, `GRANT` and `REVOKE`, `COMMENT`, and `DROP OWNED`.
+
+Still allowed:
+
+- Rows: `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` and the table API's row helpers.
+- Temporary tables and other temporary objects (those in a `pg_temp` schema), unless they inherit from a permanent table.
+- `REFRESH MATERIALIZED VIEW` and `REINDEX`, which rebuild data and change no schema.
+
+Admins, the database owner and Chelabase's own maintenance are never refused. The guard is installed in every Postgres database of a protected branch (including ones made later, within one reconcile sweep) and reinstalled if it is missing or out of date.
+
+<Callout type="warn" title="Objects planted while the branch was unprotected">
+A trigger or SECURITY DEFINER function created while the branch was unprotected runs DDL as whoever fires it later, which the guard can't tell apart from that person's own DDL. Review what a Developer created before protecting a branch.
+</Callout>
+
+## Errors
+
+A failed Postgres statement is classified by its SQLSTATE:
+
+| Status | Code | When |
+|---|---|---|
+| 409 | `branch_protected` | The guard refused (hint `chelabase:branch_protected`). |
+| 403 | `permission_denied` | 42501: the role may not do this. |
+| 409 | `lock_timeout` | 55P03: a lock wasn't granted within `lock_timeout_ms`. |
+| 504 | `timeout` | 57014: past `statement_timeout`. |
+| 409 | `conflict` | 23505, 23503, 23P01: existing rows break a unique, foreign-key or exclusion constraint. 40P01, 40001: a deadlock or serialization failure; safe to retry. |
+| 400 | `constraint_violation` | 23502, 23514, class 22: rows break NOT NULL or a check, or a value is out of range. |
+| 400 | `schema_change_failed` | Any other Postgres refusal. |
+
+Besides these: 409 `has_dependents`, 409 `dependents_changed`, 409 `index_build_failed`, 413 `too_large` (cell), and the access codes of every project route. Every code is in the [error reference](/docs/reference/errors).
+
+Each schema change that ran writes one audit log line (`orchestrator::table_api::audit`): who, where, as which role, how many operations, dry run or not, committed or not. Never the SQL or any value.

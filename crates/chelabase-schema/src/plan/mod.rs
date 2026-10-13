@@ -9,7 +9,7 @@
 //! (E15: psql `-U` [`OWNER_ROLE`]). Scripts go to psql on stdin (never `-c`, which wraps
 //! several statements in one transaction).
 
-mod ddl;
+pub(crate) mod ddl;
 mod digest;
 mod diff;
 

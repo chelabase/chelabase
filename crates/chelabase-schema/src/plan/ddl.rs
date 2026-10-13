@@ -14,7 +14,7 @@ use crate::sql::{ident, literal, qualified};
 pub const OWNER_ROLE: &str = "postgres";
 
 /// `expr` in parentheses, unless the whole text is already one parenthesized group.
-pub(super) fn paren(expr: &str) -> String {
+pub(crate) fn paren(expr: &str) -> String {
     let e = expr.trim();
     if e.starts_with('(') && closing_paren(e, 0) == Some(e.len() - 1) {
         e.to_string()
@@ -193,7 +193,7 @@ pub(super) fn strip_not_valid(def: &str) -> &str {
 }
 
 /// `PUBLIC` or the quoted role name.
-pub(super) fn role_ref(r: &RoleRef) -> String {
+pub(crate) fn role_ref(r: &RoleRef) -> String {
     match r {
         RoleRef::Public => "PUBLIC".to_string(),
         RoleRef::Role { name, .. } => ident(name),
@@ -240,8 +240,10 @@ pub(super) fn option_name(o: &str) -> &str {
     o.split_once('=').map_or(o, |(k, _)| k)
 }
 
-/// `name type [COLLATE c] [GENERATED …] [DEFAULT …] [NOT NULL]`.
-pub(super) fn column_def(c: &Column, schema: &str, with_not_null: bool) -> String {
+/// `name type [COLLATE c] [GENERATED …] [DEFAULT …] [NOT NULL]`. `ddl::render::column_def`
+/// relies on the `name type [COLLATE c]` head coming first and inserts an identity clause
+/// after it (checked there by a `debug_assert!`).
+pub(crate) fn column_def(c: &Column, schema: &str, with_not_null: bool) -> String {
     let mut s = format!("{} {}", ident(&c.name), c.data_type);
     if let Some(coll) = &c.collation {
         s.push_str(&format!(" COLLATE {coll}"));
@@ -336,7 +338,7 @@ pub(super) fn sequence_changes(
 
 /// `CREATE [UNIQUE] INDEX [CONCURRENTLY] name ON table USING m (keys) [INCLUDE (…)]
 /// [NULLS NOT DISTINCT] [WITH (…)] [WHERE (…)]`.
-pub(super) fn create_index(ix: &Index, name: &str, table_q: &str, concurrently: bool) -> String {
+pub(crate) fn create_index(ix: &Index, name: &str, table_q: &str, concurrently: bool) -> String {
     let mut s = format!(
         "CREATE {}INDEX {}{} ON {} USING {} ({})",
         if ix.unique { "UNIQUE " } else { "" },
@@ -431,7 +433,7 @@ pub(super) fn command(c: PolicyCommand) -> &'static str {
     }
 }
 
-pub(super) fn create_policy(p: &Policy, table_q: &str) -> String {
+pub(crate) fn create_policy(p: &Policy, table_q: &str) -> String {
     let roles = if p.roles.is_empty() {
         "PUBLIC".to_string()
     } else {
@@ -457,14 +459,14 @@ pub(super) fn create_policy(p: &Policy, table_q: &str) -> String {
 }
 
 /// `COMMENT ON <what> <target> IS '…' | NULL`.
-pub(super) fn comment(what: &str, target: &str, text: &Option<String>) -> String {
+pub(crate) fn comment(what: &str, target: &str, text: &Option<String>) -> String {
     format!(
         "COMMENT ON {what} {target} IS {}",
         text.as_deref().map_or("NULL".to_string(), literal)
     )
 }
 
-pub(super) fn grant_sql(g: &Grant, on: &str, column: Option<&str>) -> Option<String> {
+pub(crate) fn grant_sql(g: &Grant, on: &str, column: Option<&str>) -> Option<String> {
     let p = privilege(&g.privilege)?;
     Some(format!(
         "GRANT {p}{} ON {on} TO {}{}",
@@ -478,7 +480,7 @@ pub(super) fn grant_sql(g: &Grant, on: &str, column: Option<&str>) -> Option<Str
     ))
 }
 
-pub(super) fn revoke_sql(
+pub(crate) fn revoke_sql(
     g: &Grant,
     on: &str,
     column: Option<&str>,

@@ -1851,3 +1851,106 @@ async fn a_reconcile_hands_leftovers_to_the_last_acted_role_then_drops_the_rest(
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the dev stack (just deps-up, just dev)"]
+async fn a_protected_branch_refuses_a_developers_schema_changes() {
+    live(|fx| async move {
+        let dev = fx.members[0].id;
+        let boss = fx.members[1].id;
+        // Setup as cloud_admin: the owner may not grant CREATE on `public`.
+        fx.sql_on(&fx.ep, &fx.database, "GRANT CREATE ON SCHEMA public TO billing; CREATE TABLE public.guarded (id int); GRANT INSERT ON public.guarded TO billing;").await;
+        fx.grant(dev, PlatformRole::Developer, &["billing"]).await;
+        fx.grant(boss, PlatformRole::Admin, &["billing"]).await;
+        fx.reconcile(fx.main).await;
+        // Unprotected: the Developer may change the schema.
+        fx.as_member(dev, "SET ROLE billing; CREATE TABLE public.g1 (id int);").await.unwrap();
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        let refused = fx.as_member(dev, "SET ROLE billing; CREATE TABLE public.g2 (id int);").await.unwrap_err();
+        assert!(refused.contains("42501") && refused.contains("branch is protected") && refused.contains("chelabase:branch_protected"), "{refused}");
+        for ddl in ["DROP TABLE public.g1;", "COMMENT ON TABLE public.g1 IS 'x';", "GRANT SELECT ON public.g1 TO PUBLIC;", "ALTER TABLE public.g1 ADD COLUMN x int;"] {
+            let out = fx.as_member(dev, &format!("SET ROLE billing; {ddl}")).await;
+            assert!(out.as_ref().is_err_and(|e| e.contains("branch is protected")), "{ddl}: {out:?}");
+        }
+        // Rows and temporary objects stay normal Postgres.
+        fx.as_member(dev, "SET ROLE billing; INSERT INTO public.guarded VALUES (1);").await.unwrap();
+        fx.as_member(dev, "SET ROLE billing; CREATE TEMP TABLE scratch (id int); INSERT INTO scratch VALUES (1); DROP TABLE scratch;").await.unwrap();
+        // An Admin isn't locked.
+        fx.as_member(boss, "SET ROLE billing; CREATE TABLE public.g3 (id int);").await.unwrap();
+        // Every database, including one made after the branch: guarded after a reconcile.
+        fx.sql("CREATE DATABASE guard_two").await;
+        fx.reconcile(fx.main).await;
+        let triggers = fx.sql_on(&fx.ep, "guard_two", "SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_schema_guard%' AND evtenabled <> 'D'").await;
+        assert_eq!(triggers.trim(), "2");
+        // Unprotected again: the Developer may change the schema.
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.as_member(dev, "SET ROLE billing; CREATE TABLE public.g2 (id int);").await.unwrap();
+        fx.sql("DROP DATABASE guard_two").await;
+        fx.sql_on(&fx.ep, &fx.database, "DROP TABLE public.guarded, public.g1, public.g2, public.g3; REVOKE CREATE ON SCHEMA public FROM billing;").await;
+    })
+    .await;
+}
+
+// T7 review: a schema planted while the branch was unprotected can't block the guard (finding
+// 2), the triggers fire always (6), data maintenance stays allowed (4), and a temporary table
+// inheriting from a permanent one is refused (5).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the dev stack (just deps-up, just dev)"]
+async fn a_planted_guard_schema_cannot_block_the_guard() {
+    live(|fx| async move {
+        let dev = fx.members[0].id;
+        let db = fx.database.clone();
+        fx.sql_on(
+            &fx.ep,
+            &db,
+            &format!(
+                "GRANT CREATE ON DATABASE \"{db}\" TO billing; GRANT CREATE ON SCHEMA public TO billing; \
+                 CREATE MATERIALIZED VIEW public.mv AS SELECT 1 AS x; GRANT MAINTAIN ON public.mv TO billing; \
+                 CREATE TABLE public.parent_b (id int); ALTER TABLE public.parent_b OWNER TO billing;"
+            ),
+        )
+        .await;
+        fx.grant(dev, PlatformRole::Developer, &["billing"]).await;
+        fx.reconcile(fx.main).await;
+        // Unprotected: the Developer plants the guard's schema with a function of the wrong shape.
+        fx.as_member(
+            dev,
+            "SET ROLE billing; CREATE SCHEMA chelabase_guard; \
+             CREATE FUNCTION chelabase_guard.refuse_ddl() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+             CREATE TABLE chelabase_guard.hidden (x int);",
+        )
+        .await
+        .unwrap();
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        let enabled = fx
+            .sql_on(&fx.ep, &db, "SELECT string_agg(evtenabled::text, ',' ORDER BY evtname) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_schema_guard%'")
+            .await;
+        assert_eq!(enabled.trim(), "A,A", "both triggers installed, ENABLE ALWAYS");
+        let leftovers = fx
+            .sql_on(&fx.ep, &db, "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'chelabase_guard'")
+            .await;
+        assert_eq!(leftovers.trim(), "0", "the planted table is gone");
+        let refused = fx.as_member(dev, "SET ROLE billing; CREATE TABLE public.g9 (id int);").await.unwrap_err();
+        assert!(refused.contains("branch is protected"), "{refused}");
+        // Data maintenance stays allowed.
+        fx.as_member(dev, "SET ROLE billing; REFRESH MATERIALIZED VIEW public.mv;").await.unwrap();
+        // A temporary table inheriting from a permanent one is a schema change.
+        let refused = fx.as_member(dev, "SET ROLE billing; CREATE TEMP TABLE tt () INHERITS (public.parent_b);").await.unwrap_err();
+        assert!(refused.contains("branch is protected"), "{refused}");
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.sql_on(
+            &fx.ep,
+            &db,
+            &format!(
+                "DROP MATERIALIZED VIEW public.mv; DROP TABLE public.parent_b; \
+                 REVOKE CREATE ON SCHEMA public FROM billing; REVOKE CREATE ON DATABASE \"{db}\" FROM billing;"
+            ),
+        )
+        .await;
+    })
+    .await;
+}

@@ -4,13 +4,15 @@
 //! asserts they still match its constants (T7: `exclusion_lists_match_worker_constants`).
 
 /// Schemas never read: Postgres's own, and Chelabase's (`chelabase`: the data API bootstrap;
-/// `chelabase_merge`: the merge's recovery marker, P1).
-pub const EXCLUDED_SCHEMAS: [&str; 5] = [
+/// `chelabase_merge`: the merge's recovery marker, P1; `chelabase_guard`: the protected-branch
+/// DDL guard, TE-A P5).
+pub const EXCLUDED_SCHEMAS: [&str; 6] = [
     "pg_catalog",
     "information_schema",
     "pg_toast",
     "chelabase",
     "chelabase_merge",
+    "chelabase_guard",
 ];
 
 /// Schema name prefixes never read: TOAST schemas (`pg_toast`, `pg_toast_temp_<n>`) and
@@ -96,3 +98,13 @@ pub const MERGE_NOT_NULL_CHECK_PREFIX: &str = "chelabase_merge_nn_";
 /// Replacement indexes: `chelabase_merge_ix_<n>_<merge id as 32 hex>` (unique per merge).
 /// Leftovers are reported as `ReportedKind::MergeLeftover`.
 pub const MERGE_INDEX_PREFIX: &str = "chelabase_merge_ix_";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_guard_schema_is_excluded() {
+        assert!(EXCLUDED_SCHEMAS.contains(&"chelabase_guard"));
+    }
+}

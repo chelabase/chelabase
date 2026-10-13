@@ -158,6 +158,15 @@ impl Connected {
     pub fn backend_start(&self) -> &str {
         &self.started
     }
+
+    /// The client and the queue of notices its connection receives, in wire order. Once a
+    /// query's future has resolved, every notice the server sent before its result is queued
+    /// (the connection task queues a notice before it reads the next message). The queue is
+    /// bounded: a caller awaiting a query must keep taking notices meanwhile, or a flood of
+    /// them stalls the connection.
+    pub fn client_and_notices(&mut self) -> (&Client, &mut mpsc::Receiver<DbError>) {
+        (&self.client, &mut self.notices)
+    }
 }
 
 /// Why [`connect`] failed.

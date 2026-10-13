@@ -35,6 +35,8 @@ import type {
   BranchDatabaseView,
   BranchRole,
   CancelSqlRun202,
+  CellRequest,
+  CellValue,
   ConnectionDetails,
   ConsoleRequest,
   CreateAppUserRequest,
@@ -53,6 +55,8 @@ import type {
   DataKey,
   Database,
   DatabaseSettings,
+  DefaultRow,
+  DefaultRowRequest,
   DeleteGrantOverrideParams,
   DeleteProjectRequest,
   DisableDataApiParams,
@@ -63,6 +67,7 @@ import type {
   GetDataApiSchemaParams,
   GetSqlSchema200,
   GetSqlSchemaParams,
+  GetTableParams,
   GrantOverride,
   InstanceSettings,
   InviteDelivery,
@@ -70,12 +75,15 @@ import type {
   ListAccessEventsParams,
   ListAppUsersParams,
   ListMergesParams,
+  ListObjectsParams,
   ListProjectAccessEventsParams,
+  ListTypesParams,
   MeResponse,
   Member,
   Merge,
   MergeDetail,
   MergeSummary,
+  ObjectList,
   OperationAccepted,
   ProjectGrant,
   ProjectInfo,
@@ -92,7 +100,11 @@ import type {
   RunSqlRequest,
   SavedQuery,
   SavedQuerySummary,
+  SchemaChangeRequest,
+  SchemaChangeResponse,
+  Table,
   TenantName,
+  TypeCatalog,
   UpdateAppUserRequest,
   UpdateBranchRequest,
   UpdateDatabaseRequest,
@@ -2071,6 +2083,131 @@ export const useCreateMerge = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getCreateMergeMutationOptions(options), queryClient);
     }
 
+export const getListObjectsUrl = (id: string,
+    branchId: string,
+    params?: ListObjectsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/objects?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/objects`
+}
+
+/**
+ * Every relation the table API shows in one Postgres database of a branch (system schemas and Chelabase's own objects left out), with its kind, estimated rows, size and whether the table API edits it (`editable`: ordinary tables only).
+ * @summary The database's tables, views and other relations
+ */
+export const listObjects = async (id: string,
+    branchId: string,
+    params?: ListObjectsParams, options?: Parameters<typeof customFetch>[1]): Promise<ObjectList> => {
+
+  return customFetch<ObjectList>(getListObjectsUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListObjectsQueryKey = (id: string,
+    branchId: string,
+    params?: ListObjectsParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/objects`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getListObjectsQueryOptions = <TData = Awaited<ReturnType<typeof listObjects>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    params?: ListObjectsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listObjects>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListObjectsQueryKey(id,branchId,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listObjects>>> = ({ signal }) => listObjects(id,branchId,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listObjects>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListObjectsQueryResult = NonNullable<Awaited<ReturnType<typeof listObjects>>>
+export type ListObjectsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListObjects<TData = Awaited<ReturnType<typeof listObjects>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params: undefined |  ListObjectsParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listObjects>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listObjects>>,
+          TError,
+          Awaited<ReturnType<typeof listObjects>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListObjects<TData = Awaited<ReturnType<typeof listObjects>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: ListObjectsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listObjects>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listObjects>>,
+          TError,
+          Awaited<ReturnType<typeof listObjects>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListObjects<TData = Awaited<ReturnType<typeof listObjects>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: ListObjectsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listObjects>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary The database's tables, views and other relations
+ */
+
+export function useListObjects<TData = Awaited<ReturnType<typeof listObjects>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: ListObjectsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listObjects>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListObjectsQueryOptions(id,branchId,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
 export const getUpdatePgDatabaseUrl = (id: string,
     branchId: string,
     name: string,) => {
@@ -3147,6 +3284,98 @@ export function useListRoleSessions<TData = Awaited<ReturnType<typeof listRoleSe
 
 
 
+export const getApplySchemaChangesUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/schema-changes`
+}
+
+/**
+ * Renders the operations to SQL (names quoted, expressions as given, each exactly one SQL expression) and runs them on one of the branch's Postgres databases as the owner (Admin only) or, with `role`, as that role (the SQL editor's session: your member role, then `SET ROLE`), in one transaction with `lock_timeout` (`lock_timeout_ms`, default 5000) and `statement_timeout` (60 s; 15 s for a dry run). A dry run runs the same statements and always rolls back; it evaluates your expressions (defaults, checks, `USING`), so their non-transactional side effects (e.g. `nextval`) remain. A statement that may rewrite a table over `CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES` (default 256 MiB), and every one after it, is only rendered in a dry run (`skipped`), and then `would_succeed` is null. A table the request names that doesn't exist (and no earlier operation creates) is 404 with its `op_index`. Drops end `RESTRICT` and a request with drops returns `dependents`: what `CASCADE` would also remove beyond the request's own drop targets and their parts, and their `hash`. When something depends on a drop and the request confirms no cascade, the dry run and the real run alike answer 409 `has_dependents` with `dependents`, and change nothing. To cascade, send that hash as `cascade.dependents_hash`: the run (dry or real) locks the drop targets' tables, reads the dependents again, and refuses with 409 `dependents_changed` when they differ or when Postgres reports dropping anything but them and the parts of the request's other drop targets (drops that reach each other, e.g. a parent table and its child, need the hash of no dependents); a drop whose target an earlier drop of the request already removed is `skipped` (`already_dropped`). A `CONCURRENTLY` index operation must be the request's only operation: it runs outside a transaction (`statement_timeout` 900 s; a dry run only checks it), can't cascade, and when its build fails after creating its index, that INVALID index is dropped (another index of the same name never is). Postgres errors keep their fields (`op_index`, `sqlstate`, `message`, `detail`, `hint`, `position`; `dry_run: true` on a dry run). Each request is logged with its operation count, never its SQL.
+ * @summary Change tables, columns, constraints, indexes, policies, grants and enums
+ */
+export const applySchemaChanges = async (id: string,
+    branchId: string,
+    schemaChangeRequest: SchemaChangeRequest, options?: Parameters<typeof customFetch>[1]): Promise<SchemaChangeResponse> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<SchemaChangeResponse>(getApplySchemaChangesUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(schemaChangeRequest)
+  }
+);}
+
+
+
+
+
+export const getApplySchemaChangesMutationKey = () => ['applySchemaChanges'] as const;
+
+export const getApplySchemaChangesMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof applySchemaChanges>>, TError,ApplySchemaChangesMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof applySchemaChanges>>, TError,ApplySchemaChangesMutationVariables, TContext> => {
+
+const mutationKey = getApplySchemaChangesMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof applySchemaChanges>>, ApplySchemaChangesMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  applySchemaChanges(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ApplySchemaChangesMutationResult = NonNullable<Awaited<ReturnType<typeof applySchemaChanges>>>
+    export type ApplySchemaChangesMutationBody = SchemaChangeRequest
+    export type ApplySchemaChangesMutationError = ErrorType<ErrorEnvelope>
+    export type ApplySchemaChangesMutationVariables = {id: string;branchId: string;data: SchemaChangeRequest}
+
+    /**
+ * @summary Change tables, columns, constraints, indexes, policies, grants and enums
+ */
+export const useApplySchemaChanges = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof applySchemaChanges>>, TError,ApplySchemaChangesMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof applySchemaChanges>>,
+        TError,
+        ApplySchemaChangesMutationVariables,
+        TContext
+      > => {
+      return useMutation(getApplySchemaChangesMutationOptions(options), queryClient);
+    }
+
 export const getRunSqlUrl = (id: string,
     branchId: string,) => {
 
@@ -3431,6 +3660,464 @@ export function useGetSqlSchema<TData = Awaited<ReturnType<typeof getSqlSchema>>
  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
 
   const queryOptions = getGetSqlSchemaQueryOptions(id,branchId,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getGetTableUrl = (id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params?: GetTableParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/tables/${encodeURIComponent(String(schema))}/${encodeURIComponent(String(table))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/tables/${encodeURIComponent(String(schema))}/${encodeURIComponent(String(table))}`
+}
+
+/**
+ * The table's columns, constraints, indexes, triggers, policies, privileges and comment, as the schema merge reads them. Only ordinary tables are returned: a view, a partition child or a missing table is 404 (the object list's `editable` says why).
+ * @summary One ordinary table's structure
+ */
+export const getTable = async (id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params?: GetTableParams, options?: Parameters<typeof customFetch>[1]): Promise<Table> => {
+
+  return customFetch<Table>(getGetTableUrl(id,branchId,schema,table,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetTableQueryKey = (id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params?: GetTableParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/tables/${schema}/${table}`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getGetTableQueryOptions = <TData = Awaited<ReturnType<typeof getTable>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params?: GetTableParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTable>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetTableQueryKey(id,branchId,schema,table,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getTable>>> = ({ signal }) => getTable(id,branchId,schema,table,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && schema !== null && schema !== undefined && table !== null && table !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getTable>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetTableQueryResult = NonNullable<Awaited<ReturnType<typeof getTable>>>
+export type GetTableQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetTable<TData = Awaited<ReturnType<typeof getTable>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params: undefined |  GetTableParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTable>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getTable>>,
+          TError,
+          Awaited<ReturnType<typeof getTable>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetTable<TData = Awaited<ReturnType<typeof getTable>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params?: GetTableParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTable>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getTable>>,
+          TError,
+          Awaited<ReturnType<typeof getTable>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetTable<TData = Awaited<ReturnType<typeof getTable>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params?: GetTableParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTable>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary One ordinary table's structure
+ */
+
+export function useGetTable<TData = Awaited<ReturnType<typeof getTable>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    params?: GetTableParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTable>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetTableQueryOptions(id,branchId,schema,table,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getGetCellUrl = (id: string,
+    branchId: string,
+    schema: string,
+    table: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/tables/${encodeURIComponent(String(schema))}/${encodeURIComponent(String(table))}/cell`
+}
+
+/**
+ * The whole value of one column of the row with the given primary key, as text (a grid's preview cuts long values). `key` names exactly the primary key's columns; strings bind as given, numbers and booleans as their JSON text, compared at the column's type without its length or precision (never cut or rounded to fit). A value over 64 MiB is 413.
+ * @summary One cell's full value
+ */
+export const getCell = async (id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    cellRequest: CellRequest, options?: Parameters<typeof customFetch>[1]): Promise<CellValue> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<CellValue>(getGetCellUrl(id,branchId,schema,table),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(cellRequest)
+  }
+);}
+
+
+
+
+
+export const getGetCellMutationKey = () => ['getCell'] as const;
+
+export const getGetCellMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof getCell>>, TError,GetCellMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof getCell>>, TError,GetCellMutationVariables, TContext> => {
+
+const mutationKey = getGetCellMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof getCell>>, GetCellMutationVariables> = (props) => {
+          const {id,branchId,schema,table,data} = props ?? {};
+
+          return  getCell(id,branchId,schema,table,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type GetCellMutationResult = NonNullable<Awaited<ReturnType<typeof getCell>>>
+    export type GetCellMutationBody = CellRequest
+    export type GetCellMutationError = ErrorType<ErrorEnvelope>
+    export type GetCellMutationVariables = {id: string;branchId: string;schema: string;table: string;data: CellRequest}
+
+    /**
+ * @summary One cell's full value
+ */
+export const useGetCell = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof getCell>>, TError,GetCellMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof getCell>>,
+        TError,
+        GetCellMutationVariables,
+        TContext
+      > => {
+      return useMutation(getGetCellMutationOptions(options), queryClient);
+    }
+
+export const getInsertDefaultRowUrl = (id: string,
+    branchId: string,
+    schema: string,
+    table: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/tables/${encodeURIComponent(String(schema))}/${encodeURIComponent(String(table))}/rows/default`
+}
+
+/**
+ * Runs `INSERT INTO <table> DEFAULT VALUES` in one committed transaction (as the owner, or as `role`) and returns the inserted row as JSON. A table whose columns have no defaults fails with the constraint's error (`constraint_violation`).
+ * @summary Insert a row of all defaults
+ */
+export const insertDefaultRow = async (id: string,
+    branchId: string,
+    schema: string,
+    table: string,
+    defaultRowRequest: DefaultRowRequest, options?: Parameters<typeof customFetch>[1]): Promise<DefaultRow> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<DefaultRow>(getInsertDefaultRowUrl(id,branchId,schema,table),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(defaultRowRequest)
+  }
+);}
+
+
+
+
+
+export const getInsertDefaultRowMutationKey = () => ['insertDefaultRow'] as const;
+
+export const getInsertDefaultRowMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof insertDefaultRow>>, TError,InsertDefaultRowMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof insertDefaultRow>>, TError,InsertDefaultRowMutationVariables, TContext> => {
+
+const mutationKey = getInsertDefaultRowMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof insertDefaultRow>>, InsertDefaultRowMutationVariables> = (props) => {
+          const {id,branchId,schema,table,data} = props ?? {};
+
+          return  insertDefaultRow(id,branchId,schema,table,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type InsertDefaultRowMutationResult = NonNullable<Awaited<ReturnType<typeof insertDefaultRow>>>
+    export type InsertDefaultRowMutationBody = DefaultRowRequest
+    export type InsertDefaultRowMutationError = ErrorType<ErrorEnvelope>
+    export type InsertDefaultRowMutationVariables = {id: string;branchId: string;schema: string;table: string;data: DefaultRowRequest}
+
+    /**
+ * @summary Insert a row of all defaults
+ */
+export const useInsertDefaultRow = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof insertDefaultRow>>, TError,InsertDefaultRowMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof insertDefaultRow>>,
+        TError,
+        InsertDefaultRowMutationVariables,
+        TContext
+      > => {
+      return useMutation(getInsertDefaultRowMutationOptions(options), queryClient);
+    }
+
+export const getListTypesUrl = (id: string,
+    branchId: string,
+    params?: ListTypesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/types?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/types`
+}
+
+/**
+ * Every type a column can take in one Postgres database of a branch (base, enum, domain, composite, range and multirange types, with their oids), for a type picker and for joining a table's columns by `type_oid`.
+ * @summary The database's types
+ */
+export const listTypes = async (id: string,
+    branchId: string,
+    params?: ListTypesParams, options?: Parameters<typeof customFetch>[1]): Promise<TypeCatalog> => {
+
+  return customFetch<TypeCatalog>(getListTypesUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListTypesQueryKey = (id: string,
+    branchId: string,
+    params?: ListTypesParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/types`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getListTypesQueryOptions = <TData = Awaited<ReturnType<typeof listTypes>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    params?: ListTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTypes>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListTypesQueryKey(id,branchId,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listTypes>>> = ({ signal }) => listTypes(id,branchId,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listTypes>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListTypesQueryResult = NonNullable<Awaited<ReturnType<typeof listTypes>>>
+export type ListTypesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListTypes<TData = Awaited<ReturnType<typeof listTypes>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params: undefined |  ListTypesParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTypes>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listTypes>>,
+          TError,
+          Awaited<ReturnType<typeof listTypes>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListTypes<TData = Awaited<ReturnType<typeof listTypes>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: ListTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTypes>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listTypes>>,
+          TError,
+          Awaited<ReturnType<typeof listTypes>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListTypes<TData = Awaited<ReturnType<typeof listTypes>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: ListTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTypes>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary The database's types
+ */
+
+export function useListTypes<TData = Awaited<ReturnType<typeof listTypes>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: ListTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTypes>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListTypesQueryOptions(id,branchId,params,options)
 
   const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
 

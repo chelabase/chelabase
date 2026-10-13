@@ -84,6 +84,7 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}` | Zitadel token | Project Developer |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}/rotate` | Zitadel token | Project Developer |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/merges` | Zitadel token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/objects` | Zitadel token | Project Viewer |
 | PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}` | Zitadel token | Project Admin |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Zitadel token | Project Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Zitadel token | Project Admin |
@@ -96,9 +97,14 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Zitadel token | Project Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/reset-password` | Zitadel token | Project Admin |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/sessions` | Zitadel token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/schema-changes` | Zitadel token | Act as, by branch: Developer unprotected, Admin protected, and the role in your set |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql` | Zitadel token | Act as: Developer and the role in your set |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/runs/\{run_id\}/cancel` | Zitadel token | Project Developer |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/schema` | Zitadel token | Act as: Developer and the role in your set |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}` | Zitadel token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/cell` | Zitadel token | Act as: Viewer and the role in your set |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/rows/default` | Zitadel token | Act as: Developer and the role in your set |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/types` | Zitadel token | Project Viewer |
 | GET | `/v1/databases/\{id\}/connection` | Zitadel token | Project Admin |
 | GET | `/v1/databases/\{id\}/merges` | Zitadel token | Project Viewer |
 | GET | `/v1/databases/\{id\}/merges/\{merge_id\}` | Zitadel token | Project Viewer |

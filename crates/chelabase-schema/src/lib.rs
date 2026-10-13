@@ -13,6 +13,7 @@
 pub mod analysis;
 pub mod catalog;
 pub mod compare;
+pub mod ddl;
 pub mod error;
 pub mod exclusions;
 pub mod export;
