@@ -1,11 +1,14 @@
-//! Against a real Docker daemon and the Neon compute image (`just deps-up` pulls or builds it).
+//! Against a real Docker daemon and the Neon compute image (the workbench stack pulls or builds it).
 //!
 //! ```sh
-//! cargo test -p chelabase-neon --test docker_backend_live -- --ignored --test-threads=1
+//! just workbench test -p chelabase-neon --test docker_backend_live -- --run-ignored only
 //! ```
 //!
-//! `admin_sql_on_a_running_compute` also needs `just dev` running and `CHELABASE_LIVE_ENDPOINT`
-//! set to the endpoint id (`ep-…`, the host's first label) of a database created through the API or Studio.
+//! `admin_sql_on_a_running_compute` also needs the stack up and `CHELABASE_LIVE_ENDPOINT` set to
+//! the endpoint id (`ep-…`, the host's first label) of a database created through the API or
+//! Studio. It reads the stack's `CHELABASE_STACK` (default `main`), `CHELABASE_COMPUTE_NETWORK`
+//! (default `chelabase_default`) and `CHELABASE_CONTROL_PLANE_URI` (default
+//! `http://orchestrator:8083`).
 
 use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend};
 
@@ -25,19 +28,20 @@ fn compute_image() -> String {
         .expect("COMPUTE_NODE_IMAGE in the script's output")
 }
 
-/// The port of `CHELABASE_INTERNAL_ADDR` (`host:port`), 8083 by default.
-fn internal_port() -> u16 {
-    std::env::var("CHELABASE_INTERNAL_ADDR")
+/// The variable `name`, or `default` when it's unset or blank.
+fn env_or(name: &str, default: &str) -> String {
+    std::env::var(name)
         .ok()
-        .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse().ok()))
-        .unwrap_or(8083)
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
-fn backend(network: &str, control_plane_uri: &str) -> DockerBackend {
+fn backend(network: &str, control_plane_uri: &str, stack: &str) -> DockerBackend {
     DockerBackend::connect(ComputeSettings {
         image: compute_image(),
         network: network.to_string(),
         control_plane_uri: control_plane_uri.to_string(),
+        stack: stack.to_string(),
     })
     .unwrap()
 }
@@ -45,7 +49,7 @@ fn backend(network: &str, control_plane_uri: &str) -> DockerBackend {
 #[tokio::test]
 #[ignore = "needs Docker and the compute image"]
 async fn lifecycle() {
-    let backend = backend("bridge", "http://127.0.0.1:9");
+    let backend = backend("bridge", "http://127.0.0.1:9", "livetest");
     let ep = "ep-livetest0001";
     backend.delete(ep).await.unwrap();
 
@@ -69,12 +73,13 @@ async fn lifecycle() {
 }
 
 #[tokio::test]
-#[ignore = "needs CHELABASE_LIVE_ENDPOINT: the endpoint id of a database created through the API or Studio with `just dev`"]
+#[ignore = "needs CHELABASE_LIVE_ENDPOINT: the endpoint id of a database created through the API or Studio on the workbench stack"]
 async fn admin_sql_on_a_running_compute() {
     let ep = std::env::var("CHELABASE_LIVE_ENDPOINT").expect("CHELABASE_LIVE_ENDPOINT");
     let backend = backend(
-        "chelabase_default",
-        &format!("http://host.docker.internal:{}", internal_port()),
+        &env_or("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
+        &env_or("CHELABASE_CONTROL_PLANE_URI", "http://orchestrator:8083"),
+        &env_or("CHELABASE_STACK", "main"),
     );
 
     let out = backend

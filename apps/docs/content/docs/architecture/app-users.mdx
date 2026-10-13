@@ -23,7 +23,7 @@ The token key pair is made once by `chelabase dev bootstrap` (`.chelabase/auth/a
 Zitadel is the source of truth. Three paths copy users into the table on every live branch of the auth database:
 
 - **Write-through** from Chelabase's own flows (sign-up, the platform admin).
-- **Webhooks.** `chelabase dev bootstrap` creates one instance-wide Zitadel Actions v2 target that points at the orchestrator's internal listener (`POST /internal/zitadel/events`), with an execution on user events, and writes its signing key to `.chelabase/zitadel/actions.env` (sourced by `just`). The orchestrator checks the signature (401 for a bad one, 503 when no key is configured) and ignores events from other organizations. A user event publishes a sync job; a password change also revokes the user's sessions made before it. Compose relaxes Zitadel's `ZITADEL_HTTPCLIENT_DENYLIST` so Zitadel may call the host (self-hosted dev only).
+- **Webhooks.** `chelabase dev bootstrap` creates one instance-wide Zitadel Actions v2 target that points at the orchestrator's internal listener (`POST /internal/zitadel/events`), with an execution on user events, and writes its signing key to the stack's `zitadel/actions.env` (`.chelabase/stacks/<slug>/zitadel/actions.env`; Compose passes it to the orchestrator). The orchestrator checks the signature (401 for a bad one, 503 when no key is configured) and ignores events from other organizations. A user event publishes a sync job; a password change also revokes the user's sessions made before it. Compose relaxes Zitadel's `ZITADEL_HTTPCLIENT_DENYLIST` so Zitadel may call the orchestrator on the stack's private network (`orchestrator:8083`; self-hosted dev only).
 - **Reconcile.** Every `CHELABASE_APP_USERS_RECONCILE_SECS` (default 300) per enabled project, and right after a branch of the auth database is created, the worker compares the organization's users with each branch's rows and syncs every difference. The same pass reruns enables, disables and project deletes that have been stuck for 5 minutes, and purges sessions that were revoked or expired more than 7 days ago.
 
 The sync writes rows as the `chelabase_auth_sync` role. A guard trigger refuses inserts, deletes and changes to managed columns from any other role, so rows are Chelabase's to create and delete.
@@ -32,11 +32,11 @@ The sync writes rows as the `chelabase_auth_sync` role. A guard trigger refuses 
 
 | Variable | Default | Read by |
 | --- | --- | --- |
-| `CHELABASE_ZITADEL_ADMIN_PAT_FILE` | from `demo.env` (`.chelabase/zitadel/admin.pat`) | orchestrator, worker, auth (organization and user admin; without it app-user routes answer 503 and jobs wait) |
-| `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | from `demo.env` | auth signs, the gateway verifies |
+| `CHELABASE_ZITADEL_ADMIN_PAT_FILE` | from `demo.env` (the stack's `zitadel/admin.pat`) | orchestrator, worker, auth (organization and user admin; without it app-user routes answer 503 and jobs wait) |
+| `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | from the stack's `stack.env` (`.chelabase/auth/app-jwt.key` / `.pub`) | auth signs, the gateway verifies |
 | `CHELABASE_APP_AUTH_INTERNAL_TOKEN` | `chelabase-dev-app-auth` | auth to the orchestrator's internal app routes |
 | `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | gateway to session liveness |
-| `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY` | from `.chelabase/zitadel/actions.env` | orchestrator (webhook signatures) |
+| `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY` | from the stack's `zitadel/actions.env` | orchestrator (webhook signatures) |
 | `CHELABASE_APP_ACCESS_TTL_SECS` | `900` (60 to 86400) | auth |
 | `CHELABASE_APP_REFRESH_TTL_SECS` | `2592000` (30 days; at most 90 days) | orchestrator |
 | `CHELABASE_APP_USERS_RECONCILE_SECS` | `300` (30 to 86400) | worker |
@@ -46,4 +46,4 @@ The default internal tokens are for local development only.
 
 ## Tests
 
-`just app-users-e2e` (needs `just dev`) runs the whole story live: enabling app users, sign-up and sign-in, row-level security on the users table, branches receiving the rows, a webhook sync, refresh rotation and reuse detection, and project deletion. `app_users_live` (`cargo test -p worker --test app_users_live -- --ignored --test-threads=1`, with the environment named in the file's header) covers the bootstrap, the guard and the worker's enable, sync, resync and disable against a real compute and Zitadel.
+`just app-users-e2e` (runs on your checkout's stack) runs the whole story live: enabling app users, sign-up and sign-in, row-level security on the users table, branches receiving the rows, a webhook sync, refresh rotation and reuse detection, and project deletion. `app_users_live` (`just workbench test -p worker --test app_users_live -- --run-ignored only`) covers the bootstrap, the guard and the worker's enable, sync, resync and disable against a real compute and Zitadel.

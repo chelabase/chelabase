@@ -4,6 +4,8 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub const SECRETS_KEY_FILE: &str = "secrets.key";
+/// Auth's cookie key, in the auth dir (created with [`ensure_file`]).
+pub const COOKIE_KEY_FILE: &str = "cookie.key";
 
 /// Create `dir/secrets.key` once (0600) and return its absolute path. Never
 /// overwrites: existing encrypted passwords depend on this key.

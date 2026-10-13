@@ -57,12 +57,15 @@ for name in CHELABASE_AUTH_HOST_NAME CHELABASE_PUBLIC_PORT CHELABASE_PUBLIC_SECU
   fi
 done
 
-# Compose gets the derived values too: deps-up sources entry.sh before starting Zitadel.
-deps_up="$(awk '/^deps-up:/{f=1;next} f&&/^[^ \t#]/{f=0} f' justfile)"
-if ! grep -q "scripts/lib/entry.sh" <<<"$deps_up"; then
-  echo "entry-sh: the deps-up recipe doesn't source scripts/lib/entry.sh" >&2
-  fail=1
-fi
+# Compose gets the derived values too: the recipes that start Zitadel load the stack's env
+# (stack.env carries the entry values) before they run.
+for recipe in zitadel-reset zitadel-bootstrap; do
+  body="$(awk -v r="^${recipe}[ :]" '$0 ~ r {f=1;next} f&&/^[^ \t#]/{f=0} f' justfile)"
+  if ! grep -qE '\. "\$\(.*workbench env' <<<"$body"; then
+    echo "entry-sh: the $recipe recipe doesn't load the stack's env (workbench env)" >&2
+    fail=1
+  fi
+done
 
 
 # --- End-of-step review: entry.sh derives what Entry derives -------------------------------

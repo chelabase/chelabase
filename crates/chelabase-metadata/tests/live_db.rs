@@ -1,4 +1,4 @@
-//! Opt-in tests against a real metadata Postgres (`just deps-up` first):
+//! Opt-in tests against a real metadata Postgres (the workbench stack first):
 //!
 //! ```sh
 //! cargo test -p chelabase-metadata --test live_db -- --ignored --test-threads=1
@@ -29,11 +29,11 @@ use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
 
 async fn client() -> MetadataClient {
     let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".to_string()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
     });
     let client = MetadataClient::connect(&MetadataConfig { database_url })
         .await
-        .expect("metadata Postgres reachable (just deps-up)");
+        .expect("metadata Postgres reachable (is the workbench stack up?)");
     client.migrate().await.unwrap();
     sweep_leftovers(&client).await;
     client
@@ -359,7 +359,7 @@ const KEY_CHECK_LOCK: i64 = 7_310_001;
 async fn advisory_lock(statement: &'static str) -> sqlx::PgConnection {
     use sqlx::Connection;
     let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".to_string()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
     });
     let mut conn = sqlx::PgConnection::connect(&database_url).await.unwrap();
     sqlx::query(statement).bind(KEY_CHECK_LOCK).execute(&mut conn).await.unwrap();
@@ -816,13 +816,13 @@ async fn tenant_overview_hides_deleted_databases() {
 /// A pool that doesn't run the migrations (for scratch-schema tests).
 async fn raw_pool() -> sqlx::PgPool {
     let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".to_string()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
     });
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
         .await
-        .expect("metadata Postgres reachable (just deps-up)")
+        .expect("metadata Postgres reachable (is the workbench stack up?)")
 }
 
 fn new_branch<'a>(db: DatabaseId, name: &'a str, parent: BranchId) -> NewBranch<'a> {
@@ -1648,13 +1648,13 @@ async fn migration_backfills_main_for_live_databases_only() {
     use sqlx::Row;
 
     let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".to_string()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
     });
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
         .await
-        .expect("metadata Postgres reachable (just deps-up)");
+        .expect("metadata Postgres reachable (is the workbench stack up?)");
     let schema = format!("step5_migration_{}", hex32());
     let mut conn = pool.acquire().await.unwrap();
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}; SET search_path TO {schema};")))

@@ -1,5 +1,5 @@
 //! Live tests of members, grants, invites and the access log, each on its own scratch database
-//! of the metadata Postgres (`just deps-up`), migrated from scratch:
+//! of the metadata Postgres (the workbench stack), migrated from scratch:
 //!
 //! ```sh
 //! cargo test -p chelabase-metadata --test members_live -- --ignored
@@ -26,7 +26,7 @@ const STALE_AFTER_SECS: u64 = 3600;
 
 fn url() -> String {
     std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()
     })
 }
 
@@ -61,7 +61,7 @@ impl Scratch {
             .max_connections(1)
             .connect(&url())
             .await
-            .expect("metadata Postgres reachable (just deps-up)");
+            .expect("metadata Postgres reachable (is the workbench stack up?)");
         sweep_stale(&meta).await;
         let random = Uuid::new_v4().simple().to_string();
         let name = format!("cm_{:08x}{}", now_secs() as u32, &random[..4]);
@@ -217,7 +217,7 @@ fn week() -> chrono::DateTime<Utc> {
 const TOKEN: [u8; 32] = [7; 32];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn first_claim_is_atomic() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -268,7 +268,7 @@ async fn first_claim_is_atomic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn concurrent_demotions_keep_an_admin() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -429,7 +429,7 @@ async fn run_model(s: &Scratch, steps: Vec<Vec<Op>>) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 fn last_admin_model() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -452,7 +452,7 @@ fn last_admin_model() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn access_events_are_append_only() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -484,7 +484,7 @@ async fn access_events_are_append_only() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn owner_is_never_stored() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -608,7 +608,7 @@ async fn owner_is_never_stored() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn invited_becomes_active_on_ensure() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -670,7 +670,7 @@ async fn invited_becomes_active_on_ensure() {
 // expired, a sign-in (a password the person already had) changes nothing; a resend opens it
 // again.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn expired_invite_does_not_activate() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -713,7 +713,7 @@ async fn expired_invite_does_not_activate() {
 // M7: the fresh-install race window reads the `admin_claimed` event: true after the claim, false
 // for a tenant whose admin was set another way, and false once the window is past.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn admin_claimed_since_reads_the_claim_event() {
     let s = Scratch::new().await;
     let hour_ago = Utc::now() - Duration::hours(1);
@@ -732,7 +732,7 @@ async fn admin_claimed_since_reads_the_claim_event() {
 // land: under the member's lock the second finds the first's change (`Changed`) and writes
 // nothing. Two connections race 20 times; and a stale observation is refused outright.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn grant_and_override_race_keeps_the_invariant() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -804,7 +804,7 @@ async fn grant_and_override_race_keeps_the_invariant() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn removed_stays_removed() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -904,7 +904,7 @@ async fn removed_stays_removed() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn override_unique_per_member_and_database() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1017,7 +1017,7 @@ async fn override_unique_per_member_and_database() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn every_write_logs_one_event() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1220,7 +1220,7 @@ async fn every_write_logs_one_event() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn branch_roles_and_project_branches() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1295,7 +1295,7 @@ async fn branch_roles_and_project_branches() {
 // T8 fix round: what the member-role reconciler reads in one query per branch, the branches
 // its sweep visits, and the rows a reset or restore forgets.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn reconciler_reads_grants_branches_and_forgets_rows() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1367,7 +1367,7 @@ async fn email_of(s: &Scratch, t: TenantId, zid: &str) -> Option<String> {
 
 // R8: a new member's claim takes an email a stale member still holds; it never fails.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn newest_email_claim_wins() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1406,7 +1406,7 @@ async fn newest_email_claim_wins() {
 // R8 on the refresh and activation paths: the claimed email moves to the claimant, with no
 // event, and the name refreshes with it.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn refresh_takes_email_from_stale_holder() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1476,7 +1476,7 @@ async fn refresh_takes_email_from_stale_holder() {
 
 // R8 under concurrency: claims racing for one email leave exactly one holder, and none fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn concurrent_email_claims_leave_one_holder() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1511,7 +1511,7 @@ async fn concurrent_email_claims_leave_one_holder() {
 
 // M8: re-inviting a removed or revoked Zitadel user reuses its row, with nothing left over.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn reinvite_reuses_a_removed_row() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1576,7 +1576,7 @@ async fn reinvite_reuses_a_removed_row() {
 
 // M8: another tenant's projects and databases are NotFound, with no row and no event.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn tenant_isolation_is_not_found() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1626,7 +1626,7 @@ async fn tenant_isolation_is_not_found() {
 
 // M8 and M4: the bootstrap activates an invited member and takes a held email (R8).
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn bootstrap_activates_an_invited_member() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1663,7 +1663,7 @@ async fn bootstrap_activates_an_invited_member() {
 
 // M2: concurrent identical first puts log one event and neither fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn concurrent_first_puts_log_one_event() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1719,7 +1719,7 @@ async fn concurrent_first_puts_log_one_event() {
 // T7: the member API's reads: by id, by email (trimmed and lowercased, never a NULL or removed
 // one, R8), the open invites, and a project's grants with its databases' overrides.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn member_api_reads() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1784,7 +1784,7 @@ async fn member_api_reads() {
 // `member_added` event; a removed one comes back active (not admin, old grants gone); a live
 // one is `Conflict`; the email is taken from any other live holder (R8).
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn existing_user_is_added_active() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1841,7 +1841,7 @@ async fn existing_user_is_added_active() {
 // T7 fix I3 and M6: an existing member's invite puts all its grants in one transaction (all or
 // nothing, one event per changed grant); an unchanged grant writes nothing and says so.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn put_grants_is_all_or_nothing() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1882,7 +1882,7 @@ async fn put_grants_is_all_or_nothing() {
 
 // T7 fix M1 (R9): only an active member may become a tenant admin, checked under the lock.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn promoting_an_invited_member_conflicts() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1904,7 +1904,7 @@ async fn promoting_an_invited_member_conflicts() {
 // T7 fix M3: a project's access log also lists the events whose grants name the project
 // (invites, additions and removals); an invite or addition with one grant carries its project.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn project_events_include_listed_grants() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1945,7 +1945,7 @@ async fn project_events_include_listed_grants() {
 // rows are kept), a soft-deleted project resolves to its last name, a project row that is gone
 // to nothing.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn access_events_join_names() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -1997,7 +1997,7 @@ async fn access_events_join_names() {
 // T12x: `has_access` is a tenant admin or at least one project grant; an override alone doesn't
 // count. `created_at` is the member row's.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn member_listings_report_has_access() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -2049,7 +2049,7 @@ async fn member_listings_report_has_access() {
 // T12x: an invite is described by (Zitadel user, token hash) while it is open; the hash is
 // replaced by a resend and every closed invite describes as nothing.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn invite_description_follows_the_open_invite() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -2080,7 +2080,7 @@ async fn invite_description_follows_the_open_invite() {
 
 // R36: the display name is nullable, never empty or padded, and a change writes one event.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn tenant_display_name_round_trip() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -2125,7 +2125,7 @@ async fn tenant_display_name_round_trip() {
 
 // R40: a person who signs up under open sign-up is pending; an admin approves or declines.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn pending_member_lifecycle() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
@@ -2219,7 +2219,7 @@ async fn pending_member_lifecycle() {
 // M2: the bootstrap's `NAME_SQL` (psql variables swapped for bind parameters) names a tenant
 // once, trimmed and cut to the column's rules, and logs one event.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn bootstrap_names_the_tenant_once() {
     const NAME_SQL: &str = include_str!("../../../tools/cli/src/dev/tenant_name.sql");
     let s = Scratch::new().await;
@@ -2264,7 +2264,7 @@ async fn bootstrap_names_the_tenant_once() {
 // writes exactly what `bootstrap_admin` writes, on every starting state: members and events
 // alike (ids and times aside), and a repeat writes nothing.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn bootstrap_admin_sql_matches_the_metadata_crate() {
     const ADMIN_SQL: &str = include_str!("../../../tools/cli/src/dev/tenant_admin.sql");
     let s = Scratch::new().await;
@@ -2374,7 +2374,7 @@ async fn bootstrap_admin_sql_matches_the_metadata_crate() {
 // A pending member has no grants or overrides until an admin approves it, so a write that would
 // give it some is refused ("approve first"), even one that only deletes.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn member_status_write_matrix() {
     #[derive(Clone, Copy)]
     enum Write {

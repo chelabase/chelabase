@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Data API round-trip benchmark (step 6e), needs just deps-up and just dev (run it through just live).
+# Data API round-trip benchmark (step 6e), needs the stack: just workbench up (run it through just bench-data-api).
 # Creates a throwaway database, finds its compute container, runs tools/bench-data-api (which adds
 # netem delay on the container's eth0), and always removes the qdisc and the database afterwards.
 # Extra args go to the harness (--quick, --rtts-ms 0,0.5,2, ...). Without --quick (or --no-throughput) the results go to
@@ -14,7 +14,7 @@ LOG_PREFIX=bench-data-api
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
-INTERNAL_URL="${CHELABASE_INTERNAL_URL:-http://127.0.0.1:8083}"
+INTERNAL_URL="${CHELABASE_INTERNAL_URL:-${CHELABASE_CONTROL_PLANE_URI:-http://orchestrator:8083}}"
 INTERNAL_TOKEN="${CHELABASE_REST_INTERNAL_TOKEN:-chelabase-dev-rest-internal}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
@@ -53,14 +53,15 @@ cleanup() {
 
 command -v docker >/dev/null || die "docker is missing"
 command -v jq >/dev/null || die "jq is missing"
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-ca="$root/.chelabase/neon/proxy-ca.crt"
-[[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
+ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
+[[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 trap cleanup EXIT
 
 # ok <method> <path> <expected status> [body]: the call, or die.
@@ -124,7 +125,7 @@ wait_db
 reveal
 pass "database $name ($db_id) is ready"
 
-# 2. The compute: the published Postgres address rest itself uses, and its container.
+# 2. The compute: the Postgres address rest itself uses (the compute on the stack network), and its container.
 code="$(curl -sS --max-time 10 -o "$tmp/conn" -w '%{http_code}' \
   -H "Authorization: Bearer $INTERNAL_TOKEN" \
   "$INTERNAL_URL/internal/data/branches/$db_id/connection" || true)"
@@ -132,24 +133,27 @@ code="$(curl -sS --max-time 10 -o "$tmp/conn" -w '%{http_code}' \
 chost="$(jq -r '.host' "$tmp/conn")"
 cport="$(jq -r '.port' "$tmp/conn")"
 [[ -n "$chost" && "$chost" != null && "$cport" =~ ^[0-9]+$ ]] || die "unexpected connection body: $(cat "$tmp/conn")"
-names="$(docker ps --filter label=chelabase.dev/endpoint-id --filter "publish=$cport" --format '{{.Names}}')"
-[[ -n "$names" && "$(wc -l <<<"$names")" -eq 1 ]] || die "wanted exactly one compute container publishing port $cport, got: ${names:-none}"
+ep="${bhost%%.*}"
+names="$(docker ps --filter "label=chelabase.dev/stack=$CHELABASE_STACK" --filter "label=chelabase.dev/endpoint-id=$ep" --format '{{.Names}}')"
+[[ -n "$names" && "$(wc -l <<<"$names")" -eq 1 ]] || die "wanted exactly one compute container for endpoint $ep in this stack, got: ${names:-none}"
 container="$names"
 pass "compute container $container ($chost:$cport)"
 
 # 3. The harness, straight to the compute (no proxy).
 pw_enc="$(jq -rn --arg p "$bpw" '$p|@uri')"
 owner_url="postgresql://postgres:$pw_enc@$chost:$cport/$bdb"
-cargo build -q --release -p bench-data-api || die "cargo build -p bench-data-api"
+# Built on the host by the recipe (the runner has no toolchain).
+bench_bin="${CHELABASE_BENCH_BIN:?run through: just bench-data-api}"
+[[ -x "$bench_bin" ]] || die "$bench_bin is missing (run through: just bench-data-api)"
 if [[ "$tests_only" == 1 ]]; then
   CHELABASE_INTERNAL_URL="$INTERNAL_URL" CHELABASE_REST_INTERNAL_TOKEN="$INTERNAL_TOKEN" \
-    target/release/bench-data-api \
+    "$bench_bin" \
     --owner-url "$owner_url" --branch "$db_id" --compute-container "$container" --seed-only ||
     die "seeding the fixture"
   pass "fixture seeded"
   BENCH_OWNER_URL="$owner_url" BENCH_BRANCH="$db_id" \
     CHELABASE_INTERNAL_URL="$INTERNAL_URL" CHELABASE_REST_INTERNAL_TOKEN="$INTERNAL_TOKEN" \
-    cargo test -p bench-data-api --test variants_live -- --ignored --test-threads=1 ||
+    "${CHELABASE_BENCH_TEST_BIN:?run through: just bench-data-api}" --ignored --test-threads=1 ||
     die "live tests"
   pass "live tests"
   echo "all passed ($((SECONDS - t0)) s)"
@@ -161,7 +165,7 @@ if [[ "$quick" == 0 && "$latency_only" == 0 ]]; then
   extra=(--results-md "docs/benchmarks/$(date +%F)-data-api-pipelining.md")
 fi
 CHELABASE_INTERNAL_URL="$INTERNAL_URL" CHELABASE_REST_INTERNAL_TOKEN="$INTERNAL_TOKEN" \
-  target/release/bench-data-api \
+  "$bench_bin" \
   --owner-url "$owner_url" --branch "$db_id" --compute-container "$container" \
   "${extra[@]}" "${args[@]}" || die "bench-data-api failed"
 pass "harness finished"

@@ -36,7 +36,7 @@ See [SQL editor](/docs/architecture/sql-editor) for the details.
 
 ## Local-only defaults
 
-- Email verification of sign-ups is off in self-hosted mode (`CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides it); self-sign-up itself is off unless a tenant admin switches it on, except on a fresh install: while a tenant has no member at all, anyone who can reach Studio can sign up and becomes its admin. Set the bootstrap admin (`just zitadel-bootstrap you@example.com`) before exposing Studio, and the window never opens; it stays open until the first bootstrap, and of two people racing for it only one claims the admin (the other is admitted as `pending`). On self-hosted dev, `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential: keep it private.
+- Email verification of sign-ups is off in self-hosted mode (`CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides it); self-sign-up itself is off unless a tenant admin switches it on, except on a fresh install: while a tenant has no member at all, anyone who can reach Studio can sign up and becomes its admin. Set the bootstrap admin (`just zitadel-bootstrap you@example.com`) before exposing Studio, and the window never opens; it stays open until the first bootstrap, and of two people racing for it only one claims the admin (the other is admitted as `pending`). On self-hosted dev, the stack's `zitadel/demo-sa.json` (`.chelabase/stacks/<slug>/zitadel/demo-sa.json`) is a tenant-admin credential: keep it private.
 - Everyone who joins Studio shares one workspace.
 - The Zitadel Actions target needs Zitadel's HTTP client denylist relaxed so it can call the host.
 - Key material under `.chelabase/` is created once and never overwritten.

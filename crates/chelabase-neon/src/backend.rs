@@ -9,8 +9,7 @@ use bollard::Docker;
 use bollard::errors::Error as DockerError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerCreateBody, ContainerStateStatusEnum, HostConfig, PortBinding, RestartPolicy,
-    RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerStateStatusEnum, HostConfig, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, ListContainersOptions, RemoveContainerOptions, StartContainerOptions,
@@ -19,8 +18,8 @@ use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::compute::{
-    COMPUTE_CTL_PORT, COMPUTE_TOKEN_ENV, ComputeLocator, DockerLocator, ENDPOINT_LABEL,
-    POSTGRES_PORT, compute_ctl_args, container_name,
+    COMPUTE_TOKEN_ENV, ComputeLocator, DockerLocator, ENDPOINT_LABEL, STACK_LABEL,
+    compute_ctl_args, container_name, list_filters,
 };
 
 const ADMIN_SQL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,6 +87,8 @@ pub struct ComputeSettings {
     pub image: String,
     pub network: String,
     pub control_plane_uri: String,
+    /// The stack the computes belong to: in their names and labels, and the only ones listed.
+    pub stack: String,
 }
 
 /// Lifecycle of computes plus admin SQL inside them.
@@ -102,7 +103,8 @@ pub trait ComputeBackend: ComputeLocator {
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = anyhow::Result<Option<ComputeStatus>>> + Send;
-    /// Endpoint ids of every container carrying ENDPOINT_LABEL, running or not.
+    /// Endpoint ids of every one of this stack's computes (ENDPOINT_LABEL and STACK_LABEL),
+    /// running or not.
     fn list(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
     /// Runs `sql` (stdin) with psql inside the compute, as `opts.user` (`cloud_admin` when
     /// `None`); returns stdout. A call that outlasts `opts.timeout` fails with [`SqlTimedOut`]
@@ -131,26 +133,24 @@ pub trait ComputeBackend: ComputeLocator {
 }
 
 /// The container to create for an endpoint. The token goes in the environment, never argv.
-/// compute_ctl and Postgres are published on loopback only, each on a random host port.
+/// Nothing is published on the host: the stack reaches a compute on the compute network.
 pub fn create_body(
     endpoint_id: &str,
     compute_token: &str,
     settings: &ComputeSettings,
 ) -> ContainerCreateBody {
-    let ports = [COMPUTE_CTL_PORT, POSTGRES_PORT].map(|p| format!("{p}/tcp"));
-    let loopback = || {
-        Some(vec![PortBinding {
-            host_ip: Some("127.0.0.1".to_string()),
-            host_port: Some("0".to_string()),
-        }])
-    };
     ContainerCreateBody {
         image: Some(settings.image.clone()),
         entrypoint: Some(vec!["/usr/local/bin/compute_ctl".to_string()]),
         cmd: Some(compute_ctl_args(endpoint_id, &settings.control_plane_uri)),
         env: Some(vec![format!("{COMPUTE_TOKEN_ENV}={compute_token}")]),
-        labels: Some([(ENDPOINT_LABEL.to_string(), endpoint_id.to_string())].into()),
-        exposed_ports: Some(ports.to_vec()),
+        labels: Some(
+            [
+                (ENDPOINT_LABEL.to_string(), endpoint_id.to_string()),
+                (STACK_LABEL.to_string(), settings.stack.clone()),
+            ]
+            .into(),
+        ),
         host_config: Some(HostConfig {
             network_mode: Some(settings.network.clone()),
             restart_policy: Some(RestartPolicy {
@@ -159,8 +159,6 @@ pub fn create_body(
             }),
             memory: Some(MEMORY_BYTES),
             nano_cpus: Some(NANO_CPUS),
-            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
-            port_bindings: Some(ports.into_iter().map(|p| (p, loopback())).collect()),
             ..Default::default()
         }),
         ..Default::default()
@@ -276,7 +274,7 @@ impl DockerBackend {
     /// Nothing is contacted yet.
     pub fn connect(settings: ComputeSettings) -> anyhow::Result<Self> {
         Ok(Self {
-            locator: DockerLocator::connect(&settings.network)?,
+            locator: DockerLocator::connect(&settings.network, &settings.stack)?,
             settings,
         })
     }
@@ -305,7 +303,7 @@ impl DockerBackend {
         sql: &str,
     ) -> anyhow::Result<String> {
         let docker = self.docker();
-        let name = container_name(endpoint_id);
+        let name = container_name(&self.settings.stack, endpoint_id);
         let exec = docker
             .create_exec(
                 &name,
@@ -386,7 +384,7 @@ impl ComputeLocator for DockerBackend {
 
 impl ComputeBackend for DockerBackend {
     async fn create(&self, endpoint_id: &str, compute_token: &str) -> anyhow::Result<()> {
-        let name = container_name(endpoint_id);
+        let name = container_name(&self.settings.stack, endpoint_id);
         let body = create_body(endpoint_id, compute_token, &self.settings);
         let create = || {
             self.docker().create_container(
@@ -415,7 +413,7 @@ impl ComputeBackend for DockerBackend {
     }
 
     async fn delete(&self, endpoint_id: &str) -> anyhow::Result<()> {
-        let name = container_name(endpoint_id);
+        let name = container_name(&self.settings.stack, endpoint_id);
         self.remove(&name)
             .await
             .with_context(|| format!("removing container {name}"))
@@ -436,7 +434,7 @@ impl ComputeBackend for DockerBackend {
             .docker()
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters: Some([("label".to_string(), vec![ENDPOINT_LABEL.to_string()])].into()),
+                filters: Some(list_filters(&self.settings.stack)),
                 ..Default::default()
             }))
             .await
@@ -782,8 +780,9 @@ mod tests {
     fn settings() -> ComputeSettings {
         ComputeSettings {
             image: "neon/compute-node-v17:test".to_string(),
-            network: "chelabase_default".to_string(),
-            control_plane_uri: "http://host.docker.internal:8083".to_string(),
+            network: "chelabase-feat-x_default".to_string(),
+            control_plane_uri: "http://orchestrator:8083".to_string(),
+            stack: "feat-x".to_string(),
         }
     }
 
@@ -798,7 +797,7 @@ mod tests {
         let cmd = body.cmd.unwrap();
         assert_eq!(
             cmd,
-            compute_ctl_args("ep-abc123", "http://host.docker.internal:8083")
+            compute_ctl_args("ep-abc123", "http://orchestrator:8083")
         );
         assert_eq!(
             body.env,
@@ -816,46 +815,37 @@ mod tests {
         let host = create_body("ep-abc123", "t", &settings())
             .host_config
             .unwrap();
-        assert_eq!(host.network_mode.as_deref(), Some("chelabase_default"));
+        assert_eq!(
+            host.network_mode.as_deref(),
+            Some("chelabase-feat-x_default")
+        );
         assert_eq!(
             host.restart_policy.unwrap().name,
             Some(RestartPolicyNameEnum::UNLESS_STOPPED)
         );
         assert_eq!(host.memory, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(host.nano_cpus, Some(1_000_000_000));
-        assert!(
-            host.extra_hosts
-                .unwrap()
-                .contains(&"host.docker.internal:host-gateway".to_string())
-        );
+        assert_eq!(host.extra_hosts, None);
     }
 
     #[test]
-    fn compute_ctl_is_published_on_loopback_only() {
+    fn computes_publish_nothing_on_the_host() {
         let body = create_body("ep-abc123", "t", &settings());
-        assert!(
-            body.exposed_ports
-                .unwrap()
-                .contains(&"3080/tcp".to_string())
-        );
-        let bindings = body.host_config.unwrap().port_bindings.unwrap();
-        let binding = &bindings["3080/tcp"].as_ref().unwrap()[0];
-        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
-        assert_eq!(binding.host_port.as_deref(), Some("0"));
+        assert_eq!(body.exposed_ports, None);
+        let host = body.host_config.unwrap();
+        assert!(host.port_bindings.as_ref().is_none_or(|b| b.is_empty()));
+        assert_ne!(host.publish_all_ports, Some(true));
     }
 
     #[test]
-    fn create_body_publishes_postgres_on_loopback() {
-        let body = create_body("ep-abc123", "t", &settings());
+    fn computes_carry_their_stack_label() {
+        let labels = create_body("ep-abc123", "t", &settings()).labels.unwrap();
+        assert_eq!(labels.get("chelabase.dev/stack"), Some(&"feat-x".to_string()));
         assert_eq!(
-            body.exposed_ports,
-            Some(vec!["3080/tcp".to_string(), "5432/tcp".to_string()])
+            labels.get("chelabase.dev/endpoint-id"),
+            Some(&"ep-abc123".to_string())
         );
-        let bindings = body.host_config.unwrap().port_bindings.unwrap();
-        assert_eq!(bindings.len(), 2);
-        let binding = &bindings["5432/tcp"].as_ref().unwrap()[0];
-        assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
-        assert_eq!(binding.host_port.as_deref(), Some("0"));
+        assert_eq!(labels.len(), 2);
     }
 
     #[test]

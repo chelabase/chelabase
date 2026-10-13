@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live check of the Members step (invites, grants, act-as in the SQL editor, revoke, open
-# sign-up and approval), through the gateway and auth (needs just deps-up and just dev, with
+# sign-up and approval), through the gateway and auth (needs the stack: just workbench up, with
 # Mailpit as Zitadel's SMTP provider):
 # 1. the bootstrap admin (the demo token's user, made a tenant admin by `dev bootstrap`) can
 #    invite by email;
@@ -68,14 +68,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-# Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in Studio's .env.local.
-CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$root/apps/studio/.env.local")}"
+# Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in the stack's studio.env.
+if [[ -z "${VITE_ZITADEL_CLIENT_ID:-}" && ! -f "$CHELABASE_STACK_DIR/studio.env" ]]; then
+  echo "[members-e2e] FAIL: $CHELABASE_STACK_DIR/studio.env is missing: run just workbench up" >&2
+  exit 1
+fi
+CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$CHELABASE_STACK_DIR/studio.env")}"
 ISS="$CHELABASE_ENTRY_AUTH_URL" # the issuer, derived from the entry
 suffix="$(date +%s)-$RANDOM"
 DEV_EMAIL="members-dev-$suffix@example.com"
@@ -267,7 +272,7 @@ for _ in $(seq 120); do
 done
 [[ "$s" == ready ]] || die "database $db_id is still $s after 120 s"
 
-admin_token() { cargo run -q -p chelabase -- dev token || die "chelabase dev token"; }
+admin_token() { "$CHELABASE_CLI" dev token || die "chelabase dev token"; }
 SETUP="CREATE ROLE billing NOLOGIN;
   CREATE SCHEMA billing AUTHORIZATION billing;
   CREATE TABLE billing.t(id int PRIMARY KEY, note text);

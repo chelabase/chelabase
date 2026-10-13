@@ -2544,7 +2544,7 @@ async fn data_api_schema_is_503_when_rest_is_down() {
     let resp = t.send(Method::GET, &path, None).await;
     assert_eq!(resp.status(), 503);
     let text = resp.text().await.unwrap();
-    assert!(!text.contains("127.0.0.1"), "{text}");
+    assert!(!text.contains(&std::net::Ipv4Addr::LOCALHOST.to_string()), "{text}");
     let body: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(code_of(&body), "unavailable");
 }
@@ -4748,8 +4748,8 @@ impl ScratchCompute {
     async fn new() -> Self {
         use sqlx::Executor;
         let url = std::env::var("CHELABASE_METADATA_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into());
-        let admin = sqlx::PgPool::connect(&url).await.expect("the metadata Postgres (just deps-up)");
+            .unwrap_or_else(|_| "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into());
+        let admin = sqlx::PgPool::connect(&url).await.expect("the metadata Postgres (is the workbench stack up?)");
         let suffix = format!("{:08x}", rand_u32());
         let database = format!("t6_console_{suffix}");
         let owner = format!("t6_owner_{suffix}");
@@ -4759,7 +4759,12 @@ impl ScratchCompute {
             .await
             .unwrap();
         let opts: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
-        let addr = format!("{}:{}", opts.get_host(), opts.get_port()).parse().unwrap();
+        // The host is a service name on the stack network (`metadata-db`): resolved, not parsed.
+        let addr = tokio::net::lookup_host((opts.get_host(), opts.get_port()))
+            .await
+            .unwrap()
+            .next()
+            .expect("the metadata Postgres host resolves");
         let scratch = sqlx::PgPool::connect_with(opts.database(&database)).await.unwrap();
         scratch
             .execute(sqlx::AssertSqlSafe(format!(
@@ -4851,7 +4856,7 @@ impl Branching {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn owner_console_runs_through_the_owner_pool() {
     let logs = Logs::default();
     let _guard = logs.capture();
@@ -4899,7 +4904,7 @@ async fn owner_console_runs_through_the_owner_pool() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn owner_password_unknown_then_works_after_reset() {
     let scratch = ScratchCompute::new().await;
     let t = owner_console_app(&scratch).await;
@@ -4928,7 +4933,7 @@ async fn owner_password_unknown_then_works_after_reset() {
 /// The console's schema as the owner: everything the owner reaches, primary keys included,
 /// a schema no other role may use among it.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn owner_console_schema_shows_what_only_the_owner_reaches() {
     let scratch = ScratchCompute::new().await;
     scratch.set_password("schema-pass").await;
@@ -5651,9 +5656,10 @@ async fn create_user_inserts_then_creates_then_commits() {
     let user = au.mock().user_by_id(&id.to_string()).expect("zitadel user");
     assert_eq!((user.email.as_str(), user.org_id.as_str(), user.verified), ("new@x.test", AU_ORG, true));
     let target = au.udb.targets.lock().unwrap()[0].clone();
+    let loopback = std::net::Ipv4Addr::LOCALHOST.to_string();
     assert_eq!(
         (target.branch_id, target.host.as_str(), target.port, target.database.as_str(), target.user.as_str(), target.password.as_str()),
-        (au.main.as_uuid(), "127.0.0.1", 55432, "web1", "chelabase_auth_sync", "sync-pw")
+        (au.main.as_uuid(), loopback.as_str(), 55432, "web1", "chelabase_auth_sync", "sync-pw")
     );
     assert_eq!((target.schema.as_str(), target.table.as_str()), ("public", "users"));
     let row = au.udb.rows.lock().unwrap()[0].clone();
@@ -7025,7 +7031,7 @@ async fn wait_no_editor_sessions(scratch: &ScratchCompute) {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn run_streams_events_over_http() {
     let logs = Logs::default();
     let _guard = logs.capture();
@@ -7065,7 +7071,7 @@ async fn run_streams_events_over_http() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn closing_the_stream_cancels_the_run() {
     let logs = Logs::default();
     let _guard = logs.capture();
@@ -7112,7 +7118,7 @@ async fn closing_the_stream_cancels_the_run() {
 // I4: the run route registers the starter, so a Developer cancels their own run over HTTP and
 // another Developer can't.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn developer_cancels_their_own_run_over_http() {
     let scratch = ScratchCompute::new().await;
     scratch.set_password("starter-pass").await;
@@ -7176,7 +7182,7 @@ async fn developer_cancels_their_own_run_over_http() {
 // M6 (T9 review): a member-role login the server refuses (28P01: the password changed under
 // us) forces one reconcile, then the login is tried again; still refused is 503.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn member_login_refused_forces_one_reconcile() {
     let scratch = ScratchCompute::new().await;
     scratch.set_password("owner-pass").await;
@@ -7221,7 +7227,7 @@ async fn member_login_refused_forces_one_reconcile() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn schema_route_returns_pgls_json() {
     let scratch = ScratchCompute::new().await;
     scratch.set_password("schema-pass").await;
@@ -7281,7 +7287,7 @@ async fn table_reads_check_the_database_before_any_compute() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn table_reads_over_http() {
     let scratch = ScratchCompute::new().await;
     scratch.set_password("read-pass").await;
@@ -11747,7 +11753,7 @@ async fn changes_app(password: &str) -> (ScratchCompute, Branching) {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_dry_run_leaves_no_trace_and_the_real_run_runs_the_same_sql() {
     let (scratch, t) = changes_app("chg-pass").await;
     let main = t.main();
@@ -11772,7 +11778,7 @@ async fn a_dry_run_leaves_no_trace_and_the_real_run_runs_the_same_sql() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn cascade_needs_the_hash_the_dry_run_returned() {
     let (scratch, t) = changes_app("cas-pass").await;
     let main = t.main();
@@ -11807,7 +11813,7 @@ async fn cascade_needs_the_hash_the_dry_run_returned() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_failed_concurrent_index_leaves_no_invalid_index() {
     let (scratch, t) = changes_app("idx-pass").await;
     let main = t.main();
@@ -11823,7 +11829,7 @@ async fn a_failed_concurrent_index_leaves_no_invalid_index() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_held_lock_times_out_typed() {
     let (scratch, t) = changes_app("lock-pass").await;
     let main = t.main();
@@ -11841,7 +11847,7 @@ async fn a_held_lock_times_out_typed() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_role_without_rights_is_permission_denied() {
     let (scratch, t) = changes_app("perm-pass").await;
     let main = t.main();
@@ -11873,7 +11879,7 @@ fn no_dependents_hash() -> String {
 // Finding 1: a failed concurrent build cleans up only an index it created itself; an older
 // INVALID index of the same name (a leftover, or another session's build) stays.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_failed_concurrent_build_leaves_other_invalid_indexes_alone() {
     let (scratch, t) = changes_app("left-pass").await;
     let main = t.main();
@@ -11892,7 +11898,7 @@ async fn a_failed_concurrent_build_leaves_other_invalid_indexes_alone() {
 
 // Finding 2: drops that reach only each other aren't a cascade beyond the request.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn dropping_a_parent_and_its_child_together_works_in_both_orders() {
     let (scratch, t) = changes_app("pair-pass").await;
     let main = t.main();
@@ -11928,7 +11934,7 @@ async fn dropping_a_parent_and_its_child_together_works_in_both_orders() {
 
 // Minor: the context read before the transaction honours `lock_timeout_ms` too.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn the_context_read_times_out_on_a_held_lock() {
     let (scratch, t) = changes_app("ctx-pass").await;
     let main = t.main();
@@ -11954,7 +11960,7 @@ async fn the_context_read_times_out_on_a_held_lock() {
 // Minor: a table the request names that doesn't exist is 404 whatever the path (concurrent or
 // not, dry run or not).
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_missing_table_is_not_found_on_every_path() {
     let (scratch, t) = changes_app("ghost-pass").await;
     let main = t.main();
@@ -11972,7 +11978,7 @@ async fn a_missing_table_is_not_found_on_every_path() {
 // T6 fix round (the implementer's): an enum dropped with the table that has a column of its
 // type, or with that column. The enum's cascade reaches only the request's own targets.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn dropping_an_enum_with_its_columns_table_or_column() {
     let (scratch, t) = changes_app("enum-pass").await;
     let main = t.main();
@@ -12031,7 +12037,7 @@ async fn row_routes_validate_before_any_compute() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn default_rows_and_full_cells_over_http() {
     let (scratch, t) = changes_app("rows-pass").await;
     let main = t.main();
@@ -12077,7 +12083,7 @@ async fn default_rows_and_full_cells_over_http() {
 // Important: the 64 MiB cap is on the value's text, so a compressible value stored small but
 // over the cap as text answers 413 without being fetched.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_compressible_cell_over_the_cap_is_too_large() {
     let (scratch, t) = changes_app("cap-pass").await;
     let main = t.main();
@@ -12095,7 +12101,7 @@ async fn a_compressible_cell_over_the_cap_is_too_large() {
 
 // Minor 4: the all-defaults insert, like the cell fetch, works on ordinary tables only.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn default_rows_only_go_into_ordinary_tables() {
     let (scratch, t) = changes_app("kind-pass").await;
     let main = t.main();
@@ -12119,7 +12125,7 @@ async fn default_rows_only_go_into_ordinary_tables() {
 
 // Finding 4: a key is compared as given, never truncated or rounded to the column's typmod.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn cell_keys_are_not_truncated_by_the_column_type() {
     let (scratch, t) = changes_app("key-pass").await;
     let main = t.main();
@@ -12144,7 +12150,7 @@ async fn cell_keys_are_not_truncated_by_the_column_type() {
 
 // Finding 5: the inserted row comes back as Postgres wrote it: numeric digits kept exactly.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn default_rows_keep_numeric_digits() {
     let (scratch, t) = changes_app("num-pass").await;
     let main = t.main();
@@ -12171,7 +12177,7 @@ async fn default_rows_keep_numeric_digits() {
 // database, through PUBLIC or a grant to it. A group's CONNECT doesn't reach it, as the SQL
 // editor's login would find. The tenant admin reads as the owner.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn table_reads_need_connect_for_the_members_login() {
     let (scratch, t) = changes_app("conn-pass").await;
     let main = t.main();
@@ -12213,7 +12219,7 @@ async fn table_reads_need_connect_for_the_members_login() {
 // R12: a member with no login on the branch yet (not reconciled, or no roles to act as) can't
 // connect, so their reads are refused even while PUBLIC holds CONNECT.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn table_reads_refuse_a_member_with_no_login_on_the_branch() {
     let (scratch, t) = changes_app("conn-login").await;
     let main = t.main();

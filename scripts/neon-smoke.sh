@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Checks the running Neon storage stack (`just deps-up`): safekeeper 1 is Active, the
+# Checks the running Neon storage stack (`just workbench up`): safekeeper 1 is Active, the
 # pageserver answers, and a throwaway tenant with a timeline can be created, read back and
 # deleted. Touches nothing else: no metadata database, no user databases.
 set -euo pipefail
 
-STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
-PAGESERVER="${PAGESERVER_URL:-http://127.0.0.1:9898}"
+STORCON="${STORCON_URL:-http://storage-controller:1234}"
+PAGESERVER="${PAGESERVER_URL:-http://pageserver:9898}"
 # Per-request limit, so a stack that accepts connections but never answers can't hang this.
 MAX_TIME="${NEON_SMOKE_MAX_TIME:-60}"
 LOG_PREFIX=neon-smoke
@@ -61,7 +61,7 @@ say "created tenant $tenant"
 # The orchestrator's internal listener answers the hook; without it the notification stays pending.
 shard="$(call GET "$STORCON/control/v1/tenant/$tenant" | jq -c '.shards[0]')"
 jq -e '.is_pending_compute_notification == false' <<<"$shard" >/dev/null ||
-  die "tenant $tenant's compute notification is still pending (is the orchestrator running? just dev): $shard"
+  die "tenant $tenant's compute notification is still pending (is the orchestrator running? just workbench up): $shard"
 say "the control-plane hook was notified"
 
 call POST "$STORCON/v1/tenant/$tenant/timeline" \

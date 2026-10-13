@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live check of roadmap step 6d (Studio's SQL editor API), through the gateway (needs just
-# deps-up and just dev). Streams are NDJSON read with curl -N:
+# the stack: just workbench up). Streams are NDJSON read with curl -N:
 # - a script as owner (CREATE, INSERT, SELECT: tags and a clean done), then as anon under a row
 #   level security policy (the first run grants the role to the owner, the second is fast);
 # - a notice, an error with a position;
@@ -41,11 +41,12 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
 trap cleanup EXIT
 
@@ -74,7 +75,7 @@ wait_db() {
 # the status is printed. The token goes through stdin (-H @-), never argv.
 stream() {
   local out="$1" max="$2" body="$3" token
-  token="$(cargo run -q -p chelabase -- dev token)" || die "chelabase dev token"
+  token="$("$CHELABASE_CLI" dev token)" || die "chelabase dev token"
   printf 'Authorization: Bearer %s\n' "$token" |
     curl -sSN --max-time "$max" -o "$out" -w '%{http_code}' -H @- -H 'content-type: application/json' \
       -X POST -d "$body" "$GATEWAY$branch/sql" || true

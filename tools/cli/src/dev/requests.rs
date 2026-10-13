@@ -326,6 +326,23 @@ pub fn actions_target_create(name: &str, endpoint: &str) -> Value {
            "timeout": "10s", "payloadType": "PAYLOAD_TYPE_JSON"})
 }
 
+/// The endpoint of listed target `id`, when the listing names one.
+pub fn actions_target_endpoint(listed: &Value, id: &str) -> Option<String> {
+    listed
+        .get("targets")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|t| t.get("id").and_then(Value::as_str) == Some(id))?
+        .get("endpoint")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// UpdateTarget's body: only the endpoint changes (the signing key is kept).
+pub fn actions_target_update(endpoint: &str) -> Value {
+    json!({"endpoint": endpoint})
+}
+
 /// `(id, signingKey)` of a created target.
 pub fn actions_target_created(created: &Value) -> Result<(String, String)> {
     let field = |k: &str| {

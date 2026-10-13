@@ -251,13 +251,28 @@ pub async fn ensure_smtp(api: &impl ZitadelApi) -> Result<()> {
 }
 
 const ACTIONS_TARGET: &str = "chelabase-app-users";
-const ACTIONS_ENDPOINT: &str = "http://host.docker.internal:8083/internal/zitadel/events";
+const ACTIONS_ENDPOINT: &str = "http://orchestrator:8083/internal/zitadel/events";
 const ACTIONS_KEY_VAR: &str = "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY";
 
-/// The Actions target that posts user events to auth's internal listener, and the execution
-/// that routes the `user` event group to it. Zitadel shows a target's signing key only when it
-/// is created, so a target without its `actions.env` is deleted and created again.
-pub async fn ensure_actions_target(api: &impl ZitadelApi, env_file: &Path) -> Result<()> {
+/// The Actions endpoint: `CHELABASE_ZITADEL_ACTIONS_ENDPOINT`'s value `v`, or the orchestrator's
+/// internal listener by service name when it is unset or blank.
+pub fn actions_endpoint_from(v: Option<&str>) -> String {
+    v.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(ACTIONS_ENDPOINT)
+        .to_string()
+}
+
+/// The Actions target that posts user events to `endpoint` (the orchestrator's internal
+/// listener), and the execution that routes the `user` event group to it. Zitadel shows a
+/// target's signing key only when it is created, so a target without its `actions.env` is
+/// deleted and created again; a kept target whose endpoint differs is updated in place
+/// (`POST /v2/actions/targets/{id}`), which keeps its signing key.
+pub async fn ensure_actions_target(
+    api: &impl ZitadelApi,
+    env_file: &Path,
+    endpoint: &str,
+) -> Result<()> {
     let listed = api
         .rest(
             Method::POST,
@@ -267,7 +282,18 @@ pub async fn ensure_actions_target(api: &impl ZitadelApi, env_file: &Path) -> Re
         .await?;
     let existing = actions_target_ids(&listed, ACTIONS_TARGET);
     let id = match existing.first() {
-        Some(id) if env_file.is_file() => id.clone(),
+        Some(id) if env_file.is_file() => {
+            if actions_target_endpoint(&listed, id).as_deref() != Some(endpoint) {
+                api.rest(
+                    Method::POST,
+                    &format!("/v2/actions/targets/{id}"),
+                    actions_target_update(endpoint),
+                )
+                .await?;
+                info!("moved Actions target {ACTIONS_TARGET} to {endpoint}");
+            }
+            id.clone()
+        }
         _ => {
             for id in &existing {
                 api.rest(
@@ -281,7 +307,7 @@ pub async fn ensure_actions_target(api: &impl ZitadelApi, env_file: &Path) -> Re
                 .rest(
                     Method::POST,
                     "/v2/actions/targets",
-                    actions_target_create(ACTIONS_TARGET, ACTIONS_ENDPOINT),
+                    actions_target_create(ACTIONS_TARGET, endpoint),
                 )
                 .await?;
             let (id, key) = actions_target_created(&created)?;
@@ -753,12 +779,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
     }
 
+    const ENDPOINT: &str = "http://orchestrator:8083/internal/zitadel/events";
     const TARGETS_SEARCH: &str = "POST /v2/actions/targets/search";
     const TARGETS_CREATE: &str = "POST /v2/actions/targets";
     const EXECUTIONS: &str = "PUT /v2/actions/executions";
 
     fn target_listing(ids: &[&str]) -> Value {
-        json!({"targets": ids.iter().map(|id| json!({"id": id, "name": "chelabase-app-users"})).collect::<Vec<_>>()})
+        json!({"targets": ids.iter().map(|id| json!({"id": id, "name": "chelabase-app-users", "endpoint": ENDPOINT})).collect::<Vec<_>>()})
     }
 
     fn actions_fake(existing: &[&str]) -> Fake {
@@ -777,7 +804,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("actions.env");
         let fake = actions_fake(&[]);
-        ensure_actions_target(&fake, &file).await.unwrap();
+        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
         assert_eq!(
             fake.calls(),
             vec![TARGETS_SEARCH, TARGETS_CREATE, EXECUTIONS]
@@ -785,10 +812,7 @@ mod tests {
         let body = &fake.bodies(TARGETS_CREATE)[0];
         assert_eq!(body["name"], "chelabase-app-users");
         assert_eq!(body["restAsync"], json!({}));
-        assert_eq!(
-            body["endpoint"],
-            "http://host.docker.internal:8083/internal/zitadel/events"
-        );
+        assert_eq!(body["endpoint"], ENDPOINT);
         assert_eq!(body["payloadType"], "PAYLOAD_TYPE_JSON");
         assert_eq!(
             fake.bodies(EXECUTIONS)[0],
@@ -812,7 +836,7 @@ mod tests {
         let file = dir.path().join("actions.env");
         std::fs::write(&file, "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n").unwrap();
         let fake = actions_fake(&["t-old"]);
-        ensure_actions_target(&fake, &file).await.unwrap();
+        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
         // Kept: no delete, no create; the execution is still PUT (idempotent) with the old id.
         assert_eq!(fake.calls(), vec![TARGETS_SEARCH, EXECUTIONS]);
         assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-old"]));
@@ -827,7 +851,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("actions.env");
         let fake = actions_fake(&["t-old"]);
-        ensure_actions_target(&fake, &file).await.unwrap();
+        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
         assert_eq!(
             fake.calls(),
             vec![
@@ -842,5 +866,38 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
         );
+    }
+
+    #[tokio::test]
+    async fn actions_target_moved_to_a_new_endpoint_keeps_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("actions.env");
+        std::fs::write(&file, "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n").unwrap();
+        let fake = Fake::default()
+            .with(
+                TARGETS_SEARCH,
+                json!({"targets": [{"id": "t-old", "name": "chelabase-app-users",
+                    "endpoint": "http://host.docker.internal:8083/internal/zitadel/events"}]}),
+            )
+            .with("POST /v2/actions/targets/t-old", json!({}))
+            .with(EXECUTIONS, json!({}));
+        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![TARGETS_SEARCH, "POST /v2/actions/targets/t-old", EXECUTIONS]
+        );
+        assert_eq!(fake.bodies("POST /v2/actions/targets/t-old")[0]["endpoint"], ENDPOINT);
+        assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-old"]));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n"
+        );
+    }
+
+    #[test]
+    fn the_actions_endpoint_comes_from_the_env() {
+        assert_eq!(actions_endpoint_from(None), ENDPOINT);
+        assert_eq!(actions_endpoint_from(Some("http://x:1/e")), "http://x:1/e");
+        assert_eq!(actions_endpoint_from(Some("  ")), ENDPOINT);
     }
 }

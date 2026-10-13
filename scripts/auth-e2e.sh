@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Live check of Zitadel v4 + auth + the gateway (needs `just dev`): closed sign-up, a link invite
+# Live check of Zitadel v4 + auth + the gateway (needs `just workbench up`): closed sign-up, a link invite
 # and accepting it, token exchange, /v1/me, sign-in, identical failures, password reset, logout.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/entry.sh
 . "$ROOT/scripts/lib/entry.sh"
-set -a; source "$ROOT/.chelabase/zitadel/demo.env"; set +a
-# Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in Studio's .env.local.
-CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$ROOT/apps/studio/.env.local")}"
+set -a; source "${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"; set +a
+# Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in the stack's studio.env.
+if [[ -z "${VITE_ZITADEL_CLIENT_ID:-}" && ! -f "$CHELABASE_STACK_DIR/studio.env" ]]; then
+  echo "[auth-e2e] FAIL: $CHELABASE_STACK_DIR/studio.env is missing: run just workbench up" >&2
+  exit 1
+fi
+CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$CHELABASE_STACK_DIR/studio.env")}"
 ISS="$CHELABASE_ENTRY_AUTH_URL" # the issuer, derived from the entry
 GW="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 MAILPIT="${MAILPIT_URL:-$CHELABASE_ENTRY_MAIL_URL}"
@@ -76,7 +80,7 @@ say "sign-up is closed"
 # People join by invite. An admin (the demo token's user, `chelabase-demo`, which `just
 # zitadel-bootstrap` makes a tenant admin on a self-hosted stack) checks that email can be sent
 # (Mailpit is the SMTP provider) and invites by link.
-ADMIN_TOKEN="$(cd "$ROOT" && cargo run -q -p chelabase -- dev token)" || die "chelabase dev token"
+ADMIN_TOKEN="$("$CHELABASE_CLI" dev token)" || die "chelabase dev token"
 api() { curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' "$@"; }
 jq -e '.member.tenant_admin == true' <<<"$(api "$GW/v1/me")" >/dev/null || die "the demo token's user isn't a tenant admin: re-run just zitadel-bootstrap"
 [[ "$(api "$GW/v1/invites/delivery" | jq -c .)" == '{"email_available":true,"reason":null}' ]] || die "invites can't be emailed: is Mailpit the active SMTP provider?"

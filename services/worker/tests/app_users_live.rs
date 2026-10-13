@@ -3,14 +3,12 @@
 //! with the app-users objects, and the worker's enable, sync, branch and disable jobs with the
 //! real Zitadel.
 //!
-//! Same setup as `roles_live` (`just dev` from this checkout, so the gateway, rest and the
-//! orchestrator serve the data API, plus `psql` on the host and the proxy's CA), with
+//! Same setup as `roles_live` (the workbench stack, so the gateway, rest and the
+//! orchestrator serve the data API, plus `psql` in the runner and the proxy's CA), with
 //! `demo.env` sourced for the Zitadel admin PAT and the app JWT key pair:
 //!
 //! ```text
-//! just live bash -c 'set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a;
-//!   CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
-//!   cargo test -p worker --test app_users_live -- --ignored --test-threads=1 --nocapture'
+//! just workbench test -p worker --test app_users_live -- --run-ignored only
 //! ```
 //!
 //! Each test provisions its own database in its own project and deletes both afterwards, pass
@@ -37,7 +35,7 @@ use worker::app_users_sql::{USERS_SYNC_ROLE, gone_call_sql, upsert_call_sql, use
 use worker::config::RealWorker;
 
 mod common;
-use common::{cleanup, setup, workspace_root};
+use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup, workspace_root};
 
 const OWNER: &str = "postgres";
 /// The sync role's password the tests' own bootstraps set.
@@ -206,7 +204,11 @@ impl Fx {
     /// SQL as `chelabase_auth_sync` logged in with its password, straight to the compute's
     /// Postgres (as `auth` connects).
     async fn sync_login(&self, ep: &str, sql: &str) -> Result<String, String> {
-        let locator = DockerLocator::connect("chelabase_default").expect("the Docker client");
+        let locator = DockerLocator::connect(
+            &std::env::var("CHELABASE_COMPUTE_NETWORK").unwrap_or_else(|_| "chelabase_default".into()),
+            &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
+        )
+        .expect("the Docker client");
         let addr = locator
             .postgres_addr(ep)
             .await
@@ -370,14 +372,16 @@ fn proxy_conn(ep: &str, database: &str) -> String {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(4432);
-    let ca = workspace_root().join(".chelabase/neon/proxy-ca.crt");
+    let ca = proxy_ca_path();
     assert!(
         ca.exists(),
-        "{} is missing (run just deps-up)",
+        "{} is missing (run `just workbench up`)",
         ca.display()
     );
+    // The proxy is dialled at CHELABASE_PROXY_HOSTADDR when set; the TLS host name stays <ep>.<domain>.
+    let hostaddr = proxy_hostaddr();
     format!(
-        "host={} hostaddr=127.0.0.1 port={port} dbname={database} sslmode=verify-full sslrootcert={}",
+        "host={} hostaddr={hostaddr} port={port} dbname={database} sslmode=verify-full sslrootcert={}",
         proxy_host(ep),
         ca.display()
     )
@@ -417,13 +421,17 @@ fn gateway() -> String {
     std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://api.chelabase.localhost:8000".into())
 }
 
-/// The built `chelabase` CLI, next to this test's own binary's directory.
+/// The `chelabase` CLI: `CHELABASE_CLI` (the runner sets it), else the build next to this test's
+/// own binary's directory.
 fn chelabase_cli() -> std::path::PathBuf {
+    if let Ok(cli) = std::env::var("CHELABASE_CLI") {
+        return cli.into();
+    }
     let exe = std::env::current_exe().unwrap();
     let cli = exe.parent().unwrap().parent().unwrap().join("chelabase");
     assert!(
         cli.exists(),
-        "{} is missing (just dev builds it)",
+        "{} is missing (just workbench up builds it)",
         cli.display()
     );
     cli
@@ -433,7 +441,7 @@ fn chelabase_cli() -> std::path::PathBuf {
 async fn api(method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
     let token = tokio::process::Command::new(chelabase_cli())
         .args(["dev", "token"])
-        .current_dir(workspace_root())
+        .current_dir(std::env::var("CHELABASE_CHECKOUT").map_or_else(|_| workspace_root(), Into::into))
         .output()
         .await
         .expect("chelabase dev token");
@@ -514,7 +522,7 @@ const SNAPSHOT_SQL: &str = "SELECT string_agg(x, E'\\n' ORDER BY x) FROM (
 ) s;";
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn users_bootstrap_is_idempotent() {
     live(|fx| async move {
         fx.bootstrap().await.expect("first bootstrap");
@@ -529,7 +537,7 @@ async fn users_bootstrap_is_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn guard_refuses_the_owner_and_allows_sync() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -592,7 +600,7 @@ async fn guard_refuses_the_owner_and_allows_sync() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn protect_refuses_drop_rename_retype_disable() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -630,7 +638,7 @@ const SNAPSHOT_TRIGGERS: &str = "SELECT (SELECT count(*) FROM pg_trigger WHERE t
       AND attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at'));";
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn alter_index_rename_on_the_table_is_refused() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -646,7 +654,7 @@ async fn alter_index_rename_on_the_table_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn unrelated_ddl_works_when_the_users_table_is_fine_and_when_broken() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -676,7 +684,7 @@ async fn unrelated_ddl_works_when_the_users_table_is_fine_and_when_broken() {
 // --- Sync-role writes: sign-up data and marked deletes -------------------------------------
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn sign_up_data_respects_column_insert_privilege() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -710,7 +718,7 @@ async fn sign_up_data_respects_column_insert_privilege() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn mark_deleted_email_can_sign_up_again() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -755,7 +763,7 @@ async fn mark_deleted_email_can_sign_up_again() {
 /// with no access to schema `chelabase` still reads its tables, before and after app users
 /// are enabled (the first request of a schema version introspects as its role).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_custom_role_reads_through_the_data_api() {
     live(|fx| async move {
         fx.owner_ok(
@@ -789,7 +797,7 @@ async fn a_custom_role_reads_through_the_data_api() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn helpers_work_under_the_data_api() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -824,7 +832,7 @@ async fn helpers_work_under_the_data_api() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn new_users_table_is_rls_locked() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -871,7 +879,7 @@ async fn new_users_table_is_rls_locked() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn data_api_rebootstrap_keeps_app_users_objects() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
@@ -898,7 +906,7 @@ async fn data_api_rebootstrap_keeps_app_users_objects() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn remove_data_api_drops_the_helpers() {
     live(|fx| async move {
         // A second Postgres database, served by the data API (which installs the helpers).
@@ -982,7 +990,7 @@ async fn org_count(org: &str) -> usize {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev, CHELABASE_COMPUTE_IMAGE and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack, CHELABASE_COMPUTE_IMAGE and demo.env (Zitadel admin)"]
 async fn app_users_live() {
     live(|fx| async move {
         let zitadel = fx.worker.zitadel.as_ref().expect("Zitadel admin access (source demo.env)");

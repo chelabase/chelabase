@@ -31,7 +31,7 @@ pub struct Config {
 fn var(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| {
         format!(
-            "{name} is not set; run `just zitadel-bootstrap` and load .chelabase/zitadel/demo.env"
+            "{name} is not set; a workbench stack sets it in its stack.env or, after `just zitadel-bootstrap`, in the stack's zitadel/demo.env (`just workbench env` prints the stack.env path)"
         )
     })
 }

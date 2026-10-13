@@ -134,7 +134,7 @@ async fn spawn_gateway_with(
             .current_dir(workdir.path())
             .env("CHELABASE_GATEWAY_LISTEN", format!("127.0.0.1:{port}"))
             .env("CHELABASE_PUBLIC_SCHEME", "http")
-            .env("CHELABASE_API_HOST", "127.0.0.1")
+            .env("CHELABASE_API_HOST", std::net::Ipv4Addr::LOCALHOST.to_string())
             .env("CHELABASE_STUDIO_HOST", STUDIO_HOST)
             .env("CHELABASE_AUTH_HOST", jwks.issuer().trim_start_matches("http://"))
             .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
@@ -314,7 +314,7 @@ async fn authenticated_request_reaches_upstream_with_internal_identity_only() {
     assert_eq!(claims.rid, response_rid);
     assert_eq!(seen["x-request-id"], response_rid);
     assert_eq!(seen["x-forwarded-proto"], "http");
-    assert_eq!(seen["x-forwarded-for"], "127.0.0.1");
+    assert_eq!(seen["x-forwarded-for"], std::net::Ipv4Addr::LOCALHOST.to_string());
 }
 
 // Review Focus 2.
@@ -535,7 +535,7 @@ async fn forwarded_headers_are_replaced_not_trusted() {
     assert_eq!(resp.status(), 200);
     let seen = stack.upstream_saw().unwrap();
     assert_eq!(seen["x-forwarded-proto"], "http");
-    assert_eq!(seen["x-forwarded-for"], "127.0.0.1");
+    assert_eq!(seen["x-forwarded-for"], std::net::Ipv4Addr::LOCALHOST.to_string());
     assert_eq!(seen["x-forwarded-host"], stack.base.trim_start_matches("http://"));
 }
 
@@ -617,7 +617,7 @@ async fn the_studio_host_passes_websocket_upgrades() {
     let (base, _verify, _gateway) =
         spawn_gateway_with(&api, &jwks, &[("CHELABASE_STUDIO_UPSTREAM", studio.as_str())]).await;
     let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
-    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut sock = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
     let request = format!(
         "GET /@vite/client HTTP/1.1\r\nHost: {STUDIO_HOST}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
@@ -694,7 +694,7 @@ async fn upstream_that_never_answers_is_504_json() {
 async fn hostname_upstream_is_resolved() {
     let jwks = MockJwks::start().await;
     let (upstream, seen) = spawn_upstream().await;
-    let by_name = upstream.replace("127.0.0.1", "localhost");
+    let by_name = upstream.replace(&std::net::Ipv4Addr::LOCALHOST.to_string(), "localhost");
     let (base, _verify, _gateway) = spawn_gateway(&by_name, &jwks).await;
 
     let resp = reqwest::get(format!("{base}/health")).await.unwrap();

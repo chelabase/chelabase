@@ -61,7 +61,7 @@ impl SecretKey {
     pub fn from_env() -> Result<Self, SecretsError> {
         let path = std::env::var("CHELABASE_SECRETS_KEY").map_err(|_| {
             SecretsError::Config(
-                "CHELABASE_SECRETS_KEY is not set; run `just zitadel-bootstrap` and load .chelabase/zitadel/demo.env"
+                "CHELABASE_SECRETS_KEY is not set; a workbench stack sets it in its stack.env (`just workbench env` prints the path)"
                     .into(),
             )
         })?;

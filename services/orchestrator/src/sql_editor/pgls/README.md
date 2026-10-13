@@ -15,4 +15,5 @@ wraps each query in `json_agg` and maps the result to the JSON shape that versio
    `From` mappings) and update `assemble` in `../schema.rs` to match.
 4. Regenerate `tests/fixtures/pgls_schema_<version>.json`, and load it with the new package's
    `setSchema` plus a `complete` call to prove the shape.
-5. Run the ignored live test `tests/sql_schema_live.rs` (`just live`) and note the byte size.
+5. Run the ignored live test `tests/sql_schema_live.rs` on your stack (`just workbench test -p
+   orchestrator --test sql_schema_live -- --run-ignored only`) and note the byte size.

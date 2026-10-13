@@ -1,5 +1,5 @@
 //! Opt-in round trip through `StorconClient` against a running storage controller
-//! (`just deps-up` and `just dev` first; the storage controller calls the orchestrator's internal listener on attach):
+//! (the workbench stack first; the storage controller calls the orchestrator's internal listener on attach):
 //!
 //! ```sh
 //! just neon-test-live
@@ -12,12 +12,12 @@ use chelabase_neon::{NeonId, StorconClient};
 fn client() -> StorconClient {
     let url = std::env::var("STORCON_URL")
         .or_else(|_| std::env::var("CHELABASE_STORCON_URL"))
-        .unwrap_or_else(|_| "http://127.0.0.1:1234".to_string());
+        .unwrap_or_else(|_| "http://storage-controller:1234".to_string());
     StorconClient::new(&url, 0)
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon storage stack and the internal listener: just deps-up, then just dev"]
+#[ignore = "needs the Neon storage stack and the internal listener: the workbench stack"]
 async fn tenant_and_timeline_round_trip() {
     let client = client();
     let tenant = NeonId::new();
@@ -35,7 +35,7 @@ async fn round_trip(client: StorconClient, tenant: NeonId) {
     let safekeepers = client
         .active_safekeepers()
         .await
-        .expect("storage controller reachable (just deps-up)");
+        .expect("storage controller reachable (is the workbench stack up?)");
     assert!(!safekeepers.is_empty(), "no Active safekeeper");
 
     client.create_tenant(&tenant).await.unwrap();

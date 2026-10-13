@@ -152,7 +152,7 @@ fn info(project: Uuid, target: Uuid, verification: bool) -> Value {
         "email_verification": verification, "on_delete": "delete",
         "auth_database_id": Uuid::nil(), "pg_database": "app", "schema": "public",
         "table": "users", "target_branch_id": target,
-        "sync": {"branch_id": target, "host": "127.0.0.1", "port": 5432, "database": "app",
+        "sync": {"branch_id": target, "host": std::net::Ipv4Addr::LOCALHOST.to_string(), "port": 5432, "database": "app",
             "user": "chelabase_auth_sync", "password": "pw", "schema": "public", "table": "users"},
     })
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live check of roadmap step 6b (projects and app users), through the public API, the SDK and
-# the proxy (needs just deps-up and just dev):
+# the proxy (needs the stack: just workbench up):
 # 1. a project with a database, the data API (on by default on main) and app users enabled;
 # 2. SDK sign-up: a NOT NULL app column refuses a sign-up without it (422 constraint_violation),
 #    and sign-up `data` fills it once the column is granted for INSERT to authenticated;
@@ -23,6 +23,7 @@ LOG_PREFIX=app-users-e2e
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
+PROXY_HOSTADDR="${CHELABASE_PROXY_HOSTADDR:?run through just workbench run}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 tmp="$(mktemp -d)"
 project_id=""
@@ -45,16 +46,17 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-ca="$root/.chelabase/neon/proxy-ca.crt"
-[[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
+ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
+[[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 [[ -n "${CHELABASE_ZITADEL_ADMIN_PAT_FILE:-}" && -s "${CHELABASE_ZITADEL_ADMIN_PAT_FILE}" ]] ||
-  die "CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset or empty (run just dev: its bootstrap writes demo.env)"
+  die "CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset or empty (run just workbench up: its bootstrap writes demo.env)"
 ZITADEL="${CHELABASE_ZITADEL_ISSUER:-$CHELABASE_ENTRY_AUTH_URL}"
 command -v pnpm >/dev/null || die "pnpm is missing"
 trap cleanup EXIT
@@ -127,7 +129,7 @@ psql_on() {
   dbname="$(jq -r '.database' "$tmp/body")"
   for _ in $(seq 60); do
     if out="$(PGPASSWORD="$pw" PGCONNECT_TIMEOUT=10 psql \
-      "host=$host hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+      "host=$host hostaddr=$PROXY_HOSTADDR port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
       -X -v ON_ERROR_STOP=1 -qtA "$@" 2>"$tmp/err")"; then
       printf '%s' "$out"
       return
@@ -198,7 +200,7 @@ pass "signed up A ($user_a) and B with display_name"
 
 # 2b. Generated types mark the users table (a secret key's role reads the schema).
 ok POST "/v1/databases/$db_id/branches/$db_id/keys" 201 '{"name":"app-users-e2e"}'
-CHELABASE_DATA_KEY="$(jq -r '.key' "$tmp/body")" cargo run -q -p chelabase -- gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
+CHELABASE_DATA_KEY="$(jq -r '.key' "$tmp/body")" "$CHELABASE_CLI" gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
   die "chelabase gen types"
 grep -q 'appUsers: { schema: "public"; table: "users" }' "$tmp/db.ts" ||
   die "the generated types don't mark the users table: $(grep -n appUsers "$tmp/db.ts" || echo none)"

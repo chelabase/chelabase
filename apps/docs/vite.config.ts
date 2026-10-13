@@ -35,8 +35,9 @@ function publicHost(raw: string) {
 const { name, port } = publicHost(entrySetting('CHELABASE_DOCS_HOST'));
 
 export default defineConfig({
-  // Bound to loopback: only the gateway reaches it, at this app's host.
-  server: { host: '127.0.0.1', port: 3001, allowedHosts: [name], hmr: { host: name, clientPort: port } },
+  // Bound to loopback: only the gateway reaches it, at this app's host. Inside a workbench stack
+  // the gateway is another container, so the stack sets CHELABASE_DOCS_BIND=0.0.0.0.
+  server: { host: entrySetting('CHELABASE_DOCS_BIND') || '127.0.0.1', port: 3001, allowedHosts: [name], hmr: { host: name, clientPort: port } },
   plugins: [
     fumadocsMdx(),
     tailwindcss(),

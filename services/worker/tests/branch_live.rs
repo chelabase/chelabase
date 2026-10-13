@@ -1,12 +1,10 @@
 //! The branching story against the real Neon stack: create at a time, reset to parent,
 //! restore, a point outside the history window, and delete everything.
 //!
-//! Same setup as `neon_live` (`just deps-up`, `just dev`, `CHELABASE_COMPUTE_IMAGE`):
+//! Same setup as `neon_live` (the workbench stack, `CHELABASE_COMPUTE_IMAGE`):
 //!
 //! ```text
-//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
-//! CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
-//!   cargo test -p worker --test branch_live -- --ignored --test-threads=1 --nocapture
+//! just workbench test -p worker --test branch_live -- --run-ignored only
 //! ```
 //!
 //! Jobs go through `handle_branch_job`, the dispatch the worker's consumer uses, after the
@@ -25,7 +23,7 @@ use chelabase_types::{BranchId, DatabaseId};
 use worker::config::{RealWorker, WorkerConfig};
 
 mod common;
-use common::{cleanup, setup, sqlx_delete};
+use common::{cleanup, pageserver_container, setup, sqlx_delete};
 
 struct Story<'a> {
     worker: &'a RealWorker,
@@ -129,7 +127,7 @@ impl Story<'_> {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn branching_story() {
     let (worker, metadata, config) = setup().await;
     let worker = Arc::new(worker);
@@ -430,7 +428,7 @@ async fn noted_time() -> chrono::DateTime<chrono::Utc> {
 /// Restoring a child branch: one detach of the restored timeline copies its level and main's
 /// up to dev's branch point (Neon fork round 2, patches 1 and 3).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_a_child_branch() {
     let (worker, metadata, config) = setup().await;
     let worker = Arc::new(worker);
@@ -577,7 +575,7 @@ async fn child_story(
 /// Restoring a grandchild (main → dev → feat): one detach copies all three levels, each up to
 /// its child's branch point, and feat's own up to the restore point.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_a_grandchild_branch() {
     let (worker, metadata, config) = setup().await;
     let worker = Arc::new(worker);
@@ -720,7 +718,7 @@ async fn grandchild_story(
 /// last committed write. The test forces that window (restart the pageserver container right
 /// after a committed write) and asserts it was real; it fails rather than passing vacuously.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn branch_right_after_a_pageserver_restart_sees_the_last_write() {
     let (worker, metadata, _config) = setup().await;
     let worker = Arc::new(worker);
@@ -747,17 +745,15 @@ async fn branch_right_after_a_pageserver_restart_sees_the_last_write() {
 /// How many write+restart rounds to try for a pageserver that lags the safekeepers.
 const STALE_HEAD_ATTEMPTS: u32 = 8;
 
-/// The compose container of the pageserver.
-const PAGESERVER_CONTAINER: &str = "chelabase-pageserver-1";
-
+/// Restarts the stack's pageserver container (`<CHELABASE_COMPOSE_PROJECT>-pageserver-1`).
 async fn restart_pageserver() {
     let status = tokio::process::Command::new("docker")
-        .args(["restart", PAGESERVER_CONTAINER])
+        .args(["restart", &pageserver_container()])
         .stdout(std::process::Stdio::null())
         .status()
         .await
         .expect("run docker");
-    assert!(status.success(), "docker restart {PAGESERVER_CONTAINER}");
+    assert!(status.success(), "docker restart {}", pageserver_container());
 }
 
 async fn stale_head_story(

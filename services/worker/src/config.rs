@@ -36,6 +36,8 @@ pub struct WorkerConfig {
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
     pub control_plane_uri: String,
+    /// `CHELABASE_STACK` (default `main`): the stack this worker's computes belong to.
+    pub stack: String,
     pub valkey_url: String,
     pub compute_image: String,
     pub mode: Mode,
@@ -54,9 +56,9 @@ pub struct WorkerConfig {
     /// `CHELABASE_MEMBER_ROLES_SWEEP_SECS` (default 300, 30 to 86,400): how often every branch's
     /// member roles are reconciled, the backstop for lost or failed reconcile publishes.
     pub member_roles_sweep_every: Duration,
-    /// `CHELABASE_WORKER_REMOVE_ORPHANS` (default on): reconcile removes compute containers no
-    /// endpoint row records. Off for a worker on its own metadata database that shares the
-    /// machine's Docker with another stack (a branch's separate dev database).
+    /// `CHELABASE_WORKER_REMOVE_ORPHANS` (default on): reconcile removes this stack's compute
+    /// containers no endpoint row records. Listing is scoped to the stack, so this is an
+    /// opt-out for debugging, not a guard against other stacks.
     pub remove_orphans: bool,
 }
 
@@ -78,7 +80,7 @@ impl WorkerConfig {
         };
         let compute_image = non_blank(&get, "CHELABASE_COMPUTE_IMAGE").ok_or_else(|| {
             anyhow!(
-                "CHELABASE_COMPUTE_IMAGE is not set; just dev and just worker set it from scripts/neon-images.sh"
+                "CHELABASE_COMPUTE_IMAGE is not set; `just workbench up` sets it from scripts/neon-images.sh"
             )
         })?;
         let mode = Mode::parse(non_blank(&get, Mode::ENV).as_deref()).map_err(|e| anyhow!(e))?;
@@ -97,8 +99,12 @@ impl WorkerConfig {
             compute_network: or_default("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
             control_plane_uri: or_default(
                 "CHELABASE_CONTROL_PLANE_URI",
-                "http://host.docker.internal:8083",
+                "http://orchestrator:8083",
             ),
+            stack: chelabase_neon::check_stack(&or_default(
+                "CHELABASE_STACK",
+                chelabase_neon::DEFAULT_STACK,
+            ))?,
             valkey_url: or_default("CHELABASE_VALKEY_URL", "redis://127.0.0.1:6379"),
             compute_image,
             mode,
@@ -182,7 +188,7 @@ fn remove_orphans(value: Option<String>) -> anyhow::Result<bool> {
 pub fn check_control_plane_uri(uri: &str) -> anyhow::Result<()> {
     let bad = |why: &str| {
         anyhow!(
-            "CHELABASE_CONTROL_PLANE_URI={uri:?}: {why} (for example http://host.docker.internal:8083)"
+            "CHELABASE_CONTROL_PLANE_URI={uri:?}: {why} (for example http://orchestrator:8083)"
         )
     };
     let url = reqwest::Url::parse(uri).map_err(|e| bad(&format!("not a URL ({e})")))?;
@@ -253,6 +259,7 @@ pub fn build(
             image: config.compute_image.clone(),
             network: config.compute_network.clone(),
             control_plane_uri: config.control_plane_uri.clone(),
+            stack: config.stack.clone(),
         })?,
         cache: ProxyCache::new(&config.valkey_url)?,
         pusher: HttpPusher { http, signer },
@@ -300,12 +307,29 @@ mod tests {
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
         assert_eq!(c.compute_jwt_dir, PathBuf::from(".chelabase/neon"));
         assert_eq!(c.compute_network, "chelabase_default");
-        assert_eq!(c.control_plane_uri, "http://host.docker.internal:8083");
+        assert_eq!(c.control_plane_uri, "http://orchestrator:8083");
+        assert_eq!(c.stack, "main");
         assert_eq!(c.valkey_url, "redis://127.0.0.1:6379");
         assert_eq!(c.compute_image, "chelabase/compute-node-v17:test");
         assert_eq!(c.mode, Mode::SelfHosted);
         assert!(!c.owner_superuser_requested);
         assert!(!c.owner_superuser());
+    }
+
+    #[test]
+    fn the_stack_comes_from_the_env() {
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_STACK", "feat-x")])).unwrap();
+        assert_eq!(c.stack, "feat-x");
+        let blank = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_STACK", " ")])).unwrap();
+        assert_eq!(blank.stack, "main");
+    }
+
+    // T1 review I1
+    #[test]
+    fn a_padded_stack_is_trimmed_and_an_invalid_one_refused() {
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_STACK", " feat-x\n")])).unwrap();
+        assert_eq!(c.stack, "feat-x");
+        assert!(WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_STACK", "feat/x")])).is_err());
     }
 
     #[test]
@@ -361,7 +385,7 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "CHELABASE_COMPUTE_IMAGE is not set; just dev and just worker set it from scripts/neon-images.sh"
+            "CHELABASE_COMPUTE_IMAGE is not set; `just workbench up` sets it from scripts/neon-images.sh"
         );
     }
 
@@ -464,14 +488,14 @@ mod tests {
             ("CHELABASE_APP_USERS_RECONCILE_SECS", "45"),
             ("CHELABASE_PUBLIC_SCHEME", "http"),
             ("CHELABASE_AUTH_HOST", "auth.chelabase.localhost:8000"),
-            ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", ".chelabase/zitadel/admin.pat"),
+            ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", ".chelabase/stacks/main/zitadel/admin.pat"),
         ]))
         .unwrap();
         assert_eq!(c.app_users_reconcile_every, Duration::from_secs(45));
         assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
         assert_eq!(
             c.zitadel_admin_pat_file,
-            Some(PathBuf::from(".chelabase/zitadel/admin.pat"))
+            Some(PathBuf::from(".chelabase/stacks/main/zitadel/admin.pat"))
         );
         for edge in ["30", "86400"] {
             let c = WorkerConfig::from_lookup(lookup(&[

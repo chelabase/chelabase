@@ -1,7 +1,7 @@
 //! One compute (Postgres plus compute_ctl) per endpoint, run as a Docker container.
 
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::Context;
 use bollard::Docker;
@@ -18,11 +18,47 @@ pub const COMPUTE_TOKEN_ENV: &str = "NEON_CONTROL_PLANE_TOKEN";
 /// Container label naming the endpoint a compute belongs to.
 pub const ENDPOINT_LABEL: &str = "chelabase.dev/endpoint-id";
 
-const NAME_PREFIX: &str = "chelabase-compute-";
+/// Container label naming the stack a compute belongs to.
+pub const STACK_LABEL: &str = "chelabase.dev/stack";
 
-/// Container names are global on a Docker host; the prefix keeps ours recognisable.
-pub fn container_name(endpoint_id: &str) -> String {
-    format!("{NAME_PREFIX}{endpoint_id}")
+/// The stack a worker or orchestrator belongs to when `CHELABASE_STACK` is unset.
+pub const DEFAULT_STACK: &str = "main";
+
+/// The longest stack name accepted.
+const MAX_STACK_LEN: usize = 40;
+
+/// Trims a `CHELABASE_STACK` value and checks it is usable in a Docker container name:
+/// `[a-z0-9][a-z0-9-]*`, at most 40 characters. A blank value is an error; callers map blank
+/// or unset to [`DEFAULT_STACK`] first.
+pub fn check_stack(raw: &str) -> anyhow::Result<String> {
+    let stack = raw.trim();
+    let valid = !stack.is_empty()
+        && stack.len() <= MAX_STACK_LEN
+        && stack.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && stack
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !valid {
+        anyhow::bail!(
+            "CHELABASE_STACK {raw:?} is not a valid stack name: use [a-z0-9][a-z0-9-]*, at most {MAX_STACK_LEN} characters"
+        );
+    }
+    Ok(stack.to_string())
+}
+
+/// Container names are global on a Docker host; the prefix and the stack keep ours recognisable
+/// and apart from other stacks'.
+pub fn container_name(stack: &str, endpoint_id: &str) -> String {
+    format!("chelabase-{stack}-compute-{endpoint_id}")
+}
+
+/// Docker list filters selecting only `stack`'s computes.
+pub fn list_filters(stack: &str) -> std::collections::HashMap<String, Vec<String>> {
+    [(
+        "label".to_string(),
+        vec![ENDPOINT_LABEL.to_string(), format!("{STACK_LABEL}={stack}")],
+    )]
+    .into()
 }
 
 /// compute_ctl's arguments. It pulls its spec from
@@ -48,14 +84,14 @@ pub trait ComputeLocator: Send + Sync + 'static {
         endpoint_id: &str,
     ) -> impl Future<Output = anyhow::Result<Option<IpAddr>>> + Send;
 
-    /// `127.0.0.1:<published 3080>`: where the host reaches compute_ctl. The host can't
-    /// route to container IPs on Docker Desktop.
+    /// `<ip>:3080` on the compute network: where the stack reaches compute_ctl.
     fn control_addr(
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = anyhow::Result<Option<SocketAddr>>> + Send;
 
-    /// `127.0.0.1:<published 5432>`: where host services (the data API) reach Postgres.
+    /// `<ip>:5432` on the compute network: where the stack's services (the data API) reach
+    /// Postgres.
     fn postgres_addr(
         &self,
         endpoint_id: &str,
@@ -83,53 +119,38 @@ pub fn ip_on_network(inspect: &ContainerInspectResponse, network: &str) -> Optio
         .ok()
 }
 
-/// The loopback address compute_ctl's port is published on (`-p 127.0.0.1::3080`), if the
-/// container is running. An all-interfaces binding is reachable on loopback too.
-pub fn published_control_addr(inspect: &ContainerInspectResponse) -> Option<SocketAddr> {
-    published_addr(inspect, COMPUTE_CTL_PORT)
+/// compute_ctl's address (`<ip>:3080`) on `network`, if the container is running.
+pub fn control_addr_on_network(
+    inspect: &ContainerInspectResponse,
+    network: &str,
+) -> Option<SocketAddr> {
+    Some(SocketAddr::new(ip_on_network(inspect, network)?, COMPUTE_CTL_PORT))
 }
 
-/// The loopback address Postgres is published on (`-p 127.0.0.1::5432`), if the container is
-/// running.
-pub fn published_postgres_addr(inspect: &ContainerInspectResponse) -> Option<SocketAddr> {
-    published_addr(inspect, POSTGRES_PORT)
-}
-
-/// The loopback address the container's `port`/tcp is published on, if it's running.
-fn published_addr(inspect: &ContainerInspectResponse, port: u16) -> Option<SocketAddr> {
-    if !running(inspect) {
-        return None;
-    }
-    let bindings = inspect
-        .network_settings
-        .as_ref()?
-        .ports
-        .as_ref()?
-        .get(&format!("{port}/tcp"))?
-        .as_ref()?;
-    bindings.iter().find_map(|binding| {
-        match binding.host_ip.as_deref() {
-            None | Some("" | "127.0.0.1" | "0.0.0.0") => {}
-            Some(_) => return None,
-        }
-        let port = binding.host_port.as_deref()?.parse().ok()?;
-        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
-    })
+/// Postgres' address (`<ip>:5432`) on `network`, if the container is running.
+pub fn postgres_addr_on_network(
+    inspect: &ContainerInspectResponse,
+    network: &str,
+) -> Option<SocketAddr> {
+    Some(SocketAddr::new(ip_on_network(inspect, network)?, POSTGRES_PORT))
 }
 
 /// [`ComputeLocator`] over the Docker Engine API.
 pub struct DockerLocator {
     pub(crate) docker: Docker,
     network: String,
+    stack: String,
 }
 
 impl DockerLocator {
-    /// `DOCKER_HOST` or the local socket, like the worker. Nothing is contacted yet.
-    pub fn connect(network: &str) -> anyhow::Result<Self> {
+    /// `DOCKER_HOST` or the local socket, like the worker. Nothing is contacted yet. Computes
+    /// are the stack's own: named and looked up by `stack`, reached on `network`.
+    pub fn connect(network: &str, stack: &str) -> anyhow::Result<Self> {
         Ok(Self {
             docker: Docker::connect_with_local_defaults()
                 .context("configuring the Docker client")?,
             network: network.to_string(),
+            stack: stack.to_string(),
         })
     }
 
@@ -140,7 +161,7 @@ impl DockerLocator {
         match self
             .docker
             .inspect_container(
-                &container_name(endpoint_id),
+                &container_name(&self.stack, endpoint_id),
                 None::<InspectContainerOptions>,
             )
             .await
@@ -168,14 +189,14 @@ impl ComputeLocator for DockerLocator {
         Ok(self
             .inspect(endpoint_id)
             .await?
-            .and_then(|inspect| published_control_addr(&inspect)))
+            .and_then(|inspect| control_addr_on_network(&inspect, &self.network)))
     }
 
     async fn postgres_addr(&self, endpoint_id: &str) -> anyhow::Result<Option<SocketAddr>> {
         Ok(self
             .inspect(endpoint_id)
             .await?
-            .and_then(|inspect| published_postgres_addr(&inspect)))
+            .and_then(|inspect| postgres_addr_on_network(&inspect, &self.network)))
     }
 }
 
@@ -184,13 +205,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn containers_are_named_after_their_endpoint() {
-        assert_eq!(container_name("ep-abc123"), "chelabase-compute-ep-abc123");
+    fn containers_are_named_after_their_stack_and_endpoint() {
+        assert_eq!(
+            container_name("main", "ep-abc123"),
+            "chelabase-main-compute-ep-abc123"
+        );
+        assert_eq!(
+            container_name("feat-x", "ep-abc123"),
+            "chelabase-feat-x-compute-ep-abc123"
+        );
+    }
+
+    // T1 review I1: one check for the stack name, in every service that names computes.
+    #[test]
+    fn stack_names_are_trimmed_and_checked() {
+        assert_eq!(check_stack("feat-x").unwrap(), "feat-x");
+        assert_eq!(check_stack("  feat-x\n").unwrap(), "feat-x");
+        assert_eq!(check_stack("main").unwrap(), "main");
+        assert_eq!(check_stack("t3").unwrap(), "t3");
+        assert_eq!(check_stack(&"a".repeat(40)).unwrap(), "a".repeat(40));
+        let long = "a".repeat(41);
+        for bad in ["", "  ", "feat/x", "Feat", "-x", "a b", "a_b", "é", long.as_str()] {
+            let err = check_stack(bad).unwrap_err().to_string();
+            assert!(err.contains("CHELABASE_STACK"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn listing_selects_only_this_stacks_computes() {
+        let filters = list_filters("feat-x");
+        assert_eq!(filters.len(), 1, "{filters:?}");
+        let mut labels = filters["label"].clone();
+        labels.sort();
+        assert_eq!(
+            labels,
+            ["chelabase.dev/endpoint-id", "chelabase.dev/stack=feat-x"]
+        );
+        assert_eq!(STACK_LABEL, "chelabase.dev/stack");
     }
 
     #[test]
     fn compute_ctl_pulls_its_spec_from_the_control_plane() {
-        let args = compute_ctl_args("ep-abc123", "http://host.docker.internal:8083");
+        let args = compute_ctl_args("ep-abc123", "http://orchestrator:8083");
         assert_eq!(
             args,
             [
@@ -198,7 +254,7 @@ mod tests {
                 "--pgdata=/var/db/postgres/compute",
                 "--connstr=postgresql://cloud_admin@localhost:5432/postgres",
                 "--compute-id=ep-abc123",
-                "--control-plane-uri=http://host.docker.internal:8083",
+                "--control-plane-uri=http://orchestrator:8083",
                 "--external-http-port=3080",
             ]
         );
@@ -257,15 +313,24 @@ mod tests {
     }
 
     #[test]
-    fn a_running_compute_publishes_compute_ctl_on_loopback() {
+    fn a_running_compute_is_reached_on_the_stack_network() {
         let running = inspect(
             ContainerStateStatusEnum::RUNNING,
-            "chelabase_default",
+            "chelabase-feat-x_default",
             "172.20.0.9",
         );
         assert_eq!(
-            published_control_addr(&running),
-            Some("127.0.0.1:49153".parse().unwrap())
+            control_addr_on_network(&running, "chelabase-feat-x_default"),
+            Some("172.20.0.9:3080".parse().unwrap())
+        );
+        assert_eq!(
+            postgres_addr_on_network(&running, "chelabase-feat-x_default"),
+            Some("172.20.0.9:5432".parse().unwrap())
+        );
+        assert_eq!(
+            control_addr_on_network(&running, "chelabase_default"),
+            None,
+            "only the stack's own network"
         );
     }
 
@@ -277,7 +342,8 @@ mod tests {
             "172.20.0.9",
         );
         assert_eq!(ip_on_network(&exited, "chelabase_default"), None);
-        assert_eq!(published_control_addr(&exited), None);
+        assert_eq!(control_addr_on_network(&exited, "chelabase_default"), None);
+        assert_eq!(postgres_addr_on_network(&exited, "chelabase_default"), None);
         let blank = inspect(ContainerStateStatusEnum::RUNNING, "chelabase_default", "");
         assert_eq!(
             ip_on_network(&blank, "chelabase_default"),
@@ -286,54 +352,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn postgres_addr_reads_the_published_port() {
-        let mut running = inspect(ContainerStateStatusEnum::RUNNING, "n", "172.20.0.9");
-        assert_eq!(published_postgres_addr(&running), None, "not published");
-        let ports = running
-            .network_settings
-            .as_mut()
-            .unwrap()
-            .ports
-            .as_mut()
-            .unwrap();
-        ports.insert(
-            "5432/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some("49200".to_string()),
-            }]),
-        );
-        assert_eq!(
-            published_postgres_addr(&running),
-            Some("127.0.0.1:49200".parse().unwrap())
-        );
-        assert_eq!(
-            published_control_addr(&running),
-            Some("127.0.0.1:49153".parse().unwrap()),
-            "each port reads its own binding"
-        );
-        running.state.as_mut().unwrap().status = Some(ContainerStateStatusEnum::EXITED);
-        assert_eq!(published_postgres_addr(&running), None);
-    }
-
-    #[test]
-    fn a_binding_on_another_interface_is_not_used() {
-        let mut running = inspect(ContainerStateStatusEnum::RUNNING, "n", "172.20.0.9");
-        let ports = running
-            .network_settings
-            .as_mut()
-            .unwrap()
-            .ports
-            .as_mut()
-            .unwrap();
-        ports.insert(
-            "3080/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("192.168.1.5".to_string()),
-                host_port: Some("49153".to_string()),
-            }]),
-        );
-        assert_eq!(published_control_addr(&running), None);
-    }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Chooses the Neon images for `just deps-up`. Prints NEON_IMAGE=… and COMPUTE_NODE_IMAGE=…
+# Chooses the Neon images for `just workbench up`. Prints NEON_IMAGE=… and COMPUTE_NODE_IMAGE=…
 # on stdout for the caller to export; messages go to stderr. A local `just neon-build` wins;
 # otherwise the digest-pinned GHCR default from the Compose file is pulled.
 set -euo pipefail

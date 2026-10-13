@@ -1,11 +1,11 @@
 # Contributing
 
-How to set up a machine, run the stack, test, and commit. For what the system is and how it works, run `just docs` and open http://docs.chelabase.localhost:8000/docs/architecture (with the stack up: the docs host is reached through the gateway, which `just dev` starts).
+How to set up a machine, run the stack, test, and commit. For what the system is and how it works, run `just workbench up --with docs` and open the docs URL it prints (on main: http://docs.chelabase.localhost:8000/docs/architecture; the docs host is reached through the gateway).
 
 ## Prerequisites
 
 - [proto](https://moonrepo.dev/docs/proto)
-- Docker (Compose dependencies and the Docker socket for the worker)
+- Docker with the Compose plugin (every stack's services, including the apps, run in containers)
 - Rust toolchain (the workspace uses edition 2024)
 - cmake (Pingora builds zlib-ng): `sudo apt-get install -y cmake`
 - clang and protoc (`pg_query` builds Postgres's parser for the SQL editor's guard): `sudo apt-get install -y clang protobuf-compiler`
@@ -43,44 +43,41 @@ This is per machine, not per repo. Every worktree shares the cache. Without carg
 
 ## Recipes (`just`)
 
-Run `just` to list them all.
+Run `just` to list them all. Each checkout (the main one and every worktree) has its own stack, managed with `just workbench …` (see [Worktrees and their stacks](#worktrees-and-their-stacks)).
 
 | Command | What it does |
 | --- | --- |
-| `just deps-up` / `up` | Compose up `-d` (metadata Postgres, NATS, Zitadel, Valkey, the Neon storage stack, Mailpit), then copy the proxy's CA to `.chelabase/neon/proxy-ca.crt` |
-| `just deps-down` / `down` | Compose down, and remove the compute containers. Host apps keep running |
-| `just deps-ps` | Compose service status |
-| `just zitadel-bootstrap` | `cargo run -p chelabase -- dev bootstrap` (idempotent) |
+| `just workbench up [--with docs,landing]` | Start this checkout's stack: Compose services (metadata Postgres, NATS, Valkey, Zitadel, the Neon storage stack, Mailpit), the IAM bootstrap, then the apps (orchestrator, worker, gateway, rest, auth, Studio) in containers built from your host-built binaries. Waits in line when 4 stacks already run. Prints the URLs |
+| `just workbench restart [app…]` | Rebuild and recreate the named apps (all five Rust apps when none); `studio` restarts the dev server |
+| `just workbench down` | Stop this stack and remove its computes; volumes and state stay |
+| `just workbench purge [--stack <slug>] [--yes]` | `down`, then delete the volumes, state directory and registry entry. Main is purged only when named and confirmed: `just workbench purge --stack main --yes` |
+| `just workbench status` | Every stack: checkout, ports, running or stopped, URLs; then the queue |
+| `just workbench logs [-f] [service…]` | The stack's Compose logs |
+| `just workbench psql [db]` | `psql` in the metadata database |
+| `just workbench exec <service> <cmd…>` | A command in one of the stack's containers |
+| `just workbench test [selection…] [-- run-args…]` | Live Rust tests: archive on the host, run in the stack's runner container (see [Live Rust tests](#live-rust-tests)) |
+| `just workbench run <script> [args…]` | A repo script in the runner, on the stack's network (the e2e recipes use it) |
+| `just zitadel-bootstrap` | `chelabase dev bootstrap` against this stack (idempotent) |
 | `just auth-token` | Mint a demo JWT access token (stdout) |
-| `just zitadel-reset` | Wipe only the Zitadel volume so FirstInstance rewrites `admin.pat` |
-| `just dev` | Compose up, bootstrap, then detached apps (orchestrator, worker, gateway, rest, auth, Studio); prints the seed IDs |
-| `just dev-down` | Stop the host processes from `just dev` (Compose stays up) |
-| `just stop` | `dev-down`, then `down` |
-| `just create-db-demo [name]` | Authenticated `POST /v1/databases` through the gateway (:8000); `name` defaults to `demo1` |
-| `just sweep-dbs` | Dev reset: remove every worker-provisioned container and data volume, every Neon compute, and (with deps up) the storage-controller tenants and all metadata rows for databases, branches and endpoints |
-| `just cleanup` | Fresh start: stops the dev apps, deletes tenant databases, every Zitadel account and all Mailpit email, then re-bootstraps and sweeps old builds. Keeps the keys and the seeded tenant. Asks first |
+| `just zitadel-reset` | Wipe only this stack's Zitadel volume so FirstInstance rewrites `admin.pat` |
+| `just create-db-demo [name]` | Authenticated `POST /v1/databases` through this stack's gateway; `name` defaults to `demo1` |
+| `just sweep-dbs` | Dev reset for this stack: remove its Neon computes, its storage-controller tenants and its metadata rows for databases, branches and endpoints |
 | `just check` | Rust check, the OpenAPI freshness checks (`just api-gen` if they fail), and typecheck plus tests for the TypeScript packages; it also typechecks, builds and tests the docs site |
 | `just test` | Rust tests with nextest, then doctests |
 | `just api-gen` | Regenerate `openapi/*.json` and the generated clients. Never edit those by hand |
-| `just docs` | The docs site on http://docs.chelabase.localhost:8000 (reached through the gateway: run `just dev` first) |
 | `just sweep-builds [days=N]` | Delete build artifacts older than 14 days (or `N`) from the main and every worktree's `target/` |
-| `just wt-add <branch> [base]` / `wt-remove <branch>` | Create or remove a worktree under `.worktrees/` (see below) |
-| `just live <recipe or command>` | Queue your command on the machine's one stack; run when it's your turn |
-| `just live-status` | Who holds the stack, and who waits |
-| `just live-test` | The queue's offline tests (`scripts/tests/live.sh`) |
-| `just stack-reset-slots [--yes] [--dry-run]` | One-time cleanup of data left by the retired per-worktree slots: stops the slot projects, deletes their files and databases, then runs `just deps-up`. Asks first; idempotent |
-| `just orchestrator` / `worker` / `gateway` / `rest` / `auth` / `studio` | Run one process in the foreground |
+| `just wt-add <branch> [base]` / `wt-remove <branch>` | Create a worktree under `.worktrees/`, or purge its stack and remove it (see below) |
 
 The end-to-end recipes are in [Tests and e2e runs](#tests-and-e2e-runs).
 
 ```bash
-just dev                 # deps, IAM bootstrap, background processes
+just workbench up        # image, builds, deps, IAM bootstrap, the apps; prints the URLs
 just create-db-demo      # 202 and a database_id
 # poll with a minted token:
-#   TOKEN=$(cargo run -q -p chelabase -- dev token)
+#   TOKEN=$(just auth-token)
 #   curl -sS -H "Authorization: Bearer $TOKEN" \
-#     http://api.chelabase.localhost:8000/v1/databases/<database_id>
-just stop
+#     http://api.chelabase.localhost:8000/v1/databases/<database_id>    # your stack's API URL
+just workbench down
 ```
 
 If bootstrap fails with a missing `admin.pat` (an old Zitadel volume from before FirstInstance):
@@ -89,17 +86,17 @@ If bootstrap fails with a missing `admin.pat` (an old Zitadel volume from before
 just zitadel-reset && just zitadel-bootstrap
 ```
 
-`zitadel-bootstrap` binds the demo tenant to the Zitadel org only when the metadata database is up, so run `just deps-up` first, or rerun the bootstrap afterwards (`just dev` also rebinds). A Zitadel reset leaves no account in the tenant but the bootstrap admin that `zitadel-bootstrap` sets (pass `admin_email` to pick the user): sign in as that user. Self-sign-up is off by default, so everyone else is invited.
+`just workbench up` runs the bootstrap for you. A Zitadel reset leaves no account in the tenant but the bootstrap admin that `zitadel-bootstrap` sets (pass `admin_email` to pick the user): sign in as that user. Self-sign-up is off by default, so everyone else is invited.
 
-Logs for detached processes: `.chelabase/dev/*.log`. IAM artifacts: `.chelabase/zitadel/` (gitignored). Zitadel PATs are opaque, so demo calls use JWT-profile access tokens from `chelabase dev token`.
+Logs: `just workbench logs [-f] [service…]`. IAM artifacts are in the stack's state directory, `.chelabase/stacks/<slug>/` (gitignored; `<slug>` is `main` for the main checkout). Zitadel PATs are opaque, so demo calls use JWT-profile access tokens from `chelabase dev token` (`just auth-token`).
 
 ### Smoke test: create a database
 
-1. `just dev` (needs Docker; the worker starts each database's compute container).
+1. `just workbench up` (needs Docker; the worker starts each database's compute container).
 2. `just create-db-demo demo1` (positional; `name=demo1` would become the literal name).
-3. Poll `GET http://api.chelabase.localhost:8000/v1/databases/<id>` with a minted Bearer token until `status` is `ready`.
-4. `GET http://api.chelabase.localhost:8000/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:4432/<db>?sslmode=verify-full` URI. Connect with the proxy's CA: `psql "<uri>&sslrootcert=.chelabase/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). `CHELABASE_PROXY_CA_FILE` (default `.chelabase/neon/proxy-ca.crt`) only sets the path reported in `ca_file`; it doesn't change which CA the proxy uses.
-5. `DELETE http://api.chelabase.localhost:8000/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset.
+3. Poll `GET <api url>/v1/databases/<id>` with a minted Bearer token until `status` is `ready`.
+4. `GET <api url>/v1/databases/<id>/connection` (same token) returns the owner credentials and a `postgresql://postgres:…@<ep>.localtest.me:<proxy port>/<db>?sslmode=verify-full` URI (the proxy port is 4432 on main; `just workbench status` shows it). Connect with the stack's proxy CA: `psql "<uri>&sslrootcert=.chelabase/stacks/<slug>/neon/proxy-ca.crt"`, adding `&hostaddr=127.0.0.1` if `localtest.me` resolves to `::1` first. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). `CHELABASE_PROXY_CA_FILE` only sets the path reported in `ca_file`; it doesn't change which CA the proxy uses.
+5. `DELETE <api url>/v1/databases/<id>` removes it (or use Studio). `just sweep-dbs` is the dev-only "remove everything" reset for the stack.
 
 ## Seed tenant and project
 
@@ -108,86 +105,62 @@ Logs for detached processes: `.chelabase/dev/*.log`. IAM artifacts: `.chelabase/
 | Tenant | `demo` | `00000000-0000-4000-8000-000000000001` |
 | Project | `default` | `00000000-0000-4000-8000-000000000002` |
 
-Bootstrap sets `tenants.zitadel_org_id` for the demo tenant from the local Zitadel org.
+Bootstrap sets `tenants.zitadel_org_id` for the demo tenant from the stack's Zitadel org.
 
 ## Workbench URLs
 
-Everything a browser or a script reaches goes through the gateway on port 8000, by host name:
+Everything a browser or a script reaches goes through the stack's gateway, by host name. The main checkout's stack uses port 8000 and the host names below; a worktree's stack `x` puts its slug in the host (`studio.x.chelabase.localhost:<port>`) and uses its own port. `just workbench status` prints the URLs of every stack.
 
-| URL | What |
+| URL (main) | What |
 | --- | --- |
 | http://studio.chelabase.localhost:8000 | Studio |
 | http://api.chelabase.localhost:8000 | The management API, the data API and the app-user sign-in routes |
 | http://auth.chelabase.localhost:8000 | Zitadel (console at `/ui/console`) |
-| http://docs.chelabase.localhost:8000 | The docs site (`just docs`) |
-| http://landing.chelabase.localhost:8000 | The landing page (`just landing`) |
+| http://docs.chelabase.localhost:8000 | The docs site (`just workbench up --with docs`) |
+| http://landing.chelabase.localhost:8000 | The landing page (`just workbench up --with landing`) |
 | http://mail.chelabase.localhost:8000 | Mailpit |
 
-`chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and the hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, whose workbench values live in [`infra/compose/.env.example`](infra/compose/.env.example); the rules are in the docs page "Self-hosting → Hosts".
+`chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and a stack's hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) Different stacks have different hosts, so cookies and Zitadel sessions never mix between them. The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, which `just workbench up` renders per stack from [`infra/compose/.env.example`](infra/compose/.env.example); the rules are in the docs page "Self-hosting → Hosts".
 
-`scripts/lib/entry.sh` is the one place scripts and recipes get these URLs: `source` it and use `CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL` (and the derived `CHELABASE_AUTH_HOST_NAME`, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE`, `CHELABASE_ZITADEL_TLS_MODE`, which Compose requires: every recipe that runs `docker compose` sources it). Never write a URL literal in a script; `scripts/tests/entry-urls.sh` (run by `just check`) fails on them.
+`scripts/lib/entry.sh` is the one place scripts and recipes get these URLs: `source` it and use `CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL` (and the derived `CHELABASE_AUTH_HOST_NAME`, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE`, `CHELABASE_ZITADEL_TLS_MODE`). Never write a URL literal in a script; `scripts/tests/entry-urls.sh` (run by `just check`) fails on them.
 
-## Local dependencies
+## Ports
 
-The upstream ports below are loopback only. Reach the apps through the gateway at the URLs above; a port is for the gateway itself, for debugging, or for services that aren't web apps.
+On the host, a stack publishes only two ports, on loopback (`127.0.0.1` and `::1`). Every other service is reachable only inside the stack's network, by service name (`metadata-db:5432`, `nats:4222`, `orchestrator:8081`, and so on); tests and scripts run there, in the runner container (`just workbench test|run`), and `just workbench psql|exec` reach in.
 
-| Service | Host port | Notes |
-| --- | --- | --- |
-| metadata Postgres | 5433 | Control-plane metadata |
-| NATS (+ JetStream) | 4222 (monitor 8222) | Provision queue |
-| Zitadel | 8080 | Upstream of the auth host (`CHELABASE_ZITADEL_UPSTREAM`) |
-| Zitadel Postgres | 5434 | Zitadel's own database |
-| Mailpit | 8025 | Upstream of the mail host (`CHELABASE_MAIL_UPSTREAM`) |
-| Gateway | 8000 | HTTP front door (Pingora); the only port to open in a browser |
-| Orchestrator | 8081 | Internal HTTP API (reached through the gateway) |
-| Worker health | 8082 | `/health` |
-| Orchestrator internal | 8083 | Internal listener (proxy, compute_ctl, storage controller) |
-| auth | 8084 | Sign-in backend (through the gateway at `/auth/v1`) |
-| rest | 8085 | Data API engine (through the gateway at `/data/v1`) |
-| rest internal | 8086 | The orchestrator's schema calls to rest |
-| Studio | 3000 | Upstream of the Studio host; its sign-in fails on this port, use the Studio URL |
-| Docs site | 3001 | Upstream of the docs host (`just docs`) |
-| Landing page | 3002 | Upstream of the landing host |
-| Neon storage controller | 1234 | Tenants and timelines |
-| Neon proxy | 4432, 4444 | Postgres wire; WebSocket and SQL over HTTP |
-| Valkey | 6379 | Proxy cache invalidation and query cancel |
+| Port | main | worktree stacks | What |
+| --- | --- | --- | --- |
+| Gateway | 8000 | 8100–8199 | HTTP front door (Pingora); the only port to open in a browser |
+| Neon proxy (Postgres wire) | 4432 | 4500–4599 | `<ep>.localtest.me:<port>` for `psql` and drivers |
 
-Copy [`infra/compose/.env.example`](infra/compose/.env.example) to a root `.env` for dotenv auto-load. Prefer the values in `.chelabase/zitadel/demo.env` after bootstrap.
+A worktree's ports are allocated on its first `up` (the lowest free in the range) and kept until `purge`. The registry is `.chelabase/stacks/registry.json`, and `just workbench status` lists it.
 
-## Worktrees and the live queue
+Docker's Compose project is `chelabase` for main (its volumes survive the move to the workbench) and `chelabase-<slug>` for a worktree. Computes are named `chelabase-<slug>-compute-<ep>` and labelled `chelabase.dev/stack=<slug>`, so a stack's worker never touches another's.
 
-Each machine has one development stack. Every branch lives in its own worktree under `.worktrees/`, builds into its own `target/`, and takes turns on the shared stack through `just live`, a FIFO queue. The main checkout stays on `main`.
+Configuration: [`infra/compose/.env.example`](infra/compose/.env.example) holds the documented defaults; `just workbench up` renders each stack's `env/stack.env` from it plus the per-stack values. You don't copy it to a root `.env` (the justfile doesn't load one; a self-hoster does). Read the generated values in `.chelabase/stacks/<slug>/zitadel/demo.env` after bootstrap, or print the env file's path with `just workbench env`.
+
+## Worktrees and their stacks
+
+Every checkout runs its own stack: its own Compose project, volumes, network, computes, Zitadel instance, state directory (`.chelabase/stacks/<slug>/`) and host names. Up to 4 stacks run at once; when the machine is full, `just workbench up` waits in a FIFO queue (it re-checks every few seconds, prints a status line each minute, and gives up after 45 minutes; `CHELABASE_WORKBENCH_WAIT` changes that). The main checkout stays on `main`.
 
 ```bash
 just wt-add my-feature          # creates .worktrees/my-feature from main, with its own build dir
 just wt-add my-branch other     # branches from `other` instead
-just wt-remove my-feature       # removes the worktree and its target/, keeps the branch
+just workbench up               # (inside the worktree) its own stack, on its own ports
+just wt-remove my-feature       # purges its stack, removes the worktree and its target/, keeps the branch
 ```
 
-`just wt-add <branch> [base]` makes `.worktrees/<branch>` (a `/` in the branch name becomes `-`), creating the branch from `base` (default `main`) if it doesn't exist and reusing it if it does. It symlinks `.chelabase` and `apps/studio/.env.local` from the main checkout and runs `pnpm install --frozen-lockfile`. `just wt-remove` refuses if the worktree has changes; delete the branch yourself with `git branch -d <branch>`.
+`just wt-add <branch> [base]` makes `.worktrees/<branch>` (a `/` in the branch name becomes `-`), creating the branch from `base` (default `main`) if it doesn't exist and reusing it if it does. It symlinks `.chelabase` from the main checkout and runs `pnpm install --frozen-lockfile`. `just wt-remove` purges the worktree's stack (containers, volumes, state directory, registry entry), then refuses if the worktree has changes; delete the branch yourself with `git branch -d <branch>`.
 
 `just wt-add` only reuses a local branch. For a branch that exists only on origin, run `git fetch && git branch <branch> origin/<branch>` first, then `just wt-add <branch>`.
 
 Each worktree:
 
 - has its own `target/` directory (cargo's default; no shared `.cargo/config.toml`), and compilation is shared machine-wide through sccache;
-- symlinks `.chelabase` and `apps/studio/.env.local` from the main checkout;
-- shares the one stack: Compose is machine-wide, and `just dev`'s apps run from whichever worktree last took the stack (`just live` moves them).
+- symlinks `.chelabase` from the main checkout, which holds the machine's keys once (secrets key, gateway and cookie keys, compute-JWT keys; mounted read-only into every stack) and every stack's state;
+- runs its own stack from its own binaries: run `just workbench …` from inside the worktree. Another checkout's stack is addressable only for `status`, `logs`, `down` and `purge` (`--stack <slug>`).
 
-A worktree never runs the stack on its own. Stack recipes (`deps-up`, `dev`, `sweep-dbs`, the e2e recipes and the like) refuse while another worktree holds the stack and tell you to wait in line instead. Live tests, e2e runs and browser passes go through the queue and run one at a time:
-
-```bash
-just dev                      # start the stack: Compose up, bootstrap, background apps
-just live just neon-e2e       # queue a test run; it starts when its turn comes
-just live just data-e2e       # queue another; it waits
-just live cargo nextest run   # queue any command
-just live -- deps-up          # apply new image pins, through the queue
-just live-status              # who holds the stack and who waits
-just dev-down                 # stop the background apps (Compose stays up)
-just stop                     # dev-down, then deps-down (full shutdown)
-```
-
-Press Ctrl-C to cancel your run. Build artifacts pile up: `just sweep-builds` drops those older than 14 days from the main `target/` and every worktree's (`days=N` to change); `just cleanup` runs it too.
+`just workbench down` when you're done frees the slot. Build artifacts pile up: `just sweep-builds` drops those older than 14 days from the main `target/` and every worktree's (`days=N` to change).
 
 ## Tests and e2e runs
 
@@ -195,11 +168,10 @@ Offline checks need no stack:
 
 - `just test`: Rust tests with nextest (one process per test), then doctests, which nextest doesn't run. Dev builds carry line tables only (no full debug info), which keeps test binaries small.
 - `just check`: the typechecks, generated-code freshness and TypeScript tests, plus the docs site.
-- `just live-test`: the live queue's own tests.
 - `just neon-test`: the Neon build scripts, Compose services and neon scripts.
 - `just rename-test`: the old-name rename script.
 
-The live recipes need `just deps-up` and `just dev` (several say so in their description) and run through the queue as `just live <recipe>`. Most scripts honour `KEEP=1`, which leaves the database in place.
+The live recipes run against your checkout's own stack: each is `just workbench run scripts/<name>.sh` in the stack's runner container, so they start (or update) the stack first and need no queue. Run them from the checkout you are working in, for example `just neon-e2e`; two checkouts can run theirs at the same time. Most scripts honour `KEEP=1`, which leaves the database in place.
 
 | Recipe | What it runs |
 | --- | --- |
@@ -239,11 +211,11 @@ The live recipes need `just deps-up` and `just dev` (several say so in their des
 
 ### Live Rust tests
 
-Some Rust tests are `#[ignore]`d because they need the stack. Each file's header gives its exact command (it sources `.chelabase/zitadel/demo.env` and `scripts/neon-images.sh` first, and takes the compute image from `COMPUTE_NODE_IMAGE`); run it through `just live bash -c '…'`.
+Some Rust tests are `#[ignore]`d because they need the stack. Run them on your checkout's stack with `just workbench test -p <pkg> --test <file> -- --run-ignored only`: it makes sure the stack is up and current, archives the tests on the host and runs them in the runner container with the stack's environment (service names, the demo identity, the compute image). Arguments before `--` select what is archived; those after it go to nextest.
 
-- `rest_live` (`cargo test -p rest --test rest_live -- --ignored --test-threads=1`): two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
-- `app_users_live` (`cargo test -p worker --test app_users_live -- --ignored --test-threads=1`): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real Zitadel.
-- `just neon-test-live` (`storcon_live`): a round trip through the Rust storage-controller client. Other live files live in `services/worker/tests/` (`branch_live`, `neon_live`, `roles_live`).
+- `rest_live` (`just workbench test -p rest --test rest_live -- --run-ignored only`): two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
+- `app_users_live` (`just workbench test -p worker --test app_users_live -- --run-ignored only`): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real Zitadel.
+- `storcon_live` (`just workbench test -p chelabase-neon --test storcon_live -- --run-ignored only`): a round trip through the Rust storage-controller client. Other live files live in `services/worker/tests/` (`branch_live`, `neon_live`, `roles_live`).
 
 ## Commits and branches
 

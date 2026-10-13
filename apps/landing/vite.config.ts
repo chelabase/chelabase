@@ -34,8 +34,9 @@ function publicHost(raw: string) {
 const { name, port } = publicHost(entrySetting('CHELABASE_LANDING_HOST'));
 
 export default defineConfig({
-  // Bound to loopback: only the gateway reaches it, at this app's host.
-  server: { host: '127.0.0.1', port: 3002, allowedHosts: [name], hmr: { host: name, clientPort: port } },
+  // Bound to loopback: only the gateway reaches it, at this app's host. Inside a workbench stack
+  // the gateway is another container, so the stack sets CHELABASE_LANDING_BIND=0.0.0.0.
+  server: { host: entrySetting('CHELABASE_LANDING_BIND') || '127.0.0.1', port: 3002, allowedHosts: [name], hmr: { host: name, clientPort: port } },
   plugins: [
     tailwindcss(),
     tanstackStart({

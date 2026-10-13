@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live check of roadmap step 6a, revision 2 (login roles managed from SQL), through the gateway
-# and the proxy (needs just deps-up and just dev):
+# and the proxy (needs the stack: just workbench up):
 # - a realistic migration (scripts/fixtures/role-migration.sql: a group role, two login roles,
 #   grants, a database) runs unchanged with psql as the branch owner;
 # - listRoles shows its login roles with origin sql and password set_in_sql; the reveal
@@ -21,6 +21,7 @@ LOG_PREFIX=role-e2e
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
+PROXY_HOSTADDR="${CHELABASE_PROXY_HOSTADDR:?run through just workbench run}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 MIGRATION="$root/scripts/fixtures/role-migration.sql"
@@ -46,14 +47,15 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-ca="$root/.chelabase/neon/proxy-ca.crt"
-[[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
+ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
+[[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 trap cleanup EXIT
 
 # ok <method> <path> <expected status> [body]: the call, or die.
@@ -76,7 +78,7 @@ sql_as() {
   local user="$1" password="$2"
   shift 2
   PGUSER="$user" PGPASSWORD="$password" PGCONNECT_TIMEOUT=10 psql \
-    "host=$host hostaddr=127.0.0.1 port=${PROXY_PG_PORT} dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+    "host=$host hostaddr=$PROXY_HOSTADDR port=${PROXY_PG_PORT} dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
     -X -v ON_ERROR_STOP=1 -qtA "$@"
 }
 

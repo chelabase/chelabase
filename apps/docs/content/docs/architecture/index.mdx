@@ -50,7 +50,7 @@ client ──Postgres wire / SQL over HTTP──▶ Neon proxy ──▶ compute
 
 ## The docs app
 
-This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, prerendered to static files. The API reference pages are generated from the OpenAPI documents in `openapi/` (see [API generation](/docs/architecture/api-generation)), and TypeScript samples are type-checked at build time with twoslash. `just docs` serves it on `http://docs.chelabase.localhost:8000`, reached through the gateway, so the stack (`just dev`) must be up.
+This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, prerendered to static files. The API reference pages are generated from the OpenAPI documents in `openapi/` (see [API generation](/docs/architecture/api-generation)), and TypeScript samples are type-checked at build time with twoslash. `just workbench up --with docs` serves it on the stack's docs host (`http://docs.chelabase.localhost:8000` on main), reached through the gateway.
 
 ## Pages in this section
 

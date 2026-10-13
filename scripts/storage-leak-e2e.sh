@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live check that deletes reclaim safekeeper storage (needs just deps-up and just dev). Safekeeper
+# Live check that deletes reclaim safekeeper storage (needs the stack: just workbench up). Safekeeper
 # timelines are created by the storage controller (--timelines-onto-safekeepers), so deleting a
 # database, a branch or a timeline superseded by reset-to-parent deletes the safekeeper's copy too:
 # 1. a new database has its tenant/timeline on safekeeper1;
@@ -28,6 +28,7 @@ LOG_PREFIX=storage-leak-e2e
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
+PROXY_HOSTADDR="${CHELABASE_PROXY_HOSTADDR:?run through just workbench run}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -46,14 +47,15 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-ca="$root/.chelabase/neon/proxy-ca.crt"
-[[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
+ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
+[[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 trap cleanup EXIT
 
 ok() {
@@ -114,7 +116,7 @@ psql_on() {
   bdb="$(jq -r '.database' "$tmp/body")"
   for _ in $(seq 60); do
     if PGPASSWORD="$bpw" PGCONNECT_TIMEOUT=10 psql \
-      "host=$bhost hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
+      "host=$bhost hostaddr=$PROXY_HOSTADDR port=${PROXY_PG_PORT} user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
       -v ON_ERROR_STOP=1 -qtA -c "$2" >/dev/null 2>"$tmp/err"; then
       return
     fi
@@ -126,7 +128,7 @@ psql_on() {
 timeline_of() { metadata_sql -v id="$1" <<<"SELECT timeline_id FROM branches WHERE id = :'id';"; }
 
 # storcon_sql <psql args>: the storage controller's database.
-storcon_sql() { "${compose[@]}" exec -T storcon-db psql -U storcon -d storage_controller -v ON_ERROR_STOP=1 -qtA "$@"; }
+storcon_sql() { docker exec -i "$CHELABASE_COMPOSE_PROJECT-storcon-db-1" psql -U storcon -d storage_controller -v ON_ERROR_STOP=1 -qtA "$@"; }
 # wait_storcon_clean <tenant>: until storcon-db has no timelines and no pending-op rows for the
 # tenant, 60 s at most. A tenant delete op left behind (timeline_id '') keeps the controller from
 # removing the timelines rows (fork storage_controller/src/service/safekeeper_reconciler.rs, `delete_timeline_from_db`).
@@ -145,21 +147,21 @@ wait_storcon_clean() {
 }
 
 # --- the safekeeper and SeaweedFS views ---
-sk() { "${compose[@]}" exec -T safekeeper1 "$@"; }
+sk() { docker exec -i "$CHELABASE_COMPOSE_PROJECT-safekeeper1-1" "$@"; }
 # sk_has <tenant> <timeline>: safekeeper1 lists the timeline.
 sk_has() {
-  [[ "$(sk curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:7676/v1/tenant/$1/timeline/$2")" == 200 ]]
+  [[ "$(sk curl -s -o /dev/null -w '%{http_code}' "http://localhost:7676/v1/tenant/$1/timeline/$2")" == 200 ]]
 }
 # sk_gone <tenant> <timeline>: the safekeeper API answers 404 (a failed call or 000 is not "gone").
 sk_gone() {
-  [[ "$(sk curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:7676/v1/tenant/$1/timeline/$2")" == 404 ]]
+  [[ "$(sk curl -s -o /dev/null -w '%{http_code}' "http://localhost:7676/v1/tenant/$1/timeline/$2")" == 404 ]]
 }
 # sk_dir_has <path under /data>
 sk_dir_has() { [[ "$(sk sh -c 'test -e "$1" && echo y || echo n' _ "/data/$1")" == y ]]; }
 # sk_dir_gone <path under /data>: the exec worked and the path is absent.
 sk_dir_gone() { [[ "$(sk sh -c 'test -e "$1" && echo y || echo n' _ "/data/$1")" == n ]]; }
 # aws_sk <args>: the AWS CLI in the safekeeper container (it has the S3 credentials).
-aws_sk() { "${compose[@]}" exec -T safekeeper1 aws --endpoint-url http://seaweedfs:8333 "$@"; }
+aws_sk() { docker exec -i "$CHELABASE_COMPOSE_PROJECT-safekeeper1-1" aws --endpoint-url http://seaweedfs:8333 "$@"; }
 # s3_ls <path under safekeeper/>: the objects under that prefix (empty when none); dies when
 # the call itself fails (the CLI exits 1 with no message for an empty prefix).
 s3_ls() {
@@ -198,7 +200,7 @@ wait_removed() {
     if [[ -n "$tl" ]]; then
       sk_gone "$tenant" "$tl" || api_gone=no
     else
-      [[ "$(sk curl -sf "http://127.0.0.1:7676/v1/tenant/timeline" | jq -r --arg t "$tenant" '[.[] | select(.tenant_id == $t)] | length')" == 0 ]] || api_gone=no
+      [[ "$(sk curl -sf "http://localhost:7676/v1/tenant/timeline" | jq -r --arg t "$tenant" '[.[] | select(.tenant_id == $t)] | length')" == 0 ]] || api_gone=no
     fi
     sk_dir_gone "$path" || dir_gone=no
     out="$(s3_ls "$path")"

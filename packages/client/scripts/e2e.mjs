@@ -3,7 +3,8 @@
 // and these ids are small, so they read as numbers.
 //   node scripts/e2e.mjs queries   the secret key inserts, the public key reads, a batch rolls back
 //   node scripts/e2e.mjs rls       a row the policy hides is absent for the public key only
-// Env: GATEWAY_URL (default http://api.chelabase.localhost:8000), PUBLIC_KEY, SECRET_KEY.
+// Env: GATEWAY_URL (default $CHELABASE_ENTRY_API_URL, else http://api.chelabase.localhost:8000), PUBLIC_KEY, SECRET_KEY,
+// CHELABASE_PROXY_HOSTADDR (the proxy's address, for endpoint hosts).
 //
 // App users, for `just app-users-e2e` (scripts/app-users-e2e.sh); each user's refresh token is
 // kept in a file under STATE_DIR between phases:
@@ -13,10 +14,30 @@
 //   node scripts/e2e.mjs auth-refresh          rotation, grace, reuse and the revoked session
 // Env: GATEWAY_URL, PUBLIC_KEY, STATE_DIR, STAMP (makes the emails unique).
 import assert from "node:assert/strict";
+import dns from "node:dns";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createClient, DataApiError } from "../src/index.ts";
 
-const url = process.env.GATEWAY_URL ?? "http://api.chelabase.localhost:8000";
+// In the stack's runner the endpoint hosts (ep-<id>.…) don't resolve: they are served by the proxy,
+// whose address is CHELABASE_PROXY_HOSTADDR. Dial that address for them; the TLS server name stays
+// the endpoint host, so the certificate is still verified against it.
+const proxyAddr = process.env.CHELABASE_PROXY_HOSTADDR;
+if (proxyAddr) {
+  const realLookup = dns.lookup;
+  dns.lookup = (hostname, options, callback) => {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    if (typeof options === "number") options = { family: options };
+    if (!/^ep-[0-9a-f]+\./i.test(String(hostname))) return realLookup(hostname, options, callback);
+    const family = proxyAddr.includes(":") ? 6 : 4;
+    if (options?.all) callback(null, [{ address: proxyAddr, family }]);
+    else callback(null, proxyAddr, family);
+  };
+}
+
+const url = process.env.GATEWAY_URL ?? process.env.CHELABASE_ENTRY_API_URL ?? "http://api.chelabase.localhost:8000";
 const pub = createClient({ url, key: process.env.PUBLIC_KEY });
 const sec = createClient({ url, key: process.env.SECRET_KEY ?? "unused" });
 const PASSWORD = "Sup3r-Secret-pw!";

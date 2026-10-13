@@ -3,20 +3,19 @@
 //! API roles, the protected flag, and logins through Neon's proxy (Postgres wire on
 //! `CHELABASE_PROXY_PG_PORT`, default 4432, and SQL over HTTP on `CHELABASE_PROXY_HTTP_PORT`, default 4444).
 //!
-//! Same setup as `neon_live` (`just deps-up`, `just dev` from this checkout, so the orchestrator
+//! Same setup as `neon_live` (the workbench stack, so the orchestrator
 //! serves `neon.console_url` and the proxy runs with `max_roles=64`, `CHELABASE_COMPUTE_IMAGE` set
-//! to the fork image), plus `psql` and `curl` on the host, the built `chelabase` CLI (for API
-//! tokens) and the proxy's CA in `.chelabase/neon/proxy-ca.crt`:
+//! to the fork image), plus `psql` and `curl` in the runner, the built `chelabase` CLI (for API
+//! tokens, `CHELABASE_CLI`) and the proxy's CA (`CHELABASE_PROXY_CA_FILE`, default
+//! `.chelabase/neon/proxy-ca.crt` in the checkout):
 //!
 //! ```text
-//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
-//! CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
-//!   cargo test -p worker --test roles_live -- --ignored --test-threads=1 --nocapture
+//! just workbench test -p worker --test roles_live -- --run-ignored only
 //! ```
 //!
 //! Each test provisions its own database and deletes it afterwards, pass or fail. A few tests
-//! restart `just dev`'s orchestrator with extra settings (or stop it) and put it back as it was
-//! afterwards, pass or fail; they need `.chelabase/dev/pids` from `just dev`.
+//! recreate the stack's orchestrator through Compose with extra settings (or stop it) and recreate
+//! it plain afterwards, pass or fail; the runner has Compose and the stack's `CHELABASE_*` env.
 
 use std::future::Future;
 use std::process::Stdio;
@@ -37,7 +36,7 @@ use worker::config::RealWorker;
 use worker::roles::{RoleOutcome, RolePatch, RoleSpec};
 
 mod common;
-use common::{cleanup, setup, workspace_root};
+use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup, workspace_root};
 
 /// One provisioned database: its main branch, endpoint and the owner's password.
 struct Fx {
@@ -384,10 +383,10 @@ fn proxy_host(ep: &str) -> String {
 }
 
 fn proxy_ca() -> String {
-    let ca = workspace_root().join(".chelabase/neon/proxy-ca.crt");
+    let ca = proxy_ca_path();
     assert!(
         ca.exists(),
-        "{} is missing (run just deps-up)",
+        "{} is missing (run `just workbench up`)",
         ca.display()
     );
     ca.display().to_string()
@@ -396,8 +395,10 @@ fn proxy_ca() -> String {
 /// psql through the proxy (Postgres port) as `user` (passed in `PGUSER`, so any name works).
 fn psql_base(ep: &str, database: &str, user: &str, password: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("psql");
+    // The proxy is dialled at CHELABASE_PROXY_HOSTADDR when set; the TLS host name stays <ep>.<domain>.
+    let hostaddr = proxy_hostaddr();
     cmd.arg(format!(
-        "host={} hostaddr=127.0.0.1 port={} dbname={database} sslmode=verify-full sslrootcert={}",
+        "host={} hostaddr={hostaddr} port={} dbname={database} sslmode=verify-full sslrootcert={}",
         proxy_host(ep),
         proxy_pg_port(),
         proxy_ca()
@@ -479,10 +480,11 @@ async fn http_sql(
 ) -> (u16, String) {
     let host = proxy_host(ep);
     let http_port = proxy_http_port();
+    let hostaddr = proxy_hostaddr();
     let body = json!({ "query": sql, "params": [] }).to_string();
     let out = tokio::process::Command::new("curl")
         .args(["-sS", "--max-time", "30", "--cacert", &proxy_ca()])
-        .args(["--resolve", &format!("{host}:{http_port}:127.0.0.1")])
+        .args(["--resolve", &format!("{host}:{http_port}:{hostaddr}")])
         .args([
             "-w",
             "\n%{http_code}",
@@ -568,33 +570,50 @@ fn proxy_http_port() -> u16 {
     env_port("CHELABASE_PROXY_HTTP_PORT", 4444)
 }
 
-/// Where the orchestrator's internal listener binds: `CHELABASE_INTERNAL_ADDR` (the docker
-/// bridge on native Linux, which `just` derives; see scripts/internal-addr.sh), else loopback.
+/// `host:port` of a URL such as `http://orchestrator:8083/`; `default` when the variable is unset.
+fn url_host_port(var: &str, default: &str) -> String {
+    let url = std::env::var(var).unwrap_or_else(|_| default.into());
+    let rest = url.split_once("://").map_or(url.as_str(), |(_, r)| r);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// Where the orchestrator's internal listener answers: the host:port of `CHELABASE_INTERNAL_URL`
+/// (never the bind address variable: in the stack that is `0.0.0.0`), else the
+/// orchestrator's service name.
 fn internal_addr() -> String {
-    std::env::var("CHELABASE_INTERNAL_ADDR").unwrap_or_else(|_| format!("127.0.0.1:{}", addr_port("CHELABASE_INTERNAL_ADDR", 8083)))
+    url_host_port("CHELABASE_INTERNAL_URL", "http://orchestrator:8083")
 }
 
 fn orchestrator_addr() -> String {
-    format!("127.0.0.1:{}", addr_port("CHELABASE_ORCHESTRATOR_ADDR", 8081))
+    format!("orchestrator:{}", addr_port("CHELABASE_ORCHESTRATOR_ADDR", 8081))
 }
 
-/// The built `chelabase` CLI, next to this test's own binary's directory.
+/// The `chelabase` CLI: `CHELABASE_CLI` (the runner sets it), else the build next to this test's
+/// own binary's directory.
 fn chelabase_cli() -> std::path::PathBuf {
+    if let Ok(cli) = std::env::var("CHELABASE_CLI") {
+        return cli.into();
+    }
     let exe = std::env::current_exe().unwrap();
     let cli = exe.parent().unwrap().parent().unwrap().join("chelabase");
     assert!(
         cli.exists(),
-        "{} is missing (just dev builds it)",
+        "{} is missing (just workbench up builds it)",
         cli.display()
     );
     cli
+}
+
+/// The checkout the CLI runs in: `CHELABASE_CHECKOUT` when set, else this workspace.
+fn checkout_dir() -> std::path::PathBuf {
+    std::env::var("CHELABASE_CHECKOUT").map_or_else(|_| workspace_root(), Into::into)
 }
 
 /// A management API call through the gateway as the demo tenant's user: `(status, body)`.
 async fn api(method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
     let token = tokio::process::Command::new(chelabase_cli())
         .args(["dev", "token"])
-        .current_dir(workspace_root())
+        .current_dir(checkout_dir())
         .output()
         .await
         .expect("chelabase dev token");
@@ -675,97 +694,58 @@ async fn wait_for_data_status(key: &str, table: &str, status: u16, within: Durat
     }
 }
 
-// --- `just dev`'s orchestrator, restarted with other settings -------------------------------
-
-/// The dev directory `just dev` writes its pids and logs to.
-fn dev_dir() -> std::path::PathBuf {
-    workspace_root().join(".chelabase/dev")
-}
-
-fn pids_file() -> std::path::PathBuf {
-    dev_dir().join("pids")
-}
+// --- the stack's orchestrator, recreated with other settings -----------------------------------
 
 async fn port_open(addr: String) -> bool {
-    tokio::net::TcpStream::connect(addr)
-        .await
-        .is_ok()
+    tokio::net::TcpStream::connect(addr).await.is_ok()
 }
 
-/// Stops `just dev`'s orchestrator (its whole process group) and waits for its ports to close.
+fn required_env(var: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| panic!("{var} is unset (the stack's runner sets it)"))
+}
+
+/// `docker compose` on the stack's project, with the test's settings (`env`) in the command's
+/// environment: the orchestrator's `environment:` passes them through from the caller's.
+async fn compose(env: &[(&str, &str)], args: &[&str]) {
+    let checkout = required_env("CHELABASE_CHECKOUT");
+    let out = tokio::process::Command::new("docker")
+        .args(["compose", "-p", &required_env("CHELABASE_COMPOSE_PROJECT"), "-f"])
+        .arg(format!("{checkout}/infra/compose/docker-compose.yml"))
+        .arg("--env-file")
+        .arg(format!("{}/env/stack.env", required_env("CHELABASE_STACK_DIR")))
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run docker compose");
+    assert!(
+        out.status.success(),
+        "docker compose {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Stops the stack's orchestrator container and waits for its ports to close.
 async fn stop_orchestrator() {
-    let path = pids_file();
-    let pids =
-        std::fs::read_to_string(&path).expect("read the dev pids file (is just dev running?)");
-    let mut found = false;
-    let mut kept = Vec::new();
-    for pid in pids.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
-        if cmd.contains("orchestrator") {
-            found = true;
-            let _ = std::process::Command::new("kill")
-                .args(["--", &format!("-{pid}")])
-                .status();
-        } else {
-            kept.push(pid);
-        }
-    }
-    assert!(found, "no orchestrator in {}", path.display());
-    std::fs::write(&path, kept.join("\n") + "\n").unwrap();
+    compose(&[], &["stop", "orchestrator"]).await;
     for _ in 0..100 {
         if !port_open(internal_addr()).await && !port_open(orchestrator_addr()).await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    panic!("the orchestrator still listens 20 s after the kill");
+    panic!("the orchestrator still listens 20 s after it was stopped");
 }
 
-/// The variables `just dev` sources for its apps beyond `demo.env` (which the test's own
-/// environment already has): `.chelabase/zitadel/actions.env` under `root`, when present.
-/// `KEY=VALUE` lines; blank lines and `#` comments are skipped.
-fn dev_env_files(root: &std::path::Path) -> Vec<(String, String)> {
-    let Ok(text) = std::fs::read_to_string(root.join(".chelabase/zitadel/actions.env")) else {
-        return Vec::new();
-    };
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.to_string()))
-        .collect()
-}
-
-/// Starts the orchestrator as `just dev` does (same environment as this test, plus
-/// [`dev_env_files`], plus `env`),
-/// records it in the dev directory's `pids` in place of the old one, and waits for it to answer.
+/// Recreates the stack's orchestrator container with `env` in the compose command's environment
+/// (empty: as the stack defines it) and waits for it to answer.
 async fn start_orchestrator(env: &[(&str, &str)]) {
-    use std::os::unix::process::CommandExt;
-    let root = workspace_root();
-    let log = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(dev_dir().join("orchestrator.log"))
-        .unwrap();
-    // Detached like `just dev`'s apps: it outlives this test, and `just dev-down` stops it.
-    #[allow(clippy::zombie_processes)]
-    let child = std::process::Command::new("cargo")
-        .args(["run", "-q", "-p", "orchestrator"])
-        .current_dir(&root)
-        .envs(dev_env_files(&root))
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .process_group(0)
-        .spawn()
-        .expect("start the orchestrator");
-    let pid = child.id().to_string();
-    // First, as `just dev` writes it; `just dev-down` stops the group.
-    let path = pids_file();
-    let old = std::fs::read_to_string(&path).unwrap_or_default();
-    std::fs::write(&path, format!("{pid}\n{old}")).unwrap();
+    compose(
+        env,
+        &["up", "-d", "--force-recreate", "--no-deps", "orchestrator"],
+    )
+    .await;
     for _ in 0..600 {
         if port_open(internal_addr()).await && port_open(orchestrator_addr()).await {
             println!("orchestrator up with {env:?}");
@@ -776,7 +756,7 @@ async fn start_orchestrator(env: &[(&str, &str)]) {
     panic!("the orchestrator didn't come up within 120 s");
 }
 
-/// Runs `body` with the orchestrator restarted with `env` (`None`: stopped), then restarts it
+/// Runs `body` with the orchestrator recreated with `env` (`None`: stopped), then recreates it
 /// plain, pass or fail.
 async fn with_orchestrator<F, Fut>(env: Option<&'static [(&'static str, &'static str)]>, body: F)
 where
@@ -797,33 +777,10 @@ where
     }
 }
 
-/// The restarted orchestrator gets what `just dev` sources besides the test's own environment
-/// (`actions.env`: without its signing key the Zitadel webhook answers 503 until `just dev`
-/// runs again).
-#[test]
-fn restarted_orchestrator_gets_the_dev_env_files() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(root.path().join(".chelabase/zitadel")).unwrap();
-    std::fs::write(
-        root.path().join(".chelabase/zitadel/actions.env"),
-        "# comment\n\nCHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=k=1\n",
-    )
-    .unwrap();
-    assert_eq!(
-        dev_env_files(root.path()),
-        vec![(
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY".to_string(),
-            "k=1".to_string()
-        )]
-    );
-    let empty = tempfile::tempdir().unwrap();
-    assert!(dev_env_files(empty.path()).is_empty());
-}
-
 // --- SQL-managed roles ----------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn forwarding_is_off_in_admin_sql() {
     live(|fx| async move {
         assert_eq!(fx.value(&fx.ep, "SHOW neon.forward_ddl;").await, "off");
@@ -839,7 +796,7 @@ async fn forwarding_is_off_in_admin_sql() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn migration_script_runs_through_the_proxy() {
     live(|fx| async move {
         let (ep, db) = (fx.ep.clone(), fx.database.clone());
@@ -901,7 +858,7 @@ async fn migration_script_runs_through_the_proxy() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn quoted_names_work() {
     live(|fx| async move {
         let name = "My \"Role\"";
@@ -952,7 +909,7 @@ async fn quoted_names_work() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn savepoint_and_multi_statement_transactions() {
     live(|fx| async move {
         psql_script(
@@ -1004,7 +961,7 @@ async fn savepoint_and_multi_statement_transactions() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_before_the_migration_and_rerun() {
     live(|fx| async move {
         const MIGRATION: &str = "CREATE ROLE mig LOGIN PASSWORD 'migration-pass-1'";
@@ -1056,7 +1013,7 @@ async fn restore_before_the_migration_and_rerun() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn child_keeps_passwords_owner_differs() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE app LOGIN PASSWORD 'app-pass-child-1'")
@@ -1094,7 +1051,7 @@ async fn child_keeps_passwords_owner_differs() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn protected_child_gets_fresh_passwords() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE app LOGIN PASSWORD 'app-pass-protected'")
@@ -1137,7 +1094,7 @@ async fn protected_child_gets_fresh_passwords() {
 // that role in its catalog, though the parent's copies don't: it gets a fresh password too, so
 // the old one is refused on the child. A role without LOGIN that has a password gets one too.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn protected_child_at_a_past_point_refuses_a_dropped_roles_password() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE gone LOGIN PASSWORD 'gone-pass-12345'")
@@ -1192,7 +1149,7 @@ async fn protected_child_at_a_past_point_refuses_a_dropped_roles_password() {
 // can be granted it). Setting a password again restores the login.
 // (Refusing '' explicitly in the fork is parked until the next fork work.)
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn empty_password_means_no_password() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE blank LOGIN PASSWORD ''").await;
@@ -1225,7 +1182,7 @@ async fn empty_password_means_no_password() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn md5_refused() {
     live(|fx| async move {
         // `md5` || md5(password || user), as old pg_dumpall output has it.
@@ -1248,7 +1205,7 @@ async fn md5_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn pg_dumpall_style_scram_accepted() {
     live(|fx| async move {
         let verifier = chelabase_neon::scram::verifier("dumped-pass-12345");
@@ -1276,7 +1233,7 @@ async fn pg_dumpall_style_scram_accepted() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn weak_password_with_strength_on() {
     live(|fx| async move {
         with_orchestrator(
@@ -1313,7 +1270,7 @@ async fn weak_password_with_strength_on() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn key_role_drop_refused() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE kr LOGIN PASSWORD 'key-role-pass-1'")
@@ -1344,7 +1301,7 @@ async fn key_role_drop_refused() {
 // row has no verifier. Create and rotate check it on the compute; the key works; a drop is
 // refused while it lives; and a just-dropped name is refused a key.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn nologin_role_backs_a_secret_key() {
     live(|fx| async move {
         fx.owner_ok(
@@ -1410,7 +1367,7 @@ async fn nologin_role_backs_a_secret_key() {
 // bound to the old OID: the data API refuses it at once, and the resync revokes it. A key
 // made for the new role works.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn recreated_role_kills_its_key_and_the_resync_revokes_it() {
     live(|fx| async move {
         fx.owner_ok(
@@ -1449,7 +1406,7 @@ async fn recreated_role_kills_its_key_and_the_resync_revokes_it() {
 // Re-review: Neon sends `DROP ROLE kr; ALTER ROLE other RENAME TO kr` as the rename alone; a
 // live key on `kr` still refuses it, with the DROP's text, and nothing changes.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn drop_then_rename_onto_a_key_role_refused() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE kr LOGIN PASSWORD 'key-role-pass-1'")
@@ -1480,7 +1437,7 @@ async fn drop_then_rename_onto_a_key_role_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn control_plane_down_fails_the_ddl() {
     live(|fx| async move {
         // The owner's session is opened first: the proxy needs the control plane to log in.
@@ -1529,7 +1486,7 @@ async fn control_plane_down_fails_the_ddl() {
                 ),
                 "unexpected error: {stderr}"
             );
-            for leak in ["curl", "host.docker.internal", "control plane", "HTTP"] {
+            for leak in ["curl", concat!("host.docker", ".internal"), "control plane", "HTTP"] {
                 assert!(!stderr.contains(leak), "the error shows {leak:?}: {stderr}");
             }
             assert_eq!(fx2.role_count(&fx2.ep, "down_role").await, "0");
@@ -1552,7 +1509,7 @@ async fn control_plane_down_fails_the_ddl() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn forwarding_off_then_resync_picks_up() {
     live(|fx| async move {
         fx.sql("CREATE ROLE quiet LOGIN PASSWORD 'quiet-pass-12345';")
@@ -1573,7 +1530,7 @@ async fn forwarding_off_then_resync_picks_up() {
 
 // T12b: LOGIN and NOLOGIN reach the control plane in the statement's own transaction.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn alter_role_nologin_blocks_the_proxy_login_at_once() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE nl_role LOGIN PASSWORD 'nl-pass-12345'")
@@ -1600,7 +1557,7 @@ async fn alter_role_nologin_blocks_the_proxy_login_at_once() {
 // UNTIL (Postgres requires CREATEROLE and ADMIN on the role), so the owner case is covered by
 // `ddl_valid_until_alone_is_an_attribute_change` in the orchestrator's internal tests.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn alter_role_valid_until_keeps_the_copy() {
     live(|fx| async move {
         fx.create(fx.main, "api_vu", false).await;
@@ -1623,7 +1580,7 @@ async fn alter_role_valid_until_keeps_the_copy() {
 // data key uses it (the key keeps working), and goes through when none does. Needs a fork
 // build that sends `recreated`.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn drop_and_create_in_one_transaction_is_refused_while_a_key_uses_the_role() {
     live(|fx| async move {
         let setup = "CREATE TABLE notes (id int PRIMARY KEY, body text);\n\
@@ -1667,7 +1624,7 @@ async fn drop_and_create_in_one_transaction_is_refused_while_a_key_uses_the_role
 // T12b: a GRANT (nothing the receiver can mirror) is read back by a resync a few seconds
 // later, not at reconcile's next pass (every 30 s).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn grant_shows_the_derived_flag_within_seconds() {
     live(|fx| async move {
         fx.create(fx.main, "api_admin", true).await;
@@ -1702,7 +1659,7 @@ async fn grant_shows_the_derived_flag_within_seconds() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn owner_level_by_sql_blocks_the_key() {
     live(|fx| async move {
         fx.create(fx.main, "api_admin", true).await;
@@ -1785,7 +1742,7 @@ async fn owner_level_by_sql_blocks_the_key() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn database_cap_refusal_leaves_no_database() {
     live(|fx| async move {
         with_orchestrator(
@@ -1825,7 +1782,7 @@ async fn database_cap_refusal_leaves_no_database() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn owner_can_use_roles_it_creates() {
     live(|fx| async move {
         // Q9: `createrole_self_grant = 'set, inherit'`. (`ALTER … OWNER TO` also needs the new
@@ -1852,7 +1809,7 @@ async fn owner_can_use_roles_it_creates() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn main_database_drop_is_refused() {
     live(|fx| async move {
         let main = fx.database.clone();
@@ -1942,7 +1899,7 @@ async fn main_database_drop_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn system_database_listed_and_connectable() {
     live(|fx| async move {
         // Right after the provision: no resync has to happen first.
@@ -1973,7 +1930,7 @@ async fn system_database_listed_and_connectable() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn owner_password_set_in_sql() {
     live(|fx| async move {
         fx.owner_ok("ALTER ROLE postgres PASSWORD 'owner-set-in-sql-1'")
@@ -2014,7 +1971,7 @@ async fn owner_password_set_in_sql() {
 // --- API roles ------------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn plain_role_logs_in_and_is_plain() {
     live(|fx| async move {
         fx.create(fx.main, "app", false).await;
@@ -2030,7 +1987,7 @@ async fn plain_role_logs_in_and_is_plain() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn owner_level_role_is_a_neon_superuser_member() {
     live(|fx| async move {
         fx.create(fx.main, "admin", true).await;
@@ -2050,7 +2007,7 @@ async fn owner_level_role_is_a_neon_superuser_member() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn reset_applies_at_once() {
     live(|fx| async move {
         fx.create(fx.main, "app", false).await;
@@ -2070,7 +2027,7 @@ async fn reset_applies_at_once() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn reset_of_an_sql_role_makes_it_revealable() {
     live(|fx| async move {
         fx.owner_ok("CREATE ROLE app LOGIN PASSWORD 'app-pass-sql-reset'")
@@ -2088,7 +2045,7 @@ async fn reset_of_an_sql_role_makes_it_revealable() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn delete_refuses_login_and_hands_objects_to_the_owner() {
     live(|fx| async move {
         fx.create(fx.main, "app", false).await;
@@ -2156,7 +2113,7 @@ async fn delete_refuses_login_and_hands_objects_to_the_owner() {
 // I1: a database name that isn't a plain identifier (here one with a hyphen) doesn't block
 // the delete: psql reaches it, and the role's table in it moves to the owner.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn delete_reaches_a_hyphenated_database() {
     live(|fx| async move {
         fx.create(fx.main, "app", false).await;
@@ -2187,7 +2144,7 @@ async fn delete_reaches_a_hyphenated_database() {
 // as that membership's grantor) still deletes. (The owner makes the group and gives `admin`
 // ADMIN on it: revision 2's owner-level role is a `neon_superuser` member without CREATEROLE.)
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn delete_owner_level_role_that_granted_memberships() {
     live(|fx| async move {
         fx.create(fx.main, "admin", true).await;
@@ -2276,7 +2233,7 @@ async fn delete_owner_level_role_that_granted_memberships() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_before_the_role_brings_it_back() {
     live(|fx| async move {
         fx.sql("CREATE TABLE t (v text); INSERT INTO t VALUES ('A');")
@@ -2323,7 +2280,7 @@ async fn restore_before_the_role_brings_it_back() {
 // LOGIN member of it; an update drops the membership and LOGIN; the resync keeps both
 // NOLOGIN roles and restores the group's attributes after drift in SQL.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn nologin_group_role_and_membership_on_a_real_compute() {
     live(|fx| async move {
         const ATTRS: &str = "SELECT rolcanlogin::text || ',' || rolinherit::text || ',' || \
@@ -2506,7 +2463,7 @@ impl Fx {
 // (made before the branch, the same OID and name on both timelines) is kept and stamped with
 // the new timeline.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn reset_does_not_move_a_key_to_a_reused_oid() {
     live(|fx| async move {
         fx.sql("CREATE ROLE shared NOLOGIN;").await;
@@ -2570,7 +2527,7 @@ async fn reset_does_not_move_a_key_to_a_reused_oid() {
 // with forwarding off, its row resealed under the new name (the password logs in, the old name
 // doesn't), and its key following with its OID (still served).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn rename_role_through_the_control_plane() {
     live(|fx| async move {
         fx.create(fx.main, "app", false).await;
@@ -2615,7 +2572,7 @@ async fn rename_role_through_the_control_plane() {
 // T14 E32, the upgrade: an API-made role given a group and attributes in SQL (as a migration
 // would) keeps them through the resync, which records them; nothing is revoked.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn sql_changes_to_an_api_role_stick_through_the_resync() {
     live(|fx| async move {
         fx.create(fx.main, "app", false).await;
@@ -2646,7 +2603,7 @@ async fn sql_changes_to_an_api_role_stick_through_the_resync() {
 // T14 I2: turning LOGIN on counts toward the login-role cap, in the same transaction as the
 // write (the worker's cap is 50 in the dev stack: a branch near it is built with SQL roles).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn turning_login_on_respects_the_cap() {
     live(|fx| async move {
         let cap = fx.worker.roles.role_cap;
@@ -2677,7 +2634,7 @@ async fn turning_login_on_respects_the_cap() {
 /// E29a: a role's live sessions, read by the worker over the admin path and served by
 /// `listRoleSessions`: the count, the client address, `application_name` and start time.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn role_sessions_lists_the_live_connections() {
     live(|fx| async move {
         fx.create(fx.main, "sess_app", false).await;

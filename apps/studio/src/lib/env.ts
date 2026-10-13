@@ -1,4 +1,4 @@
-/** Studio configuration, written to apps/studio/.env.local by `chelabase dev bootstrap`. */
+/** Studio configuration, written to the stack's `studio.env` by `chelabase dev bootstrap` (Compose passes it to Studio's container). */
 export interface StudioEnv {
   issuer: string;
   clientId: string;
@@ -22,7 +22,7 @@ export function readEnv(source: Record<string, string | undefined>): StudioEnv {
     .map((key) => KEYS[key]);
   if (missing.length > 0) {
     throw new Error(
-      `Studio is missing ${missing.join(", ")}. Run \`just zitadel-bootstrap\` to write apps/studio/.env.local, then restart Studio.`,
+      `Studio is missing ${missing.join(", ")}. Run \`just zitadel-bootstrap\` to write the stack's studio.env, then \`just workbench restart studio\`.`,
     );
   }
   return {

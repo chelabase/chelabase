@@ -1,11 +1,18 @@
-# Chelabase local control-plane dependencies.
-# Rust apps and Studio run on the host against these services.
+# A Chelabase workbench stack (W2): the infra, Neon storage and proxy, Zitadel, Mailpit and the app
+# tier (orchestrator, worker, gateway, auth, rest, Studio; docs and landing under the `sites`
+# profile; the test runner under the `runner` profile).
+#
+# One file, any project: there is no `name:`. Every caller goes through `chelabase workbench`,
+# which passes `-p <project> -f <checkout>/infra/compose/docker-compose.yml
+# --env-file <state>/env/stack.env`; stack.env is rendered from .env.example plus the stack's own
+# values (its slug, ports, host names, paths, uid/gid, the workbench image).
+#
+# Reachable from the host only through the gateway's port and the proxy's Postgres port, each on
+# 127.0.0.1 and ::1. Everything else talks over the project network by service name.
 
-name: chelabase
-
-# --- Neon storage (part of the base stack: `just deps-up`) ---
-# Pinned by digest; `just deps-up` overrides these with a local `just neon-build` when present.
-# The packages are public on ghcr.io (infra/neon/README.md).
+# --- Neon storage ---
+# Pinned by digest; `chelabase workbench up` overrides these with a local `just neon-build` when
+# present. The packages are public on ghcr.io (infra/neon/README.md).
 x-neon-images:
   neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:c8d1bb68b81f-dev@sha256:66b57f9ebe0f25d410da3d0f20638823f1cce0f6b3bdfad2dca419dd82f16010}
   # The image of the compute containers the worker starts (CHELABASE_COMPUTE_IMAGE); pinned here.
@@ -17,6 +24,70 @@ x-neon-s3-env: &neon-s3-env
   AWS_SECRET_ACCESS_KEY: chelabase-dev-secret
   AWS_DEFAULT_REGION: us-east-1
 
+# --- The app tier's shared parts ---
+# Every path is mounted at its own host path (the checkout, the shared machine keys under
+# <main>/.chelabase, the stack's state dir), so the file paths in demo.env mean the same thing
+# inside and outside the containers.
+x-workbench: &workbench
+  image: ${CHELABASE_WORKBENCH_IMAGE:?set by chelabase workbench (stack.env)}
+  user: "${CHELABASE_UID:?set by chelabase workbench (stack.env)}:${CHELABASE_GID:?set by chelabase workbench (stack.env)}"
+  working_dir: ${CHELABASE_CHECKOUT:?set by chelabase workbench (stack.env)}
+  restart: unless-stopped
+
+# stack.env is always rendered before the CLI calls Compose (it is the --env-file too, and the
+# `:?` settings above fail without it), so it is not marked required here: `docker compose
+# config` must render a stack offline from the fixture alone.
+x-stack-env: &stack-env
+  path: ${CHELABASE_STACK_DIR:?set by chelabase workbench (stack.env)}/env/stack.env
+  required: false
+x-demo-env: &demo-env
+  path: ${CHELABASE_STACK_DIR}/zitadel/demo.env
+  required: false
+
+x-checkout-ro: &checkout-ro
+  type: bind
+  source: ${CHELABASE_CHECKOUT}
+  target: ${CHELABASE_CHECKOUT}
+  read_only: true
+x-checkout-rw: &checkout-rw
+  type: bind
+  source: ${CHELABASE_CHECKOUT}
+  target: ${CHELABASE_CHECKOUT}
+x-keys-secrets: &keys-secrets
+  type: bind
+  source: ${CHELABASE_KEYS_DIR:?set by chelabase workbench (stack.env)}/secrets
+  target: ${CHELABASE_KEYS_DIR}/secrets
+  read_only: true
+x-keys-gateway: &keys-gateway
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/gateway
+  target: ${CHELABASE_KEYS_DIR}/gateway
+  read_only: true
+x-keys-auth: &keys-auth
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/auth
+  target: ${CHELABASE_KEYS_DIR}/auth
+  read_only: true
+x-keys-neon: &keys-neon
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon
+  target: ${CHELABASE_KEYS_DIR}/neon
+  read_only: true
+x-state: &state
+  type: bind
+  source: ${CHELABASE_STACK_DIR}
+  target: ${CHELABASE_STACK_DIR}
+x-docker-sock: &docker-sock
+  type: bind
+  source: /var/run/docker.sock
+  target: /var/run/docker.sock
+
+x-app-health: &app-health
+  interval: 2s
+  timeout: 5s
+  retries: 30
+  start_period: 60s
+
 services:
   metadata-db:
     image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
@@ -25,8 +96,6 @@ services:
       POSTGRES_USER: chelabase
       POSTGRES_PASSWORD: chelabase
       POSTGRES_DB: chelabase_metadata
-    ports:
-      - "127.0.0.1:5433:5432"
     volumes:
       - metadata_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -39,9 +108,6 @@ services:
     image: nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
     restart: unless-stopped
     command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
-    ports:
-      - "127.0.0.1:4222:4222"
-      - "127.0.0.1:8222:8222"
     volumes:
       - nats_data:/data
     healthcheck:
@@ -52,12 +118,10 @@ services:
 
   # Valkey (BSD-3-Clause, speaks the Redis protocol). Neon's proxy uses it for query cancel and
   # for the cache-clearing messages the control plane publishes on a password change. Local dev:
-  # no auth, loopback only. Platform mode needs auth and TLS.
+  # no auth, internal to the stack's network. Platform mode needs auth and TLS.
   valkey:
     image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:6379:6379"
     volumes: ["valkey_data:/data"]
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
@@ -71,8 +135,6 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    ports:
-      - "127.0.0.1:5434:5432"
     volumes:
       - zitadel_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -81,11 +143,13 @@ services:
       timeout: 5s
       retries: 10
 
-  # Zitadel v4: sign-in pages are Studio's own (/login …), served by auth. FirstInstance writes admin.pat and login-client.pat once, on a fresh zitadel_pg_data volume.
+  # Zitadel v4: sign-in pages are Studio's own (/login …), served by auth. FirstInstance writes
+  # admin.pat and login-client.pat once, on a fresh zitadel_pg_data volume, into the stack's
+  # state dir.
   zitadel:
     image: ghcr.io/zitadel/zitadel:v4.19.1@sha256:f98935f56505ec6fa3e6523261cd1b8ace0c622e16da4a45acd493cb472f003f
     restart: unless-stopped
-    command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode ${CHELABASE_ZITADEL_TLS_MODE:?set by scripts/lib/entry.sh (just deps-up)}
+    command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode ${CHELABASE_ZITADEL_TLS_MODE:?set by chelabase workbench (stack.env)}
     environment:
       ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
       ZITADEL_DATABASE_POSTGRES_PORT: 5432
@@ -96,12 +160,15 @@ services:
       ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
       ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
       ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
-      # Zitadel's public address is the gateway's auth host (CHELABASE_AUTH_HOST), set apart here:
-      # its name, the public port and whether the scheme is https. scripts/lib/entry.sh derives
-      # them (and the TLS mode above) from the entry settings; there are no defaults here.
-      ZITADEL_EXTERNALSECURE: "${CHELABASE_PUBLIC_SECURE:?set by scripts/lib/entry.sh (just deps-up)}"
-      ZITADEL_EXTERNALDOMAIN: "${CHELABASE_AUTH_HOST_NAME:?set by scripts/lib/entry.sh (just deps-up)}"
-      ZITADEL_EXTERNALPORT: "${CHELABASE_PUBLIC_PORT:?set by scripts/lib/entry.sh (just deps-up)}"
+      # Zitadel's public address is the stack's auth host (CHELABASE_AUTH_HOST), set apart here:
+      # its name, the public port and whether the scheme is https. stack.env carries them (and
+      # the TLS mode above); there are no defaults here.
+      ZITADEL_EXTERNALSECURE: "${CHELABASE_PUBLIC_SECURE:?set by chelabase workbench (stack.env)}"
+      ZITADEL_EXTERNALDOMAIN: "${CHELABASE_AUTH_HOST_NAME:?set by chelabase workbench (stack.env)}"
+      ZITADEL_EXTERNALPORT: "${CHELABASE_PUBLIC_PORT:?set by chelabase workbench (stack.env)}"
+      # The TLS mode is `disabled` or `external` (TLS ends at the gateway), so Zitadel serves
+      # plain HTTP; `zitadel ready` (the healthcheck) reads this, not the start flag.
+      ZITADEL_TLS_ENABLED: "false"
       # Zitadel's own registration is off: sign-up goes only through Chelabase's rules. (A volume
       # made before this setting gets it from `chelabase dev bootstrap`.)
       ZITADEL_DEFAULTINSTANCE_LOGINPOLICY_ALLOWREGISTER: "false"
@@ -116,23 +183,29 @@ services:
       ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
       ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
       # The login UI is Studio, at its public origin (scheme and CHELABASE_STUDIO_HOST).
-      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: "${CHELABASE_PUBLIC_SCHEME:?set by scripts/lib/entry.sh (just deps-up)}://${CHELABASE_STUDIO_HOST:?set by scripts/lib/entry.sh (just deps-up)}/"
-      ZITADEL_OIDC_DEFAULTLOGINURLV2: "${CHELABASE_PUBLIC_SCHEME:?set by scripts/lib/entry.sh (just deps-up)}://${CHELABASE_STUDIO_HOST:?set by scripts/lib/entry.sh (just deps-up)}/login?authRequest="
-      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "${CHELABASE_PUBLIC_SCHEME:?set by scripts/lib/entry.sh (just deps-up)}://${CHELABASE_STUDIO_HOST:?set by scripts/lib/entry.sh (just deps-up)}/logout?post_logout_redirect="
-      # self-hosted dev only: lets Actions call the host's internal listener (R11)
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: "${CHELABASE_PUBLIC_SCHEME:?set by chelabase workbench (stack.env)}://${CHELABASE_STUDIO_HOST:?set by chelabase workbench (stack.env)}/"
+      ZITADEL_OIDC_DEFAULTLOGINURLV2: "${CHELABASE_PUBLIC_SCHEME}://${CHELABASE_STUDIO_HOST}/login?authRequest="
+      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "${CHELABASE_PUBLIC_SCHEME}://${CHELABASE_STUDIO_HOST}/logout?post_logout_redirect="
+      # Actions call the orchestrator by service name (a private address on the stack network,
+      # allowed); loopback and link-local stay blocked.
       ZITADEL_HTTPCLIENT_DENYLIST: "localhost,0.0.0.0/8,127.0.0.0/8,169.254.0.0/16,::1/128"
-    # self-hosted dev only: lets Actions call the host's internal listener (R11)
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     depends_on:
       zitadel-db:
         condition: service_healthy
-    ports:
-      - "127.0.0.1:8080:8080"
     volumes:
-      - ../../.chelabase/zitadel:/zitadel-bootstrap
+      - type: bind
+        source: ${CHELABASE_STACK_DIR}/zitadel
+        target: /zitadel-bootstrap
+    # The image has no shell or HTTP client; `zitadel ready` asks its own /debug/ready.
+    healthcheck:
+      test: ["CMD", "/app/zitadel", "ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
 
-  # Local mail catcher: Zitadel's emails (invites, resets, verification codes) land here (UI :8025).
+  # Local mail catcher: Zitadel's emails (invites, resets, verification codes) land here; its UI
+  # is the stack's mail host, through the gateway.
   mailpit:
     image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
     restart: unless-stopped
@@ -141,8 +214,12 @@ services:
       # accept any user/password over plain SMTP. Local dev only.
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
       MP_SMTP_AUTH_ALLOW_INSECURE: "true"
-    ports:
-      - "127.0.0.1:8025:8025"
+    # `mailpit readyz` asks the server's /readyz (the image has no HTTP client of its own).
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
   # --- Neon storage ------------------------------------------------------
   # Flags and health checks come from the old cheladb repo's core/docker/docker-compose.yml,
@@ -194,7 +271,8 @@ services:
       interval: 2s
       retries: 60
 
-  # One safekeeper keeps WAL on one disk; enough for local dev.
+  # One safekeeper keeps WAL on one disk; enough for local dev. The worker reads each
+  # timeline's commit LSN from its HTTP API (CHELABASE_SAFEKEEPER_HTTP, by service name).
   safekeeper1:
     image: *neon-image
     restart: unless-stopped
@@ -210,9 +288,6 @@ services:
       - --availability-zone=az-1
       - --broker-endpoint=http://storage-broker:50051
       - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
-    # The worker reads each timeline's commit LSN from here (CHELABASE_SAFEKEEPER_HTTP).
-    ports:
-      - "127.0.0.1:7676:7676"
     volumes:
       - neon_safekeeper1_data:/data
     healthcheck:
@@ -245,14 +320,13 @@ services:
     restart: unless-stopped
     command:
       - storage_controller
-      # --dev: no JWT auth between storage components. Their ports stay on the Compose
-      # network; only the APIs below are published, on loopback.
+      # --dev: no JWT auth between storage components. Their ports stay on the stack's network.
       - --dev
       - --listen=0.0.0.0:1234
       # Attachment changes (every tenant create, too) are pushed to the orchestrator's
-      # internal listener on the host; a tenant's reconcile waits until it answers. The
+      # internal listener, by service name; a tenant's reconcile waits until it answers. The
       # token is local dev only.
-      - --control-plane-url=http://host.docker.internal:8083/storcon
+      - --control-plane-url=http://orchestrator:8083/storcon
       - --control-plane-jwt-token=${CHELABASE_STORCON_HOOK_TOKEN:-chelabase-dev-storcon-hook}
       - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
       # The controller creates and deletes each timeline on the safekeepers (one, here). Without
@@ -260,10 +334,6 @@ services:
       # timeline leaves its WAL on the safekeeper and in S3. Count 1: the default 3 needs three.
       - --timelines-onto-safekeepers
       - --timeline-safekeeper-count=1
-    ports:
-      # The control plane runs on the host.
-      - "127.0.0.1:1234:1234"
-    extra_hosts: ["host.docker.internal:host-gateway"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1234/ready"]
       interval: 2s
@@ -294,9 +364,6 @@ services:
         EOT
         echo '{"host":"pageserver","port":6400,"http_host":"pageserver","http_port":9898,"availability_zone_id":"az-1"}' > /data/.neon/metadata.json
         exec pageserver -D /data/.neon
-    ports:
-      # HTTP API for the host-side control plane; the pg port (6400) stays internal.
-      - "127.0.0.1:9898:9898"
     volumes:
       - neon_pageserver_data:/data
     healthcheck:
@@ -334,8 +401,8 @@ services:
         condition: service_healthy
 
   # Writes the proxy's TLS certificate once: a local CA and a *.localtest.me certificate signed
-  # by it. Clients verify against the CA; `just deps-up` copies it to
-  # .chelabase/neon/proxy-ca.crt.
+  # by it. Clients verify against the CA; `chelabase workbench up` copies it to
+  # <state>/neon/proxy-ca.crt.
   proxy-tls:
     image: *neon-image
     restart: "no"
@@ -363,17 +430,18 @@ services:
     network_mode: none
 
   # Neon's proxy. Clients connect to <endpoint-id>.localtest.me (which resolves to 127.0.0.1):
-  # Postgres wire on 4432; WebSocket and SQL over HTTP on 4444. It asks the orchestrator's
-  # internal listener for role secrets and compute addresses, and reaches computes on this
-  # network. Role secrets are cached for at most a minute, and dropped at once when the
-  # control plane publishes /password_updated to Valkey.
+  # Postgres wire on the stack's proxy port (4432 inside); WebSocket and SQL over HTTP on 4444,
+  # inside the stack's network only. It asks the orchestrator's internal listener for role
+  # secrets and compute addresses, and reaches computes on this network. Role secrets are cached
+  # for at most a minute, and dropped at once when the control plane publishes
+  # /password_updated to Valkey.
   proxy:
     image: *neon-image
     restart: unless-stopped
     command:
       - proxy
       - --auth-backend=control-plane
-      - --auth-endpoint=http://host.docker.internal:8083/proxy/api/v1
+      - --auth-endpoint=http://orchestrator:8083/proxy/api/v1
       - --proxy=0.0.0.0:4432
       - --wss=0.0.0.0:4444
       # The proxy takes the endpoint domain from the certificate's CN.
@@ -385,9 +453,8 @@ services:
     environment:
       NEON_PROXY_TO_CONTROLPLANE_TOKEN: ${CHELABASE_PROXY_API_TOKEN:-chelabase-dev-proxy-api}
     ports:
-      - "127.0.0.1:4432:4432"
-      - "127.0.0.1:4444:4444"
-    extra_hosts: ["host.docker.internal:host-gateway"]
+      - "127.0.0.1:${CHELABASE_PROXY_PORT:?set by chelabase workbench (stack.env)}:4432"
+      - "[::1]:${CHELABASE_PROXY_PORT}:4432"
     volumes: ["neon_proxy_tls:/tls:ro"]
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/4432"]
@@ -399,6 +466,236 @@ services:
       # The proxy exits if it can't reach Redis at startup.
       valkey:
         condition: service_healthy
+
+  # --- The app tier: the checkout's host-built debug binaries in the workbench image ---------
+  # Listeners bind 0.0.0.0 inside and every URL is a service name (stack.env). The gateway is the
+  # one way in from the host.
+
+  orchestrator:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/orchestrator"]
+    env_file:
+      - *stack-env
+      - *demo-env
+      - path: ${CHELABASE_STACK_DIR}/zitadel/actions.env
+        required: false
+    environment:
+      # Connection strings name the proxy's published port on the host.
+      - CHELABASE_PROXY_PG_PORT=${CHELABASE_PROXY_PORT}
+      # Bare names: taken from the caller's env, unset when it has none. The runner's live tests
+      # recreate the orchestrator with these to exercise the settings (roles_live).
+      - CHELABASE_PASSWORD_STRENGTH
+      - CHELABASE_BRANCH_DATABASE_CAP
+    group_add: ["${CHELABASE_DOCKER_GID:?set by chelabase workbench (stack.env)}"]
+    volumes:
+      - *checkout-ro
+      - *keys-secrets
+      - *keys-gateway
+      - *keys-auth
+      - *keys-neon
+      - *state
+      - *docker-sock
+    healthcheck:
+      <<: *app-health
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health && curl -fsS http://127.0.0.1:8083/health"]
+    depends_on:
+      metadata-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      storage-controller:
+        condition: service_healthy
+      zitadel:
+        condition: service_healthy
+
+  worker:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/worker"]
+    env_file:
+      - *stack-env
+      - *demo-env
+    group_add: ["${CHELABASE_DOCKER_GID}"]
+    volumes:
+      - *checkout-ro
+      - *keys-secrets
+      - *keys-gateway
+      - *keys-auth
+      - *keys-neon
+      - *state
+      - *docker-sock
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/health"]
+    depends_on:
+      metadata-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      storage-controller:
+        condition: service_healthy
+      pageserver:
+        condition: service_healthy
+      safekeeper1:
+        condition: service_healthy
+      register-safekeepers:
+        condition: service_completed_successfully
+      zitadel:
+        condition: service_healthy
+
+  # The front door. It listens on the stack's gateway port inside too (CHELABASE_GATEWAY_LISTEN)
+  # and answers every host of its stack on the network (the aliases), so one URL works from the
+  # host, from an app container and from the runner. It starts before its backends (502 until
+  # they come up).
+  gateway:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/gateway"]
+    env_file:
+      - *stack-env
+      - *demo-env
+    ports:
+      - "127.0.0.1:${CHELABASE_GATEWAY_PORT:?set by chelabase workbench (stack.env)}:${CHELABASE_GATEWAY_PORT}"
+      - "[::1]:${CHELABASE_GATEWAY_PORT}:${CHELABASE_GATEWAY_PORT}"
+    networks:
+      default:
+        aliases:
+          - ${CHELABASE_STUDIO_HOST_NAME:?set by chelabase workbench (stack.env)}
+          - ${CHELABASE_API_HOST_NAME:?set by chelabase workbench (stack.env)}
+          - ${CHELABASE_AUTH_HOST_NAME}
+          - ${CHELABASE_MAIL_HOST_NAME:?set by chelabase workbench (stack.env)}
+          - ${CHELABASE_DOCS_HOST_NAME:?set by chelabase workbench (stack.env)}
+          - ${CHELABASE_LANDING_HOST_NAME:?set by chelabase workbench (stack.env)}
+    volumes:
+      - *checkout-ro
+      - *keys-secrets
+      - *keys-gateway
+      - *keys-auth
+      - *keys-neon
+      - *state
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${CHELABASE_GATEWAY_PORT}/_gateway/health"]
+    depends_on:
+      zitadel:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+
+  # Studio's sign-in backend. Only the gateway reaches it (CHELABASE_AUTH_TRUSTED_PROXY).
+  auth:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/auth"]
+    env_file:
+      - *stack-env
+      - *demo-env
+    volumes:
+      - *checkout-ro
+      - *keys-secrets
+      - *keys-gateway
+      - *keys-auth
+      - *keys-neon
+      - *state
+    # auth has no health route: any HTTP answer (even a 404) means it is serving.
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://127.0.0.1:8084/"]
+    depends_on:
+      zitadel:
+        condition: service_healthy
+
+  rest:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/rest"]
+    env_file:
+      - *stack-env
+      - *demo-env
+    volumes:
+      - *checkout-ro
+      - *keys-secrets
+      - *keys-gateway
+      - *keys-auth
+      - *keys-neon
+      - *state
+    # rest has no health route: any HTTP answer (even a 404) means it is serving.
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://127.0.0.1:8085/"]
+    depends_on:
+      metadata-db:
+        condition: service_healthy
+
+  # Vite dev servers from the checkout (read-write: Vite's cache lives under node_modules), bound
+  # to 0.0.0.0 (CHELABASE_*_BIND) and reached through the gateway; HMR goes through it too.
+  studio:
+    <<: *workbench
+    command: ["pnpm", "--filter", "@chelabase/studio", "dev"]
+    env_file:
+      - *stack-env
+      - path: ${CHELABASE_STACK_DIR}/studio.env
+        required: false
+    environment:
+      CHELABASE_STUDIO_PORT: "3000"
+    volumes:
+      - *checkout-rw
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_STUDIO_HOST_NAME}", "http://127.0.0.1:3000/"]
+
+  docs:
+    <<: *workbench
+    profiles: ["sites"]
+    command: ["pnpm", "--filter", "@chelabase/docs", "dev"]
+    env_file:
+      - *stack-env
+    volumes:
+      - *checkout-rw
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_DOCS_HOST_NAME}", "http://127.0.0.1:3001/"]
+
+  landing:
+    <<: *workbench
+    profiles: ["sites"]
+    command: ["pnpm", "--filter", "@chelabase/landing", "dev"]
+    env_file:
+      - *stack-env
+    volumes:
+      - *checkout-rw
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_LANDING_HOST_NAME}", "http://127.0.0.1:3002/"]
+
+  # The test runner (`chelabase workbench test` / `run`, through `compose run --rm`): live tests
+  # and e2e scripts on the stack's network, by service name. The CLI points CHELABASE_NEXTEST_BIN
+  # at the host's cargo-nextest.
+  runner:
+    <<: *workbench
+    profiles: ["runner"]
+    restart: "no"
+    entrypoint: []
+    env_file:
+      - *stack-env
+      - *demo-env
+    environment:
+      # Bare names: a live test's own input, taken from the caller's env (unset when it has none),
+      # e.g. `CHELABASE_LIVE_ENDPOINT=ep-… just workbench test -p chelabase-neon …`.
+      - CHELABASE_LIVE_ENDPOINT
+    group_add: ["${CHELABASE_DOCKER_GID}"]
+    volumes:
+      - *checkout-rw
+      - *keys-secrets
+      - *keys-gateway
+      - *keys-auth
+      - *keys-neon
+      - *state
+      - *docker-sock
+      - type: bind
+        source: ${CHELABASE_NEXTEST_BIN:-/usr/local/bin/cargo-nextest}
+        target: /usr/local/bin/cargo-nextest
+        read_only: true
 
 volumes:
   metadata_pg_data:

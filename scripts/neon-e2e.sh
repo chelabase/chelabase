@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live check of roadmap step 4, through the public API (needs just deps-up and just dev):
+# Live check of roadmap step 4, through the public API (needs the stack: just workbench up):
 # - creates a database and waits until it is ready;
 # - psql, SQL over HTTP and the serverless driver answer through Neon's proxy;
 # - a wrong password is refused, and query cancel works;
@@ -13,10 +13,13 @@ cd "$root"
 LOG_PREFIX=neon-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-[[ -z "${CHELABASE_INTERNAL_ADDR:-}" ]] || check_internal_addr "$CHELABASE_INTERNAL_ADDR"
-STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
+STORCON="${STORCON_URL:-http://storage-controller:1234}"
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
+# The runner dials the proxy inside the stack network (CHELABASE_PROXY_PG_PORT); connection
+# strings the orchestrator hands out name the stack's port on the host (CHELABASE_PROXY_PORT).
 PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
+URI_PG_PORT="${CHELABASE_PROXY_PORT:?run through just workbench run}"
+PROXY_HOSTADDR="${CHELABASE_PROXY_HOSTADDR:?run through just workbench run}"
 PROXY_HTTP_PORT="${CHELABASE_PROXY_HTTP_PORT:-4444}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
@@ -41,16 +44,17 @@ refused() { grep -q "password authentication failed for user 'postgres'" "$1"; }
 
 # Built up front: a cold compile between the first connect and the cache check (step 5) could
 # outlast the proxy's 1-minute cache TTL.
-cargo build -q -p chelabase || die "cargo build -p chelabase"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
 
 # The demo tenant's identity (the token is minted per request: it is short-lived).
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-ca="$root/.chelabase/neon/proxy-ca.crt"
-[[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
+ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
+[[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 
 trap cleanup EXIT
 
@@ -97,7 +101,7 @@ http_url="$(jq -r '.http_url' "$tmp/body")"
 uri="$(jq -r '.uri' "$tmp/body")"
 ep="${host%%.*}"
 [[ "$ep" =~ ^ep-[0-9a-f]{12}$ ]] || die "unexpected host '$host' in /connection"
-[[ "$uri" == "postgresql://postgres:$old@$host:${PROXY_PG_PORT}/$dbname?sslmode=verify-full" ]] ||
+[[ "$uri" == "postgresql://postgres:$old@$host:${URI_PG_PORT}/$dbname?sslmode=verify-full" ]] ||
   die "unexpected uri in /connection (host $host, database $dbname)"
 pass "/connection reveals $host, database $dbname"
 
@@ -106,12 +110,13 @@ sql() {
   local pw="$1"
   shift
   PGPASSWORD="$pw" PGCONNECT_TIMEOUT=10 psql \
-    "host=$host hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+    "host=$host hostaddr=$PROXY_HOSTADDR port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
     -v ON_ERROR_STOP=1 -qtA "$@"
 }
 # http_sql <password> <query>: prints the HTTP status; the body goes to $tmp/body.
 http_sql() {
-  curl -sS --max-time 30 --cacert "$ca" -o "$tmp/body" -w '%{http_code}' -X POST "$http_url" \
+  # <ep>.localtest.me resolves to loopback in the runner: dial the proxy's address instead.
+  curl -sS --max-time 30 --cacert "$ca" --connect-to "$host:$PROXY_HTTP_PORT:$PROXY_HOSTADDR:$PROXY_HTTP_PORT" -o "$tmp/body" -w '%{http_code}' -X POST "$http_url" \
     -H "Neon-Connection-String: postgresql://postgres:$1@$host/$dbname" \
     -H 'content-type: application/json' \
     -d "$(jq -nc --arg q "$2" '{query: $q, params: []}')" || true
@@ -155,7 +160,7 @@ pass "a wrong password is refused ($PROXY_PG_PORT and /sql)"
 # Query cancel goes through the proxy (it keeps cancel keys in Valkey).
 started=$SECONDS
 PGPASSWORD="$old" timeout -s INT 2 psql \
-  "host=$host hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+  "host=$host hostaddr=$PROXY_HOSTADDR port=${PROXY_PG_PORT} user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
   -c 'SELECT pg_sleep(30)' >/dev/null 2>"$tmp/err" || true
 [[ $((SECONDS - started)) -lt 10 ]] || die "cancel took $((SECONDS - started)) s"
 grep -q 'canceling statement due to user request' "$tmp/err" || die "query cancel: $(cat "$tmp/err")"
@@ -189,7 +194,7 @@ for i in $(seq 60); do
   sleep 1
 done
 db_id=""
-[[ -z "$(docker ps -aq --filter "name=^chelabase-compute-$ep\$")" ]] || die "container chelabase-compute-$ep still exists"
+[[ -z "$(docker ps -aq --filter "label=chelabase.dev/stack=$CHELABASE_STACK" --filter "label=chelabase.dev/endpoint-id=$ep")" ]] || die "the compute container of endpoint $ep still exists"
 status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "$STORCON/control/v1/tenant/$tenant")" ||
   die "the storage controller didn't answer"
 [[ "$status" == 404 ]] || die "tenant $tenant still exists (HTTP $status)"

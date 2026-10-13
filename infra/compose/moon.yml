@@ -1,22 +1,22 @@
 language: "bash"
 
-# The lifecycle lives in the justfile (it refuses while another worktree holds the stack: just live).
+# The lifecycle lives in the justfile: `just workbench …` manages this checkout's stack.
 tasks:
   up:
     command: "just"
-    args: ["deps-up"]
+    args: ["workbench", "up"]
     options:
       cache: false
       runFromWorkspaceRoot: true
   down:
     command: "just"
-    args: ["deps-down"]
+    args: ["workbench", "down"]
     options:
       cache: false
       runFromWorkspaceRoot: true
   ps:
     command: "just"
-    args: ["deps-ps"]
+    args: ["workbench", "status"]
     options:
       cache: false
       runFromWorkspaceRoot: true

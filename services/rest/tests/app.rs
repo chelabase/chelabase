@@ -173,7 +173,7 @@ fn unknown() -> Result<ConnInfo, ConnError> {
 /// A branch serving `main` and `analytics`, at an address nothing listens on.
 fn served() -> Result<ConnInfo, ConnError> {
     Ok(serde_json::from_value(serde_json::json!({
-        "host": "127.0.0.1", "port": 1, "database": "main",
+        "host": std::net::Ipv4Addr::LOCALHOST.to_string(), "port": 1, "database": "main",
         "user": "authenticator", "password": "pw", "status": "ready",
         "settings": { "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 2 },
         "databases": [

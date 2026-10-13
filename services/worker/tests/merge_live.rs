@@ -2,13 +2,12 @@
 //! through `handle_merge_job` (the merge consumer's dispatch), after the status moves the
 //! orchestrator makes before it publishes each job.
 //!
-//! Same setup as `branch_live` and `roles_live` (`just dev` from this checkout, so the proxy,
+//! Same setup as `branch_live` and `roles_live` (the workbench stack, so the proxy,
 //! gateway and orchestrator run this branch, `CHELABASE_COMPUTE_IMAGE` set to the fork image),
-//! plus `psql` and `curl` on the host and the proxy's CA in `.chelabase/neon/proxy-ca.crt`:
+//! plus `psql` and `curl` in the runner and the proxy's CA (`CHELABASE_PROXY_CA_FILE`, default `.chelabase/neon/proxy-ca.crt` in the checkout):
 //!
 //! ```text
-//! just live bash -c 'set -a; source .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; set +a; \
-//!   CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE" cargo test -p worker --test merge_live -- --ignored --test-threads=1'
+//! just workbench test -p worker --test merge_live -- --run-ignored only
 //! ```
 //!
 //! Each test provisions its own database and deletes it afterwards, pass or fail (`KEEP=1`
@@ -39,7 +38,7 @@ use worker::config::RealWorker;
 use worker::roles::{RoleOutcome, RoleSpec};
 
 mod common;
-use common::{cleanup, setup, workspace_root};
+use common::{cleanup, pageserver_container, proxy_ca_path, proxy_hostaddr, setup};
 
 /// One provisioned database: main, its database name and the owner's password.
 struct Fx {
@@ -603,15 +602,17 @@ async fn proxy_login(
     user: &str,
     password: &str,
 ) -> Result<String, String> {
-    let ca = workspace_root().join(".chelabase/neon/proxy-ca.crt");
+    let ca = proxy_ca_path();
     assert!(
         ca.exists(),
-        "{} is missing (run just deps-up)",
+        "{} is missing (run `just workbench up`)",
         ca.display()
     );
+    // The proxy is dialled at CHELABASE_PROXY_HOSTADDR when set; the TLS host name stays <ep>.<domain>.
+    let hostaddr = proxy_hostaddr();
     let out = tokio::process::Command::new("psql")
         .arg(format!(
-            "host={} hostaddr=127.0.0.1 port={} dbname={database} sslmode=verify-full sslrootcert={}",
+            "host={} hostaddr={hostaddr} port={} dbname={database} sslmode=verify-full sslrootcert={}",
             proxy_host(ep),
             proxy_pg_port(),
             ca.display()
@@ -720,7 +721,7 @@ async fn base_and_dev(fx: &Fx) -> BranchId {
 /// privileges; neither the rehearsal nor the apply reports them as drift, and the rehearsal
 /// (whose branch build runs the data API bootstrap again) isn't stale.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn merge_into_parent_end_to_end() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -846,7 +847,7 @@ async fn merge_into_parent_end_to_end() {
 
 /// main's change into its child: the `update` base on the child.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn update_from_parent_end_to_end() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -883,7 +884,7 @@ async fn update_from_parent_end_to_end() {
 /// A rename on the branch and a new column on main merge by OID: main ends with the renamed
 /// table and column and keeps its own new column.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn rename_on_branch_with_new_column_on_main() {
     live(|fx| async move {
         fx.owner(fx.main, "CREATE TABLE orders (id int PRIMARY KEY, total int);")
@@ -920,7 +921,7 @@ async fn rename_on_branch_with_new_column_on_main() {
 
 /// Every resolution choice: keep target, take source, own SQL, and the target's columns first.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn each_resolution_choice() {
     live(|fx| async move {
         fx.owner(
@@ -988,7 +989,7 @@ async fn each_resolution_choice() {
 /// a backfill step before it makes it pass. E15: a step that tries to become `cloud_admin` fails
 /// with permission denied in the owner's session, and `RESET ROLE` is refused before planning.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn not_null_fails_in_rehearsal_then_passes_with_backfill_step() {
     live(|fx| async move {
         fx.owner(
@@ -1085,7 +1086,7 @@ async fn not_null_fails_in_rehearsal_then_passes_with_backfill_step() {
 /// T8a: the rehearsal makes them NOLOGIN and shows no drift for it. P9/M8: the BYPASSRLS role
 /// needs its acknowledgement when the apply starts. U3: `result.created_roles`.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn nologin_group_role_and_login_role_created_through_control_plane() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1188,7 +1189,7 @@ async fn nologin_group_role_and_login_role_created_through_control_plane() {
 /// After-merge choices: reset (the source goes back to its parent), delete refused by a child
 /// (recorded, the merge still done), and delete.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn keep_reset_delete_after_merge() {
     live(|fx| async move {
         fx.owner(fx.main, BASE).await;
@@ -1281,7 +1282,7 @@ async fn keep_reset_delete_after_merge() {
 /// another merge holds it (here an update of the source from main, failed half applied): the
 /// refusal names that merge, the source keeps its timeline, and the merge is still done.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn the_after_merge_choice_waits_for_a_merge_holding_the_source() {
     live(|fx| async move {
         fx.owner(fx.main, BASE).await;
@@ -1335,7 +1336,7 @@ async fn the_after_merge_choice_waits_for_a_merge_holding_the_source() {
 /// compute finds the marker and leaves it failed in `online` with its plan; a retry then runs
 /// its online steps to the end.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_recompute_after_a_committed_phase1_stays_half_applied() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1398,7 +1399,7 @@ async fn a_recompute_after_a_committed_phase1_stays_half_applied() {
 /// After a merge with keep, the next merge carries only what changed since, and a column
 /// renamed since is renamed on main (the identity map recorded with the keep base).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn second_merge_carries_only_newer_changes() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1457,7 +1458,7 @@ async fn second_merge_carries_only_newer_changes() {
 /// rehearsal and the apply makes the apply stale (the pre-check, before phase 0), and nothing
 /// changes on main.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn concurrent_ddl_on_target_makes_the_merge_stale() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1498,7 +1499,7 @@ async fn concurrent_ddl_on_target_makes_the_merge_stale() {
 /// Review Focus 5: a new table in the schema the data API serves gets the default privileges'
 /// grants on main, and nobody reports them: not the rehearsal, not the apply.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn new_table_in_served_schema_has_no_drift() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1550,7 +1551,7 @@ async fn new_table_in_served_schema_has_no_drift() {
 /// unroutable, so the proxy refuses a login the target takes, and (M11) the data API
 /// gateway doesn't serve it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn rehearsal_endpoint_is_not_routable() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1670,7 +1671,7 @@ async fn rehearsal_endpoint_is_not_routable() {
 /// T4: a `chelabase_merge` schema the tenant made is never trusted: the marker setup refuses,
 /// and the rehearsal fails with nothing applied.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_tenant_made_marker_schema_is_refused() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1697,7 +1698,7 @@ async fn a_tenant_made_marker_schema_is_refused() {
 /// reaches it, the catalog read (REPEATABLE READ READ ONLY, with its DO block) runs on the
 /// hot standby, and the model equals the one recorded at branch create.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_base_read_live_equals_the_create_time_base() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1806,7 +1807,7 @@ async fn a_base_read_live_equals_the_create_time_base() {
 /// T7b: restoring the branch to before a keep-merge restores the older base, so the next merge
 /// doesn't read the merged table (now on main only) as the branch dropping it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_before_a_keep_merge_uses_the_older_base() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -1895,7 +1896,7 @@ async fn restore_before_a_keep_merge_uses_the_older_base() {
 /// E19: a phase 2 `SET NOT NULL` behind a long transaction on main waits at most the merge's
 /// `lock_timeout`, the merge fails in `online`, and Retry finishes it once the transaction ends.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn phase2_lock_timeout_fails_online_then_retry_finishes() {
     live(|fx| async move {
         fx.owner(
@@ -2011,7 +2012,7 @@ async fn phase2_lock_timeout_fails_online_then_retry_finishes() {
 /// E20: a phase 1a lock timeout fails the merge in `enum_add`; Retry applies from the start, and
 /// the enum value the first attempt made doesn't make it stale (`precheck_fingerprint`).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn retry_after_an_enum_add_lock_timeout_runs_from_the_start() {
     live(|fx| async move {
         fx.owner(
@@ -2138,7 +2139,7 @@ async fn retry_after_an_enum_add_lock_timeout_runs_from_the_start() {
 /// claim of a reset is refused), and abandoning it lists the temporary NOT NULL check phase 1
 /// left, which is on the target.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_failed_online_merge_holds_its_target_and_abandon_lists_leftovers() {
     use chelabase_metadata::{BranchBusy, ClaimOutcome, MergeEvent};
     live(|fx| async move {
@@ -2200,7 +2201,7 @@ async fn a_failed_online_merge_holds_its_target_and_abandon_lists_leftovers() {
 /// E21: a merge that reads back with drift ends `applied_with_drift` and skips the after-merge
 /// choice; `finishMerge {after: keep}` then runs it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn applied_with_drift_skips_the_choice_then_finish_keeps() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -2245,7 +2246,7 @@ async fn applied_with_drift_skips_the_choice_then_finish_keeps() {
 /// - after phase 1 commits but before the status moved on: the marker is there, so the resume
 ///   carries on with phase 2 and finishes.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn recovery_reads_the_marker() {
     live(|fx| async move {
         let dev = base_and_dev(&fx).await;
@@ -2405,7 +2406,7 @@ async fn recovery_reads_the_marker() {
 /// `SET ROLE postgres` (a rehearsal's phase 0), and through the control plane's `create_role`
 /// (an apply's phase 0). `chelabase_schema::owner_grants` encodes them.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn owner_memberships_of_created_roles() {
     live(|fx| async move {
         fx.owner(fx.main, "CREATE ROLE p_sql NOLOGIN;").await;
@@ -2461,9 +2462,6 @@ async fn owner_memberships_of_created_roles() {
 // =============================================================================================
 // E17 after Neon fork round 2's patch 4: live base reads behind the GC cutoff
 // =============================================================================================
-
-/// The compose container of the pageserver.
-const PAGESERVER_CONTAINER: &str = "chelabase-pageserver-1";
 
 /// How long GC may take to pass a point once [`Fx::fast_gc`] ran.
 const GC_WAIT: Duration = Duration::from_secs(300);
@@ -2547,13 +2545,14 @@ impl Fx {
             resp.text().await.unwrap_or_default()
         );
 
+        // The stack's pageserver: `<CHELABASE_COMPOSE_PROJECT>-pageserver-1`.
         let restarted = tokio::process::Command::new("docker")
-            .args(["restart", PAGESERVER_CONTAINER])
+            .args(["restart", &pageserver_container()])
             .stdout(Stdio::null())
             .status()
             .await
             .expect("run docker");
-        assert!(restarted.success(), "docker restart {PAGESERVER_CONTAINER}");
+        assert!(restarted.success(), "docker restart {}", pageserver_container());
         let main: NeonId = self
             .branch(self.main)
             .await
@@ -2739,7 +2738,7 @@ async fn a_dev_m_d(fx: &Fx) -> BranchId {
 /// read live (the stored one is another model version's) is read on main's timeline at that
 /// point, which main retains while dev exists; the merge analyses against it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_branch_point_behind_gc_is_read_on_the_parent() {
     live(|fx| async move {
         let dev = a_dev_m_d(&fx).await;
@@ -2769,7 +2768,7 @@ async fn a_branch_point_behind_gc_is_read_on_the_parent() {
 /// retains: once GC passed it, the merge stays a draft with `merge_base_unavailable`, and no
 /// static compute is started.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_keep_merge_base_behind_gc_is_unavailable() {
     live(|fx| async move {
         let dev = a_dev_m_d(&fx).await;
@@ -2802,7 +2801,7 @@ async fn a_keep_merge_base_behind_gc_is_unavailable() {
 /// a child of main's: it is read on main's timeline at dev's branch point. Once the backup is
 /// deleted, nothing keeps that location, and the merge gives `merge_base_unavailable`.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_restored_branch_reads_its_base_until_the_backup_is_deleted() {
     live(|fx| async move {
         let dev = a_dev_m_d(&fx).await;
@@ -2886,7 +2885,7 @@ async fn a_restored_branch_reads_its_base_until_the_backup_is_deleted() {
 /// A grandchild (main → dev → feat): once GC passed feat's branch point on feat's and dev's
 /// timelines, feat's base is read on dev's timeline at that point.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_grandchild_branch_point_behind_gc_is_read_on_its_parent() {
     live(|fx| async move {
         fx.owner(fx.main, "CREATE TABLE a (v int);").await;

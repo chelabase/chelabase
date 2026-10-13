@@ -197,7 +197,7 @@ pub fn generate_keypair_pem() -> (String, String) {
 fn env_path(var: &str) -> Result<String, AuthError> {
     std::env::var(var).map_err(|_| {
         AuthError::Config(format!(
-            "{var} is not set; run `just zitadel-bootstrap` and load .chelabase/zitadel/demo.env"
+            "{var} is not set; a workbench stack sets it in its stack.env (`just workbench env` prints the path)"
         ))
     })
 }

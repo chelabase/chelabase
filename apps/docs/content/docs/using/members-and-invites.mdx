@@ -60,7 +60,7 @@ Pending sign-ups appear under Members › People › **Requests**, with a badge 
 Zitadel's own registration page is turned off (`allowRegister: false`), so these routes are the only way in.
 
 <Callout type="warn">
-**The fresh-install window.** While a tenant has no member at all, sign-up is open, and the first person to sign in claims the tenant admin. Set the bootstrap admin before you expose Studio to anyone: run `just zitadel-bootstrap you@example.com` (positional; without an address the admin is `zitadel-admin@zitadel.localhost`) first, and the window never opens. The window exists until the first `just zitadel-bootstrap`. If two people race for it, only one claims the admin and the other is admitted as `pending`. Also, `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential on self-hosted dev: keep it private.
+**The fresh-install window.** While a tenant has no member at all, sign-up is open, and the first person to sign in claims the tenant admin. Set the bootstrap admin before you expose Studio to anyone: run `just zitadel-bootstrap you@example.com` (positional; without an address the admin is `zitadel-admin@zitadel.<auth host>` on a fresh stack, `zitadel-admin@zitadel.localhost` on an older one) first, and the window never opens. The window exists until the first `just zitadel-bootstrap`. If two people race for it, only one claims the admin and the other is admitted as `pending`. Also, the stack's `zitadel/demo-sa.json` (`.chelabase/stacks/<slug>/zitadel/demo-sa.json`) is a tenant-admin credential on self-hosted dev: keep it private.
 </Callout>
 
 ### Removing a member

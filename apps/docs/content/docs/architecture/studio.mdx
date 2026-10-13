@@ -27,11 +27,11 @@ Everyone who joins (by invite, or by sign-up when it is open) is in the same org
 
 ## Local sign-in flow
 
-1. `just dev`, then open `http://studio.chelabase.localhost:8000` and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost`, or the email you pass it, `just zitadel-bootstrap you@example.com`, the tenant admin).
+1. `just workbench up`, then open `http://studio.chelabase.localhost:8000` and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` makes `zitadel-admin@zitadel.<auth host>`, or the email you pass it, `just zitadel-bootstrap you@example.com`, the tenant admin).
 2. Emails such as invites and password resets land in Mailpit at `http://mail.chelabase.localhost:8000`. Without an email provider, invite by link instead.
 3. Studio opens on your projects and their databases; everything goes through the gateway on `:8000` with your Zitadel token.
 
-Open Studio at `http://studio.chelabase.localhost:8000`, through the gateway: the Zitadel redirect URI and the gateway's CORS origin are registered for that host. The dev server itself listens on loopback port 3000 (`CHELABASE_STUDIO_PORT` changes it; set the gateway's `CHELABASE_STUDIO_UPSTREAM` to match) and is reached only through the gateway.
+Open Studio at `http://studio.chelabase.localhost:8000`, through the gateway: the Zitadel redirect URI and the gateway's CORS origin are registered for that host. The dev server itself listens on port 3000 (`CHELABASE_STUDIO_PORT` changes it; set the gateway's `CHELABASE_STUDIO_UPSTREAM` to match); in the workbench it runs in the stack's network, unpublished, and is reached only through the gateway.
 
 ## What the dev bootstrap does
 
@@ -40,9 +40,9 @@ Open Studio at `http://studio.chelabase.localhost:8000`, through the gateway: th
 - registers the `chelabase-studio` OIDC app (PKCE, JWT access tokens; drifted redirect settings are corrected in place);
 - points Zitadel's SMTP at Mailpit;
 - creates `.chelabase/auth/cookie.key`;
-- writes `apps/studio/.env.local` (git-ignored).
+- writes the stack's `studio.env` (in `.chelabase/stacks/<slug>/`, git-ignored; the Studio container reads it).
 
-It needs `.chelabase/zitadel/login-client.pat`, which Zitadel writes only on a fresh instance. If it is missing, run `just zitadel-reset` and bootstrap again.
+It needs `login-client.pat` in the stack's `zitadel/` state directory, which Zitadel writes only on a fresh instance. If it is missing, run `just zitadel-reset` and bootstrap again.
 
 The bootstrap also creates the key material the other services need (the gateway's identity key pair, the secrets key, the compute JWT keys and the app-user token key pair), the Zitadel Actions target for app users, and the demo tenant binding. None of these files is ever overwritten once it exists.
 

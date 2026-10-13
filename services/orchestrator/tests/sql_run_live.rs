@@ -1,5 +1,5 @@
 //! Live checks of the SQL editor's run engine against a scratch database on the dev metadata
-//! Postgres (`just deps-up`).
+//! Postgres (the workbench stack).
 
 use std::time::{Duration, Instant};
 
@@ -15,13 +15,13 @@ use uuid::Uuid;
 
 fn admin_url() -> String {
     std::env::var("CHELABASE_METADATA_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into())
+        .unwrap_or_else(|_| "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into())
 }
 
 async fn admin_connect() -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(&admin_url(), NoTls)
         .await
-        .expect("the metadata Postgres (just deps-up)");
+        .expect("the metadata Postgres (is the workbench stack up?)");
     tokio::spawn(conn);
     client
 }
@@ -65,9 +65,16 @@ impl Scratch {
         let host = match &config.get_hosts()[0] {
             tokio_postgres::config::Host::Tcp(h) => h.clone(),
             #[allow(unreachable_patterns)]
-            _ => "127.0.0.1".into(),
+            _ => "metadata-db".into(),
         };
-        let addr = format!("{host}:{}", config.get_ports()[0]).parse().unwrap();
+        // The host is a service name inside the stack, so resolve it.
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&format!(
+            "{host}:{}",
+            config.get_ports()[0]
+        ))
+        .unwrap()
+        .next()
+        .unwrap();
         Scratch {
             admin,
             target: RunTarget {
@@ -200,7 +207,7 @@ fn rows_of(events: &[RunEvent], index: usize) -> Vec<Vec<Option<String>>> {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn multi_statement_results_and_tags() {
     let s = Scratch::new().await;
     let events = s
@@ -255,7 +262,7 @@ async fn multi_statement_results_and_tags() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn notice_arrives_before_done() {
     let s = Scratch::new().await;
     let events = s
@@ -279,7 +286,7 @@ async fn notice_arrives_before_done() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn error_position_and_statement_index() {
     let s = Scratch::new().await;
     let events = s.run_ok("SELECT 1; SELECT nope").await;
@@ -302,7 +309,7 @@ async fn error_position_and_statement_index() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn explicit_transaction_is_honoured() {
     let s = Scratch::new().await;
     let events = s
@@ -320,7 +327,7 @@ async fn explicit_transaction_is_honoured() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn lone_vacuum_runs() {
     let s = Scratch::new().await;
     let events = s.run_ok("VACUUM").await;
@@ -330,7 +337,7 @@ async fn lone_vacuum_runs() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn set_role_failure_is_an_error_event() {
     let s = Scratch::new().await;
     let events = s
@@ -348,7 +355,7 @@ async fn set_role_failure_is_an_error_event() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn set_role_runs_as_that_role() {
     let s = Scratch::new().await;
     s.admin
@@ -371,7 +378,7 @@ async fn set_role_runs_as_that_role() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn row_cap_truncates_but_completes() {
     let s = Scratch::new().await;
     let events = s.run_ok("SELECT generate_series(1, 5000)").await;
@@ -389,7 +396,7 @@ async fn row_cap_truncates_but_completes() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn deadline_ends_with_timeout() {
     let s = Scratch::new().await;
     let started = Instant::now();
@@ -407,7 +414,7 @@ async fn deadline_ends_with_timeout() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn token_cancels_the_backend() {
     let s = Scratch::new().await;
     let connected = run::connect(&s.target).await.unwrap();
@@ -438,7 +445,7 @@ async fn token_cancels_the_backend() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn client_drop_cancels_the_backend() {
     let s = Scratch::new().await;
     let connected = run::connect(&s.target).await.unwrap();
@@ -464,7 +471,7 @@ async fn client_drop_cancels_the_backend() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn unread_stream_frees_its_slot_after_the_deadline() {
     let s = Scratch::new().await;
     let connected = run::connect(&s.target).await.unwrap();
@@ -491,7 +498,7 @@ async fn unread_stream_frees_its_slot_after_the_deadline() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn external_cancel_before_the_deadline_is_an_error() {
     let s = Scratch::new().await;
     let connected = run::connect(&s.target).await.unwrap();
@@ -526,7 +533,7 @@ async fn external_cancel_before_the_deadline_is_an_error() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn response_cap_ends_with_truncated_response() {
     let s = Scratch::new().await;
     // Two statements of 1,000 rows of 10 kB: about 20 MB, twice the cap, in 2 MB `rows` events.
@@ -552,7 +559,7 @@ fn sent_bytes(events: &[RunEvent]) -> usize {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn wide_rows_flush_before_the_cap() {
     let s = Scratch::new().await;
     // Ten 3 MB rows: the rows that fit go out before the run stops at the cap, rather than all
@@ -569,7 +576,7 @@ async fn wide_rows_flush_before_the_cap() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_row_past_the_cap_stops_the_run() {
     let s = Scratch::new().await;
     // 50 rows of 20 MB: the first row alone passes the cap; nothing past it is read.
@@ -586,7 +593,7 @@ async fn a_row_past_the_cap_stops_the_run() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn notice_flood_with_a_slow_reader_ends_at_the_cap() {
     let s = Scratch::new().await;
     // About 25 MB of notices while the reader dawdles: the notice queue stays bounded
@@ -737,7 +744,7 @@ fn errors(events: &[RunEvent]) -> Vec<String> {
 // The hole T9 closes: a script that resets its role lands on the member role, never on the
 // owner, and can't become the owner from there.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn script_cannot_reset_to_owner() {
     let s = Scratch::new().await;
     let m = MemberRole::new(&s).await;
@@ -765,7 +772,7 @@ async fn script_cannot_reset_to_owner() {
 // R5: what a script creates as the member role itself (after `RESET ROLE`, wherever PUBLIC may
 // create) is handed to the acted role once the run is over, after a failing run too.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn objects_created_after_reset_role_end_up_owned_by_the_acted_role() {
     let s = Scratch::new().await;
     let m = MemberRole::new(&s).await;
@@ -839,7 +846,7 @@ async fn objects_created_after_reset_role_end_up_owned_by_the_acted_role() {
 // The schema read on the member role's session, as the acted role, sees what that role may use:
 // a schema it has USAGE on, not one it hasn't.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn schema_read_follows_role_usage() {
     let s = Scratch::new().await;
     let m = MemberRole::new(&s).await;
@@ -1019,7 +1026,7 @@ async fn until_committed(admin: &tokio_postgres::Client, n: usize) {
 /// its reconciled safe set. Driven by [`escape_script`], which tries every way a script has
 /// to leave something behind as the member role.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn member_role_holds_nothing_after_any_run() {
     let s = Scratch::new().await;
     let m = MemberRole::new(&s).await;
@@ -1194,7 +1201,7 @@ async fn assert_member_holds_nothing(admin: &tokio_postgres::Client, m: &MemberR
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn nothing_leaks_between_runs() {
     let s = Scratch::new().await;
     let events = s

@@ -19,6 +19,8 @@ pub struct InternalConfig {
     /// `CHELABASE_CONTROL_PLANE_URI`: how computes reach this listener; the DDL receiver's URL
     /// (`neon.console_url`) is built from it.
     pub control_plane_uri: String,
+    /// `CHELABASE_STACK` (default `main`): the stack whose computes this orchestrator locates.
+    pub stack: String,
     /// `CHELABASE_VALKEY_URL`: where the receiver tells the proxies a role's secret changed.
     pub valkey_url: String,
     /// `CHELABASE_APP_AUTH_INTERNAL_TOKEN`: the `auth` service's bearer for the app routes.
@@ -65,7 +67,11 @@ impl InternalConfig {
             compute_network: or("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
             control_plane_uri: check_control_plane_uri(or(
                 "CHELABASE_CONTROL_PLANE_URI",
-                "http://host.docker.internal:8083",
+                "http://orchestrator:8083",
+            ))?,
+            stack: chelabase_neon::check_stack(&or(
+                "CHELABASE_STACK",
+                chelabase_neon::DEFAULT_STACK,
             ))?,
             valkey_url: or("CHELABASE_VALKEY_URL", "redis://127.0.0.1:6379"),
             app_auth_token: or("CHELABASE_APP_AUTH_INTERNAL_TOKEN", "chelabase-dev-app-auth"),
@@ -143,7 +149,7 @@ fn refresh_ttl(value: &str) -> Result<Duration> {
 fn check_control_plane_uri(uri: String) -> Result<String> {
     let bad = |why: &str| {
         anyhow!(
-            "CHELABASE_CONTROL_PLANE_URI={uri:?}: {why} (for example http://host.docker.internal:8083)"
+            "CHELABASE_CONTROL_PLANE_URI={uri:?}: {why} (for example http://orchestrator:8083)"
         )
     };
     let url = reqwest::Url::parse(&uri).map_err(|e| bad(&format!("not a URL ({e})")))?;
@@ -172,6 +178,7 @@ impl std::fmt::Debug for InternalConfig {
             .field("compute_jwt_dir", &self.compute_jwt_dir)
             .field("compute_network", &self.compute_network)
             .field("control_plane_uri", &self.control_plane_uri)
+            .field("stack", &self.stack)
             // A URL with credentials (`redis://:pw@host`) isn't shown.
             .field(
                 "valkey_url",
@@ -210,6 +217,26 @@ mod tests {
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
         assert_eq!(c.compute_jwt_dir, PathBuf::from(".chelabase/neon"));
         assert_eq!(c.compute_network, "chelabase_default");
+        assert_eq!(c.stack, "main");
+        assert_eq!(c.control_plane_uri.as_str(), "http://orchestrator:8083");
+    }
+
+    #[test]
+    fn the_stack_comes_from_the_env() {
+        let c = InternalConfig::from_lookup(|k| (k == "CHELABASE_STACK").then(|| "feat-x".to_string()))
+            .unwrap();
+        assert_eq!(c.stack, "feat-x");
+    }
+
+    // T1 review I1: the orchestrator and the worker read the stack the same way.
+    #[test]
+    fn a_padded_stack_is_trimmed_and_an_invalid_one_refused() {
+        let with = |v: &'static str| {
+            InternalConfig::from_lookup(move |k| (k == "CHELABASE_STACK").then(|| v.to_string()))
+        };
+        assert_eq!(with(" feat-x\n").unwrap().stack, "feat-x");
+        assert_eq!(with("  ").unwrap().stack, "main");
+        assert!(with("feat/x").is_err());
     }
 
     #[test]
@@ -237,7 +264,7 @@ mod tests {
     #[test]
     fn config_reads_control_plane_uri_and_valkey() {
         let d = InternalConfig::from_lookup(|_| None).unwrap();
-        assert_eq!(d.control_plane_uri, "http://host.docker.internal:8083");
+        assert_eq!(d.control_plane_uri, "http://orchestrator:8083");
         assert_eq!(d.valkey_url, "redis://127.0.0.1:6379");
         let c = InternalConfig::from_lookup(|name| match name {
             "CHELABASE_CONTROL_PLANE_URI" => Some("http://172.17.0.1:9083".into()),
@@ -307,7 +334,7 @@ mod tests {
             "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN" => Some("gw-tok".into()),
             "CHELABASE_APP_REFRESH_TTL_SECS" => Some("3600".into()),
             "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key".into()),
-            "CHELABASE_ZITADEL_ADMIN_PAT_FILE" => Some(".chelabase/zitadel/admin.pat".into()),
+            "CHELABASE_ZITADEL_ADMIN_PAT_FILE" => Some(".chelabase/stacks/main/zitadel/admin.pat".into()),
             "CHELABASE_PUBLIC_SCHEME" => Some("http".into()),
             "CHELABASE_AUTH_HOST" => Some("auth.chelabase.localhost:8000".into()),
             _ => None,
@@ -319,7 +346,7 @@ mod tests {
         assert_eq!(c.actions_signing_key.as_deref(), Some("sign-key"));
         assert_eq!(
             c.zitadel_admin_pat_file,
-            Some(PathBuf::from(".chelabase/zitadel/admin.pat"))
+            Some(PathBuf::from(".chelabase/stacks/main/zitadel/admin.pat"))
         );
         assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
         let blank = InternalConfig::from_lookup(|name| {

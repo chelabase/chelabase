@@ -1238,7 +1238,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&plain).unwrap()["role_bypass_rls"], false);
     }
 
-    /// Opt-in, against the Compose NATS (`just deps-up`): a stream and consumer of their own,
+    /// Opt-in, against the stack's NATS (`just workbench test`): a stream and consumer of their own,
     /// deleted afterwards.
     mod live {
         use std::sync::{Arc, Mutex};
@@ -1249,7 +1249,7 @@ mod tests {
         async fn js() -> async_nats::jetstream::Context {
             let client = connect(&NatsConfig::from_env().unwrap())
                 .await
-                .expect("NATS reachable (just deps-up)");
+                .expect("NATS reachable (run through just workbench test)");
             async_nats::jetstream::new(client)
         }
 

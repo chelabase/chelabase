@@ -7,8 +7,8 @@ This takes you from a running stack to a database you can connect to. It uses se
 
 ## 1. Start the stack and sign in
 
-1. Run `just dev`, then open [http://studio.chelabase.localhost:8000](http://studio.chelabase.localhost:8000) and choose **Sign in** as the bootstrap admin: `just zitadel-bootstrap` makes `zitadel-admin@zitadel.localhost` (or the email you pass to it, `just zitadel-bootstrap you@example.com`) the tenant admin.
-2. You land in Studio. Set the bootstrap admin before you expose Studio to anyone: until a tenant has its first member, the first person to sign in claims the admin, so run `just zitadel-bootstrap you@example.com` (positional) first; that fresh-install window exists until the first bootstrap. `.chelabase/zitadel/demo-sa.json` is a tenant-admin credential on self-hosted dev: keep it private. Emails such as invites and password resets land in Mailpit at [http://mail.chelabase.localhost:8000](http://mail.chelabase.localhost:8000).
+1. Run `just workbench up`, then open [http://studio.chelabase.localhost:8000](http://studio.chelabase.localhost:8000) and choose **Sign in** as the bootstrap admin: `just zitadel-bootstrap` makes `zitadel-admin@zitadel.<auth host>` (or the email you pass to it, `just zitadel-bootstrap you@example.com`) the tenant admin.
+2. You land in Studio. Set the bootstrap admin before you expose Studio to anyone: until a tenant has its first member, the first person to sign in claims the admin, so run `just zitadel-bootstrap you@example.com` (positional) first; that fresh-install window exists until the first bootstrap. The stack's `zitadel/demo-sa.json` (`.chelabase/stacks/<slug>/zitadel/demo-sa.json`) is a tenant-admin credential on self-hosted dev: keep it private. Emails such as invites and password resets land in Mailpit at [http://mail.chelabase.localhost:8000](http://mail.chelabase.localhost:8000).
 3. On `/app` you see your project, its databases, and a form to create one.
 
 <Callout type="info">

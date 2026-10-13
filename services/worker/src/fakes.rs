@@ -3593,7 +3593,7 @@ pub fn worker() -> (FakeWorker, Journal) {
             strength: false,
             prehashed_allowed: true,
         },
-        control_plane_uri: "http://host.docker.internal:8083".to_string(),
+        control_plane_uri: "http://orchestrator:8083".to_string(),
         ready_poll: Duration::from_millis(1),
         ready_timeout: Duration::from_millis(20),
         claim_refresh: Duration::from_millis(5),

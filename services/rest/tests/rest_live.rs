@@ -5,15 +5,16 @@
 //! no management token is needed), serves rest's router in-process on `127.0.0.1:0` and
 //! talks to it with identity tokens it mints itself (a fresh key pair; the gateway is out
 //! of the picture). Connection info comes from the orchestrator's internal listener, so
-//! `just dev` must be up. Owner DDL runs through `admin_sql` after `SET ROLE postgres`,
+//! The workbench stack must be up. Owner DDL runs through `admin_sql` after `SET ROLE postgres`,
 //! which is what the owner's own connection would do. The database is removed at the end,
 //! pass or fail.
 //!
 //! ```text
-//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
-//! CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
-//!   cargo test -p rest --test rest_live -- --ignored --test-threads=1 --nocapture
+//! just workbench test -p rest --test rest_live -- --run-ignored only
 //! ```
+//!
+//! The runner carries the stack's env (stack.env and the bootstrap's demo.env) and the compute
+//! image.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -84,13 +85,13 @@ async fn setup() -> (RealWorker, MetadataClient) {
     let metadata = MetadataClient::connect(&MetadataConfig {
         database_url: env_or(
             "CHELABASE_METADATA_DATABASE_URL",
-            "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata",
+            "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata",
         ),
     })
     .await
     .expect("metadata database");
     let key =
-        SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (source .chelabase/zitadel/demo.env)");
+        SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (run through just workbench test)");
     let worker = build(&config, metadata.clone(), key).expect("worker");
     (worker, metadata)
 }
@@ -172,7 +173,7 @@ where
     let state = Arc::new(AppState {
         engine: Engine::new(
             InternalSource::new(
-                &env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
+                &env_or("CHELABASE_INTERNAL_URL", "http://orchestrator:8083"),
                 &internal_token,
             ),
             200,
@@ -623,7 +624,7 @@ fn keys(row: &Value) -> Vec<&str> {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn select_insert_update_delete_call_and_batch_round_trip() {
     live("crud", |l| async move {
         l.owner(
@@ -701,7 +702,7 @@ async fn select_insert_update_delete_call_and_batch_round_trip() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn batch_failure_rolls_back_everything() {
     live("batch", |l| async move {
         l.owner("CREATE TABLE u (id int PRIMARY KEY);").await;
@@ -729,7 +730,7 @@ async fn batch_failure_rolls_back_everything() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn casts_for_enum_domain_uuid_timestamptz_numeric_arrays_jsonb() {
     live("casts", |l| async move {
         l.owner(
@@ -788,7 +789,7 @@ async fn casts_for_enum_domain_uuid_timestamptz_numeric_arrays_jsonb() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn anon_reads_and_cannot_write() {
     live("anon", |l| async move {
         l.owner("CREATE TABLE t (v text);").await;
@@ -811,7 +812,7 @@ async fn anon_reads_and_cannot_write() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn secret_key_custom_role() {
     live("role", |l| async move {
         l.owner(
@@ -851,7 +852,7 @@ async fn secret_key_custom_role() {
 /// refuse) gets no request of the old key, on the sequential path or the pipeline, and the
 /// key bound to the new OID works.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn secret_key_is_bound_to_its_roles_oid() {
     live("roleoid", |l| async move {
         l.owner(
@@ -893,7 +894,7 @@ async fn secret_key_is_bound_to_its_roles_oid() {
 /// and so does a role with BYPASSRLS (it reads past row-level security; the worker's check
 /// says so, for Studio's mark).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn secret_key_of_an_owner_level_role_is_refused() {
     live("ownerlvl", |l| async move {
         l.owner(
@@ -959,7 +960,7 @@ async fn secret_key_of_an_owner_level_role_is_refused() {
 /// The internal schema route with `?role=` (the console's schema as a role): what that role
 /// reaches, with its privileges; a missing role is 404 `unknown_role`, an owner-level one 403.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn internal_schema_for_a_console_role() {
     live("schemarole", |l| async move {
         l.owner(
@@ -1004,7 +1005,7 @@ async fn internal_schema_for_a_console_role() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn rls_policy_is_enforced() {
     live("rls", |l| async move {
         l.owner(
@@ -1035,7 +1036,7 @@ async fn rls_policy_is_enforced() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn unfiltered_update_is_refused() {
     live("unfiltered", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('a'), ('b');").await;
@@ -1054,7 +1055,7 @@ async fn unfiltered_update_is_refused() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn new_column_is_visible_on_the_next_request() {
     live("ddl", |l| async move {
         l.owner("CREATE TABLE t (a int); INSERT INTO t VALUES (1);")
@@ -1082,7 +1083,7 @@ async fn new_column_is_visible_on_the_next_request() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_rewinds_the_schema_and_the_old_shape_is_served() {
     live("restore", |l| async move {
         l.owner("CREATE TABLE h (a int); INSERT INTO h VALUES (1);")
@@ -1123,7 +1124,7 @@ async fn restore_rewinds_the_schema_and_the_old_shape_is_served() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn dropped_chelabase_is_unavailable_then_healed_by_bootstrap() {
     live("heal", |l| async move {
         l.owner("CREATE TABLE t (v text);").await;
@@ -1161,7 +1162,7 @@ async fn dropped_chelabase_is_unavailable_then_healed_by_bootstrap() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn reset_moves_the_compute_and_the_engine_reconnects() {
     live("reset", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('A');")
@@ -1214,7 +1215,7 @@ async fn reset_moves_the_compute_and_the_engine_reconnects() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn unreachable_table_looks_missing() {
     live("hidden", |l| async move {
         l.owner(
@@ -1263,7 +1264,7 @@ async fn unreachable_table_looks_missing() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn hostile_names_live() {
     live("names", |l| async move {
         l.owner(r#"CREATE TABLE "Order" (id int PRIMARY KEY, "select" text, "we""ird; x" text);"#)
@@ -1294,7 +1295,7 @@ async fn hostile_names_live() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn extension_functions_work_in_defaults_and_are_not_callable() {
     live("ext", |l| async move {
         l.owner(
@@ -1318,7 +1319,7 @@ async fn extension_functions_work_in_defaults_and_are_not_callable() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn schema_endpoints_live() {
     live("schema", |l| async move {
         l.owner(
@@ -1369,7 +1370,7 @@ async fn schema_endpoints_live() {
 /// and a membership in `chelabase_admin`: the bootstrap renames the schema aside, revokes
 /// the membership and never runs the owner's code as superuser.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn untrusted_chelabase_is_quarantined_and_runs_nothing_as_superuser() {
     live("quarantine", |l| async move {
         let superuser = || async {
@@ -1482,7 +1483,7 @@ async fn untrusted_chelabase_is_quarantined_and_runs_nothing_as_superuser() {
 /// (session user not a superuser, so neon_fmgr_hook lets them run): that is Postgres and
 /// Neon behaviour, reported separately, not this trigger.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn owner_event_triggers_never_run_as_superuser() {
     live("evtrig", |l| async move {
         let mut owner = l.owner_session().await;
@@ -1528,7 +1529,7 @@ async fn owner_event_triggers_never_run_as_superuser() {
 /// A superuser's CREATE EXTENSION (compute_ctl, Neon's privileged path) must keep the
 /// extension's own revokes: Chelabase's trigger grants only the owner role's functions.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_superusers_extension_keeps_its_revokes() {
     live("extrevoke", |l| async move {
         let can = l
@@ -1550,7 +1551,7 @@ async fn a_superusers_extension_keeps_its_revokes() {
 /// A bare 30-digit number in the request keeps its digits: into a `numeric` column, a
 /// `jsonb` column and a filter.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn big_request_numbers_keep_their_digits() {
     live("bignum", |l| async move {
         const BIG: &str = "123456789012345678901234567890";
@@ -1580,7 +1581,7 @@ async fn big_request_numbers_keep_their_digits() {
 
 /// Each relation's `kind`, and `security_invoker` for views however the option was spelt.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn kinds_and_security_invoker_live() {
     live("kinds", |l| async move {
         l.owner(
@@ -1625,7 +1626,7 @@ async fn kinds_and_security_invoker_live() {
 /// The transaction timeout (= `statement_timeout_ms`) bounds a whole batch, even when no
 /// single statement is over it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_batch_past_the_transaction_timeout_answers_timeout() {
     live("txtimeout", |l| async move {
         l.metadata
@@ -1667,7 +1668,7 @@ async fn a_batch_past_the_transaction_timeout_answers_timeout() {
 /// A function that changes the session (its role, a setting) leaves nothing behind for the
 /// next request on the same connection.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_session_level_set_role_does_not_leak_to_the_next_request() {
     live("reset", |l| async move {
         l.metadata
@@ -1703,7 +1704,7 @@ async fn a_session_level_set_role_does_not_leak_to_the_next_request() {
 /// Reconcile's health check notices each thing the bootstrap repairs, and the bootstrap
 /// repairs it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn the_health_check_sees_what_the_bootstrap_repairs() {
     live("health", |l| async move {
         let main = l.branch(l.main_id()).await;
@@ -1740,7 +1741,7 @@ async fn the_health_check_sees_what_the_bootstrap_repairs() {
 /// so it's planned again and runs sequentially, and its write commits once (the stale
 /// pipeline's transaction aborted at the preamble, before the plan ran).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn stale_version_replans_and_commits_once() {
     live("stale", |l| async move {
         l.owner("CREATE TABLE t (v text);").await;
@@ -1770,7 +1771,7 @@ async fn stale_version_replans_and_commits_once() {
 /// A pipelined batch whose third write fails: every step after it is aborted, `COMMIT`
 /// rolls back, and none of the batch's rows stay.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn mid_batch_failure_leaves_no_rows() {
     live("midbatch", |l| async move {
         l.owner(
@@ -1807,7 +1808,7 @@ async fn mid_batch_failure_leaves_no_rows() {
 /// A write whose `returning` is over the response cap is the 413, and the row isn't kept:
 /// the cap is checked in SQL, before `COMMIT`.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn oversized_write_response_leaves_no_row() {
     live_capped("oversized", 200, |l| async move {
         l.owner("CREATE TABLE w (v text);").await;
@@ -1838,7 +1839,7 @@ async fn oversized_write_response_leaves_no_row() {
 /// but it can't make the response pass the budget: a single result over it is refused in
 /// SQL whatever the counter says, and Rust counts the results again.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn forged_response_counter_cannot_return_more_than_the_budget() {
     live_capped("forged", 200, |l| async move {
         l.owner(
@@ -1884,7 +1885,7 @@ async fn forged_response_counter_cannot_return_more_than_the_budget() {
 /// the next request on the same connection: the pipeline resets the session after `COMMIT`,
 /// before the next request prepares its statements on it.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn session_state_set_by_an_rpc_does_not_reach_the_next_request() {
     live("session", |l| async move {
         l.metadata
@@ -1946,7 +1947,7 @@ async fn session_state_set_by_an_rpc_does_not_reach_the_next_request() {
 /// added): the pipeline finds them missing and every request runs sequentially, with the same
 /// answers, until the bootstrap puts them back.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_database_without_the_guard_functions_runs_sequentially() {
     live("noguard", |l| async move {
         l.owner("CREATE TABLE t (id int PRIMARY KEY, v text);").await;
@@ -2059,7 +2060,7 @@ async fn owner_ddl(l: &Live, sql: &str) {
 /// A second database, enabled with its own default schema: each database answers from its own
 /// `t`, its own schema cache, and the schema endpoint lists both.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn two_databases_serve_separately_with_their_own_schema() {
     live("twodb", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('main');")
@@ -2163,7 +2164,7 @@ async fn two_databases_serve_separately_with_their_own_schema() {
 /// time. A branch bootstrapped without that grant fails the health check, and the bootstrap
 /// puts it back.
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn a_non_public_default_schema_runs_pipelined() {
     live("nonpublic", |l| async move {
         l.create_database("analytics").await;
@@ -2220,7 +2221,7 @@ async fn a_non_public_default_schema_runs_pipelined() {
 /// A stored list follows a rename made in SQL, and dropping the last listed database revokes
 /// the key (Review Focus 2).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn allow_list_limits_a_key_to_one_database() {
     live("allow", |l| async move {
         l.owner("CREATE TABLE t (v text); INSERT INTO t VALUES ('main');")
@@ -2359,7 +2360,7 @@ async fn allow_list_limits_a_key_to_one_database() {
 /// Disabling a served database while rest holds a warm pool and cached shapes for it: 404 at
 /// once after the invalidate, and within the 60 s info cache without it (Review Focus 4).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn disable_answers_unknown_database_at_once() {
     live("disable", |l| async move {
         l.create_database("analytics").await;
@@ -2425,7 +2426,7 @@ async fn disable_answers_unknown_database_at_once() {
 /// A child of a branch that serves a second database serves it too, with the parent's
 /// default schema, and its own bootstrap ran there (Review Focus 5).
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn child_branch_serves_the_parent_second_database() {
     live("childdb", |l| async move {
         l.create_database("analytics").await;

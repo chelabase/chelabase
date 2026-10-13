@@ -1,0 +1,105 @@
+# W2: workbench isolation (design)
+
+Branch `workbench-isolation`. This is the second of the two stack-rework steps; W1 (the entry layout, `06601036`) came first. The decisions are in the roadmap's "stack and worktree rework" note: Q1–Q7, the housekeeping answers, W2-Q1 to W2-Q6, the W2 housekeeping and the W2 approach. The user approved the design as a whole on 2026-10-13 ("Approved all, just build it") after part 1 was shown, and asked for the step to run without the spec and plan pauses (the end-of-step pause before merging stays). Choices made while writing this spec are **W-rulings**, listed at the end for review. The facts behind it are in `docs/superpowers/notes/2026-10-13-stack-survey.md` and the post-W1 re-survey summarized in the plan's pre-flight scan.
+
+## Goal
+
+Every checkout (the main checkout and each `.worktrees/<dir>`) runs its own isolated stack: its own Compose project, volumes, network, computes, Zitadel instance, state files and host names, reachable from the host only through its gateway port and its proxy Postgres port. Up to 4 stacks run at once. Agents run live tests, e2e runs and browser passes against their own worktree's stack; the `just live` queue and stack swapping are gone.
+
+Non-goals: self-hosted packaging (the containerized app tier here runs host-built debug binaries and the Vite dev server; it is workbench-only), remote Docker hosts, Windows/macOS Docker Desktop specifics beyond what works today, and any fork change (none; no image build of the Neon images).
+
+## 1. Stack identity, registry and slots
+
+- **One stack per checkout.** The main checkout's slug is `main`. A worktree's slug is its `.worktrees/` directory name, lowercased, every character outside `[a-z0-9-]` replaced by `-`, runs of `-` collapsed, leading and trailing `-` trimmed; a result longer than 40 characters is cut to 33 and gets `-` plus the first 6 hex characters of the SHA-256 of the full directory name. An empty result is an error. The slug `main` is reserved for the main checkout (a worktree directory named `main` gets `main-wt`).
+- **Commands act on the current checkout's stack.** `--stack <slug>` selects another one for `status`, `logs`, `down` and `purge` only.
+- **Names derived from the slug:**
+
+  | | main | worktree `x` |
+  |---|---|---|
+  | Compose project | `chelabase` (today's volumes survive) | `chelabase-x` |
+  | Hosts | `studio.`, `api.`, `auth.`, `mail.`, `docs.`, `landing.` + `chelabase.localhost` | `studio.x.chelabase.localhost`, … |
+  | Gateway port (host and container) | 8000 | lowest free in 8100–8199 |
+  | Proxy Postgres port (host) | 4432 | lowest free in 4500–4599 |
+  | State dir | `<main>/.chelabase/stacks/main/` | `<main>/.chelabase/stacks/x/` |
+
+  `<main>` is the main checkout, found with `git rev-parse --path-format=absolute --git-common-dir` (its parent), so a worktree resolves the same registry and keys.
+- **Registry:** `<main>/.chelabase/stacks/registry.json`, every read-modify-write under an exclusive `flock` (Rust `std::fs::File::lock`) on `<main>/.chelabase/stacks/registry.lock`. One entry per stack: slug, checkout path, gateway port, proxy port, created-at, and `running_since` (null when stopped). Ports are allocated on the stack's first `up` and kept until purge; a port is taken only if it is in no other entry and a bind test on `127.0.0.1` and `::1` succeeds.
+- **Slots:** a stack holds a slot while `running_since` is set. The cap is 4 (main included), `CHELABASE_WORKBENCH_SLOTS` overrides it (W-3). When full, `up` writes a ticket `<main>/.chelabase/stacks/queue/<unix-nanos>-<slug>` and waits in FIFO order: it re-checks every 5 s, prints a status line every minute, and after 45 min (`CHELABASE_WORKBENCH_WAIT`, seconds or `<n>m`) exits non-zero naming the running stacks and how long each has been up. Only the oldest ticket may take a freed slot; a ticket whose process is gone is dropped. Before counting, a running entry whose checkout no longer exists, or whose Compose project has no running containers, is marked stopped (W-1).
+- **State dir contents:** `env/stack.env` (the one generated env file), `zitadel/` (Zitadel's PAT bind mount, `demo.env`, `actions.env`, `demo-sa.json`), `neon/proxy-ca.crt`, `studio.env`, `logs/`, `test/` (nextest archives), `binaries.json` (W-6).
+- **Machine keys stay shared:** `<main>/.chelabase/{secrets,gateway,auth,neon}` (secrets key, gateway key pair, cookie and app-JWT keys, compute-JWT keys) are generated once by the existing key steps and mounted read-only into every stack. `wt-add` keeps symlinking `.chelabase`; it no longer symlinks `apps/studio/.env.local`.
+
+## 2. Compose: the stack's services and network
+
+- **One file, any project.** `infra/compose/docker-compose.yml` loses `name: chelabase`. Every caller goes through the CLI, which always passes `-p <project> -f <checkout>/infra/compose/docker-compose.yml --env-file <state>/env/stack.env`. `infra/compose/.env.example` stays the documented defaults; the CLI renders `stack.env` from it plus the per-stack values (W-2).
+- **Published ports, and only these:** the gateway on `127.0.0.1:<gw>:<gw>` and `[::1]:<gw>:<gw>`; the proxy's Postgres listener on `127.0.0.1:<pg>:4432` and `[::1]:<pg>:4432`. Everything else (metadata-db, nats, valkey, zitadel-db, zitadel, mailpit, safekeeper, storcon, pageserver, the proxy's HTTP port, all app ports) is internal to the project network.
+- **App tier in the stack:** new services `orchestrator`, `worker`, `gateway`, `auth`, `rest` and `studio`, plus `docs` and `landing` under the Compose profile `sites`, and `runner` under the profile `runner` (used through `compose run --rm`).
+  - Image: one local image `chelabase-workbench:<hash>` built from `infra/workbench/Dockerfile` (W-4): `ubuntu:26.04` (pinned by digest), `ca-certificates`, `curl`, `jq`, `postgresql-client`, `openssl`, `iproute2`, the Docker CLI, node 24.21.0 (the host's, so the worktree's `node_modules` match) and pnpm through corepack at the repo's `packageManager`. `<hash>` is the first 12 hex characters of the SHA-256 of the Dockerfile; `up` builds it when that tag is missing.
+  - The Rust apps run `<checkout>/target/debug/<app>` with the checkout bind-mounted read-only at its own absolute path, `user: <uid>:<gid>`, `working_dir: <checkout>`.
+  - Same paths inside (W-5): the checkout, the shared key dirs (read-only) and the state dir (read-write) are mounted at their host absolute paths, so `demo.env`'s file paths mean the same thing inside and outside containers.
+  - Env: each app gets `env_file: [<state>/env/stack.env, <state>/zitadel/demo.env]` (the orchestrator also `actions.env`), then service-specific `environment:` with service-name URLs: metadata `postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata`, NATS `nats://nats:4222`, valkey `redis://valkey:6379`, storcon `http://storage-controller:1234`, safekeeper `1=http://safekeeper1:7676`, internal `http://orchestrator:8083`, rest internal `http://rest:8086`, upstreams `http://orchestrator:8081`, `http://auth:8084`, `http://rest:8085`, `http://studio:3000`, `http://zitadel:8080`, `http://mailpit:8025`, `http://docs:3001`, `http://landing:3002`. Listeners bind `0.0.0.0` inside; auth gets `CHELABASE_AUTH_TRUSTED_PROXY=true` (only the gateway reaches it).
+  - The worker and the orchestrator mount `/var/run/docker.sock` with `group_add: [<docker gid>]` (they create and locate computes); so does the runner (e2e scripts inspect computes).
+  - Studio runs `pnpm --filter @chelabase/studio dev` in the checkout with `CHELABASE_STUDIO_BIND=0.0.0.0` (new; Vite's `server.host`, default `127.0.0.1`) and `env_file: <state>/studio.env`; HMR goes through the gateway as in W1. Docs and landing are the same with their own binds.
+- **Same URL inside and outside (W2-Q4):** the gateway listens on `0.0.0.0:<gw>` inside the container and carries network aliases for every host of its stack (`studio.<…>`, `api.<…>`, `auth.<…>`, `mail.<…>`, `docs.<…>`, `landing.<…>`), so `http://auth.x.chelabase.localhost:8137` reaches the same gateway from the host, from an app container and from the runner. Internal callers (orchestrator, worker, CLI bootstrap, tests) use the public URLs derived by W1's `Entry`; there is no second "internal gateway URL".
+- **Callbacks by service name:** storcon's hook `http://orchestrator:8083/storcon`, the proxy's auth endpoint `http://orchestrator:8083/proxy/api/v1`, compute_ctl's `--control-plane-uri` `http://orchestrator:8083`, Zitadel Actions `http://orchestrator:8083/internal/zitadel/events`. `host.docker.internal`, its `extra_hosts` entries and `scripts/internal-addr.sh` go.
+- **Zitadel:** external domain, port and scheme come from the stack's auth host (W1); its PAT bind mount is `<state>/zitadel`. The deny-list keeps loopback blocked; the orchestrator's network address is private and allowed.
+- **Startup order:** infra services → `zitadel` and `gateway` (the gateway starts without its backends; it 502s until they come) → bootstrap (section 4) → the apps. Healthchecks: every app gets one (`curl -fsS` on its health path), Zitadel gets one on `/debug/ready`, Mailpit on `/livez`.
+
+## 3. Computes scoped to a stack
+
+- `ComputeSettings` gains `stack: String`, read from `CHELABASE_STACK` (default `main`) by the worker and the orchestrator.
+- **Labels:** every compute carries `chelabase.dev/endpoint-id=<ep>` and `chelabase.dev/stack=<slug>`. **Name:** `chelabase-<slug>-compute-<ep>`.
+- **Listing and orphan removal** select by both labels (`label=chelabase.dev/stack=<slug>`), so a stack's worker never sees, let alone removes, another stack's computes. The `CHELABASE_WORKER_REMOVE_ORPHANS` stopgap stays as a switch but its doc no longer calls it a cross-stack guard.
+- **No published compute ports.** Computes join only the stack network (`<project>_default`, `CHELABASE_COMPUTE_NETWORK`); `control_addr` and `postgres_addr` return the container's IP on that network with ports 3080 and 5432. `extra_hosts host.docker.internal` goes.
+- **Machine-wide sweeps go:** `deps-down`, `sweep-dbs`, `zitadel-reset.sh` and the e2e `docker ps` checks select by the stack label or the project, never by name prefix alone. Purge removes the stack's computes by label.
+- **Legacy computes:** main's first `up` removes containers named `chelabase-compute-*` that carry no stack label (the worker recreates main's computes under the new name).
+
+## 4. The `chelabase workbench` commands and their lifecycle
+
+A new `workbench` subcommand group in `tools/cli` (`chelabase workbench …`); `just workbench *args` forwards to `cargo run -q -p chelabase -- workbench {{args}}`.
+
+| Command | What it does |
+|---|---|
+| `up [--with docs,landing]` | Resolve the stack, register it, take a slot (FIFO), render `stack.env` and `studio.env`, build the image if missing, `cargo build` the five apps and the CLI, ensure the machine keys, start infra + Zitadel + gateway, wait for the PATs, run the bootstrap against the stack, start the apps (and the sites when asked), wait for `/_gateway/health` and Studio, copy the proxy CA, record binary mtimes, print the URLs. Idempotent: on a running stack it only starts what is missing. |
+| `restart [app…]` | `cargo build -p` the named apps (all five when none), then recreate only those containers. `studio` restarts the Vite container without a build. |
+| `down [--stack s]` | `compose down` (volumes kept), remove the stack's computes, release the slot. |
+| `purge [--stack s] [--yes]` | `down`, then `compose down -v`, remove the stack's computes and the state dir, drop the registry entry and any queue ticket. Purging `main` needs `--yes`. |
+| `status` | Every registered stack: slug, checkout, ports, running or stopped (with uptime), URLs; then the queue. |
+| `logs [service…] [-f]` | `compose logs` for the stack. |
+| `psql [db]` | `psql` in `metadata-db` (default database `chelabase_metadata`). |
+| `exec <service> <cmd…>` | `compose exec` in the stack. |
+| `test [nextest args…]` | Ensure up and current (W-6), `cargo nextest archive` on the host with the given package/target args into `<state>/test/archive.tar.zst`, then run it in the runner with `--workspace-remap <checkout>` and the run args, the stack's env, on the stack network. |
+| `run [--env K=V]… <script> [args…]` | Ensure up and current, then run a repo script (an e2e script) in the runner with the stack's env plus the given variables. |
+
+- **Bootstrap per stack:** the existing `chelabase dev bootstrap` runs on the host with the stack's env (`stack.env`, `CHELABASE_STACK_DIR=<state>`): it reaches Zitadel through the stack's public auth URL (the gateway is up first), binds the demo tenant with `docker compose -p <project> exec metadata-db psql`, writes `demo.env`, `actions.env`, `demo-sa.json` into `<state>/zitadel` and `studio.env` into `<state>`. Paths: `CHELABASE_STACK_DIR` sets `zitadel_dir`, `studio_env_file` and the proxy CA; the key dirs stay under `<main>/.chelabase`. The Actions endpoint comes from `CHELABASE_ZITADEL_ACTIONS_ENDPOINT` (stack.env: `http://orchestrator:8083/internal/zitadel/events`), and an existing target whose endpoint differs is updated in place, keeping its signing key.
+- **`chelabase dev bootstrap` and `dev token` stay** as the building blocks (the e2e scripts call `dev token`); run outside a workbench they behave as today.
+- **Fresh and seeded (W2-Q1):** a new stack's volumes are empty; `up` seeds it with the bootstrap (Zitadel instance, demo admin, demo tenant and project).
+- **Worktree hooks:** `just wt-add` no longer symlinks `apps/studio/.env.local`. `just wt-remove <branch>` runs `chelabase workbench purge --stack <slug> --yes` for that worktree before `git worktree remove`; a missing stack is not an error.
+- **Retired:** `just dev`, `dev-down`, `stop`, `deps-up`, `deps-down`, `deps-ps`, `neon-ps`, `orchestrator`, `worker`, `gateway`, `rest`, `auth`, `studio`, `cleanup`/`_cleanup`, `live`, `live-status`, `live-test`, `_live-check`, `_live-swap-dev`, `stack-reset-slots`, `neon-test-live`, `worker-live`, `docs`/`landing` as host commands (replaced by `up --with`), `scripts/live.sh`, `scripts/internal-addr.sh`, `scripts/stack-reset-slots.sh` and their offline tests, `.chelabase/dev/`, `.chelabase/live/`, `CHELABASE_LIVE_*`, `LIVE_SWAP_DEV`. Every e2e recipe becomes `just <name>-e2e` → `chelabase workbench run scripts/<name>-e2e.sh`. `just sweep-dbs` becomes `chelabase workbench run scripts/sweep-dbs.sh` (the stack's own computes and rows). `just zitadel-reset` acts on the current stack's project.
+
+## 5. Tests and e2e on a stack
+
+- **Rust live tests (W2-Q3):** `chelabase workbench test` archives on the host and runs in the runner. The runner's env is the app env (section 2) plus `GATEWAY_URL=<api url>`, `CHELABASE_ZITADEL_ISSUER`, `COMPUTE_NODE_IMAGE`, `CHELABASE_COMPUTE_IMAGE`, `CHELABASE_PROXY_PG_PORT=4432`, `CHELABASE_PROXY_HOSTADDR=<proxy's IP>` and demo.env.
+- **Defaults move to service names:** every live test's fallback (`127.0.0.1:5433`, `:1234`, `:6379`, `:8081`, `:8083`, `:4222`, `chelabase_default`) becomes the service-name form (`metadata-db:5432`, `storage-controller:1234`, `valkey:6379`, `orchestrator:8081`, `orchestrator:8083`, `nats:4222`, `chelabase_default` stays only where it names main's network). The services' own defaults stay loopback (self-hosted runs them however it likes); compose sets the service names.
+- **The proxy from inside the network:** `<ep>.localtest.me` resolves to loopback, which inside the runner isn't the proxy. Tests and scripts keep the TLS host name `<ep>.localtest.me` (SNI picks the endpoint) and connect to `CHELABASE_PROXY_HOSTADDR` (libpq `hostaddr`, tokio-postgres `hostaddr`) when it is set.
+- **e2e scripts run in the runner:** `scripts/lib/neon-common.sh` and the scripts use `psql "$CHELABASE_METADATA_DATABASE_URL"` instead of `compose exec metadata-db psql`, `docker exec "$CHELABASE_COMPOSE_PROJECT-<service>-1"` instead of `compose exec` (storage-leak), the stack label in `docker ps` filters, `CHELABASE_PROXY_HOSTADDR`, and the CA at `$CHELABASE_STACK_DIR/neon/proxy-ca.crt`. `cargo run -q -p chelabase -- <args>` becomes `"$CHELABASE_CLI" <args>` (the host-built `target/debug/chelabase`, mounted). The one `cargo test` inside a script (`bench-data-api.sh`) becomes `"$CHELABASE_BENCH_TEST_BIN"`: the `bench-data-api` recipe builds that test binary on the host and passes its path with `workbench run --env K=V` (W-10).
+- **Browser passes** stay on the host (Playwright MCP) at `http://studio.<slug>.chelabase.localhost:<gw>`.
+- **Offline guards:** `scripts/tests/entry-urls.sh` is extended (or a sibling `stack-urls.sh` added) to fail on `127.0.0.1:5433`, `:1234`, `:6379`, `:8081`, `:8083`, `host.docker.internal`, `just live` and `just dev` outside the allow-list; `infra/neon/tests/run.sh` drops its pinned host ports and project name and checks the new compose shape.
+
+## 6. Moving main over, the rules, and testing W2
+
+- **Main's first `up` migrates once (idempotent):** if `<main>/.chelabase/dev/pids` lists live processes, it stops them (same command-line check as `dev-down`); it moves `.chelabase/zitadel` to `.chelabase/stacks/main/zitadel` and `.chelabase/neon/proxy-ca.crt` to `.chelabase/stacks/main/neon/`; it deletes `apps/studio/.env.local` in the main checkout and the symlinks to it in worktrees; it removes `.chelabase/dev/` and `.chelabase/live/`; it removes legacy unlabelled computes. Compose project `chelabase` keeps every volume, so main keeps its data, its Zitadel instance (same external domain and port) and its PATs.
+- **Rules rewrite:** `CLAUDE.md` ("One machine, one dev stack" becomes one stack per checkout through `just workbench`), `docs/agent-preamble.md` (the "never start the stack" rule becomes "run your own worktree's stack with `just workbench up|test|run`; at most 3 builds or test suites at once; `just workbench down` when done unless told otherwise"), the roadmap's working rules ("live tests stay one at a time" goes), `CONTRIBUTING.md` (quickstart, recipe table, port table, worktrees section), `.env.example` comments.
+- **Testing W2:** unit tests for the slug, registry, port allocation, slots and FIFO, env rendering, compose and nextest argv, the compute labels, names, filters and addresses, the Actions endpoint update and the migration; offline compose checks with `docker compose config`; then the live pass: main migrated and up; a branch stack up beside it; the full live suites and e2e runs on the branch stack through `workbench test` and `run`; the same e2e (`neon-e2e`) on both stacks at once with neither losing computes; a slot test with `CHELABASE_WORKBENCH_SLOTS=2` showing a third `up` waiting and then timing out; `wt-remove` purging a task stack; a browser pass on the branch stack (sign-in, Zitadel console, a Studio hot reload, Mailpit, docs and landing with `--with`).
+
+## W-rulings (made while writing; for review)
+
+- **W-1 Dead stacks give their slot back.** A running entry whose checkout is gone or whose project has no running containers is marked stopped before slots are counted. Cost if wrong: a stack whose containers all crashed loses its slot (ports and data stay; its next `up` queues again).
+- **W-2 `stack.env` is rendered from `.env.example`.** `.env.example` stays the one documented source of defaults; the CLI overlays the per-stack values (hosts, ports, slug, project, paths, uid/gid, docker gid). Cost if wrong: a self-hoster's `.env` isn't involved; none for the workbench.
+- **W-3 Slot cap override** `CHELABASE_WORKBENCH_SLOTS` (default 4), so the live pass can test waiting without 5 real stacks. Cost: none.
+- **W-4 One local image for apps, Studio and the runner** (Q3 said "thin ubuntu:26.04" for the apps; the shared image is ubuntu:26.04 plus tools, so the apps also get `curl` for healthchecks and CA certificates). Cost if wrong: a few hundred MB on disk once, shared by all stacks.
+- **W-5 Same absolute paths inside containers** for the checkout, the key dirs and the state dir. Cost if wrong: none on Linux; a Docker Desktop host would need its file sharing to cover the checkout (it already does for today's bind mount).
+- **W-6 "Current" means rebuilt and restarted.** `test` and `run` run `cargo build` for the five apps, and restart the containers whose binary's mtime differs from the one recorded at their last start (`binaries.json`). Cost if wrong: an extra restart or a missed one; `restart` is always available.
+- **W-7 Purging main needs `--yes`.** Cost: none.
+- **W-8 (amended 2026-10-14, plan R4) The runner has the Docker CLI and the Compose plugin;** scripts use `docker exec <project>-<service>-1` where that is enough, and the live tests that recreate the orchestrator with a test setting use `docker compose`. Cost if wrong: ~60 MB in the image.
+- **W-10 `workbench run --env K=V`** passes extra variables into the runner (used by the benchmark for its prebuilt test binary). Cost: none.
+- **W-9 Services keep loopback defaults;** only tests and compose move to service names. Self-hosted runs services however its operator likes. Cost: none.

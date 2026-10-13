@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live check of roadmap step 5 (branching), through the public API and the proxy (needs just
-# deps-up and just dev). The same story as services/worker/tests/branch_live.rs:
+# Live check of roadmap step 5 (branching), through the public API and the proxy (needs
+# the stack: just workbench up). The same story as services/worker/tests/branch_live.rs:
 # - a branch at a past time has the old rows; reset to parent brings it back to its parent's;
 # - restore rewinds main and keeps the old data in a backup (no compute) that can be branched;
 # - a point outside the history window is refused, naming the oldest available point's time;
@@ -13,9 +13,10 @@ cd "$root"
 LOG_PREFIX=branch-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
+STORCON="${STORCON_URL:-http://storage-controller:1234}"
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
+PROXY_HOSTADDR="${CHELABASE_PROXY_HOSTADDR:?run through just workbench run}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -34,14 +35,15 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-ca="$root/.chelabase/neon/proxy-ca.crt"
-[[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
+ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
+[[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 trap cleanup EXIT
 
 # ok <method> <path> <expected status> [body]: the call, or die.
@@ -120,7 +122,7 @@ psql_on() {
   reveal "$id"
   for i in $(seq 60); do
     if out="$(PGPASSWORD="$bpw" PGCONNECT_TIMEOUT=10 psql \
-      "host=$bhost hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
+      "host=$bhost hostaddr=$PROXY_HOSTADDR port=${PROXY_PG_PORT} user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
       -v ON_ERROR_STOP=1 -qtA "$@" 2>"$tmp/err")"; then
       printf '%s' "$out"
       return
@@ -226,7 +228,7 @@ for i in $(seq 120); do
 done
 db_id=""
 for ep in $(sort -u "$tmp/endpoints"); do
-  [[ -z "$(docker ps -aq --filter "name=^chelabase-compute-$ep\$")" ]] || die "container chelabase-compute-$ep still exists"
+  [[ -z "$(docker ps -aq --filter "label=chelabase.dev/stack=$CHELABASE_STACK" --filter "label=chelabase.dev/endpoint-id=$ep")" ]] || die "the compute container of endpoint $ep still exists"
   [[ "$(metadata_sql -v ep="$ep" <<<"SELECT count(*) FROM neon_endpoints WHERE id = :'ep';")" == 0 ]] ||
     die "endpoint $ep still has a row in neon_endpoints"
 done

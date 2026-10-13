@@ -13,6 +13,46 @@ pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The address to dial the proxy at while keeping the TLS host name `<ep>.<domain>`: the stack's
+/// `CHELABASE_PROXY_HOSTADDR` when set (the runner cannot reach the proxy on loopback), else
+/// the `proxy` service in a stack's runner, else loopback (a proxy published on this host).
+pub fn proxy_hostaddr() -> String {
+    std::env::var("CHELABASE_PROXY_HOSTADDR")
+        .ok()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| {
+            if std::env::var_os("CHELABASE_COMPOSE_PROJECT").is_some() {
+                // In a stack's runner the proxy is the `proxy` service.
+                "proxy".into()
+            } else {
+                std::net::Ipv4Addr::LOCALHOST.to_string()
+            }
+        })
+}
+
+/// The proxy's CA certificate: `CHELABASE_PROXY_CA_FILE` when set, else the checkout's
+/// `.chelabase/neon/proxy-ca.crt`.
+pub fn proxy_ca_path() -> PathBuf {
+    std::env::var("CHELABASE_PROXY_CA_FILE")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map_or_else(
+            || workspace_root().join(".chelabase/neon/proxy-ca.crt"),
+            PathBuf::from,
+        )
+}
+
+/// The stack's compose project name (`CHELABASE_COMPOSE_PROJECT`), else `chelabase`.
+pub fn compose_project() -> String {
+    std::env::var("CHELABASE_COMPOSE_PROJECT").unwrap_or_else(|_| "chelabase".into())
+}
+
+/// The stack's pageserver container.
+pub fn pageserver_container() -> String {
+    format!("{}-pageserver-1", compose_project())
+}
+
 pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
     let mut config =
         WorkerConfig::from_env().expect("worker config (is CHELABASE_COMPUTE_IMAGE set?)");
@@ -21,13 +61,13 @@ pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
     }
     let metadata = MetadataClient::connect(&MetadataConfig {
         database_url: std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
+            "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()
         }),
     })
     .await
     .expect("metadata database");
     let key =
-        SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (source .chelabase/zitadel/demo.env)");
+        SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (run through just workbench test)");
     let worker = build(&config, metadata.clone(), key).expect("worker");
     (worker, metadata, config)
 }

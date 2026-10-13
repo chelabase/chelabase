@@ -61,8 +61,9 @@ export default defineConfig(({ mode }) => {
     optimizeDeps: { exclude: ["@postgres-language-server/wasm"] },
     server: {
       // Bound to loopback on 3000 (or CHELABASE_STUDIO_PORT): only the gateway reaches it, at
-      // Studio's host. Never drift to another port.
-      host: "127.0.0.1",
+      // Studio's host. Never drift to another port. Inside a workbench stack the gateway is
+      // another container, so the stack sets CHELABASE_STUDIO_BIND=0.0.0.0.
+      host: entrySetting("CHELABASE_STUDIO_BIND") || "127.0.0.1",
       port: devPort(process.env),
       strictPort: true,
       allowedHosts: [name],

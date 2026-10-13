@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
-# Wipe only the Zitadel Postgres volume so FirstInstance can rewrite admin.pat.
-# Does not touch metadata or NATS volumes.
+# Wipe only this stack's Zitadel Postgres volume so FirstInstance can rewrite admin.pat.
+# Does not touch metadata or NATS volumes. Host script: the justfile loads the stack's env first
+# (`just zitadel-reset`): CHELABASE_COMPOSE_PROJECT, CHELABASE_STACK_DIR and CHELABASE_ZITADEL_DIR.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT="${CHELABASE_COMPOSE_PROJECT:?run through: just zitadel-reset}"
+STACK_DIR="${CHELABASE_STACK_DIR:?run through: just zitadel-reset}"
+ZDIR="${CHELABASE_ZITADEL_DIR:?run through: just zitadel-reset}"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/infra/compose/docker-compose.yml}"
-COMPOSE_ENV="${COMPOSE_ENV:-$ROOT/infra/compose/.env.example}"
-ZDIR="${CHELABASE_ZITADEL_DIR:-$ROOT/.chelabase/zitadel}"
-# The entry values Compose interpolates (Zitadel's external domain, port, TLS mode).
+# The entry values Compose interpolates (Zitadel's external domain, port, TLS mode): the stack's
+# env already holds them, entry.sh derives any that are missing.
 # shellcheck source=lib/entry.sh
 . "$ROOT/scripts/lib/entry.sh"
+compose=(docker compose -p "$CHELABASE_COMPOSE_PROJECT" -f "$COMPOSE_FILE" --env-file "$STACK_DIR/env/stack.env")
 
-echo "[zitadel-reset] stopping Zitadel services and removing zitadel_pg_data…"
-docker compose -f "$COMPOSE_FILE" --env-file "$COMPOSE_ENV" stop zitadel zitadel-db >/dev/null 2>&1 || true
-docker compose -f "$COMPOSE_FILE" --env-file "$COMPOSE_ENV" rm -f zitadel zitadel-db >/dev/null 2>&1 || true
+echo "[zitadel-reset] stopping Zitadel services and removing ${PROJECT}_zitadel_pg_data…"
+"${compose[@]}" stop zitadel zitadel-db >/dev/null 2>&1 || true
+"${compose[@]}" rm -f zitadel zitadel-db >/dev/null 2>&1 || true
 
-# Volume name is project_volume → chelabase_zitadel_pg_data
-VOL="$(docker volume ls -q --filter name=zitadel_pg_data | head -n1 || true)"
-if [[ -n "$VOL" ]]; then
+# Volume name is <project>_zitadel_pg_data, matched exactly: another stack's volume is never touched.
+VOL="${PROJECT}_zitadel_pg_data"
+if docker volume inspect "$VOL" >/dev/null 2>&1; then
   docker volume rm "$VOL"
   echo "[zitadel-reset] removed volume ${VOL}"
 else
-  echo "[zitadel-reset] no zitadel_pg_data volume found"
+  echo "[zitadel-reset] no ${VOL} volume found"
 fi
 
 rm -f "${ZDIR}/admin.pat" "${ZDIR}/login-client.pat" "${ZDIR}/demo.env" "${ZDIR}/demo-sa.json"
@@ -29,7 +33,7 @@ mkdir -p "$ZDIR"
 chmod 777 "$ZDIR" 2>/dev/null || true
 
 echo "[zitadel-reset] starting Zitadel fresh…"
-docker compose -f "$COMPOSE_FILE" --env-file "$COMPOSE_ENV" up -d zitadel-db zitadel
+"${compose[@]}" up -d zitadel-db zitadel
 
 echo "[zitadel-reset] waiting for admin.pat…"
 for _ in $(seq 1 60); do
@@ -40,5 +44,5 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 
-echo "[zitadel-reset] ERROR: admin.pat not written. Check: docker compose -f ${COMPOSE_FILE} logs zitadel" >&2
+echo "[zitadel-reset] ERROR: admin.pat not written. Check: ${compose[*]} logs zitadel" >&2
 exit 1

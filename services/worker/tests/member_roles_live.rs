@@ -2,13 +2,12 @@
 //! and 7; rulings R16, R17): the reconciler keeps each branch's hidden `cb_m_*` roles equal to
 //! the metadata, and Postgres holds a member role to the roles it may become.
 //!
-//! Same setup as `roles_live` (`just deps-up`, `just dev` from this checkout, the fork image in
-//! `CHELABASE_COMPUTE_IMAGE`), plus `psql` on the host and the proxy's CA in
-//! `.chelabase/neon/proxy-ca.crt`:
+//! Same setup as `roles_live` (the workbench stack, the fork image in
+//! `CHELABASE_COMPUTE_IMAGE`), plus `psql` in the runner and the proxy's CA in
+//! `CHELABASE_PROXY_CA_FILE` (default `.chelabase/neon/proxy-ca.crt` in the checkout):
 //!
 //! ```text
-//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
-//! cargo test -p worker --test member_roles_live -- --ignored --test-threads=1 --nocapture
+//! just workbench test -p worker --test member_roles_live -- --run-ignored only
 //! ```
 //!
 //! Each test makes its own tenant and project (so no other member of the dev tenant is in the
@@ -46,7 +45,7 @@ use worker::member_roles::member_role_name;
 use worker::roles::{RoleOutcome, RolePatch, RoleSpec};
 
 mod common;
-use common::{cleanup, setup, workspace_root};
+use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup};
 
 /// The roles the tests grant from (made in SQL by the owner, `NOLOGIN`).
 const POOL: [&str; 3] = ["billing", "sales", "hr"];
@@ -538,14 +537,16 @@ fn proxy_conn(ep: &str, database: &str) -> String {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(4432);
-    let ca = workspace_root().join(".chelabase/neon/proxy-ca.crt");
+    let ca = proxy_ca_path();
     assert!(
         ca.exists(),
-        "{} is missing (run just deps-up)",
+        "{} is missing (run `just workbench up`)",
         ca.display()
     );
+    // The proxy is dialled at CHELABASE_PROXY_HOSTADDR when set; the TLS host name stays <ep>.<domain>.
+    let hostaddr = proxy_hostaddr();
     format!(
-        "host={ep}.{domain} hostaddr=127.0.0.1 port={port} dbname={database} sslmode=verify-full sslrootcert={}",
+        "host={ep}.{domain} hostaddr={hostaddr} port={port} dbname={database} sslmode=verify-full sslrootcert={}",
         ca.display()
     )
 }
@@ -824,7 +825,7 @@ async fn apply(fx: &Fx, model: &mut Model, op: &Op) {
 /// its desired roles and nothing owner-level, every catalog password is its row's, and a
 /// second reconcile changes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn reconcile_converges() {
     live(|fx| async move {
         let model = Arc::new(Mutex::new(Model {
@@ -903,7 +904,7 @@ async fn reconcile_converges() {
 
 /// Review focus 1: removing a member's access ends its open sessions.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn revoke_terminates_member_sessions() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -930,10 +931,10 @@ async fn revoke_terminates_member_sessions() {
         assert_terminated(ended);
         assert_eq!(session_count(&fx, &role).await, 0);
         assert!(
-            fx.catalog(&fx.ep).await.get(&role).is_none(),
+            !fx.catalog(&fx.ep).await.contains_key(&role),
             "no role left without a grant"
         );
-        assert!(fx.rows(fx.main).await.get(&role).is_none());
+        assert!(!fx.rows(fx.main).await.contains_key(&role));
     })
     .await;
 }
@@ -941,7 +942,7 @@ async fn revoke_terminates_member_sessions() {
 /// M10: removing the member (not just a grant) ends its open sessions too: the grants go with
 /// the member, the reconcile finds nothing wanted, locks the role out and drops it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn remove_member_terminates_member_sessions() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -965,10 +966,10 @@ async fn remove_member_terminates_member_sessions() {
         assert_terminated(ended);
         assert_eq!(session_count(&fx, &role).await, 0);
         assert!(
-            fx.catalog(&fx.ep).await.get(&role).is_none(),
+            !fx.catalog(&fx.ep).await.contains_key(&role),
             "no role left for a removed member"
         );
-        assert!(fx.rows(fx.main).await.get(&role).is_none());
+        assert!(!fx.rows(fx.main).await.contains_key(&role));
     })
     .await;
 }
@@ -997,7 +998,7 @@ async fn wait_for_sessions(fx: &Fx, role: &str, n: usize) {
 /// I6 (c): narrowing {billing, sales} to {sales} revokes `billing` and ends the session
 /// holding it; the role stays, and `sales` still works.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn partial_revoke_terminates_the_session_and_keeps_the_rest() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1047,7 +1048,7 @@ async fn partial_revoke_terminates_the_session_and_keeps_the_rest() {
 /// Review focus 5: a child inherits its parent's member roles and passwords; its reconcile
 /// gives them fresh passwords, so the parent's password never opens a child session.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn child_branch_gets_fresh_member_passwords() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1098,7 +1099,7 @@ async fn child_branch_gets_fresh_member_passwords() {
 
 /// Review focus 2: a grant naming a role the branch doesn't have is skipped, not a failure.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn reconcile_skips_roles_missing_on_the_branch() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1124,7 +1125,7 @@ async fn reconcile_skips_roles_missing_on_the_branch() {
 /// C1 (R16): an owner-level role is never given to a member role, even when its grant names
 /// it, and a role that becomes owner-level later is taken away (sessions ended).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn owner_level_roles_are_never_given() {
     live(|fx| async move {
         assert_eq!(
@@ -1184,7 +1185,7 @@ async fn owner_level_roles_are_never_given() {
 /// C2: a restore brings back an older catalog (a revoked membership, the old password). The
 /// branch's rows are forgotten, so the reconcile rotates the password and revokes again.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn restore_brings_back_no_revoked_role() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1244,7 +1245,7 @@ async fn restore_brings_back_no_revoked_role() {
 /// Invariant 7: a member role acting as `billing` can't get anywhere else, and each attempt
 /// fails for the reason that proves it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn escape_attempts_fail() {
     live(|fx| async move {
         assert_eq!(
@@ -1384,7 +1385,7 @@ async fn escape_attempts_fail() {
 /// R22: a member role is only ever made a member of NOLOGIN group roles; a LOGIN role named
 /// by a grant is left out.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn login_roles_are_never_given() {
     live(|fx| async move {
         assert_eq!(
@@ -1421,7 +1422,7 @@ async fn login_roles_are_never_given() {
 /// R22: a granted role whose chain reaches a LOGIN role is left out entirely, with what only
 /// it reaches; once the role is NOLOGIN again, the granted role comes back.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn chain_reaching_a_login_role_excludes_the_granted_role() {
     live(|fx| async move {
         fx.as_owner("CREATE ROLE ops NOLOGIN;\nGRANT hr TO ops;")
@@ -1455,7 +1456,7 @@ async fn chain_reaching_a_login_role_excludes_the_granted_role() {
 /// N2: a role that holds ADMIN on another (with no SET) could grant itself that role, so it
 /// is never given, nor a role whose chain reaches it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn admin_holders_are_never_given() {
     live(|fx| async move {
         fx.as_owner(
@@ -1490,7 +1491,7 @@ async fn admin_holders_are_never_given() {
 /// granted role reach an ADMIN holder; the DDL receiver asks for a reconcile, and the stack's
 /// worker revokes the role within a bounded time, with no reconcile called here.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev) running this branch's worker"]
+#[ignore = "needs the workbench stack running this branch's worker"]
 async fn an_owner_chain_made_in_sql_is_revoked_by_the_hook() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1546,7 +1547,7 @@ async fn an_owner_chain_made_in_sql_is_revoked_by_the_hook() {
 /// R21: granting a role includes its chain. The member role holds only `billing_admin`, and
 /// Postgres' own `SET` chaining lets it become `billing` too; nothing else.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn granted_role_brings_its_chain() {
     live(|fx| async move {
         fx.as_owner("CREATE ROLE billing_admin NOLOGIN;\nGRANT billing TO billing_admin;")
@@ -1598,7 +1599,7 @@ async fn granted_role_brings_its_chain() {
 /// with what it alone reaches; the member's other roles stay. Once the chain is safe again, the
 /// role comes back.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn chain_reaching_owner_level_excludes_the_granted_role() {
     live(|fx| async move {
         fx.as_owner("CREATE ROLE ops NOLOGIN;\nGRANT hr TO ops;")
@@ -1680,7 +1681,7 @@ async fn leftovers_and_password(fx: &Fx, role: &str) -> (Vec<String>, String) {
 /// this database), and can't set a password of its own; the hand-over gives the table to the
 /// acted role, drops the rest, resets the settings and puts the row's password back (M-e).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn a_hand_over_through_the_rpc_holds_the_invariant_and_restores_the_password() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1753,7 +1754,7 @@ async fn a_hand_over_through_the_rpc_holds_the_invariant_and_restores_the_passwo
 /// acted as, drops the privilege granted to it, and a converged reconcile after that finds
 /// nothing left to do.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn the_sweep_cleans_up_after_a_hand_over_that_never_ran() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1802,7 +1803,7 @@ async fn the_sweep_cleans_up_after_a_hand_over_that_never_ran() {
 /// narrowing reconcile that revokes `sales` still hands the table to `sales` (the member role
 /// held it before this reconcile), drops the privilege, and leaves it owning nothing.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn a_reconcile_hands_leftovers_to_the_last_acted_role_then_drops_the_rest() {
     live(|fx| async move {
         let m = fx.members[0].id;
@@ -1853,7 +1854,7 @@ async fn a_reconcile_hands_leftovers_to_the_last_acted_role_then_drops_the_rest(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn a_protected_branch_refuses_a_developers_schema_changes() {
     live(|fx| async move {
         let dev = fx.members[0].id;
@@ -1897,7 +1898,7 @@ async fn a_protected_branch_refuses_a_developers_schema_changes() {
 // 2), the triggers fire always (6), data maintenance stays allowed (4), and a temporary table
 // inheriting from a permanent one is refused (5).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the dev stack (just deps-up, just dev)"]
+#[ignore = "needs the workbench stack"]
 async fn a_planted_guard_schema_cannot_block_the_guard() {
     live(|fx| async move {
         let dev = fx.members[0].id;

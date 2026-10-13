@@ -92,4 +92,4 @@ A run the guard held logs one line with outcome `confirm_required`. A run whose 
 
 ## Tests
 
-`just live sql-editor-e2e` (needs `just deps-up` and `just dev`) runs a script as owner and as `anon` under RLS, a notice, an error with its position, a cancel, closing the stream through the gateway (the run's slot is freed), a 75 s `pg_sleep` through the gateway (heartbeats), the guard (`DROP` needs `confirm`; a protected branch holds writes), saved queries (including a stale version) and the schema document. `KEEP=1` leaves the database in place.
+`just sql-editor-e2e` (on your checkout's stack) runs a script as owner and as `anon` under RLS, a notice, an error with its position, a cancel, closing the stream through the gateway (the run's slot is freed), a 75 s `pg_sleep` through the gateway (heartbeats), the guard (`DROP` needs `confirm`; a protected branch holds writes), saved queries (including a stale version) and the schema document. `KEEP=1` leaves the database in place.

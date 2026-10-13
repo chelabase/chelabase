@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live check of roadmap step 6 (the data API), through the gateway and the proxy (needs just
-# deps-up and just dev):
+# the stack: just workbench up):
 # - a public and a secret key; the secret key inserts, the public key reads, and the public key's
 #   insert is refused (403); a batch rolls back on error (packages/client/scripts/e2e.mjs);
 # - `chelabase gen types` output typechecks against the SDK, and a wrong column doesn't;
@@ -14,9 +14,10 @@ cd "$root"
 LOG_PREFIX=data-e2e
 # shellcheck source=lib/neon-common.sh
 . scripts/lib/neon-common.sh
-STORCON="${STORCON_URL:-http://127.0.0.1:1234}"
+STORCON="${STORCON_URL:-http://storage-controller:1234}"
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 PROXY_PG_PORT="${CHELABASE_PROXY_PG_PORT:-4432}"
+PROXY_HOSTADDR="${CHELABASE_PROXY_HOSTADDR:?run through just workbench run}"
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 tmp="$(mktemp -d)"
@@ -35,14 +36,15 @@ cleanup() {
   rm -rf "$tmp"
 }
 
-cargo build -q -p chelabase || die "cargo build -p chelabase"
-[[ -f .chelabase/zitadel/demo.env ]] || die ".chelabase/zitadel/demo.env is missing (run just dev)"
+[[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
+demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
+[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
 set -a
 # shellcheck disable=SC1091
-source .chelabase/zitadel/demo.env
+source "$demo_env"
 set +a
-ca="$root/.chelabase/neon/proxy-ca.crt"
-[[ -s "$ca" ]] || die "$ca is missing (run just deps-up)"
+ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
+[[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 command -v pnpm >/dev/null || die "pnpm is missing"
 trap cleanup EXIT
 
@@ -82,7 +84,7 @@ psql_on() {
   reveal
   for _ in $(seq 60); do
     if out="$(PGPASSWORD="$bpw" PGCONNECT_TIMEOUT=10 psql \
-      "host=$bhost hostaddr=127.0.0.1 port=${PROXY_PG_PORT} user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
+      "host=$bhost hostaddr=$PROXY_HOSTADDR port=${PROXY_PG_PORT} user=postgres dbname=$bdb sslmode=verify-full sslrootcert=$ca" \
       -v ON_ERROR_STOP=1 -qtA "$@" 2>"$tmp/err")"; then
       printf '%s' "$out"
       return
@@ -123,7 +125,7 @@ pass "secret insert, public select, public insert refused, batch rollback"
 
 # 4. Generated types against the SDK: a valid call compiles, a wrong column doesn't.
 # The key goes through the environment, never argv (other users can read a process's argv).
-CHELABASE_DATA_KEY="$SECRET_KEY" cargo run -q -p chelabase -- gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
+CHELABASE_DATA_KEY="$SECRET_KEY" "$CHELABASE_CLI" gen types --url "$GATEWAY" --out "$tmp/db.ts" ||
   die "chelabase gen types"
 grep -q 'notes' "$tmp/db.ts" || die "the generated types don't mention notes"
 cat >"$tmp/sample.ts" <<EOF

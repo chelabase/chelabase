@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
     let internal_state = Arc::new(InternalState {
         metadata: metadata.clone(),
-        locator: DockerLocator::connect(&internal_config.compute_network)?,
+        locator: DockerLocator::connect(&internal_config.compute_network, &internal_config.stack)?,
         storcon: StorconClient::new(&internal_config.storcon_url, 0)
             .with_timeout(Duration::from_secs(10)),
         signer,
@@ -107,7 +107,10 @@ async fn main() -> anyhow::Result<()> {
             .filter(|v| !v.is_empty()),
         proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),
         data_api_database_cap,
-        locator: Arc::new(DockerLocator::connect(&internal_config.compute_network)?),
+        locator: Arc::new(DockerLocator::connect(
+            &internal_config.compute_network,
+            &internal_config.stack,
+        )?),
         console: Console::default(),
         zitadel: zitadel_admin(&entry.issuer()),
         users_db: Arc::new(PgUsersDb::new()),

@@ -16,7 +16,7 @@ packages/            TypeScript packages: client, management-client, neon-e2e
 openapi/             generated OpenAPI documents (management, login, data)
 infra/compose/       metadata Postgres, NATS, Zitadel, Mailpit, Neon storage
 infra/neon/          Neon image pins and build notes
-scripts/             dev stack, live queue and codegen scripts
+scripts/             e2e, stack and codegen scripts
 docs/                design specs, plans, roadmap and security notes
 ```
 
@@ -37,21 +37,21 @@ git clone https://github.com/chelabase/chelabase.git
 cd chelabase
 proto install
 pnpm install
-just dev
+just workbench up
 ```
 
-`just dev` starts the Compose dependencies, bootstraps Zitadel, builds the Rust services and runs them and Studio in the background. The first run builds a lot and takes a while.
+`just workbench up` builds the Rust services on the host, starts the Compose dependencies, bootstraps Zitadel, then runs the services and Studio in containers, and prints the URLs. The first run builds a lot and takes a while.
 
 Open http://studio.chelabase.localhost:8000 and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` sets it). Self-sign-up is off by default: an admin invites everyone else (or switches open sign-up on and approves requests). Emails such as invites and password resets land in Mailpit at http://mail.chelabase.localhost:8000.
 
-Stop everything with `just stop`. `just` lists every recipe.
+Stop everything with `just workbench down`. `just` lists every recipe.
 
 ## Documentation
 
-The docs site runs locally, reached through the gateway (start the stack with `just dev` first):
+The docs site runs locally, reached through the gateway:
 
 ```bash
-just docs
+just workbench up --with docs
 ```
 
 Then open http://docs.chelabase.localhost:8000/docs. It has three sections:
@@ -60,4 +60,4 @@ Then open http://docs.chelabase.localhost:8000/docs. It has three sections:
 - [Reference](http://docs.chelabase.localhost:8000/docs/reference/errors): the management and data API references and the error codes (the internal login API is under Architecture)
 - [Architecture](http://docs.chelabase.localhost:8000/docs/architecture): how the gateway, Studio, data API, Neon storage and security fit together
 
-Working on the repo: see [CONTRIBUTING.md](CONTRIBUTING.md) (worktrees, the live queue, tests, code generation). Product direction: [PRODUCT.md](PRODUCT.md).
+Working on the repo: see [CONTRIBUTING.md](CONTRIBUTING.md) (worktrees and their stacks, tests, code generation). Product direction: [PRODUCT.md](PRODUCT.md).

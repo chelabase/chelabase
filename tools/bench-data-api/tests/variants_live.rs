@@ -1,5 +1,5 @@
 //! Live checks of the four variants against a seeded bench database (`setup::seed` already
-//! run). Ignored by default; run through `just live` with `BENCH_OWNER_URL`, `BENCH_BRANCH`,
+//! run). Ignored by default; run through `just workbench run` with `BENCH_OWNER_URL`, `BENCH_BRANCH`,
 //! `CHELABASE_INTERNAL_URL` and `CHELABASE_REST_INTERNAL_TOKEN` set.
 
 use std::sync::Arc;
@@ -148,7 +148,7 @@ fn mask_inserted_ids(v: &mut Value) {
 }
 
 #[tokio::test]
-#[ignore = "needs the dev stack (just live)"]
+#[ignore = "needs the workbench stack"]
 async fn variants_agree() {
     let e = env().await;
     // The four Phase 1 variants and the shipped path (R): same JSON for the same ops.
@@ -200,7 +200,7 @@ async fn variants_agree() {
 }
 
 #[tokio::test]
-#[ignore = "needs the dev stack (just live)"]
+#[ignore = "needs the workbench stack"]
 async fn b_claims_round_trip() {
     let e = env().await;
     let claims = serde_json::json!({"sub": "it's", "path": "a\\b", "name": "Jürgen"});
@@ -213,7 +213,7 @@ async fn b_claims_round_trip() {
 }
 
 #[tokio::test]
-#[ignore = "needs the dev stack (just live)"]
+#[ignore = "needs the workbench stack"]
 async fn c_pipeline_prepares_before_sending() {
     let mut e = env().await;
     let c = e.c(e.version);
@@ -225,7 +225,7 @@ async fn c_pipeline_prepares_before_sending() {
 }
 
 #[tokio::test]
-#[ignore = "needs the dev stack (just live)"]
+#[ignore = "needs the workbench stack"]
 async fn c_stale_version_rolls_back() {
     let mut e = env().await;
     let c = e.c(uuid::Uuid::new_v4());
@@ -241,7 +241,7 @@ async fn c_stale_version_rolls_back() {
 }
 
 #[tokio::test]
-#[ignore = "needs the dev stack (just live)"]
+#[ignore = "needs the workbench stack"]
 async fn d_stale_version_rolls_back() {
     let mut e = env().await;
     let d = e.d(uuid::Uuid::new_v4());
@@ -261,7 +261,7 @@ fn empty(out: &str) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "needs the dev stack (just live)"]
+#[ignore = "needs the workbench stack"]
 async fn session_state_doesnt_leak() {
     let e = env().await;
     let set = e.raw("SELECT set_config('x.y', '1', false)");

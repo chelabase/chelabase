@@ -3,6 +3,7 @@
 use crate::paths::{compose_env, compose_file};
 use anyhow::{Context, Result, bail};
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 use tracing::{info, warn};
 
@@ -16,28 +17,65 @@ fn metadata_db_name(url: Option<&str>) -> String {
         .unwrap_or_else(|| "chelabase_metadata".to_string())
 }
 
-pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
-    let compose = compose_file();
-    let env_file = compose_env();
-    let url = std::env::var("CHELABASE_METADATA_DATABASE_URL").ok();
-    let database = metadata_db_name(url.as_deref());
+/// `docker` arguments that open a Compose call: `compose -p <project> -f <file> --env-file
+/// <env>`. A workbench stack names its project (`CHELABASE_COMPOSE_PROJECT`); without one, main's
+/// project (`chelabase`). The compose file has no `name:` of its own, so `-p` is always given.
+pub fn compose_base(project: Option<&str>, file: &Path, env: &Path) -> Vec<String> {
+    let project = project.map_or_else(
+        || crate::workbench::slug::project_name(crate::workbench::slug::MAIN),
+        str::to_string,
+    );
+    let mut args = vec!["compose".to_string(), "-p".to_string(), project];
+    args.extend([
+        "-f".to_string(),
+        file.display().to_string(),
+        "--env-file".to_string(),
+        env.display().to_string(),
+    ]);
+    args
+}
 
-    let ready = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose.to_str().unwrap(),
-            "--env-file",
-            env_file.to_str().unwrap(),
-            "exec",
-            "-T",
-            "metadata-db",
-            "pg_isready",
-            "-U",
-            "chelabase",
-            "-d",
-            &database,
-        ])
+/// The current stack's Compose project, from `CHELABASE_COMPOSE_PROJECT` (unset or blank: none).
+fn compose_project() -> Option<String> {
+    std::env::var("CHELABASE_COMPOSE_PROJECT")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+}
+
+/// `docker compose … exec -T metadata-db <cmd…>` in the current stack.
+fn metadata_exec(cmd: &[&str]) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .args(compose_base(
+            compose_project().as_deref(),
+            &compose_file(),
+            &compose_env(),
+        ))
+        .args(["exec", "-T", "metadata-db"])
+        .args(cmd);
+    command
+}
+
+/// `psql -U chelabase -d <database> <extra…>` in the current stack's metadata-db.
+fn metadata_psql(database: &str, extra: &[&str]) -> Command {
+    let mut command = metadata_exec(&["psql", "-U", "chelabase", "-d", database]);
+    command.args(extra);
+    command
+}
+
+fn metadata_database() -> String {
+    metadata_db_name(
+        std::env::var("CHELABASE_METADATA_DATABASE_URL")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
+    let database = metadata_database();
+
+    let ready = metadata_exec(&["pg_isready", "-U", "chelabase", "-d", &database])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -45,29 +83,18 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
         .unwrap_or(false);
 
     if !ready {
-        warn!("metadata Postgres not ready — skipped tenant bind (re-run after deps-up)");
+        warn!("metadata Postgres not ready — skipped tenant bind (re-run once the stack is up: just workbench up)");
         return Ok(());
     }
 
-    let col = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose.to_str().unwrap(),
-            "--env-file",
-            env_file.to_str().unwrap(),
-            "exec",
-            "-T",
-            "metadata-db",
-            "psql",
-            "-U",
-            "chelabase",
-            "-d",
-            &database,
+    let col = metadata_psql(
+        &database,
+        &[
             "-tAc",
             "SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='zitadel_org_id'",
-        ])
-        .output()
+        ],
+    )
+    .output()
         .context("check zitadel_org_id column")?;
 
     let col_exists = String::from_utf8_lossy(&col.stdout).trim() == "1";
@@ -79,26 +106,7 @@ pub fn bind_demo_tenant(org_id: &str, demo_tenant: &str) -> Result<()> {
     }
 
     let sql = format!("UPDATE tenants SET zitadel_org_id = '{org_id}' WHERE id = '{demo_tenant}';");
-    let status = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            compose.to_str().unwrap(),
-            "--env-file",
-            env_file.to_str().unwrap(),
-            "exec",
-            "-T",
-            "metadata-db",
-            "psql",
-            "-U",
-            "chelabase",
-            "-d",
-            &database,
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            &sql,
-        ])
+    let status = metadata_psql(&database, &["-v", "ON_ERROR_STOP=1", "-c", &sql])
         .stdout(std::process::Stdio::null())
         .status()
         .context("bind demo tenant")?;
@@ -144,30 +152,8 @@ pub fn fill_display_name(demo_tenant: &str, org_name: &str) -> Result<()> {
     let Some(org_name) = tenant_name_from_org(org_name) else {
         return Ok(());
     };
-    let compose = compose_file();
-    let env_file = compose_env();
-    let url = std::env::var("CHELABASE_METADATA_DATABASE_URL").ok();
-    let database = metadata_db_name(url.as_deref());
-    let psql = |extra: &[&str]| {
-        let mut cmd = Command::new("docker");
-        cmd.args([
-            "compose",
-            "-f",
-            compose.to_str().unwrap(),
-            "--env-file",
-            env_file.to_str().unwrap(),
-            "exec",
-            "-T",
-            "metadata-db",
-            "psql",
-            "-U",
-            "chelabase",
-            "-d",
-            &database,
-        ])
-        .args(extra);
-        cmd
-    };
+    let database = metadata_database();
+    let psql = |extra: &[&str]| metadata_psql(&database, extra);
     let col = psql(&[
         "-tAc",
         "SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='display_name'",
@@ -209,30 +195,8 @@ pub fn fill_display_name(demo_tenant: &str, org_name: &str) -> Result<()> {
 /// Upserts `zitadel_user_id` as the tenant's active admin (see [`ADMIN_SQL`]). Skips with a
 /// warning while the metadata database or its members table isn't there yet.
 pub fn bootstrap_admin(demo_tenant: &str, zitadel_user_id: &str, email: &str) -> Result<()> {
-    let compose = compose_file();
-    let env_file = compose_env();
-    let url = std::env::var("CHELABASE_METADATA_DATABASE_URL").ok();
-    let database = metadata_db_name(url.as_deref());
-    let psql = |extra: &[&str]| {
-        let mut cmd = Command::new("docker");
-        cmd.args([
-            "compose",
-            "-f",
-            compose.to_str().unwrap(),
-            "--env-file",
-            env_file.to_str().unwrap(),
-            "exec",
-            "-T",
-            "metadata-db",
-            "psql",
-            "-U",
-            "chelabase",
-            "-d",
-            &database,
-        ])
-        .args(extra);
-        cmd
-    };
+    let database = metadata_database();
+    let psql = |extra: &[&str]| metadata_psql(&database, extra);
 
     let table = psql(&["-tAc", "SELECT to_regclass('public.members') IS NOT NULL"])
         .output()
@@ -276,7 +240,7 @@ pub fn bootstrap_admin(demo_tenant: &str, zitadel_user_id: &str, email: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{metadata_db_name, tenant_name_from_org, NAME_SQL};
+    use super::{compose_base, metadata_db_name, tenant_name_from_org, NAME_SQL};
 
     #[test]
     fn org_names_become_tenant_names_like_the_apps() {
@@ -318,5 +282,19 @@ mod tests {
         );
         assert_eq!(metadata_db_name(Some("postgres://u:p@h:5433/")), "chelabase_metadata");
         assert_eq!(metadata_db_name(Some("not a url")), "chelabase_metadata");
+    }
+
+    #[test]
+    fn tenant_bind_runs_in_the_stacks_project() {
+        use std::path::Path;
+        assert_eq!(
+            compose_base(Some("chelabase-feat-x"), Path::new("/w/c.yml"), Path::new("/s/stack.env")),
+            ["compose", "-p", "chelabase-feat-x", "-f", "/w/c.yml", "--env-file", "/s/stack.env"]
+        );
+        assert_eq!(
+            compose_base(None, Path::new("/w/c.yml"), Path::new("/e")),
+            ["compose", "-p", "chelabase", "-f", "/w/c.yml", "--env-file", "/e"],
+            "outside a workbench, the main project by name: compose never runs without -p (T5 review M5)"
+        );
     }
 }

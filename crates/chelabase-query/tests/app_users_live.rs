@@ -1,6 +1,6 @@
 //! `PgUsersDb` against the dev metadata Postgres as a stand-in for a branch (no guard
 //! trigger). Run through the live queue:
-//! just live cargo test -p chelabase-query --test app_users_live -- --ignored
+//! just workbench test -p chelabase-query --test app_users_live -- --run-ignored only
 //!
 //! Each test works in its own scratch schema, dropped afterwards even when the test fails.
 //! The metadata cluster gains a `NOLOGIN` role `authenticated` (made once, kept: harmless,
@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// exports it), else the shared dev one.
 fn url() -> String {
     std::env::var("CHELABASE_METADATA_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into())
+        .unwrap_or_else(|_| "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into())
 }
 
 /// The database name in `url()` (its last path segment, without a query string).
@@ -37,7 +37,7 @@ impl Scratch {
     async fn new() -> Scratch {
         let mut admin = PgConnection::connect(&url())
             .await
-            .expect("metadata Postgres (just deps-up)");
+            .expect("metadata Postgres (is the workbench stack up?)");
         let run = Uuid::new_v4().simple().to_string();
         let schema = format!("cq_app_users_{}", &run[..12]);
         for sql in [
@@ -63,10 +63,12 @@ impl Scratch {
                 .await
                 .unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
+        // The metadata database as the URL names it (a service name inside the stack).
+        let options: sqlx::postgres::PgConnectOptions = url().parse().unwrap();
         let target = SyncTarget {
             branch_id: Uuid::new_v4(),
-            host: "127.0.0.1".into(),
-            port: 5433,
+            host: options.get_host().to_string(),
+            port: options.get_port(),
             database: database_name(),
             user: "chelabase".into(),
             password: "chelabase".into(),
@@ -153,7 +155,7 @@ fn row(email: &str, data: Value) -> NewUserRow {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn unknown_key_rolls_back() {
     let mut s = Scratch::new().await;
     for key in ["nope", "email"] {
@@ -167,7 +169,7 @@ async fn unknown_key_rolls_back() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn check_violation_is_constraint_with_name() {
     let mut s = Scratch::new().await;
     let r =
@@ -184,7 +186,7 @@ async fn check_violation_is_constraint_with_name() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn duplicate_email_is_email_taken() {
     let mut s = Scratch::new().await;
     s.db.begin_insert(&s.target, &row("a@x.io", json!({})))
@@ -202,7 +204,7 @@ async fn duplicate_email_is_email_taken() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn commit_then_visible() {
     let mut s = Scratch::new().await;
     let p =
@@ -224,7 +226,7 @@ async fn commit_then_visible() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn rollback_leaves_nothing() {
     let mut s = Scratch::new().await;
     let p =
@@ -237,7 +239,7 @@ async fn rollback_leaves_nothing() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn column_without_authenticated_insert_is_unknown() {
     let mut s = Scratch::new().await;
     sqlx::query(sqlx::AssertSqlSafe(format!(

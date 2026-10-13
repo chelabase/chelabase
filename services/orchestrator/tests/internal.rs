@@ -42,7 +42,7 @@ const STORCON_TOKEN: &str = "storcon-token";
 const COMPUTE_TOKEN: &str = "compute-token";
 const DATA_KEYS_TOKEN: &str = "data-keys-token";
 const REST_TOKEN: &str = "rest-token";
-const CONTROL_PLANE_URI: &str = "http://host.docker.internal:8083";
+const CONTROL_PLANE_URI: &str = "http://orchestrator:8083";
 const APP_AUTH_TOKEN: &str = "app-auth-token";
 const APP_SESSIONS_TOKEN: &str = "app-sessions-token";
 const SIGNING_KEY: &str = "actions-signing-key";
@@ -1940,7 +1940,7 @@ async fn connection_opens_the_authenticator_password() {
     assert_eq!(
         body,
         json!({
-            "host": "127.0.0.1",
+            "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
             "port": 55432,
             "database": "web1",
             "user": "authenticator",
@@ -3579,7 +3579,7 @@ async fn spec_route_sets_console_url() {
 const ORG: &str = "o1";
 const SYNC_PW: &str = "sync-password";
 const MAIN_PG: &str = "127.0.0.1:55432";
-const CHILD_PG: &str = "127.0.0.1:55433";
+const CHILD_PG: &str = "127.0.0.1:55435";
 
 /// A project with app users on, and one without.
 struct AppWorld {
@@ -4000,7 +4000,7 @@ async fn branch_info_for_auth_branch_targets_itself() {
             "target_branch_id": w.main,
             "sync": {
                 "branch_id": w.main,
-                "host": "127.0.0.1",
+                "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
                 "port": 55432,
                 "database": "shop",
                 "user": "chelabase_auth_sync",

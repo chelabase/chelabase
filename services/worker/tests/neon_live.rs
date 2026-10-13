@@ -1,13 +1,11 @@
 //! The whole lifecycle against the real Neon stack: provision, reset, delete.
 //!
-//! Needs `just deps-up` (storage controller, proxy, Valkey, metadata database, Docker)
-//! and `just dev` running (computes pull their spec from the orchestrator's internal
-//! listener on `CHELABASE_INTERNAL_ADDR`, default :8083), plus `CHELABASE_COMPUTE_IMAGE` exported from `scripts/neon-images.sh`:
+//! Needs `just workbench up` (storage controller, proxy, Valkey, metadata database, Docker)
+//! and the workbench stack running (computes pull their spec from the orchestrator's internal
+//! listener, `CHELABASE_INTERNAL_URL`, default http://orchestrator:8083), plus `CHELABASE_COMPUTE_IMAGE` exported from `scripts/neon-images.sh`:
 //!
 //! ```text
-//! set -a; . .chelabase/zitadel/demo.env; eval "$(scripts/neon-images.sh)"; CHELABASE_COMPUTE_IMAGE="$COMPUTE_NODE_IMAGE"; set +a
-//! CHELABASE_COMPUTE_IMAGE=$COMPUTE_NODE_IMAGE \
-//!   cargo test -p worker --test neon_live -- --ignored --test-threads=1 --nocapture
+//! just workbench test -p worker --test neon_live -- --run-ignored only
 //! ```
 
 use std::sync::Arc;
@@ -24,7 +22,7 @@ mod common;
 use common::{cleanup, setup, sqlx_delete};
 
 #[tokio::test]
-#[ignore = "needs the Neon stack, just dev and CHELABASE_COMPUTE_IMAGE"]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn provision_reset_and_delete_a_database() {
     let (worker, metadata, config) = setup().await;
     let worker = Arc::new(worker);

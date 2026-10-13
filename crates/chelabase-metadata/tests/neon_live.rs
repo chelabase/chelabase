@@ -1,5 +1,5 @@
 //! Opt-in tests of the Neon endpoint queries against a real metadata Postgres
-//! (`just deps-up` first):
+//! (the workbench stack first):
 //!
 //! ```sh
 //! cargo test -p chelabase-metadata --test neon_live -- --ignored --test-threads=1
@@ -11,11 +11,11 @@ use chelabase_metadata::{MetadataClient, MetadataConfig, NeonDatabase, NeonEndpo
 
 async fn client() -> MetadataClient {
     let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".to_string()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
     });
     let client = MetadataClient::connect(&MetadataConfig { database_url })
         .await
-        .expect("metadata Postgres reachable (just deps-up)");
+        .expect("metadata Postgres reachable (is the workbench stack up?)");
     client.migrate().await.unwrap();
     client
 }
@@ -84,7 +84,7 @@ async fn delete(client: &MetadataClient, id: &str) {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn finds_an_endpoint_its_roles_and_databases() {
     with_endpoint(|client, ep| async move {
         assert_eq!(
@@ -132,7 +132,7 @@ async fn finds_an_endpoint_its_roles_and_databases() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn role_secrets_tell_unknown_endpoints_from_unknown_roles() {
     with_endpoint(|client, ep| async move {
         assert_eq!(
@@ -152,7 +152,7 @@ async fn role_secrets_tell_unknown_endpoints_from_unknown_roles() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn deleting_an_endpoint_deletes_its_roles_and_databases() {
     with_endpoint(|client, ep| async move {
         delete(&client, &ep.id).await;
@@ -179,7 +179,7 @@ async fn needs_reconfigure(client: &MetadataClient, ep: &str) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn clear_needs_reconfigure_only_for_the_applied_version() {
     with_endpoint(|client, ep| async move {
         sqlx::query("UPDATE neon_endpoints SET needs_reconfigure = true WHERE id = $1")
@@ -204,7 +204,7 @@ async fn clear_needs_reconfigure_only_for_the_applied_version() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn replace_compute_token_stores_the_new_hash() {
     with_endpoint(|client, ep| async move {
         client.replace_compute_token(&ep.id, &"ef".repeat(32)).await.unwrap();
@@ -217,7 +217,7 @@ async fn replace_compute_token_stores_the_new_hash() {
 // A newer write commits while the clear waits on the endpoint row: the clear must recheck the
 // committed version, not its old snapshot, or the newer write is never pushed.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn clear_needs_reconfigure_rechecks_the_version_after_a_lock_wait() {
     with_endpoint(|client, ep| async move {
         sqlx::query("UPDATE neon_endpoints SET needs_reconfigure = true WHERE id = $1")
@@ -255,7 +255,7 @@ async fn clear_needs_reconfigure_rechecks_the_version_after_a_lock_wait() {
 
 // Review I1: one holder per endpoint across clients (worker processes); dropping releases it.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn lock_endpoint_admits_one_holder_until_dropped() {
     use std::time::Duration;
     let (a, b) = (client().await, client().await);
@@ -277,7 +277,7 @@ async fn lock_endpoint_admits_one_holder_until_dropped() {
 
 // A waiter gives up on its own, well inside the reset deadline, with an error that says why.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn lock_endpoint_gives_up_with_a_clear_error() {
     use std::time::{Duration, Instant};
     let (a, b) = (client().await, client().await);
@@ -301,7 +301,7 @@ async fn lock_endpoint_gives_up_with_a_clear_error() {
 
 // Waiters are served first come, first served. Polling would pick one at random each round.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn lock_endpoint_serves_waiters_in_order() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

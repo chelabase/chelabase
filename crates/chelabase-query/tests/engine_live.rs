@@ -1,6 +1,6 @@
 //! `with_transaction` and the pipelined `run` against the dev metadata Postgres. Run through
 //! the live queue:
-//! just live cargo test -p chelabase-query --test engine_live -- --ignored
+//! just workbench test -p chelabase-query --test engine_live -- --run-ignored only
 //!
 //! `with_transaction` works in its own scratch table; the pipeline tests each in a scratch
 //! database with a minimal `chelabase` schema (the version table and the guard functions),
@@ -22,7 +22,7 @@ const RESET_SQL: &str = "SET ROLE NONE; RESET ALL";
 /// justfile exports it), else the shared dev one.
 fn url() -> String {
     std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()
     })
 }
 
@@ -48,14 +48,14 @@ async fn state(admin: &mut PgConnection, pid: i32) -> String {
 /// everything `f` wrote and leaves the connection idle and usable; a success commits; and a
 /// transaction a dropped request left open is rolled back, never committed by the next one.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn with_transaction_rolls_back_on_error() {
     let mut admin = PgConnection::connect(&url())
         .await
-        .expect("metadata Postgres (just deps-up)");
+        .expect("metadata Postgres (is the workbench stack up?)");
     let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
         .await
-        .expect("metadata Postgres (just deps-up)");
+        .expect("metadata Postgres (is the workbench stack up?)");
     tokio::spawn(connection);
     let pid: i32 = client
         .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
@@ -230,7 +230,7 @@ impl Scratch {
     async fn new() -> Scratch {
         let mut meta = PgConnection::connect(&url())
             .await
-            .expect("metadata Postgres (just deps-up)");
+            .expect("metadata Postgres (is the workbench stack up?)");
         let run = Uuid::new_v4().simple().to_string();
         let name = format!("cq_pipe_{}", &run[..12]);
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
@@ -351,7 +351,7 @@ impl Scratch {
 
 /// With the version cached, a write runs in one pipeline and commits.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn pipeline_commits_a_write() {
     let mut s = Scratch::new().await;
     s.warm().await;
@@ -378,7 +378,7 @@ async fn pipeline_commits_a_write() {
 /// A schema version changed under the cache: the pipeline's assert fails (`CB001`), nothing
 /// of it commits, and the sequential path runs the request once and records the version.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn stale_version_replans_once_and_commits_once() {
     let mut s = Scratch::new().await;
     s.warm().await;
@@ -413,7 +413,7 @@ async fn stale_version_replans_once_and_commits_once() {
 
 /// A response past the budget fails in SQL (`CB002`): the 413, and the write rolled back.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn cap_error_leaves_no_row() {
     let mut s = Scratch::new().await;
     s.warm().await;
@@ -436,7 +436,7 @@ async fn cap_error_leaves_no_row() {
 /// A database without the guard functions (one dropped here) is served sequentially and
 /// marked, so the next request doesn't try the pipeline.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn missing_guard_functions_run_sequentially() {
     let mut s = Scratch::new().await;
     s.warm().await;
@@ -461,7 +461,7 @@ async fn missing_guard_functions_run_sequentially() {
 /// A transaction a dropped request left open (with a write in it) is rolled back by the
 /// pipeline's first step, never committed with the next request's work.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_stale_open_transaction_is_not_committed() {
     let mut s = Scratch::new().await;
     s.warm().await;
@@ -483,7 +483,7 @@ async fn a_stale_open_transaction_is_not_committed() {
 /// `Unknown`, not `Idle`) still gets the `ROLLBACK`: the transaction it opened and wrote in
 /// is never committed with the next request's work.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_dropped_request_leaves_a_transaction_that_is_not_committed() {
     let mut s = Scratch::new().await;
     s.warm().await;

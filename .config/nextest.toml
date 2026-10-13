@@ -1,0 +1,18 @@
+# cargo-nextest settings (https://nexte.st/docs/configuration/).
+
+# The worker's live tests share the checkout's stack: branch_live restarts its pageserver,
+# roles_live recreates its orchestrator, and the caps count every database. They run one at a
+# time (`just workbench test -p worker -- --run-ignored only`). Guarded by
+# scripts/tests/workbench-recipes.sh.
+[test-groups.stack-serial]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(worker) & binary(/_live$/)'
+test-group = "stack-serial"
+
+# The catalog reader's live tests create cluster-wide roles in the metadata Postgres (the
+# reserved ones too, on a fresh stack) and read every role back.
+[[profile.default.overrides]]
+filter = 'package(chelabase-schema) & binary(catalog_live)'
+test-group = "stack-serial"

@@ -28,7 +28,7 @@ Management endpoints require `Authorization: Bearer <Zitadel JWT>`. The gateway 
 
 The orchestrator trusts only that token (it holds the verify key, `CHELABASE_INTERNAL_VERIFY_KEY`) and maps its `org_id` to a tenant (a soft binding through `tenants.zitadel_org_id`). Calling the orchestrator's port `:8081` directly returns `401`.
 
-`chelabase dev bootstrap` creates the gateway's key pair in `.chelabase/gateway/` once (it is never overwritten) and writes both key paths into `.chelabase/zitadel/demo.env`.
+`just workbench up` creates the gateway's key pair in `.chelabase/gateway/` once (it is never overwritten) and writes both key paths into the stack's `stack.env`, so the gateway starts before the first Zitadel bootstrap.
 
 ## Data API requests
 

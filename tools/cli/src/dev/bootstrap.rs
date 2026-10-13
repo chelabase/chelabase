@@ -14,16 +14,25 @@ use std::path::Path;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Zitadel's first-instance human admin, the dev stack's sign-in.
-pub const DEV_USER_EMAIL: &str = "zitadel-admin@zitadel.localhost";
+/// The email asked for (trimmed, lowercased, like the members table), if any: a requested email
+/// that no Zitadel user has is an error, the default only a warning.
+fn requested_admin_email(requested: Option<&str>) -> Option<String> {
+    requested
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(chelabase_zitadel::rules::normalize_email)
+}
 
-/// The admin's email (trimmed, lowercased, like the members table) and whether it was asked
-/// for: a requested email that no Zitadel user has is an error, the default only a warning.
-fn resolve_admin_email(requested: Option<&str>) -> (String, bool) {
-    match requested.map(str::trim).filter(|e| !e.is_empty()) {
-        Some(email) => (chelabase_zitadel::rules::normalize_email(email), true),
-        None => (DEV_USER_EMAIL.to_string(), false),
-    }
+/// Zitadel's first-instance human admin, the dev stack's sign-in, is named after the instance's
+/// external domain: `zitadel-admin@zitadel.<auth host name>` on a fresh stack. An instance made
+/// before W1 keeps `zitadel-admin@zitadel.localhost`. The derived email comes first.
+fn default_admin_emails(auth_host_name: &str) -> Vec<String> {
+    let mut emails = vec![
+        format!("zitadel-admin@zitadel.{auth_host_name}"),
+        "zitadel-admin@zitadel.localhost".to_string(),
+    ];
+    emails.dedup();
+    emails
 }
 
 /// Whether the demo machine user is made a tenant admin: on a self-hosted dev stack only.
@@ -31,7 +40,30 @@ fn demo_admin(mode: chelabase_types::mode::Mode) -> bool {
     mode == chelabase_types::mode::Mode::SelfHosted
 }
 
+/// `dev bootstrap` writes into a workbench stack's state dir (`CHELABASE_STACK_DIR`, set by the
+/// stack's env). Without it, it would recreate the retired zitadel dir under `.chelabase`.
+pub fn check_stack_env(stack_dir: Option<&str>) -> Result<()> {
+    if stack_dir.is_none_or(|d| d.trim().is_empty()) {
+        bail!(
+            "CHELABASE_STACK_DIR isn't set: `dev bootstrap` runs with a workbench stack's env. \
+             Use `just workbench up` (it bootstraps), or `just zitadel-bootstrap`, which loads \
+             the stack env"
+        );
+    }
+    Ok(())
+}
+
+/// Set to `1` by the workbench's bootstrap before the apps: Zitadel refuses an Actions target
+/// whose host doesn't resolve (`Errors.Target.DeniedURL`), and on a fresh stack the orchestrator
+/// container doesn't exist yet. The bootstrap after the apps creates the target.
+pub const SKIP_ACTIONS_VAR: &str = "CHELABASE_BOOTSTRAP_SKIP_ACTIONS";
+
+pub fn skip_actions_target(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.trim() == "1")
+}
+
 pub async fn run(admin_email: Option<&str>) -> Result<()> {
+    check_stack_env(std::env::var("CHELABASE_STACK_DIR").ok().as_deref())?;
     let entry = entry()?;
     let iss = entry.issuer();
     let studio_origin = entry.studio_origin();
@@ -39,8 +71,6 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
     fs::create_dir_all(&zdir).with_context(|| format!("mkdir {}", zdir.display()))?;
 
     // Local files first, so they exist even if Zitadel isn't up.
-    let internal = internal_keys::ensure(&gateway_dir())?;
-    let secrets = secrets_key::ensure(&secrets_dir())?;
     let cookie_dir = auth_dir().with_context(|| {
         format!(
             "migrate auth cookie dir from {} to {}",
@@ -48,9 +78,13 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
             crate::paths::repo_root().join(".chelabase/auth").display()
         )
     })?;
-    let cookie_key = secrets_key::ensure_file(&cookie_dir, "cookie.key")?;
-    let compute_jwt = compute_jwt::ensure(&neon_dir())?;
-    let app_jwt = app_keys::ensure(&cookie_dir)?;
+    let MachineKeys {
+        internal,
+        secrets,
+        cookie_key,
+        compute_jwt,
+        app_jwt,
+    } = ensure_machine_keys(&gateway_dir(), &secrets_dir(), &cookie_dir, &neon_dir())?;
 
     let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat", 45, TOKEN_POLL).await?;
     let login_client = zdir.join("login-client.pat");
@@ -71,15 +105,38 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
     steps::ensure_demo_key(&api, &demo_user_id, &zdir.join("demo-sa.json")).await?;
     steps::ensure_smtp(&api).await?;
     steps::ensure_zitadel_registration_off(&api).await?;
-    steps::ensure_actions_target(&api, &zdir.join("actions.env")).await?;
+    if skip_actions_target(std::env::var(SKIP_ACTIONS_VAR).ok().as_deref()) {
+        info!("Actions target left for the bootstrap after the apps ({SKIP_ACTIONS_VAR})");
+    } else {
+        let actions_endpoint = steps::actions_endpoint_from(
+            std::env::var("CHELABASE_ZITADEL_ACTIONS_ENDPOINT")
+                .ok()
+                .as_deref(),
+        );
+        steps::ensure_actions_target(&api, &zdir.join("actions.env"), &actions_endpoint)
+            .await?;
+    }
 
     // The admin is looked up before the org is bound to the tenant: a tenant with no member
     // lets the first person to sign in claim the admin, so a bind must never be left without
     // its admin when the admin was asked for.
-    let (email, requested) = resolve_admin_email(admin_email);
-    let admin = steps::find_user_by_email(&api, &org_id, &email).await?;
-    if admin.is_none() && requested {
-        bail!("no Zitadel user with email {email} in the org: create that user in Zitadel first");
+    let requested = requested_admin_email(admin_email);
+    let candidates = match &requested {
+        Some(email) => vec![email.clone()],
+        None => default_admin_emails(&chelabase_types::entry::normalize_host(entry.auth_host())),
+    };
+    let mut admin = None;
+    for candidate in &candidates {
+        if let Some(user_id) = steps::find_user_by_email(&api, &org_id, candidate).await? {
+            admin = Some((user_id, candidate.clone()));
+            break;
+        }
+    }
+    if admin.is_none() && requested.is_some() {
+        bail!(
+            "no Zitadel user with email {} in the org: create that user in Zitadel first",
+            candidates[0]
+        );
     }
 
     let demo_tenant = demo_tenant_id();
@@ -88,10 +145,12 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
         tenant::fill_display_name(&demo_tenant, name)?;
     }
     match &admin {
-        Some(user_id) => tenant::bootstrap_admin(&demo_tenant, user_id, &email)?,
+        Some((user_id, email)) => tenant::bootstrap_admin(&demo_tenant, user_id, email)?,
         None => warn!(
-            "dev user {email} not found in Zitadel: no tenant admin is set, so the first person to \
-             sign in to Studio claims it. Re-run with --admin-email before exposing Studio"
+            "dev user not found in Zitadel (tried {}): no tenant admin is set, so the first \
+             person to sign in to Studio claims it. Re-run with --admin-email before exposing \
+             Studio",
+            candidates.join(", ")
         ),
     }
     // Every `dev token` script acts as the demo machine user, so it is an admin too (self-hosted
@@ -142,6 +201,33 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
     )?;
     info!("bootstrap complete (idempotent)");
     Ok(())
+}
+
+/// The machine keys bootstrap ensures before it talks to Zitadel.
+pub struct MachineKeys {
+    pub internal: internal_keys::InternalKeyPaths,
+    pub secrets: std::path::PathBuf,
+    pub cookie_key: std::path::PathBuf,
+    pub compute_jwt: compute_jwt::ComputeJwtPaths,
+    pub app_jwt: app_keys::AppKeyPaths,
+}
+
+/// Creates the machine keys that are missing (never overwrites one): the gateway's internal key
+/// pair, the secrets key, auth's cookie key and app-JWT pair, and the compute-JWT pair. The
+/// workbench runs this before any container mounts the key dirs.
+pub fn ensure_machine_keys(
+    gateway: &Path,
+    secrets: &Path,
+    auth: &Path,
+    neon: &Path,
+) -> Result<MachineKeys> {
+    Ok(MachineKeys {
+        internal: internal_keys::ensure(gateway)?,
+        secrets: secrets_key::ensure(secrets)?,
+        cookie_key: secrets_key::ensure_file(auth, secrets_key::COOKIE_KEY_FILE)?,
+        compute_jwt: compute_jwt::ensure(neon)?,
+        app_jwt: app_keys::ensure(auth)?,
+    })
 }
 
 const TOKEN_POLL: Duration = Duration::from_secs(2);
@@ -215,15 +301,39 @@ mod tests {
         assert!(err.contains("just zitadel-reset"), "{err}");
     }
 
+    // W2 live: Zitadel names its first admin after the instance's external domain, so a fresh
+    // stack's admin is `zitadel-admin@zitadel.<auth host name>`; an instance made before W1
+    // (main's) keeps the old `zitadel.localhost` name. The default tries both, in that order.
     #[test]
-    fn admin_email_defaults_to_dev_user() {
-        assert_eq!(resolve_admin_email(None), (DEV_USER_EMAIL.to_string(), false));
-        assert_eq!(resolve_admin_email(Some("  ")), (DEV_USER_EMAIL.to_string(), false));
+    fn the_default_admin_follows_zitadels_external_domain() {
+        assert_eq!(
+            default_admin_emails("auth.feat-x.chelabase.localhost"),
+            [
+                "zitadel-admin@zitadel.auth.feat-x.chelabase.localhost",
+                "zitadel-admin@zitadel.localhost"
+            ]
+        );
+        assert_eq!(default_admin_emails("localhost"), ["zitadel-admin@zitadel.localhost"]);
+    }
+
+    #[test]
+    fn admin_email_is_only_requested_when_given() {
+        assert_eq!(requested_admin_email(None), None);
+        assert_eq!(requested_admin_email(Some("  ")), None);
         // Emails are stored trimmed and lowercased; an explicit one is required to exist.
         assert_eq!(
-            resolve_admin_email(Some(" Ada@Example.COM ")),
-            ("ada@example.com".to_string(), true)
+            requested_admin_email(Some(" Ada@Example.COM ")),
+            Some("ada@example.com".to_string())
         );
+    }
+
+    #[test]
+    fn the_actions_target_is_skipped_only_when_asked() {
+        assert!(skip_actions_target(Some("1")));
+        assert!(skip_actions_target(Some(" 1\n")));
+        assert!(!skip_actions_target(None));
+        assert!(!skip_actions_target(Some("")));
+        assert!(!skip_actions_target(Some("0")));
     }
 
     #[test]

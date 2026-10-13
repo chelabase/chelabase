@@ -1,5 +1,5 @@
 //! Live tests of the catalog reader: [`CATALOG_SQL`] run on scratch databases of the metadata
-//! Postgres (`just deps-up`), parsed with [`parse_catalog`].
+//! Postgres (the workbench stack), parsed with [`parse_catalog`].
 //!
 //! Scratch databases are named `cs_<8 hex unix seconds><4 hex random>` and the run's roles
 //! `cs_<same 12 hex>_<name>` (roles are cluster-wide), so a later run can sweep what a dead run
@@ -17,7 +17,7 @@ const STALE_AFTER_SECS: u64 = 3600;
 
 fn url() -> String {
     std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()
     })
 }
 
@@ -35,7 +35,7 @@ fn url_for(name: &str) -> String {
 async fn connect(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, NoTls)
         .await
-        .expect("metadata Postgres (just deps-up)");
+        .expect("metadata Postgres (is the workbench stack up?)");
     tokio::spawn(connection);
     client
 }
@@ -234,7 +234,7 @@ fn reported<'a>(m: &'a SchemaModel, kind: ReportedKind, name: &str) -> Option<&'
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn fixture_reads_every_object_type() {
     let mut s = Scratch::new().await;
     s.fixture().await;
@@ -513,7 +513,7 @@ async fn fixture_reads_every_object_type() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn two_reads_are_identical() {
     let mut s = Scratch::new().await;
     s.fixture().await;
@@ -531,7 +531,7 @@ async fn two_reads_are_identical() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn excluded_objects_are_absent() {
     let mut s = Scratch::new().await;
     s.fixture().await;
@@ -670,7 +670,7 @@ async fn excluded_objects_are_absent() {
 /// E16 (fix round M7): the owner's global functions row is excluded only when it is exactly the
 /// data API's revoke; holding another grant too, it stays.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn the_owners_functions_row_with_another_grant_stays() {
     let mut s = Scratch::new().await;
     s.reserved_roles().await;
@@ -706,7 +706,7 @@ async fn the_owners_functions_row_with_another_grant_stays() {
 
 /// T14 M7: every `chelabase_…` role is reserved (any case), listed or not.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn chelabase_roles_are_never_read() {
     let s = Scratch::new().await;
     let lower = format!("chelabase_{}x", s.prefix());
@@ -730,7 +730,7 @@ async fn chelabase_roles_are_never_read() {
 /// Members and roles T2: a hidden `cb_m_*` member role, its membership and its table grant
 /// are invisible to the catalog read (no role, no ACL entry, no `member_of`).
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn member_roles_and_their_grants_are_invisible() {
     let s = Scratch::new().await;
     let lower = format!("cb_m_test_{}", s.name);
@@ -778,7 +778,7 @@ async fn member_roles_and_their_grants_are_invisible() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn merge_leftovers_are_reported() {
     let s = Scratch::new().await;
     s.sql(
@@ -812,7 +812,7 @@ async fn merge_leftovers_are_reported() {
 /// The target digest (E4) runs on a real catalog, as the admin session runs it (prelude
 /// included), and changes with a column's default but not with a role.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn target_digest_runs_and_tracks_ddl() {
     use chelabase_schema::plan::admin_digest_sql;
 
@@ -857,7 +857,7 @@ async fn target_digest_runs_and_tracks_ddl() {
 /// script); B read back equals A, modulo OIDs (the drift compare finds nothing). Roles are
 /// cluster-wide, so B already has A's and the plan has no phase 0.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn create_everything_round_trip() {
     use chelabase_schema::analysis::{analyze, merge};
     use chelabase_schema::compare::compare;
@@ -928,7 +928,7 @@ async fn read_as(s: &Scratch, role: &str, sql: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn one_table_reads_as_the_whole_catalog_does() {
     let mut s = Scratch::new().await;
     s.fixture().await;
@@ -947,7 +947,7 @@ async fn one_table_reads_as_the_whole_catalog_does() {
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn objects_and_types_list_what_the_editor_needs() {
     use chelabase_types::table_api::{ObjectKind, TypeKind};
     let s = Scratch::new().await;
@@ -987,7 +987,7 @@ async fn objects_and_types_list_what_the_editor_needs() {
 // T4 review, minor 1: a shell type (`CREATE TYPE x;`, not yet defined) can't be a column's
 // type, so the catalog never lists it.
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn shell_types_are_not_listed() {
     let s = Scratch::new().await;
     let owner = s.role("owner");

@@ -3,18 +3,28 @@
 use orchestrator::sql_editor::{MAX_SCHEMA_BYTES, schema};
 use tokio_postgres::NoTls;
 
-const BASE: &str = "postgres://chelabase:chelabase@127.0.0.1:5433";
+/// The metadata server without a database name: `CHELABASE_METADATA_DATABASE_URL`'s base, else
+/// the stack's `metadata-db` service.
+fn base() -> String {
+    match std::env::var("CHELABASE_METADATA_DATABASE_URL") {
+        Ok(url) => match url.rsplit_once('/') {
+            Some((base, _db)) if base.contains('@') => base.to_string(),
+            _ => url,
+        },
+        Err(_) => "postgres://chelabase:chelabase@metadata-db:5432".into(),
+    }
+}
 
 async fn connect(db: &str) -> tokio_postgres::Client {
-    let (client, conn) = tokio_postgres::connect(&format!("{BASE}/{db}"), NoTls)
+    let (client, conn) = tokio_postgres::connect(&format!("{}/{db}", base()), NoTls)
         .await
-        .expect("the metadata Postgres (just deps-up)");
+        .expect("the metadata Postgres (is the workbench stack up?)");
     tokio::spawn(conn);
     client
 }
 
 #[tokio::test]
-#[ignore = "needs the metadata Postgres (just deps-up)"]
+#[ignore = "needs the workbench stack's metadata Postgres"]
 async fn introspection_runs_and_fits() {
     let mut buf = [0u8; 4];
     getrandom::fill(&mut buf).unwrap();

@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
     let pipeline = Pipeline::new(registry, config.entry.studio_origin(), verifier, signer, keys, users);
 
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
-    // periods. Under `just dev`, Compose, or k8s a process manager restarts us,
+    // periods. Under Compose (the workbench) or k8s a process manager restarts us,
     // so exit promptly on SIGTERM.
     let conf = ServerConf {
         grace_period_seconds: Some(0),

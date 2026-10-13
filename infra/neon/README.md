@@ -8,8 +8,8 @@ controller, proxy) and a compute image. Both come from our hard fork,
 
 **Round 2:** `NEON_REF` pins fork `main` at `c8d1bb68b`. Shipped: detach waits for each ancestor's WAL
 and multi-level detach copies every ancestor's layers; multixact redo writes the next offset like
-Postgres; the worker reads the safekeepers' `commit_lsn` over HTTP (compose publishes
-safekeeper1 on `127.0.0.1:7676`; `CHELABASE_SAFEKEEPER_HTTP`) for a branch's head; reads at kept LSNs
+Postgres; the worker reads the safekeepers' `commit_lsn` over HTTP (`safekeeper1:7676` on the
+stack network; `CHELABASE_SAFEKEEPER_HTTP`) for a branch's head; reads at kept LSNs
 (patch 4: an LSN below the GC cutoff is readable and leasable when a child's branch point or a lease
 keeps it exactly, and branch create at such a point takes a short lease); DDL forwarding of role
 attributes (patch 5: LOGIN and VALID UNTIL are forwarded; other attributes and GRANT trigger a
@@ -23,7 +23,7 @@ unreadable. Never roll the pageserver back to a pre-round-2 pin once a round-2 i
 
 ## Pull (default)
 
-`just deps-up` pulls `ghcr.io/chelabase/neon-storage` and `ghcr.io/chelabase/neon-compute-v17`
+`just workbench up` pulls `ghcr.io/chelabase/neon-storage` and `ghcr.io/chelabase/neon-compute-v17`
 (the fork's dev images, tagged `<sha12>-dev`), pinned by digest in `infra/compose/docker-compose.yml`.
 The packages are public on ghcr.io, so pulling needs no login. (Pushing from a fork checkout needs `docker login ghcr.io` with a
 token that has `write:packages`.)
@@ -36,7 +36,7 @@ upstream Neon; they stay for old pins and are no longer used.
 `just neon-build` shallow-clones the fork at `NEON_REF` into `infra/neon/.cache/` and builds
 `chelabase/neon-storage:<tag>` and `chelabase/neon-compute-v17:<tag>`; `<tag>` is the first 12
 chars of `NEON_REF`, plus `-dev` for the dev variant. The first build needs about 40 GB of
-free disk and about 40 minutes. When those local images exist, `just deps-up` uses them
+free disk and about 40 minutes. When those local images exist, `just workbench up` uses them
 instead of pulling. Reclaim the build cache afterwards with
 `docker builder prune -f --keep-storage 5GB`.
 
@@ -48,7 +48,7 @@ instead of pulling. Reclaim the build cache afterwards with
 | `platform` | every Postgres version | `EXTENSIONS=all` | `<sha12>` |
 
 `EXTENSIONS=<set>` overrides the compute's extension set for either variant. Only the dev
-tag is picked up by `just deps-up`.
+tag is picked up by `just workbench up` (`scripts/neon-images.sh`).
 
 ## Safekeeper timelines
 
@@ -83,9 +83,9 @@ landed in chelabase/neon-pre-replay#25 (https://github.com/chelabase/neon-pre-re
    `infra/compose/docker-compose.yml` (both images).
 5. `just neon-test` (it checks the ref exists on the fork and that both pins carry
    `:<sha12>-dev@sha256:`).
-6. Move the stack onto the new pins with `just live just deps-up`, then run the e2e scripts
-   through the queue (`just live just neon-e2e`, and likewise `branch-e2e`, `data-e2e`,
-   `console-e2e`, `role-e2e`, `auth-e2e` and `storage-leak-e2e`).
+6. Move your checkout's stack onto the new pins with `just workbench up`, then run the e2e
+   recipes on it (`just neon-e2e`, and likewise `branch-e2e`, `data-e2e`, `console-e2e`,
+   `role-e2e`, `auth-e2e` and `storage-leak-e2e`).
 
 The compute image runs Postgres 17.11 (the fork's `REL_17_STABLE_chelabase`).
 
@@ -101,10 +101,10 @@ patches; chelabase only moves `NEON_REF` forward as above.
 | Recipe | Does |
 |---|---|
 | `just neon-build` | build both images from source (`VARIANT=dev` by default) |
-| `just deps-up` | start the storage stack (local images if present, else pull) |
-| `just neon-ps` | show its containers |
+| `just workbench up` | start this checkout's stack, storage included (local images if present, else pull) |
+| `just workbench status` | every stack, running or stopped |
 | `just neon-smoke` | check it: safekeeper Active, pageserver up, create/delete a tenant |
-| `just deps-down` | stop it (volumes kept) |
+| `just workbench down` | stop it (volumes kept) |
 | `just neon-test` | offline checks of these scripts and the Compose files |
 
-The stack starts with `just deps-up` and backs every database. `just down` also stops it.
+The storage stack is part of every checkout's stack and backs every database there.

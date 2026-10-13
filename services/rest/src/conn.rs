@@ -1178,12 +1178,12 @@ mod tests {
     /// Two connections left idle in one, then one taken in the other: the branch never has
     /// more than 2 open.
     #[tokio::test]
-    #[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the dev metadata Postgres (just deps-up)"]
+    #[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
     async fn open_connections_stay_within_the_branch_cap_live() {
         use sqlx::Executor;
         use sqlx::postgres::PgPool;
         let url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into()
+            "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()
         });
         let parsed = reqwest::Url::parse(&url).unwrap();
         let admin = PgPool::connect(&url).await.unwrap();
