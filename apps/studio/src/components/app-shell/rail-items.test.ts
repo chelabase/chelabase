@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import { RAIL_ENTRIES, isRailItemActive } from "./rail-items";
 
 describe("isRailItemActive", () => {
+  it("tables_item_active_on_editor_routes", () => {
+    expect(isRailItemActive("tables", "/app/tables")).toBe(true);
+    expect(isRailItemActive("tables", "/app/tables/p1/d1")).toBe(true);
+    expect(isRailItemActive("tables", "/app/tablesx")).toBe(false);
+    expect(isRailItemActive("projects", "/app/tables/p1")).toBe(false);
+  });
+
   it("projects is active on /app, /app/ and /app/projects/p1", () => {
     expect(isRailItemActive("projects", "/app")).toBe(true);
     expect(isRailItemActive("projects", "/app/")).toBe(true);
@@ -33,13 +40,13 @@ describe("isRailItemActive", () => {
 });
 
 describe("RAIL_ENTRIES", () => {
-  it("lists Projects, API reference, a placeholder and Members (last) in order", () => {
+  it("lists Projects, Table editor, API reference and Members (last) in order", () => {
     expect(RAIL_ENTRIES.map((e) => [e.kind, e.id, e.label])).toEqual([
       ["link", "projects", "Projects"],
+      ["link", "tables", "Table editor"],
       ["link", "api", "API reference"],
-      ["placeholder", "placeholder-1", "Placeholder"],
       ["link", "members", "Members"],
     ]);
-    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/api", "/app/members"]);
+    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/api", "/app/members"]);
   });
 });

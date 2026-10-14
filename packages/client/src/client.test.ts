@@ -164,3 +164,17 @@ describe("databases", () => {
     expect(db.database("analytics", types)).toBeDefined();
   });
 });
+
+describe("count (TE-B1 T8)", () => {
+  test("count_sends_a_count_tree_and_resolves_the_number", async () => {
+    const fetch = fakeFetch('{"count":2}');
+    const db = createClient<Database>({ types, url, key, fetch });
+    const res: { count: number } = await db.from("orders").where({ status: "paid" }).count();
+    expect(res).toEqual({ count: 2 });
+    const { init } = fetch.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({ v: 1, op: "count", from: "orders", where: { col: "status", eq: "paid" } });
+  });
+  test("count_without_a_filter_and_in_a_batch", async () => {
+    expect(createClient<Database>({ types, url, key, fetch: fakeFetch("[]") }).from("orders").count().toTree()).toEqual({ v: 1, op: "count", from: "orders" });
+  });
+});

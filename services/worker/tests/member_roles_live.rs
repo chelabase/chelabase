@@ -220,6 +220,16 @@ impl Live {
             .collect()
     }
 
+    /// What every role (`All`) starts from: the branch's roles but the data API's `anon` and
+    /// `authenticated`, which a member holds only when a grant names them (R18).
+    fn every(&self) -> BTreeSet<String> {
+        self.roles
+            .iter()
+            .filter(|r| !["anon", "authenticated"].contains(&r.to_ascii_lowercase().as_str()))
+            .cloned()
+            .collect()
+    }
+
     /// What `SET ROLE` reaches from `roles`, them included.
     fn closure(&self, roles: &BTreeSet<String>) -> BTreeSet<String> {
         roles.iter().flat_map(|r| self.reach(r)).collect()
@@ -684,18 +694,33 @@ impl Model {
     /// holds.
     fn expected(&self, fx: &Fx, live: &Live) -> BTreeMap<String, BTreeSet<String>> {
         let mut out = BTreeMap::new();
-        let admin = live.safe(&live.roles);
+        let admin = live.safe(&live.every());
         if !admin.is_empty() {
             out.insert(member_role_name(fx.admin.id), admin);
         }
         for (i, m) in fx.members.iter().enumerate() {
-            let Some((_, roles)) = self.grants.get(&i) else {
+            let Some((level, roles)) = self.grants.get(&i) else {
                 continue;
             };
-            let mut roles = roles.clone();
-            if let Some((_, Some(narrow))) = self.overrides.get(&i) {
-                roles.retain(|r| narrow.contains(r));
-            }
+            let (narrow_level, narrow) = match self.overrides.get(&i) {
+                Some((l, n)) => (*l, n.as_ref()),
+                None => (None, None),
+            };
+            // R17: an Admin grant is every role (R18: anon/authenticated left out): an
+            // override's roles replace it, and an override below Admin without roles leaves none.
+            let roles = if *level == PlatformRole::Admin {
+                match narrow {
+                    Some(narrow) => narrow.clone(),
+                    None if narrow_level.is_none_or(|l| l == PlatformRole::Admin) => live.every(),
+                    None => BTreeSet::new(),
+                }
+            } else {
+                let mut roles = roles.clone();
+                if let Some(narrow) = narrow {
+                    roles.retain(|r| narrow.contains(r));
+                }
+                roles
+            };
             let roles = live.safe(&roles);
             if !roles.is_empty() {
                 out.insert(member_role_name(m.id), roles);

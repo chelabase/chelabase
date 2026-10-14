@@ -48,8 +48,8 @@ use uuid::Uuid;
 use crate::access::{RoleGraph, Target, authorize, authorize_project};
 use crate::app_user_admin::{zitadel_failed, zitadel_unavailable};
 use crate::{
-    ApiBytes, AppState, AuthPrincipal, BoxError, InstancePrincipal, JobPort, MemberStatusView, MetadataPort,
-    NatsPorts, roles,
+    AllRoles, ApiBytes, AppState, AuthPrincipal, BoxError, InstancePrincipal, JobPort, MeRoles,
+    MemberStatusView, MetadataPort, NatsPorts, roles,
 };
 
 /// The metadata the member API reads and writes ([`MetadataClient`]'s methods of the same
@@ -579,9 +579,10 @@ pub(crate) struct UpdateMemberRequest {
 pub(crate) struct InviteGrant {
     project_id: ProjectId,
     platform_role: PlatformRole,
-    /// Postgres role names. Never `owner` or the database's owner (the admin platform role
-    /// includes it), nor a reserved name. Below admin, only NOLOGIN groups whose memberships
-    /// reach no owner-level, LOGIN or reserved role.
+    /// Postgres role names; for `admin`, which holds every role (R17), checked and dropped.
+    /// Never `owner` or the database's owner (the admin platform role includes it), nor a
+    /// reserved name. Below admin, only NOLOGIN groups whose memberships reach no owner-level,
+    /// LOGIN or reserved role.
     #[serde(default)]
     pg_roles: Vec<String>,
 }
@@ -719,8 +720,11 @@ pub(crate) struct ProjectGrant {
     member_id: Uuid,
     /// `admin` includes the database owner.
     platform_role: PlatformRole,
-    /// Sorted. A granted role includes every role it can `SET ROLE` to.
-    pg_roles: Vec<String>,
+    /// `"all"` for `admin`: every role on the project (narrowed per database by `overrides`),
+    /// except the data API's `anon` and `authenticated` for acting as them, which need a grant
+    /// naming them. Below `admin` the names, sorted; a granted role includes every role it can
+    /// `SET ROLE` to.
+    pg_roles: MeRoles,
     overrides: Vec<GrantOverride>,
 }
 
@@ -737,9 +741,10 @@ pub(crate) struct GrantOverride {
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct PutGrantRequest {
     platform_role: PlatformRole,
-    /// Postgres role names. Never `owner` or the database's owner (the admin platform role
-    /// includes it), nor a reserved name. Below admin, only NOLOGIN groups whose memberships
-    /// reach no owner-level, LOGIN or reserved role.
+    /// Postgres role names; for `admin`, which holds every role (R17), checked and dropped.
+    /// Never `owner` or the database's owner (the admin platform role includes it), nor a
+    /// reserved name. Below admin, only NOLOGIN groups whose memberships reach no owner-level,
+    /// LOGIN or reserved role.
     #[serde(default)]
     pg_roles: Vec<String>,
 }
@@ -1003,12 +1008,16 @@ struct RoleContext {
 }
 
 /// What a grant narrowed by an override leaves: the lower platform role, and the grant's roles
-/// the override keeps.
+/// the override keeps. R17: an Admin grant is every role, so it keeps the override's roles,
+/// and none when an override takes it below Admin without naming roles (as
+/// [`chelabase_types::access::effective`]); while still Admin, the roles aren't checked.
 fn effective_on(grant: &GrantRow, o: Option<&OverrideRow>) -> (PlatformRole, Vec<String>) {
     let role = o
         .and_then(|o| o.platform_role)
         .map_or(grant.platform_role, |r| r.min(grant.platform_role));
     let roles = match o.and_then(|o| o.pg_roles.as_ref()) {
+        Some(keep) if grant.every_role() => keep.clone(),
+        None if grant.every_role() => Vec::new(),
         Some(keep) => grant
             .pg_roles
             .iter()
@@ -1289,13 +1298,13 @@ where
             Err(err) => return Err(internal("invite: load project", err)),
         }
         let context = RoleContext::project(state, g.project_id).await?;
+        // As a project grant: names no grant may hold are refused, then an Admin grant is every
+        // role (R17).
         context.check_names(&g.pg_roles).map_err(on_project)?;
+        let grant = GrantRow::new(g.platform_role, &g.pg_roles);
         out.push(CheckedGrant {
             project: g.project_id.as_uuid(),
-            grant: GrantRow {
-                platform_role: g.platform_role,
-                pg_roles: g.pg_roles,
-            },
+            grant,
             context,
         });
     }
@@ -1765,7 +1774,8 @@ fn grants_view(access: ProjectAccess) -> Vec<ProjectGrant> {
         .map(|(member, g)| ProjectGrant {
             member_id: member,
             platform_role: g.platform_role,
-            pg_roles: g.pg_roles,
+            // R17: an Admin grant is every role.
+            pg_roles: if g.every_role() { MeRoles::All(AllRoles::All) } else { MeRoles::Only(g.pg_roles) },
             overrides: overrides.remove(&member).unwrap_or_default(),
         })
         .collect()
@@ -2493,7 +2503,7 @@ where
     operation_id = "putProjectGrant",
     tag = "members",
     summary = "Grant a member access to a project",
-    description = "Creates or replaces the member's grant. `admin` includes the database owner, so `owner` (or the owner's name) is never listed. Below `admin`, each role must be a NOLOGIN group whose memberships (every one, whatever its options) reach no owner-level role (the owner, `neon_superuser`, `cloud_admin`, or SUPERUSER, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), LOGIN role, reserved role or role that holds the ADMIN option on another role, on any branch. The same holds on each database for what the member's overrides there leave of the grant; a grant that breaks it is refused naming the database. Every branch of the project then reconciles its member roles.",
+    description = "Creates or replaces the member's grant. `admin` holds every role on the project, the database owner included (the names in `pg_roles` are checked, then dropped, and it is answered as `\"all\"`; overrides still narrow it per database), so `owner` (or the owner's name) is never listed. Below `admin`, each role must be a NOLOGIN group whose memberships (every one, whatever its options) reach no owner-level role (the owner, `neon_superuser`, `cloud_admin`, or SUPERUSER, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), LOGIN role, reserved role or role that holds the ADMIN option on another role, on any branch. The same holds on each database for what the member's overrides there leave of the grant; a grant that breaks it is refused naming the database. Every branch of the project then reconciles its member roles.",
     params(
         ("id" = Uuid, Path, description = "Project id"),
         ("member_id" = Uuid, Path, description = "Member id"),
@@ -2527,11 +2537,10 @@ where
     let actor = tri!(actor(principal.member.as_ref()));
     tri!(live_member(&state, principal.tenant_id, member_id).await);
     let context = tri!(RoleContext::project(&state, project.id).await);
+    // Names no grant may hold are refused at any level; R17: then an Admin grant is every role
+    // on the project, whatever (valid) roles the request names.
     tri!(context.check_names(&body.pg_roles));
-    let grant = GrantRow {
-        platform_role: body.platform_role,
-        pg_roles: body.pg_roles,
-    };
+    let grant = GrantRow::new(body.platform_role, &body.pg_roles);
     // I1: the new grant with each of the member's overrides keeps the invariant. I4: the write
     // goes ahead only while those overrides are still what the check read.
     let mut tries = 0;
@@ -2619,7 +2628,7 @@ where
     operation_id = "putGrantOverride",
     tag = "members",
     summary = "Narrow a member's grant on one database",
-    description = "An override only narrows: its role is at most the grant's, its roles some of the grant's. Narrowing below `admin` takes the database owner away there, and the roles left must pass the same checks as a grant below `admin`. Every branch of the project then reconciles its member roles.",
+    description = "An override only narrows: its role is at most the grant's, its roles some of the grant's (any roles for an `admin` grant, which holds every role: the member keeps only those there, with the owner while still `admin`). Narrowing below `admin` takes the database owner away there, and the roles left must pass the same checks as a grant below `admin`. Every branch of the project then reconciles its member roles.",
     params(
         ("id" = Uuid, Path, description = "Project id"),
         ("member_id" = Uuid, Path, description = "Member id"),
@@ -2690,11 +2699,12 @@ where
             ))
             .into_response();
         }
+        // R17: an Admin grant holds every role, so any role narrows it.
         if let Some(extra) = body
             .pg_roles
             .iter()
             .flatten()
-            .find(|r| !grant.pg_roles.contains(r))
+            .find(|r| !grant.every_role() && !grant.pg_roles.contains(r))
         {
             return unprocessable(format!(
                 "an override can't widen the grant: `{extra}` isn't one of its roles"

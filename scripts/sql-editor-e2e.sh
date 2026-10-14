@@ -2,7 +2,8 @@
 # Live check of roadmap step 6d (Studio's SQL editor API), through the gateway (needs just
 # the stack: just workbench up). Streams are NDJSON read with curl -N:
 # - a script as owner (CREATE, INSERT, SELECT: tags and a clean done), then as anon under a row
-#   level security policy (the first run grants the role to the owner, the second is fast);
+#   level security policy, as a member whose grant names anon (the tenant admin is refused
+#   anon, R18; the member's second run is fast);
 # - a notice, an error with a position;
 # - cancel of a pg_sleep through the cancel route, and by closing the stream through the gateway;
 # - a 75 s pg_sleep (the stream stays open past the gateway's 60 s idle limit thanks to heartbeats);
@@ -35,6 +36,7 @@ die() {
 }
 cleanup() {
   [[ -z "$bg_pid" ]] || kill "$bg_pid" 2>/dev/null || true
+  [[ -z "${MEMBER_ID:-}" ]] || api DELETE "/v1/members/$MEMBER_ID" >/dev/null || true
   if [[ -n "$db_id" && "${KEEP:-}" != 1 ]]; then
     api DELETE "/v1/databases/$db_id" >/dev/null || true
   fi
@@ -49,6 +51,8 @@ set -a
 source "$demo_env"
 set +a
 trap cleanup EXIT
+# shellcheck source=lib/member-sign-in.sh
+. scripts/lib/member-sign-in.sh
 
 # ok <method> <path> <expected status> [body]: the call, or die.
 ok() {
@@ -74,8 +78,8 @@ wait_db() {
 # stream <out file> <max seconds> <json body>: POSTs the run; the body goes to the file and
 # the status is printed. The token goes through stdin (-H @-), never argv.
 stream() {
-  local out="$1" max="$2" body="$3" token
-  token="$("$CHELABASE_CLI" dev token)" || die "chelabase dev token"
+  local out="$1" max="$2" body="$3" token="${STREAM_TOKEN:-}"
+  [[ -n "$token" ]] || token="$("$CHELABASE_CLI" dev token)" || die "chelabase dev token"
   printf 'Authorization: Bearer %s\n' "$token" |
     curl -sSN --max-time "$max" -o "$out" -w '%{http_code}' -H @- -H 'content-type: application/json' \
       -X POST -d "$body" "$GATEWAY$branch/sql" || true
@@ -118,19 +122,32 @@ jq -s -e '[.[] | select(.t == "complete") | .tag] == ["CREATE TABLE","INSERT 0 2
   die "owner script: $(jq -sc . "$tmp/events")"
 pass "owner script: CREATE TABLE, INSERT 0 2, SELECT 2, done ok"
 
-# 3. As anon under RLS (the first anon run grants the role to the owner).
+# 3. As anon under RLS. Every role leaves out the data API's anon (R18): the tenant admin is
+# refused, and a member whose grant names anon runs as it (their member role is made and
+# reconciled on first use: the first run may take a few tries).
 SQL="ALTER TABLE notes ENABLE ROW LEVEL SECURITY; GRANT SELECT ON notes TO anon;
   CREATE POLICY anon_read ON notes FOR SELECT TO anon USING (id = 1)"
 run_sql '.[-1].outcome == "ok"'
 SQL="SELECT count(*) FROM notes"
-run_sql '(.[-1].outcome == "ok") and ([.[] | select(.t == "rows") | .rows[0][0]] == ["1"])' '{"role":"anon"}'
-SQL="SELECT count(*) FROM notes"
+status="$(stream "$tmp/events" 60 "$(jq -nc --arg id "$(cat /proc/sys/kernel/random/uuid)" --arg sql "$SQL" '{run_id: $id, sql: $sql, role: "anon"}')")"
+[[ "$status" == 403 && "$(jq -r '.error.code' "$tmp/events")" == forbidden &&
+  "$(jq -r '.error.required' "$tmp/events")" == role:anon ]] ||
+  die "the tenant admin's Run as anon: $status $(cat "$tmp/events") (wanted 403 forbidden role:anon)"
+new_member "$DEMO_PROJECT_ID" '{"platform_role":"developer","pg_roles":["anon"]}'
+mtok="$(member_token)"
+anon_one='(.[-1].outcome == "ok") and ([.[] | select(.t == "rows") | .rows[0][0]] == ["1"])'
+for _ in $(seq 30); do
+  status="$(STREAM_TOKEN="$mtok" stream "$tmp/events" 60 "$(jq -nc --arg id "$(cat /proc/sys/kernel/random/uuid)" --arg sql "$SQL" '{run_id: $id, sql: $sql, role: "anon"}')")"
+  [[ "$status" == 200 ]] && break
+  sleep 2
+done
+[[ "$status" == 200 ]] || die "the member's first anon run: $status $(cat "$tmp/events")"
+jq -s -e "$anon_one" "$tmp/events" >/dev/null || die "the member's first anon run: $(jq -sc . "$tmp/events")"
 t1=$SECONDS
-run_sql '(.[-1].outcome == "ok") and ([.[] | select(.t == "rows") | .rows[0][0]] == ["1"])' '{"role":"anon"}'
-((SECONDS - t1 <= 5)) || die "the second anon run took $((SECONDS - t1)) s (the grant should be cached)"
-SQL="SELECT count(*) FROM notes"
+STREAM_TOKEN="$mtok" run_sql "$anon_one" '{"role":"anon"}'
+((SECONDS - t1 <= 5)) || die "the second anon run took $((SECONDS - t1)) s (the member's session should be cached)"
 run_sql '[.[] | select(.t == "rows") | .rows[0][0]] == ["2"]'
-pass "anon sees 1 row under the policy (the owner sees 2); the second anon run was fast"
+pass "the tenant admin's Run as anon is 403 role:anon; a member granted anon sees 1 row under the policy (the owner sees 2); the second anon run was fast"
 
 # 4. A notice.
 SQL="DO \$\$ BEGIN RAISE NOTICE 'hello'; END \$\$"

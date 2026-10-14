@@ -81,6 +81,15 @@ fn schema_and_parser_reject_the_same_inputs() {
             r#"{"v": 1, "op": "batch", "ops": [{"op": "batch", "ops": []}]}"#.into(),
         ),
         ("batch with 51 ops", ops(51)),
+        // T8 review M3: a count takes no select, paging, ordering or `all`.
+        ("count with limit", r#"{"v": 1, "op": "count", "from": "t", "limit": 1}"#.into()),
+        ("count with select", r#"{"v": 1, "op": "count", "from": "t", "select": ["a"]}"#.into()),
+        ("count with all", r#"{"v": 1, "op": "count", "from": "t", "all": true}"#.into()),
+        (
+            "database in a batch member count",
+            r#"{"v": 1, "op": "batch", "ops": [{"op": "count", "from": "t", "database": "d"}]}"#
+                .into(),
+        ),
         ("empty select", r#"{"v": 1, "op": "select", "from": "t", "select": []}"#.into()),
         ("negative limit", r#"{"v": 1, "op": "select", "from": "t", "limit": -1}"#.into()),
         ("empty values", r#"{"v": 1, "op": "insert", "into": "t", "values": []}"#.into()),
@@ -179,6 +188,10 @@ fn schema_and_parser_accept_the_same_edge_inputs() {
     let validator = validator();
     let cases = [
         ("empty batch", r#"{"v": 1, "op": "batch", "ops": []}"#),
+        (
+            "count with a null where",
+            r#"{"v": 1, "op": "count", "from": "t", "where": null}"#,
+        ),
         (
             "null where",
             r#"{"v": 1, "op": "select", "from": "t", "where": null}"#,

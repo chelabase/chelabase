@@ -24,7 +24,7 @@ Now grant Dana the **Developer** role on the project, with the Postgres role `bi
 | Same, `CREATE TABLE public.t …` or a write to another schema | Refused by Postgres (`permission denied`): `billing` owns nothing there. |
 | **Run as** the owner (`postgres`) | 403 `forbidden` with `required: "owner"`. Only an Admin acts as the owner, so Studio's **Run as** list leaves **Owner** out for a Developer. |
 | **Run as** a role that isn't in Dana's grant (`sales`) | 403 `forbidden` with `required: "role:sales"`. |
-| Tables console as `billing` | Browses and edits the tables `billing` can reach. |
+| Table editor acting as `billing` | Browses and edits the rows `billing` can reach. |
 
 Another Developer granted no `billing` role gets a 403 for `billing`, so only the people you named can change that schema. A Viewer granted `billing` can read through the console as `billing` (select only) but can't run SQL: the SQL editor needs Developer.
 

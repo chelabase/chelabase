@@ -13,9 +13,10 @@ export interface NarrowingDraft {
  * Whether the draft takes anything away from the grant: a lower role, or fewer roles. The API
  * refuses "narrows nothing" (422), so Save waits until this is true.
  */
-export function narrowsGrant(grant: { platformRole: PlatformRole; pgRoles: readonly string[] }, draft: NarrowingDraft): boolean {
+export function narrowsGrant(grant: { platformRole: PlatformRole; pgRoles: "all" | readonly string[] }, draft: NarrowingDraft): boolean {
   const lower = draft.platformRole !== null && RANK[draft.platformRole] < RANK[grant.platformRole];
-  const fewer = draft.pgRoles !== null && draft.pgRoles.length < grant.pgRoles.length;
+  // Every role (an Admin grant, R17): any named roles are fewer.
+  const fewer = draft.pgRoles !== null && (grant.pgRoles === "all" || draft.pgRoles.length < grant.pgRoles.length);
   return lower || fewer;
 }
 

@@ -99,3 +99,15 @@ fn different_columns_change_the_hash() {
         }
     }
 }
+
+// ---- count (TE-B1 T8) ----
+
+#[test]
+fn count_shapes_depend_on_table_and_filter_not_values() {
+    let a = hash(r#"{"v":1,"op":"count","from":"Order","where":{"col":"total","gt":1}}"#);
+    assert_eq!(a, hash(r#"{"v":1,"op":"count","from":"Order","where":{"col":"total","gt":900}}"#));
+    assert_ne!(a, hash(r#"{"v":1,"op":"count","from":"billing.invoices","where":{"col":"amount","gt":1}}"#));
+    assert_ne!(a, hash(r#"{"v":1,"op":"count","from":"Order","where":{"col":"total","lt":1}}"#));
+    assert_ne!(a, hash(r#"{"v":1,"op":"count","from":"Order"}"#));
+    assert_ne!(a, hash(r#"{"v":1,"op":"select","from":"Order","where":{"col":"total","gt":1}}"#));
+}

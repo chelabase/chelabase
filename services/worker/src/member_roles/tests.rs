@@ -198,7 +198,8 @@ fn owner_is_never_granted() {
         ..MemberCatalog::default()
     };
     let (roles, skipped) = granted_roles(&tenant_admin_grant(), &catalog);
-    assert_eq!(roles, set(&["anon", "billing"]));
+    // Nor the data API's `anon` unless named (R18).
+    assert_eq!(roles, set(&["billing"]));
     assert!(skipped.is_empty());
 }
 
@@ -2273,4 +2274,19 @@ async fn template1_is_touched_only_when_another_database_changed() {
         let in_template1: Vec<String> = all_scripts(&w).into_iter().filter(|(db, _)| db == "template1").map(|(_, s)| s).collect();
         assert_eq!(!in_template1.is_empty(), touched, "protected {protected}, app answered {answer}: {in_template1:?}");
     }
+}
+
+// R18 (user, 2026-10-14): every role (`All`, a project Admin's grant, R17) covers the branch's
+// own roles, not the data API's `anon` and `authenticated`: the member login gets those only
+// when a grant names them, so a member's SQL session can't `SET ROLE anon` without it.
+#[test]
+fn every_role_leaves_out_the_data_api_roles_unless_named() {
+    let catalog = MemberCatalog { roles: set(&["anon", "authenticated", "billing", "sales"]), ..Default::default() };
+    let all = Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All };
+    assert_eq!(granted_roles(&all, &catalog).0, set(&["billing", "sales"]));
+    let named = Grant {
+        platform_role: PlatformRole::Developer,
+        roles: RoleSet::Only([PgRole::Named("anon".into()), PgRole::Named("billing".into())].into_iter().collect()),
+    };
+    assert_eq!(granted_roles(&named, &catalog).0, set(&["anon", "billing"]));
 }

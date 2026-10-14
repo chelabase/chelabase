@@ -63,7 +63,7 @@ use chelabase_schema::sql::{ident, literal};
 use chelabase_secrets::{open_member_role_password, seal_member_role_password};
 use chelabase_types::BranchId;
 use chelabase_types::access::{
-    Grant, Narrowing, PgRole, PlatformRole, RoleSet, act_as_reserved, effective,
+    Grant, Narrowing, PgRole, PlatformRole, RoleSet, act_as_reserved, data_api_role, effective,
     tenant_admin_grant,
 };
 use chelabase_types::role_name::MEMBER_ROLE_PREFIX;
@@ -804,14 +804,16 @@ pub enum Skipped {
 }
 
 /// The roles a member role gets for `grant` on a branch: the owner and reserved names never,
-/// then [`safe_roles`]. A tenant admin's `All` starts from every role on the branch. Each
-/// named role left out is returned with why.
+/// then [`safe_roles`]. An Admin's `All` (a project Admin's, R17, or a tenant admin's) starts
+/// from every role on the branch except the data API's `anon` and `authenticated`, which a
+/// member gets only when its grant names them (R18). Each named role left out is returned
+/// with why.
 pub fn granted_roles(
     grant: &Grant,
     catalog: &MemberCatalog,
 ) -> (BTreeSet<String>, Vec<(String, Skipped)>) {
     let named: BTreeSet<String> = match &grant.roles {
-        RoleSet::All => catalog.roles.clone(),
+        RoleSet::All => catalog.roles.iter().filter(|r| !data_api_role(r)).cloned().collect(),
         RoleSet::Only(set) => set
             .iter()
             .filter_map(|r| match r {
@@ -840,11 +842,9 @@ pub fn granted_roles(
     (roles, skipped)
 }
 
+/// R17: an Admin grant is every role on the project.
 fn grant_of(row: &GrantRow) -> Grant {
-    Grant {
-        platform_role: row.platform_role,
-        roles: RoleSet::Only(row.pg_roles.iter().map(|r| PgRole::parse(r)).collect()),
-    }
+    row.to_grant()
 }
 
 fn narrowing_of(row: &OverrideRow) -> Narrowing {

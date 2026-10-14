@@ -82,6 +82,7 @@ enum OpKind {
     Update,
     Delete,
     Call,
+    Count,
 }
 
 impl OpKind {
@@ -92,6 +93,7 @@ impl OpKind {
             OpKind::Update => "update",
             OpKind::Delete => "delete",
             OpKind::Call => "call",
+            OpKind::Count => "count",
         }
     }
 }
@@ -190,6 +192,15 @@ fn op_schema(kind: OpKind, top_level: bool) -> Object {
             "args",
             ObjectBuilder::new().description(Some("Named arguments, each any JSON value")),
         ),
+        OpKind::Count => o
+            .property("from", of::<TableName>())
+            .required("from")
+            .property(
+                "where",
+                or_null(of::<Filter>()).description(Some(
+                    "The rows to count; every row the role sees when left out",
+                )),
+            ),
     };
     o.additional_properties(closed()).build()
 }
@@ -369,6 +380,11 @@ component! {
 }
 
 component! {
+    /// A top-level count.
+    CountRequest => op_component(OpKind::Count, true)
+}
+
+component! {
     /// A select inside a batch.
     BatchSelect => op_component(OpKind::Select, false)
 }
@@ -393,8 +409,13 @@ component! {
     BatchCall => op_component(OpKind::Call, false)
 }
 
+component! {
+    /// A count inside a batch.
+    BatchCount => op_component(OpKind::Count, false)
+}
+
 /// `op` → the component, for a discriminator's mapping.
-fn mapping(entries: [(&'static str, Cow<'static, str>); 5]) -> Vec<(&'static str, String)> {
+fn mapping(entries: [(&'static str, Cow<'static, str>); 6]) -> Vec<(&'static str, String)> {
     entries
         .into_iter()
         .map(|(op, name)| (op, format!("#/components/schemas/{name}")))
@@ -427,6 +448,7 @@ component! {
                         .item(of::<BatchUpdate>())
                         .item(of::<BatchDelete>())
                         .item(of::<BatchCall>())
+                        .item(of::<BatchCount>())
                         .discriminator(Some(Discriminator::with_mapping(
                             "op",
                             mapping([
@@ -435,6 +457,7 @@ component! {
                                 ("update", BatchUpdate::name()),
                                 ("delete", BatchDelete::name()),
                                 ("call", BatchCall::name()),
+                                ("count", BatchCount::name()),
                             ]),
                         ))),
                 )
@@ -449,11 +472,12 @@ component! {
 component! {
     /// What a query returns, as Postgres's JSON: an array of row objects for a select and for
     /// writes (`[]` without `returning`); the function's result for a call (an array for a
-    /// set-returning function, `null` for a void one); the list of results for a batch.
+    /// set-returning function, `null` for a void one); `{"count": N}` for a count; the list
+    /// of results for a batch.
     QueryResult => ObjectBuilder::new()
         .schema_type(SchemaType::AnyValue)
         .description(Some(
-            "Rows as an array of objects for a select and for writes (`[]` without `returning`); the function's result for a call (an array for a set-returning function, `null` for a void one); for a batch, the array of each operation's result in order",
+            "Rows as an array of objects for a select and for writes (`[]` without `returning`); the function's result for a call (an array for a set-returning function, `null` for a void one); `{\"count\": N}` for a count (an integer); for a batch, the array of each operation's result in order",
         ))
         .into()
 }
@@ -470,6 +494,7 @@ impl PartialSchema for QueryRequest {
             ("update", UpdateRequest::name()),
             ("delete", DeleteRequest::name()),
             ("call", CallRequest::name()),
+            ("count", CountRequest::name()),
         ]);
         mapping.push(("batch", batch));
         OneOfBuilder::new()
@@ -478,6 +503,7 @@ impl PartialSchema for QueryRequest {
             .item(of::<UpdateRequest>())
             .item(of::<DeleteRequest>())
             .item(of::<CallRequest>())
+            .item(of::<CountRequest>())
             .item(of::<BatchRequest>())
             .discriminator(Some(Discriminator::with_mapping("op", mapping)))
             .description(Some(
@@ -502,12 +528,14 @@ impl ToSchema for QueryRequest {
         push::<UpdateRequest>(schemas);
         push::<DeleteRequest>(schemas);
         push::<CallRequest>(schemas);
+        push::<CountRequest>(schemas);
         push::<BatchRequest>(schemas);
         push::<BatchSelect>(schemas);
         push::<BatchInsert>(schemas);
         push::<BatchUpdate>(schemas);
         push::<BatchDelete>(schemas);
         push::<BatchCall>(schemas);
+        push::<BatchCount>(schemas);
         push::<Filter>(schemas);
         push::<TableName>(schemas);
         push::<SelectItem>(schemas);

@@ -121,7 +121,7 @@ function AddForm({
     setFailure({});
     try {
       // The plain function, not a mutation hook: a link's URL must never reach a cache.
-      const result = await createProjectInvite(project.id, { email: address, platform_role: platformRole, pg_roles: pgRoles, delivery: how });
+      const result = await createProjectInvite(project.id, { email: address, platform_role: platformRole, pg_roles: platformRole === "admin" ? [] : pgRoles, delivery: how });
       void queryClient.invalidateQueries({ queryKey: getListProjectGrantsQueryKey(project.id) });
       refreshAccess(queryClient);
       setBusy(false);

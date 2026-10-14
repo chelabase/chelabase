@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Table editor - inside a table</title>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0b1c1f;--deep:#0f2a2d;--sec:#14363a;--chalk:#e6ede7;--dim:#aebfc0;--hair:rgb(230 237 231/.16);--strong:rgb(230 237 231/.34);--ctl:rgb(230 237 231/.4);--sand:#f2c7a3;--coral:#eda6aa;--sea:#9fd4c6}
+*{box-sizing:border-box}
+html,body{width:1440px;height:900px;overflow:hidden;margin:0}
+body{background:var(--ink);color:var(--chalk);font:14px/1.3 "Atkinson Hyperlegible Next",system-ui,sans-serif;display:flex}
+.m,.id{font-family:"JetBrains Mono",monospace;font-size:13px}
+.dim{color:var(--dim)}
+svg{width:20px;height:20px;fill:none;stroke:var(--dim);stroke-width:1.6;stroke-linecap:square}
+.rail{width:56px;height:900px;background:var(--deep);border-right:1px solid var(--strong);display:flex;flex-direction:column;align-items:center;padding-top:14px;gap:6px}
+.claw{width:24px;height:24px;border:2px solid var(--chalk);margin-bottom:22px}
+.ri{width:56px;height:44px;display:flex;align-items:center;justify-content:center;position:relative}
+.ri.on{background:var(--sec)}.ri.on:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--sand)}
+.ri.on svg{stroke:var(--chalk)}
+.main{width:1384px;height:900px;position:relative;overflow:hidden}
+.hdr{height:52px;border-bottom:1px solid var(--hair);display:flex;align-items:center;padding:0 16px;gap:10px}
+.trig{height:32px;display:flex;align-items:center;gap:8px;padding:0 8px;border:1px solid transparent}
+.sep{color:var(--dim)}
+.tag{font-size:12px;color:var(--dim);border:1px solid var(--strong);padding:1px 6px;display:inline-flex;gap:4px;align-items:center}
+.tag svg{width:12px;height:12px}
+.act{margin-left:24px;border:1px solid var(--ctl);height:32px;display:flex;align-items:center;gap:8px;padding:0 10px}
+.acct{margin-left:auto;display:flex;align-items:center;gap:8px}
+.av{width:28px;height:28px;border:1px solid var(--ctl);background:var(--sec)}
+.crumb{height:40px;display:flex;align-items:center;gap:10px;padding:0 24px;border-bottom:1px solid var(--hair)}
+.crumb a{color:var(--chalk);text-decoration:underline;text-underline-offset:3px}
+.btn{height:32px;display:inline-flex;align-items:center;gap:6px;padding:0 14px;border:1px solid var(--ctl);color:var(--chalk);background:none}
+.btn.pri{background:var(--sand);border-color:var(--sand);color:var(--ink);font-weight:600}
+.btn.ghost{border-color:transparent;color:var(--dim)}
+.tbar{padding:14px 24px 0;display:flex;align-items:flex-start}
+.tbar h1{margin:0;font:500 22px/28px "JetBrains Mono",monospace}
+.tbar p{margin:4px 0 0;color:var(--dim)}
+.tools{margin-left:auto;display:flex;gap:8px;padding-top:6px}
+.tabs{display:flex;gap:24px;padding:0 24px;height:40px;border-bottom:1px solid var(--hair);margin-top:6px}
+.tab{display:flex;align-items:flex-end;padding-bottom:10px;color:var(--dim)}
+.tab.on{color:var(--chalk);border-bottom:2px solid var(--sand);margin-bottom:-1px}
+.grid{width:1384px;overflow:hidden;height:482px}
+.r{display:grid;grid-template-columns:48px 118px 140px 130px 130px 80px 180px 120px 120px 190px 130px 170px;height:36px;align-items:center;border-bottom:1px solid var(--hair);white-space:nowrap}
+.r>*{padding:0 12px;overflow:hidden}
+.r>:first-child{color:var(--dim);font-size:12px;text-align:right;border-right:1px solid var(--hair);height:100%;line-height:36px}
+.r.h{height:44px;background:var(--deep);border-bottom:1px solid var(--strong)}
+.r.h span small{display:block;font:12px/14px "Atkinson Hyperlegible Next",sans-serif;color:var(--dim)}
+.r.h span{line-height:16px}
+.n{text-align:right}
+.paid{color:var(--sea)}.open{color:var(--chalk)}.void{color:var(--dim)}
+.r .ed{outline:2px solid var(--sand);outline-offset:-2px;background:var(--ink);padding:0 10px;display:flex;align-items:center;height:36px}
+.r .ed i{width:1px;height:16px;background:var(--chalk);margin-left:1px}
+.foot{height:36px;display:flex;align-items:center;padding:0 24px;gap:12px;border-top:1px solid var(--hair);color:var(--dim);position:absolute;top:674px;left:0;width:1384px;background:var(--ink)}
+.foot .btn{height:26px;padding:0 10px}
+.tray{position:absolute;left:0;bottom:0;width:1384px;height:190px;background:var(--deep);border-top:1px solid var(--strong);display:flex}
+.pend{width:340px;padding:16px 20px;border-right:1px solid var(--hair)}
+.pend h3{margin:0 0 12px;font:600 14px/20px "Atkinson Hyperlegible Next",sans-serif;display:flex;gap:8px}
+.pend ol{margin:0;padding:0;list-style:none;display:grid;gap:12px}
+.pend li{display:flex;gap:10px;line-height:18px}.pend li b{color:var(--dim);font-weight:400;width:14px}
+.sql{flex:1;background:var(--ink);margin:16px;border:1px solid var(--hair);padding:12px 16px;line-height:22px;color:var(--chalk)}
+.sql .k{color:var(--dim)}
+.verdict{width:280px;padding:16px 20px 16px 4px;display:flex;flex-direction:column;gap:12px}
+.ok{display:flex;gap:8px;align-items:center;color:var(--chalk)}
+.ok i{width:10px;height:10px;background:var(--sea)}
+.acts{margin-top:auto;display:flex;gap:8px;justify-content:flex-end}
+</style></head><body>
+<nav class="rail"><div class="claw"></div>
+<div class="ri"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="14" height="14"/><path d="M3 8h14"/></svg></div>
+<div class="ri on"><svg viewBox="0 0 20 20"><rect x="2" y="3" width="16" height="14"/><path d="M2 8h16M2 12h16M8 8v9"/></svg></div>
+<div class="ri"><svg viewBox="0 0 20 20"><path d="M4 5l5 5-5 5M11 15h6"/></svg></div>
+<div class="ri"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3"/></svg></div></nav>
+<div class="main">
+<header class="hdr"><span class="trig">acme-shop</span><span class="sep">/</span><span class="trig">orders-db</span><span class="sep">/</span>
+<span class="trig"><span class="m">main</span><span class="tag"><svg viewBox="0 0 12 12"><rect x="2" y="5" width="8" height="6"/><path d="M4 5V3h4v2"/></svg>protected</span></span><span class="sep">/</span>
+<span class="trig"><span class="dim">Postgres</span><span class="m">app</span></span>
+<span class="act"><span class="dim">Act as</span><span class="m">billing_admin</span></span>
+<span class="acct"><span>mike@acme.shop</span><span class="av"></span></span></header>
+<div class="crumb"><a>Tables</a><span class="dim">›</span><span class="m dim">public</span><span class="dim">›</span><span class="m">invoices</span>
+<span class="btn" style="margin-left:auto">Switch table <span class="dim m">⌘K</span></span></div>
+<div class="tbar"><div><h1>public.invoices</h1><p>≈ 48,210 rows · 12 MB · RLS on · data API on</p></div>
+<div class="tools"><span class="btn">Filter</span><span class="btn">Sort</span><span class="btn">Insert row</span></div></div>
+<div class="tabs"><span class="tab on">Rows</span><span class="tab">Structure</span></div>
+<div class="grid">
+<div class="r h"><span></span><span class="m">id<small>uuid</small></span><span class="m">customer_id<small>uuid</small></span><span class="m">status<small>invoice_status</small></span><span class="m n">amount_cents<small>int8</small></span><span class="m">currency<small>text</small></span><span class="m">issued_at<small>timestamptz</small></span><span class="m">due_at<small>date</small></span><span class="m">paid_at<small>timestamptz</small></span><span class="m">memo<small>text</small></span><span class="m">created_by<small>uuid</small></span><span class="m">updated_at<small>timestamptz</small></span></div>
+<div class="r m"><span>1</span><span>3f9a…c21e</span><span>a07d…5b90</span><span class="paid">paid</span><span class="n">12900</span><span>USD</span><span>2026-10-02 09:14</span><span>2026-10-16</span><span>2026-10-03 11:02</span><span>Annual plan</span><span>c4e1…77aa</span><span>2026-10-03 11:02</span></div>
+<div class="r m"><span>2</span><span>8b12…e0f4</span><span>19c6…d2a1</span><span class="open">open</span><span class="n">48050</span><span>USD</span><span>2026-10-02 09:31</span><span>2026-10-16</span><span class="dim">null</span><span>Seats x 12</span><span>c4e1…77aa</span><span>2026-10-02 09:31</span></div>
+<div class="r m"><span>3</span><span>d6c0…19b3</span><span>a07d…5b90</span><span class="paid">paid</span><span class="n">3500</span><span>USD</span><span>2026-10-01 16:48</span><span>2026-10-15</span><span>2026-10-02 08:20</span><span>Add-on storage</span><span>51b9…0c3e</span><span>2026-10-02 08:20</span></div>
+<div class="r m"><span>4</span><span>51e7…a4d8</span><span>7e30…c8f2</span><span class="void">void</span><span class="n">9900</span><span>EUR</span><span>2026-10-01 14:05</span><span>2026-10-15</span><span class="dim">null</span><span>Duplicate</span><span>51b9…0c3e</span><span>2026-10-01 14:40</span></div>
+<div class="r m"><span>5</span><span>0a4f…62be</span><span>b2f8…1e07</span><span class="open">open</span><span class="n">215000</span><span>USD</span><span>2026-09-30 10:12</span><span>2026-10-14</span><span class="dim">null</span><span>Enterprise Q4</span><span>c4e1…77aa</span><span>2026-09-30 10:12</span></div>
+<div class="r m"><span>6</span><span>e93b…7f10</span><span>19c6…d2a1</span><span class="paid">paid</span><span class="n">48050</span><span>USD</span><span>2026-09-29 17:26</span><span>2026-10-13</span><span>2026-09-30 07:55</span><span>Seats x 12</span><span>c4e1…77aa</span><span>2026-09-30 07:55</span></div>
+<div class="r m"><span>7</span><span>7c58…b3e2</span><span>3d91…f6a0</span><span class="paid">paid</span><span class="n"><span class="ed">12900<i></i></span></span><span>USD</span><span>2026-09-29 12:03</span><span>2026-10-13</span><span>2026-09-29 12:40</span><span>Annual plan</span><span>51b9…0c3e</span><span>2026-09-29 12:40</span></div>
+<div class="r m"><span>8</span><span>2d05…94c7</span><span>7e30…c8f2</span><span class="open">open</span><span class="n">7400</span><span>EUR</span><span>2026-09-28 08:44</span><span>2026-10-12</span><span class="dim">null</span><span>Support pack</span><span>c4e1…77aa</span><span>2026-09-28 08:44</span></div>
+<div class="r m"><span>9</span><span>b8a1…3e5d</span><span>f4c2…0b19</span><span class="paid">paid</span><span class="n">12900</span><span>USD</span><span>2026-09-27 15:19</span><span>2026-10-11</span><span>2026-09-27 15:52</span><span>Annual plan</span><span>51b9…0c3e</span><span>2026-09-27 15:52</span></div>
+<div class="r m"><span>10</span><span>4f72…d1a9</span><span>b2f8…1e07</span><span class="paid">paid</span><span class="n">86000</span><span>USD</span><span>2026-09-26 11:37</span><span>2026-10-10</span><span>2026-09-28 09:01</span><span>Enterprise Q3 true-up</span><span>c4e1…77aa</span><span>2026-09-28 09:01</span></div>
+<div class="r m"><span>11</span><span>c13e…8a66</span><span>a07d…5b90</span><span class="open">open</span><span class="n">1990</span><span>USD</span><span>2026-09-25 09:58</span><span>2026-10-09</span><span class="dim">null</span><span>Overage</span><span>51b9…0c3e</span><span>2026-09-25 09:58</span></div>
+<div class="r m"><span>12</span><span>96d0…2b4f</span><span>3d91…f6a0</span><span class="void">void</span><span class="n">12900</span><span>USD</span><span>2026-09-24 13:21</span><span>2026-10-08</span><span class="dim">null</span><span>Issued in error</span><span>c4e1…77aa</span><span>2026-09-24 14:02</span></div>
+<div class="r m"><span>13</span><span>1e8c…5f37</span><span>f4c2…0b19</span><span class="paid">paid</span><span class="n">48050</span><span>USD</span><span>2026-09-23 10:07</span><span>2026-10-07</span><span>2026-09-23 10:30</span><span>Seats x 12</span><span>51b9…0c3e</span><span>2026-09-23 10:30</span></div>
+</div>
+<div class="foot"><span>Rows 1–100 of ≈ 48,210</span><span style="margin-left:auto" class="btn">‹ Prev</span><span class="m">1 / 483</span><span class="btn">Next ›</span></div>
+<section class="tray">
+<div class="pend"><h3>Pending changes <span class="dim">· 2</span></h3><ol>
+<li><b>1.</b><span>Add column <span class="id">discount_cents</span> <span class="id dim">int8</span> default 0, not null</span></li>
+<li><b>2.</b><span>Rename <span class="id">memo</span> → <span class="id">note</span></span></li></ol></div>
+<div class="sql m"><div class="k">-- 2 statements, one transaction</div>
+<div>ALTER TABLE public.invoices</div>
+<div>&nbsp;&nbsp;ADD COLUMN discount_cents int8 NOT NULL DEFAULT 0;</div>
+<div>ALTER TABLE public.invoices</div>
+<div>&nbsp;&nbsp;RENAME COLUMN memo TO note;</div></div>
+<div class="verdict"><div class="ok"><i></i>Dry run passed · no rewrite</div><div class="dim">Runs on branch main as billing_admin.</div>
+<div class="acts"><span class="btn ghost">Discard</span><span class="btn pri">Apply 2 changes</span></div></div>
+</section>
+</div></body></html>

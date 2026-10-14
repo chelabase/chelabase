@@ -71,6 +71,12 @@ export type ResultSpec =
   | { kind: "scalar"; exact: PgExact; name: string }
   | { kind: "batch"; items: ResultSpec[] };
 
+/**
+ * A count's result, `{ "count": N }`: one row whose `count` is always a `number` (in
+ * bigint mode too); a count beyond `Number.MAX_SAFE_INTEGER` throws `UnsafeIntegerError`.
+ */
+export const COUNT_SPEC: ResultSpec = { kind: "rows", columns: {}, name: "count" };
+
 const INTEGER = /^-?\d+$/;
 
 /**

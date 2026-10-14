@@ -8,10 +8,15 @@ import { errorText } from "@/lib/errors";
 export interface NewBranchFormProps {
   databaseId: string;
   branches: Branch[];
-  historyWindow: number;
+  /** The database's history window; absent while it loads (the point-in-time option is disabled until then). */
+  historyWindow: number | undefined;
+  /** The parent chosen first (default: the root branch). */
+  defaultParent?: string;
+  /** Called after the branch was created, with it. */
+  onCreated?: (branch: Branch) => void;
 }
 
-export function NewBranchForm({ databaseId, branches, historyWindow }: NewBranchFormProps) {
+export function NewBranchForm({ databaseId, branches, historyWindow, defaultParent, onCreated }: NewBranchFormProps) {
   const queryClient = useQueryClient();
   const createBranch = useCreateBranch({
     mutation: {
@@ -23,20 +28,22 @@ export function NewBranchForm({ databaseId, branches, historyWindow }: NewBranch
   const parents = branches.filter((b) => b.status === "ready");
   const main = parents.find((b) => b.kind === "normal" && b.parent_branch_id === null);
   const [name, setName] = useState("");
-  const [parent, setParent] = useState<string>(main?.id ?? parents[0]?.id ?? "");
-  const [mode, setMode] = useState<"now" | "time">("now");
+  const [parent, setParent] = useState<string>(parents.find((b) => b.id === defaultParent)?.id ?? main?.id ?? parents[0]?.id ?? "");
+  const [picked, setMode] = useState<"now" | "time">("now");
+  const windowKnown = historyWindow !== undefined;
+  const mode = windowKnown ? picked : "now";
   const [time, setTime] = useState("");
   const [error, setError] = useState<string | null>(null);
   const busy = createBranch.isPending;
   const nameError = name === "" ? null : validateBranchName(name);
   const since = parents.find((b) => b.id === parent)?.history_start;
-  const bounds = restoreBounds(new Date(), historyWindow, since);
+  const bounds = restoreBounds(new Date(), historyWindow ?? 0, since);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy || name === "" || nameError || !parent) return;
     const request: CreateBranchRequest = { name, parent_branch_id: parent };
-    if (mode === "time") {
+    if (mode === "time" && historyWindow !== undefined) {
       const at = pointToUtc(time, new Date(), historyWindow, since);
       if (!at.ok) {
         setError(at.error);
@@ -46,10 +53,11 @@ export function NewBranchForm({ databaseId, branches, historyWindow }: NewBranch
     }
     setError(null);
     try {
-      await createBranch.mutateAsync({ id: databaseId, data: request });
+      const created = await createBranch.mutateAsync({ id: databaseId, data: request });
       setName("");
       setTime("");
       setMode("now");
+      onCreated?.(created);
     } catch (err) {
       setError(errorText(err));
     }
@@ -79,7 +87,7 @@ export function NewBranchForm({ databaseId, branches, historyWindow }: NewBranch
             Now
           </label>
           <label className="flex items-center gap-1">
-            <input type="radio" name="point" checked={mode === "time"} onChange={() => setMode("time")} />
+            <input type="radio" name="point" checked={mode === "time"} disabled={!windowKnown} onChange={() => setMode("time")} />
             At a time
           </label>
         </fieldset>

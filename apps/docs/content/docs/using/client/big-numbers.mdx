@@ -27,7 +27,7 @@ The check is compile-time only, since the generic is erased at run time. `bigint
 | `int8` | `number`; **throws `UnsafeIntegerError`** outside the safe range | `bigint`, always |
 | `numeric` | `string` with the exact digits | `string` |
 
-Use `bigint: true` together with `types` to get `bigint` for all `int8` columns, arguments and returns:
+Use `bigint: true` together with `types` to get `bigint` for all `int8` columns, arguments and returns. `count()` is the exception: it always resolves to a `number`, and a count beyond 2^53 throws `UnsafeIntegerError`.
 
 ```ts twoslash
 import { createClient } from "@chelabase/client";

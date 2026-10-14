@@ -200,6 +200,11 @@ export interface SelectQuery<Row, Out> extends Operation<Out[]> {
   /** At most `n` rows (the server also clamps to its `max_rows`). */
   limit(n: number): SelectQuery<Row, Out>;
   offset(n: number): SelectQuery<Row, Out>;
+  /**
+   * The number of rows that match the filter, as the role sees them (row-level security
+   * applies). Sends only the table and `where`: a count after `limit` or `offset` throws.
+   */
+  count(): Operation<{ count: number }>;
 }
 
 type Returned<Row, C extends readonly unknown[]> = Simplify<Pick<Row, C[number] & keyof Row>>[];

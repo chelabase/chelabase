@@ -277,25 +277,10 @@ describe("AppRail", () => {
     expect(nav).toHaveAttribute("data-expanded", "false");
   });
 
-  it("placeholders are aria-disabled and not focusable", async () => {
+  it("no_placeholder_is_left_and_table_editor_is_a_link", async () => {
     await renderRail("expanded");
-    const placeholders = screen.getAllByText("Placeholder").map((label) => label.closest("[aria-disabled]"));
-    expect(placeholders).toHaveLength(1);
-    for (const placeholder of placeholders) {
-      expect(placeholder).toHaveAttribute("aria-disabled", "true");
-      expect(placeholder).not.toHaveAttribute("tabindex");
-      expect(placeholder?.tagName).toBe("DIV");
-    }
-    const user = userEvent.setup();
-    const visited: Element[] = [];
-    for (let i = 0; i < 6; i++) {
-      await user.tab();
-      if (document.activeElement) visited.push(document.activeElement);
-    }
-    for (const placeholder of placeholders) {
-      expect(visited.some((el) => placeholder?.contains(el))).toBe(false);
-    }
-    expect(visited).toContain(screen.getByRole("button", { name: "Sidebar behaviour" }));
+    expect(screen.queryByText("Placeholder")).toBeNull();
+    expect(screen.getByRole("link", { name: "Table editor" })).toHaveAttribute("href", "/app/tables");
   });
 
   it("rail_badge_counts_pending: the Members item carries the number of waiting requests", async () => {

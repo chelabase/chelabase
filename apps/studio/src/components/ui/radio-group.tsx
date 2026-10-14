@@ -21,6 +21,8 @@ export interface RadioGroupProps<T extends string> {
   disabled?: boolean;
   /** `segmented`: one row of joined options (platform roles); `stacked`: one per line with hints. */
   layout?: "segmented" | "stacked";
+  /** A segmented group's chosen option: `sand` (filled, the default) or `tab` (channel with a sand underline, like the Rows | Structure tabs). */
+  tone?: "sand" | "tab";
 }
 
 const focus = "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand";
@@ -29,7 +31,7 @@ const focus = "outline-none focus-visible:outline-2 focus-visible:-outline-offse
  * A labelled radio group. Each option is one `role=radio` element holding its text, so the whole
  * option is the target. Arrow keys move the choice; the chosen option carries sand.
  */
-export function RadioGroup<T extends string>({ label, options, value, onValueChange, disabled, layout = "stacked" }: RadioGroupProps<T>) {
+export function RadioGroup<T extends string>({ label, options, value, onValueChange, disabled, layout = "stacked", tone = "sand" }: RadioGroupProps<T>) {
   const labelId = useId();
   const segmented = layout === "segmented";
   return (
@@ -53,7 +55,10 @@ export function RadioGroup<T extends string>({ label, options, value, onValueCha
               className={cn(
                 focus,
                 "cursor-default border-r border-input px-3 py-1.5 text-sm font-medium text-chalk last:border-r-0",
-                "hover:bg-chalk/[0.06] data-[checked]:bg-sand data-[checked]:text-ink data-[disabled]:opacity-50",
+                "hover:bg-chalk/[0.06] data-[disabled]:opacity-50",
+                tone === "tab"
+                  ? "text-chalk-dim hover:text-chalk data-[checked]:bg-channel data-[checked]:text-chalk data-[checked]:shadow-[inset_0_-2px_0_var(--sand)]"
+                  : "data-[checked]:bg-sand data-[checked]:text-ink",
               )}
             >
               {o.label}

@@ -175,7 +175,7 @@ const STATUS_WORDS: Record<string, string> = { active: "Active", invited: "Invit
  * An event's `before` or `after` as labelled, readable fields (projects and databases by name,
  * roles as words, times in UTC); a field Studio doesn't know yet keeps its key and compact JSON.
  */
-export function eventFields(value: unknown, ctx: SentenceContext): EventField[] {
+export function eventFields(value: unknown, ctx: SentenceContext, action?: string): EventField[] {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return [];
   const out: EventField[] = [];
   for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
@@ -196,7 +196,9 @@ export function eventFields(value: unknown, ctx: SentenceContext): EventField[] 
     else if (key === "platform_role" && v === null) out.push({ label: "Platform role", value: "Same as the project" });
     else if (key === "pg_roles") {
       const roles = rolesOf(value);
-      out.push({ label: "Postgres roles", value: v === null ? "All of the project's roles" : roles.length > 0 ? roles.join(", ") : "None" });
+      // R17: an Admin grant holds every role, so it names none.
+      const every = action === "grant_put" && field(value, "platform_role") === "admin" && roles.length === 0;
+      out.push({ label: "Postgres roles", value: every ? "All roles" : v === null ? "All of the project's roles" : roles.length > 0 ? roles.join(", ") : "None" });
     } else out.push({ label: key, value: typeof v === "string" ? v : JSON.stringify(v) });
   }
   return out;

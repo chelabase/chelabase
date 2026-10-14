@@ -9,7 +9,10 @@ import { actAsReserved, closure, refusal } from "./role-rules";
 export interface ProjectCaps {
   /** The effective platform role; null when the caller has no access to the project. */
   role: PlatformRole | null;
-  /** `"all"` for a tenant admin, else the granted role names (owner never listed: Admin implies it). */
+  /**
+   * `"all"` for an Admin (a tenant admin, or a project Admin, R17; never the data API's roles,
+   * R18), else the granted role names (`owner` may be listed with Admin).
+   */
   roles: "all" | string[];
   tenantAdmin: boolean;
   atLeast: (level: PlatformRole) => boolean;
@@ -36,7 +39,8 @@ export function projectCaps(me: Me | undefined, projectId: string, databaseId?: 
   const grant = (me.projects ?? []).find((p) => p.project_id === projectId);
   if (!grant) return caps(null, [], false);
   const narrowed = databaseId ? (grant.databases ?? []).find((d) => d.database_id === databaseId) : undefined;
-  if (narrowed) return caps(narrowed.platform_role, narrowed.roles, false);
+  // A field the narrowing leaves out is the grant's.
+  if (narrowed) return caps(narrowed.platform_role ?? grant.platform_role, narrowed.roles ?? grant.roles, false);
   return caps(grant.platform_role, grant.roles, false);
 }
 
@@ -76,20 +80,43 @@ export function useProjectCaps(): ProjectCaps {
 }
 
 /**
- * The roles the caller may act as on a branch, in the branch's order.
- * Admin: the owner and every other role. Below Admin: the granted roles and every role their
- * chains reach through `member_of` (R21), minus the owner, LOGIN roles and owner-level roles (R16, R22).
+ * The roles the caller may act as on a branch, in the branch's order: only granted ones (R18).
+ * - The owner with Admin.
+ * - Every role (`"all"`, an Admin's, R17): every other role of the branch except reserved ones
+ *   and the data API's `anon` and `authenticated`, which need a grant naming them.
+ * - Named roles: those and every role their chains reach through `member_of` (R21), never
+ *   reserved ones; below Admin also never the owner, LOGIN or owner-level roles, or one whose
+ *   own chain is refused (R16, R22, R23). An Admin narrowed to named roles acts as exactly
+ *   those (and what they reach), LOGIN roles included.
  */
 export function actAsRoles(c: ProjectCaps, branchRoles: BranchRole[]): { owner: boolean; roles: string[] } {
   const others = branchRoles.filter((r) => r.origin !== "owner");
-  if (c.atLeast("admin")) return { owner: true, roles: others.map((r) => r.name) };
-  const granted = c.roles === "all" ? others.map((r) => r.name) : c.roles;
+  const admin = c.atLeast("admin");
+  if (c.roles === "all") {
+    const usable = (r: BranchRole) => !actAsReserved(r.name) && !isDataApiRole(r.name) && (admin || refusal(branchRoles, r.name) === null);
+    return { owner: admin, roles: others.filter(usable).map((r) => r.name) };
+  }
+  const granted = c.roles;
   // A granted role contributes its chain only when nothing in it is refused (`chain_grants`).
   const reach = new Set<string>(granted);
   for (const g of granted) {
     if (refusal(branchRoles, g) === null) for (const n of closure(branchRoles, g)) reach.add(n);
   }
-  // Only listed roles, never reserved ones, and never one whose own chain is refused (R16, R21–R23).
-  const usable = (r: BranchRole) => reach.has(r.name) && !actAsReserved(r.name) && refusal(branchRoles, r.name) === null;
-  return { owner: false, roles: others.filter(usable).map((r) => r.name) };
+  const usable = (r: BranchRole) => reach.has(r.name) && !actAsReserved(r.name) && (admin || refusal(branchRoles, r.name) === null);
+  return { owner: admin, roles: others.filter(usable).map((r) => r.name) };
+}
+
+/** The data API's roles. */
+export const DATA_API_ROLES = ["anon", "authenticated"] as const;
+
+const isDataApiRole = (name: string) => (DATA_API_ROLES as readonly string[]).includes(name);
+
+/**
+ * The data API roles the caller may act as, whether or not the branch's role list shows them:
+ * only those the grant names (R18). Every role (`"all"`, an Admin's) doesn't hold them.
+ */
+export function dataApiActAs(c: ProjectCaps): string[] {
+  if (c.roles === "all") return [];
+  const named = c.roles;
+  return DATA_API_ROLES.filter((r) => named.includes(r));
 }

@@ -1,6 +1,6 @@
 ---
 title: Studio tour
-description: What each Studio screen does, from signing in to the Tables console and the SQL editor.
+description: What each Studio screen does, from signing in to the Table editor and the SQL editor.
 ---
 
 Studio is Chelabase's web app. In a local stack it runs at `http://studio.chelabase.localhost:8000` (`just workbench up` starts it). Everything it does goes through the gateway on `:8000` with your Zitadel token, so anything you can click you can also do through the Management API (the reference is in Studio's **API** page and under Reference in these docs).
@@ -33,7 +33,7 @@ The **Databases** tab lists each database with its status and endpoint. **Connec
 - **Branches**: the branch tree with each branch's status and endpoint, a form for a new branch, and the database's settings (history window, branch limit, max rows, statement timeout, max connections). Each branch has **Connection details**, **Reset password**, **Protect** or **Unprotect**, **Reset to parent**, **Restore**, **Delete branch**, **Roles** and, with a parent, **Merge into** and **Update from** it (see [Merging schema](/docs/using/merging-schema#in-studio)). A disabled action says why next to the buttons; while a schema merge holds the branch, a link opens the merge. See [Branches](/docs/using/branches) and [Login roles](/docs/using/login-roles).
 - **Merges**: the database's schema merges, newest first, each opening its [merge page](/docs/using/merging-schema#in-studio).
 - **Data API**: the endpoint, the public key (with **Rotate public key**), secret keys, and per-database access. See [Data API](/docs/using/data-api).
-- **Tables**: the console, below.
+- **Tables**: opens the [Table editor](/docs/using/table-editor).
 - **SQL**: the [SQL editor](/docs/using/sql-editor).
 
 ### RLS warning
@@ -46,9 +46,9 @@ The Data API panel lists every table, view or foreign table that `anon` or `auth
 
 It also names the app users table while its RLS is off, even before any role can reach it, because the table holds your users' emails.
 
-## Tables console
+## Table editor
 
-The **Tables** view browses and edits rows in any served database and schema of a branch. Pick the **Branch**, **Database**, **Schema** and **View as** (the owner, `anon`, `authenticated`, or a custom role), then a table or view. The grid sorts, filters (match all or any), pages, edits cells in place, inserts rows and deletes selected rows. Views, materialized views and foreign tables, and tables without a primary key, are read-only. **View as** the owner, or a role with `BYPASSRLS`, shows a warning: row-level security is bypassed, and edits apply to every row. Owner-level roles are listed but can't be picked.
+The **Table editor** in the left rail browses and edits rows and changes table structure. See [Table editor](/docs/using/table-editor). Rows are read and written through the console endpoint below.
 
 Over the API, the console is `POST /v1/databases/{id}/branches/{branch_id}/console/query` with:
 

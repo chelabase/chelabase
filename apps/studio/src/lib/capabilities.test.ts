@@ -113,7 +113,8 @@ describe("memberGate", () => {
 describe("actAsRoles", () => {
   it("role_picker_lists_allowed_roles: admin gets the owner and every role", () => {
     const caps = projectCaps({ ...base, member: { id: "m-self", status: "active", tenant_admin: true } }, "p1");
-    expect(actAsRoles(caps, roles)).toEqual({ owner: true, roles: ["billing_admin", "billing", "reports", "app_login", "anon"] });
+    // R18: every role, but not the data API's anon and authenticated (a grant must name them).
+    expect(actAsRoles(caps, roles)).toEqual({ owner: true, roles: ["billing_admin", "billing", "reports", "app_login"] });
   });
 
   it("role_picker_lists_allowed_roles: below admin only granted roles and their chains, never the owner or a LOGIN role", () => {

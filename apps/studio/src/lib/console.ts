@@ -161,15 +161,20 @@ export function buildSelect(args: {
   pk: string[];
   /** Rows per page; the server clamps to its max_rows, so a smaller max_rows lowers it. */
   pageSize?: number;
+  /** The columns to read (`tree.select`); every column when absent. */
+  columns?: string[];
+  /** The first row to read; overrides `page * pageSize` (pages whose size changed, e.g. halved on `too_large`). */
+  offset?: number;
 }): Tree {
   const size = args.pageSize ?? PAGE_SIZE;
   const tree: Tree = { v: 1, op: "select", from: `${args.schema}.${args.table}` };
+  if (args.columns) tree.select = args.columns;
   if (args.filters) tree.where = args.filters;
   const order: { col: string; dir: SortDir }[] = args.sort ? [{ col: args.sort.col, dir: args.sort.dir }] : [];
   for (const c of args.pk) if (c !== args.sort?.col) order.push({ col: c, dir: "asc" });
   if (order.length > 0) tree.orderBy = order;
   tree.limit = size;
-  tree.offset = args.page * size;
+  tree.offset = args.offset ?? args.page * size;
   return tree;
 }
 

@@ -10,13 +10,13 @@ export interface AppHeaderProps {
 const focusRing =
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sand";
 
-/** The top bar of the signed-in shell: an empty context slot and the profile menu. */
+/** The top bar of the signed-in shell: a context slot (`#app-header-context`, filled by `HeaderContext`) and the profile menu. */
 export function AppHeader({ profile, onSignOut }: AppHeaderProps) {
   const queryClient = useQueryClient();
   const label = profile.name || profile.email;
   return (
     <header className="sticky top-0 z-20 flex h-[52px] shrink-0 items-center justify-between border-b border-line bg-background px-4">
-      <div data-slot="context" />
+      <div id="app-header-context" data-slot="context" className="flex min-w-0 flex-1 items-center pr-3" />
       <Menu.Root>
         <Menu.Trigger
           aria-label={label ? undefined : "Account"}

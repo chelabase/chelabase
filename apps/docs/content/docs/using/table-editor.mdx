@@ -1,0 +1,74 @@
+---
+title: Table editor
+description: Browse and edit rows, and change table structure without writing SQL, from Studio's Table editor.
+---
+
+Studio's **Table editor** reads and edits rows and changes table structure. Structure changes are staged, shown as the exact SQL with a dry run, and applied together in one transaction. Open it from **Table editor** in the left rail, or from the **Tables** button on a database in the project's **Databases** tab. The rail link returns to the last place you worked: the same project, database, branch, Postgres database and schema, as long as each still exists.
+
+The address holds the whole position: `/app/tables/{project}/{database}/{branch}/{postgres database}/{schema}/{table}`. A level you leave out gets a default, and the address is rewritten. While the levels above it are the ones you last worked in, a missing level takes your last value (when it still exists); otherwise the defaults are the first project, the project's first database, the root branch, the branch's main Postgres database and the `public` schema (else the first). No table is picked for you. The **Types** and **New table** views aren't part of the address: a reload, or another schema, returns to the table view. An id that doesn't exist shows a not-found message with the pickers still usable.
+
+## Pickers and Act as
+
+The bar at the top has **Project**, **Database**, **Branch**, **Postgres db** and **Act as**. Each picker searches. Picking one drops the levels after it. The branch picker shows the branch tree with protected branches marked, and **New branch from …** at the end. The **Postgres db** picker marks the databases the [data API](/docs/using/data-api) serves; the system database `postgres` isn't offered.
+
+**Act as** is the Postgres role that reads and writes rows, and that structure changes run as. It lists only the roles you're granted. Admins can act as the owner (the default) and every role of the branch, or, on a database where they are narrowed, the owner and the roles kept there; others get the roles their grant lists (and what those reach), and the first is the default. The data API's roles `anon` and `authenticated` are offered only when a grant names them, Admins included; a read-only **View as** for what the data API sees comes later. The choice is kept per branch. Acting as the owner bypasses row-level security. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
+
+The left list shows the tables of the picked schema, with a filter and a **Schema** picker.
+
+## Who can do what
+
+- Anyone who can view the project can read structure.
+- Rows need a role to act as and the data API on that Postgres database. Without it, **Rows** says rows need the data API and offers **Enable data API** (Developer or Admin). Without any role, it says you can't act as any Postgres role here. Branch protection doesn't block rows; Postgres grants decide.
+- Viewers read rows but can't change them. Developers edit rows.
+- Structure changes need Developer on a normal branch and Admin on a protected one. Otherwise the structure controls are read-only, with the reason beside them.
+- Views, materialized views, foreign tables, partitioned tables and tables without a primary key are read-only.
+
+The API stays the authority: a refusal is always shown.
+
+## Rows
+
+A table has two views: **Rows** and **Structure**.
+
+- **Reading:** the grid pages through the table as the role you act as, a page at a time (50 rows, or the database's `max_rows` when that is lower). The footer says `Rows 1–50 of ≈ N` with the table's row estimate, `of N` once the exact total is known (a short last page gives it), and `of more` while pages stay full; between **Prev** and **Next**, `1 / N` shows the page once the total is known. Click a column header to sort ascending, descending, then off, or use **Sort** to pick a column and a direction (**Apply sort**, **Clear sort**). **Filter** adds conditions on columns; each one can be removed.
+- **Editing in place:** arrows move between cells. Enter or F2 edits the cell (typing starts an edit too), Enter saves, Escape cancels, Tab moves on. Each save is one update by primary key; the row is refreshed from the write. An error appears at the cell. Ctrl/Cmd+C copies the selected rows when there are any, else the active cell (a JSON value as JSON). Drag a column's edge to resize it, click the edge to widen it a step (Shift+click narrows), or press Alt+Left/Right on its header; double-click the edge to reset it.
+- **Large values:** cells show at most 200 characters. A page too large for the response limit is read in smaller pages. Large columns of a very large row show **Load value**.
+- **Row panel:** the icon at a row's left, or Enter on it, opens that row in a side panel with a field per column: a **NULL** toggle on nullable columns, **Now** on date and time fields, enum selects, JSON fields in a small code editor. A foreign key field has **Pick…**, which searches the referenced table as the same role, and **Open**, which goes to the referenced table. Above 30 columns the panel has **Filter fields**. **Save row** writes only the changed fields; **Delete row** asks first, and says so when no row was deleted (the row is hidden from the role you act as, or already gone).
+- **Insert row:** opens the panel empty. Defaults show as placeholders, and generated and identity columns can't be edited. Saving with no field filled inserts a row of defaults. The menu beside it has **Insert with all defaults**.
+
+## Selecting and deleting rows
+
+Row checkboxes and the header checkbox select the loaded page. The bar then offers:
+
+- **Copy** (tab-separated) and **Copy as JSON**, for the loaded rows;
+- **Delete**, which asks for confirmation with the count, and says how many rows were deleted when fewer were (rows hidden from the role you act as, or already gone);
+- **Select all N matching rows**, which selects every row beyond the page. With a filter on, N is the exact count (the data API's [`count`](/docs/using/data-api/query-language#count)), counted as your role. If the count fails, the button omits the figure. Without a filter it shows the table's estimate (`≈ N`).
+
+With all matching rows selected, **Delete** deletes every row that matches the filter, not just the loaded ones; the dialog names the count (**Delete N matching rows**) when it is known, else it confirms with **Delete matching rows**. With no filter it empties the table: the dialog confirms with **Delete all rows**, and you type the table's name to confirm. Changing the table, filter or sort clears the selection, and so does the header checkbox. When the table's columns change (after an apply, say), a sort or filter on a column that's gone is dropped.
+
+## Changing structure
+
+Structure edits are staged, not run. Open **Structure** for the table, or use the column strip above the grid.
+
+- **Column strip:** a chip per column with its type and marks for key, foreign key and nullability. A chip opens that column's form. **Add column** opens an empty one. Pending changes show on the chip: added columns are marked new, changed ones carry an edge, dropped ones are struck through.
+- **Column form** (side panel): name, type (searched from the catalog, including your enums) and an array switch, default (none, a value or an SQL expression), not null, unique, primary key, a reference to another table's column, a check expression and a comment. It previews the SQL for this edit. **Add to changes** stages it. Editing a column you added in the same set of changes rewrites that addition instead of stacking another edit.
+- **Structure view:** columns with every attribute; constraints (**Add constraint** for a primary key, unique, foreign key or check, with **Add as NOT VALID** to skip the existing rows and **Validate** later; **Rename**, **Drop**); indexes, policies and grants as read-only lists; and the table itself (**Rename table**, **Move to schema**, **Comment**, **Drop table**).
+- **Types:** each schema in the left list has a **Types** entry for enums: **New enum**, add a value, rename a value, **Rename**, **Drop**.
+- **New table:** a draft table with a name, a schema, starter columns `id bigint generated always as identity primary key` and `created_at timestamptz not null default now()` (edit or remove them, or **Add column**), a comment and a **Turn RLS on** checkbox. Creating it is one change, reviewed like any other.
+
+Staged changes survive switching panels and reloading the tab, in that tab only. Leaving the page with changes pending asks first.
+
+## Reviewing and applying changes
+
+The changes panel lists the staged edits in order, each with its dry-run status. An edit can be removed; a column edit reopens its form, and any other edit highlights its SQL. The panel shows the full SQL and re-runs the dry run shortly after each edit. A dry run changes nothing.
+
+- **Warnings:** a statement that rewrites the table says how big it is (`Rewrites invoices (12 MB)`) and that reads and writes wait while it runs; each statement shows the lock it takes; a statement that couldn't be simulated says why.
+- **Dependents:** when a drop would affect views or other objects, they are listed, and **Drop dependents too (cascade)** includes them. If the list changes between the dry run and Apply, the new list is shown and the box is unticked.
+- **Apply:** **Apply N changes** runs every edit in one transaction, as the role you act as; either all of them land or none. It's enabled once the dry run passes. If part couldn't be simulated, you first tick that you've read the SQL. An error appears on the edit that caused it, with Postgres's detail and hint. After an apply, a line says what was applied and the changed columns are marked until you move on.
+- **Changed underneath you:** if the table changes after you started (someone else altered it), Apply is blocked with "This table changed since you started" until you've reviewed a fresh dry run.
+- **Discard** drops the staged changes after a confirmation.
+
+On a protected branch, applying needs Admin: see [Branches](/docs/using/branches).
+
+## Row-level security
+
+The New table form has a **Turn RLS on** checkbox, unticked by default. With RLS off, in a schema the data API serves, `anon` reads every row and `authenticated` reads and writes every row (the data API's default grants). Tick it, or turn RLS on later from the banner, and add policies. A table with RLS off shows a banner over the grid and **Structure**: any role with grants reads and writes every row, with **Turn RLS on** to stage it (the change goes through the changes panel like any other). A table with RLS on and no policies says only the owner and roles that bypass RLS see rows. Policies are read-only in the editor for now. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation) and the [RLS warning](/docs/using/studio#rls-warning).

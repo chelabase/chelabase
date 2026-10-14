@@ -14,6 +14,7 @@ const db = createClient<Database>({ ...opts, types });
 const big = createClient<Database>({ ...opts, bigint: true, types });
 
 const builders: Record<string, () => { toTree(): unknown }> = {
+  "count-filtered": () => db.from("billing.invoices").where({ paid: false }).count(),
   "select-basic": () =>
     db
       .from("orders")

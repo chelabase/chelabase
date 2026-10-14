@@ -21,6 +21,8 @@ pub enum Op {
     Update(Update),
     Delete(Delete),
     Call(Call),
+    /// The number of rows the role sees: `{"count": N}`.
+    Count(Count),
     /// Never nested; at most [`MAX_BATCH`] operations.
     Batch(Vec<Op>),
 }
@@ -188,6 +190,16 @@ pub struct Delete {
     pub all: bool,
     #[serde(default)]
     pub returning: Option<Returning>,
+}
+
+/// Counts the rows of `from` that match `where` (all of them without one), as the
+/// requesting role sees them. No column list, ordering or paging.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Count {
+    pub from: Name,
+    #[serde(rename = "where", default)]
+    pub filter: Option<Filter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -477,9 +489,10 @@ fn parse_op(tree: Value, in_batch: bool) -> Result<Op, QueryError> {
         "update" => Op::Update(serde_json::from_value(fields)?),
         "delete" => Op::Delete(serde_json::from_value(fields)?),
         "call" => Op::Call(serde_json::from_value(fields)?),
+        "count" => Op::Count(serde_json::from_value(fields)?),
         other => {
             return Err(QueryError::new(format!(
-                "unknown variant `{other}`, expected one of `select`, `insert`, `update`, `delete`, `call`, `batch`"
+                "unknown variant `{other}`, expected one of `select`, `insert`, `update`, `delete`, `call`, `count`, `batch`"
             )));
         }
     };
@@ -549,7 +562,7 @@ fn validate(op: &Op) -> Result<(), QueryError> {
             need_where(&u.filter, u.all, "update")?;
         }
         Op::Delete(d) => need_where(&d.filter, d.all, "delete")?,
-        Op::Call(_) | Op::Batch(_) => {}
+        Op::Call(_) | Op::Count(_) | Op::Batch(_) => {}
     }
     Ok(())
 }
@@ -574,7 +587,8 @@ pub fn resolve<'a>(op: &'a Op, path: &Path) -> Option<&'a Value> {
                 Op::Select(s) => s.filter.as_ref(),
                 Op::Update(u) => u.filter.as_ref(),
                 Op::Delete(d) => d.filter.as_ref(),
-                _ => None,
+                Op::Count(c) => c.filter.as_ref(),
+                Op::Insert(_) | Op::Call(_) | Op::Batch(_) => None,
             }?;
             for &i in indices {
                 filter = match filter {

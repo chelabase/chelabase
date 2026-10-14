@@ -28,7 +28,6 @@ import { MembersPage, type MembersTab } from "./members/members-page";
 import { AccessTab } from "./project-access/access-tab";
 import { ProjectPage } from "./project-page";
 import { ProjectSettings } from "./project-settings";
-import { TablesView } from "./tables-view";
 import { MergePage } from "./merges/merge-page";
 import { branchOf, detailOf, devBranch, mergeOf } from "@/test/merge-fixtures";
 
@@ -295,16 +294,6 @@ const CONTROLS: Control[] = [
     name: "Create branch", operationId: "createBranch",
     ui: () => <DatabaseBranches projectId="p1" database={database as never} />,
     ready: () => screen.findByText(/branches/), query: button("Create branch"),
-  },
-  {
-    // The console route admits Viewers for reads; its writes need Developer (spec part 4).
-    name: "Insert a row", operationId: "consoleQuery", access: "Project Developer",
-    ui: () => <TablesView databaseId="d1" />,
-    ready: async () => {
-      (await screen.findByRole("button", { name: /^items/ })).click();
-      return screen.findByText("public.items");
-    },
-    query: button("Insert row"),
   },
   {
     name: "Recompute a merge into an open branch", operationId: "recomputeMerge",

@@ -45,7 +45,9 @@ use crate::{
     roles,
 };
 use chelabase_metadata::members::MemberBranchRole;
-use chelabase_nats::{MemberRoleHandOverRequest, MemberRolesReconcileRequest, MemberRolesReply};
+use chelabase_nats::{
+    MemberRoleApplied, MemberRoleHandOverRequest, MemberRolesReconcileRequest, MemberRolesReply,
+};
 use chelabase_routes::orchestrator as ep;
 use chelabase_secrets::open_member_role_password;
 use chelabase_types::access::{Access, Deny, PgRole, PlatformRole, Requested};
@@ -266,9 +268,9 @@ where
         .grant
         .as_ref()
         .is_some_and(|g| g.platform_role == PlatformRole::Admin);
-    // A role the branch has (or the data API's own): an Admin may always act as it.
-    let admin_may = admin
-        && (graph.as_ref().is_some_and(|g| g.has(role)) || matches!(role, "anon" | "authenticated"));
+    // A role the branch has: an Admin the access check let act as it may always (R22, login
+    // roles included). The data API's roles needed a grant naming them there (R18).
+    let admin_may = admin && graph.as_ref().is_some_and(|g| g.has(role));
     if graph.as_ref().is_some_and(|g| g.refusal(role).is_some()) {
         return if admin_may { as_owner(Some(role)).await } else { Err(role_forbidden(role)) };
     }
@@ -350,6 +352,38 @@ fn reconcile_failed() -> ApiError {
     .retry_after(RETRY_AFTER_SECS)
 }
 
+/// Asks the worker to reconcile `member`'s role on `branch` now
+/// (`chelabase.rpc.member_roles.reconcile`) and returns what it applied for that member (none
+/// when the member has no roles to act as there). A failure or timeout is 503
+/// `member_role_reconcile_failed`. The SQL editor's lazy check and the table API's reads (C1)
+/// both ask through here.
+pub(crate) async fn reconcile_member_role<M, J>(
+    state: &AppState<M, J>,
+    branch: BranchId,
+    member: Uuid,
+) -> Result<Option<MemberRoleApplied>, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let request = MemberRolesReconcileRequest { branch_id: branch.as_uuid(), member_id: Some(member) };
+    match state.js.reconcile_member_roles(request).await {
+        Ok(MemberRolesReply::Done { roles }) => Ok(roles.into_iter().find(|r| r.member_id == member)),
+        Ok(MemberRolesReply::Failed { message }) => {
+            warn!(branch_id = %branch, %member, "member-role reconcile failed: {message}");
+            Err(reconcile_failed())
+        }
+        Err(ResetError::Timeout) => {
+            warn!(branch_id = %branch, %member, "member-role reconcile timed out");
+            Err(reconcile_failed())
+        }
+        Err(ResetError::Transport(err)) => {
+            warn!(branch_id = %branch, %member, "member-role reconcile: {err}");
+            Err(reconcile_failed())
+        }
+    }
+}
+
 /// Whether a member role holding `applied` can `SET ROLE` to `role`: one of them, or reached
 /// through one's memberships as 6a records them (R21; Postgres checks the same at `SET ROLE`).
 fn reaches(applied: &[String], graph: Option<&RoleGraph>, role: &str) -> bool {
@@ -422,29 +456,9 @@ where
     let password = match fresh.and_then(open) {
         Some(password) => password,
         None => {
-            let request = MemberRolesReconcileRequest {
-                branch_id: branch.id.as_uuid(),
-                member_id: Some(member),
-            };
-            match state.js.reconcile_member_roles(request).await {
-                Ok(MemberRolesReply::Done { roles }) => {
-                    let mine = roles.into_iter().find(|r| r.member_id == member);
-                    if !mine.is_some_and(|r| reaches(&r.applied_roles, graph, role)) {
-                        return Err(role_forbidden(role));
-                    }
-                }
-                Ok(MemberRolesReply::Failed { message }) => {
-                    warn!(branch_id = %branch.id, %member, "member-role reconcile failed: {message}");
-                    return Err(reconcile_failed());
-                }
-                Err(ResetError::Timeout) => {
-                    warn!(branch_id = %branch.id, %member, "member-role reconcile timed out");
-                    return Err(reconcile_failed());
-                }
-                Err(ResetError::Transport(err)) => {
-                    warn!(branch_id = %branch.id, %member, "member-role reconcile: {err}");
-                    return Err(reconcile_failed());
-                }
+            let mine = reconcile_member_role(state, branch.id, member).await?;
+            if !mine.is_some_and(|r| reaches(&r.applied_roles, graph, role)) {
+                return Err(role_forbidden(role));
             }
             match read_row().await?.as_ref().and_then(open) {
                 Some(password) => password,

@@ -6,6 +6,7 @@ import {
   putGrantOverride,
   type DatabaseSummary,
   type GrantOverride,
+  type MeRoles,
   type PlatformRole,
   type Project,
 } from "@chelabase/management-client";
@@ -13,14 +14,15 @@ import { PlatformRoleField } from "@/components/members/platform-role-field";
 import { refreshAccess } from "@/components/members/keys";
 import { Button } from "@/components/ui/button";
 import { ROLE_LABEL } from "@/lib/members";
-import { refusal } from "@/lib/role-rules";
+import { actAsReserved, refusal } from "@/lib/role-rules";
 import { useRoleSources } from "./use-role-sources";
 import { failureOf, FailureText, type Failure } from "./failure";
 import { narrowsGrant, overrideWords } from "./narrowing";
 
 export interface NarrowingGrant {
   platformRole: PlatformRole;
-  pgRoles: string[];
+  /** `"all"` for an Admin grant (every role, R17). */
+  pgRoles: MeRoles;
 }
 
 export interface DatabaseNarrowingProps {
@@ -163,22 +165,30 @@ function NarrowingForm({
   const stored = override?.platform_role ?? null;
   const clamped = stored !== null && RANK[stored] > RANK[grant.platformRole];
   const [role, setRole] = useState<PlatformRole>(clamped ? grant.platformRole : (stored ?? grant.platformRole));
+  const every = grant.pgRoles === "all";
   const [allRoles, setAllRoles] = useState(override?.pg_roles == null);
-  const [chosen, setChosen] = useState<string[]>(override?.pg_roles ?? grant.pgRoles);
+  const [chosen, setChosen] = useState<string[]>(override?.pg_roles ?? (grant.pgRoles === "all" ? [] : grant.pgRoles));
   const [busy, setBusy] = useState(false);
-
-  const draft = {
-    platformRole: sameRole || role === grant.platformRole ? null : role,
-    pgRoles: allRoles ? null : grant.pgRoles.filter((r) => chosen.includes(r)),
-  };
-  const narrower = narrowsGrant(grant, draft);
-  const effective = draft.platformRole ?? grant.platformRole;
 
   // Below Admin the server refuses roles whose chain is owner-level, LOGIN or reserved on this
   // database (`check_effective`): while such a role is still held, the lower roles stay locked.
   const { sources } = useRoleSources([database]);
   const rows = sources[0]?.roles ?? [];
-  const held = allRoles ? grant.pgRoles : grant.pgRoles.filter((r) => chosen.includes(r));
+  // The roles a narrowing may keep: the grant's, or for every role (R17) this database's own
+  // (never the owner or a reserved name), with any the narrowing already names.
+  const offered: string[] =
+    grant.pgRoles === "all"
+      ? [...new Set([...rows.filter((r) => r.origin !== "owner" && !actAsReserved(r.name)).map((r) => r.name), ...(override?.pg_roles ?? [])])]
+      : grant.pgRoles;
+
+  const draft = {
+    platformRole: sameRole || role === grant.platformRole ? null : role,
+    pgRoles: allRoles ? null : offered.filter((r) => chosen.includes(r)),
+  };
+  const narrower = narrowsGrant(grant, draft);
+  const effective = draft.platformRole ?? grant.platformRole;
+  // Every role narrowed below Admin with no roles named keeps none there (R17).
+  const held = allRoles ? (every ? [] : offered) : offered.filter((r) => chosen.includes(r));
   const adminOnly = grant.platformRole === "admin" ? held.filter((r) => refusal(rows, r) !== null) : [];
   const locked: PlatformRole[] = adminOnly.length > 0 ? ["viewer", "developer"] : [];
 
@@ -230,19 +240,22 @@ function NarrowingForm({
             </p>
           )}
           {grant.platformRole === "admin" && effective !== "admin" && (
-            <p className="text-xs text-chalk-dim">Below Admin, {memberName} can't act as the database owner on {database.name}.</p>
+            <p className="text-xs text-chalk-dim">
+              Below Admin, {memberName} can't act as the database owner on {database.name}
+              {every && allRoles ? ", nor any role: pick the roles to keep." : "."}
+            </p>
           )}
         </div>
-        {grant.pgRoles.length > 0 && (
+        {offered.length > 0 && (
           <div className="space-y-2">
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" className={checkbox} checked={allRoles} onChange={(e) => setAllRoles(e.target.checked)} />
-              All of the project's roles
+              {every ? "All roles" : "All of the project's roles"}
             </label>
             {!allRoles && (
               <fieldset className="m-0 min-w-0 space-y-1 border-0 p-0">
                 <legend className="mb-1 text-sm font-medium">Roles on this database</legend>
-                {grant.pgRoles.map((r) => {
+                {offered.map((r) => {
                   const chain = chains.get(r) ?? [];
                   return (
                     <label key={r} htmlFor={`${id}-${r}`} className="flex items-center gap-2 text-sm">

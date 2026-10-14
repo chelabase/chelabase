@@ -18,7 +18,7 @@
 //! claims never both fail or both hold it. A claim refresh logs no event.
 
 use chelabase_types::TenantId;
-use chelabase_types::access::PlatformRole;
+use chelabase_types::access::{Grant, PgRole, PlatformRole, RoleSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -130,6 +130,34 @@ impl GrantRow {
     /// True when `pg_roles` names [`OWNER_ROLE`]: refused whatever the platform role (R7).
     pub fn names_owner(&self) -> bool {
         self.pg_roles.iter().any(|r| r == OWNER_ROLE)
+    }
+
+    /// A grant of `platform_role` with `pg_roles`, as the API writes it: R17, an Admin grant
+    /// holds every role on the project, so it names none (whatever was asked); below Admin the
+    /// roles sorted and deduplicated. [`GrantRow::to_grant`] reads an Admin row as every role
+    /// whatever it names.
+    pub fn new(platform_role: PlatformRole, pg_roles: &[String]) -> Self {
+        let pg_roles = match platform_role {
+            PlatformRole::Admin => Vec::new(),
+            _ => normalize_roles(pg_roles),
+        };
+        Self { platform_role, pg_roles }
+    }
+
+    /// R17: whether the grant holds every role on the project (an Admin grant).
+    pub fn every_role(&self) -> bool {
+        self.platform_role == PlatformRole::Admin
+    }
+
+    /// The access grant it gives: every role for Admin (R17, whatever a row from before that
+    /// names), else the named roles (`owner` is never stored, R7).
+    pub fn to_grant(&self) -> Grant {
+        let roles = if self.every_role() {
+            RoleSet::All
+        } else {
+            RoleSet::Only(self.pg_roles.iter().map(|r| PgRole::parse(r)).collect())
+        };
+        Grant { platform_role: self.platform_role, roles }
     }
 }
 
@@ -2733,6 +2761,26 @@ mod tests {
             }
         );
         assert!(override_from_parts(Some("boss"), None).is_err());
+    }
+
+    // R17: an Admin grant holds every role: the API writes it with no roles, and a row from
+    // before (naming some) still reads as every role.
+    #[test]
+    fn an_admin_grant_is_every_role() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let admin = GrantRow::new(PlatformRole::Admin, &names(&["b", "a"]));
+        assert_eq!(admin.pg_roles, Vec::<String>::new());
+        assert!(admin.every_role());
+        assert_eq!(admin.to_grant(), Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All });
+        let old = GrantRow { platform_role: PlatformRole::Admin, pg_roles: names(&["a"]) };
+        assert_eq!(old.to_grant().roles, RoleSet::All);
+        let dev = GrantRow::new(PlatformRole::Developer, &names(&["b", "a", "b"]));
+        assert_eq!(dev.pg_roles, names(&["a", "b"]));
+        assert!(!dev.every_role());
+        assert_eq!(
+            dev.to_grant().roles,
+            RoleSet::Only([PgRole::Named("a".into()), PgRole::Named("b".into())].into_iter().collect())
+        );
     }
 
     // R7: Admin implies the database owner, so `owner` is never stored, whatever the role.

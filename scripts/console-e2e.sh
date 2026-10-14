@@ -7,8 +7,9 @@
 #   unknown_database; the public key's list is edited too;
 # - the console as the owner (rows in analytics and in main: one owner pool per database), with
 #   insert, update, delete and a batch;
-# - the console as anon under a row-level security policy (it sees, writes and deletes only
-#   what the policies allow), as a plain role, as an owner-level role (refused), as a role that
+# - the console as anon under a row-level security policy, as a member whose grant names anon
+#   (it sees, writes and deletes only what the policies allow; the tenant admin is refused anon,
+#   R18), as a plain role, as an owner-level role (refused), as a role that
 #   doesn't exist (refused) and as one dropped after its check (unknown_role);
 # - an owner password set in SQL answers 409 owner_password_unknown until a reset;
 # - main can't be switched off; disable answers 409 data_api_disabled in the console and 404
@@ -41,6 +42,7 @@ die() {
   exit 1
 }
 cleanup() {
+  [[ -z "${MEMBER_ID:-}" ]] || api DELETE "/v1/members/$MEMBER_ID" >/dev/null || true
   if [[ -n "$db_id" && "${KEEP:-}" != 1 ]]; then
     api DELETE "/v1/databases/$db_id" >/dev/null || true
   fi
@@ -57,6 +59,8 @@ set +a
 ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
 [[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 trap cleanup EXIT
+# shellcheck source=lib/member-sign-in.sh
+. scripts/lib/member-sign-in.sh
 
 # ok <method> <path> <expected status> [body]: the call, or die.
 ok() {
@@ -110,9 +114,17 @@ db_field() {
 
 # console <role JSON: null or "name"> <database JSON: null or "name"> <tree>: the console call;
 # prints the status, the body goes to $tmp/body.
+# As the demo tenant admin, or as the person whose token is in $CONSOLE_TOKEN.
 console() {
-  api POST "$branch/console/query" "$(jq -nc --argjson r "$1" --argjson d "$2" --argjson t "$3" \
-    '{role: $r, database: $d, tree: $t}')"
+  local body
+  body="$(jq -nc --argjson r "$1" --argjson d "$2" --argjson t "$3" '{role: $r, database: $d, tree: $t}')"
+  if [[ -z "${CONSOLE_TOKEN:-}" ]]; then
+    api POST "$branch/console/query" "$body"
+    return
+  fi
+  printf 'Authorization: Bearer %s\n' "$CONSOLE_TOKEN" |
+    curl -sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -H @- -H 'content-type: application/json' \
+      -X POST -d "$body" "$GATEWAY$branch/console/query" || true
 }
 # console_ok <role> <database> <tree> <jq check>: a 200 whose body passes the check.
 console_ok() {
@@ -234,12 +246,27 @@ console_err null '"nope"' '{"v":1,"op":"select","from":"items"}' 404 not_found
 pass "owner: reads in main and $DB2, insert, update, delete and a batch"
 
 # 5. Row-level security, as anon: it sees, writes and deletes only what the policies allow.
+# Every role leaves out the data API's anon (R18): the tenant admin is refused, and a member
+# whose grant names anon acts as it (their member role is made and reconciled on first use:
+# the first call may take a few tries).
 psql_in "$DB2" -c "ALTER TABLE app.items ENABLE ROW LEVEL SECURITY;
   GRANT INSERT, UPDATE, DELETE ON app.items TO anon;
   CREATE POLICY anon_read ON app.items FOR SELECT TO anon USING (visibility = 'public');
   CREATE POLICY anon_write ON app.items FOR INSERT TO anon WITH CHECK (visibility = 'public');
   CREATE POLICY anon_edit ON app.items FOR UPDATE TO anon USING (visibility = 'public') WITH CHECK (visibility = 'public');
   CREATE POLICY anon_delete ON app.items FOR DELETE TO anon USING (visibility = 'public');" >/dev/null
+status="$(console '"anon"' "\"$DB2\"" '{"v":1,"op":"select","from":"items"}')"
+[[ "$status" == 403 && "$(jq -r '.error.code' "$tmp/body")" == forbidden &&
+  "$(jq -r '.error.required' "$tmp/body")" == role:anon ]] ||
+  die "the tenant admin as anon: $status $(cat "$tmp/body") (wanted 403 forbidden role:anon)"
+new_member "$DEMO_PROJECT_ID" '{"platform_role":"developer","pg_roles":["anon"]}'
+CONSOLE_TOKEN="$(member_token)"
+for _ in $(seq 30); do
+  status="$(console '"anon"' "\"$DB2\"" '{"v":1,"op":"select","from":"items"}')"
+  [[ "$status" == 200 ]] && break
+  sleep 2
+done
+[[ "$status" == 200 ]] || die "the member's first call as anon: $status $(cat "$tmp/body")"
 console_ok '"anon"' "\"$DB2\"" '{"v":1,"op":"select","from":"items"}' '[.[].label] == ["first"]'
 console_ok '"anon"' "\"$DB2\"" '{"v":1,"op":"insert","into":"items","values":[{"label":"from anon","visibility":"public"}],"returning":["id"]}' \
   'length == 1'
@@ -252,8 +279,9 @@ console_ok '"anon"' "\"$DB2\"" "{\"v\":1,\"op\":\"update\",\"table\":\"items\",\
   '. == [{"label":"from anon, edited"}]'
 console_ok '"anon"' "\"$DB2\"" '{"v":1,"op":"delete","from":"items","all":true,"returning":["label"]}' \
   '[.[].label] | sort == ["first","from anon, edited"]'
+CONSOLE_TOKEN=""
 console_ok null "\"$DB2\"" '{"v":1,"op":"select","from":"items"}' '[.[].label] == ["second"]'
-pass "anon under RLS: reads, inserts, updates and deletes only public rows; the owner sees the rest"
+pass "the tenant admin as anon is 403 role:anon; a member granted anon reads, inserts, updates and deletes only public rows under RLS; the owner sees the rest"
 
 # 6. Other roles: a plain one, an owner-level one, one that doesn't exist, one dropped later.
 psql_in "$DB2" -c "CREATE ROLE reporter NOLOGIN; GRANT USAGE ON SCHEMA app TO reporter;

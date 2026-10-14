@@ -114,8 +114,8 @@ function EventRow({ event, context, detailsRef }: { event: AccessEvent; context:
       </div>
       {open && (
         <div id={detailsId} className="grid gap-3 pb-3 sm:grid-cols-2">
-          <Payload label="Before" fields={eventFields(event.before, context)} />
-          <Payload label="After" fields={eventFields(event.after, context)} />
+          <Payload label="Before" fields={eventFields(event.before, context, event.action)} />
+          <Payload label="After" fields={eventFields(event.after, context, event.action)} />
         </div>
       )}
     </li>

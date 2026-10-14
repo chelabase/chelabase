@@ -2167,8 +2167,9 @@ impl From<MemberStatus> for MemberStatusView {
 struct MeProject {
     project_id: ProjectId,
     platform_role: chelabase_types::access::PlatformRole,
-    /// The Postgres roles the caller may act as on the project: `"all"` for a tenant admin,
-    /// else the names (`owner`, the database's owner, comes with the admin role). A database
+    /// The Postgres roles the caller may act as on the project: `"all"` for an admin (a tenant
+    /// admin, or a project admin, R17), else the names (`owner`, the database's owner, comes
+    /// with the admin role). A database
     /// the grant is narrowed on may allow less: see `databases`.
     roles: MeRoles,
     /// The databases of the project the caller's grant is narrowed on, with what they may do
@@ -2186,16 +2187,19 @@ struct MeDatabase {
     roles: MeRoles,
 }
 
+/// Postgres roles: `"all"` (an Admin's: every role of the branch, the owner included, but not
+/// the data API's `anon` and `authenticated` for acting as them, which need a grant naming
+/// them), or the names.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
-enum MeRoles {
+pub(crate) enum MeRoles {
     All(AllRoles),
     Only(Vec<String>),
 }
 
 /// Every role, the owner included.
 #[derive(Debug, Serialize, ToSchema)]
-enum AllRoles {
+pub(crate) enum AllRoles {
     #[serde(rename = "all")]
     All,
 }

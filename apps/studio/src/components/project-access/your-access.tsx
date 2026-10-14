@@ -35,11 +35,11 @@ export function YourAccess({ project, me, compact = false }: { project: Project;
       </section>
     );
   }
-  return <RolesAccess project={project} role={caps.role} roles={caps.roles === "all" ? [] : caps.roles} label={label} />;
+  return <RolesAccess project={project} role={caps.role} roles={caps.roles} label={label} />;
 }
 
 /** The full view (below Admin): roles with their chains, which need the databases' role lists. */
-function RolesAccess({ project, role, roles, label }: { project: Project; role: PlatformRole; roles: string[]; label: string }) {
+function RolesAccess({ project, role, roles, label }: { project: Project; role: PlatformRole; roles: "all" | string[]; label: string }) {
   const { sources } = useRoleSources(project.databases);
   const chains = chainsOf(sources);
   return (
@@ -50,7 +50,10 @@ function RolesAccess({ project, role, roles, label }: { project: Project; role: 
       <p className="text-sm text-chalk">
         You're {article(label)} {label} on {project.name}.
       </p>
-      {roles.length > 0 ? (
+      {roles === "all" ? (
+        // R17: an Admin holds every role of the project.
+        <p className="text-sm text-chalk">You may act as every role of the project, the database owner included.</p>
+      ) : roles.length > 0 ? (
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span className="text-chalk">You may act as</span>
           {roles.map((r) => {

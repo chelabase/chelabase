@@ -6,4 +6,9 @@
  */
 import type { AllRoles } from './allRoles.ts';
 
+/**
+ * Postgres roles: `"all"` (an Admin's: every role of the branch, the owner included, but not
+ * the data API's `anon` and `authenticated` for acting as them, which need a grant naming
+ * them), or the names.
+ */
 export type MeRoles = AllRoles | string[];

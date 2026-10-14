@@ -202,7 +202,7 @@ pub struct ConsoleRequest {
 /// its operations is.
 pub fn write_kind(op: &Op) -> Option<&'static str> {
     match op {
-        Op::Select(_) => None,
+        Op::Select(_) | Op::Count(_) => None,
         Op::Insert(_) => Some("insert"),
         Op::Update(_) => Some("update"),
         Op::Delete(_) => Some("delete"),
@@ -1038,6 +1038,8 @@ mod tests {
         let select = json!({ "v": 1, "op": "select", "from": "t" });
         let insert = json!({ "v": 1, "op": "insert", "into": "t", "values": [{ "a": 1 }] });
         assert_eq!(write_kind(&op(select.clone())), None);
+        // A count is a read: Viewers may run it.
+        assert_eq!(write_kind(&op(json!({ "v": 1, "op": "count", "from": "t" }))), None);
         assert_eq!(write_kind(&op(insert.clone())), Some("insert"));
         assert_eq!(
             write_kind(&op(

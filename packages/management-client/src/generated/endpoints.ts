@@ -8416,7 +8416,7 @@ export const getPutProjectGrantUrl = (id: string,
 }
 
 /**
- * Creates or replaces the member's grant. `admin` includes the database owner, so `owner` (or the owner's name) is never listed. Below `admin`, each role must be a NOLOGIN group whose memberships (every one, whatever its options) reach no owner-level role (the owner, `neon_superuser`, `cloud_admin`, or SUPERUSER, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), LOGIN role, reserved role or role that holds the ADMIN option on another role, on any branch. The same holds on each database for what the member's overrides there leave of the grant; a grant that breaks it is refused naming the database. Every branch of the project then reconciles its member roles.
+ * Creates or replaces the member's grant. `admin` holds every role on the project, the database owner included (the names in `pg_roles` are checked, then dropped, and it is answered as `"all"`; overrides still narrow it per database), so `owner` (or the owner's name) is never listed. Below `admin`, each role must be a NOLOGIN group whose memberships (every one, whatever its options) reach no owner-level role (the owner, `neon_superuser`, `cloud_admin`, or SUPERUSER, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), LOGIN role, reserved role or role that holds the ADMIN option on another role, on any branch. The same holds on each database for what the member's overrides there leave of the grant; a grant that breaks it is refused naming the database. Every branch of the project then reconciles its member roles.
  * @summary Grant a member access to a project
  */
 export const putProjectGrant = async (id: string,
@@ -8585,7 +8585,7 @@ export const getPutGrantOverrideUrl = (id: string,
 }
 
 /**
- * An override only narrows: its role is at most the grant's, its roles some of the grant's. Narrowing below `admin` takes the database owner away there, and the roles left must pass the same checks as a grant below `admin`. Every branch of the project then reconciles its member roles.
+ * An override only narrows: its role is at most the grant's, its roles some of the grant's (any roles for an `admin` grant, which holds every role: the member keeps only those there, with the owner while still `admin`). Narrowing below `admin` takes the database owner away there, and the roles left must pass the same checks as a grant below `admin`. Every branch of the project then reconciles its member roles.
  * @summary Narrow a member's grant on one database
  */
 export const putGrantOverride = async (id: string,

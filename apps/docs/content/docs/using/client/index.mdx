@@ -42,6 +42,16 @@ const first = rows[0];
 
 `select()` and `returning()` need at least one column. Leave `select()` out for every column. Filters are covered on [Filters](/docs/using/client/filters).
 
+`count()` counts the matching rows as your role sees them (row-level security applies) and resolves to `{ count: number }`. It sends only the table and the filter; a count after `limit()` or `offset()` throws.
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
+// ---cut---
+const { count } = await db.from("orders").where({ vip: true }).count();
+```
+
 `toTree()` returns the exact JSON tree a builder sends, the [query language](/docs/using/data-api/query-language) of the data API:
 
 ```ts twoslash

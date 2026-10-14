@@ -271,12 +271,14 @@ describe("SqlEditor", () => {
     expect(screen.queryByText(/Protected branch/)).not.toBeInTheDocument();
   });
 
-  it("anon_listed_only_when_bootstrapped", async () => {
+  // R18 (user, 2026-10-14): an Admin doesn't run as the data API's roles unless a grant names
+  // them; previewing the data API is TE-B2's View as.
+  it("admins_dont_run_as_anon_without_a_named_grant", async () => {
     const { user } = setup({ databases: [dbView("app", true), dbView("analytics", false, "off")] });
     const sel = await screen.findByLabelText("Run as");
     await screen.findByRole("option", { name: "reporter" });
     const names = () => Array.from(sel.querySelectorAll("option")).map((o) => o.textContent);
-    expect(names()).toEqual(["Owner", "anon", "authenticated", "reporter"]);
+    expect(names()).toEqual(["Owner", "reporter"]);
     await user.selectOptions(screen.getByLabelText("Database"), "analytics");
     await waitFor(() => expect(names()).toEqual(["Owner", "reporter"]));
   });

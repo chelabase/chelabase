@@ -29,6 +29,11 @@ export interface MultiComboboxProps {
   notes?: readonly string[];
   /** Mono labels: the values are code (role names). */
   mono?: boolean;
+  /**
+   * Where the popup opens (default below). A field above a dialog's buttons opens it above, so
+   * the open list never covers them (it flips when there's no room).
+   */
+  side?: "top" | "bottom";
 }
 
 const optionRow =
@@ -39,7 +44,7 @@ const optionRow =
  * (deep water, strong hairline, square). Arrow keys move, Enter toggles, Backspace in an empty
  * field removes the last chip, Escape closes. Disabled options stay listed with their reason.
  */
-export function MultiCombobox({ label, options, value, onValueChange, chipDetail, invalid, placeholder, disabled, status, notes, mono }: MultiComboboxProps) {
+export function MultiCombobox({ label, options, value, onValueChange, chipDetail, invalid, placeholder, disabled, status, notes, mono, side = "bottom" }: MultiComboboxProps) {
   const id = useId();
   const byValue = new Map(options.map((o) => [o.value, o]));
   // Enabled options first, then the ones that can't be chosen (with their reasons).
@@ -88,7 +93,7 @@ export function MultiCombobox({ label, options, value, onValueChange, chipDetail
         </Combobox.InputGroup>
       </div>
       <Combobox.Portal>
-        <Combobox.Positioner sideOffset={4} className="z-[60] outline-none">
+        <Combobox.Positioner side={side} sideOffset={4} className="z-[60] outline-none">
           <Combobox.Popup className="max-h-[min(var(--available-height),20rem)] w-[var(--anchor-width)] overflow-y-auto border border-line-strong bg-deep p-1 text-sm text-chalk">
             {notes?.map((n) => (
               <p key={n} className="px-2 py-1.5 text-xs text-chalk-dim">

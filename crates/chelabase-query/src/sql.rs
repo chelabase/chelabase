@@ -431,6 +431,15 @@ impl<'c, C: Catalog> Planner<'c, C> {
                     format!("SELECT to_json({call})::text")
                 }))
             }
+            Op::Count(c) => {
+                let table = self.table(&c.from)?;
+                let filter = self.where_clause(table, c.filter.as_ref())?;
+                // `count(*)` is a bigint; `json_build_object` writes it as a JSON number.
+                Ok(Built::from(format!(
+                    "SELECT json_build_object('count', count(*))::text FROM {}{filter}",
+                    table_sql(table)
+                )))
+            }
             Op::Batch(_) => Err(invalid("batches don't nest")),
         }
     }

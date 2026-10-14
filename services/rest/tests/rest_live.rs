@@ -2505,3 +2505,29 @@ async fn child_branch_serves_the_parent_second_database() {
     })
     .await;
 }
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn count_respects_rls_and_filters() {
+    live("count", |l| async move {
+        l.owner(
+            "CREATE TABLE c (v int, visible boolean);
+             INSERT INTO c SELECT g, g % 2 = 0 FROM generate_series(1, 10) g;
+             ALTER TABLE c ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY see ON c FOR SELECT TO anon USING (visible);",
+        )
+        .await;
+        assert_eq!(l.anon(json!({"v":1,"op":"count","from":"c"})).await.ok(), &json!({"count": 5}));
+        assert_eq!(
+            l.anon(json!({"v":1,"op":"count","from":"c","where":{"col":"v","gt":4}})).await.ok(),
+            &json!({"count": 3})
+        );
+        // RLS on and no policy for authenticated: nothing to count.
+        assert_eq!(l.auth(json!({"v":1,"op":"count","from":"c"})).await.ok(), &json!({"count": 0}));
+        assert_eq!(
+            l.anon(json!({"v":1,"op":"batch","ops":[{"op":"count","from":"c"},{"op":"select","from":"c","select":["v"],"where":{"col":"v","eq":2}}]})).await.ok(),
+            &json!([{"count": 5}, [{"v": 2}]])
+        );
+    })
+    .await;
+}

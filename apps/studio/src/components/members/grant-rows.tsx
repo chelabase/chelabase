@@ -26,7 +26,8 @@ export interface RowError {
 }
 
 export function toInviteGrants(rows: readonly GrantRow[]): InviteGrant[] {
-  return rows.map((r) => ({ project_id: r.projectId, platform_role: r.platformRole, pg_roles: r.pgRoles }));
+  // R17: an Admin grant holds every role, so it names none.
+  return rows.map((r) => ({ project_id: r.projectId, platform_role: r.platformRole, pg_roles: r.platformRole === "admin" ? [] : r.pgRoles }));
 }
 
 export interface GrantRowsProps {

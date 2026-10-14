@@ -270,3 +270,40 @@ fn a_database_inside_a_batch_op_is_refused() {
         }
     }
 }
+
+// ---- count (TE-B1 T8) ----
+
+#[test]
+fn count_parses_with_an_optional_where() {
+    match accepted(r#"{"v":1,"op":"count","from":"billing.invoices","where":{"col":"paid","eq":false}}"#) {
+        Op::Count(c) => {
+            assert_eq!(c.from, Name { schema: Some("billing".into()), name: "invoices".into() });
+            assert!(c.filter.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    match accepted(r#"{"v":1,"op":"count","from":"t"}"#) {
+        Op::Count(c) => assert!(c.filter.is_none()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn count_takes_no_select_order_limit_or_offset() {
+    for field in [r#""limit":1"#, r#""offset":1"#, r#""select":["a"]"#, r#""orderBy":[{"col":"a"}]"#] {
+        let json = format!(r#"{{"v":1,"op":"count","from":"t",{field}}}"#);
+        let msg = rejected(&json);
+        let name = field.split('"').nth(1).unwrap();
+        assert!(msg.contains(name), "{json}: {msg}");
+    }
+}
+
+#[test]
+fn count_is_listed_and_allowed_in_a_batch() {
+    let msg = rejected(r#"{"v":1,"op":"merge","from":"t"}"#);
+    assert!(msg.contains("`count`"), "{msg}");
+    match accepted(r#"{"v":1,"op":"batch","ops":[{"op":"count","from":"t"},{"op":"select","from":"t"}]}"#) {
+        Op::Batch(ops) => assert!(matches!(ops[0], Op::Count(_)), "{ops:?}"),
+        other => panic!("{other:?}"),
+    }
+}

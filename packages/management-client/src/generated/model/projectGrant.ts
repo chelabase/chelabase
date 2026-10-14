@@ -5,6 +5,7 @@
  * OpenAPI spec version: 1
  */
 import type { GrantOverride } from './grantOverride.ts';
+import type { MeRoles } from './meRoles.ts';
 import type { PlatformRole } from './platformRole.ts';
 
 /**
@@ -13,8 +14,13 @@ import type { PlatformRole } from './platformRole.ts';
 export interface ProjectGrant {
   member_id: string;
   overrides: GrantOverride[];
-  /** Sorted. A granted role includes every role it can `SET ROLE` to. */
-  pg_roles: string[];
+  /**
+     * `"all"` for `admin`: every role on the project (narrowed per database by `overrides`),
+     * except the data API's `anon` and `authenticated` for acting as them, which need a grant
+     * naming them. Below `admin` the names, sorted; a granted role includes every role it can
+     * `SET ROLE` to.
+     */
+  pg_roles: MeRoles;
   /** `admin` includes the database owner. */
   platform_role: PlatformRole;
 }

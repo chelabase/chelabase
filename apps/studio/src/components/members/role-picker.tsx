@@ -139,11 +139,19 @@ export function RolePicker({ databases, platformRole, value, onChange, refused, 
       ? "No roles to grant yet. Create a NOLOGIN group role on a branch (Branches → Roles), or in SQL with CREATE ROLE … NOLOGIN."
       : undefined;
 
+  // R17: an Admin grant holds every role on the project; narrowing is per database.
+  if (platformRole === "admin") {
+    return (
+      <div role="group" aria-label="Postgres roles" className="space-y-1">
+        <p className="text-sm font-medium">Postgres roles</p>
+        <p className="text-sm">All roles</p>
+        <p className="text-xs text-chalk-dim">An Admin holds every role of the project, the owner included. Narrow it on a database to keep fewer roles there.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-1">
-      {platformRole === "admin" && (
-        <p className="text-xs text-chalk-dim">List the roles they should also act as; the owner is already included.</p>
-      )}
       <MultiCombobox
         label="Postgres roles"
         mono

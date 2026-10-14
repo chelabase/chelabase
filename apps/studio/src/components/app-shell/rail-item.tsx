@@ -1,7 +1,7 @@
 import { Tooltip } from "@base-ui/react/tooltip";
 import { Link } from "@tanstack/react-router";
 import { cn } from "@/lib/utils";
-import { isRailItemActive, type RailEntry } from "./rail-items";
+import { isRailItemActive, TABLES_ROUTE, type RailEntry } from "./rail-items";
 
 export interface RailItemProps {
   entry: RailEntry;
@@ -57,7 +57,7 @@ export function RailItem({ entry, pathname, expanded, tooltip, badge = 0 }: Rail
   const active = isRailItemActive(entry.id, pathname);
   const link = (
     <Link
-      to={entry.to}
+      to={entry.to === "/app/tables" ? TABLES_ROUTE : entry.to}
       aria-label={counted ? badgeName(entry.label, badge) : undefined}
       aria-current={active ? "page" : undefined}
       activeOptions={{ exact: true }}

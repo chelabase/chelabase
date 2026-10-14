@@ -44,7 +44,8 @@ const grants: ProjectGrant[] = [
     overrides: [{ database_id: "d1", platform_role: "viewer", pg_roles: null }],
   },
   { member_id: "cy", platform_role: "viewer", pg_roles: ["reporting"], overrides: [] },
-  { member_id: "eve", platform_role: "admin", pg_roles: ["reporting"], overrides: [] },
+  // R17: an Admin grant is every role.
+  { member_id: "eve", platform_role: "admin", pg_roles: "all", overrides: [] },
   { member_id: "gus", platform_role: "developer", pg_roles: ["billing_admin", "reporting"], overrides: [] },
   { member_id: "fay", platform_role: "admin", pg_roles: ["app_login"], overrides: [] },
 ];
@@ -103,17 +104,16 @@ describe("AccessTab", () => {
     const eve = await screen.findByText("eve@example.test");
     const eveRow = eve.closest("tr")!;
     expect(within(eveRow).getByText("includes the database owner")).toBeInTheDocument();
-    // Only the listed role is a chip; the owner ("o") is never one.
-    expect(within(eveRow).getByText("reporting")).toBeInTheDocument();
+    // R17: an Admin holds every role: no chips, the owner ("o") never one.
+    expect(within(eveRow).getByText("All roles")).toBeInTheDocument();
     expect(within(eveRow).queryByText("o")).toBeNull();
     expect(within(eveRow).queryByText(/owner chip/i)).toBeNull();
 
+    // The editor shows every role instead of a role picker; narrowing stays per database.
     const editor = await openEditor("Eve");
-    expect(within(editor).getByText("List the roles they should also act as; the owner is already included.")).toBeInTheDocument();
-    await userEvent.click(within(editor).getByLabelText("Postgres roles"));
-    expect(await screen.findByRole("option", { name: /^billing_admin/ })).toBeInTheDocument();
-    expect(screen.queryByRole("option", { name: /^o\b/ })).toBeNull();
-    expect(screen.queryByRole("option", { name: /owner/i })).toBeNull();
+    const roles = within(editor).getByRole("group", { name: "Postgres roles" });
+    expect(within(roles).getByText("All roles")).toBeInTheDocument();
+    expect(within(editor).queryByRole("combobox", { name: "Postgres roles" })).toBeNull();
   });
 
   it("narrow_table_keeps_roles_and_narrowing_on_separate_lines", async () => {
@@ -508,7 +508,24 @@ describe("AccessTab", () => {
     expect(within(form).queryByText(/can't act as the database owner/)).toBeNull();
     await userEvent.click(within(form).getByRole("checkbox", { name: "Same as the project" }));
     await userEvent.click(within(form).getByRole("radio", { name: "Developer" }));
-    expect(within(form).getByText("Below Admin, Eve can't act as the database owner on events.")).toBeInTheDocument();
+    // R17: Eve's every role narrowed below Admin without named roles keeps none.
+    expect(within(form).getByText("Below Admin, Eve can't act as the database owner on events, nor any role: pick the roles to keep.")).toBeInTheDocument();
+  });
+
+  // R17: narrowing an Admin's every role offers the database's own roles and sends the ones kept.
+  it("narrowing_every_role_offers_the_databases_roles", async () => {
+    const { f } = setup({
+      routes: { "PUT /v1/projects/p1/grants/eve/overrides": ok({ database_id: "d1", platform_role: null, pg_roles: ["reporting"] }) },
+    });
+    const editor = await openEditor("Eve");
+    await userEvent.click(within(within(editor).getByRole("group", { name: "orders" })).getByRole("button", { name: "Narrow access on orders" }));
+    const form = await within(editor).findByRole("form", { name: "Narrow on orders" });
+    await userEvent.click(within(form).getByRole("checkbox", { name: "All roles" }));
+    await userEvent.click(await within(form).findByRole("checkbox", { name: /^reporting/ }));
+    await userEvent.click(within(form).getByRole("button", { name: "Save narrowing" }));
+    const puts = () => f.calls.filter((r) => r.method === "PUT");
+    await waitFor(() => expect(puts()).toHaveLength(1));
+    expect(await puts()[0].clone().json()).toEqual({ database_id: "d1", platform_role: null, pg_roles: ["reporting"] });
   });
 
   it("admin_only_roles_keep_admin_in_a_narrowing", async () => {

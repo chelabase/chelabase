@@ -764,3 +764,31 @@ fn param_types_follow_binds() {
         vec![ParamType::Jsonb, ParamType::Int8, ParamType::Int8]
     );
 }
+
+// ---- count (TE-B1 T8) ----
+
+#[test]
+fn golden_count() {
+    let p = one(r#"{"v":1,"op":"count","from":"billing.invoices","where":{"col":"amount","gt":100}}"#);
+    assert_eq!(
+        p.sql,
+        r#"SELECT json_build_object('count', count(*))::text FROM "billing"."invoices" WHERE "amount" > CAST($1 AS numeric)"#
+    );
+    assert_eq!(p.binds, vec![text_where(&[])]);
+    let all = one(r#"{"v":1,"op":"count","from":"Order"}"#);
+    assert_eq!(all.sql, r#"SELECT json_build_object('count', count(*))::text FROM "public"."Order""#);
+    assert!(all.binds.is_empty());
+}
+
+#[test]
+fn count_errors_like_select() {
+    assert_eq!(code(r#"{"v":1,"op":"count","from":"nope"}"#), "unknown_table");
+    assert_eq!(code(r#"{"v":1,"op":"count","from":"Order","where":{"col":"nope","eq":1}}"#), code(r#"{"v":1,"op":"select","from":"Order","where":{"col":"nope","eq":1}}"#));
+}
+
+#[test]
+fn count_in_a_batch_binds_per_member() {
+    let p = plans(r#"{"v":1,"op":"batch","ops":[{"op":"select","from":"Order","select":["id"],"limit":1},{"op":"count","from":"billing.invoices","where":{"col":"amount","gt":1}}]}"#).unwrap();
+    assert_eq!(p.len(), 2);
+    assert_eq!(p[1].binds, vec![Bind::Text(Path { op: Some(1), slot: Slot::Where(vec![]) })]);
+}

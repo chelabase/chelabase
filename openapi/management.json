@@ -3056,7 +3056,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your login on the branch didn't exist yet and couldn't be prepared (`Retry-After`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5959,7 +5959,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your login on the branch didn't exist yet and couldn't be prepared (`Retry-After`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6451,7 +6451,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your login on the branch didn't exist yet and couldn't be prepared (`Retry-After`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -10980,7 +10980,7 @@
           "members"
         ],
         "summary": "Grant a member access to a project",
-        "description": "Creates or replaces the member's grant. `admin` includes the database owner, so `owner` (or the owner's name) is never listed. Below `admin`, each role must be a NOLOGIN group whose memberships (every one, whatever its options) reach no owner-level role (the owner, `neon_superuser`, `cloud_admin`, or SUPERUSER, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), LOGIN role, reserved role or role that holds the ADMIN option on another role, on any branch. The same holds on each database for what the member's overrides there leave of the grant; a grant that breaks it is refused naming the database. Every branch of the project then reconciles its member roles.",
+        "description": "Creates or replaces the member's grant. `admin` holds every role on the project, the database owner included (the names in `pg_roles` are checked, then dropped, and it is answered as `\"all\"`; overrides still narrow it per database), so `owner` (or the owner's name) is never listed. Below `admin`, each role must be a NOLOGIN group whose memberships (every one, whatever its options) reach no owner-level role (the owner, `neon_superuser`, `cloud_admin`, or SUPERUSER, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), LOGIN role, reserved role or role that holds the ADMIN option on another role, on any branch. The same holds on each database for what the member's overrides there leave of the grant; a grant that breaks it is refused naming the database. Every branch of the project then reconciles its member roles.",
         "operationId": "putProjectGrant",
         "parameters": [
           {
@@ -11219,7 +11219,7 @@
           "members"
         ],
         "summary": "Narrow a member's grant on one database",
-        "description": "An override only narrows: its role is at most the grant's, its roles some of the grant's. Narrowing below `admin` takes the database owner away there, and the roles left must pass the same checks as a grant below `admin`. Every branch of the project then reconciles its member roles.",
+        "description": "An override only narrows: its role is at most the grant's, its roles some of the grant's (any roles for an `admin` grant, which holds every role: the member keeps only those there, with the owner while still `admin`). Narrowing below `admin` takes the database owner away there, and the roles left must pass the same checks as a grant below `admin`. Every branch of the project then reconciles its member roles.",
         "operationId": "putGrantOverride",
         "parameters": [
           {
@@ -15691,7 +15691,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Postgres role names. Never `owner` or the database's owner (the admin platform role\nincludes it), nor a reserved name. Below admin, only NOLOGIN groups whose memberships\nreach no owner-level, LOGIN or reserved role."
+            "description": "Postgres role names; for `admin`, which holds every role (R17), checked and dropped.\nNever `owner` or the database's owner (the admin platform role includes it), nor a\nreserved name. Below admin, only NOLOGIN groups whose memberships reach no owner-level,\nLOGIN or reserved role."
           },
           "platform_role": {
             "$ref": "#/components/schemas/PlatformRole"
@@ -15829,7 +15829,7 @@
           },
           "roles": {
             "$ref": "#/components/schemas/MeRoles",
-            "description": "The Postgres roles the caller may act as on the project: `\"all\"` for a tenant admin,\nelse the names (`owner`, the database's owner, comes with the admin role). A database\nthe grant is narrowed on may allow less: see `databases`."
+            "description": "The Postgres roles the caller may act as on the project: `\"all\"` for an admin (a tenant\nadmin, or a project admin, R17), else the names (`owner`, the database's owner, comes\nwith the admin role). A database\nthe grant is narrowed on may allow less: see `databases`."
           }
         }
       },
@@ -15933,7 +15933,8 @@
               "type": "string"
             }
           }
-        ]
+        ],
+        "description": "Postgres roles: `\"all\"` (an Admin's: every role of the branch, the owner included, but not\nthe data API's `anon` and `authenticated` for acting as them, which need a grant naming\nthem), or the names."
       },
       "MeUser": {
         "type": "object",
@@ -17462,11 +17463,8 @@
             }
           },
           "pg_roles": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Sorted. A granted role includes every role it can `SET ROLE` to."
+            "$ref": "#/components/schemas/MeRoles",
+            "description": "`\"all\"` for `admin`: every role on the project (narrowed per database by `overrides`),\nexcept the data API's `anon` and `authenticated` for acting as them, which need a grant\nnaming them. Below `admin` the names, sorted; a granted role includes every role it can\n`SET ROLE` to."
           },
           "platform_role": {
             "$ref": "#/components/schemas/PlatformRole",
@@ -17632,7 +17630,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Postgres role names. Never `owner` or the database's owner (the admin platform role\nincludes it), nor a reserved name. Below admin, only NOLOGIN groups whose memberships\nreach no owner-level, LOGIN or reserved role."
+            "description": "Postgres role names; for `admin`, which holds every role (R17), checked and dropped.\nNever `owner` or the database's owner (the admin platform role includes it), nor a\nreserved name. Below admin, only NOLOGIN groups whose memberships reach no owner-level,\nLOGIN or reserved role."
           },
           "platform_role": {
             "$ref": "#/components/schemas/PlatformRole"

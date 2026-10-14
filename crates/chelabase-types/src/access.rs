@@ -71,7 +71,10 @@ impl PgRole {
 /// The Postgres roles a grant allows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoleSet {
-    /// Every role, the owner included: only a tenant admin's grant (always Admin).
+    /// Every role of the branch, the owner included: an Admin's grant (a project Admin's,
+    /// ruling R17, and a tenant admin's), never below Admin. It doesn't hold the data API's
+    /// `anon` and `authenticated` for acting as them (R18): only a set naming them does (see
+    /// [`RoleSet::may_act_as`]).
     All,
     Only(BTreeSet<PgRole>),
 }
@@ -81,6 +84,19 @@ impl RoleSet {
         match self {
             Self::All => true,
             Self::Only(set) => set.contains(r),
+        }
+    }
+
+    /// Whether a grant with these roles lets its holder act as the named role `name` (R18):
+    /// never a name [`act_as_reserved`] refuses; `All` is every other role except the data
+    /// API's `anon` and `authenticated`, which need a set naming them.
+    pub fn may_act_as(&self, name: &str) -> bool {
+        if act_as_reserved(name) {
+            return false;
+        }
+        match self {
+            Self::All => !data_api_role(name),
+            Self::Only(set) => set.contains(&PgRole::Named(name.to_string())),
         }
     }
 
@@ -118,24 +134,41 @@ pub struct Narrowing {
 /// - Grant rows never store the owner. Entries no grant may hold are dropped defensively (the
 ///   grant API refuses them): `owner` in any case, [`PgRole::Owner`], and every name
 ///   [`act_as_reserved`] refuses (the owner's own name `postgres` among them).
-/// - A tenant admin's grant (Admin + `RoleSet::All`) comes back unchanged: a tenant admin is
-///   Admin with every role on every project, whatever override rows they hold as a member.
+/// - R17: a project Admin's grant is every role (Admin + `RoleSet::All`). An override narrows
+///   it as any grant: its roles alone are kept (with the owner while still Admin); a level
+///   below Admin without roles leaves no roles; an override that changes neither keeps `All`.
 ///   `All` without Admin is malformed and is read as no roles.
+/// - A tenant admin escapes narrowing because the callers that know the caller is one never
+///   pass their member overrides (they use [`tenant_admin_grant`] directly), not because of
+///   the grant's shape: a project Admin's grant has the same shape.
 pub fn effective(project: &Grant, database: Option<&Narrowing>) -> Grant {
-    if project == &tenant_admin_grant() {
-        return tenant_admin_grant();
-    }
     let mut role = project.platform_role;
+    let every = project.platform_role == PlatformRole::Admin && project.roles == RoleSet::All;
     let mut roles: BTreeSet<PgRole> = match &project.roles {
         RoleSet::Only(set) => set.iter().filter(|r| grantable(r)).cloned().collect(),
         RoleSet::All => BTreeSet::new(),
     };
+    let mut kept_roles = None;
     if let Some(level) = database {
         if let Some(r) = level.platform_role {
             role = role.min(r);
         }
         if let Some(set) = &level.roles {
-            roles.retain(|r| set.contains(r));
+            if every {
+                kept_roles = Some(set.iter().filter(|r| grantable(r)).cloned().collect());
+            } else {
+                roles.retain(|r| set.contains(r));
+            }
+        }
+    }
+    if every {
+        match kept_roles {
+            Some(kept) => roles = kept,
+            None if role == PlatformRole::Admin => {
+                return Grant { platform_role: role, roles: RoleSet::All };
+            }
+            // Narrowed below Admin with no roles named: nothing left of "every role".
+            None => {}
         }
     }
     if role == PlatformRole::Admin {
@@ -157,13 +190,20 @@ fn grantable(r: &PgRole) -> bool {
 /// data API's own `anon` and `authenticated`, which the console and SQL editor run as.
 /// The owner is reached only as [`Requested::Owner`].
 pub fn act_as_reserved(name: &str) -> bool {
-    if name == "anon" || name == "authenticated" {
+    if data_api_role(name) {
         return false;
     }
     name.eq_ignore_ascii_case(PgRole::OWNER) || crate::role_name::is_membership_reserved(name)
 }
 
-/// A tenant admin's grant on every project: Admin with every role, the owner included.
+/// The data API's own roles, `anon` and `authenticated`: a member acts as them only with a
+/// grant naming them, Admins included (R18).
+pub fn data_api_role(name: &str) -> bool {
+    name == "anon" || name == "authenticated"
+}
+
+/// A tenant admin's grant on every project: Admin with every role, the owner included. A
+/// project Admin's grant (R17) has the same shape; only a tenant admin's is never narrowed.
 pub fn tenant_admin_grant() -> Grant {
     Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All }
 }
@@ -346,8 +386,10 @@ pub fn decide(
                 forbidden(PgRole::OWNER)
             }
         }
+        // R18: only granted roles; `All` doesn't hold the data API's roles, a grant must name
+        // them.
         Requested::Role(name) => {
-            if !act_as_reserved(name) && grant.roles.contains(&PgRole::Named(name.to_string())) {
+            if grant.roles.may_act_as(name) {
                 Ok(())
             } else {
                 forbidden(&format!("role:{name}"))
@@ -446,8 +488,12 @@ mod tests {
         // A role and a roles override together: the lower role, the intersected roles.
         let both = Narrowing { platform_role: Some(Developer), roles: Some(set(&["sales", "app"])) };
         assert_eq!(effective(&grant(Admin, &["billing", "sales"]), Some(&both)), grant(Developer, &["sales"]));
-        // A tenant admin's grant isn't narrowed by member overrides (spec part 1).
-        assert_eq!(effective(&tenant_admin_grant(), Some(&both)), tenant_admin_grant());
+        // R17: Admin with every role (a project Admin's grant, the tenant admin's shape) is
+        // narrowed like any grant; only the callers keep a tenant admin's grant unnarrowed.
+        assert_eq!(effective(&tenant_admin_grant(), Some(&both)), grant(Developer, &["sales", "app"]));
+        assert_eq!(effective(&tenant_admin_grant(), Some(&roles_only)), grant(Admin, &["owner", "sales"]));
+        let admin_level = Narrowing { platform_role: Some(Admin), roles: None };
+        assert_eq!(effective(&tenant_admin_grant(), Some(&admin_level)), tenant_admin_grant());
         // `All` is only valid with Admin: anything else is read as no roles.
         let bad_all = Grant { platform_role: Developer, roles: RoleSet::All };
         assert_eq!(effective(&bad_all, None), grant(Developer, &[]));
@@ -505,9 +551,10 @@ mod tests {
 
     fn kinds() -> Vec<Kind> {
         use PlatformRole::*;
-        let row_admin = effective(&grant(Admin, &["billing"]), None);
+        // R17: a project Admin's grant is every role.
+        let row_admin = effective(&tenant_admin_grant(), None);
         let admin_to_dev = effective(
-            &grant(Admin, &["billing"]),
+            &tenant_admin_grant(),
             Some(&Narrowing { platform_role: Some(Developer), roles: None }),
         );
         // A grant built without `effective`, listing names no grant may hold.
@@ -516,15 +563,15 @@ mod tests {
             Kind { name: "operator, active, no grants", member: active(false, false), operator: true, grant: None,
                 levels: ["I.TYYY", "..TYYY"], requests: "" },
             Kind { name: "tenant admin, grant None", member: active(true, true), operator: false, grant: None,
-                levels: ["......", "I....."], requests: "......rr.r" },
+                levels: ["......", "I....."], requests: "......rrrr" },
             Kind { name: "tenant admin, all-roles grant", member: active(true, true), operator: false, grant: Some(tenant_admin_grant()),
-                levels: ["......", "I....."], requests: "......rr.r" },
+                levels: ["......", "I....."], requests: "......rrrr" },
             Kind { name: "tenant admin, narrowed grant", member: active(true, false), operator: false, grant: Some(grant(Viewer, &["billing"])),
-                levels: ["......", "I....."], requests: "......rr.r" },
+                levels: ["......", "I....."], requests: "......rrrr" },
             Kind { name: "admin", member: active(false, true), operator: false, grant: Some(row_admin),
-                levels: ["I.T...", "I.T..."], requests: "...r..rrrr" },
+                levels: ["I.T...", "I.T..."], requests: "......rrrr" },
             Kind { name: "admin overridden to developer", member: active(false, true), operator: false, grant: Some(admin_to_dev),
-                levels: ["I.T..a", "I.T..a"], requests: "oo.roorrrr" },
+                levels: ["I.T..a", "I.T..a"], requests: "oorroorrrr" },
             Kind { name: "developer, raw grant", member: active(false, true), operator: false, grant: Some(raw_dev),
                 levels: ["I.T..a", "I.T..a"], requests: "oo.roorrrr" },
             Kind { name: "developer", member: active(false, true), operator: false, grant: Some(grant(Developer, &["billing"])),
@@ -718,6 +765,42 @@ mod tests {
         assert_eq!(act(Requested::Role("billing")), Ok(()));
     }
 
+    // R15 (table editor): an Admin may act as `anon` and `authenticated` without a grant of
+    // them; below Admin only a grant listing them lets a member act as them.
+    #[test]
+    fn admins_act_as_the_data_api_roles() {
+        // R17/R18 (user, 2026-10-14): only granted roles. A project Admin's grant is every role
+        // (`All`) except the data API's anon and authenticated, which need a grant naming them;
+        // an Admin narrowed to named roles acts only as those (and the owner).
+        use PlatformRole::*;
+        let policy = ModePolicy::new(Mode::SelfHosted);
+        let caller = CallerFacts { member: active(false, true), in_operator_org: false };
+        let act = |g: &Grant, r| decide(&policy, &caller, Some(g), None, Some(Requested::Role(r)), Some("postgres"), Access::ActAs(Viewer));
+        let refused = |r: &str| Err(Deny::Forbidden { required: format!("role:{r}") });
+        let admin_all = effective(&Grant { platform_role: Admin, roles: RoleSet::All }, None);
+        let admin_narrowed = effective(
+            &Grant { platform_role: Admin, roles: RoleSet::All },
+            Some(&Narrowing { platform_role: None, roles: Some([PgRole::Named("billing".into())].into_iter().collect()) }),
+        );
+        let dev = effective(&grant(Developer, &["billing"]), None);
+        let dev_anon = effective(&grant(Developer, &["billing", "anon"]), None);
+        // R18: every role means the branch's own roles; the data API's roles only when named.
+        for r in ["sales", "billing"] {
+            assert_eq!(act(&admin_all, r), Ok(()), "{r}");
+        }
+        for r in ["anon", "authenticated"] {
+            assert_eq!(act(&admin_all, r), refused(r), "{r}");
+        }
+        for r in ["anon", "authenticated", "sales"] {
+            assert_eq!(act(&admin_narrowed, r), refused(r), "{r}");
+            assert_eq!(act(&dev, r), refused(r), "{r}");
+        }
+        assert_eq!(act(&admin_narrowed, "billing"), Ok(()));
+        assert_eq!(act(&dev_anon, "anon"), Ok(()));
+        assert_eq!(act(&dev_anon, "authenticated"), refused("authenticated"));
+        assert_eq!(act(&admin_all, "authenticator"), refused("authenticator"));
+    }
+
     // ---- grant_algebra ------------------------------------------------------------------
 
     use proptest::prelude::*;
@@ -775,8 +858,22 @@ mod tests {
             prop_assert!(e.roles != RoleSet::All || e.platform_role == PlatformRole::Admin);
 
             if project == tenant_admin_grant() {
-                // A tenant admin's grant isn't narrowed by member overrides.
-                prop_assert_eq!(e, tenant_admin_grant());
+                // R17: every role, narrowed by an override as any grant: the override's valid
+                // roles (with the owner while Admin), none below Admin without roles, and
+                // still every role when the override changes neither.
+                let want_role = db.as_ref().and_then(|n| n.platform_role).map_or(PlatformRole::Admin, |r| r.min(PlatformRole::Admin));
+                let want = match db.as_ref().and_then(|n| n.roles.as_ref()) {
+                    Some(s) => {
+                        let mut kept: BTreeSet<PgRole> = s.iter().filter(|r| valid_named(r)).cloned().collect();
+                        if want_role == PlatformRole::Admin {
+                            kept.insert(PgRole::Owner);
+                        }
+                        RoleSet::Only(kept)
+                    }
+                    None if want_role == PlatformRole::Admin => RoleSet::All,
+                    None => RoleSet::Only(BTreeSet::new()),
+                };
+                prop_assert_eq!(e, Grant { platform_role: want_role, roles: want });
                 return Ok(());
             }
             let project_roles = match &project.roles {

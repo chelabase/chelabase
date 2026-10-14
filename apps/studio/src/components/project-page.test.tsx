@@ -212,15 +212,9 @@ describe("ProjectPage", () => {
     expect(screen.queryByText("http://gw/data/v1/query")).not.toBeInTheDocument();
   });
 
-  it("opens the Tables console of a database", async () => {
-    setup({
-      "GET /v1/databases/d1/branches/b-main/databases": () =>
-        jsonResponse([{ name: "app", main: true, data_api: "on", data_api_error: null, default_schema: "public", origin: "owner", owner: "o" }]),
-      "GET /v1/databases/d1/branches/b-main/roles": () => jsonResponse([]),
-    });
-    await userEvent.click(await screen.findByRole("button", { name: "Tables" }));
-    expect(await screen.findByLabelText("View as")).toBeInTheDocument();
-    expect(screen.getByText(/Viewing as owner/)).toBeInTheDocument();
+  it("tables_links_to_the_table_editor", async () => {
+    setup({});
+    expect(await screen.findByRole("link", { name: "Tables" })).toHaveAttribute("href", "/app/tables/p1/d1");
   });
 
   it("opens the SQL editor of a database", async () => {

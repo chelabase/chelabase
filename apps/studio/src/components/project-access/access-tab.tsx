@@ -10,6 +10,7 @@ import {
   useListMembers,
   useListProjectGrants,
   type Member,
+  type MeRoles,
   type Project,
   type ProjectGrant,
 } from "@chelabase/management-client";
@@ -319,7 +320,9 @@ function Person({ member, label }: { member: Member | undefined; label?: string 
   );
 }
 
-function RoleChips({ roles, chains }: { roles: readonly string[]; chains: ReadonlyMap<string, string[]> }) {
+function RoleChips({ roles, chains }: { roles: MeRoles; chains: ReadonlyMap<string, string[]> }) {
+  // R17: an Admin grant holds every role on the project.
+  if (roles === "all") return <p>All roles</p>;
   if (roles.length === 0) return <p className="text-chalk-dim">No roles</p>;
   return (
     <ul className="flex flex-wrap gap-1">

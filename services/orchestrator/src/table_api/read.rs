@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::access::Target;
 use crate::console::{owner_pool_for, pool_failure, RETRY_AFTER_SECS};
 use crate::branches::unprocessable;
-use crate::sql_editor::{load_authorized, pick_pg_database};
+use crate::sql_editor::{load_authorized, pick_pg_database, reconcile_member_role};
 use crate::{roles, AppState, AuthPrincipal, JobPort, MetadataPort};
 
 /// The longest one catalog read may run.
@@ -126,57 +126,85 @@ where
         .await
         .map_err(|e| Box::new(e.into_response()))?;
     let rid = principal.request_id.as_str();
-    let subject = connect_subject(
-        authorized.grant.as_ref(),
-        principal.member.as_ref().map(|m| m.id),
-        &owner,
-    );
-    let result: Result<Option<String>, QueryFailure> = async {
-        // Not marked done on failure: the connection is closed rather than pooled.
-        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid))?);
-        let client = lease.client();
-        client
-            .simple_query(READ_TIMEOUT_SQL)
-            .await
-            .map_err(|e| QueryFailure::from_pg(&e, rid))?;
-        let may_connect: bool = client
-            .query_one(MAY_CONNECT_SQL, &[&subject])
-            .await
-            .map_err(|e| QueryFailure::from_pg(&e, rid))?
-            .get(0);
-        if !may_connect {
-            // The timeout is reset, so the connection goes back to the pool clean.
-            client
-                .simple_query("RESET statement_timeout")
-                .await
-                .map_err(|e| QueryFailure::from_pg(&e, rid))?;
-            lease.done();
-            return Ok(None);
+    let member = principal.member.as_ref().map(|m| m.id);
+    let subject = connect_subject(authorized.grant.as_ref(), member, &owner);
+    // C1 (R16): the subject is the member's own login, which only exists once the member-role
+    // reconcile has run on this branch; a missing login asks for that reconcile once, then the
+    // check runs again. An existing login without CONNECT is refused with no reconcile.
+    let login_member = member.filter(|_| subject != owner);
+    let mut reconciled = false;
+    loop {
+        match (read_once(&pool, &subject, &script, rid).await, login_member) {
+            (Ok(Read::Document(json)), _) => return Ok(json),
+            (Ok(Read::NoLogin), Some(member)) if !reconciled => {
+                reconcile_member_role(state, branch.id, member)
+                    .await
+                    .map_err(|e| Box::new(e.into_response()))?;
+                reconciled = true;
+            }
+            (Ok(Read::NoLogin | Read::NoConnect), _) => {
+                return Err(Box::new(cannot_connect().into_response()));
+            }
+            (Err(f), _) => return Err(Box::new(read_failure(f).into_response())),
         }
-        let messages = client
-            .simple_query(&script)
-            .await
-            .map_err(|e| QueryFailure::from_pg(&e, rid))?;
+    }
+}
+
+/// What one CONNECT check and read gave.
+enum Read {
+    /// The catalog document.
+    Document(String),
+    /// The subject role doesn't exist on the compute.
+    NoLogin,
+    /// The subject role exists but may not connect.
+    NoConnect,
+}
+
+/// The CONNECT check as `subject`, then (when it passes) `script`, on one pooled connection.
+async fn read_once(
+    pool: &deadpool_postgres::Pool,
+    subject: &str,
+    script: &str,
+    rid: &str,
+) -> Result<Read, QueryFailure> {
+    // Not marked done on failure: the connection is closed rather than pooled.
+    let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid))?);
+    let client = lease.client();
+    client
+        .simple_query(READ_TIMEOUT_SQL)
+        .await
+        .map_err(|e| QueryFailure::from_pg(&e, rid))?;
+    let row = client
+        .query_one(MAY_CONNECT_SQL, &[&subject])
+        .await
+        .map_err(|e| QueryFailure::from_pg(&e, rid))?;
+    let (exists, may_connect): (bool, bool) = (row.get(0), row.get(1));
+    if !may_connect {
+        // The timeout is reset, so the connection goes back to the pool clean.
         client
             .simple_query("RESET statement_timeout")
             .await
             .map_err(|e| QueryFailure::from_pg(&e, rid))?;
         lease.done();
-        messages
-            .iter()
-            .find_map(|m| match m {
-                SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
-                _ => None,
-            })
-            .map(Some)
-            .ok_or_else(|| QueryFailure::internal(rid, "the catalog read returned no document"))
+        return Ok(if exists { Read::NoConnect } else { Read::NoLogin });
     }
-    .await;
-    match result {
-        Ok(Some(json)) => Ok(json),
-        Ok(None) => Err(Box::new(cannot_connect().into_response())),
-        Err(f) => Err(Box::new(read_failure(f).into_response())),
-    }
+    let messages = client
+        .simple_query(script)
+        .await
+        .map_err(|e| QueryFailure::from_pg(&e, rid))?;
+    client
+        .simple_query("RESET statement_timeout")
+        .await
+        .map_err(|e| QueryFailure::from_pg(&e, rid))?;
+    lease.done();
+    messages
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .map(Read::Document)
+        .ok_or_else(|| QueryFailure::internal(rid, "the catalog read returned no document"))
 }
 
 /// The Postgres role a read's CONNECT check is made as (R10, R12): what Postgres decides when
@@ -193,9 +221,9 @@ fn connect_subject(grant: Option<&Grant>, member: Option<Uuid>, owner: &str) -> 
     }
 }
 
-/// One query on the owner's connection: whether the role `$1` exists and holds CONNECT on the
-/// current database. A missing role is no.
-const MAY_CONNECT_SQL: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = $1::text AND pg_catalog.has_database_privilege(r.rolname, pg_catalog.current_database(), 'CONNECT'))";
+/// One query on the owner's connection: whether the role `$1` exists, and whether it holds
+/// CONNECT on the current database (a missing role doesn't).
+const MAY_CONNECT_SQL: &str = "SELECT r.oid IS NOT NULL, COALESCE(pg_catalog.has_database_privilege(r.rolname, pg_catalog.current_database(), 'CONNECT'), false) FROM (SELECT 1) one LEFT JOIN pg_catalog.pg_roles r ON r.rolname = $1::text";
 
 /// 403 `permission_denied`: the read's refusal when no role of the caller may connect.
 fn cannot_connect() -> ApiError {
@@ -233,7 +261,7 @@ fn unreadable(err: SchemaError) -> Response {
         (status = 409, description = "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the query string is malformed", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your login on the branch didn't exist yet and couldn't be prepared (`Retry-After`)", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the read took over 15 s", body = ErrorEnvelope),
     ),
 )]
@@ -288,7 +316,7 @@ where
         (status = 409, description = "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the query string is malformed", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your login on the branch didn't exist yet and couldn't be prepared (`Retry-After`)", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the read took over 15 s", body = ErrorEnvelope),
     ),
 )]
@@ -342,7 +370,7 @@ where
         (status = 409, description = "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the query string is malformed", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your login on the branch didn't exist yet and couldn't be prepared (`Retry-After`)", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the read took over 15 s", body = ErrorEnvelope),
     ),
 )]

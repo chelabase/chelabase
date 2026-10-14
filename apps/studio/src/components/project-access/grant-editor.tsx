@@ -37,25 +37,30 @@ const sameSet = (a: readonly string[], b: readonly string[]) => a.length === b.l
 export function GrantEditor({ project, grant, name, chains, onClose, onStatus, returnFocus }: GrantEditorProps) {
   const queryClient = useQueryClient();
   const [platformRole, setPlatformRole] = useState<PlatformRole>(grant.platform_role);
-  const [pgRoles, setPgRoles] = useState<string[]>(grant.pg_roles);
+  // R17: an Admin grant holds every role (`"all"`); a grant moved below Admin starts with none.
+  const granted = grant.pg_roles === "all" ? [] : grant.pg_roles;
+  const [pgRoles, setPgRoles] = useState<string[]>(granted);
   const [blocked, setBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<Failure | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmError, setConfirmError] = useState<string | null>(null);
 
-  const changed = platformRole !== grant.platform_role || !sameSet(pgRoles, grant.pg_roles);
+  const admin = platformRole === "admin";
+  const changed = platformRole !== grant.platform_role || (!admin && !sameSet(pgRoles, granted));
+  // The role picker isn't shown for Admin, so nothing it held back counts.
+  const held = blocked && !admin;
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: getListProjectGrantsQueryKey(project.id) });
     refreshAccess(queryClient);
   };
 
   async function save() {
-    if (busy || !changed || blocked) return;
+    if (busy || !changed || held) return;
     setBusy(true);
     setFailure(null);
     try {
-      await putProjectGrant(project.id, grant.member_id, { platform_role: platformRole, pg_roles: pgRoles });
+      await putProjectGrant(project.id, grant.member_id, { platform_role: platformRole, pg_roles: admin ? [] : pgRoles });
       refresh();
       onClose(`Saved ${name}'s access.`);
     } catch (err) {
@@ -105,7 +110,7 @@ export function GrantEditor({ project, grant, name, chains, onClose, onStatus, r
         </fieldset>
         {failure && <FailureText failure={failure} />}
         <div className="flex flex-wrap items-center gap-2">
-          <Button type="submit" disabled={busy || !changed || blocked}>
+          <Button type="submit" disabled={busy || !changed || held}>
             {busy ? "Saving…" : "Save"}
           </Button>
           <Button type="button" variant="ghost" disabled={busy} onClick={() => onClose()}>

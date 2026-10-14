@@ -359,6 +359,43 @@
         },
         "additionalProperties": false
       },
+      "BatchCount": {
+        "type": "object",
+        "required": [
+          "op",
+          "from"
+        ],
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "count"
+            ]
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          },
+          "where": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The rows to count; every row the role sees when left out"
+          }
+        },
+        "additionalProperties": false
+      },
       "BatchDelete": {
         "allOf": [
           {
@@ -527,12 +564,16 @@
                 },
                 {
                   "$ref": "#/components/schemas/BatchCall"
+                },
+                {
+                  "$ref": "#/components/schemas/BatchCount"
                 }
               ],
               "discriminator": {
                 "propertyName": "op",
                 "mapping": {
                   "call": "#/components/schemas/BatchCall",
+                  "count": "#/components/schemas/BatchCount",
                   "delete": "#/components/schemas/BatchDelete",
                   "insert": "#/components/schemas/BatchInsert",
                   "select": "#/components/schemas/BatchSelect",
@@ -782,6 +823,50 @@
             "type": "string"
           }
         }
+      },
+      "CountRequest": {
+        "type": "object",
+        "required": [
+          "v",
+          "op",
+          "from"
+        ],
+        "properties": {
+          "database": {
+            "type": "string",
+            "description": "The Postgres database to run in (1 to 63 bytes); the key's main database when left out",
+            "maxLength": 63,
+            "minLength": 1
+          },
+          "from": {
+            "$ref": "#/components/schemas/TableName"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "count"
+            ]
+          },
+          "v": {
+            "type": "integer",
+            "description": "The query language's version",
+            "enum": [
+              1
+            ]
+          },
+          "where": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Filter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The rows to count; every row the role sees when left out"
+          }
+        },
+        "additionalProperties": false
       },
       "DataApiSchema": {
         "type": "object",
@@ -1261,6 +1346,9 @@
             "$ref": "#/components/schemas/CallRequest"
           },
           {
+            "$ref": "#/components/schemas/CountRequest"
+          },
+          {
             "$ref": "#/components/schemas/BatchRequest"
           }
         ],
@@ -1270,6 +1358,7 @@
           "mapping": {
             "batch": "#/components/schemas/BatchRequest",
             "call": "#/components/schemas/CallRequest",
+            "count": "#/components/schemas/CountRequest",
             "delete": "#/components/schemas/DeleteRequest",
             "insert": "#/components/schemas/InsertRequest",
             "select": "#/components/schemas/SelectRequest",
@@ -1278,7 +1367,7 @@
         }
       },
       "QueryResult": {
-        "description": "Rows as an array of objects for a select and for writes (`[]` without `returning`); the function's result for a call (an array for a set-returning function, `null` for a void one); for a batch, the array of each operation's result in order"
+        "description": "Rows as an array of objects for a select and for writes (`[]` without `returning`); the function's result for a call (an array for a set-returning function, `null` for a void one); `{\"count\": N}` for a count (an integer); for a batch, the array of each operation's result in order"
       },
       "ReturnDesc": {
         "type": "object",

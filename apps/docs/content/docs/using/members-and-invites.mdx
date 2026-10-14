@@ -13,20 +13,21 @@ A grant gives a member a **platform role** on one project:
 
 | Platform role | Can |
 |---|---|
-| Viewer | Read: projects, databases, branches, schemas, merges, the Tables console (select only), data keys' list. |
+| Viewer | Read: projects, databases, branches, schemas, merges, the table editor (rows and structure, no changes), data keys' list. |
 | Developer | Everything a Viewer can, plus: create branches; change unprotected branches (reset, restore, delete, rename); run SQL as an allowed Postgres role; start and run schema merges (merges don't run as a Postgres role); create and block app users; save and run queries; create data keys bound to an allowed role. |
 | Admin | Everything on the project: protected branches, connection strings and passwords, login roles, the Data API settings, grants and invites, and acting as the database owner. |
 
 A grant also lists the **Postgres roles** the member may act as in the SQL editor and the console. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation). The rules, in short:
 
-- **Admin implies owner.** An Admin on a project can act as the database owner. Developers and Viewers can't, and `owner` is never listed in a grant: the Admin role includes it.
+- **Admin holds every role.** An Admin on a project may act as the database owner and every other role of the project's branches, login roles included; the grant lists no roles (`GET /v1/projects/{id}/grants` and `GET /v1/me` answer `"all"`). Roles named when granting Admin are checked, then dropped. To give an Admin fewer roles on one database, narrow it there (below). Developers and Viewers can't act as the owner, and `owner` is never listed in a grant.
+- **The data API's roles only when named.** `anon` and `authenticated` aren't part of an Admin's every role: Act as and Run as offer them only to a member whose grant (or a narrowing) names them, Admins included.
 - **A granted role includes its chain.** If you grant `billing_admin` and it can `SET ROLE billing`, the member may act as both. Studio shows the expanded set.
 - **Some roles are Admin-only**, whether you grant them, act as them or bind a data key to them: owner-level roles (superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`, or a path to `neon_superuser`), roles that can log in (`LOGIN`), reserved roles, and any role whose chain reaches one of those. A Developer can't be given such a role, and can't create a key for one. A role whose chain holds `ADMIN` on another role is refused at grant time (422), whatever the grant's level. Permissions go on `NOLOGIN` group roles, which is the Postgres convention.
 - **Saved queries are shared within the project.** Any Developer can read them; only the author or an Admin edits or deletes one.
 
 ### Per-database overrides
 
-A project grant applies to every database in the project. An **override** narrows it for one Chelabase database. Overrides are per Chelabase database only, never per Postgres database inside it: to restrict within a database, use Postgres privileges. In Studio, a project's Access tab has **Per database**, where each line offers **Narrow** (and **Stop narrowing** once narrowed). `GET /v1/me` lists the narrowed databases per project (`projects[].databases`). The effective grant is the project grant intersected with the override: the platform role is the lower of the two and the role set is the overlap. An override can never widen access, even after the project grant changes later. Narrowing an Admin to Developer takes the owner away in that database.
+A project grant applies to every database in the project. An **override** narrows it for one Chelabase database. Overrides are per Chelabase database only, never per Postgres database inside it: to restrict within a database, use Postgres privileges. In Studio, a project's Access tab has **Per database**, where each line offers **Narrow** (and **Stop narrowing** once narrowed). `GET /v1/me` lists the narrowed databases per project (`projects[].databases`). The effective grant is the project grant intersected with the override: the platform role is the lower of the two and the role set is the overlap. An override can never widen access, even after the project grant changes later. Narrowing an Admin to Developer takes the owner away in that database. An Admin's every role narrows like this: an override naming roles keeps only those there (with the owner while still Admin); an override down to Developer or Viewer without naming roles leaves no roles there. A tenant admin is never narrowed.
 
 ### What a member without a grant sees
 

@@ -1,6 +1,6 @@
 // The runtime builders. One immutable `Query` class backs every typed builder interface in
 // `types.ts`; each method returns a new `Query`.
-import type { ResultSpec } from "./json.ts";
+import { COUNT_SPEC, type ResultSpec } from "./json.ts";
 import type { PgExact, QueryTree, TypeMap } from "./types.ts";
 
 /** What the builders need from their client. */
@@ -9,7 +9,7 @@ export interface Runner {
   types: TypeMap | undefined;
 }
 
-type Kind = "select" | "insert" | "update" | "delete" | "call" | "batch";
+type Kind = "select" | "insert" | "update" | "delete" | "call" | "count" | "batch";
 type SelectItem = string | { col: string; as: string };
 
 interface State {
@@ -82,6 +82,15 @@ export class Query implements PromiseLike<unknown> {
     return this.#with({ kind: "delete" });
   }
 
+  /** The number of matching rows: only the table and the filter are sent. */
+  count(): Query {
+    const s = this.#state;
+    if (s.limit !== undefined || s.offset !== undefined) {
+      throw new TypeError("count(): a count takes no limit or offset; it counts every matching row");
+    }
+    return new Query(this.#runner, s.where === undefined ? { kind: "count", name: s.name } : { kind: "count", name: s.name, where: s.where });
+  }
+
   all(): Query {
     return this.#with({ all: true });
   }
@@ -128,6 +137,10 @@ export class Query implements PromiseLike<unknown> {
         t["fn"] = s.name;
         if (s.args !== undefined) t["args"] = s.args;
         break;
+      case "count":
+        t["from"] = s.name;
+        if (s.where !== undefined) t["where"] = s.where;
+        break;
       case "batch":
         t["ops"] = (s.ops ?? []).map((op) => op.#body());
         break;
@@ -142,6 +155,8 @@ export class Query implements PromiseLike<unknown> {
     switch (s.kind) {
       case "batch":
         return { kind: "batch", items: (s.ops ?? []).map((op) => op.spec()) };
+      case "count":
+        return COUNT_SPEC;
       case "call": {
         const fn = types === undefined ? undefined : lookup(types, s.name, "functions");
         if (fn === undefined) return { kind: "untyped", name: s.name };

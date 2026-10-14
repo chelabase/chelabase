@@ -35,6 +35,11 @@ describe("buildSelect", () => {
     ]);
     expect(buildSelect({ schema: "p", table: "t", page: 0, sort: { col: "id", dir: "asc" }, filters: null, pk: ["id"] }).orderBy).toEqual([{ col: "id", dir: "asc" }]);
   });
+  it("reads only the given columns, from an explicit offset", () => {
+    const tree = buildSelect({ schema: "p", table: "t", page: 9, sort: null, filters: null, pk: [], pageSize: 25, columns: ["a", "b"], offset: 75 });
+    expect(tree).toMatchObject({ select: ["a", "b"], limit: 25, offset: 75 });
+    expect(buildSelect({ schema: "p", table: "t", page: 0, sort: null, filters: null, pk: [] })).not.toHaveProperty("select");
+  });
 });
 
 describe("buildFilterTree", () => {

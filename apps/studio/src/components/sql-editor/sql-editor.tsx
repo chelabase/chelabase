@@ -9,7 +9,7 @@ import {
   useListRoles,
   type SavedQuery,
 } from "@chelabase/management-client";
-import { actAsRoles, useProjectCaps } from "@/lib/capabilities";
+import { DATA_API_ROLES, actAsRoles, dataApiActAs, useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import type { PglsClient } from "@/lib/pgls/client";
 import { sqlExtensions } from "@/lib/pgls/codemirror";
@@ -65,12 +65,13 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
 
   const rolesQuery = useListRoles(databaseId, branchId ?? "", { query: { enabled: branchId !== null } });
   // Only the roles the caller may act as: Admin has the owner and every role; below Admin the
-  // granted roles and their chains (the API decides; this only hides what it would refuse).
+  // granted roles and their chains (the API decides; this only hides what it would refuse). The
+  // data API's anon and authenticated only when a grant names them (R18), whatever the level.
   const caps = useProjectCaps();
   const allowed = actAsRoles(caps, rolesQuery.data ?? []);
   const roleOptionsFor = (d: typeof db) => {
-    const own = allowed.roles.filter((n) => n !== "anon" && n !== "authenticated");
-    const api = ["anon", "authenticated"].filter((n) => allowed.owner || allowed.roles.includes(n));
+    const api: string[] = DATA_API_ROLES.filter((n) => dataApiActAs(caps).includes(n) || allowed.roles.includes(n));
+    const own = allowed.roles.filter((n) => !api.includes(n));
     return d?.data_api === "on" ? [...api, ...own] : own;
   };
   const roleOptions = roleOptionsFor(db);

@@ -32,6 +32,19 @@ One request is one operation: a JSON tree sent to `POST /data/v1/query`. The [Ty
 - `select` can't be empty (leave it out for every column). An alias is 1 to 63 bytes.
 - `limit` and `offset` can't be negative. The server also clamps the result to the branch's `max_rows` [setting](/docs/using/data-api/settings).
 
+## count
+
+`from`, and optionally `where`. It answers `{ "count": <integer> }`: the number of matching rows, or every row without `where`.
+
+```json
+{ "v": 1, "op": "count", "from": "billing.invoices", "where": { "col": "paid", "eq": false } }
+```
+
+- It counts as the requesting role, like `select`: row-level security decides which rows are counted, and a role whose policies show it no rows gets `{ "count": 0 }`. A role without `SELECT` on the table gets `permission_denied`.
+- `select`, `orderBy`, `limit` and `offset` aren't accepted; `max_rows` doesn't cap a count.
+- It can sit in a `batch` like any other operation, and the same statement timeout applies.
+- In the TypeScript client: `db.from("billing.invoices").where({ paid: false }).count()` resolves to `{ count: number }`.
+
 ## insert
 
 `into`, `values` (a non-empty array of non-empty objects that all have the same keys), and optionally `returning` (`"*"` or a non-empty list of columns).

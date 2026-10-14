@@ -13,6 +13,7 @@
     "client",
     "app-users",
     "sql-editor",
+    "table-editor",
     "table-api",
     "studio",
     "self-hosted-vs-platform"

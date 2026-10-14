@@ -13,9 +13,10 @@ import type { ProjectId } from './projectId.ts';
  */
 export interface InviteGrant {
   /**
-     * Postgres role names. Never `owner` or the database's owner (the admin platform role
-     * includes it), nor a reserved name. Below admin, only NOLOGIN groups whose memberships
-     * reach no owner-level, LOGIN or reserved role.
+     * Postgres role names; for `admin`, which holds every role (R17), checked and dropped.
+     * Never `owner` or the database's owner (the admin platform role includes it), nor a
+     * reserved name. Below admin, only NOLOGIN groups whose memberships reach no owner-level,
+     * LOGIN or reserved role.
      */
   pg_roles?: string[];
   platform_role: PlatformRole;

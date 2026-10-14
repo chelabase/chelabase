@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Table editor - the grid is the schema</title>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0b1c1f;--deep:#0f2a2d;--chan:#14363a;--chalk:#e6ede7;--dim:#aebfc0;--hl:rgb(230 237 231/.16);--hs:rgb(230 237 231/.34);--hc:rgb(230 237 231/.4);--sand:#f2c7a3;--coral:#eda6aa;--sea:#9fd4c6}
+*{box-sizing:border-box}
+html,body{width:1440px;height:900px;overflow:hidden;margin:0}
+body{background:var(--ink);color:var(--chalk);font:14px/20px "Atkinson Hyperlegible Next",sans-serif;display:flex}
+.m,code{font-family:"JetBrains Mono",monospace;font-size:13px}
+.dim{color:var(--dim)}
+svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6}
+/* rail */
+.rail{width:56px;background:var(--deep);border-right:1px solid var(--hs);display:flex;flex-direction:column;align-items:center;padding-top:16px;gap:8px}
+.claw{width:24px;height:24px;border:2px solid var(--chalk);margin-bottom:20px}
+.slot{width:56px;height:44px;display:flex;align-items:center;justify-content:center;color:var(--dim);position:relative}
+.slot.on{color:var(--chalk)}.slot.on:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--sand)}
+.col{flex:1;display:flex;flex-direction:column;min-width:0}
+/* header */
+.hdr{height:52px;border-bottom:1px solid var(--hl);display:flex;align-items:center;padding:0 20px;gap:10px;flex:none}
+.hdr .sep{color:var(--dim)}
+.lock{border:1px solid var(--hc);padding:0 6px;font-size:12px;color:var(--dim);line-height:18px}
+.act{margin-left:auto;display:flex;gap:10px;align-items:center}
+.acct{margin-left:28px;display:flex;gap:8px;align-items:center}.acct i{width:26px;height:26px;border:1px solid var(--hc)}
+.body{flex:1;display:flex;min-height:0}
+/* objects */
+.objs{width:232px;background:var(--deep);border-right:1px solid var(--hl);display:flex;flex-direction:column;flex:none}
+.inp{margin:12px;height:36px;border:1px solid var(--hc);padding:8px 10px;color:var(--dim)}
+.sch{padding:8px 16px;color:var(--dim);font-size:12px;letter-spacing:.06em;text-transform:uppercase}
+.t{height:36px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;position:relative}
+.t.sel:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--sand)}
+.t.sel{background:var(--chan)}.t span:last-child{font-size:12px;color:var(--dim)}
+.new{margin-top:auto;height:44px;border-top:1px solid var(--hl);padding:11px 16px}
+/* main */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
+.bar{height:72px;padding:12px 20px;display:flex;align-items:center;gap:10px;flex:none;border-bottom:1px solid var(--hl)}
+.bar h1{margin:0;font:500 18px/24px "JetBrains Mono",monospace}
+.bar .sp{flex:1}
+.btn{height:36px;padding:8px 14px;border:1px solid var(--hc);background:none;color:var(--chalk)}
+.btn.p{background:var(--sand);border-color:var(--sand);color:var(--ink);font-weight:600}
+.btn.g{border-color:transparent;color:var(--dim)}
+.grid{flex:1;overflow:hidden}
+.r{display:grid;grid-template-columns:30px 96px 116px 76px 82px 88px 100px 88px 86px 30px;height:36px;align-items:center;border-bottom:1px solid var(--hl);padding-right:0}
+.r>*{padding:0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:"JetBrains Mono",monospace;font-size:13px}
+.r>i{font-style:normal;color:var(--dim);font-size:12px;text-align:center;padding:0}
+.r b{font-weight:400}.num{text-align:right}
+.r.h{height:56px;background:var(--deep);border-bottom:1px solid var(--hs);align-items:stretch}
+.r.h>*{padding:8px;line-height:20px;border-right:1px solid var(--hl)}
+.r.h>i{padding:0}
+.r.h span{display:block;color:var(--dim);font-size:12px;line-height:16px;margin-top:2px}
+.r.h .nm{display:block;color:var(--chalk)}
+.r.h .open{background:var(--chan);border-bottom:2px solid var(--sand)}
+.r.h .pend{border-top:2px solid var(--sand);position:relative}
+.pend em{position:absolute;right:4px;top:-1px;font:600 10px/14px "Atkinson Hyperlegible Next",sans-serif;color:var(--sand);font-style:normal;text-transform:uppercase}
+.r .pc{background:var(--chan);border-left:1px dashed var(--hc)}
+.paid{color:var(--sea)}.void{color:var(--coral)}.open_{color:var(--chalk)}
+.plus{text-align:center;font-size:18px;color:var(--dim)}
+.menu{position:absolute;left:342px;top:196px;width:200px;background:var(--deep);border:1px solid var(--hs);padding:4px 0;z-index:2}
+.menu div{height:34px;padding:7px 14px}.menu .hz{color:var(--coral);border-top:1px solid var(--hl);margin-top:4px;padding-top:11px;height:40px}
+.foot{height:44px;border-top:1px solid var(--hs);display:flex;align-items:center;padding:0 20px;gap:10px;flex:none;background:var(--deep)}
+.foot .sp{flex:1}.pg{width:32px;height:32px;border:1px solid var(--hc);text-align:center;padding-top:5px}
+/* inspector */
+.ins{width:340px;background:var(--deep);border-left:1px solid var(--hs);display:flex;flex-direction:column;flex:none}
+.tabs{display:flex;height:44px;border-bottom:1px solid var(--hl)}
+.tabs div{padding:12px 20px;color:var(--dim)}.tabs .on{color:var(--chalk);border-bottom:2px solid var(--sand)}
+.ops{padding:16px 20px;display:flex;flex-direction:column;gap:12px}
+.ops h3{margin:0;font:600 12px/16px "Atkinson Hyperlegible Next";letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+.op{display:flex;gap:10px}.op>b{color:var(--dim);font-weight:400}
+pre{margin:0;background:var(--ink);border:1px solid var(--hl);padding:12px;font:13px/20px "JetBrains Mono",monospace;color:var(--chalk);white-space:pre-wrap}
+.ok{display:flex;gap:8px;align-items:center;color:var(--chalk)}.ok i{width:10px;height:10px;background:var(--sea)}
+.btns{display:flex;gap:10px;justify-content:flex-end}
+.sec{height:40px;display:flex;justify-content:space-between;align-items:center;padding:0 20px;border-top:1px solid var(--hl);color:var(--chalk)}
+.sec span:last-child{color:var(--dim);font-size:12px}
+.secs{margin-top:auto}
+</style></head><body>
+<nav class="rail"><div class="claw"></div>
+<div class="slot"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="14" height="14"/></svg></div>
+<div class="slot on"><svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12"/><path d="M3 8h14M8 8v8"/></svg></div>
+<div class="slot"><svg viewBox="0 0 20 20"><path d="M5 6l-3 4 3 4M15 6l3 4-3 4M11 4l-2 12"/></svg></div>
+<div class="slot"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><circle cx="10" cy="10" r="7"/></svg></div></nav>
+<div class="col">
+<header class="hdr"><span>acme-shop</span><span class="sep">/</span><span>orders-db</span><span class="sep">/</span><span class="m">main</span><span class="lock">protected</span><span class="sep">/</span><span>Postgres <span class="m">app</span></span>
+<div class="act"><span class="dim">Act as</span><span class="m">billing_admin</span><span class="dim">v</span><div class="acct"><i></i><span>Mara Voss</span></div></div></header>
+<div class="body">
+<aside class="objs"><div class="inp">Filter tables</div><div class="sch">public</div>
+<div class="t m"><span>customers</span><span>9.4k</span></div>
+<div class="t m sel"><span>invoices</span><span>48k</span></div>
+<div class="t m"><span>invoice_lines</span><span>131k</span></div>
+<div class="t m"><span>payments</span><span>52k</span></div>
+<div class="t m"><span>plans</span><span>14</span></div>
+<div class="t m"><span>refunds</span><span>1.2k</span></div>
+<div class="t m"><span>subscriptions</span><span>7.8k</span></div>
+<div class="t m"><span>tax_rates</span><span>63</span></div>
+<div class="t m"><span>webhooks</span><span>310</span></div>
+<div class="sch" style="margin-top:8px">&gt; billing</div>
+<div class="new">+ New table</div></aside>
+<main class="main">
+<div class="bar"><div><h1>public.invoices</h1><div class="dim" style="font-size:13px">≈ 48,210 rows · 12 MB · RLS on · data API on</div></div><div class="sp"></div><button class="btn">Filter</button><button class="btn">Sort</button><button class="btn">Insert row</button></div>
+<div class="grid">
+<div class="r h"><i></i><div><b class="nm">id</b><span>uuid · PK</span></div><div><b class="nm">customer_id</b><span>uuid · → customers.id</span></div><div class="open"><b class="nm">status</b><span>invoice_status</span></div><div><b class="nm">total_cents</b><span>int8 · not null</span></div><div><b class="nm">memo</b><span>text</span></div><div><b class="nm">issued_at</b><span>timestamptz · default now()</span></div><div><b class="nm">paid_at</b><span>timestamptz · null</span></div><div class="pend"><em>new</em><b class="nm">discount_cents</b><span>int8 · default 0</span></div><div class="plus">+</div></div>
+<div class="r"><i>1</i><b>3f9a…c21e</b><b>a71d…09b4</b><b class="paid">paid</b><b class="num">12900</b><b class="dim">Annual plan</b><b>2026-10-13</b><b>2026-10-13</b><b class="pc"></b><b></b></div>
+<div class="r"><i>2</i><b>8c02…f7a1</b><b>51be…d3c8</b><b class="open_">open</b><b class="num">4950</b><b class="dim">Seats x5</b><b>2026-10-13</b><b class="dim">null</b><b class="pc"></b><b></b></div>
+<div class="r"><i>3</i><b>d41e…2a90</b><b>a71d…09b4</b><b class="paid">paid</b><b class="num">2900</b><b class="dim">Add-on</b><b>2026-10-12</b><b>2026-10-12</b><b class="pc"></b><b></b></div>
+<div class="r"><i>4</i><b>02b7…e5c3</b><b>9e60…4417</b><b class="void">void</b><b class="num">18000</b><b class="dim">Duplicate</b><b>2026-10-12</b><b class="dim">null</b><b class="pc"></b><b></b></div>
+<div class="r"><i>5</i><b>77af…10de</b><b>c3d2…8a05</b><b class="paid">paid</b><b class="num">9900</b><b class="dim">Monthly</b><b>2026-10-11</b><b>2026-10-11</b><b class="pc"></b><b></b></div>
+<div class="r"><i>6</i><b>e9c8…6b32</b><b>51be…d3c8</b><b class="paid">paid</b><b class="num">4950</b><b class="dim">Seats x5</b><b>2026-10-11</b><b>2026-10-12</b><b class="pc"></b><b></b></div>
+<div class="r"><i>7</i><b>1a5d…bb70</b><b>0f18…e2a9</b><b class="open_">open</b><b class="num">32500</b><b class="dim">Pro upgrade</b><b>2026-10-10</b><b class="dim">null</b><b class="pc"></b><b></b></div>
+<div class="r"><i>8</i><b>b60c…3d84</b><b>d907…51fc</b><b class="paid">paid</b><b class="num">1500</b><b class="dim">Overage</b><b>2026-10-10</b><b>2026-10-10</b><b class="pc"></b><b></b></div>
+<div class="r"><i>9</i><b>5f23…a8e6</b><b>a71d…09b4</b><b class="paid">paid</b><b class="num">12900</b><b class="dim">Annual plan</b><b>2026-10-09</b><b>2026-10-09</b><b class="pc"></b><b></b></div>
+<div class="r"><i>10</i><b>c8e1…7740</b><b>38aa…b6d1</b><b class="open_">open</b><b class="num">7400</b><b class="dim">Q4 retainer</b><b>2026-10-09</b><b class="dim">null</b><b class="pc"></b><b></b></div>
+<div class="r"><i>11</i><b>94d0…c1f5</b><b>c3d2…8a05</b><b class="paid">paid</b><b class="num">9900</b><b class="dim">Monthly</b><b>2026-10-08</b><b>2026-10-09</b><b class="pc"></b><b></b></div>
+<div class="r"><i>12</i><b>2e7b…58a3</b><b>7c41…f09e</b><b class="void">void</b><b class="num">600</b><b class="dim">Test</b><b>2026-10-08</b><b class="dim">null</b><b class="pc"></b><b></b></div>
+<div class="r"><i>13</i><b>f03a…d9b2</b><b>9e60…4417</b><b class="paid">paid</b><b class="num">18000</b><b class="dim">Annual plan</b><b>2026-10-07</b><b>2026-10-07</b><b class="pc"></b><b></b></div>
+<div class="r"><i>14</i><b>6d18…e04c</b><b>0f18…e2a9</b><b class="paid">paid</b><b class="num">32500</b><b class="dim">Pro upgrade</b><b>2026-10-07</b><b>2026-10-08</b><b class="pc"></b><b></b></div>
+<div class="r"><i>15</i><b>a2f9…1b57</b><b>51be…d3c8</b><b class="paid">paid</b><b class="num">4950</b><b class="dim">Seats x5</b><b>2026-10-06</b><b>2026-10-06</b><b class="pc"></b><b></b></div>
+<div class="r"><i>16</i><b>3b84…90ca</b><b>d907…51fc</b><b class="open_">open</b><b class="num">2100</b><b class="dim">Overage</b><b>2026-10-06</b><b class="dim">null</b><b class="pc"></b><b></b></div>
+<div class="r"><i>17</i><b>7e51…f2d8</b><b>38aa…b6d1</b><b class="paid">paid</b><b class="num">7400</b><b class="dim">Q3 retainer</b><b>2026-10-05</b><b>2026-10-05</b><b class="pc"></b><b></b></div>
+<div class="r"><i>18</i><b>d9a6…4e13</b><b>a71d…09b4</b><b class="paid">paid</b><b class="num">2900</b><b class="dim">Add-on</b><b>2026-10-05</b><b>2026-10-06</b><b class="pc"></b><b></b></div>
+</div>
+<div class="menu"><div>Rename column</div><div>Change type…</div><div>Default…</div><div>Not null</div><div>Comment…</div><div class="hz">Drop column</div></div>
+<div class="foot"><span class="dim">Rows 1–100 of ≈ 48,210</span><span class="sp"></span><span class="pg">&lt;</span><span class="m">1 / 483</span><span class="pg">&gt;</span></div>
+</main>
+<aside class="ins">
+<div class="tabs"><div>Table</div><div class="on">Changes · 2</div></div>
+<div class="ops"><h3>Pending operations</h3>
+<div class="op"><b>1.</b><span>Add column <code>discount_cents</code> <code class="dim">int8 default 0</code></span></div>
+<div class="op"><b>2.</b><span>Rename <code>memo</code> → <code>note</code></span></div>
+<h3>SQL</h3>
+<pre>alter table public.invoices
+  add column discount_cents int8
+  default 0;
+alter table public.invoices
+  rename column memo to note;</pre>
+<div class="ok"><i></i><span>Dry run passed · no rewrite</span></div>
+<div class="btns"><button class="btn g">Discard</button><button class="btn p">Apply 2 changes</button></div></div>
+<div class="secs"><div class="sec"><span>Constraints</span><span>3</span></div><div class="sec"><span>Enums used</span><span>1</span></div><div class="sec"><span>Policies</span><span>2 (read-only)</span></div><div class="sec"><span>Grants</span><span>(read-only)</span></div></div>
+</aside>
+</div></div></body></html>

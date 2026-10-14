@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Table editor: add column</title>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0b1c1f;--deep:#0f2a2d;--chan:#14363a;--chalk:#e6ede7;--dim:#aebfc0;--hl:rgb(230 237 231/.16);--hs:rgb(230 237 231/.34);--hc:rgb(230 237 231/.4);--sand:#f2c7a3;--coral:#eda6aa;--sea:#9fd4c6;
+--cols:44px 96px 104px 96px 104px 72px 92px 92px 92px 84px 112px 96px}
+html{overflow:auto}
+body{width:1440px;height:900px;overflow:hidden;margin:0;background:var(--ink);color:var(--chalk);font:14px/1 "Atkinson Hyperlegible Next",system-ui,sans-serif}
+*{box-sizing:border-box}
+.m,.mono{font-family:"JetBrains Mono",monospace;font-size:13px}
+.app{display:flex;width:1440px;height:900px;position:relative}
+.rail{width:56px;background:var(--deep);border-right:1px solid var(--hs);display:flex;flex-direction:column;align-items:center;padding-top:14px;gap:6px}
+.claw{width:24px;height:24px;border:2px solid var(--chalk);margin-bottom:18px}
+.ic{width:36px;height:36px;display:grid;place-items:center;color:var(--dim)}
+.ic svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6}
+.ic.on{color:var(--chalk);position:relative}
+.ic.on:before{content:"";position:absolute;left:-10px;top:0;bottom:0;width:2px;background:var(--sand)}
+.col{flex:1;display:flex;flex-direction:column;min-width:0}
+header{height:52px;border-bottom:1px solid var(--hl);display:flex;align-items:center;padding:0 16px;gap:10px;flex:none}
+header .sl{color:var(--hs)}
+.pk{height:36px;padding:0 8px;border:1px solid transparent;display:flex;gap:6px;align-items:center}
+.pk:after{content:"";width:6px;height:6px;border-right:1.5px solid var(--dim);border-bottom:1.5px solid var(--dim);transform:rotate(45deg) translateY(-2px);margin-left:4px}
+.pk small{color:var(--dim);font-size:11px;margin-right:2px}
+.lock{font-size:12px;color:var(--dim);border:1px solid var(--hl);padding:3px 6px}
+.sp{flex:1}
+.act{border:1px solid var(--hc);padding:8px 10px;display:flex;gap:8px;align-items:center}
+.act small{color:var(--dim);font-size:12px}
+.av{width:28px;height:28px;border:1px solid var(--hc);display:grid;place-items:center;font-size:12px;margin-left:8px}
+.body{flex:1;display:flex;min-height:0}
+.list{width:248px;background:var(--deep);border-right:1px solid var(--hl);display:flex;flex-direction:column;padding:12px 0}
+.schema{margin:0 12px 12px;height:36px;border:1px solid var(--hc);display:flex;align-items:center;justify-content:space-between;padding:0 10px}
+.schema small{color:var(--dim);font-size:12px}
+.flt{margin:0 12px 14px;height:36px;border:1px solid var(--hc);padding:0 10px;display:flex;align-items:center;color:var(--dim)}
+.sh{padding:0 16px 8px;font-size:12px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}
+.t{height:36px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;position:relative;color:var(--dim)}
+.t em{font-style:normal;font-size:12px}
+.t.sel{color:var(--chalk);background:var(--chan)}.t.sel:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--sand)}
+.nt{margin:auto 12px 0;height:36px;border:1px solid var(--hc);display:flex;align-items:center;padding:0 12px}
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+.bar{height:84px;flex:none;padding:12px 16px 0;display:flex;align-items:flex-start;gap:16px;border-bottom:1px solid var(--hl)}
+.bar h1{margin:0 0 8px;font:500 18px/24px "JetBrains Mono",monospace}
+.bar p{margin:0;color:var(--dim);font-size:13px;white-space:nowrap}
+.seg{display:flex;border:1px solid var(--hc);margin-top:2px}
+.seg span{padding:9px 12px;color:var(--dim)}.seg .on{background:var(--chan);color:var(--chalk);box-shadow:inset 0 -2px 0 var(--sand)}
+.btn{height:36px;padding:0 14px;display:flex;align-items:center;border:1px solid var(--hc);white-space:nowrap}
+.btn.p{background:var(--sand);border-color:var(--sand);color:var(--ink);font-weight:600}
+.btn.g{border-color:transparent;color:var(--dim)}
+.bar .btn{height:34px;margin-top:2px;padding:0 10px}
+.tools{display:flex;gap:6px;margin-left:auto}
+.strip{height:44px;flex:none;display:grid;grid-template-columns:var(--cols);align-items:center;border-bottom:1px solid var(--hs);background:var(--deep);overflow:hidden}
+.chip{height:32px;border:1px solid var(--hl);margin-right:-1px;padding:0 6px;display:flex;flex-direction:column;justify-content:center;gap:3px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;position:relative;font:11px "JetBrains Mono",monospace}
+.chip i{font-style:normal;font-size:11px;color:var(--dim);overflow:hidden;text-overflow:ellipsis}
+.chip.new{border-left:2px solid var(--sand)}.chip.new b{font:600 11px "Atkinson Hyperlegible Next";color:var(--sand)}
+.chip.add{border:1px solid var(--hc);outline:2px solid var(--sand);outline-offset:-2px;color:var(--chalk);padding-left:6px;background:var(--chan)}
+.hd,.r{height:36px;display:grid;grid-template-columns:var(--cols);align-items:center;flex:none;overflow:hidden}
+.hd{background:var(--chan);border-bottom:1px solid var(--hs);color:var(--dim);font-size:12px}
+.hd span{padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.hd .pend{height:36px;border-top:2px solid rgb(242 199 163/.45);padding-top:12px}
+.r{border-bottom:1px solid var(--hl);font:12px "JetBrains Mono",monospace}
+.r>*{padding:0 6px;white-space:nowrap;overflow:hidden;font-style:normal;text-decoration:none;font-weight:400}
+.r>i:first-child{color:var(--dim);font-size:11px;display:flex;gap:5px;align-items:center}
+.r>i:first-child:before{content:"";width:11px;height:11px;border:1px solid var(--hc);flex:none}
+.r .v{color:var(--sea)}.r .o{color:var(--chalk)}.r .x{color:var(--coral)}.r .d{color:var(--dim)}
+.r>u{height:36px;border-left:1px dashed rgb(242 199 163/.3);background:rgb(242 199 163/.03)}
+.r.z{background:rgb(230 237 231/.045)}
+.foot{height:40px;margin-top:auto;border-top:1px solid var(--hs);display:flex;align-items:center;justify-content:space-between;padding:0 16px;color:var(--dim);font-size:13px;flex:none;background:var(--ink)}
+.pg{display:flex;gap:6px}.pg span{border:1px solid var(--hc);padding:6px 10px;color:var(--chalk)}
+.side{width:360px;background:var(--deep);border-left:1px solid var(--hs);padding:16px;display:flex;flex-direction:column;gap:12px}
+.side h2{margin:0;font:600 16px/24px "Atkinson Hyperlegible Next"}
+.top{display:flex;align-items:center;gap:12px}.top h2{flex:1}
+.x{width:28px;height:28px;display:grid;place-items:center;border:1px solid var(--hl);color:var(--dim)}
+.lnk{font-size:13px;color:var(--dim);text-decoration:underline;text-decoration-color:var(--hs);text-underline-offset:3px;margin-top:-6px}
+.f{display:flex;flex-direction:column;gap:4px}
+.f>label{font-size:12px;color:var(--dim);line-height:16px}
+.c{height:36px;border:1px solid var(--hc);background:var(--ink);display:flex;align-items:center;padding:0 10px;gap:8px;justify-content:space-between}
+.c small{color:var(--dim);font:12px "Atkinson Hyperlegible Next"}
+.c.q{color:var(--dim)}
+.row2{display:flex;gap:12px;align-items:flex-end}.row2 .f{flex:1}
+.ck{display:flex;align-items:center;gap:8px;height:36px}
+.bx{width:16px;height:16px;border:1px solid var(--hc);background:var(--ink);flex:none;position:relative}
+.bx.on:after{content:"";position:absolute;left:4px;top:0;width:5px;height:10px;border-right:2px solid var(--sand);border-bottom:2px solid var(--sand);transform:rotate(40deg)}
+.ck.off{color:var(--dim)}.ck.off .bx{border-color:var(--hl)}.ck.off small{font-size:12px}
+.seg3{display:flex;border:1px solid var(--hc);height:36px;background:var(--ink)}
+.seg3 span{flex:1;display:grid;place-items:center;color:var(--dim)}.seg3 .on{background:var(--chan);color:var(--chalk);box-shadow:inset 0 -2px 0 var(--sand)}
+.sg{display:flex;gap:14px;font:12px "JetBrains Mono",monospace;color:var(--dim)}.sg span{text-decoration:underline;text-decoration-color:var(--hs);text-underline-offset:3px}
+.sql{background:var(--ink);border:1px solid var(--hl);padding:10px 12px;font:12px/20px "JetBrains Mono",monospace;color:var(--chalk);word-break:break-word}
+.ok{display:flex;gap:8px;color:var(--dim);font-size:13px;line-height:18px}.ok:before{content:"";flex:none;width:8px;height:8px;margin-top:5px;background:var(--sea)}
+.acts{margin-top:auto;display:flex;justify-content:flex-end;gap:8px}
+
+.hd>span,.r>*{border-right:1px solid var(--hl);height:36px;display:flex;align-items:center}
+.strip>*{border-right-color:var(--hl)}
+.hd>span.rz{position:relative;color:var(--chalk);background:rgb(230 237 231/.08)}
+.hd>span.rz:after{content:"";position:absolute;right:-2px;top:0;bottom:0;width:3px;background:var(--sand)}
+.hd>span.rz:before{content:"\2194";position:absolute;right:6px;color:var(--sand);font-size:12px}
+.mini{width:48px;background:var(--deep);border-left:1px solid var(--hs);display:flex;flex-direction:column;align-items:center;padding:12px 0;gap:14px}
+.mini .ex{width:36px;height:36px;border:1px solid var(--hc);display:grid;place-items:center;color:var(--chalk)}
+.mini .vt{writing-mode:vertical-rl;transform:rotate(180deg);display:flex;gap:10px;align-items:center;color:var(--chalk);font-size:14px}
+.mini .vt b{font-weight:400;color:var(--dim)}
+.mini .dot{width:8px;height:8px;background:var(--sand)}
+</style></head><body><div class="app">
+<nav class="rail"><div class="claw"></div>
+<div class="ic"><svg viewBox="0 0 20 20"><path d="M3 9l7-6 7 6v8H3z"/></svg></div>
+<div class="ic on"><svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12"/><path d="M3 8h14M8 8v8"/></svg></div>
+<div class="ic"><svg viewBox="0 0 20 20"><path d="M4 5l5 5-5 5M11 15h5"/></svg></div>
+<div class="ic"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3"/></svg></div></nav>
+<div class="col">
+<header><span class="pk"><small>Project</small>acme-shop</span><span class="sl">/</span><span class="pk"><small>Database</small>orders-db</span><span class="sl">/</span>
+<span class="pk"><small>Branch</small>main <span class="lock">protected</span></span><span class="sl">/</span><span class="pk mono"><small>Postgres db</small>app</span>
+<span class="sp"></span><span class="act"><small>Act as</small><span class="mono">billing_admin</span></span><span class="av">MF</span></header>
+<div class="body">
+<aside class="list"><div class="schema"><span><small>Schema </small><span class="m">public</span></span><span class="sl">▾</span></div><div class="flt">Filter tables</div><div class="sh">public · 9 tables</div>
+<div class="t m">customers<em>3.1k</em></div><div class="t m sel">invoices<em>48.2k</em></div><div class="t m">invoice_lines<em>131k</em></div>
+<div class="t m">payments<em>52.7k</em></div><div class="t m">plans<em>12</em></div><div class="t m">refunds<em>1.9k</em></div>
+<div class="t m">subscriptions<em>6.4k</em></div><div class="t m">tax_rates<em>47</em></div><div class="t m">webhooks<em>12.4k</em></div>
+<div class="nt">New table</div></aside>
+<main class="main">
+<div class="bar"><div><h1>public.invoices</h1><p>≈ 48,210 rows · RLS on</p></div>
+<div class="seg"><span class="on">Rows</span><span>Structure</span></div><div class="btn">Review 1 change</div>
+<div class="tools"><div class="btn">Filter</div><div class="btn">Sort</div></div></div>
+<div class="strip"><span></span>
+<div class="chip">id<i>uuid · key</i></div><div class="chip">customer_id<i>uuid → fk</i></div><div class="chip">status<i>enum</i></div>
+<div class="chip">amount_cents<i>int8</i></div><div class="chip">currency<i>text</i></div><div class="chip">issued_at<i>timestamptz</i></div>
+<div class="chip">due_at<i>timestamptz</i></div><div class="chip">paid_at<i>tstz null</i></div><div class="chip">memo<i>text null</i></div>
+<div class="chip new">discount_cents<i>int8 <b>new</b></i></div><div class="chip add">+ Column</div></div>
+<div class="hd"><span></span><span>id</span><span>customer_id</span><span>status</span><span class="rz">amount_cents</span><span>currency</span><span>issued_at</span><span>due_at</span><span>paid_at</span><span>memo</span><span class="pend">discount_cents</span></div>
+<div class="r"><i>1</i><b class="d">3f9a…</b><b class="d">a07d…</b><b class="v">paid</b><b>12900</b><b>EUR</b><b>09-02</b><b>09-16</b><b>09-05</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>2</i><b class="d">81c4…</b><b class="d">5be2…</b><b class="o">open</b><b>45000</b><b>EUR</b><b>09-03</b><b>09-17</b><b class="d">null</b><b class="d">Q3 plan</b><u></u></div>
+<div class="r"><i>3</i><b class="d">c2d1…</b><b class="d">19ac…</b><b class="v">paid</b><b>8900</b><b>USD</b><b>09-03</b><b>09-17</b><b>09-09</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>4</i><b class="d">07be…</b><b class="d">d44f…</b><b class="x">void</b><b>2400</b><b>EUR</b><b>09-04</b><b>09-18</b><b class="d">null</b><b class="d">dup</b><u></u></div>
+<div class="r"><i>5</i><b class="d">9e60…</b><b class="d">a07d…</b><b class="v">paid</b><b>19900</b><b>EUR</b><b>09-05</b><b>09-19</b><b>09-06</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>6</i><b class="d">5a73…</b><b class="d">6f1b…</b><b class="o">open</b><b>72500</b><b>GBP</b><b>09-06</b><b>09-20</b><b class="d">null</b><b class="d">null</b><u></u></div>
+<div class="r"><i>7</i><b class="d">e8f0…</b><b class="d">3c9e…</b><b class="v">paid</b><b>3300</b><b>USD</b><b>09-06</b><b>09-20</b><b>09-08</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>8</i><b class="d">14d7…</b><b class="d">b81a…</b><b class="o">open</b><b>15800</b><b>EUR</b><b>09-07</b><b>09-21</b><b class="d">null</b><b class="d">null</b><u></u></div>
+<div class="r"><i>9</i><b class="d">b6a2…</b><b class="d">5be2…</b><b class="v">paid</b><b>99000</b><b>EUR</b><b>09-08</b><b>09-22</b><b>09-12</b><b class="d">Annual</b><u></u></div>
+<div class="r z"><i>10</i><b class="d">70c9…</b><b class="d">f20d…</b><b class="x">void</b><b>5000</b><b>USD</b><b>09-08</b><b>09-22</b><b class="d">null</b><b class="d">test</b><u></u></div>
+<div class="r"><i>11</i><b class="d">2ed5…</b><b class="d">19ac…</b><b class="o">open</b><b>8900</b><b>USD</b><b>09-09</b><b>09-23</b><b class="d">null</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>12</i><b class="d">d913…</b><b class="d">a07d…</b><b class="v">paid</b><b>12900</b><b>EUR</b><b>09-10</b><b>09-24</b><b>09-11</b><b class="d">null</b><u></u></div>
+<div class="r"><i>13</i><b class="d">48b0…</b><b class="d">8d3f…</b><b class="o">open</b><b>27650</b><b>GBP</b><b>09-11</b><b>09-25</b><b class="d">null</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>14</i><b class="d">f1e8…</b><b class="d">c7a4…</b><b class="v">paid</b><b>6400</b><b>EUR</b><b>09-12</b><b>09-26</b><b>09-14</b><b class="d">null</b><u></u></div>
+<div class="r"><i>15</i><b class="d">0a2c…</b><b class="d">3c9e…</b><b class="o">open</b><b>3300</b><b>USD</b><b>09-13</b><b>09-27</b><b class="d">null</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>16</i><b class="d">c58d…</b><b class="d">6f1b…</b><b class="v">paid</b><b>72500</b><b>GBP</b><b>09-14</b><b>09-28</b><b>09-15</b><b class="d">null</b><u></u></div>
+<div class="r"><i>17</i><b class="d">93f7…</b><b class="d">e19b…</b><b class="o">open</b><b>11200</b><b>EUR</b><b>09-15</b><b>09-29</b><b class="d">null</b><b class="d">null</b><u></u></div>
+<div class="r z"><i>18</i><b class="d">6d04…</b><b class="d">5be2…</b><b class="v">paid</b><b>45000</b><b>EUR</b><b>09-16</b><b>09-30</b><b>09-18</b><b class="d">null</b><u></u></div>
+<div class="foot"><span>Rows 1–100 of ≈ 48,210</span><div class="pg"><span>Prev</span><span>1 / 483</span><span>Next</span></div></div>
+</main>
+<aside class="mini"><div class="ex" title="Expand panel">&#x21E4;</div><div class="vt"><span class="dot"></span>New column <b>· draft, not added yet</b></div></aside>
+</div></div></div></body></html>

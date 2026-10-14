@@ -144,3 +144,15 @@ Branch `neon-fork-round-2`; fork branch `round-2` on `chelabase/neon`. Spec `doc
   - Not yet seen in a browser: Studio's create form didn't respond on the branch stack, an issue outside this step.
 - **Known residual:** a database a guarded login makes from `template0` is unguarded until the reconcile its creation asks for (seconds). Closing it needs the fork and is queued for the next fork round, with REASSIGN OWNED.
 - **Status:** merged to `main` 2026-10-14.
+
+### A table editor that shows the SQL before it touches your schema (TE-B1)
+
+- **Problem:** Studio's old Tables console was a flat grid: no structure editing, no review of what a change would run, and no way to see what a role can actually read.
+- **What we built:**
+  - **Staged structure changes.** Columns, constraints (PK, unique, FK with NOT VALID + validate, check), table rename/move/comment/drop, new tables and enums stack up as pending edits. Every change re-runs a dry run on the branch and shows the SQL, lock level, table rewrites and dependents (with a cascade checkbox) before one transactional Apply.
+  - **A changeset model that stays correct under edits:** folding, removing an edit and its dependents, and addressing every operation to the table's name at its position (after pending renames/moves), checked by property tests.
+  - **A row grid** (virtualized, inline type-aware editing, keyboard navigation) with a row panel for inserts, long values and NULL/default toggles; select a page or every matching row, with an exact `count` from the query engine (a new `count` op, also for apps).
+  - **Act as a role.** Reads and writes run as one of your granted Postgres roles; a project Admin holds every role of their project (narrowable per database), and the data API's `anon`/`authenticated` only when a grant names them.
+  - **Honest defaults:** new tables offer "Turn RLS on" and say plainly what the data API exposes while RLS is off.
+- **Evidence:** Studio 1 370+ unit and property tests; `just check` green; live: the orchestrator API suite 449/449, `rest_live` 37/38 (the one failure is the known, parked compute_ctl migration race during provisioning), `sql-editor-e2e` and `console-e2e` green with the new act-as rules; browser passes as an Admin and a Developer.
+- **Status:** ready to merge (2026-10-14), awaiting the user's decision.

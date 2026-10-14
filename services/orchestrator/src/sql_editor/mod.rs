@@ -16,7 +16,7 @@ pub mod schema;
 mod routes;
 pub(crate) use routes::{
     Session, connect_as_owner, hand_over_after, invalid_role, load_authorized, open_session,
-    pick_pg_database,
+    pick_pg_database, reconcile_member_role,
 };
 
 pub const MAX_SQL_BYTES: usize = 1_048_576;

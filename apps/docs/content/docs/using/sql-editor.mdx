@@ -77,9 +77,9 @@ It looks at the statement, not at what the statement calls, and a client that se
 
 ## Run as
 
-The **Run as** picker (`role` in the request) runs `SET ROLE` first, to preview what `anon`, `authenticated` or a custom role would see under row-level security. It is a **preview, not a security boundary**: the connection is the owner's.
+The **Run as** picker (`role` in the request) runs `SET ROLE` first, to see what a role would see under row-level security. It lists only the roles you're granted: an Admin, every role of the branch and the owner (or, on a database where the Admin is narrowed, the roles kept there); a Developer, the roles their grant lists and what those reach. It is a **preview, not a security boundary**: the connection is the owner's.
 
-- `anon` and `authenticated` are offered where the data API was set up. The worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the owner inheriting the role's privileges. The orchestrator re-checks the grant at most every 5 minutes per branch.
+- `anon` and `authenticated` are offered only when a grant names them (an Admin's every role doesn't include them), and only where the data API was set up. Running as one without such a grant answers 403 with `required: "role:anon"`; a saved query whose role is `anon` still saves. A read-only view of what the data API's roles see comes later. The worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the owner inheriting the role's privileges. The orchestrator re-checks the grant at most every 5 minutes per branch.
 - Other roles of the branch need no grant: roles the owner created are already its own.
 - System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`) are refused (422), and a role that doesn't exist is 404.
 

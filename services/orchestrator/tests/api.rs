@@ -6607,10 +6607,11 @@ async fn sql_run_as_role_uses_member_session() {
     assert_eq!(err["error"]["required"], "owner");
     let resp = t.run_as(DEFAULT_SUB, main, None).await;
     assert_eq!(code_of(&error_of(resp, 409).await), "owner_password_unknown");
-    // `anon` works like any other role, through membership: no grant to the owner.
-    let admin = t.member_of_sub(DEFAULT_SUB);
-    t.put_member_role(t.member_role_row(admin, main, &["anon", "billing"]));
-    let resp = t.run_as(DEFAULT_SUB, main, Some("anon")).await;
+    // `anon` works like any other role, through membership: no grant to the owner. R18: for a
+    // grant naming it (an Admin's every role doesn't hold it).
+    let anon_dev = t.grant_member("anon_dev", PlatformRole::Developer, &["anon", "billing"]);
+    t.put_member_role(t.member_role_row(anon_dev, main, &["anon", "billing"]));
+    let resp = t.run_as("anon_dev", main, Some("anon")).await;
     assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
     assert!(t.reconciles().is_empty(), "{:?}", t.reconciles());
 }
@@ -6740,6 +6741,24 @@ async fn admin_acts_as_login_role_through_the_owner() {
     t.grant_member("dev2", PlatformRole::Developer, &["editor"]);
     let err = error_of(t.run_as("dev2", main, Some("editor")).await, 403).await;
     assert_eq!(err["error"]["required"], "admin");
+}
+
+// R18 (user, 2026-10-14): Run as / Act as never offer the data API's roles unless a grant
+// names them: an Admin (every role, R17) is refused anon and authenticated; a member whose grant
+// names `anon` may run as it. Previewing what the data API sees is TE-B2's read-only View as.
+#[tokio::test]
+async fn admins_run_as_the_data_api_roles_only_when_granted_by_name() {
+    let (t, _dev) = act_as_app().await;
+    let main = t.main();
+    for role in ["anon", "authenticated"] {
+        let err = error_of(t.run_as(DEFAULT_SUB, main, Some(role)).await, 403).await;
+        assert_eq!(err["error"]["required"], format!("role:{role}"), "{role}");
+    }
+    let dev3 = t.grant_member("dev3", PlatformRole::Developer, &["anon"]);
+    // The member's login already holds anon on this branch (as the reconciler leaves it).
+    t.put_member_role(t.member_role_row(dev3, main, &["anon"]));
+    let resp = t.run_as("dev3", main, Some("anon")).await;
+    assert_ne!(resp.status(), 403, "a grant naming anon may run as it");
 }
 
 // I2 (T9 review): an effective Admin acts as any role of the branch. When the member role can't
@@ -8709,7 +8728,8 @@ async fn me_lists_narrowed_databases() {
         json!([{
             "project_id": w.project,
             "platform_role": "admin",
-            "roles": ["owner", "app", "reports"],
+            // R17: an Admin grant is every role, whatever a row names.
+            "roles": "all",
             "databases": [{ "database_id": w.db, "platform_role": "developer", "roles": ["app"] }],
         }]),
         "{me}"
@@ -8912,7 +8932,8 @@ async fn approve_checks_grants_against_overrides() {
     let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
     t.w.metadata.overrides.lock().unwrap().insert(
         (pat, t.w.db.as_uuid()),
-        chelabase_metadata::members::OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None },
+        // R17: an Admin grant keeps the roles an override names.
+        chelabase_metadata::members::OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: Some(vec!["via_login".into()]) },
     );
     let path = format!("/v1/members/{pat}/approve");
     let body = json!({ "grants": [{ "project_id": t.w.project, "platform_role": "admin", "pg_roles": ["via_login"] }] });
@@ -9075,10 +9096,10 @@ async fn me_lists_capabilities() {
     let names: Vec<&str> = me["tenant"]["projects"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["Billing"]);
 
-    // An Admin grant includes the database owner.
+    // R17: an Admin grant is every role (the database owner included), whatever a row names.
     w.metadata.add_granted(w.tenant, "fay", other, PlatformRole::Admin, &["billing"]);
     let me: Value = w.app.send_as("fay", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert_eq!(me["projects"][0]["roles"], json!(["owner", "billing"]));
+    assert_eq!(me["projects"][0]["roles"], json!("all"));
 
     // The tenant admin: every project, every role, and (self-hosted) the instance.
     let me: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
@@ -10293,6 +10314,25 @@ async fn override_cannot_widen() {
     assert_eq!(code_of(&err), "invalid_request");
 }
 
+// R17 (user, 2026-10-14): a project Admin's grant is every role on the project (`"all"`),
+// whatever roles the request names; Developer and Viewer grants keep their named roles.
+#[tokio::test]
+async fn an_admin_grant_holds_every_role() {
+    let t = mw(Mode::SelfHosted).await;
+    let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+    let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
+    for roles in [json!([]), json!(["a", "b"])] {
+        let resp = t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "admin", "pg_roles": roles }))).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await["pg_roles"], json!("all"));
+    }
+    let list = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/projects/{}/grants", t.w.project), None).await).await;
+    let row = list.as_array().unwrap().iter().find(|g| g["member_id"] == json!(m.to_string())).unwrap().clone();
+    assert_eq!(row["pg_roles"], json!("all"));
+    let resp = t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": "developer", "pg_roles": ["a"] }))).await;
+    assert_eq!(body_of(resp).await["pg_roles"], json!(["a"]));
+}
+
 #[tokio::test]
 async fn grant_change_enqueues_reconcile_for_every_branch() {
     let t = mw(Mode::SelfHosted).await;
@@ -10493,9 +10533,10 @@ async fn grant_put_checks_again_when_an_override_lands_in_between() {
     let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
     t.w.metadata.grant(m, t.w.project, PlatformRole::Admin, &["plain"]);
     let db = t.w.db;
-    // Admin may hold `boss`; but another request narrows the member to Developer on web1.
+    // Admin may hold `boss`; but another request narrows the member to Developer with `boss`
+    // on web1 (R17: an Admin grant keeps the roles an override names).
     t.w.metadata.race_once(move |md| {
-        md.narrow(m, db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None });
+        md.narrow(m, db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: Some(vec!["boss".into()]) });
     });
     let grant = format!("/v1/projects/{}/grants/{m}", t.w.project);
     let err = error_of(
@@ -10515,8 +10556,9 @@ async fn invite_of_an_existing_member_checks_again_when_an_override_lands_in_bet
     t.w.metadata.set_member(t.w.tenant, "m", |r| r.email = Some("m@x.com".into()));
     t.w.metadata.grant(m, t.w.project, PlatformRole::Admin, &["plain"]);
     let db = t.w.db;
+    // R17: an Admin grant keeps the roles an override names.
     t.w.metadata.race_once(move |md| {
-        md.narrow(m, db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None });
+        md.narrow(m, db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: Some(vec!["boss".into()]) });
     });
     let err = error_of(
         t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "m@x.com", "admin", &["boss"]))).await,
@@ -10534,11 +10576,13 @@ async fn override_put_checks_again_when_the_grant_changes_in_between() {
     let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
     t.w.metadata.grant(m, t.w.project, PlatformRole::Admin, &["plain"]);
     let project = t.w.project;
-    // Another request gives the member `boss` as Admin, which is fine until the override lands.
-    t.w.metadata.race_once(move |md| md.grant(m, project, PlatformRole::Admin, &["plain", "boss"]));
+    // Narrowing the Admin (every role, R17) to `boss` is fine; but another request makes the
+    // member a Developer holding `boss` (a stand-in for any grant change), which breaks it once
+    // the override lands.
+    t.w.metadata.race_once(move |md| md.grant(m, project, PlatformRole::Developer, &["plain", "boss"]));
     let o = format!("/v1/projects/{}/grants/{m}/overrides", t.w.project);
     let err = error_of(
-        t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": t.w.db, "platform_role": "developer" }))).await,
+        t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": t.w.db, "pg_roles": ["boss"] }))).await,
         422,
     )
     .await;
@@ -10659,13 +10703,14 @@ async fn grant_put_rechecks_existing_overrides() {
     let put = |role: &str, roles: &[&str]| {
         t.send(DEFAULT_SUB, Method::PUT, &grant, Some(json!({ "platform_role": role, "pg_roles": roles })))
     };
-    assert_eq!(put("admin", &["plain"]).await.status(), 200);
+    assert_eq!(put("developer", &["plain"]).await.status(), 200);
     let o = format!("{grant}/overrides");
-    let resp = t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": t.w.db, "platform_role": "developer" }))).await;
-    assert_eq!(resp.status(), 200);
+    // An override at Developer naming `boss` (the API can't write it today; written directly,
+    // as if `boss` changed since).
+    t.w.metadata.narrow(m, t.w.db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: Some(vec!["boss".into()]) });
     let events = t.actions().len();
-    // Admin may hold `boss`, but on web1 the override leaves Developer with it.
-    let err = error_of(put("admin", &["plain", "boss"]).await, 422).await;
+    // Admin holds every role (R17), but on web1 the override leaves Developer with `boss`.
+    let err = error_of(put("admin", &[]).await, 422).await;
     assert_eq!(err["error"]["database_id"], t.w.db.to_string(), "{err}");
     assert_eq!(err["error"]["role"], "boss");
     assert!(message_of(&err).contains("web1"), "{err}");
@@ -10688,9 +10733,10 @@ async fn grant_put_rechecks_existing_overrides() {
     assert_eq!(put("admin", &["plain", "boss", "login"]).await.status(), 200);
     // Dropping web1's narrowing leaves the Admin grant there: fine.
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("{o}?database_id={}", t.w.db), None).await.status(), 204);
-    // On web2 an override down to Developer would leave `login`: refused, named web2.
+    // On web2 an override down to Viewer keeping `login` (R17: an Admin grant keeps the roles
+    // an override names): refused, named web2.
     let err = error_of(
-        t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": db2, "platform_role": "viewer" }))).await,
+        t.send(DEFAULT_SUB, Method::PUT, &o, Some(json!({ "database_id": db2, "platform_role": "viewer", "pg_roles": ["login"] }))).await,
         422,
     )
     .await;
@@ -10781,9 +10827,11 @@ async fn existing_member_invite_is_all_or_nothing() {
     let other = t.w.metadata.create_project(t.w.tenant, "Other").await.unwrap().id;
     let m = t.w.metadata.add_granted(t.w.tenant, "m", t.w.project, PlatformRole::Admin, &["plain"]);
     t.w.metadata.set_member(t.w.tenant, "m", |r| r.email = Some("m@x.com".into()));
-    t.w.metadata.narrow(m, t.w.db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None });
+    // Written directly (the API can't today), as if `boss` changed since.
+    t.w.metadata.narrow(m, t.w.db, OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: Some(vec!["boss".into()]) });
     t.clear_enqueued();
-    // The second grant is refused (web1's override would leave Developer with `boss`).
+    // The second grant is refused (web1's override would leave Developer with `boss`; R17: an
+    // Admin grant keeps the roles an override names).
     let body = json!({ "email": "m@x.com", "grants": [
         { "project_id": other, "platform_role": "viewer", "pg_roles": [] },
         { "project_id": t.w.project, "platform_role": "admin", "pg_roles": ["boss"] },
@@ -10795,7 +10843,7 @@ async fn existing_member_invite_is_all_or_nothing() {
     // Both fine: both written, one event each, both projects reconciled.
     let body = json!({ "email": "m@x.com", "grants": [
         { "project_id": other, "platform_role": "viewer", "pg_roles": [] },
-        { "project_id": t.w.project, "platform_role": "admin", "pg_roles": ["plain", "group2"] },
+        { "project_id": t.w.project, "platform_role": "developer", "pg_roles": ["plain", "group2"] },
     ] });
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await.status(), 200);
     assert!(t.w.metadata.grants.lock().unwrap().get(&(m, other.as_uuid())).is_some());
@@ -11139,9 +11187,9 @@ async fn grant_whose_chain_is_not_plain_groups_is_refused_below_admin() {
         }
         // Admin may hold it (R16: owner-level and LOGIN roles are Admin-only).
         assert_eq!(put("admin", name).await.status(), 200, "admin {name}");
-        // An override may not narrow such a grant below Admin.
+        // An override may not keep it below Admin (R17: an Admin grant keeps what it names).
         let err = error_of(
-            t.send(DEFAULT_SUB, Method::PUT, &format!("{grant}/overrides"), Some(json!({ "database_id": t.w.db, "platform_role": "developer" })))
+            t.send(DEFAULT_SUB, Method::PUT, &format!("{grant}/overrides"), Some(json!({ "database_id": t.w.db, "platform_role": "developer", "pg_roles": [name] })))
                 .await,
             422,
         )
@@ -12265,6 +12313,47 @@ async fn table_reads_refuse_a_member_with_no_login_on_the_branch() {
         let path = format!("{}/{rest}", t.branch(main));
         assert_eq!(t.send_as("vic", Method::GET, &path, None).await.status(), 200, "{rest}");
     }
+    wait_no_editor_sessions(&scratch).await;
+    let admin = scratch.admin.clone();
+    scratch.drop().await;
+    use sqlx::Executor;
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {login}"))).await.unwrap();
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {group}"))).await.unwrap();
+}
+
+// TE-B1 browser pass C1 (ruling R16): a member whose login isn't on the branch yet (the SQL
+// editor's lazy reconcile never ran there) gets it reconciled by the read itself, once, before
+// the CONNECT check; a login that exists but lacks CONNECT asks for no reconcile.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn table_reads_reconcile_a_missing_member_login_first() {
+    let (scratch, t) = changes_app("conn-reconcile").await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    let group = format!("{}_grp", scratch.owner);
+    t.metadata.add_group_role(&ep, &group, &[]);
+    let dev = t.grant_member("dev", PlatformRole::Developer, &[&group]);
+    let login = chelabase_types::role_name::member_role_name(dev);
+    scratch.exec_in(&format!("CREATE ROLE {group} NOLOGIN;")).await;
+    let path = format!("{}/objects", t.branch(main));
+    // No login yet: the read asks the worker to reconcile this member on this branch.
+    let _ = t.send_as("dev", Method::GET, &path, None).await;
+    let asked: Vec<_> = t.jobs.member_reconciles.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "one reconcile for the missing login: {asked:?}");
+    assert_eq!((asked[0].branch_id, asked[0].member_id), (main.as_uuid(), Some(dev)));
+    // Once the login exists (as the worker would leave it), the read passes with no new reconcile.
+    scratch
+        .exec_in(&format!("CREATE ROLE {login} LOGIN NOINHERIT; GRANT {group} TO {login} WITH INHERIT FALSE, SET TRUE;"))
+        .await;
+    assert_eq!(t.send_as("dev", Method::GET, &path, None).await.status(), 200);
+    assert_eq!(t.jobs.member_reconciles.lock().unwrap().len(), 1, "an existing login needs no reconcile");
+    // A login without CONNECT is refused as before, with no reconcile.
+    scratch
+        .exec_in(&format!("REVOKE CONNECT ON DATABASE {db} FROM PUBLIC;", db = scratch.database))
+        .await;
+    let err = error_of(t.send_as("dev", Method::GET, &path, None).await, 403).await;
+    assert_eq!(code_of(&err), "permission_denied");
+    assert_eq!(t.jobs.member_reconciles.lock().unwrap().len(), 1);
     wait_no_editor_sessions(&scratch).await;
     let admin = scratch.admin.clone();
     scratch.drop().await;

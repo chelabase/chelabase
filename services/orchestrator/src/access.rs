@@ -173,12 +173,10 @@ fn internal(what: &str, err: impl std::fmt::Display) -> ApiError {
     ApiError::internal()
 }
 
-/// A stored project grant as an access grant (`owner` never stored, R7).
+/// A stored project grant as an access grant (`owner` never stored, R7; an Admin grant is
+/// every role, R17).
 pub(crate) fn grant_of(row: &GrantRow) -> Grant {
-    Grant {
-        platform_role: row.platform_role,
-        roles: RoleSet::Only(row.pg_roles.iter().map(|r| PgRole::parse(r)).collect()),
-    }
+    row.to_grant()
 }
 
 pub(crate) fn narrowing_of(row: &OverrideRow) -> Narrowing {
@@ -574,10 +572,12 @@ impl RoleGraph {
     }
 
     /// R21: whether a granted role's chain reaches `name`. A granted role whose chain holds an
-    /// owner-level, LOGIN or reserved role contributes nothing.
+    /// owner-level, LOGIN or reserved role contributes nothing. Every role (`All`) already
+    /// allows every role it may (R18: never the data API's, which need a grant naming them),
+    /// so its chains add nothing.
     fn chain_grants(&self, granted: &RoleSet, name: &str) -> bool {
         let RoleSet::Only(set) = granted else {
-            return true;
+            return false;
         };
         set.iter().any(|role| {
             let PgRole::Named(g) = role else {

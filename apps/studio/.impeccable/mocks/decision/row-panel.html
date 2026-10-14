@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Table editor: row panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0b1c1f;--deep:#0f2a2d;--chan:#14363a;--chalk:#e6ede7;--dim:#aebfc0;--hl:rgb(230 237 231/.16);--hs:rgb(230 237 231/.34);--hc:rgb(230 237 231/.4);--sand:#f2c7a3;--coral:#eda6aa;--sea:#9fd4c6;
+--cols:40px 70px 76px 66px 76px 54px 80px 80px 80px 60px}
+html{overflow:auto}
+body{width:1440px;height:900px;overflow:hidden;margin:0;background:var(--ink);color:var(--chalk);font:14px/1 "Atkinson Hyperlegible Next",system-ui,sans-serif}
+*{box-sizing:border-box}
+.m,.mono{font-family:"JetBrains Mono",monospace;font-size:13px}
+.app{display:flex;width:1440px;height:900px;position:relative}
+.rail{width:56px;background:var(--deep);border-right:1px solid var(--hs);display:flex;flex-direction:column;align-items:center;padding-top:14px;gap:6px;position:relative}
+.claw{width:24px;height:24px;border:2px solid var(--chalk);margin-bottom:18px}
+.ic{width:36px;height:36px;display:grid;place-items:center;color:var(--dim)}
+.ic svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6}
+.ic.on{color:var(--chalk);position:relative}
+.ic.on:before{content:"";position:absolute;left:-10px;top:0;bottom:0;width:2px;background:var(--sand)}
+.col{flex:1;display:flex;flex-direction:column;min-width:0}
+header{height:52px;border-bottom:1px solid var(--hl);display:flex;align-items:center;padding:0 16px;gap:10px;flex:none}
+header .sl{color:var(--hs)}
+.lock{font-size:12px;color:var(--dim);border:1px solid var(--hl);padding:3px 6px}
+.sp{flex:1}
+.act{border:1px solid var(--hc);padding:8px 10px;display:flex;gap:8px;align-items:center}
+.act small{color:var(--dim);font-size:12px}
+.av{width:28px;height:28px;border:1px solid var(--hc);display:grid;place-items:center;font-size:12px;margin-left:8px}
+.body{flex:1;display:flex;min-height:0}
+.list{width:248px;background:var(--deep);border-right:1px solid var(--hl);display:flex;flex-direction:column;padding:12px 0}
+.flt{margin:0 12px 14px;height:36px;border:1px solid var(--hc);padding:0 10px;display:flex;align-items:center;color:var(--dim)}
+.sh{padding:0 16px 8px;font-size:12px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}
+.t{height:36px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;position:relative;color:var(--dim)}
+.t em{font-style:normal;font-size:12px;color:var(--dim)}
+.t.sel{color:var(--chalk);background:var(--chan)}.t.sel:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--sand)}
+.nt{margin:auto 12px 0;height:36px;border:1px solid var(--hc);display:flex;align-items:center;padding:0 12px}
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+.bar{height:84px;flex:none;padding:12px 16px 0;display:flex;align-items:flex-start;gap:16px;border-bottom:1px solid var(--hl)}
+.bar h1{margin:0 0 8px;font:500 18px/24px "JetBrains Mono",monospace}
+.bar p{margin:0;color:var(--dim);font-size:13px;white-space:nowrap}
+.seg{display:flex;border:1px solid var(--hc);margin-top:2px}
+.seg span{padding:9px 12px;color:var(--dim)}.seg .on{background:var(--chan);color:var(--chalk);box-shadow:inset 0 -2px 0 var(--sand)}
+.btn{height:36px;padding:0 14px;display:flex;align-items:center;border:1px solid var(--hc)}
+.btn.p{background:var(--sand);border-color:var(--sand);color:var(--ink);font-weight:600}
+.btn.g{border-color:transparent;color:var(--dim)}
+.btn.d{border-color:transparent;color:var(--coral);padding:0 8px}
+.tools{display:flex;gap:6px;margin-left:auto}.tools .btn{height:32px;padding:0 10px}
+.strip{height:44px;flex:none;display:grid;grid-template-columns:var(--cols) auto;align-items:center;border-bottom:1px solid var(--hs);background:var(--deep);overflow:hidden}
+.chip{height:32px;border:1px solid var(--hl);margin-right:-1px;padding:0 6px;display:flex;flex-direction:column;justify-content:center;gap:3px;overflow:hidden;white-space:nowrap;font-family:"JetBrains Mono",monospace;font-size:11px}
+.chip i{font-style:normal;font-size:11px;color:var(--dim)}
+.chip.add{border-style:dashed;border-color:var(--hc);color:var(--dim);padding-left:4px;width:72px}
+.hd,.r{height:36px;display:grid;grid-template-columns:var(--cols);align-items:center;flex:none;overflow:hidden}
+.hd{background:var(--chan);border-bottom:1px solid var(--hs);color:var(--dim);font-size:12px}
+.hd span{padding:0 6px;white-space:nowrap}
+.r{border-bottom:1px solid var(--hl);font-family:"JetBrains Mono",monospace;font-size:12px}
+.r>*{padding:0 6px;white-space:nowrap;overflow:hidden;font-style:normal;text-decoration:none}
+.r>i:first-child{color:var(--dim);font-size:11px;display:flex;gap:5px;align-items:center}
+.r>i:first-child:before{content:"";width:11px;height:11px;border:1px solid var(--hc);background:linear-gradient(90deg,transparent 58%,var(--chalk) 58%);visibility:hidden}
+.r:hover>i:first-child:before,.r.open>i:first-child:before{visibility:visible}
+.r.z{background:rgb(230 237 231/.045)}
+.r.open{background:var(--chan);box-shadow:inset 2px 0 0 var(--sand)}
+.r .v{color:var(--sea)}.r .o{color:var(--chalk)}.r .x{color:var(--coral)}.r .d{color:var(--dim)}
+.foot{height:40px;margin-top:auto;border-top:1px solid var(--hs);display:flex;align-items:center;justify-content:space-between;padding:0 16px;color:var(--dim);font-size:13px;flex:none;background:var(--ink)}
+.pg{display:flex;gap:6px}.pg span{border:1px solid var(--hc);padding:6px 10px;color:var(--chalk)}
+.pk{height:36px;padding:0 8px;border:1px solid transparent;display:flex;gap:6px;align-items:center}
+.pk:after{content:"";width:6px;height:6px;border-right:1.5px solid var(--dim);border-bottom:1.5px solid var(--dim);transform:rotate(45deg) translateY(-2px);margin-left:4px}
+.pk small{color:var(--dim);font-size:11px;margin-right:2px}
+.schema{margin:0 12px 12px;height:36px;border:1px solid var(--hc);display:flex;align-items:center;justify-content:space-between;padding:0 10px}
+.schema small{color:var(--dim);font-size:12px}
+.side{width:420px;flex:none;background:var(--deep);border-left:1px solid var(--hs);display:flex;flex-direction:column}
+.ph{height:72px;flex:none;padding:14px 16px 0;display:flex;justify-content:space-between;border-bottom:1px solid var(--hl)}
+.ph h2{margin:0 0 6px;font:600 16px/22px "Atkinson Hyperlegible Next";display:flex;gap:10px;align-items:baseline}
+.ph h2 span{font:400 13px "JetBrains Mono",monospace;color:var(--dim)}
+.ph p{margin:0;color:var(--dim);font-size:13px}
+.cl{width:36px;height:36px;margin:-6px -8px 0 0;display:grid;place-items:center;color:var(--dim)}
+.cl svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.6;fill:none}
+.flds{flex:1;overflow:hidden;padding:12px 16px 0;display:flex;flex-direction:column;gap:10px}
+.lb{display:flex;gap:8px;align-items:baseline;margin-bottom:4px;height:18px;font:13px/18px "JetBrains Mono",monospace}
+.lb i{font-style:normal;font-size:12px;color:var(--dim)}
+.ctl{height:36px;border:1px solid var(--hc);background:var(--ink);display:flex;align-items:center;gap:8px;padding:0 10px;font:13px "JetBrains Mono",monospace;white-space:nowrap;overflow:hidden}
+.ctl.ro{border-color:transparent;background:none;color:var(--dim);height:28px;padding:0}
+.ctl.ro em{margin-left:auto;font:12px "Atkinson Hyperlegible Next";font-style:normal;color:var(--dim);border:1px solid var(--hl);padding:2px 6px}
+.ctl.chg{box-shadow:inset 2px 0 0 var(--sand)}
+.ctl.num{justify-content:flex-end}
+.ctl small,.lnk{font:12px "Atkinson Hyperlegible Next";color:var(--dim)}
+.lnk{color:var(--chalk);text-decoration:underline;text-underline-offset:3px}
+.sb{height:24px;padding:0 8px;border:1px solid var(--hc);display:flex;align-items:center;font:12px "Atkinson Hyperlegible Next";margin-left:auto}
+.sb.tx{border-color:transparent;text-decoration:underline;text-underline-offset:3px}
+.sel2:after{content:"";width:6px;height:6px;border-right:1.5px solid var(--dim);border-bottom:1.5px solid var(--dim);transform:rotate(45deg) translateY(-2px)}
+.null{font:italic 13px "Atkinson Hyperlegible Next";color:var(--dim)}
+.tg{margin-left:auto;display:flex;gap:8px;align-items:center;font:12px "Atkinson Hyperlegible Next";color:var(--chalk)}
+.tg:after{content:"";order:-1;width:28px;height:16px;border:1px solid var(--sea);background:linear-gradient(90deg,transparent 50%,var(--sea) 50%)}
+.ta{height:66px;align-items:flex-start;padding:8px 10px;white-space:normal;line-height:18px;font:13px/16px "Atkinson Hyperlegible Next"}
+.cut{margin-top:4px;font-size:12px;color:var(--dim);height:18px;line-height:18px}
+.hint{flex:none;padding:0 16px 8px;color:var(--dim);font-size:13px}
+.pf{flex:none;height:60px;border-top:1px solid var(--hs);display:flex;align-items:center;gap:8px;padding:0 16px;background:var(--deep)}
+</style></head><body><div class="app">
+<nav class="rail"><div class="claw"></div>
+<div class="ic"><svg viewBox="0 0 20 20"><path d="M3 9l7-6 7 6v8H3z"/></svg></div>
+<div class="ic on"><svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12"/><path d="M3 8h14M8 8v8"/></svg></div>
+<div class="ic"><svg viewBox="0 0 20 20"><path d="M4 5l5 5-5 5M11 15h5"/></svg></div>
+<div class="ic"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3"/></svg></div></nav>
+<div class="col">
+<header><span class="pk"><small>Project</small>acme-shop</span><span class="sl">/</span><span class="pk"><small>Database</small>orders-db</span><span class="sl">/</span>
+<span class="pk"><small>Branch</small>main <span class="lock">protected</span></span><span class="sl">/</span><span class="pk mono"><small>Postgres db</small>app</span>
+<span class="sp"></span><span class="act"><small>Act as</small><span class="mono">billing_admin</span></span><span class="av">MF</span></header>
+<div class="body">
+<aside class="list"><div class="schema"><span><small>Schema </small><span class="m">public</span></span><span class="sl">▾</span></div><div class="flt">Filter tables</div><div class="sh">public · 9 tables</div>
+<div class="t m">customers<em>3.1k</em></div><div class="t m sel">invoices<em>48.2k</em></div><div class="t m">invoice_lines<em>131k</em></div>
+<div class="t m">payments<em>52.7k</em></div><div class="t m">plans<em>12</em></div><div class="t m">refunds<em>1.9k</em></div>
+<div class="t m">subscriptions<em>6.4k</em></div><div class="t m">tax_rates<em>47</em></div><div class="t m">webhooks<em>12.4k</em></div>
+<div class="nt">New table</div></aside>
+<main class="main">
+<div class="bar"><div><h1>public.invoices</h1><p>≈ 48,210 rows · 12 MB · RLS on · data API on</p></div>
+<div class="seg"><span class="on">Rows</span><span>Structure</span></div>
+<div class="tools"><div class="btn">Filter</div><div class="btn">Sort</div><div class="btn">Insert row</div></div></div>
+<div class="strip">
+<div class="chip">id<i>uuid · key</i></div><div class="chip">customer_id<i>uuid → fk</i></div><div class="chip">status<i>invoice_status</i></div>
+<div class="chip">amount_cents<i>int8</i></div><div class="chip">currency<i>text</i></div><div class="chip">issued_at<i>timestamptz</i></div>
+<div class="chip">due_at<i>timestamptz</i></div><div class="chip">paid_at<i>tstz null</i></div><div class="chip">memo<i>text null</i></div>
+<div class="chip add">+ Column</div></div>
+<div class="hd"><span></span><span>id</span><span>customer_id</span><span>status</span><span>amount_cents</span><span>currency</span><span>issued_at</span><span>due_at</span><span>paid_at</span><span>memo</span></div>
+<div class="r"><i>1</i><b class="d">3f9a…c21e</b><b class="d">a07d…91b4</b><b class="v">paid</b><b>12900</b><b>EUR</b><b>2026-09-02</b><b>2026-09-16</b><b>2026-09-05</b><b class="d">null</b></div>
+<div class="r z"><i>2</i><b class="d">81c4…0e7a</b><b class="d">5be2…77d0</b><b class="o">open</b><b>45000</b><b>EUR</b><b>2026-09-03</b><b>2026-09-17</b><b class="d">null</b><b class="d">Q3 plan</b></div>
+<div class="r"><i>3</i><b class="d">c2d1…4f08</b><b class="d">19ac…e3b6</b><b class="v">paid</b><b>8900</b><b>USD</b><b>2026-09-03</b><b>2026-09-17</b><b>2026-09-09</b><b class="d">null</b></div>
+<div class="r z"><i>4</i><b class="d">07be…b9d3</b><b class="d">d44f…2a10</b><b class="x">void</b><b>2400</b><b>EUR</b><b>2026-09-04</b><b>2026-09-18</b><b class="d">null</b><b class="d">dup</b></div>
+<div class="r"><i>5</i><b class="d">9e60…1c5f</b><b class="d">a07d…91b4</b><b class="v">paid</b><b>19900</b><b>EUR</b><b>2026-09-05</b><b>2026-09-19</b><b>2026-09-06</b><b class="d">null</b></div>
+<div class="r open"><i>6</i><b class="d">5a73…d8e2</b><b class="d">6f1b…c049</b><b class="o">open</b><b>72500</b><b>GBP</b><b>2026-09-06</b><b>2026-09-20</b><b class="d">null</b><b class="d">Customer asked…</b></div>
+<div class="r"><i>7</i><b class="d">e8f0…3a96</b><b class="d">3c9e…58a1</b><b class="v">paid</b><b>3300</b><b>USD</b><b>2026-09-06</b><b>2026-09-20</b><b>2026-09-08</b><b class="d">null</b></div>
+<div class="r z"><i>8</i><b class="d">14d7…f6b0</b><b class="d">b81a…07ee</b><b class="o">open</b><b>15800</b><b>EUR</b><b>2026-09-07</b><b>2026-09-21</b><b class="d">null</b><b class="d">null</b></div>
+<div class="r"><i>9</i><b class="d">b6a2…8c1d</b><b class="d">5be2…77d0</b><b class="v">paid</b><b>99000</b><b>EUR</b><b>2026-09-08</b><b>2026-09-22</b><b>2026-09-12</b><b class="d">Annual</b></div>
+<div class="r z"><i>10</i><b class="d">70c9…e154</b><b class="d">f20d…a6c3</b><b class="x">void</b><b>5000</b><b>USD</b><b>2026-09-08</b><b>2026-09-22</b><b class="d">null</b><b class="d">test</b></div>
+<div class="r"><i>11</i><b class="d">2ed5…9b07</b><b class="d">19ac…e3b6</b><b class="o">open</b><b>8900</b><b>USD</b><b>2026-09-09</b><b>2026-09-23</b><b class="d">null</b><b class="d">null</b></div>
+<div class="r z"><i>12</i><b class="d">d913…6a4c</b><b class="d">a07d…91b4</b><b class="v">paid</b><b>12900</b><b>EUR</b><b>2026-09-10</b><b>2026-09-24</b><b>2026-09-11</b><b class="d">null</b></div>
+<div class="r"><i>13</i><b class="d">48b0…c7f2</b><b class="d">8d3f…1e59</b><b class="o">open</b><b>27650</b><b>GBP</b><b>2026-09-11</b><b>2026-09-25</b><b class="d">null</b><b class="d">null</b></div>
+<div class="r z"><i>14</i><b class="d">f1e8…02da</b><b class="d">c7a4…b360</b><b class="v">paid</b><b>6400</b><b>EUR</b><b>2026-09-12</b><b>2026-09-26</b><b>2026-09-14</b><b class="d">null</b></div>
+<div class="r"><i>15</i><b class="d">0a2c…5e8b</b><b class="d">3c9e…58a1</b><b class="o">open</b><b>3300</b><b>USD</b><b>2026-09-13</b><b>2026-09-27</b><b class="d">null</b><b class="d">null</b></div>
+<div class="r z"><i>16</i><b class="d">c58d…7f13</b><b class="d">6f1b…c049</b><b class="v">paid</b><b>72500</b><b>GBP</b><b>2026-09-14</b><b>2026-09-28</b><b>2026-09-15</b><b class="d">null</b></div>
+<div class="r"><i>17</i><b class="d">93f7…a2c0</b><b class="d">e19b…4d72</b><b class="o">open</b><b>11200</b><b>EUR</b><b>2026-09-15</b><b>2026-09-29</b><b class="d">null</b><b class="d">null</b></div>
+<div class="r z"><i>18</i><b class="d">6d04…b8e9</b><b class="d">5be2…77d0</b><b class="v">paid</b><b>45000</b><b>EUR</b><b>2026-09-16</b><b>2026-09-30</b><b>2026-09-18</b><b class="d">null</b></div>
+<div class="foot"><span>Rows 1–100 of ≈ 48,210</span><div class="pg"><span>Prev</span><span>1 / 483</span><span>Next</span></div></div>
+</main>
+<aside class="side">
+<div class="ph"><div><h2>Row <span>id = 5a73…d8e2</span></h2><p>public.invoices · acting as billing_admin</p></div><div class="cl"><svg viewBox="0 0 16 16"><path d="M3 3l10 10M13 3L3 13"/></svg></div></div>
+<div class="flds">
+<div><div class="lb">id <i>uuid</i></div><div class="ctl ro">5a73c0e1-92b4-4f6d-8a17-3be0d4d1d8e2<em>key</em></div></div>
+<div><div class="lb">customer_id <i>uuid → customers</i></div><div class="ctl">6f1b…c049 <span class="lnk">Open customer</span><span class="sb">Pick…</span></div></div>
+<div><div class="lb">status <i>invoice_status</i></div><div class="ctl chg sel2">open<small style="margin-left:auto">open · paid · void</small></div></div>
+<div><div class="lb">amount_cents <i>int8</i></div><div class="ctl chg num">72500</div></div>
+<div><div class="lb">currency <i>text</i></div><div class="ctl">GBP</div></div>
+<div><div class="lb">issued_at <i>timestamptz</i></div><div class="ctl">2026-09-06 14:02:11+00<span class="sb tx">Now</span></div></div>
+<div><div class="lb">paid_at <i>timestamptz null</i></div><div class="ctl"><span class="null">NULL</span><span class="tg">Set NULL</span></div></div>
+<div><div class="lb">memo <i>text null</i></div><div class="ctl ta">Customer asked to split payment across two cards; second card declined, retry on 2026-09-20.</div></div>
+<div><div class="lb">attachment_note <i>text</i></div><div class="ctl"><span style="color:var(--dim);overflow:hidden;text-overflow:ellipsis">Delivery note scan, pages 1 to 14, signed by…</span></div><div class="cut">Showing 1 KB of 2.4 MB · <span class="lnk">Load full value</span></div></div>
+</div>
+<div class="hint">2 fields changed</div>
+<div class="pf"><div class="btn d">Delete row</div><span class="sp"></span><div class="btn g">Cancel</div><div class="btn p">Save row</div></div>
+</aside>
+</div></div></div></body></html>

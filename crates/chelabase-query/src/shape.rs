@@ -87,6 +87,11 @@ fn hash_op(op: &Op, h: &mut DefaultHasher) {
             names.sort();
             names.hash(h);
         }
+        Op::Count(c) => {
+            6u8.hash(h);
+            c.from.hash(h);
+            hash_filter_opt(c.filter.as_ref(), h);
+        }
         Op::Batch(ops) => {
             5u8.hash(h);
             ops.len().hash(h);

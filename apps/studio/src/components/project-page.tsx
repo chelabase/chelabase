@@ -8,7 +8,8 @@ import {
   type MeResponse as Me,
   type ProjectInfo,
 } from "@chelabase/management-client";
-import { Button } from "@/components/ui/button";
+import { TABLES_ROUTE } from "@/components/app-shell/rail-items";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Tabs } from "@/components/ui/tabs";
 import { ProjectCapsContext, noAccess, projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
@@ -23,7 +24,6 @@ import { NO_ACCESS_POLL_MS, NoAccess } from "./no-access";
 import { MergesList } from "./merges/merges-list";
 import { AccessTab } from "./project-access/access-tab";
 import { ProjectSettings } from "./project-settings";
-import { TablesView } from "./tables-view";
 import { UsersTab } from "./users-tab";
 
 // The editor, CodeMirror and the pgls worker load only when a SQL view opens.
@@ -186,7 +186,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   );
 }
 
-type DatabaseView = "branches" | "merges" | "data-api" | "tables" | "sql";
+type DatabaseView = "branches" | "merges" | "data-api" | "sql";
 
 function DatabasesTable({
   projectId,
@@ -264,15 +264,19 @@ function DatabasesTable({
                   >
                     Data API
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={db.status !== "ready"}
-                    aria-expanded={open?.id === db.database_id && open.view === "tables"}
-                    onClick={() => toggle(db.database_id, "tables")}
-                  >
-                    Tables
-                  </Button>
+                  {db.status === "ready" ? (
+                    <Link
+                      to={TABLES_ROUTE}
+                      params={{ projectId, databaseId: db.database_id }}
+                      className={buttonVariants({ size: "sm", variant: "outline" })}
+                    >
+                      Tables
+                    </Link>
+                  ) : (
+                    <Button size="sm" variant="outline" disabled>
+                      Tables
+                    </Button>
+                  )}
                   {/* The SQL editor needs Developer; Viewers read through Tables. */}
                   {canSql && (
                     <Button
@@ -299,8 +303,6 @@ function DatabasesTable({
                     />
                   ) : open.view === "merges" ? (
                     <MergesList projectId={projectId} databaseId={db.database_id} />
-                  ) : open.view === "tables" ? (
-                    <TablesView databaseId={db.database_id} />
                   ) : open.view === "sql" && canSql ? (
                     <Suspense fallback={<p className="py-3 text-sm text-muted-foreground">Loading the editor…</p>}>
                       <SqlEditor databaseId={db.database_id} />
