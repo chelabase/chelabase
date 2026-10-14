@@ -9,7 +9,8 @@
 //! dead run left once they are older than [`STALE_AFTER_SECS`].
 
 use chelabase_metadata::members::{
-    AccessWriteError, Admission, GrantRow, GrantRows, MemberBranchRole, MemberStatus, OverrideRow,
+    AccessWriteError, Admission, GrantRow, GrantRows, MemberBranchRole, MemberStatus, NewInvite,
+    OverrideRow,
 };
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_types::access::PlatformRole;
@@ -216,6 +217,11 @@ fn week() -> chrono::DateTime<Utc> {
 /// An invite token's SHA-256 (any 32 bytes will do for these tests).
 const TOKEN: [u8; 32] = [7; 32];
 
+/// An invite of `zitadel_user_id` at `email`, open for a week, with `TOKEN` and `grants`.
+fn new_invite<'a>(zitadel_user_id: &'a str, email: &'a str, grants: &'a [(Uuid, GrantRow)]) -> NewInvite<'a> {
+    NewInvite { zitadel_user_id, email, expires_at: week(), token_hash: TOKEN, grants }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn first_claim_is_atomic() {
@@ -385,7 +391,7 @@ async fn run_model(s: &Scratch, steps: Vec<Vec<Op>>) -> Result<(), String> {
                         .map_err(|e| AccessWriteError::Conflict(format!("ensure_member: {e}"))),
                     (Op::Add, _) => {
                         match c
-                            .create_invited_member(actor.unwrap(), t, &zid, &email, week(), TOKEN, &[])
+                            .create_invited_member(actor.unwrap(), t, new_invite(&zid, &email, &[]))
                             .await
                         {
                             Ok(_) => c
@@ -523,15 +529,7 @@ async fn owner_is_never_stored() {
     // An invite carrying such a grant is refused the same way, and creates nobody.
     let invite = s
         .client
-        .create_invited_member(
-            a.id,
-            t,
-            "zi",
-            "i@x.com",
-            week(),
-            TOKEN,
-            &[(p, grant(PlatformRole::Viewer, &["owner"]))],
-        )
+        .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[(p, grant(PlatformRole::Viewer, &["owner"]))]))
         .await;
     assert!(
         matches!(invite, Err(AccessWriteError::Conflict(_))),
@@ -548,7 +546,7 @@ async fn owner_is_never_stored() {
     ));
     assert!(matches!(
         s.client
-            .create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[(p, admin.clone())])
+            .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[(p, admin.clone())]))
             .await,
         Err(AccessWriteError::Conflict(_))
     ));
@@ -621,7 +619,7 @@ async fn invited_becomes_active_on_ensure() {
     let g = grant(PlatformRole::Developer, &["app"]);
     let (m, invite) = s
         .client
-        .create_invited_member(a.id, t, "zi", " Inv@X.com ", week(), TOKEN, &[(p, g.clone())])
+        .create_invited_member(a.id, t, new_invite("zi", " Inv@X.com ", &[(p, g.clone())]))
         .await
         .unwrap();
     assert_eq!(m.status, MemberStatus::Invited);
@@ -681,7 +679,7 @@ async fn expired_invite_does_not_activate() {
         .unwrap();
     let (m, invite) = s
         .client
-        .create_invited_member(a.id, t, "zi", "inv@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("zi", "inv@x.com", &[]))
         .await
         .unwrap();
     sqlx::query("UPDATE invites SET expires_at = now() - interval '1 minute' WHERE id = $1")
@@ -1109,7 +1107,7 @@ async fn every_write_logs_one_event() {
     );
     let (_, invite) = one_event!(
         "invite_created",
-        c.create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[(p, g.clone())])
+        c.create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[(p, g.clone())]))
             .await
             .unwrap()
     );
@@ -1130,7 +1128,7 @@ async fn every_write_logs_one_event() {
     );
     let (_, invite2) = one_event!(
         "invite_created",
-        c.create_invited_member(a.id, t, "zj", "j@x.com", week(), TOKEN, &[])
+        c.create_invited_member(a.id, t, new_invite("zj", "j@x.com", &[]))
             .await
             .unwrap()
     );
@@ -1437,7 +1435,7 @@ async fn refresh_takes_email_from_stale_holder() {
     // Activation takes the email too.
     let (invited, _) = s
         .client
-        .create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[]))
         .await
         .unwrap();
     let c = s
@@ -1524,13 +1522,13 @@ async fn reinvite_reuses_a_removed_row() {
     let g = grant(PlatformRole::Developer, &["app"]);
     let (i, invite) = s
         .client
-        .create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[(p, g.clone())])
+        .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[(p, g.clone())]))
         .await
         .unwrap();
     s.client.revoke_invite(a.id, invite).await.unwrap();
     let (again, invite2) = s
         .client
-        .create_invited_member(a.id, t, "zi", "i2@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("zi", "i2@x.com", &[]))
         .await
         .unwrap();
     assert_ne!(invite2, invite);
@@ -1555,7 +1553,7 @@ async fn reinvite_reuses_a_removed_row() {
     s.client.remove_member(a.id, m.id).await.unwrap();
     let (back, _) = s
         .client
-        .create_invited_member(a.id, t, "m", "m@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("m", "m@x.com", &[]))
         .await
         .unwrap();
     assert_eq!(back.id, m.id);
@@ -1567,7 +1565,7 @@ async fn reinvite_reuses_a_removed_row() {
     // A live member can't be invited again.
     assert!(matches!(
         s.client
-            .create_invited_member(a.id, t, "a", "a3@x.com", week(), TOKEN, &[])
+            .create_invited_member(a.id, t, new_invite("a", "a3@x.com", &[]))
             .await,
         Err(AccessWriteError::Conflict(_))
     ));
@@ -1609,7 +1607,7 @@ async fn tenant_isolation_is_not_found() {
     ));
     assert!(matches!(
         s.client
-            .create_invited_member(a.id, t, "zx", "x@x.com", week(), TOKEN, &[(p2, g)])
+            .create_invited_member(a.id, t, new_invite("zx", "x@x.com", &[(p2, g)]))
             .await,
         Err(AccessWriteError::NotFound)
     ));
@@ -1637,7 +1635,7 @@ async fn bootstrap_activates_an_invited_member() {
         .unwrap();
     let (i, invite) = s
         .client
-        .create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[]))
         .await
         .unwrap();
     let boot = s.client.bootstrap_admin(t, "zi", "i@x.com").await.unwrap();
@@ -1742,7 +1740,7 @@ async fn member_api_reads() {
     assert_eq!(c.member_by_email(t, "").await.unwrap(), None);
 
     let (i, invite) = c
-        .create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[(p, grant(PlatformRole::Viewer, &[]))])
+        .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[(p, grant(PlatformRole::Viewer, &[]))]))
         .await
         .unwrap();
     let open = c.open_invites(t).await.unwrap();
@@ -1829,7 +1827,7 @@ async fn existing_user_is_added_active() {
         Err(AccessWriteError::Conflict(_))
     ));
     let (back, _) = c
-        .create_invited_member(a.id, t, "zu", "u@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("zu", "u@x.com", &[]))
         .await
         .unwrap();
     assert_eq!(back.id, u.id);
@@ -1889,7 +1887,7 @@ async fn promoting_an_invited_member_conflicts() {
     let c = &s.client;
     let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     let (i, _) = c
-        .create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[]))
         .await
         .unwrap();
     let events = s.event_count(t).await;
@@ -1913,12 +1911,12 @@ async fn project_events_include_listed_grants() {
     let c = &s.client;
     let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     let g = grant(PlatformRole::Viewer, &[]);
-    c.create_invited_member(a.id, t, "z1", "one@x.com", week(), TOKEN, &[(p, g.clone())])
+    c.create_invited_member(a.id, t, new_invite("z1", "one@x.com", &[(p, g.clone())]))
         .await
         .unwrap();
     let single = &c.access_events(t, None, None, 1).await.unwrap()[0];
     assert_eq!((single.action.as_str(), single.project_id), ("invite_created", Some(p)));
-    c.create_invited_member(a.id, t, "z2", "two@x.com", week(), TOKEN, &[(p, g.clone()), (p2, g.clone())])
+    c.create_invited_member(a.id, t, new_invite("z2", "two@x.com", &[(p, g.clone()), (p2, g.clone())]))
         .await
         .unwrap();
     let u = c
@@ -1953,7 +1951,7 @@ async fn access_events_join_names() {
     let c = &s.client;
     let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     let (m, _) = c
-        .create_invited_member(a.id, t, "zm", "m@x.com", week(), TOKEN, &[])
+        .create_invited_member(a.id, t, new_invite("zm", "m@x.com", &[]))
         .await
         .unwrap();
     let ev = &c.access_events(t, None, None, 1).await.unwrap()[0];
@@ -2033,9 +2031,9 @@ async fn member_listings_report_has_access() {
     let list = c.list_member_listings(t).await.unwrap();
     assert!(!list.iter().find(|l| l.member.id == bare.id).unwrap().has_access);
     // Created in order: the rows' `created_at` follows insertion, and a write returns it.
-    let (first, _) = c.create_invited_member(a.id, t, "zo1", "o1@x.com", week(), TOKEN, &[]).await.unwrap();
+    let (first, _) = c.create_invited_member(a.id, t, new_invite("zo1", "o1@x.com", &[])).await.unwrap();
     let (second, _) = c
-        .create_invited_member(a.id, t, "zo2", "o2@x.com", week(), TOKEN, &[(p, grant(PlatformRole::Viewer, &[]))])
+        .create_invited_member(a.id, t, new_invite("zo2", "o2@x.com", &[(p, grant(PlatformRole::Viewer, &[]))]))
         .await
         .unwrap();
     assert!(first.created_at < second.created_at);
@@ -2056,7 +2054,7 @@ async fn invite_description_follows_the_open_invite() {
     let c = &s.client;
     let a = c.ensure_member(t, "a", "a@x.com", "Alice", Admission::Active).await.unwrap();
     assert!(c.open_invite_for_user("zi").await.unwrap().is_none());
-    let (_, invite) = c.create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[]).await.unwrap();
+    let (_, invite) = c.create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[])).await.unwrap();
     let d = c.open_invite_for_user("zi").await.unwrap().unwrap();
     assert_eq!(d.token_hash.as_deref(), Some(&TOKEN[..]));
     assert_eq!((d.inviter_name.as_str(), d.inviter_email.as_deref()), ("Alice", Some("a@x.com")));
@@ -2091,7 +2089,7 @@ async fn tenant_display_name_round_trip() {
     c.set_tenant_display_name(a.id, t, Some("Acme Corp")).await.unwrap();
     assert_eq!(name().await.as_deref(), Some("Acme Corp"));
     // The invite description carries the display name, and the slug to fall back to.
-    c.create_invited_member(a.id, t, "zi", "i@x.com", week(), TOKEN, &[]).await.unwrap();
+    c.create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[])).await.unwrap();
     let d = c.open_invite_for_user("zi").await.unwrap().unwrap();
     assert_eq!(d.tenant_display_name.as_deref(), Some("Acme Corp"));
     c.set_tenant_display_name(a.id, t, None).await.unwrap();
@@ -2320,7 +2318,7 @@ async fn bootstrap_admin_sql_matches_the_metadata_crate() {
         ("invited with an open invite", |s, t| {
             Box::pin(async move {
                 let a = s.client.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-                s.client.create_invited_member(a.id, t, "boss", "boss@x.com", week(), TOKEN, &[]).await.unwrap();
+                s.client.create_invited_member(a.id, t, new_invite("boss", "boss@x.com", &[])).await.unwrap();
             })
         }),
         ("removed", |s, t| {
@@ -2460,7 +2458,7 @@ async fn member_status_write_matrix() {
                 Decline => name(c.decline_member(admin.id, id).await),
                 Promote => name(c.set_tenant_admin(Some(admin.id), id, true).await),
                 Remove => name(c.remove_member(admin.id, id).await),
-                Invite => name(c.create_invited_member(admin.id, t, &zid, &email, week(), TOKEN, &[]).await),
+                Invite => name(c.create_invited_member(admin.id, t, new_invite(&zid, &email, &[])).await),
             };
             if got != expected[status_index] {
                 failures.push(format!("{label} on a {status} member: {got}, want {}", expected[status_index]));

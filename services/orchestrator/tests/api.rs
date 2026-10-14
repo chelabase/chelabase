@@ -11296,7 +11296,7 @@ async fn access_events_name_removed_members_and_projects() {
     assert_eq!((put["target_email"].as_str(), put["project_name"].as_str()), (Some("m@example.test"), Some("Billing")));
     // A project row that is gone, and an event with no actor or project, resolve to null.
     md.projects.lock().unwrap().retain(|p| p.id != t.w.project);
-    md.log(t.w.tenant, None, "open_signup_set", None, None, None, None);
+    md.log(Change::new(t.w.tenant, None, "open_signup_set", None));
     let page = events("/v1/access-events".into()).await;
     let system = &page["events"][0];
     assert_eq!((system["actor_email"].is_null(), system["target_email"].is_null(), system["project_name"].is_null()), (true, true, true));

@@ -108,9 +108,8 @@ check:
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
     cargo check --workspace
-    cargo test -p orchestrator -p auth -p rest openapi::tests
-    cargo test -p chelabase-query --test openapi_fidelity
-    cargo test -p chelabase-routes --test docs_tables
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo nextest run --workspace
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
     test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }

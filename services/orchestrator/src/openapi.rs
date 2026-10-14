@@ -765,7 +765,7 @@ impl members::MembersPort for Doc {
     async fn invite(
         &self,
         invite: Uuid,
-    ) -> Result<Option<(Uuid, chrono::DateTime<chrono::Utc>, DocStamp, DocStamp)>, MetadataError> {
+    ) -> Result<Option<chelabase_metadata::members::InviteState>, MetadataError> {
         match *self {}
     }
     async fn project_access(
@@ -824,11 +824,7 @@ impl members::MembersPort for Doc {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
-        email: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-        token_hash: [u8; 32],
-        grants: &[(Uuid, GrantRow)],
+        new: chelabase_metadata::members::NewInvite<'_>,
     ) -> Result<(chelabase_metadata::members::MemberListing, Uuid), DocWriteError> {
         match *self {}
     }
@@ -882,7 +878,6 @@ impl members::MembersPort for Doc {
     }
 }
 
-type DocStamp = Option<chrono::DateTime<chrono::Utc>>;
 type DocWriteError = chelabase_metadata::members::AccessWriteError;
 
 #[cfg(test)]

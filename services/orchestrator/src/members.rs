@@ -20,8 +20,8 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chelabase_metadata::members::{
-    AccessEvent as EventRecord, AccessWriteError, GrantRow, MemberListing, MemberRecord, MemberStatus,
-    Observed, OpenInvite,
+    AccessEvent as EventRecord, AccessWriteError, GrantRow, InviteState, MemberListing, MemberRecord,
+    MemberStatus, NewInvite, Observed, OpenInvite,
     OverrideRow, ProjectAccess,
 };
 use chelabase_metadata::{
@@ -51,9 +51,6 @@ use crate::{
     ApiBytes, AppState, AuthPrincipal, BoxError, InstancePrincipal, JobPort, MemberStatusView, MetadataPort,
     NatsPorts, roles,
 };
-
-/// When an invite was revoked or accepted, if it was.
-type Stamp = Option<DateTime<Utc>>;
 
 /// The metadata the member API reads and writes ([`MetadataClient`]'s methods of the same
 /// names, so tests can use a fake).
@@ -93,7 +90,7 @@ pub trait MembersPort: Send + Sync + 'static {
     fn invite(
         &self,
         invite: Uuid,
-    ) -> impl Future<Output = Result<Option<(Uuid, DateTime<Utc>, Stamp, Stamp)>, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<Option<InviteState>, MetadataError>> + Send;
 
     /// The project's grants and the overrides on its databases.
     fn project_access(
@@ -192,11 +189,7 @@ pub trait MembersPort: Send + Sync + 'static {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
-        email: &str,
-        expires_at: DateTime<Utc>,
-        token_hash: [u8; 32],
-        grants: &[(Uuid, GrantRow)],
+        new: NewInvite<'_>,
     ) -> impl Future<Output = Result<(MemberListing, Uuid), AccessWriteError>> + Send;
 
     /// A person already in the tenant's org, added active.
@@ -296,7 +289,7 @@ impl MembersPort for MetadataClient {
     async fn invite(
         &self,
         invite: Uuid,
-    ) -> Result<Option<(Uuid, DateTime<Utc>, Stamp, Stamp)>, MetadataError> {
+    ) -> Result<Option<InviteState>, MetadataError> {
         MetadataClient::invite(self, invite).await
     }
 
@@ -398,23 +391,9 @@ impl MembersPort for MetadataClient {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
-        email: &str,
-        expires_at: DateTime<Utc>,
-        token_hash: [u8; 32],
-        grants: &[(Uuid, GrantRow)],
+        new: NewInvite<'_>,
     ) -> Result<(MemberListing, Uuid), AccessWriteError> {
-        MetadataClient::create_invited_member(
-            self,
-            actor,
-            tenant,
-            zitadel_user_id,
-            email,
-            expires_at,
-            token_hash,
-            grants,
-        )
-        .await
+        MetadataClient::create_invited_member(self, actor, tenant, new).await
     }
 
     async fn add_existing_user(
@@ -1657,11 +1636,13 @@ where
         .create_invited_member(
             actor,
             principal.tenant_id,
-            &user,
-            email,
-            expires_at,
-            token.hash,
-            &grants,
+            NewInvite {
+                zitadel_user_id: &user,
+                email,
+                expires_at,
+                token_hash: token.hash,
+                grants: &grants,
+            },
         )
         .await
     {

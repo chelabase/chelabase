@@ -553,6 +553,23 @@ type Tx = Transaction<'static, Postgres>;
 /// When an invite was revoked or accepted, if it was.
 type Stamp = Option<DateTime<Utc>>;
 
+/// An invite's member, expiry, and when it was revoked or accepted.
+pub type InviteState = (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// An open invite's token hash, inviter name and email, tenant slug and display name.
+type InviteDescriptionRow = (Option<Vec<u8>>, String, Option<String>, String, Option<String>);
+
+/// The person [`MetadataClient::create_invited_member`] invites: their Zitadel user, email, the
+/// invite's expiry and token hash, and the grants they get once active.
+#[derive(Debug, Clone, Copy)]
+pub struct NewInvite<'a> {
+    pub zitadel_user_id: &'a str,
+    pub email: &'a str,
+    pub expires_at: DateTime<Utc>,
+    pub token_hash: [u8; 32],
+    pub grants: &'a [(Uuid, GrantRow)],
+}
+
 /// One `access_events` row, written in the transaction of the change it records.
 struct NewEvent {
     tenant: Uuid,
@@ -1359,7 +1376,7 @@ impl MetadataClient {
         &self,
         zitadel_user_id: &str,
     ) -> Result<Option<InviteDescription>, MetadataError> {
-        let row: Option<(Option<Vec<u8>>, String, Option<String>, String, Option<String>)> = sqlx::query_as(
+        let row: Option<InviteDescriptionRow> = sqlx::query_as(
             "SELECT i.token_hash, inviter.display_name, inviter.email, t.slug, t.display_name
              FROM invites i
              JOIN members m ON m.id = i.member_id
@@ -2069,12 +2086,9 @@ impl MetadataClient {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
-        email: &str,
-        expires_at: DateTime<Utc>,
-        token_hash: [u8; 32],
-        grants: &[(Uuid, GrantRow)],
+        new: NewInvite<'_>,
     ) -> Result<(MemberListing, Uuid), AccessWriteError> {
+        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants } = new;
         if grants.iter().any(|(_, g)| g.names_owner()) {
             return Err(AccessWriteError::Conflict(OWNER_IS_IMPLIED.into()));
         }
@@ -2178,7 +2192,7 @@ impl MetadataClient {
     pub async fn invite(
         &self,
         invite: Uuid,
-    ) -> Result<Option<(Uuid, DateTime<Utc>, Stamp, Stamp)>, MetadataError> {
+    ) -> Result<Option<InviteState>, MetadataError> {
         Ok(sqlx::query_as(
             "SELECT member_id, expires_at, revoked_at, accepted_at FROM invites WHERE id = $1",
         )

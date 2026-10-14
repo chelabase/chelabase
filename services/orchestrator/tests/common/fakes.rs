@@ -1764,7 +1764,7 @@ impl MetadataPort for FakeMetadata {
             self.set_admin_claim(tenant, Some(chrono::Utc::now()));
         }
         if status == MemberStatus::Pending {
-            self.log(tenant, Some(record.id), "member_joined", Some(record.id), None, None, Some(json!({ "status": "pending", "tenant_admin": false })));
+            self.log(Change::new(tenant, Some(record.id), "member_joined", Some(record.id)).after(json!({ "status": "pending", "tenant_admin": false })));
         }
         Ok(record)
     }
@@ -2508,6 +2508,36 @@ fn event_names_project(e: &chelabase_metadata::members::AccessEvent, project: uu
     e.project_id == Some(project) || lists(&e.before) || lists(&e.after)
 }
 
+/// An access event the fake records, built like the store's `NewEvent`.
+struct Change {
+    tenant: TenantId,
+    actor: Option<uuid::Uuid>,
+    action: &'static str,
+    target: Option<uuid::Uuid>,
+    project: Option<uuid::Uuid>,
+    database: Option<uuid::Uuid>,
+    before: Option<Value>,
+    after: Option<Value>,
+}
+
+impl Change {
+    fn new(tenant: TenantId, actor: Option<uuid::Uuid>, action: &'static str, target: Option<uuid::Uuid>) -> Self {
+        Self { tenant, actor, action, target, project: None, database: None, before: None, after: None }
+    }
+
+    fn scope(self, project: Option<uuid::Uuid>, database: Option<uuid::Uuid>) -> Self {
+        Self { project, database, ..self }
+    }
+
+    fn before(self, before: impl Into<Option<Value>>) -> Self {
+        Self { before: before.into(), ..self }
+    }
+
+    fn after(self, after: impl Into<Option<Value>>) -> Self {
+        Self { after: after.into(), ..self }
+    }
+}
+
 /// The only grant's project, when there is exactly one.
 fn single_project(grants: &[(uuid::Uuid, GrantRow)]) -> Option<uuid::Uuid> {
     match grants {
@@ -2589,16 +2619,12 @@ impl FakeMetadata {
         self.overrides.lock().unwrap().retain(|(m, _), _| *m != member);
         self.members.lock().unwrap().iter_mut().find(|x| x.id == member).unwrap().status = MemberStatus::Removed;
         let after = reason.map(|r| json!({ "status": "removed", "reason": r }));
-        self.log(m.tenant_id, Some(actor), "invite_revoked", Some(member), None, None, after);
+        self.log(Change::new(m.tenant_id, Some(actor), "invite_revoked", Some(member)).after(after));
         Ok(zid)
     }
 
-    fn log(&self, tenant: TenantId, actor: Option<uuid::Uuid>, action: &str, target: Option<uuid::Uuid>, project: Option<uuid::Uuid>, database: Option<uuid::Uuid>, after: Option<Value>) {
-        self.log_change(tenant, actor, action, target, project, database, None, after);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn log_change(&self, tenant: TenantId, actor: Option<uuid::Uuid>, action: &str, target: Option<uuid::Uuid>, project: Option<uuid::Uuid>, database: Option<uuid::Uuid>, before: Option<Value>, after: Option<Value>) {
+    fn log(&self, change: Change) {
+        let Change { tenant, actor, action, target, project, database, before, after } = change;
         let mut events = self.events.lock().unwrap();
         let id = events.len() as i64 + 1;
         events.push(chelabase_metadata::members::AccessEvent {
@@ -2753,7 +2779,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             .filter(|m| m.tenant_id == tenant && m.status != MemberStatus::Removed)
             .cloned()
             .collect();
-        out.sort_by(|a, b| (a.email.clone(), a.id).cmp(&(b.email.clone(), b.id)));
+        out.sort_by_key(|m| (m.email.clone(), m.id));
         Ok(out.into_iter().map(|m| self.listing(m)).collect())
     }
 
@@ -2779,7 +2805,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
     async fn invite(
         &self,
         invite: uuid::Uuid,
-    ) -> Result<Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)>, MetadataError> {
+    ) -> Result<Option<chelabase_metadata::members::InviteState>, MetadataError> {
         let now = chrono::Utc::now();
         Ok(self
             .invites
@@ -2886,7 +2912,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         }
         self.members.lock().unwrap().iter_mut().find(|x| x.id == member).unwrap().tenant_admin = admin;
         let action = if admin { "admin_set" } else { "admin_unset" };
-        self.log(m.tenant_id, actor, action, Some(member), None, None, Some(json!({ "tenant_admin": admin })));
+        self.log(Change::new(m.tenant_id, actor, action, Some(member)).after(json!({ "tenant_admin": admin })));
         Ok(())
     }
 
@@ -2936,7 +2962,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             x.status = MemberStatus::Removed;
             x.tenant_admin = false;
         }
-        self.log_change(m.tenant_id, Some(actor), "member_removed", Some(member), None, None, Some(json!({ "grants": grants })), None);
+        self.log(Change::new(m.tenant_id, Some(actor), "member_removed", Some(member)).before(json!({ "grants": grants })));
         Ok(touched)
     }
 
@@ -2968,7 +2994,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             if self.grants.lock().unwrap().insert((member, *project), after.clone()).as_ref() == Some(&after) {
                 continue;
             }
-            self.log(m.tenant_id, Some(actor), "grant_put", Some(member), Some(*project), None, Some(json!({ "platform_role": grant.platform_role.as_str(), "pg_roles": roles })));
+            self.log(Change::new(m.tenant_id, Some(actor), "grant_put", Some(member)).scope(Some(*project), None).after(json!({ "platform_role": grant.platform_role.as_str(), "pg_roles": roles })));
             changed.push(*project);
         }
         Ok(changed)
@@ -2978,7 +3004,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         use chelabase_metadata::members::AccessWriteError;
         let m = self.writable_member(member)?;
         self.grants.lock().unwrap().remove(&(member, project)).ok_or(AccessWriteError::NotFound)?;
-        self.log(m.tenant_id, Some(actor), "grant_deleted", Some(member), Some(project), None, None);
+        self.log(Change::new(m.tenant_id, Some(actor), "grant_deleted", Some(member)).scope(Some(project), None));
         Ok(())
     }
 
@@ -3007,7 +3033,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         if self.overrides.lock().unwrap().insert((member, database), after.clone()).as_ref() == Some(&after) {
             return Ok(false);
         }
-        self.log(m.tenant_id, Some(actor), "override_put", Some(member), Some(project), Some(database), None);
+        self.log(Change::new(m.tenant_id, Some(actor), "override_put", Some(member)).scope(Some(project), Some(database)));
         Ok(true)
     }
 
@@ -3021,7 +3047,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         }
         self.settle(member, std::slice::from_ref(expect))?;
         self.overrides.lock().unwrap().remove(&(member, database)).ok_or(AccessWriteError::NotFound)?;
-        self.log(m.tenant_id, Some(actor), "override_deleted", Some(member), Some(project), Some(database), None);
+        self.log(Change::new(m.tenant_id, Some(actor), "override_deleted", Some(member)).scope(Some(project), Some(database)));
         Ok(())
     }
 
@@ -3029,13 +3055,10 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         &self,
         actor: uuid::Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
-        email: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-        token_hash: [u8; 32],
-        grants: &[(uuid::Uuid, GrantRow)],
+        new: chelabase_metadata::members::NewInvite<'_>,
     ) -> FakeWrite<(chelabase_metadata::members::MemberListing, uuid::Uuid)> {
-        use chelabase_metadata::members::AccessWriteError;
+        use chelabase_metadata::members::{AccessWriteError, NewInvite};
+        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants } = new;
         let email = email.trim().to_lowercase();
         let existing = self.member(tenant, zitadel_user_id);
         if existing.as_ref().is_some_and(|m| m.status != MemberStatus::Removed) {
@@ -3074,7 +3097,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             revoked: false,
             accepted: false,
         });
-        self.log(tenant, Some(actor), "invite_created", Some(id), single_project(grants), None, Some(json!({ "email": email, "grants": grants_json(grants) })));
+        self.log(Change::new(tenant, Some(actor), "invite_created", Some(id)).scope(single_project(grants), None).after(json!({ "email": email, "grants": grants_json(grants) })));
         let listing = chelabase_metadata::members::MemberListing {
             created_at: self.created_at(record.id),
             has_access: !grants.is_empty(),
@@ -3118,7 +3141,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             members.retain(|m| m.id != id);
             members.push(record.clone());
         }
-        self.log(tenant, Some(actor), "member_added", Some(id), single_project(grants), None, Some(json!({ "email": email, "grants": grants_json(grants) })));
+        self.log(Change::new(tenant, Some(actor), "member_added", Some(id)).scope(single_project(grants), None).after(json!({ "email": email, "grants": grants_json(grants) })));
         Ok(chelabase_metadata::members::MemberListing {
             created_at: self.created_at(record.id),
             has_access: !grants.is_empty(),
@@ -3139,7 +3162,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             i.member_id
         };
         let tenant = self.members.lock().unwrap().iter().find(|m| m.id == member).unwrap().tenant_id;
-        self.log(tenant, Some(actor), "invite_resent", Some(member), None, None, None);
+        self.log(Change::new(tenant, Some(actor), "invite_resent", Some(member)));
         Ok(())
     }
 
@@ -3154,7 +3177,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
     async fn set_open_signup(&self, actor: uuid::Uuid, tenant: TenantId, on: bool) -> FakeWrite<()> {
         let old = self.open_signups.lock().unwrap().insert(tenant, on).unwrap_or(false);
         if old != on {
-            self.log(tenant, Some(actor), "open_signup_set", None, None, None, Some(json!({ "open_signup": on })));
+            self.log(Change::new(tenant, Some(actor), "open_signup_set", None).after(json!({ "open_signup": on })));
         }
         Ok(())
     }
@@ -3166,10 +3189,10 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         grants: &[(uuid::Uuid, GrantRow)],
     ) -> FakeWrite<chelabase_metadata::members::MemberListing> {
         use chelabase_metadata::members::AccessWriteError;
-        if self.vanish_on_approve.lock().unwrap().take() == Some(member) {
-            if let Some(x) = self.members.lock().unwrap().iter_mut().find(|x| x.id == member) {
-                x.status = MemberStatus::Removed;
-            }
+        if self.vanish_on_approve.lock().unwrap().take() == Some(member)
+            && let Some(x) = self.members.lock().unwrap().iter_mut().find(|x| x.id == member)
+        {
+            x.status = MemberStatus::Removed;
         }
         let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().ok_or(AccessWriteError::MemberNotFound)?;
         match m.status {
@@ -3185,16 +3208,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             row.accepted_at = Some(chrono::Utc::now());
             row.clone()
         };
-        self.log_change(
-            m.tenant_id,
-            Some(actor),
-            "member_approved",
-            Some(member),
-            single_project(grants),
-            None,
-            Some(json!({ "status": "pending" })),
-            Some(json!({ "status": "active", "grants": grants_json(grants) })),
-        );
+        self.log(Change::new(m.tenant_id, Some(actor), "member_approved", Some(member)).scope(single_project(grants), None).before(json!({ "status": "pending" })).after(json!({ "status": "active", "grants": grants_json(grants) })));
         Ok(chelabase_metadata::members::MemberListing {
             created_at: self.created_at(record.id),
             has_access: !grants.is_empty(),
@@ -3211,16 +3225,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             _ => return Err(AccessWriteError::Conflict("the member isn't waiting for approval".into())),
         }
         self.members.lock().unwrap().iter_mut().find(|x| x.id == member).unwrap().status = MemberStatus::Removed;
-        self.log_change(
-            m.tenant_id,
-            Some(actor),
-            "member_declined",
-            Some(member),
-            None,
-            None,
-            Some(json!({ "status": "pending" })),
-            Some(json!({ "status": "removed" })),
-        );
+        self.log(Change::new(m.tenant_id, Some(actor), "member_declined", Some(member)).before(json!({ "status": "pending" })).after(json!({ "status": "removed" })));
         Ok(m.zitadel_user_id)
     }
 
@@ -3236,16 +3241,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             None => names.remove(&tenant),
         };
         if old.as_deref() != display_name {
-            self.log_change(
-                tenant,
-                Some(actor),
-                "tenant_renamed",
-                None,
-                None,
-                None,
-                Some(json!({ "display_name": old })),
-                Some(json!({ "display_name": display_name })),
-            );
+            self.log(Change::new(tenant, Some(actor), "tenant_renamed", None).before(json!({ "display_name": old })).after(json!({ "display_name": display_name })));
         }
         Ok(())
     }
