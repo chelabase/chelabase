@@ -220,4 +220,28 @@ describe("AcceptInviteForm", () => {
     expect(screen.getByText(/Setting up your account didn't finish in time/)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/app");
   });
+  it("focuses the ending heading in the same commit that inserts it", async () => {
+    // The flake (T2): focus came from a passive effect, a task after the commit, so an assertion
+    // that ran first under load saw <body>. The first microtask after the insertion is
+    // deterministic: after the commit, before any passive effect.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    renderAccept(<AcceptInviteForm user="z1" code="c1" t="tok" authRequest="" startSignIn={vi.fn()} go={vi.fn()} />, {
+      "POST /auth/v1/invite": async () => {
+        await gate;
+        return jsonResponse({ error: { code: "not_found", message: "nf" } }, 404);
+      },
+    });
+    let atInsert: Element | null | undefined;
+    const obs = new MutationObserver(() => {
+      if (atInsert === undefined && screen.queryByRole("heading", { name: "This invite link no longer works" })) {
+        atInsert = document.activeElement;
+      }
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+    release();
+    const heading = await screen.findByRole("heading", { name: "This invite link no longer works" });
+    obs.disconnect();
+    expect(atInsert).toBe(heading);
+  });
 });

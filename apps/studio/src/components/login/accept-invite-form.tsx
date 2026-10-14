@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { describeInvite, useAcceptInvite } from "@/lib/login-client/generated/endpoints";
@@ -124,7 +124,8 @@ export function AcceptInviteForm({
   const field = useRef<HTMLInputElement>(null);
   const title = useRef<HTMLHeadingElement>(null);
 
-  useEffect(() => {
+  // A layout effect: the heading is focused in the commit that inserts it, never a task later.
+  useLayoutEffect(() => {
     if (ending || !complete) title.current?.focus();
   }, [ending, complete]);
 

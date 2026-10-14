@@ -45,7 +45,7 @@ Non-goals: per-branch stacks, the port registry, containerizing anything, the `j
   | `Docs`, `Landing`, `Mail` | Each goes to its upstream (`CHELABASE_DOCS_UPSTREAM` :3001, `CHELABASE_LANDING_UPSTREAM` :3002, `CHELABASE_MAIL_UPSTREAM` :8025). Websockets pass through. A scope exists only when its host is set. |
 
 - **Forwarded headers (S7):** for every scope the gateway sets `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Forwarded-For`, replacing any the client sent.
-- **Limits:** today's request limits and timeouts stay on `Api`. The other scopes get the proxy's defaults, except that a websocket gets no idle timeout below 1 h.
+- **Limits:** today's request limits and timeouts stay on `Api`. The other scopes get the proxy's defaults, except that a websocket, or a request whose `Accept` includes `text/event-stream` (a dev server's SSE), gets no idle timeout below 1 h.
 - **Errors:** an upstream that is down returns 502 with a plain-text body on non-API scopes. `Api` keeps its JSON error shape.
 
 ## 3. Zitadel and the bootstrap

@@ -17,13 +17,14 @@ use tracing::info;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// A site websocket's idle limit, both ways: long enough for a quiet socket (Vite's hot
-/// reload). Every other request, API or site, uses the configured upstream read timeout.
+/// reload). A site event stream gets it as its upstream read timeout too. Every other
+/// request, API or site, uses the configured upstream read timeout.
 const WEBSOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub struct Gateway {
     pipeline: Pipeline,
     upstreams: Upstreams,
-    /// The upstream read timeout of every request but a site websocket
+    /// The upstream read timeout of every request but a site websocket or event stream
     /// ([`WEBSOCKET_READ_TIMEOUT`]).
     read_timeout: Duration,
     /// `X-Forwarded-Proto`: the public scheme (`CHELABASE_PUBLIC_SCHEME`), never the client's.
@@ -129,13 +130,13 @@ impl ProxyHttp for Gateway {
                 let addr = self.upstreams.site_addr(site).ok_or_else(|| {
                     Error::explain(ErrorType::ConnectError, format!("no upstream for the {} site", site.name()))
                 })?;
-                // Spec §2: only a websocket may sit idle up to an hour; a plain site request
-                // that gets no answer times out like the API's (504).
-                let timeout = if session.is_upgrade_req() {
-                    WEBSOCKET_READ_TIMEOUT
-                } else {
-                    self.read_timeout
-                };
+                // Spec §2: a websocket or an event stream may sit idle up to an hour; any
+                // other site request that gets no answer times out like the API's (504).
+                let timeout = site_read_timeout(
+                    session.is_upgrade_req(),
+                    &session.req_header().headers,
+                    self.read_timeout,
+                );
                 (addr, timeout)
             }
             (None, Some(plan)) => (self.upstreams.addr(plan.endpoint.service), self.read_timeout),
@@ -372,6 +373,26 @@ async fn resolve_upstream(addr: &str) -> Vec<SocketAddr> {
     }
 }
 
+/// A site request's upstream read timeout: [`WEBSOCKET_READ_TIMEOUT`] for a websocket
+/// upgrade or a request whose `Accept` lists `text/event-stream` (a dev server's SSE, which
+/// may stay quiet for minutes); `configured` for everything else.
+fn site_read_timeout(upgrade: bool, headers: &http::HeaderMap, configured: Duration) -> Duration {
+    let event_stream = headers
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|range| {
+            let media = range.split(';').next().unwrap_or_default().trim();
+            media.eq_ignore_ascii_case("text/event-stream")
+        });
+    if upgrade || event_stream {
+        WEBSOCKET_READ_TIMEOUT
+    } else {
+        configured
+    }
+}
+
 /// After a connect failure on candidate `attempt`, the next one to try.
 fn next_attempt(attempt: usize, candidates: usize) -> Option<usize> {
     let next = attempt + 1;
@@ -474,6 +495,50 @@ mod tests {
         // Unknown values remove the client's rather than keep them.
         let unset = forwarded_headers("http", None, None);
         assert_eq!((unset[1].1.as_deref(), unset[2].1.as_deref()), (None, None));
+    }
+
+    fn accept(values: &[&str]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for v in values {
+            headers.append(http::header::ACCEPT, v.parse().unwrap());
+        }
+        headers
+    }
+
+    const CONFIGURED: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_site_websocket_gets_the_long_idle_limit() {
+        assert_eq!(site_read_timeout(true, &accept(&[]), CONFIGURED), WEBSOCKET_READ_TIMEOUT);
+    }
+
+    #[test]
+    fn a_site_event_stream_gets_the_long_idle_limit() {
+        for values in [
+            &["text/event-stream"][..],
+            &["text/event-stream, */*"],
+            &["application/json;q=0.9, Text/Event-Stream ;q=1"],
+            &["application/json", "text/event-stream"],
+        ] {
+            assert_eq!(
+                site_read_timeout(false, &accept(values), CONFIGURED),
+                WEBSOCKET_READ_TIMEOUT,
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_site_request_gets_the_configured_timeout() {
+        for values in [
+            &[][..],
+            &["*/*"],
+            &["text/html, application/xhtml+xml"],
+            &["text/event-streams"],
+            &["text/*"],
+        ] {
+            assert_eq!(site_read_timeout(false, &accept(values), CONFIGURED), CONFIGURED, "{values:?}");
+        }
     }
 
     #[test]

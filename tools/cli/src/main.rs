@@ -70,15 +70,20 @@ enum WorkbenchCommands {
         cmd: Vec<String>,
     },
     Test {
+        stack: Option<String>,
         archive: Vec<String>,
         run: Vec<String>,
     },
     Run {
+        stack: Option<String>,
         env: Vec<String>,
         script: String,
         args: Vec<String>,
     },
     Env,
+    SlugOf {
+        branch: String,
+    },
 }
 
 impl From<WorkbenchCli> for WorkbenchCommands {
@@ -92,8 +97,16 @@ impl From<WorkbenchCli> for WorkbenchCommands {
             WorkbenchCli::Logs { follow, services } => Self::Logs { follow, services },
             WorkbenchCli::Psql { db } => Self::Psql { db },
             WorkbenchCli::Exec { service, cmd } => Self::Exec { service, cmd },
-            WorkbenchCli::Test { archive, run } => Self::Test { archive, run },
-            WorkbenchCli::Run { env, argv } => {
+            WorkbenchCli::Test {
+                stack,
+                archive,
+                run,
+            } => Self::Test {
+                stack,
+                archive,
+                run,
+            },
+            WorkbenchCli::Run { stack, env, argv } => {
                 let mut argv = argv.into_iter();
                 // Clap requires at least one value.
                 let script = argv.next().unwrap_or_default();
@@ -102,9 +115,15 @@ impl From<WorkbenchCli> for WorkbenchCommands {
                 if args.first().is_some_and(|a| a == "--") {
                     args.remove(0);
                 }
-                Self::Run { env, script, args }
+                Self::Run {
+                    stack,
+                    env,
+                    script,
+                    args,
+                }
             }
             WorkbenchCli::Env => Self::Env,
+            WorkbenchCli::SlugOf { branch } => Self::SlugOf { branch },
         }
     }
 }
@@ -185,6 +204,9 @@ enum WorkbenchCli {
     },
     /// Archive tests on the host and run them in the stack's runner
     Test {
+        /// Run on this registered stack instead of this checkout's (before the selection)
+        #[arg(long)]
+        stack: Option<String>,
         /// What to archive (cargo nextest archive's package and target selection)
         #[arg(allow_hyphen_values = true, value_terminator = "--")]
         archive: Vec<String>,
@@ -194,6 +216,9 @@ enum WorkbenchCli {
     },
     /// Run a repo script (an e2e script) in the stack's runner
     Run {
+        /// Run on this registered stack instead of this checkout's (before the script)
+        #[arg(long)]
+        stack: Option<String>,
         /// Extra variables for the runner (KEY=VALUE, repeatable; before the script)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -209,6 +234,8 @@ enum WorkbenchCli {
     },
     /// Print the path of this checkout's stack.env
     Env,
+    /// Print the registered stack slug of a base branch (empty when none); `just wt-add` uses it
+    SlugOf { branch: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -323,11 +350,19 @@ async fn main() -> anyhow::Result<()> {
                 WorkbenchCommands::Logs { follow, services } => wb::logs(follow, &services),
                 WorkbenchCommands::Psql { db } => wb::psql(db.as_deref()),
                 WorkbenchCommands::Exec { service, cmd } => wb::exec(&service, &cmd),
-                WorkbenchCommands::Test { archive, run } => wb::test(&archive, &run),
-                WorkbenchCommands::Run { env, script, args } => {
-                    wb::run_script(&env, &script, &args)
-                }
+                WorkbenchCommands::Test {
+                    stack,
+                    archive,
+                    run,
+                } => wb::test(stack.as_deref(), &archive, &run),
+                WorkbenchCommands::Run {
+                    stack,
+                    env,
+                    script,
+                    args,
+                } => wb::run_script(stack.as_deref(), &env, &script, &args),
                 WorkbenchCommands::Env => wb::env(),
+                WorkbenchCommands::SlugOf { branch } => wb::slug_of(&branch),
             }
         }
     }
@@ -342,7 +377,7 @@ mod workbench_cli_tests {
         argv.extend_from_slice(args);
         match Cli::try_parse_from(argv).unwrap().command {
             Commands::Workbench {
-                command: WorkbenchCommands::Test { archive, run },
+                command: WorkbenchCommands::Test { archive, run, .. },
             } => (archive, run),
             other => panic!("not workbench test: {other:?}"),
         }
@@ -366,7 +401,7 @@ mod workbench_cli_tests {
         let cli = Cli::try_parse_from(["chelabase", "workbench", "run", "s.sh", "--", "--help"])
             .unwrap();
         let Commands::Workbench {
-            command: WorkbenchCommands::Run { env, script, args },
+            command: WorkbenchCommands::Run { env, script, args, .. },
         } = cli.command
         else {
             panic!("not workbench run");
@@ -424,21 +459,54 @@ mod tests {
     }
 
     #[test]
+    fn test_and_run_take_a_stack() {
+        let WorkbenchCommands::Test { stack, archive, run } =
+            workbench(&["test", "--stack", "feat", "-p", "rest", "--", "--run-ignored", "only"])
+        else {
+            panic!()
+        };
+        assert_eq!(stack.as_deref(), Some("feat"));
+        assert_eq!(archive, ["-p", "rest"]);
+        assert_eq!(run, ["--run-ignored", "only"]);
+        let WorkbenchCommands::Test { stack, .. } = workbench(&["test", "-p", "rest"]) else {
+            panic!()
+        };
+        assert_eq!(stack, None);
+        let WorkbenchCommands::Run { stack, env, script, args } =
+            workbench(&["run", "--stack", "feat", "--env", "A=1", "s.sh", "--stack", "x"])
+        else {
+            panic!()
+        };
+        assert_eq!(stack.as_deref(), Some("feat"));
+        assert_eq!(env, ["A=1"]);
+        assert_eq!(script, "s.sh");
+        assert_eq!(args, ["--stack", "x"], "after the script, everything is the script's");
+    }
+
+    #[test]
+    fn slug_of_takes_a_branch() {
+        let WorkbenchCommands::SlugOf { branch } = workbench(&["slug-of", "feat/x"]) else {
+            panic!()
+        };
+        assert_eq!(branch, "feat/x");
+    }
+
+    #[test]
     fn workbench_test_splits_selection_and_run_args() {
-        let WorkbenchCommands::Test { archive, run } = workbench(&[
+        let WorkbenchCommands::Test { archive, run, .. } = workbench(&[
             "test", "-p", "rest", "--test", "rest_live", "--", "--run-ignored", "only",
         ]) else {
             panic!()
         };
         assert_eq!(archive, ["-p", "rest", "--test", "rest_live"]);
         assert_eq!(run, ["--run-ignored", "only"]);
-        let WorkbenchCommands::Test { archive, run } = workbench(&["test"]) else { panic!() };
+        let WorkbenchCommands::Test { archive, run, .. } = workbench(&["test"]) else { panic!() };
         assert!(archive.is_empty() && run.is_empty());
     }
 
     #[test]
     fn workbench_run_takes_env_then_the_script_and_its_args() {
-        let WorkbenchCommands::Run { env, script, args } = workbench(&[
+        let WorkbenchCommands::Run { env, script, args, .. } = workbench(&[
             "run", "--env", "A=1", "--env", "B=2", "scripts/neon-e2e.sh", "--fast", "x",
         ]) else {
             panic!()
@@ -487,7 +555,7 @@ mod tests {
     // T5 review M5: a script's own flags after its name reach the script.
     #[test]
     fn workbench_run_passes_the_scripts_flags_through() {
-        let WorkbenchCommands::Run { env, script, args } =
+        let WorkbenchCommands::Run { env, script, args, .. } =
             workbench(&["run", "scripts/s.sh", "--help", "--env", "x"])
         else {
             panic!()

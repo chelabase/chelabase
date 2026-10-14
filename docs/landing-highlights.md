@@ -143,4 +143,4 @@ Branch `neon-fork-round-2`; fork branch `round-2` on `chelabase/neon`. Spec `doc
   - `just check` green.
   - Not yet seen in a browser: Studio's create form didn't respond on the branch stack, an issue outside this step.
 - **Known residual:** a database a guarded login makes from `template0` is unguarded until the reconcile its creation asks for (seconds). Closing it needs the fork and is queued for the next fork round, with REASSIGN OWNED.
-- **Status:** on branch `protected-branches`, awaiting the merge decision (2026-10-14).
+- **Status:** merged to `main` 2026-10-14.

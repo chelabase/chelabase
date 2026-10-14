@@ -7,6 +7,7 @@ pub mod migrate;
 pub mod registry;
 pub mod slots;
 pub mod slug;
+pub mod target;
 
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default, reason = "the coordinator's RED tests, kept as written")]
@@ -23,3 +24,9 @@ mod t5_fix_tests;
 
 #[cfg(test)]
 mod eos_tests;
+
+#[cfg(test)]
+mod stack_target_tests;
+
+#[cfg(test)]
+mod stack_fix_tests;

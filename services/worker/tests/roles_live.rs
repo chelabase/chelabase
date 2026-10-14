@@ -707,13 +707,17 @@ fn required_env(var: &str) -> String {
 /// `docker compose` on the stack's project, with the test's settings (`env`) in the command's
 /// environment: the orchestrator's `environment:` passes them through from the caller's.
 async fn compose(env: &[(&str, &str)], args: &[&str]) {
-    let checkout = required_env("CHELABASE_CHECKOUT");
+    // The stack's own checkout, never the task checkout the runner works in: the recreated
+    // orchestrator must stay on the stack's files.
+    let checkout = std::env::var("CHELABASE_STACK_CHECKOUT")
+        .unwrap_or_else(|_| required_env("CHELABASE_CHECKOUT"));
     let out = tokio::process::Command::new("docker")
         .args(["compose", "-p", &required_env("CHELABASE_COMPOSE_PROJECT"), "-f"])
         .arg(format!("{checkout}/infra/compose/docker-compose.yml"))
         .arg("--env-file")
         .arg(format!("{}/env/stack.env", required_env("CHELABASE_STACK_DIR")))
         .args(args)
+        .env("CHELABASE_CHECKOUT", &checkout)
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .output()

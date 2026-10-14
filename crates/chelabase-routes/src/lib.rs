@@ -928,13 +928,6 @@ pub mod auth {
         }
     }
 
-    const fn get(name: &'static str, path: &'static str) -> Endpoint {
-        Endpoint {
-            method: Method::Get,
-            ..post(name, path)
-        }
-    }
-
     pub const AUTH_REQUEST: Endpoint = post("auth.auth_request", "/auth/v1/auth-request");
     pub const SIGN_IN: Endpoint = post("auth.sign_in", "/auth/v1/sign-in");
     pub const SIGN_UP: Endpoint = post("auth.sign_up", "/auth/v1/sign-up");

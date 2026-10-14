@@ -26,6 +26,16 @@ just --show wt-remove | grep -q 'workbench purge' || fail "wt-remove purges the 
 ! just --show wt-remove | grep -qiE 'sha256|sha256sum|cut -c' || fail "wt-remove lets the CLI resolve the worktree's stack (run from the worktree), never recomputes the slug"
 just --show wt-remove | grep -q -- '--show-toplevel' || fail "wt-remove checks the directory is still that worktree (git toplevel) before it purges (T5 review I4)"
 ! just --show wt-add | grep -q '\.env\.local' || fail "wt-add no longer links Studio's env"
+just --show wt-add | grep -q 'workbench slug-of' ||
+  fail "wt-add asks the CLI for the base's stack, never recomputes the slug"
+just --show wt-add | grep -q '\.workbench-stack' || fail "wt-add records the base's stack in the task worktree"
+grep -qx '/.workbench-stack' .gitignore || fail ".workbench-stack is git-ignored"
+# End-of-step I1: a test that recreates the stack's apps interpolates the stack's own checkout
+# (CHELABASE_STACK_CHECKOUT), never the task checkout the runner works in.
+while IFS= read -r f; do
+  grep -q 'CHELABASE_STACK_CHECKOUT' "$f" || fail "$f recreates apps without CHELABASE_STACK_CHECKOUT"
+done < <(git grep -l -e '--force-recreate' -- 'services/*/tests/*' 'crates/*/tests/*' 'crates/*/src/*' 'services/*/src/*')
+just --show wt-add | grep -q 'origin/main' || fail "wt-add treats origin/main as a step base"
 for r in create-db-demo zitadel-reset; do
   just --show "$r" | grep -q 'workbench env' || fail "$r loads the stack's env"
 done

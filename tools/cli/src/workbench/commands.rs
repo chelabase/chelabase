@@ -10,6 +10,9 @@ use super::slots::{
     wait_from_env,
 };
 use super::slug::{Hosts, MAIN, hosts, project_name, slug_for_dir};
+use super::target::{
+    Target, archive_path, check_up_allowed, base_stack_slug, check_ready, read_recorded, resolve_target,
+};
 use anyhow::{Context as _, bail};
 use chelabase_neon::compute::{ENDPOINT_LABEL, STACK_LABEL};
 use sha2::{Digest, Sha256};
@@ -89,7 +92,7 @@ pub struct Stack {
 }
 
 impl Stack {
-    fn new(slug: &str, checkout: &Path, main: &Path) -> Self {
+    pub(crate) fn new(slug: &str, checkout: &Path, main: &Path) -> Self {
         let stacks_dir = stacks_dir(main);
         let state = stacks_dir.join(slug);
         Stack {
@@ -642,6 +645,7 @@ impl Phases {
 /// `workbench up [--with …]`.
 pub fn up(with: &[Site]) -> anyhow::Result<()> {
     let stack = current_stack()?;
+    check_up_allowed(read_recorded(&stack.checkout)?.as_deref(), &stack.slug)?;
     up_stack(&stack, with)
 }
 
@@ -1382,15 +1386,26 @@ pub fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The stack `env`, `psql`, `logs` and `exec` act on: the recorded one in a task worktree, else
+/// this checkout's own. Never starts anything.
+fn followed_stack() -> anyhow::Result<Stack> {
+    let here = current_stack()?;
+    let recorded = read_recorded(&here.checkout)?;
+    match resolve_target(None, recorded.as_deref(), &here.slug)? {
+        Target::Own => Ok(here),
+        Target::Other(slug) => Ok(chosen_stack(&here, Some(&slug))?.0),
+    }
+}
+
 /// `workbench env`: the path of the stack's `stack.env` (it exists once `up` has run).
 pub fn env() -> anyhow::Result<()> {
-    println!("{}", current_stack()?.env_file.display());
+    println!("{}", followed_stack()?.env_file.display());
     Ok(())
 }
 
 /// `workbench logs [-f] [service…]`.
 pub fn logs(follow: bool, services: &[String]) -> anyhow::Result<()> {
-    let stack = current_stack()?;
+    let stack = followed_stack()?;
     let mut args = vec!["--profile", "sites", "logs"];
     if follow {
         args.push("-f");
@@ -1401,7 +1416,7 @@ pub fn logs(follow: bool, services: &[String]) -> anyhow::Result<()> {
 
 /// `workbench psql [db]`: psql in metadata-db (default `chelabase_metadata`).
 pub fn psql(db: Option<&str>) -> anyhow::Result<()> {
-    let stack = current_stack()?;
+    let stack = followed_stack()?;
     let db = db.unwrap_or("chelabase_metadata");
     pass_through(stack.compose_cmd(&[
         "exec",
@@ -1416,7 +1431,7 @@ pub fn psql(db: Option<&str>) -> anyhow::Result<()> {
 
 /// `workbench exec <service> <cmd…>`.
 pub fn exec(service: &str, cmd: &[String]) -> anyhow::Result<()> {
-    let stack = current_stack()?;
+    let stack = followed_stack()?;
     let mut args = vec!["--profile", "sites", "exec", service];
     args.extend(cmd.iter().map(String::as_str));
     pass_through(stack.compose_cmd(&args)?)
@@ -1424,32 +1439,79 @@ pub fn exec(service: &str, cmd: &[String]) -> anyhow::Result<()> {
 
 // --- test, run ---
 
-/// `workbench test [selection…] [-- run-args…]`: archive on the host (the runner has no cargo),
-/// run the archive in the runner on the stack's network.
-pub fn test(selection: &[String], run_args: &[String]) -> anyhow::Result<()> {
-    let stack = current_stack()?;
-    let entry = ensure_current(&stack)?;
-    let archive = stack.state.join("test/archive.tar.zst");
+/// `workbench test [--stack <slug>] [selection…] [-- run-args…]`: archive on the host (the runner
+/// has no cargo), run the archive in the runner on the stack's network. On another checkout's
+/// stack (`--stack`, or the one `wt-add` recorded) the stack is never started, rebuilt or
+/// recreated; this checkout's files are what runs.
+pub fn test(stack: Option<&str>, selection: &[String], run_args: &[String]) -> anyhow::Result<()> {
+    let here = current_stack()?;
+    let (target, entry) = stack_for_run(&here, stack)?;
+    let archive = archive_path(&target.state, &target.slug, &here.slug);
     let phases = Phases;
     phases.run("nextest archive", || {
         let mut cmd = Command::new("cargo");
         cmd.args(nextest_archive_args(selection, &archive))
-            .current_dir(&stack.checkout);
+            .current_dir(&here.checkout);
         run(cmd)
     })?;
     let mut cmd = vec!["cargo-nextest".to_string()];
-    cmd.extend(nextest_run_args(run_args, &archive, &stack.checkout));
-    in_runner(&stack, &entry, &[], &cmd)
+    cmd.extend(nextest_run_args(run_args, &archive, &here.checkout));
+    in_runner(&target, &here.checkout, &entry, &[], &cmd)
 }
 
-/// `workbench run [--env K=V]… <script> [args…]`: a repo script in the runner.
-pub fn run_script(env: &[String], script: &str, args: &[String]) -> anyhow::Result<()> {
+/// `workbench run [--stack <slug>] [--env K=V]… <script> [args…]`: a repo script in the runner.
+pub fn run_script(
+    stack: Option<&str>,
+    env: &[String],
+    script: &str,
+    args: &[String],
+) -> anyhow::Result<()> {
     let pairs = parse_env_pairs(env)?;
-    let stack = current_stack()?;
-    let entry = ensure_current(&stack)?;
+    let here = current_stack()?;
+    let (target, entry) = stack_for_run(&here, stack)?;
     let mut cmd = vec![script.to_string()];
     cmd.extend(args.iter().cloned());
-    in_runner(&stack, &entry, &pairs, &cmd)
+    in_runner(&target, &here.checkout, &entry, &pairs, &cmd)
+}
+
+/// The stack a `test`/`run` uses, with its registry entry: this checkout's own (started or brought
+/// current), or another checkout's, checked ready and left untouched.
+fn stack_for_run(here: &Stack, flag: Option<&str>) -> anyhow::Result<(Stack, Entry)> {
+    match resolve_stack_target(here, flag)? {
+        None => Ok((here.clone(), ensure_current(here)?)),
+        Some(other) => Ok(other),
+    }
+}
+
+/// `None` for this checkout's own stack; else another stack, checked ready (registered, holding
+/// its slot, every app running), with its registry entry.
+fn resolve_stack_target(
+    here: &Stack,
+    flag: Option<&str>,
+) -> anyhow::Result<Option<(Stack, Entry)>> {
+    let recorded = read_recorded(&here.checkout)?;
+    match resolve_target(flag, recorded.as_deref(), &here.slug)? {
+        Target::Own => Ok(None),
+        Target::Other(slug) => {
+            let (stack, entry) = chosen_stack(here, Some(&slug))?;
+            let running = if entry.is_some() {
+                stack.running_services()?
+            } else {
+                Vec::new()
+            };
+            check_ready(&slug, entry.as_ref(), &APPS, &running)?;
+            let entry = entry.with_context(|| format!("stack {slug} isn't registered"))?;
+            Ok(Some((stack, entry)))
+        }
+    }
+}
+
+/// `workbench slug-of <branch>`: the registered stack slug of a base branch, or an empty line.
+pub fn slug_of(branch: &str) -> anyhow::Result<()> {
+    let here = current_stack()?;
+    let registry = read_registry(&here.stacks_dir)?;
+    println!("{}", base_stack_slug(branch, &registry)?);
+    Ok(())
 }
 
 /// W-6: up (idempotent) when the stack isn't running or any app service is missing (a half-up
@@ -1490,9 +1552,51 @@ fn ensure_current(stack: &Stack) -> anyhow::Result<Entry> {
         .with_context(|| format!("stack {} isn't registered", stack.slug))
 }
 
-/// `compose run --rm --no-deps` of the runner with the pinned env, then `extra`.
+/// The runner's `docker compose … --profile runner run --rm --no-deps [-e K=V]… runner <cmd…>`
+/// for `stack`, run on `checkout`'s files: when `checkout` isn't `stack.checkout`, the process env
+/// gets `CHELABASE_CHECKOUT=<checkout>` (set after `compose_command`'s env-file values, so it wins
+/// the interpolation) and `-e CHELABASE_CHECKOUT=<checkout>` and `-e CHELABASE_CLI=<checkout>/target/debug/chelabase`
+/// (the stack env's value points into the stack's checkout, which the runner doesn't mount) come
+/// before `env`'s pairs. Always
+/// `-e CHELABASE_STACK_CHECKOUT=<stack.checkout>`: a suite that recreates the stack's apps through
+/// Compose interpolates that, never the task checkout.
+pub(crate) fn runner_command(
+    stack: &Stack,
+    checkout: &Path,
+    env: &[(String, String)],
+    cmd: &[String],
+) -> anyhow::Result<Command> {
+    let mut pairs: Vec<String> = vec![format!(
+        "CHELABASE_STACK_CHECKOUT={}",
+        stack.checkout.display()
+    )];
+    let other = checkout != stack.checkout;
+    if other {
+        pairs.push(format!("CHELABASE_CHECKOUT={}", checkout.display()));
+        pairs.push(format!(
+            "CHELABASE_CLI={}",
+            checkout.join("target").join("debug").join("chelabase").display()
+        ));
+    }
+    pairs.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
+    let mut args: Vec<&str> = vec!["--profile", "runner", "run", "--rm", "--no-deps"];
+    for p in &pairs {
+        args.extend(["-e", p.as_str()]);
+    }
+    args.push("runner");
+    args.extend(cmd.iter().map(String::as_str));
+    let mut command = stack.compose_cmd(&args)?;
+    if other {
+        command.env("CHELABASE_CHECKOUT", checkout);
+    }
+    Ok(command)
+}
+
+/// `compose run --rm --no-deps` of the runner with the pinned env, then `extra`; `checkout` is the
+/// checkout whose files run (the current one).
 fn in_runner(
     stack: &Stack,
+    checkout: &Path,
     entry: &Entry,
     extra: &[(String, String)],
     cmd: &[String],
@@ -1521,14 +1625,7 @@ fn in_runner(
         ("CURL_HOME".into(), stack.runner_dir().display().to_string()),
     ];
     env.extend(extra.iter().cloned());
-    let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mut args: Vec<&str> = vec!["--profile", "runner", "run", "--rm", "--no-deps"];
-    for p in &pairs {
-        args.extend(["-e", p.as_str()]);
-    }
-    args.push("runner");
-    args.extend(cmd.iter().map(String::as_str));
-    pass_through(stack.compose_cmd(&args)?)
+    pass_through(runner_command(stack, checkout, &env, cmd)?)
 }
 
 /// The proxy container's address on the stack network (`<project>_default`).

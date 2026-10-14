@@ -158,7 +158,8 @@ sweep-builds days="14":
     done
 
 # New worktree at .worktrees/<branch with / as ->; creates the branch from base if it is new.
-# It builds into its own target/ and runs nothing: its stack comes from `just workbench up` there.
+# It builds the CLI in the new worktree (`workbench slug-of`) and starts no stack: a task worktree
+# records the base's stack in `.workbench-stack`; a main-based one gets its own from `just workbench up`.
 wt-add branch base="main":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -172,6 +173,14 @@ wt-add branch base="main":
       git -C "$main" worktree add "$dir" -b "$branch" "$base"
     fi
     ln -s "$main/.chelabase" "$dir/.chelabase"
+    if [ "$base" != main ] && [ "$base" != origin/main ]; then
+      # A task worktree of a plan lands on the plan's stack: `workbench test`/`run` read this file.
+      slug="$(env -C "$dir" cargo run -q -p chelabase -- workbench slug-of "$base" || true)"
+      printf '%s\n' "$slug" > "$dir/.workbench-stack"
+      if [ -z "$slug" ]; then
+        echo "no stack for $base: bring it up there (just workbench up) or pass --stack" >&2
+      fi
+    fi
     (cd "$dir" && pnpm install --frozen-lockfile)
     echo "$dir"
 

@@ -662,6 +662,62 @@ async fn spawn_silent_upstream() -> String {
     format!("http://{addr}")
 }
 
+/// One HTTP/1.1 chunk.
+fn chunk(data: &str) -> Vec<u8> {
+    format!("{:x}\r\n{data}\r\n", data.len()).into_bytes()
+}
+
+/// A raw upstream that answers one event-stream request: its head and a first event, then 3 s of
+/// silence, then a second event and the end of the stream.
+async fn spawn_event_stream_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        read_head(&mut sock).await;
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+              Transfer-Encoding: chunked\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        sock.write_all(&chunk("data: one\n\n")).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        sock.write_all(&chunk("data: two\n\n")).await.unwrap();
+        sock.write_all(b"0\r\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    format!("http://{addr}")
+}
+
+// workbench-stack (user, 2026-10-14): a site's event stream (the request asks for
+// `text/event-stream`) may sit idle like a websocket, past the upstream read timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_site_event_stream_may_idle_past_the_upstream_timeout() {
+    let jwks = MockJwks::start().await;
+    let (api, _) = spawn_upstream().await;
+    let stream = spawn_event_stream_upstream().await;
+    let (base, _verify, _gateway) = spawn_gateway_with(
+        &api,
+        &jwks,
+        &[("CHELABASE_STUDIO_UPSTREAM", stream.as_str()), ("CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS", "1")],
+    )
+    .await;
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap()
+        .get(format!("{base}/__tsd/console-pipe/sse"))
+        .header(reqwest::header::HOST, STUDIO_HOST)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.expect("the stream isn't cut by the 1 s upstream timeout");
+    assert!(body.contains("data: one") && body.contains("data: two"), "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_that_never_answers_is_504_json() {
     let jwks = MockJwks::start().await;
@@ -879,7 +935,7 @@ async fn chelabase_user_header_is_stripped_upstream() {
 }
 
 // Spec §2: a site request that gets no answer times out like the API's; only websocket
-// upgrades may stay open up to an hour.
+// upgrades and event streams (`Accept: text/event-stream`) may stay open up to an hour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hung_site_request_times_out_like_the_api() {
     let jwks = MockJwks::start().await;
