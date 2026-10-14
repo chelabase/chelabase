@@ -143,6 +143,13 @@ pub struct BranchRecord {
     pub authenticator_password_enc: Option<String>,
     /// Refused by delete and reset-to-parent (restore still works).
     pub protected: bool,
+    /// Login roles other than the owner, the maintenance roles and the exempt ones can't run
+    /// schema changes here (the schema guard's login-role rule).
+    pub guard_logins: bool,
+    /// The hash of the protection review last acknowledged, if any.
+    pub review_ack_hash: Option<String>,
+    /// The item keys of that acknowledged review.
+    pub review_ack_keys: Vec<String>,
 }
 
 /// A branch to create (always `normal`, status `pending`).
@@ -290,7 +297,7 @@ pub struct LiveBranch {
 const BRANCH_COLUMNS: &str = "id, database_id, name, parent_branch_id, kind, status, timeline_id, \
      pending_timeline_id, pending_timeline_at, superseded_timeline_id, endpoint_id, owner_password_enc, \
      branched_at_time, branched_at_lsn, error, created_at, updated_at, history_start, \
-     authenticator_password_enc, protected";
+     authenticator_password_enc, protected, guard_logins, review_ack_hash, review_ack_keys";
 
 fn branch_from_row(r: &PgRow) -> Result<BranchRecord, MetadataError> {
     Ok(BranchRecord {
@@ -314,7 +321,27 @@ fn branch_from_row(r: &PgRow) -> Result<BranchRecord, MetadataError> {
         history_start: r.get("history_start"),
         authenticator_password_enc: r.get("authenticator_password_enc"),
         protected: r.get("protected"),
+        guard_logins: r.get("guard_logins"),
+        review_ack_hash: r.get("review_ack_hash"),
+        review_ack_keys: r.get("review_ack_keys"),
     })
+}
+
+/// Copies `from`'s guard exemptions onto `to` (a new branch row in the same transaction).
+async fn copy_guard_exemptions(
+    tx: &mut sqlx::PgConnection,
+    from: Uuid,
+    to: Uuid,
+) -> Result<(), MetadataError> {
+    sqlx::query(
+        "INSERT INTO branch_guard_exemptions (branch_id, role_name)
+         SELECT $2, role_name FROM branch_guard_exemptions WHERE branch_id = $1",
+    )
+    .bind(from)
+    .bind(to)
+    .execute(tx)
+    .await?;
+    Ok(())
 }
 
 /// Branches matching `condition` (on `$1`), oldest first.
@@ -414,8 +441,9 @@ impl MetadataClient {
         }
         let inserted = sqlx::query(
             "INSERT INTO branches (id, database_id, name, parent_branch_id, kind, status,
-                                   branched_at_time, branched_at_lsn)
-             VALUES ($1, $2, $3, $4, 'normal', 'pending', $5, $6)",
+                                   branched_at_time, branched_at_lsn, guard_logins)
+             VALUES ($1, $2, $3, $4, 'normal', 'pending', $5, $6,
+                     (SELECT guard_logins FROM branches WHERE id = $4))",
         )
         .bind(b.id.as_uuid())
         .bind(b.database_id.as_uuid())
@@ -432,6 +460,10 @@ impl MetadataClient {
             }
             Err(err) => return Err(err.into()),
         }
+        // A point-in-time snapshot: the parent's FOR SHARE lock doesn't block exemption writes
+        // (they take only a key-share lock through the FK), so a concurrent add/remove may or
+        // may not reach the child.
+        copy_guard_exemptions(&mut tx, b.parent_branch_id.as_uuid(), b.id.as_uuid()).await?;
         tx.commit().await?;
         Ok(CreateBranchOutcome::Created)
     }
@@ -461,12 +493,14 @@ impl MetadataClient {
         if parent_ready != Some(true) {
             return Err(MetadataError::Conflict);
         }
+        let new_id = BranchId::new().as_uuid();
         let inserted = sqlx::query(
-            "INSERT INTO branches (id, database_id, name, parent_branch_id, kind, status)
-             VALUES ($1, $2, $3, $4, 'rehearsal', 'pending')
+            "INSERT INTO branches (id, database_id, name, parent_branch_id, kind, status, guard_logins)
+             VALUES ($1, $2, $3, $4, 'rehearsal', 'pending',
+                     (SELECT guard_logins FROM branches WHERE id = $4))
              RETURNING *",
         )
-        .bind(BranchId::new().as_uuid())
+        .bind(new_id)
         .bind(database_id.as_uuid())
         .bind(name)
         .bind(parent.as_uuid())
@@ -479,6 +513,9 @@ impl MetadataClient {
             }
             Err(err) => return Err(err.into()),
         };
+        // A point-in-time snapshot, as in `create_branch`: a concurrent exemption add/remove on
+        // the parent (key-share lock only) may or may not reach this branch.
+        copy_guard_exemptions(&mut tx, parent.as_uuid(), new_id).await?;
         tx.commit().await?;
         branch_from_row(&row)
     }
@@ -628,6 +665,115 @@ impl MetadataClient {
         sqlx::query(AssertSqlSafe(sql))
             .bind(id.as_uuid())
             .bind(protected)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(branch_from_row)
+            .transpose()
+    }
+
+    /// Sets the login-role guard switch (same row guards as [`Self::set_branch_protected`]).
+    pub async fn set_branch_guard_logins(
+        &self,
+        id: BranchId,
+        on: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        let sql = format!(
+            "UPDATE branches SET guard_logins = $2, updated_at = now()
+             WHERE id = $1 AND kind = 'normal' AND status NOT IN ('deleting', 'deleted')
+             RETURNING {BRANCH_COLUMNS}"
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(id.as_uuid())
+            .bind(on)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(branch_from_row)
+            .transpose()
+    }
+
+    /// The branch's guard-exempt role names, sorted (byte order).
+    pub async fn list_guard_exemptions(&self, id: BranchId) -> Result<Vec<String>, MetadataError> {
+        Ok(sqlx::query_scalar(
+            "SELECT role_name FROM branch_guard_exemptions
+             WHERE branch_id = $1 ORDER BY role_name COLLATE \"C\"",
+        )
+        .bind(id.as_uuid())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// `true` when inserted, `false` when already exempt. An unknown branch fails with the FK error.
+    pub async fn add_guard_exemption(&self, id: BranchId, role: &str) -> Result<bool, MetadataError> {
+        let done = sqlx::query(
+            "INSERT INTO branch_guard_exemptions (branch_id, role_name) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id.as_uuid())
+        .bind(role)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// `true` when removed, `false` when it wasn't exempt.
+    pub async fn remove_guard_exemption(
+        &self,
+        id: BranchId,
+        role: &str,
+    ) -> Result<bool, MetadataError> {
+        let done = sqlx::query(
+            "DELETE FROM branch_guard_exemptions WHERE branch_id = $1 AND role_name = $2",
+        )
+        .bind(id.as_uuid())
+        .bind(role)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// protected = true and the acknowledged list, in one UPDATE (same row guards as
+    /// [`Self::set_branch_protected`]).
+    pub async fn protect_branch(
+        &self,
+        id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        let sql = format!(
+            "UPDATE branches SET protected = true, review_ack_hash = $2, review_ack_keys = $3,
+                    updated_at = now()
+             WHERE id = $1 AND kind = 'normal' AND status NOT IN ('deleting', 'deleted')
+             RETURNING {BRANCH_COLUMNS}"
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(id.as_uuid())
+            .bind(hash)
+            .bind(keys)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(branch_from_row)
+            .transpose()
+    }
+
+    /// Records the acknowledged review; nothing else changes.
+    pub async fn acknowledge_review(
+        &self,
+        id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        let sql = format!(
+            "UPDATE branches SET review_ack_hash = $2, review_ack_keys = $3, updated_at = now()
+             WHERE id = $1 AND kind = 'normal' AND status NOT IN ('deleting', 'deleted')
+             RETURNING {BRANCH_COLUMNS}"
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(id.as_uuid())
+            .bind(hash)
+            .bind(keys)
             .fetch_optional(&self.pool)
             .await?
             .as_ref()
@@ -1084,8 +1230,9 @@ impl MetadataClient {
         };
         sqlx::query(
             "INSERT INTO branches (id, database_id, name, parent_branch_id, kind, status,
-                                   timeline_id, history_start)
-             VALUES ($1, $2, $3, $4, 'backup', 'ready', $5, $6)",
+                                   timeline_id, history_start, guard_logins)
+             VALUES ($1, $2, $3, $4, 'backup', 'ready', $5, $6,
+                     (SELECT guard_logins FROM branches WHERE id = $4))",
         )
         .bind(backup.as_uuid())
         .bind(database_id)
@@ -1102,6 +1249,7 @@ impl MetadataClient {
             }
             err => err.into(),
         })?;
+        copy_guard_exemptions(&mut tx, id.as_uuid(), backup.as_uuid()).await?;
         let (endpoint_id, timeline_id): (Option<String>, String) = sqlx::query_as(
             "UPDATE branches
              SET timeline_id = pending_timeline_id, pending_timeline_id = NULL,

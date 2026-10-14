@@ -98,6 +98,10 @@ A change made through Studio or the API that the compute didn't confirm (the com
 
 When Chelabase can't reach the control plane, role and database DDL fails after about 5 seconds with `role and database changes are unavailable right now; try again` (SQLSTATE `55000`). The change doesn't take effect; retry the statement. Other refusals reach the client as their own one-line message, for example `the branch owner's password can't be removed; reset it instead`.
 
+## On a protected branch
+
+On a protected branch with the "guard login roles" switch on, a login role other than the owner can't change the schema unless it is exempted on that branch by name. The member logins of non-Admins are refused either way. See [Protected branches](/docs/using/branches#protected-branches).
+
 ## Passwords across branches
 
 A new branch keeps its parent's role passwords unless the parent is protected. See [Branches](/docs/using/branches).

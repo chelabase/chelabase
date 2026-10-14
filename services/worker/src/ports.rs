@@ -431,6 +431,11 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         branch: Uuid,
     ) -> impl Future<Output = Result<Vec<MemberBranchRole>, MetadataError>> + Send;
+    /// PB: the login roles exempt from the branch's login-role guard, by name.
+    fn guard_exemptions(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<String>, MetadataError>> + Send;
     fn upsert_member_branch_role(
         &self,
         row: &MemberBranchRole,
@@ -1118,6 +1123,10 @@ impl WorkerMetadata for MetadataClient {
         branch: Uuid,
     ) -> Result<Vec<MemberBranchRole>, MetadataError> {
         MetadataClient::member_branch_roles(self, branch).await
+    }
+
+    async fn guard_exemptions(&self, branch: BranchId) -> Result<Vec<String>, MetadataError> {
+        MetadataClient::list_guard_exemptions(self, branch).await
     }
 
     async fn upsert_member_branch_role(&self, row: &MemberBranchRole) -> Result<(), MetadataError> {

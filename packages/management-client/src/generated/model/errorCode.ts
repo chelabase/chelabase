@@ -107,4 +107,5 @@ export const ErrorCode = {
   lock_timeout: 'lock_timeout',
   schema_change_failed: 'schema_change_failed',
   has_dependents: 'has_dependents',
+  review_changed: 'review_changed',
 } as const;

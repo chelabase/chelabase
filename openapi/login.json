@@ -2617,7 +2617,8 @@
           "index_build_failed",
           "lock_timeout",
           "schema_change_failed",
-          "has_dependents"
+          "has_dependents",
+          "review_changed"
         ]
       },
       "ErrorEnvelope": {

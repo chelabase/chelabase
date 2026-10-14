@@ -238,6 +238,9 @@ pub struct FakeState {
     pub member_roles: Vec<chelabase_metadata::members::MemberBranchRole>,
     /// R31: the last acted role by (member, branch).
     pub acted_roles: HashMap<(uuid::Uuid, uuid::Uuid), String>,
+    /// PB: each branch's login-role guard exemptions, in stored order (missing key: none). A
+    /// new branch and a restore's backup copy their source's.
+    pub guard_exemptions: HashMap<BranchId, Vec<String>>,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -523,6 +526,9 @@ impl FakeMetadata {
                 history_start: None,
                 authenticator_password_enc: None,
                 protected: false,
+                guard_logins: true,
+                review_ack_hash: None,
+                review_ack_keys: Vec::new(),
             },
         );
         id
@@ -573,6 +579,7 @@ impl FakeMetadata {
             return CreateBranchOutcome::CapReached { max };
         }
         let now = chrono::Utc::now();
+        let parent_guard_logins = state.branches[&b.parent_branch_id].guard_logins;
         state.branches.insert(
             b.id,
             BranchRecord {
@@ -596,8 +603,14 @@ impl FakeMetadata {
                 history_start: None,
                 authenticator_password_enc: None,
                 protected: false,
+                guard_logins: parent_guard_logins,
+                review_ack_hash: None,
+                review_ack_keys: Vec::new(),
             },
         );
+        if let Some(exempt) = state.guard_exemptions.get(&b.parent_branch_id).cloned() {
+            state.guard_exemptions.insert(b.id, exempt);
+        }
         CreateBranchOutcome::Created
     }
 
@@ -1916,8 +1929,14 @@ impl WorkerMetadata for FakeMetadata {
                 history_start: b.history_start,
                 authenticator_password_enc: None,
                 protected: false,
+                guard_logins: b.guard_logins,
+                review_ack_hash: None,
+                review_ack_keys: Vec::new(),
             },
         );
+        if let Some(exempt) = state.guard_exemptions.get(&id).cloned() {
+            state.guard_exemptions.insert(backup, exempt);
+        }
         let branch = state.branches.get_mut(&id).expect("looked up above");
         branch.timeline_id = branch.pending_timeline_id.take();
         branch.pending_timeline_at = None;
@@ -2171,10 +2190,6 @@ impl WorkerMetadata for FakeMetadata {
                     return false;
                 };
                 live(db.status)
-                    && (state.members.iter().any(|m| {
-                        m.tenant_id == db.tenant_id
-                            && m.status == chelabase_metadata::members::MemberStatus::Active
-                    }) || state.member_roles.iter().any(|r| r.branch_id == b.id.as_uuid()))
             })
             .map(|b| b.id.as_uuid())
             .collect();
@@ -2202,6 +2217,11 @@ impl WorkerMetadata for FakeMetadata {
             .collect();
         rows.sort_by_key(|r| r.member_id);
         Ok(rows)
+    }
+
+    async fn guard_exemptions(&self, branch: BranchId) -> Result<Vec<String>, MetadataError> {
+        let state = self.read("guard_exemptions")?;
+        Ok(state.guard_exemptions.get(&branch).cloned().unwrap_or_default())
     }
 
     async fn upsert_member_branch_role(
@@ -2901,6 +2921,9 @@ impl WorkerMetadata for FakeMetadata {
             history_start: None,
             authenticator_password_enc: None,
             protected: false,
+            guard_logins: true,
+            review_ack_hash: None,
+            review_ack_keys: Vec::new(),
         };
         state.branches.insert(row.id, row.clone());
         Ok(row)
@@ -3682,6 +3705,26 @@ pub fn restored_by_hand(w: &FakeWorker, branch: BranchId, backup_name: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PB T1 review, finding 1: the fake restore's backup carries the restored branch's switch,
+    // as the real insert does.
+    #[tokio::test]
+    async fn a_restore_backup_copies_guard_logins() {
+        use crate::ports::WorkerMetadata as _;
+        let (w, _journal) = worker();
+        let db = ready_database(&w).await;
+        let main = w.metadata.main(db);
+        {
+            let mut state = w.metadata.state();
+            let record = state.branches.get_mut(&main.id).unwrap();
+            record.guard_logins = false;
+            record.status = BranchStatus::Resetting;
+            record.pending_timeline_id = Some("tl-restored".into());
+        }
+        let backup = BranchId::new();
+        assert!(w.metadata.switch_to_restored_timeline(main.id, "tl-restored", backup, "main-before-restore", "0/1").await.unwrap());
+        assert!(!w.metadata.state().branches[&backup].guard_logins);
+    }
 
     fn storage() -> (FakeStorage, NeonId, NeonId) {
         let (w, _journal) = worker();

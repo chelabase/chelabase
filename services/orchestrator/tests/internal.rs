@@ -3151,8 +3151,9 @@ async fn ddl_touched_roles_ask_for_one_resync() {
 
 // Members T8 (I3, R17): every accepted delta that touches roles (made, dropped, renamed,
 // touched attributes or memberships, a password) asks for one member-role reconcile of the
-// branch; a databases-only delta asks for none (member roles are cluster-wide), and neither
-// does a refused one.
+// branch; a refused one asks for none. PB end-of-step R12: a delta that makes a database asks
+// for one too (the new database needs the protected-branch guard); one that only drops a
+// database asks for none.
 #[tokio::test]
 async fn ddl_role_changes_ask_for_a_member_reconcile() {
     let (neon, branch) = ddl_neon();
@@ -3161,6 +3162,9 @@ async fn ddl_role_changes_ask_for_a_member_reconcile() {
     let app = spawn_with_resync(neon.clone(), resync.clone()).await;
     let db = dbs_delta(vec![json!({ "op": "set", "name": "extra", "owner": "postgres" })]);
     assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &db).await.0, 200);
+    assert!(wait_until(|| resync.members_asked.lock().unwrap().len() == 1).await, "a new database");
+    let dropped = dbs_delta(vec![json!({ "op": "del", "name": "extra" })]);
+    assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &dropped).await.0, 200);
     let refused = roles_delta(vec![set("anon", STRONG, SCRAM)]);
     assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &refused).await.0, 409);
     for (i, op) in [
@@ -3173,9 +3177,9 @@ async fn ddl_role_changes_ask_for_a_member_reconcile() {
     .enumerate()
     {
         assert_eq!(app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op.clone()])).await.0, 200, "{op}");
-        assert!(wait_until(|| resync.members_asked.lock().unwrap().len() == i + 1).await, "{op}");
+        assert!(wait_until(|| resync.members_asked.lock().unwrap().len() == i + 2).await, "{op}");
     }
-    assert_eq!(*resync.members_asked.lock().unwrap(), [branch; 4]);
+    assert_eq!(*resync.members_asked.lock().unwrap(), [branch; 5]);
 }
 
 // M1: dropping a group role changes its members' derived levels, so a `del` resyncs too.
@@ -3634,6 +3638,9 @@ fn branch_record(
         history_start: None,
         authenticator_password_enc: None,
         protected: false,
+        guard_logins: true,
+        review_ack_hash: None,
+        review_ack_keys: Vec::new(),
     }
 }
 

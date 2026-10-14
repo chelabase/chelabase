@@ -69,7 +69,7 @@ done
 # I2: recipe arguments are passed as arguments, never re-split by the shell.
 grep -q '^set positional-arguments' justfile || fail "the justfile sets positional-arguments"
 for r in workbench bench-data-api zitadel-bootstrap; do
-  just --show "$r" | grep -qF '"$@"' || fail "$r passes its arguments with \"\$@\""
+  just --show "$r" | grep -qE '"\$(@|1)"' || fail "$r passes its arguments quoted (\"\$@\" or \"\$1\")"
   ! just --show "$r" | grep -qF '{{' || fail "$r interpolates its arguments into the shell line"
 done
 # Minor: Studio's env must exist before a script reads the client id from it.

@@ -2915,6 +2915,7 @@ async fn create_role_takes_owner_level_and_refuses_privileged() {
             "bypass_rls",
             "connection_limit",
             "created_at",
+            "guard_exempt",
             "inherit",
             "level",
             "login",
@@ -3618,17 +3619,18 @@ async fn list_branches_reads_databases_once() {
 async fn update_branch_protected() {
     let t = branching().await;
     let dev = t.ready("dev");
-    let resp = t.send(Method::PATCH, &t.branch(dev), Some(json!({ "protected": true }))).await;
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["id"], dev.as_uuid().to_string());
-    assert_eq!(body["protected"], true);
-    assert!(t.metadata.branch(dev).protected);
+    // Protecting runs the review scan: the fake has no compute (P4), so 503 and no change.
+    let err = error_of(t.send(Method::PATCH, &t.branch(dev), Some(json!({ "protected": true }))).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+    assert!(!t.metadata.branch(dev).protected);
+    // Unprotecting needs no compute.
+    t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().protected = true;
     let body: Value = t.send(Method::PATCH, &t.branch(dev), Some(json!({ "protected": false }))).await.json().await.unwrap();
+    assert_eq!(body["id"], dev.as_uuid().to_string());
     assert_eq!(body["protected"], false);
-    // Main can be protected too.
-    assert_eq!(t.send(Method::PATCH, &t.branch(t.main()), Some(json!({ "protected": true }))).await.status(), 200);
-    // A backup: 409; unknown: 404; a deleting branch: 409 branch_not_ready.
+    assert_eq!(body["guard_logins"], true);
+    assert!(body["review_acknowledged_hash"].is_null());
+    // A backup: 409; unknown: 404; a deleting branch: 409 branch_not_ready (before any scan).
     let backup = t.backup(dev);
     let err = error_of(t.send(Method::PATCH, &t.branch(backup), Some(json!({ "protected": true }))).await, 409).await;
     assert_eq!(code_of(&err), "backup_branch");
@@ -3636,8 +3638,15 @@ async fn update_branch_protected() {
     let deleting = t.add("gone", t.main(), BranchKind::Normal, BranchStatus::Deleting);
     let err = error_of(t.send(Method::PATCH, &t.branch(deleting), Some(json!({ "protected": true }))).await, 409).await;
     assert_eq!(code_of(&err), "branch_not_ready");
-    // Unknown or missing field: 422; a bad body: 400.
-    for body in [json!({ "protected": true, "name": "x" }), json!({}), json!({ "protected": "yes" })] {
+    // Unknown or missing field, a hash without protect: 422 (P5).
+    for body in [
+        json!({ "protected": true, "name": "x" }),
+        json!({}),
+        json!({ "protected": "yes" }),
+        json!({ "review_hash": "abc" }),
+        json!({ "protected": false, "review_hash": "abc" }),
+        json!({ "guard_logins": "on" }),
+    ] {
         let err = error_of(t.send(Method::PATCH, &t.branch(dev), Some(body.clone())).await, 422).await;
         assert_eq!(code_of(&err), "invalid_request", "{body}");
     }
@@ -11650,14 +11659,29 @@ async fn rename_needs_tenant_admin() {
 // --- Protection reconciles member roles (TE-A, T7) ---------------------------------------
 
 #[tokio::test]
-async fn protecting_a_branch_reconciles_its_member_roles() {
+async fn guard_changes_reconcile_member_roles() {
     let t = branching().await;
     let main = t.main();
-    for protected in [true, false] {
-        let resp = t.send(Method::PATCH, &t.branch(main), Some(json!({ "protected": protected }))).await;
-        assert_eq!(resp.status(), 200);
-    }
-    assert_eq!(*t.jobs.member_role_enqueues.lock().unwrap(), vec![main, main]);
+    t.metadata.branches.lock().unwrap().get_mut(&main).unwrap().protected = true;
+    assert_eq!(t.send(Method::PATCH, &t.branch(main), Some(json!({ "protected": false }))).await.status(), 200);
+    assert_eq!(t.send(Method::PATCH, &t.branch(main), Some(json!({ "guard_logins": false }))).await.status(), 200);
+    assert_eq!(t.send(Method::PUT, &format!("{}/guard-exemptions/deploy", t.branch(main)), None).await.status(), 200);
+    assert_eq!(t.send(Method::DELETE, &format!("{}/guard-exemptions/deploy", t.branch(main)), None).await.status(), 200);
+    assert_eq!(*t.jobs.member_role_enqueues.lock().unwrap(), vec![main, main, main, main]);
+}
+
+// PB T1 review, finding 2: the fake's create copies the parent's switch, as the real one does.
+#[tokio::test]
+async fn a_new_branch_copies_its_parents_guard_switch() {
+    let t = branching().await;
+    let main = t.main();
+    t.metadata.branches.lock().unwrap().get_mut(&main).unwrap().guard_logins = false;
+    let resp = t.send(Method::POST, &t.branches(), Some(json!({ "name": "kid" }))).await;
+    assert_eq!(resp.status(), 202);
+    let body: Value = resp.json().await.unwrap();
+    let kid = BranchId(body["id"].as_str().unwrap().parse().unwrap());
+    assert!(!t.metadata.branch(kid).guard_logins);
+    assert_eq!(body["guard_logins"], false);
 }
 
 // --- Table API: schema changes (TE-A, T6) -------------------------------------------------
@@ -12247,4 +12271,206 @@ async fn table_reads_refuse_a_member_with_no_login_on_the_branch() {
     use sqlx::Executor;
     admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {login}"))).await.unwrap();
     admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {group}"))).await.unwrap();
+}
+
+// --- Protected branches: switch, exemptions, review (PB, T4) -------------------------------
+
+#[tokio::test]
+async fn the_switch_and_exemptions_round_trip() {
+    let t = sql_app().await;
+    let main = t.main();
+    let body: Value = t.send(Method::PATCH, &t.branch(main), Some(json!({ "guard_logins": false }))).await.json().await.unwrap();
+    assert_eq!(body["guard_logins"], false);
+    assert!(!t.metadata.branch(main).guard_logins);
+    let list = |resp: reqwest::Response| async move { resp.json::<Value>().await.unwrap()["exemptions"].clone() };
+    let exemptions = format!("{}/guard-exemptions", t.branch(main));
+    assert_eq!(list(t.send(Method::GET, &exemptions, None).await).await, json!([]));
+    assert_eq!(list(t.send(Method::PUT, &format!("{exemptions}/editor"), None).await).await, json!(["editor"]));
+    assert_eq!(list(t.send(Method::PUT, &format!("{exemptions}/editor"), None).await).await, json!(["editor"]), "idempotent");
+    assert_eq!(list(t.send(Method::PUT, &format!("{exemptions}/Ci%20Bot"), None).await).await, json!(["Ci Bot", "editor"]));
+    // The role list says which login roles are exempt.
+    let roles: Value = t.send(Method::GET, &format!("{}/roles", t.branch(main)), None).await.json().await.unwrap();
+    let exempt = |name: &str| roles.as_array().unwrap().iter().find(|r| r["name"] == name).unwrap()["guard_exempt"].clone();
+    assert_eq!((exempt("editor"), exempt("postgres")), (json!(true), json!(false)));
+    assert_eq!(list(t.send(Method::DELETE, &format!("{exemptions}/editor"), None).await).await, json!(["Ci Bot"]));
+    assert_eq!(list(t.send(Method::DELETE, &format!("{exemptions}/editor"), None).await).await, json!(["Ci Bot"]), "idempotent");
+    // A name of 64 bytes: 422 (P10).
+    let err = error_of(t.send(Method::PUT, &format!("{exemptions}/{}", "a".repeat(64)), None).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    // Unknown branch: 404.
+    assert_eq!(t.send(Method::GET, &format!("{}/guard-exemptions", t.branch(BranchId::new())), None).await.status(), 404);
+}
+
+#[tokio::test]
+async fn guard_writes_need_admin_and_reads_need_developer() {
+    let (t, _dev) = act_as_app().await;
+    let main = t.main();
+    let exemptions = format!("{}/guard-exemptions", t.branch(main));
+    for (method, path, body) in [
+        (Method::PATCH, t.branch(main), Some(json!({ "guard_logins": false }))),
+        (Method::PUT, format!("{exemptions}/deploy"), None),
+        (Method::DELETE, format!("{exemptions}/deploy"), None),
+        (Method::POST, format!("{}/review/acknowledge", t.branch(main)), Some(json!({ "hash": "h" }))),
+        (Method::POST, format!("{}/review/fix", t.branch(main)), Some(json!({ "key": "k", "action": "drop", "hash": "h" }))),
+    ] {
+        let err = error_of(t.send_as("dev", method.clone(), &path, body).await, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")), "{method} {path}");
+    }
+    assert_eq!(t.send_as("dev", Method::GET, &exemptions, None).await.status(), 200);
+    assert!(t.metadata.branch(main).guard_logins, "unchanged");
+    // The review read is allowed for a Developer (it needs a compute: the fake has none).
+    let err = error_of(t.send_as("dev", Method::GET, &format!("{}/review", t.branch(main)), None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+}
+
+#[tokio::test]
+async fn review_requests_validate_before_any_compute() {
+    let t = sql_app().await;
+    let main = t.main();
+    for (path, body) in [
+        ("review/acknowledge", json!({})),
+        ("review/acknowledge", json!({ "hash": "h", "x": 1 })),
+        ("review/fix", json!({ "key": "k", "action": "burn", "hash": "h" })),
+        ("review/fix", json!({ "key": "k", "action": "drop" })),
+    ] {
+        let err = error_of(t.send(Method::POST, &format!("{}/{path}", t.branch(main)), Some(body.clone())).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{path} {body}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+// --- The review goes through the worker (PB T4 fix round, R8/R10) ---------------------------
+
+const REVIEW_DOC: &str = r#"[
+  {"kind":"function","schema":"public","name":"planted","identity":"","function":"public.planted()","owner":"dev","reasons":[{"kind":"security_definer","via":null}],"opaque_body":true},
+  {"kind":"function","schema":"public","name":"later","identity":"","function":"public.later()","owner":"dev","reasons":[{"kind":"security_definer","via":null}],"opaque_body":true}
+]"#;
+
+/// The two planted functions of [`REVIEW_DOC`] in database `web1` (`later` first: keys sort).
+fn review_items() -> Vec<chelabase_types::protection::ReviewItem> {
+    chelabase_schema::review::parse_review("web1", REVIEW_DOC).unwrap()
+}
+
+impl Branching {
+    fn review_answers(&self, reply: chelabase_nats::ReviewReply) {
+        *self.jobs.review_reply.lock().unwrap() = Some(Ok(reply));
+    }
+
+    fn review_requests(&self) -> Vec<chelabase_nats::ReviewRequest> {
+        self.jobs.review_requests.lock().unwrap().clone()
+    }
+}
+
+#[tokio::test]
+async fn the_review_comes_from_the_worker() {
+    let t = branching().await;
+    let main = t.main();
+    let items = review_items();
+    t.review_answers(chelabase_nats::ReviewReply::Scanned { items: items.clone() });
+    let body: Value = t.send(Method::GET, &format!("{}/review", t.branch(main)), None).await.json().await.unwrap();
+    assert_eq!(body["hash"], chelabase_schema::review::review_hash(&items).as_str());
+    assert_eq!(body["items"][0]["key"], items[0].key.as_str());
+    assert_eq!((body["items"][0]["new"].clone(), body["items"][1]["new"].clone()), (json!(false), json!(false)), "nothing is new before a first acknowledgement");
+    assert!(body["acknowledged_hash"].is_null());
+    assert_eq!(t.review_requests(), vec![chelabase_nats::ReviewRequest { branch_id: main.as_uuid(), fix: None }]);
+}
+
+#[tokio::test]
+async fn protect_needs_the_current_review_hash() {
+    let t = branching().await;
+    let main = t.main();
+    let items = review_items();
+    let hash = chelabase_schema::review::review_hash(&items);
+    t.review_answers(chelabase_nats::ReviewReply::Scanned { items: items.clone() });
+    for body in [json!({ "protected": true }), json!({ "protected": true, "review_hash": "0".repeat(64) })] {
+        let err = error_of(t.send(Method::PATCH, &t.branch(main), Some(body.clone())).await, 409).await;
+        assert_eq!(code_of(&err), "review_changed", "{body}");
+        assert_eq!(err["error"]["review"]["hash"], hash.as_str());
+        assert!(!t.metadata.branch(main).protected);
+    }
+    assert!(t.jobs.member_role_enqueues.lock().unwrap().is_empty());
+    let body: Value = t.send(Method::PATCH, &t.branch(main), Some(json!({ "protected": true, "review_hash": hash }))).await.json().await.unwrap();
+    assert_eq!((body["protected"].as_bool(), body["review_acknowledged_hash"].as_str()), (Some(true), Some(hash.as_str())));
+    let record = t.metadata.branch(main);
+    assert_eq!(record.review_ack_keys, items.iter().map(|i| i.key.clone()).collect::<Vec<_>>());
+    assert_eq!(*t.jobs.member_role_enqueues.lock().unwrap(), vec![main]);
+    // An empty review needs no hash.
+    let dev = t.ready("dev");
+    t.review_answers(chelabase_nats::ReviewReply::Scanned { items: vec![] });
+    assert_eq!(t.send(Method::PATCH, &t.branch(dev), Some(json!({ "protected": true }))).await.status(), 200);
+}
+
+// T4 review, Minor 3: the scan comes before any write, so a failed scan writes nothing.
+#[tokio::test]
+async fn a_failed_scan_writes_nothing() {
+    let t = branching().await;
+    let main = t.main();
+    t.review_answers(chelabase_nats::ReviewReply::Failed { message: "compute unreachable".into() });
+    let err = error_of(t.send(Method::PATCH, &t.branch(main), Some(json!({ "guard_logins": false, "protected": true }))).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+    let record = t.metadata.branch(main);
+    assert!(record.guard_logins && !record.protected);
+    assert!(t.jobs.member_role_enqueues.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn new_and_acknowledge_follow_the_acknowledged_keys() {
+    let t = branching().await;
+    let main = t.main();
+    let items = review_items();
+    let planted = items.iter().find(|i| i.name == "planted").unwrap().key.clone();
+    {
+        let mut branches = t.metadata.branches.lock().unwrap();
+        let record = branches.get_mut(&main).unwrap();
+        record.review_ack_hash = Some("h0".into());
+        record.review_ack_keys = vec![planted.clone()];
+    }
+    t.review_answers(chelabase_nats::ReviewReply::Scanned { items: items.clone() });
+    let path = format!("{}/review", t.branch(main));
+    let body: Value = t.send(Method::GET, &path, None).await.json().await.unwrap();
+    let new_of = |name: &str| body["items"].as_array().unwrap().iter().find(|i| i["name"] == name).unwrap()["new"].clone();
+    assert_eq!((new_of("planted"), new_of("later")), (json!(false), json!(true)));
+    assert_eq!(body["acknowledged_hash"], "h0");
+    let hash = chelabase_schema::review::review_hash(&items);
+    let err = error_of(t.send(Method::POST, &format!("{path}/acknowledge"), Some(json!({ "hash": "h0" }))).await, 409).await;
+    assert_eq!(code_of(&err), "review_changed");
+    assert_eq!(t.send(Method::POST, &format!("{path}/acknowledge"), Some(json!({ "hash": hash }))).await.status(), 200);
+    let record = t.metadata.branch(main);
+    assert_eq!(record.review_ack_hash.as_deref(), Some(hash.as_str()));
+    assert_eq!(record.review_ack_keys.len(), 2);
+}
+
+#[tokio::test]
+async fn fixes_go_to_the_worker_with_the_hash() {
+    let t = branching().await;
+    let main = t.main();
+    let items = review_items();
+    let hash = chelabase_schema::review::review_hash(&items);
+    let path = format!("{}/review/fix", t.branch(main));
+    let key = items[0].key.clone();
+    let order = json!({ "key": key, "action": "reassign", "hash": hash });
+    t.review_answers(chelabase_nats::ReviewReply::Fixed { sql: "ALTER ROUTINE public.later() OWNER TO postgres;".into(), items: vec![] });
+    let body: Value = t.send(Method::POST, &path, Some(order.clone())).await.json().await.unwrap();
+    assert_eq!(body["sql"], "ALTER ROUTINE public.later() OWNER TO postgres;");
+    assert_eq!(body["review"]["items"], json!([]));
+    assert_eq!(body["review"]["hash"], chelabase_schema::review::review_hash(&[]).as_str());
+    assert_eq!(
+        t.review_requests(),
+        vec![chelabase_nats::ReviewRequest {
+            branch_id: main.as_uuid(),
+            fix: Some(chelabase_nats::ReviewFixOrder { key: key.clone(), action: chelabase_types::protection::FixAction::Reassign, hash: hash.clone() }),
+        }]
+    );
+    t.review_answers(chelabase_nats::ReviewReply::Changed { items: items.clone() });
+    let err = error_of(t.send(Method::POST, &path, Some(order.clone())).await, 409).await;
+    assert_eq!(code_of(&err), "review_changed");
+    assert_eq!(err["error"]["review"]["hash"], hash.as_str());
+    t.review_answers(chelabase_nats::ReviewReply::NotFound { items: items.clone() });
+    assert_eq!(code_of(&error_of(t.send(Method::POST, &path, Some(order.clone())).await, 404).await), "not_found");
+    for (sqlstate, code) in [("2BP01", "has_dependents"), ("55P03", "lock_timeout")] {
+        t.review_answers(chelabase_nats::ReviewReply::FixFailed { sqlstate: sqlstate.into(), message: "refused".into(), items: items.clone() });
+        assert_eq!(code_of(&error_of(t.send(Method::POST, &path, Some(order.clone())).await, 409).await), code, "{sqlstate}");
+    }
+    t.review_answers(chelabase_nats::ReviewReply::Failed { message: "compute unreachable".into() });
+    assert_eq!(code_of(&error_of(t.send(Method::POST, &path, Some(order)).await, 503).await), "unavailable");
 }

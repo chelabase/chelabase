@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::access::{authorize_database, Target};
 use crate::{
-    merges, AppState, ApiBytes, AuthPrincipal, BACKUP_REFUSAL, ConnectionDetails, JobPort, MetadataPort, OperationAccepted,
+    merges, protection, AppState, ApiBytes, AuthPrincipal, BACKUP_REFUSAL, ConnectionDetails, JobPort, MetadataPort, OperationAccepted,
     proxy_address, reset_branch_password, reveal,
 };
 use chelabase_routes::orchestrator as ep;
@@ -85,6 +85,14 @@ struct Branch {
     /// A protected branch can't be deleted or reset to its parent (restore still works), and
     /// its database can't be deleted. Set with `updateBranch`.
     protected: bool,
+    /// The "guard login roles" switch: on a protected branch, login roles other than the
+    /// owner, member logins and the branch's guard exemptions can't change the schema. Copied
+    /// from the parent when the branch is made.
+    guard_logins: bool,
+    /// The review hash last acknowledged (by protecting or `acknowledgeBranchReview`); null
+    /// when none was.
+    #[schema(required = true)]
+    review_acknowledged_hash: Option<String>,
     /// A ready branch with no recorded main database: it was dropped in SQL. The data API is
     /// unavailable on the branch until a database of the main name exists again.
     main_database_missing: bool,
@@ -119,6 +127,8 @@ impl Branch {
             history_start: b.history_start,
             error: b.error,
             protected: b.protected,
+            guard_logins: b.guard_logins,
+            review_acknowledged_hash: b.review_ack_hash,
             main_database_missing,
         }
     }
@@ -1069,12 +1079,34 @@ where
         .into_response()
 }
 
+/// At least one of `protected` and `guard_logins`; `review_hash` only with `protected: true`.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct UpdateBranchRequest {
     /// `true` refuses deleting the branch, resetting it to its parent and deleting its
-    /// database; restore still works.
-    protected: bool,
+    /// database; restore still works. Protecting runs the branch's review (it needs a running
+    /// compute) and needs `review_hash` when the review lists anything.
+    #[serde(default)]
+    protected: Option<bool>,
+    /// The "guard login roles" switch (see the branch's `guard_logins`).
+    #[serde(default)]
+    guard_logins: Option<bool>,
+    /// The `hash` of the review (`getBranchReview`) the caller saw; stored as acknowledged.
+    #[serde(default)]
+    review_hash: Option<String>,
+}
+
+impl UpdateBranchRequest {
+    /// P5: something to change, and a hash only with a protect.
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.protected.is_none() && self.guard_logins.is_none() {
+            return Err(unprocessable("give `protected`, `guard_logins` or both"));
+        }
+        if self.review_hash.is_some() && self.protected != Some(true) {
+            return Err(unprocessable("`review_hash` goes with `protected: true` only"));
+        }
+        Ok(())
+    }
 }
 
 #[utoipa::path(
@@ -1082,20 +1114,22 @@ struct UpdateBranchRequest {
     path = "/v1/databases/{id}/branches/{branch_id}",
     operation_id = "updateBranch",
     tag = "branches",
-    summary = "Protect or unprotect a branch",
-    description = "Sets the branch's `protected` flag. A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included.",
+    summary = "Protect or unprotect a branch, or switch its login-role guard",
+    description = "Sets the branch's `protected` flag and its `guard_logins` switch (at least one of them). A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included. Protecting runs the branch's review (`getBranchReview`) on its running compute: when the review lists anything, `review_hash` must be its current `hash` (else 409 `review_changed` with the current review), and the review is stored as acknowledged. On a protected branch with `guard_logins` on, login roles other than the owner, member logins and the branch's guard exemptions can't change the schema. Every change reconciles the branch's member roles and its guard.",
     params(("id" = Uuid, Path, description = "Database id"), ("branch_id" = Uuid, Path, description = "Branch id")),
     request_body = UpdateBranchRequest,
     responses(
-        (status = 200, description = "The branch with its new flag", body = Branch),
+        (status = 200, description = "The branch with its new settings", body = Branch),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`backup_branch`: a restore backup can't be protected; `branch_not_ready`: the branch is being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`backup_branch`: a restore backup can't be protected; `branch_not_ready`: the branch is being deleted (or, to protect, isn't ready); `review_changed`: protecting without `review_hash` while the review lists anything, or with a stale one (`error.review`: the current review)", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: an unknown or missing field, or `protected` isn't a boolean", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: an unknown field, a field of the wrong type, neither `protected` nor `guard_logins`, or `review_hash` without `protected: true`", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: to protect, the branch's compute isn't running or can't be reached, so the review couldn't run (`Retry-After`); `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope),
+        (status = 504, description = "`timeout`: the worker didn't answer the review in time", body = ErrorEnvelope),
     ),
 )]
 async fn update_branch<M, J>(
@@ -1108,6 +1142,9 @@ where
     M: MetadataPort,
     J: JobPort,
 {
+    if let Err(err) = request.validate() {
+        return err.into_response();
+    }
     let record = match authorize_database(&state, &principal, ep::UPDATE_BRANCH.policy.access, Target::Branch { database: id, branch: branch_id }).await {
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
@@ -1122,28 +1159,64 @@ where
     if branch.status == BranchStatus::Deleting {
         return conflict(ErrorCode::BranchNotReady, "branch is being deleted").into_response();
     }
-    match state.metadata.set_branch_protected(branch.id, request.protected).await {
-        Ok(Some(updated)) => {
-            info!(
-                request_id = %principal.request_id,
-                branch_id = %branch.id,
-                protected = request.protected,
-                "branch protection changed"
-            );
-            // The DDL guard follows protection: the member-role reconciler locks (or unlocks)
-            // the branch's non-Admin member roles and installs the guard.
-            if let Err(err) = state.js.enqueue_member_roles(branch.id).await {
-                warn!(branch_id = %branch.id, "member roles: enqueue failed; the sweep will reconcile it: {err}");
+    // A protect checks the review before anything changes.
+    let protect = match request.protected {
+        Some(true) => match protection::current_review(&state, &branch).await {
+            Ok(review) if protection::confirms(request.review_hash.as_deref(), &review) => Some(review),
+            Ok(review) => return protection::review_changed(&review).into_response(),
+            Err(err) => return err.into_response(),
+        },
+        _ => None,
+    };
+    let being_deleted = || conflict(ErrorCode::BranchNotReady, "branch is being deleted").into_response();
+    let mut updated = branch.clone();
+    if let Some(on) = request.guard_logins {
+        match state.metadata.set_branch_guard_logins(branch.id, on).await {
+            Ok(Some(row)) => updated = row,
+            // The branch started deleting between the load and the update.
+            Ok(None) => return being_deleted(),
+            Err(err) => {
+                error!("set branch guard_logins: {err}");
+                return ApiError::internal().into_response();
             }
-            Json(branch_view(&state, updated).await).into_response()
-        }
-        // The branch started deleting between the load and the update.
-        Ok(None) => conflict(ErrorCode::BranchNotReady, "branch is being deleted").into_response(),
-        Err(err) => {
-            error!("set branch protected: {err}");
-            ApiError::internal().into_response()
         }
     }
+    let changed = match (&protect, request.protected) {
+        (Some(review), _) => {
+            let keys: Vec<String> = review.items.iter().map(|i| i.key.clone()).collect();
+            state.metadata.protect_branch(branch.id, &review.hash, &keys).await
+        }
+        (None, Some(protected)) => state.metadata.set_branch_protected(branch.id, protected).await,
+        (None, None) => Ok(Some(updated)),
+    };
+    let updated = match changed {
+        Ok(Some(row)) => row,
+        failed => {
+            // PB R16: the switch is already written, so the guard follows it even when the
+            // protect then fails.
+            if request.guard_logins.is_some() {
+                protection::reconcile_guard(&state, branch.id).await;
+            }
+            return match failed {
+                Err(err) => {
+                    error!("set branch protected: {err}");
+                    ApiError::internal().into_response()
+                }
+                _ => being_deleted(),
+            };
+        }
+    };
+    info!(
+        request_id = %principal.request_id,
+        branch_id = %branch.id,
+        protected = ?request.protected,
+        guard_logins = ?request.guard_logins,
+        "branch protection changed"
+    );
+    // The DDL guard follows protection and the switch: the member-role reconciler locks (or
+    // unlocks) the branch's non-Admin member roles and installs (or removes) the guard.
+    protection::reconcile_guard(&state, branch.id).await;
+    Json(branch_view(&state, updated).await).into_response()
 }
 
 /// A Postgres database of a branch.

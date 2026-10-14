@@ -131,11 +131,13 @@ pub enum ErrorCode {
     SchemaChangeFailed,
     /// A drop has dependents and the request doesn't confirm a cascade.
     HasDependents,
+    /// The branch's review list changed since the hash the request carries.
+    ReviewChanged,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 95] = [
+    pub const ALL: [ErrorCode; 96] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantNotBound,
@@ -231,6 +233,7 @@ impl ErrorCode {
         Self::LockTimeout,
         Self::SchemaChangeFailed,
         Self::HasDependents,
+        Self::ReviewChanged,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -330,6 +333,7 @@ impl ErrorCode {
             Self::LockTimeout => "lock_timeout",
             Self::SchemaChangeFailed => "schema_change_failed",
             Self::HasDependents => "has_dependents",
+            Self::ReviewChanged => "review_changed",
         }
     }
 }
@@ -432,7 +436,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 95] = [
+    const ALL: [(ErrorCode, &str); 96] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -528,6 +532,7 @@ mod tests {
         (ErrorCode::LockTimeout, "lock_timeout"),
         (ErrorCode::SchemaChangeFailed, "schema_change_failed"),
         (ErrorCode::HasDependents, "has_dependents"),
+        (ErrorCode::ReviewChanged, "review_changed"),
     ];
 
     #[test]

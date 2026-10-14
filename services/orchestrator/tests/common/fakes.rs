@@ -127,6 +127,8 @@ struct FakeMetadata {
     tenant_names: Arc<Mutex<HashMap<TenantId, String>>>,
     /// The reconciler's member roles, as (member, branch).
     member_branch_roles: Arc<Mutex<Vec<(uuid::Uuid, BranchId)>>>,
+    /// PB: each branch's guard exemptions, sorted (missing: none).
+    guard_exemptions: Arc<Mutex<HashMap<BranchId, Vec<String>>>>,
 }
 
 /// An `invites` row.
@@ -197,7 +199,10 @@ fn main_for(record: &DatabaseRecord) -> BranchRecord {
         updated_at: now,
         history_start: None,
         authenticator_password_enc: None,
-            protected: false,
+        protected: false,
+        guard_logins: true,
+        review_ack_hash: None,
+        review_ack_keys: Vec::new(),
     }
 }
 
@@ -349,7 +354,10 @@ impl FakeMetadata {
                 updated_at: now,
                 history_start: None,
                 authenticator_password_enc: None,
-            protected: false,
+                protected: false,
+                guard_logins: true,
+                review_ack_hash: None,
+                review_ack_keys: Vec::new(),
             },
         );
         id
@@ -357,6 +365,17 @@ impl FakeMetadata {
 
     fn branch(&self, id: BranchId) -> BranchRecord {
         self.branches.lock().unwrap().get(&id).cloned().expect("branch row")
+    }
+
+    /// `change` on a `normal` branch that isn't deleting (the real updates' row guards).
+    fn update_normal_branch(&self, id: BranchId, change: impl FnOnce(&mut BranchRecord)) -> Option<BranchRecord> {
+        match self.branches.lock().unwrap().get_mut(&id) {
+            Some(b) if b.kind == BranchKind::Normal && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) => {
+                change(b);
+                Some(b.clone())
+            }
+            _ => None,
+        }
     }
 
     fn database(&self, id: DatabaseId) -> DatabaseRecord {
@@ -601,6 +620,13 @@ impl MetadataPort for FakeMetadata {
             return Ok(CreateBranchOutcome::CapReached { max });
         }
         let now = chrono::Utc::now();
+        let parent_guard_logins = branches[&b.parent_branch_id].guard_logins;
+        // The parent's exemptions too, as the real create does in its transaction.
+        let mut exemptions = self.guard_exemptions.lock().unwrap();
+        if let Some(parent) = exemptions.get(&b.parent_branch_id).cloned() {
+            exemptions.insert(b.id, parent);
+        }
+        drop(exemptions);
         branches.insert(
             b.id,
             BranchRecord {
@@ -623,7 +649,10 @@ impl MetadataPort for FakeMetadata {
                 updated_at: now,
                 history_start: None,
                 authenticator_password_enc: None,
-            protected: false,
+                protected: false,
+                guard_logins: parent_guard_logins,
+                review_ack_hash: None,
+                review_ack_keys: Vec::new(),
             },
         );
         Ok(CreateBranchOutcome::Created)
@@ -703,6 +732,67 @@ impl MetadataPort for FakeMetadata {
             }
             _ => Ok(None),
         }
+    }
+
+    async fn set_branch_guard_logins(
+        &self,
+        branch_id: BranchId,
+        on: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        Ok(self.update_normal_branch(branch_id, |b| b.guard_logins = on))
+    }
+
+    async fn list_guard_exemptions(&self, branch_id: BranchId) -> Result<Vec<String>, MetadataError> {
+        Ok(self.guard_exemptions.lock().unwrap().get(&branch_id).cloned().unwrap_or_default())
+    }
+
+    async fn add_guard_exemption(&self, branch_id: BranchId, role: &str) -> Result<bool, MetadataError> {
+        if !self.branches.lock().unwrap().contains_key(&branch_id) {
+            return Err(MetadataError::Config("branch_guard_exemptions: no such branch (FK)".into()));
+        }
+        let mut all = self.guard_exemptions.lock().unwrap();
+        let list = all.entry(branch_id).or_default();
+        if list.iter().any(|r| r == role) {
+            return Ok(false);
+        }
+        list.push(role.to_string());
+        list.sort();
+        Ok(true)
+    }
+
+    async fn remove_guard_exemption(&self, branch_id: BranchId, role: &str) -> Result<bool, MetadataError> {
+        let mut all = self.guard_exemptions.lock().unwrap();
+        let Some(list) = all.get_mut(&branch_id) else {
+            return Ok(false);
+        };
+        let before = list.len();
+        list.retain(|r| r != role);
+        Ok(list.len() != before)
+    }
+
+    async fn protect_branch(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        Ok(self.update_normal_branch(branch_id, |b| {
+            b.protected = true;
+            b.review_ack_hash = Some(hash.to_string());
+            b.review_ack_keys = keys.to_vec();
+        }))
+    }
+
+    async fn acknowledge_review(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        Ok(self.update_normal_branch(branch_id, |b| {
+            b.review_ack_hash = Some(hash.to_string());
+            b.review_ack_keys = keys.to_vec();
+        }))
     }
 
     async fn set_branch_failed(&self, branch_id: BranchId, error: &str) -> Result<(), MetadataError> {
@@ -1842,6 +1932,9 @@ struct FakeJobs {
     member_hand_overs: Arc<Mutex<Vec<MemberRoleHandOverRequest>>>,
     /// T7: branches asked to reconcile their member roles, in order.
     member_role_enqueues: Arc<Mutex<Vec<BranchId>>>,
+    /// PB: each review request, and what every one answers (unset: `Failed`, no compute).
+    review_requests: Arc<Mutex<Vec<chelabase_nats::ReviewRequest>>>,
+    review_reply: Arc<Mutex<Option<Result<chelabase_nats::ReviewReply, ResetError>>>>,
 }
 
 /// A metadata store of member-role rows and the rows a reconcile writes into it.
@@ -1954,6 +2047,16 @@ impl JobPort for FakeJobs {
     ) -> Result<MemberRolesReply, ResetError> {
         self.member_hand_overs.lock().unwrap().push(request);
         Ok(MemberRolesReply::Done { roles: vec![] })
+    }
+
+    async fn review(
+        &self,
+        request: chelabase_nats::ReviewRequest,
+    ) -> Result<chelabase_nats::ReviewReply, ResetError> {
+        self.review_requests.lock().unwrap().push(request);
+        self.review_reply.lock().unwrap().clone().unwrap_or_else(|| {
+            Ok(chelabase_nats::ReviewReply::Failed { message: "no compute in the fake".into() })
+        })
     }
 
     async fn enable_data_api(

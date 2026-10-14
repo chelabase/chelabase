@@ -34,6 +34,7 @@ pub mod provision;
 pub mod reconcile;
 pub mod reset;
 pub mod resync;
+pub mod review;
 pub mod role_sessions;
 pub mod roles;
 pub mod safekeepers;

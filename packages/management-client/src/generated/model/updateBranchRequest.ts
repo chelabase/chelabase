@@ -5,10 +5,25 @@
  * OpenAPI spec version: 1
  */
 
+/**
+ * At least one of `protected` and `guard_logins`; `review_hash` only with `protected: true`.
+ */
 export interface UpdateBranchRequest {
   /**
-     * `true` refuses deleting the branch, resetting it to its parent and deleting its
-     * database; restore still works.
+     * The "guard login roles" switch (see the branch's `guard_logins`).
+     * @nullable
      */
-  protected: boolean;
+  guard_logins?: boolean | null;
+  /**
+     * `true` refuses deleting the branch, resetting it to its parent and deleting its
+     * database; restore still works. Protecting runs the branch's review (it needs a running
+     * compute) and needs `review_hash` when the review lists anything.
+     * @nullable
+     */
+  protected?: boolean | null;
+  /**
+     * The `hash` of the review (`getBranchReview`) the caller saw; stored as acknowledged.
+     * @nullable
+     */
+  review_hash?: string | null;
 }

@@ -5,14 +5,17 @@ import {
   getBranchConnection,
   getListRolesQueryKey,
   useCreateRole,
+  useDeleteGuardExemption,
   useDeleteRole,
   useListRoles,
+  usePutGuardExemption,
   useResetRolePassword,
   type BranchRole,
   type ConnectionDetails,
   type RoleInUseKey,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { PASSWORD_STATE_TEXT } from "@/lib/password-state";
@@ -72,6 +75,8 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
   const create = useCreateRole({ mutation: { onSettled: refresh } });
   const reset = useResetRolePassword({ mutation: { onSettled: refresh } });
   const remove = useDeleteRole({ mutation: { onSettled: refresh } });
+  const exempt = usePutGuardExemption({ mutation: { onSettled: refresh } });
+  const unexempt = useDeleteGuardExemption({ mutation: { onSettled: refresh } });
   const [name, setName] = useState("");
   const [ownerLevel, setOwnerLevel] = useState(false);
   const [shown, setShown] = useState<Shown | null>(null);
@@ -115,6 +120,12 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
     } finally {
       setBusy(false);
     }
+  }
+
+  function setExempt(role: BranchRole, on: boolean) {
+    void guarded(async () => {
+      await (on ? exempt : unexempt).mutateAsync({ id: databaseId, branchId, role: role.name });
+    });
   }
 
   function submit(event: FormEvent) {
@@ -173,6 +184,7 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
             <th className="py-1 font-medium">Level</th>
             <th className="py-1 font-medium">Login</th>
             <th className="py-1 font-medium">Attributes</th>
+            <th className="py-1 font-medium">Login guard</th>
             <th className="py-1 font-medium">Password</th>
             <th className="py-1 font-medium">Created</th>
             <th className="py-1 font-medium">Actions</th>
@@ -194,6 +206,16 @@ export function BranchRoles({ databaseId, branchId }: BranchRolesProps) {
               <td className="py-1">{r.login ? "Yes" : "No"}</td>
               <td className="py-1">
                 <RoleAttributes role={r} />
+              </td>
+              <td className="py-1">
+                {r.login && r.origin !== "owner" && (
+                  <Switch
+                    aria-label={`Exempt ${r.name} from the login guard`}
+                    checked={r.guard_exempt}
+                    disabled={busy || !admin}
+                    onCheckedChange={(on) => setExempt(r, on)}
+                  />
+                )}
               </td>
               <td className="py-1">
                 <span className={r.password === "generated" ? undefined : "text-xs text-destructive"}>

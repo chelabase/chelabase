@@ -772,9 +772,11 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
         request_resync(state.resync.clone(), branch);
     }
     // T8 I3: a role made, dropped, renamed or changed in SQL can change what member roles may
-    // hold (R16) or which names grants find. Databases alone don't (R17: member roles are
-    // cluster-wide).
-    if let (false, Some(branch)) = (delta.roles.is_empty(), branch) {
+    // hold (R16) or which names grants find. PB R12: a database made (or renamed, or given a
+    // new owner: any `set`) needs the protected-branch guard, which the same reconcile
+    // installs; a database only dropped needs nothing (member roles are cluster-wide, R17).
+    let makes_database = delta.dbs.iter().any(|d| d.op == Op::Set);
+    if let (true, Some(branch)) = (!delta.roles.is_empty() || makes_database, branch) {
         request_member_reconcile(state.resync.clone(), branch);
     }
     publish(state.cache.clone(), id, changed);

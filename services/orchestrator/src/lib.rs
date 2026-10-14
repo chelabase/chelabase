@@ -49,6 +49,7 @@ pub mod members;
 mod merges;
 mod openapi;
 pub mod projects;
+mod protection;
 mod roles;
 pub mod sql_editor;
 mod table_api;
@@ -207,6 +208,50 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         &self,
         branch_id: BranchId,
         protected: bool,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+
+    /// Sets a `normal` branch's "guard login roles" switch; `None` as `set_branch_protected`.
+    fn set_branch_guard_logins(
+        &self,
+        branch_id: BranchId,
+        on: bool,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+
+    /// The branch's guard exemptions, by role name, sorted (byte order).
+    fn list_guard_exemptions(
+        &self,
+        branch_id: BranchId,
+    ) -> impl Future<Output = Result<Vec<String>, MetadataError>> + Send;
+
+    /// Exempts `role` on the branch; `true` when it wasn't already.
+    fn add_guard_exemption(
+        &self,
+        branch_id: BranchId,
+        role: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Removes `role`'s exemption; `true` when there was one.
+    fn remove_guard_exemption(
+        &self,
+        branch_id: BranchId,
+        role: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Protects a `normal` branch and stores the review it acknowledged (hash and keys), in
+    /// one update; `None` as `set_branch_protected`.
+    fn protect_branch(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+
+    /// Stores the review as acknowledged; `None` as `set_branch_protected`.
+    fn acknowledge_review(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
     ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
 
     fn set_branch_failed(
@@ -674,6 +719,44 @@ impl MetadataPort for MetadataClient {
         MetadataClient::set_branch_protected(self, branch_id, protected).await
     }
 
+    async fn set_branch_guard_logins(
+        &self,
+        branch_id: BranchId,
+        on: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::set_branch_guard_logins(self, branch_id, on).await
+    }
+
+    async fn list_guard_exemptions(&self, branch_id: BranchId) -> Result<Vec<String>, MetadataError> {
+        MetadataClient::list_guard_exemptions(self, branch_id).await
+    }
+
+    async fn add_guard_exemption(&self, branch_id: BranchId, role: &str) -> Result<bool, MetadataError> {
+        MetadataClient::add_guard_exemption(self, branch_id, role).await
+    }
+
+    async fn remove_guard_exemption(&self, branch_id: BranchId, role: &str) -> Result<bool, MetadataError> {
+        MetadataClient::remove_guard_exemption(self, branch_id, role).await
+    }
+
+    async fn protect_branch(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::protect_branch(self, branch_id, hash, keys).await
+    }
+
+    async fn acknowledge_review(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::acknowledge_review(self, branch_id, hash, keys).await
+    }
+
     async fn set_branch_failed(&self, branch_id: BranchId, error: &str) -> Result<(), MetadataError> {
         MetadataClient::set_branch_failed(self, branch_id, error).await
     }
@@ -1113,6 +1196,13 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
         request: chelabase_nats::MemberRoleHandOverRequest,
     ) -> impl Future<Output = Result<chelabase_nats::MemberRolesReply, ResetError>> + Send;
 
+    /// Asks the worker for a branch's protection review, or one fix of it
+    /// (`chelabase.rpc.review`; scanned and fixed as `cloud_admin`).
+    fn review(
+        &self,
+        request: chelabase_nats::ReviewRequest,
+    ) -> impl Future<Output = Result<chelabase_nats::ReviewReply, ResetError>> + Send;
+
     /// Tells the worker to bootstrap the data API in a database the orchestrator marked
     /// `enabling` (a core publish: no reply; reconcile retries a row left `enabling`).
     fn enable_data_api(
@@ -1226,12 +1316,13 @@ async fn role_rpc<T: Serialize>(
     serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
 }
 
-/// One member-role request/reply to the worker on `subject`, waiting up to [`RESET_TIMEOUT`].
-async fn member_roles_rpc<T: Serialize>(
+/// One member-role (or review) request/reply to the worker on `subject`, waiting up to
+/// [`RESET_TIMEOUT`].
+async fn member_roles_rpc<T: Serialize, R: serde::de::DeserializeOwned>(
     client: &async_nats::Client,
     subject: &'static str,
     request: &T,
-) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
+) -> Result<R, ResetError> {
     use async_nats::RequestErrorKind;
     let body = serde_json::to_vec(request).map_err(|e| ResetError::Transport(e.to_string()))?;
     let request = async_nats::Request::new()
@@ -1349,6 +1440,13 @@ impl JobPort for NatsPorts {
         request: chelabase_nats::MemberRoleHandOverRequest,
     ) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
         member_roles_rpc(&self.client, chelabase_nats::SUBJECT_MEMBER_ROLES_HAND_OVER, &request).await
+    }
+
+    async fn review(
+        &self,
+        request: chelabase_nats::ReviewRequest,
+    ) -> Result<chelabase_nats::ReviewReply, ResetError> {
+        member_roles_rpc(&self.client, chelabase_nats::SUBJECT_REVIEW, &request).await
     }
 
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
@@ -2214,6 +2312,7 @@ where
         .routes(routes!(reset_password))
         .routes(routes!(me))
         .merge(branches::routes())
+        .merge(protection::routes())
         .merge(merges::routes())
         .merge(data_keys::routes())
         .merge(data_api_databases::routes())

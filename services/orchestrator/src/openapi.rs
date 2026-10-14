@@ -255,6 +255,38 @@ impl MetadataPort for Doc {
     ) -> Result<Option<BranchRecord>, MetadataError> {
         match *self {}
     }
+    async fn set_branch_guard_logins(
+        &self,
+        branch_id: BranchId,
+        on: bool,
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn list_guard_exemptions(&self, branch_id: BranchId) -> Result<Vec<String>, MetadataError> {
+        match *self {}
+    }
+    async fn add_guard_exemption(&self, branch_id: BranchId, role: &str) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn remove_guard_exemption(&self, branch_id: BranchId, role: &str) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn protect_branch(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn acknowledge_review(
+        &self,
+        branch_id: BranchId,
+        hash: &str,
+        keys: &[String],
+    ) -> Result<Option<BranchRecord>, MetadataError> {
+        match *self {}
+    }
     async fn set_branch_failed(
         &self,
         branch_id: BranchId,
@@ -633,6 +665,12 @@ impl JobPort for Doc {
     ) -> Result<chelabase_nats::MemberRolesReply, ResetError> {
         match *self {}
     }
+    async fn review(
+        &self,
+        request: chelabase_nats::ReviewRequest,
+    ) -> Result<chelabase_nats::ReviewReply, ResetError> {
+        match *self {}
+    }
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
         match *self {}
     }
@@ -931,6 +969,10 @@ mod tests {
                 "deleteBranch",
             ),
             (
+                "DELETE /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
+                "deleteGuardExemption",
+            ),
+            (
                 "DELETE /v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
                 "revokeKey",
             ),
@@ -974,10 +1016,15 @@ mod tests {
                 "listBranchDatabases",
             ),
             (
+                "GET /v1/databases/{id}/branches/{branch_id}/guard-exemptions",
+                "listGuardExemptions",
+            ),
+            (
                 "GET /v1/databases/{id}/branches/{branch_id}/keys",
                 "listKeys",
             ),
             ("GET /v1/databases/{id}/branches/{branch_id}/objects", "listObjects"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/review", "getBranchReview"),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/roles",
                 "listRoles",
@@ -1069,6 +1116,14 @@ mod tests {
                 "restoreBranch",
             ),
             (
+                "POST /v1/databases/{id}/branches/{branch_id}/review/acknowledge",
+                "acknowledgeBranchReview",
+            ),
+            (
+                "POST /v1/databases/{id}/branches/{branch_id}/review/fix",
+                "fixBranchReviewItem",
+            ),
+            (
                 "POST /v1/databases/{id}/branches/{branch_id}/roles",
                 "createRole",
             ),
@@ -1105,6 +1160,10 @@ mod tests {
             ("POST /v1/projects/{id}/users", "createAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/deactivate", "deactivateAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/reactivate", "reactivateAppUser"),
+            (
+                "PUT /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
+                "putGuardExemption",
+            ),
             ("PUT /v1/projects/{id}/app-users", "putAppUsers"),
             ("PUT /v1/projects/{id}/grants/{member_id}", "putProjectGrant"),
             (
@@ -1221,6 +1280,7 @@ mod tests {
         let expected = [
             "AccessEvent",
             "AccessEventPage",
+            "AcknowledgeReviewRequest",
             "AfterMerge",
             "AllRoles",
             "AppUser",
@@ -1293,12 +1353,14 @@ mod tests {
             "ErrorEnvelope",
             "ExclusionElement",
             "FinishRequest",
+            "FixAction",
             "FkAction",
             "ForeignKeyTarget",
             "FunctionDesc",
             "Grant",
             "GrantOverride",
             "Grantee",
+            "GuardExemptions",
             "Identity",
             "IdentityChange",
             "IdentityGeneration",
@@ -1360,6 +1422,13 @@ mod tests {
             "RestoreAccepted",
             "RestoreRequest",
             "ReturnDesc",
+            "Review",
+            "ReviewFixRequest",
+            "ReviewFixResponse",
+            "ReviewItem",
+            "ReviewItemKind",
+            "ReviewReason",
+            "ReviewReasonKind",
             "RlsSpec",
             "RoleInUseKey",
             "RoleLevel",

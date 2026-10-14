@@ -28,7 +28,7 @@ function branch(over: Partial<Branch> & { name: string }): Branch {
     created_at: `2026-09-30T10:${String(n).padStart(2, "0")}:00Z`,
     error: null,
     protected: false,
-    main_database_missing: false,
+    main_database_missing: false, guard_logins: true, review_acknowledged_hash: null,
     ...over,
   };
 }

@@ -7499,3 +7499,106 @@ async fn rename_role_copy_moves_the_row_and_keys() {
     assert_eq!(role_of(rowless_key.id), Some(("group2".into(), Some(16391), Some(TL1.into()))));
     assert_eq!(role_of(dead_key.id).map(|r| r.0), Some("ghost".into()));
 }
+
+// --- Protected branches (PB, T1) -------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn guard_settings_default_on_and_children_copy_them() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let main = main_of(id);
+    let root = branch(&client, main).await;
+    assert!(root.guard_logins, "a root branch starts with the switch on");
+    assert_eq!(root.review_ack_hash, None);
+    assert!(root.review_ack_keys.is_empty());
+    assert!(client.list_guard_exemptions(main).await.unwrap().is_empty());
+    // By name, idempotent, sorted.
+    assert!(client.add_guard_exemption(main, "deploy").await.unwrap());
+    assert!(client.add_guard_exemption(main, "Ci Bot").await.unwrap());
+    assert!(!client.add_guard_exemption(main, "deploy").await.unwrap());
+    assert_eq!(client.list_guard_exemptions(main).await.unwrap(), ["Ci Bot", "deploy"]);
+    assert!(client.add_guard_exemption(main, "").await.is_err(), "empty");
+    assert!(client.add_guard_exemption(main, &"a".repeat(64)).await.is_err(), "64 bytes");
+    let off = client.set_branch_guard_logins(main, false).await.unwrap().expect("a normal branch");
+    assert!(!off.guard_logins);
+    // A child copies the switch and the exemptions; later changes stay on their branch.
+    let dev = ready_branch(&client, id, "dev", main).await;
+    assert!(!branch(&client, dev).await.guard_logins);
+    assert_eq!(client.list_guard_exemptions(dev).await.unwrap(), ["Ci Bot", "deploy"]);
+    assert!(client.remove_guard_exemption(main, "deploy").await.unwrap());
+    assert!(!client.remove_guard_exemption(main, "deploy").await.unwrap());
+    assert_eq!(client.list_guard_exemptions(main).await.unwrap(), ["Ci Bot"]);
+    assert_eq!(client.list_guard_exemptions(dev).await.unwrap(), ["Ci Bot", "deploy"]);
+    let on = client.set_branch_guard_logins(dev, true).await.unwrap().expect("a normal branch");
+    assert!(on.guard_logins);
+    assert!(!branch(&client, main).await.guard_logins);
+    assert!(client.set_branch_guard_logins(BranchId::new(), true).await.unwrap().is_none());
+    cleanup(&client, id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn protect_with_a_review_stores_the_acknowledged_list() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let dev = ready_branch(&client, id, "dev", main_of(id)).await;
+    let keys = vec!["app/function/public.f()".to_string(), "app/rule/public.r(public.t)".to_string()];
+    let protected = client.protect_branch(dev, "h1", &keys).await.unwrap().expect("a normal branch");
+    assert!(protected.protected);
+    assert_eq!(protected.review_ack_hash.as_deref(), Some("h1"));
+    assert_eq!(protected.review_ack_keys, keys);
+    let acked = client.acknowledge_review(dev, "h2", &[]).await.unwrap().expect("a normal branch");
+    assert!(acked.protected, "acknowledging changes nothing else");
+    assert_eq!(acked.review_ack_hash.as_deref(), Some("h2"));
+    assert!(acked.review_ack_keys.is_empty());
+    // A child copies neither the flag nor the acknowledgement (the parent keeps its
+    // acknowledgement when unprotected; a child of a protected branch goes through the
+    // parent-protection recheck, so it's made from the unprotected parent here).
+    client.set_branch_protected(dev, false).await.unwrap().unwrap();
+    assert_eq!(branch(&client, dev).await.review_ack_hash.as_deref(), Some("h2"));
+    let child = ready_branch(&client, id, "dev-child", dev).await;
+    let record = branch(&client, child).await;
+    assert!(!record.protected);
+    assert_eq!(record.review_ack_hash, None);
+    assert!(record.review_ack_keys.is_empty());
+    // Not once a delete has begun, nor for an unknown branch.
+    let gone = ready_branch(&client, id, "gone", main_of(id)).await;
+    client.begin_branch_delete(gone).await.unwrap();
+    assert!(client.protect_branch(gone, "h", &[]).await.unwrap().is_none());
+    assert!(client.acknowledge_review(gone, "h", &[]).await.unwrap().is_none());
+    assert!(client.protect_branch(BranchId::new(), "h", &[]).await.unwrap().is_none());
+    client.set_branch_protected(dev, false).await.unwrap().unwrap();
+    cleanup(&client, id).await;
+}
+
+// PB end-of-step R12: the member-role sweep is the guard's backstop too, so it visits every
+// ready normal branch, members or not (a member-less tenant's guard settings still converge).
+#[tokio::test]
+#[ignore]
+async fn the_member_role_sweep_visits_branches_of_member_less_tenants() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let main = main_of(id);
+    let visited = client.member_role_branches().await.unwrap();
+    cleanup(&client, id).await;
+    assert!(visited.contains(&main.as_uuid()), "{visited:?}");
+}
+
+// PB end-of-step Minor: the CHECK refused U+0001 (meant for NUL, which text can't hold).
+#[tokio::test]
+#[ignore]
+async fn an_exemption_name_may_hold_any_character_but_nul() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, _ep) = ready_database(&client).await;
+    let main = main_of(id);
+    let added = client.add_guard_exemption(main, "a\u{1}b").await;
+    let listed = client.list_guard_exemptions(main).await;
+    cleanup(&client, id).await;
+    assert!(added.unwrap());
+    assert_eq!(listed.unwrap(), ["a\u{1}b"]);
+}

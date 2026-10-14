@@ -459,6 +459,26 @@ impl Fx {
         child
     }
 
+    /// [`Fx::direct`] into database `database` (PB end-of-step).
+    async fn direct_in(
+        &self,
+        ep: &str,
+        database: &str,
+        user: &str,
+        password: &str,
+        script: &str,
+    ) -> Result<String, String> {
+        let addr = self
+            .worker
+            .computes
+            .postgres_addr(ep)
+            .await
+            .expect("the compute's Postgres address")
+            .expect("a published Postgres port");
+        let conn = format!("host={} port={} dbname={database} sslmode=prefer", addr.ip(), addr.port());
+        psql(&conn, user, password, script).await
+    }
+
     /// psql straight to `ep`'s compute (as the orchestrator connects a member role).
     async fn direct(
         &self,
@@ -1952,6 +1972,163 @@ async fn a_planted_guard_schema_cannot_block_the_guard() {
             ),
         )
         .await;
+    })
+    .await;
+}
+
+// PB, T3: login roles on a protected branch, the switch, exemptions, a role made later from
+// SQL, and an unprotected child copied from a protected parent.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack"]
+async fn a_protected_branch_guards_login_roles_unless_exempt() {
+    live(|fx| async move {
+        fx.sql_on(&fx.ep, &fx.database, "CREATE ROLE pb_ci LOGIN PASSWORD 'pb-ci-pass'; CREATE ROLE pb_deploy LOGIN PASSWORD 'pb-deploy-pass'; GRANT CREATE ON SCHEMA public TO pb_ci, pb_deploy;").await;
+        let refused = |out: &Result<String, String>| out.as_ref().is_err_and(|e| e.contains("42501") && e.contains("branch is protected") && e.contains("chelabase:branch_protected"));
+        // Unprotected: login roles change the schema freely.
+        fx.direct(&fx.ep, "pb_ci", "pb-ci-pass", "CREATE TABLE public.pb_t1 (id int);").await.unwrap();
+        // Protected, switch on (the default), pb_deploy exempt.
+        fx.metadata.add_guard_exemption(fx.main, "pb_deploy").await.unwrap();
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        for ddl in ["CREATE TABLE public.pb_t2 (id int);", "DROP TABLE public.pb_t1;", "ALTER TABLE public.pb_t1 ADD COLUMN x int;"] {
+            let out = fx.direct(&fx.ep, "pb_ci", "pb-ci-pass", ddl).await;
+            assert!(refused(&out), "{ddl}: {out:?}");
+        }
+        fx.direct(&fx.ep, "pb_ci", "pb-ci-pass", "CREATE TEMP TABLE pb_scratch (id int); DROP TABLE pb_scratch;").await.unwrap();
+        fx.direct(&fx.ep, "pb_deploy", "pb-deploy-pass", "CREATE TABLE public.pb_t3 (id int);").await.unwrap();
+        // A login role made from SQL afterwards is guarded at once, with no reconcile.
+        fx.sql_on(&fx.ep, &fx.database, "CREATE ROLE pb_late LOGIN PASSWORD 'pb-late-pass'; GRANT CREATE ON SCHEMA public TO pb_late;").await;
+        let out = fx.direct(&fx.ep, "pb_late", "pb-late-pass", "CREATE TABLE public.pb_t4 (id int);").await;
+        assert!(refused(&out), "{out:?}");
+        // Switch off: only member logins stay guarded.
+        fx.metadata.set_branch_guard_logins(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.direct(&fx.ep, "pb_ci", "pb-ci-pass", "CREATE TABLE public.pb_t2 (id int);").await.unwrap();
+        // Switch on again; an unprotected child of the protected branch carries no guard.
+        fx.metadata.set_branch_guard_logins(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        let child = fx.child("pb-child").await;
+        let child_ep = fx.endpoint_of(child).await;
+        fx.reconcile(child).await;
+        let triggers = fx.sql_on(&child_ep, &fx.database, "SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_schema_guard%'").await;
+        assert_eq!(triggers.trim(), "0");
+        let schema = fx.sql_on(&child_ep, &fx.database, "SELECT count(*) FROM pg_namespace WHERE nspname = 'chelabase_guard'").await;
+        assert_eq!(schema.trim(), "0");
+        // The child gave pb_ci a fresh password (protected parent): set a known one.
+        fx.sql_on(&child_ep, "postgres", "ALTER ROLE pb_ci PASSWORD 'pb-ci-child';").await;
+        fx.direct(&child_ep, "pb_ci", "pb-ci-child", "CREATE TABLE public.pb_t5 (id int);").await.unwrap();
+        // Clean up main.
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.sql_on(&fx.ep, &fx.database, "DROP TABLE IF EXISTS public.pb_t1, public.pb_t2, public.pb_t3; REVOKE CREATE ON SCHEMA public FROM pb_ci, pb_deploy, pb_late; DROP ROLE pb_ci; DROP ROLE pb_deploy; DROP ROLE pb_late;").await;
+        fx.metadata.remove_guard_exemption(fx.main, "pb_deploy").await.unwrap();
+    })
+    .await;
+}
+
+// PB T3 review: a session stays guarded when its role loses LOGIN while it's open (the rule
+// is about who logged in, not who may log in now).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack"]
+async fn a_guarded_session_stays_guarded_after_its_role_loses_login() {
+    live(|fx| async move {
+        fx.sql_on(&fx.ep, &fx.database, "CREATE ROLE pb_flip LOGIN PASSWORD 'pb-flip-pass'; GRANT CREATE ON SCHEMA public TO pb_flip;").await;
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        let session = fx.direct(&fx.ep, "pb_flip", "pb-flip-pass", "SELECT pg_sleep(4); CREATE TABLE public.pb_flip_t (id int);");
+        let flip = async {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            fx.sql_on(&fx.ep, &fx.database, "ALTER ROLE pb_flip NOLOGIN;").await;
+        };
+        let (out, ()) = tokio::join!(session, flip);
+        assert!(out.as_ref().is_err_and(|e| e.contains("42501") && e.contains("branch is protected")), "{out:?}");
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.sql_on(&fx.ep, &fx.database, "DROP TABLE IF EXISTS public.pb_flip_t; REVOKE CREATE ON SCHEMA public FROM pb_flip; DROP ROLE pb_flip;").await;
+    })
+    .await;
+}
+
+// PB T4 fix round (R8/R10): the review lists every live database (one made from SQL included)
+// and fixes as cloud_admin a function of a role the owner doesn't hold.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack"]
+async fn the_review_scans_every_database_and_fixes_as_cloud_admin() {
+    use chelabase_nats::{ReviewFixOrder, ReviewReply, ReviewRequest};
+    use chelabase_types::protection::FixAction;
+    live(|fx| async move {
+        fx.sql_on(&fx.ep, &fx.database, "CREATE ROLE pb_rv_dev; CREATE FUNCTION public.pb_planted() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION public.pb_planted() OWNER TO pb_rv_dev;").await;
+        fx.sql("CREATE DATABASE pb_rv_two").await;
+        fx.sql_on(&fx.ep, "pb_rv_two", "CREATE FUNCTION public.pb_hidden() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION public.pb_hidden() OWNER TO pb_rv_dev;").await;
+        let ReviewReply::Scanned { items } = fx.worker.review(ReviewRequest { branch_id: fx.main.as_uuid(), fix: None }).await else {
+            panic!("the scan failed");
+        };
+        let planted = format!("{}/function/public.pb_planted()", fx.database);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        assert!(keys.contains(&planted.as_str()) && keys.contains(&"pb_rv_two/function/public.pb_hidden()"), "{keys:#?}");
+        let hash = chelabase_schema::review::review_hash(&items);
+        let order = ReviewFixOrder { key: planted.clone(), action: FixAction::Reassign, hash };
+        let reply = fx.worker.review(ReviewRequest { branch_id: fx.main.as_uuid(), fix: Some(order) }).await;
+        let ReviewReply::Fixed { sql, items } = reply else { panic!("{reply:?}") };
+        assert_eq!(sql, "ALTER ROUTINE public.pb_planted() OWNER TO postgres;");
+        assert!(items.iter().all(|i| i.key != planted), "{items:#?}");
+        let owner = fx.sql_on(&fx.ep, &fx.database, "SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = 'pb_planted'").await;
+        assert_eq!(owner.trim(), "postgres");
+        fx.sql_on(&fx.ep, &fx.database, "DROP FUNCTION public.pb_planted();").await;
+        fx.sql("DROP DATABASE pb_rv_two").await;
+        fx.sql("DROP ROLE pb_rv_dev").await;
+    })
+    .await;
+}
+
+// PB end-of-step (R12, R13), the invariant: on a protected branch with the switch on, no
+// session of a guarded role (any non-superuser other than the owner, an Admin's member login or
+// an honored exemption) changes a permanent schema object in any database of the branch,
+// including databases and roles it makes itself. Every known escape is tried here; the
+// NOLOGIN flip has its own test above.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack"]
+async fn no_guarded_session_escapes_the_guard() {
+    live(|fx| async move {
+        fx.sql_on(&fx.ep, &fx.database, "CREATE ROLE pb_esc LOGIN CREATEDB CREATEROLE PASSWORD 'pb-esc-pass'; GRANT CREATE ON SCHEMA public TO pb_esc;").await;
+        // An exemption for a name nobody holds yet, and one for a role only cloud_admin controls.
+        fx.metadata.add_guard_exemption(fx.main, "pb_ghost").await.unwrap();
+        fx.metadata.add_guard_exemption(fx.main, "pb_trusted").await.unwrap();
+        fx.sql_on(&fx.ep, &fx.database, "CREATE ROLE pb_trusted LOGIN PASSWORD 'pb-trusted-pass'; GRANT CREATE ON SCHEMA public TO pb_trusted;").await;
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        let refused = |out: &Result<String, String>| out.as_ref().is_err_and(|e| e.contains("42501") && e.contains("branch is protected"));
+        // The honored exemption works.
+        fx.direct(&fx.ep, "pb_trusted", "pb-trusted-pass", "CREATE TABLE public.pb_esc_ok (id int); DROP TABLE public.pb_esc_ok;").await.unwrap();
+        // 1. A database the guarded role makes from template1 is guarded at once (no reconcile).
+        fx.direct(&fx.ep, "pb_esc", "pb-esc-pass", "CREATE DATABASE pb_esc_one;").await.unwrap();
+        let out = fx.direct_in(&fx.ep, "pb_esc_one", "pb_esc", "pb-esc-pass", "CREATE TABLE public.t (id int);").await;
+        assert!(refused(&out), "template1: {out:?}");
+        // 2. One made from template0 is guarded once the reconcile its creation asks for has run
+        //    (the orchestrator's DDL receiver asks; the window until then is the fork round's).
+        fx.direct(&fx.ep, "pb_esc", "pb-esc-pass", "CREATE DATABASE pb_esc_zero TEMPLATE template0;").await.unwrap();
+        fx.reconcile(fx.main).await;
+        let out = fx.direct_in(&fx.ep, "pb_esc_zero", "pb_esc", "pb-esc-pass", "CREATE TABLE public.t (id int);").await;
+        assert!(refused(&out), "template0 after its reconcile: {out:?}");
+        // 3. A role the guarded role makes under an exempt name isn't honored, even after a
+        //    reconcile: a guarded role administers it.
+        fx.direct(&fx.ep, "pb_esc", "pb-esc-pass", "CREATE ROLE pb_ghost LOGIN PASSWORD 'pb-ghost-pass';").await.unwrap();
+        fx.sql_on(&fx.ep, &fx.database, "GRANT CREATE ON SCHEMA public TO pb_ghost;").await;
+        let out = fx.direct(&fx.ep, "pb_ghost", "pb-ghost-pass", "CREATE TABLE public.pb_ghost_t (id int);").await;
+        assert!(refused(&out), "before a reconcile: {out:?}");
+        fx.reconcile(fx.main).await;
+        let out = fx.direct(&fx.ep, "pb_ghost", "pb-ghost-pass", "CREATE TABLE public.pb_ghost_t (id int);").await;
+        assert!(refused(&out), "after a reconcile: {out:?}");
+        // The honored exemption still works after those reconciles.
+        fx.direct(&fx.ep, "pb_trusted", "pb-trusted-pass", "CREATE TABLE public.pb_esc_ok (id int); DROP TABLE public.pb_esc_ok;").await.unwrap();
+        // Clean up.
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.sql("DROP DATABASE pb_esc_one WITH (FORCE)").await;
+        fx.sql("DROP DATABASE pb_esc_zero WITH (FORCE)").await;
+        fx.sql_on(&fx.ep, &fx.database, "REVOKE CREATE ON SCHEMA public FROM pb_esc, pb_trusted, pb_ghost; DROP ROLE pb_ghost; DROP ROLE pb_trusted; DROP ROLE pb_esc;").await;
+        fx.metadata.remove_guard_exemption(fx.main, "pb_ghost").await.unwrap();
+        fx.metadata.remove_guard_exemption(fx.main, "pb_trusted").await.unwrap();
     })
     .await;
 }

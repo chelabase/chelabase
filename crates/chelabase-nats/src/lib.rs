@@ -318,6 +318,56 @@ pub struct MemberRoleApplied {
     pub applied_roles: Vec<String>,
 }
 
+/// Core request/reply: a branch's protection review (code owned by non-Admin roles that can run
+/// in someone else's session), scanned by the worker as `cloud_admin` in every live database
+/// of the branch; with `fix`, one item fixed after the hash check. Answers a [`ReviewReply`].
+pub const SUBJECT_REVIEW: &str = "chelabase.rpc.review";
+
+/// A review scan of `branch_id`, or (with `fix`) one fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRequest {
+    pub branch_id: Uuid,
+    #[serde(default)]
+    pub fix: Option<ReviewFixOrder>,
+}
+
+/// One fix: the item's key, what to do, and the hash of the review the caller saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFixOrder {
+    pub key: String,
+    pub action: chelabase_types::protection::FixAction,
+    pub hash: String,
+}
+
+/// The review's answer. `items` are the scan's (after the fix for `Fixed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReviewReply {
+    Scanned {
+        items: Vec<chelabase_types::protection::ReviewItem>,
+    },
+    Fixed {
+        sql: String,
+        items: Vec<chelabase_types::protection::ReviewItem>,
+    },
+    /// The fix's hash isn't the current review's; nothing ran.
+    Changed {
+        items: Vec<chelabase_types::protection::ReviewItem>,
+    },
+    /// The review has no item of the fix's key; nothing ran.
+    NotFound {
+        items: Vec<chelabase_types::protection::ReviewItem>,
+    },
+    /// Postgres refused the fix (`XX000` when the SQLSTATE couldn't be read).
+    FixFailed {
+        sqlstate: String,
+        message: String,
+        items: Vec<chelabase_types::protection::ReviewItem>,
+    },
+    /// The scan (or the branch, or the compute) failed: no partial list.
+    Failed { message: String },
+}
+
 /// Core request/reply: stop serving a database (`remove` also drops the `chelabase` machinery).
 /// Answers a [`CheckDataRoleReply`].
 pub const SUBJECT_DATA_API_DISABLE: &str = "chelabase.rpc.data_api.disable";
@@ -1553,6 +1603,7 @@ mod tests {
     #[test]
     fn member_role_hand_over_wire_shape() {
         assert_eq!(SUBJECT_MEMBER_ROLES_HAND_OVER, "chelabase.rpc.member_roles.hand_over");
+        assert_eq!(SUBJECT_REVIEW, "chelabase.rpc.review");
         let request = MemberRoleHandOverRequest {
             branch_id: Uuid::new_v4(),
             member_id: Uuid::new_v4(),

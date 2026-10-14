@@ -346,7 +346,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// token's hash is written first (the compute's first spec request must already pass), then
     /// the container is created and waited for, then the role and data API bootstraps run (a
     /// restore can rewind both); then the endpoint records [`COMPUTE_SETTINGS_VERSION`], and
-    /// last the login-role resync runs. The catalog is the one the compute had: the forwarded
+    /// last the login-role resync runs and, for a kept catalog, a member-role reconcile is
+    /// asked for (PB R12: the guard follows the branch's settings). The catalog is the one the compute had: the forwarded
     /// guards stay (an upgrade, a missing compute, a restart on the old timeline).
     pub(crate) async fn recreate_compute(&self, branch: BranchId, ep: &str) -> Result<(), String> {
         self.recreate_compute_with(branch, ep, Catalog::Kept).await
@@ -413,7 +414,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // resync does, and a resync that keeps failing gets a plain `Resync` from reconcile,
         // not a re-creation every pass.
         self.record_compute_settings(ep).await;
-        self.resync_endpoint(branch, ep, catalog).await
+        let resynced = self.resync_endpoint(branch, ep, catalog).await;
+        // PB R12: a restarted compute's guard may be missing or stale (a restart after a failed
+        // reconcile): the member-role reconcile brings it current. A replaced catalog (reset,
+        // restore) asks once the branch is ready again (`finish_ready`).
+        if catalog == Catalog::Kept {
+            self.member_role_requests.request(branch);
+        }
+        resynced
     }
 
     /// Records that `ep`'s compute runs [`COMPUTE_SETTINGS_VERSION`]'s settings. A failure
@@ -2676,6 +2684,19 @@ mod tests {
         *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
         let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
         assert!(err.starts_with("waiting for the compute: "), "{err}");
+    }
+
+    // PB end-of-step R12: a compute started for a branch (missing, upgraded, after a reset or
+    // restore whose catalog may lack the guard) asks for a member-role reconcile, which also
+    // brings the protected-branch guard to the current settings.
+    #[tokio::test]
+    async fn recreate_compute_asks_for_a_member_reconcile() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        let before = w.member_role_requests.sent().len();
+        w.recreate_compute(s.dev, &s.dev_ep).await.unwrap();
+        assert_eq!(w.member_role_requests.sent()[before..], [s.dev]);
     }
 
     #[tokio::test]

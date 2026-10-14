@@ -37,7 +37,7 @@ or subtle orderings. Delete these comments when you copy it.
 |---|---|---|---|---|---|
 | T1 | <scope> | sonnet | sonnet | 1 | — |
 
-Waves run in parallel when their files are disjoint (pre-flight scan), each task in its own worktree (`just wt-add <branch>-tN <branch>`), with at most 3 builds or test suites at once.
+Waves run in parallel when their files are disjoint (pre-flight scan), each task in its own worktree (`just wt-add <branch>-tN <branch>`), with at most 3 builds or test suites at once. One stack serves the whole plan (up when the plan is written, purged after the final merge); tasks in a wave never run conflicting live suites on it at the same time (see each task's "Live runs").
 
 ## Shared interfaces (pinned)
 
@@ -55,19 +55,22 @@ Waves run in parallel when their files are disjoint (pre-flight scan), each task
 
 **Behaviour:** <spec section, plus rules not in the spec>.
 
-**RED tests (coordinator):** <the full code of every test, with where it goes>.
+**RED tests (coordinator):** <the full code of every test, with where it goes>. Before briefing: every RED target compiles (live ones with `--no-run`), and each assumption about harnesses, helpers and system behaviour is checked in the code.
 
 **Gotchas:** <traps>.
 
 **Verify:** <exact commands: unit, clippy, live tests compiled with `--no-run`, and any live run named for the coordinator>.
 
+**Live runs (the plan's one stack):** <each suite this task runs on the shared stack, when, and what it would conflict with (branch/role/database state, app restarts, suites needing the task's own binaries); a conflicting run whose result nothing later in the task needs is deferred to "End of step" 5 and named there>.
+
 ---
 
 ## End of step
 
-1. Whole-branch review (opus) on `main..<branch>`.
-2. Fix round: the coordinator writes a failing test for each finding first.
-3. `just check`.
+0. (Before the plan, security/concurrency steps: the spec's red-team pass; at the step's start: `main` green.)
+1. Whole-branch review (opus) on `main..<branch>`; it also covers the leaf tasks that had no review of their own.
+2. The one final fix round: the end-of-step review's findings plus every task finding deferred to it (the Status lists them); the coordinator writes a failing test for each finding first.
+3. `just check`, once (the step's only gate run; a flaky test seen here is fixed, not rerun).
 4. Integration, plus the one gate and the one image build, only if a fork changed (list pending fork changes in the Status first; there must be none).
 5. Live pass: <suites, e2e runs and browser pass, with exact commands>.
 6. Update `docs/landing-highlights.md` on `main`, the plan Status and the roadmap's "Resume here", then pause for the user.

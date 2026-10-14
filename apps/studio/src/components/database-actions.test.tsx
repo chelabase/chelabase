@@ -264,7 +264,7 @@ describe("DatabaseActions", () => {
     const branch = {
       id: "b2", name: "dev", parent_branch_id: "d1", kind: "normal", status: "ready", host: EP, port: 4432,
       branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
-      protected: false, main_database_missing: false,
+      protected: false, main_database_missing: false, guard_logins: true, review_acknowledged_hash: null,
     } as const;
     const { queryClient } = renderWithQuery(<DatabaseActions database={ready} branch={branch} />, { fetch: f });
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
@@ -282,7 +282,7 @@ describe("DatabaseActions", () => {
     const branch = {
       id: "b2", name: "dev", parent_branch_id: "d1", kind: "normal", status: "ready", host: EP, port: 4432,
       branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
-      protected: false, main_database_missing: false,
+      protected: false, main_database_missing: false, guard_logins: true, review_acknowledged_hash: null,
     } as const;
     const row = (name: string, kind: "owner" | "login") => ({
       name, origin: kind === "owner" ? "owner" : "api", level: kind === "owner" ? "owner_level" : "plain",
@@ -314,7 +314,7 @@ describe("DatabaseActions", () => {
   const branchB2 = {
     id: "b2", name: "dev", parent_branch_id: "d1", kind: "normal", status: "ready", host: EP, port: 4432,
     branched_at_time: null, branched_at_lsn: null, created_at: "2026-09-30T10:00:00Z", history_start: null, error: null,
-    protected: false, main_database_missing: false,
+    protected: false, main_database_missing: false, guard_logins: true, review_acknowledged_hash: null,
   } as const;
   const ownerRow = {
     name: "chelabase_owner", origin: "owner", level: "owner_level", login: true, password: "generated",

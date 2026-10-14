@@ -21,7 +21,7 @@ const b = (name: string, over: Partial<Branch> = {}): Branch => ({
   history_start: null,
   error: null,
   protected: false,
-  main_database_missing: false,
+  main_database_missing: false, guard_logins: true, review_acknowledged_hash: null,
   ...over,
 });
 const keys = [

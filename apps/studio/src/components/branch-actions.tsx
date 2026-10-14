@@ -4,8 +4,11 @@ import { useRouter } from "@tanstack/react-router";
 import {
   ApiError,
   createMerge,
+  getGetBranchReviewQueryKey,
   getListMergesQueryKey,
+  useAcknowledgeBranchReview,
   useDeleteBranch,
+  useGetBranchReview,
   useResetBranchToParent,
   useRestoreBranch,
   useUpdateBranch,
@@ -14,6 +17,7 @@ import {
   type MergeSummary,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   actionReasons,
   heldReason,
@@ -26,13 +30,15 @@ import {
   toLocalInput,
   type ActionKey,
 } from "@/lib/branches";
+import { errorText } from "@/lib/errors";
 import { useProjectCaps } from "@/lib/capabilities";
 import { mergeErrorText } from "@/lib/merges";
+import { BranchReview, reviewChangedText } from "./branch-review";
 import { BranchRoles } from "./branch-roles";
 import { DatabaseActions } from "./database-actions";
 import { MERGE_ROUTE, MergeLink } from "./merges/merge-link";
 
-type Panel = "none" | "protect" | "reset-to-parent" | "restore" | "delete" | "roles";
+type Panel = "none" | "protect" | "protection" | "reset-to-parent" | "restore" | "delete" | "roles";
 
 export interface BranchActionsProps {
   /** The project the database belongs to (for links to its merges). */
@@ -79,6 +85,8 @@ export function BranchActions({
   const restoreBranch = useRestoreBranch(invalidate);
   const updateBranch = useUpdateBranch(invalidate);
   const [panel, setPanel] = useState<Panel>("none");
+  const [guardLogins, setGuardLogins] = useState(branch.guard_logins);
+  const acknowledge = useAcknowledgeBranchReview();
   const [point, setPoint] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Failure | null>(null);
@@ -117,12 +125,24 @@ export function BranchActions({
     const reason = reasons[key];
     return reason === null ? undefined : `${baseId}-reason-${reasonTexts.indexOf(reason)}`;
   };
+  // The review: loaded for a protected branch (Admin) and when Protect or Protection opens, never otherwise.
+  const reviewKey = getGetBranchReviewQueryKey(databaseId, branch.id);
+  const reviewWanted = caps.atLeast("admin") && (branch.protected || panel === "protect");
+  // The badge's scan runs on the branch's compute: kept 5 minutes and not redone on window focus
+  // (opening Protection invalidates it).
+  const reviewQuery = useGetBranchReview(databaseId, branch.id, {
+    query: { enabled: reviewWanted, retry: false, staleTime: 5 * 60_000, refetchOnWindowFocus: false },
+  });
+  const review = reviewQuery.data;
+  const reviewChanged = branch.protected && !!review && review.hash !== (review.acknowledged_hash ?? null);
   const bounds = restoreBounds(new Date(), historyWindow, branch.history_start);
 
   function open(next: Panel) {
     setError(null);
     setNotice(null);
     setPoint("");
+    setGuardLogins(branch.guard_logins);
+    if (next === "protection" && panel !== next) void queryClient.invalidateQueries({ queryKey: reviewKey });
     setPanel(panel === next ? "none" : next);
   }
 
@@ -170,6 +190,58 @@ export function BranchActions({
       await updateBranch.mutateAsync({ id: databaseId, branchId: branch.id, data: { protected: value } });
       return null;
     });
+  /** Protects with the review the caller saw; a changed review replaces the list and asks again. */
+  async function confirmProtect() {
+    if (!review) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await updateBranch.mutateAsync({
+        id: databaseId,
+        branchId: branch.id,
+        data: {
+          protected: true,
+          review_hash: review.hash,
+          ...(guardLogins !== branch.guard_logins ? { guard_logins: guardLogins } : {}),
+        },
+      });
+      void queryClient.invalidateQueries({ queryKey: reviewKey });
+      setPanel("none");
+    } catch (err) {
+      const changed = reviewChangedText(err, queryClient, databaseId, branch.id);
+      setError(changed ? { text: changed, mergeId: null } : mergeErrorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  /** The Protection panel's switch acts at once. */
+  async function saveGuardLogins(value: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      await updateBranch.mutateAsync({ id: databaseId, branchId: branch.id, data: { guard_logins: value } });
+    } catch (err) {
+      setError(mergeErrorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function acknowledgeReview() {
+    if (!review) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const done = await acknowledge.mutateAsync({ id: databaseId, branchId: branch.id, data: { hash: review.hash } });
+      queryClient.setQueryData(reviewKey, done);
+      void invalidateBranches(queryClient, databaseId);
+    } catch (err) {
+      const changed = reviewChangedText(err, queryClient, databaseId, branch.id);
+      setError(changed ? { text: changed, mergeId: null } : mergeErrorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
   const resetToParent = () =>
     run(async () => {
       await resetBranch.mutateAsync({ id: databaseId, branchId: branch.id });
@@ -253,9 +325,14 @@ export function BranchActions({
       >
         {branch.kind === "normal" && caps.atLeast("admin") &&
           (branch.protected ? (
-            <Button size="sm" variant="outline" disabled={busy} onClick={() => void setProtected(false)}>
-              Unprotect
-            </Button>
+            <>
+              <Button size="sm" variant="outline" disabled={busy} onClick={() => open("protection")}>
+                Protection
+              </Button>
+              <Button size="sm" variant="outline" disabled={busy} onClick={() => void setProtected(false)}>
+                Unprotect
+              </Button>
+            </>
           ) : (
             <Button size="sm" variant="outline" disabled={busy} onClick={() => open("protect")}>
               Protect
@@ -299,6 +376,17 @@ export function BranchActions({
 
       {panel === "roles" && reasons.connect === null && <BranchRoles databaseId={databaseId} branchId={branch.id} />}
 
+      {reviewChanged && (
+        <p>
+          <span className="border px-2 py-0.5 text-xs">Review changed</span>
+        </p>
+      )}
+      {branch.protected && reviewQuery.isError && (
+        <p>
+          <span className="border px-2 py-0.5 text-xs">Review unavailable</span>
+        </p>
+      )}
+
       {branch.main_database_missing && (
         <p role="status" className="text-sm text-destructive">
           Main database missing: create a database named <code>{databaseName}</code> to bring it back
@@ -311,12 +399,65 @@ export function BranchActions({
             Children of a protected branch get new passwords for every role. It can&apos;t be deleted or reset to its
             parent until you unprotect it. Restore stays allowed.
           </p>
+          <label className="flex items-center gap-2">
+            <Switch aria-label="Guard login roles" checked={guardLogins} onCheckedChange={setGuardLogins} disabled={busy} />
+            <span aria-hidden>Guard login roles</span>
+          </label>
+          {reviewQuery.isError && (
+            <p role="alert" className="text-destructive">
+              {errorText(reviewQuery.error)}{" "}
+              <Button size="xs" variant="outline" onClick={() => void reviewQuery.refetch()}>
+                Retry
+              </Button>
+            </p>
+          )}
+          {review ? (
+            <BranchReview databaseId={databaseId} branchId={branch.id} review={review} canFix />
+          ) : (
+            !reviewQuery.isError && <p className="text-muted-foreground">Loading the review…</p>
+          )}
           <div className="flex gap-2">
-            <Button size="sm" disabled={busy} onClick={() => void setProtected(true)}>
+            <Button size="sm" disabled={busy || !review} onClick={() => void confirmProtect()}>
               Confirm protect
             </Button>
             <Button size="sm" variant="outline" onClick={() => open("none")}>
               Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {panel === "protection" && branch.protected && (
+        <div className="space-y-2 border p-3 text-sm">
+          <h3 className="font-medium">Protection</h3>
+          <label className="flex items-center gap-2">
+            <Switch
+              aria-label="Guard login roles"
+              checked={branch.guard_logins}
+              onCheckedChange={(v) => void saveGuardLogins(v)}
+              disabled={busy}
+            />
+            <span aria-hidden>Guard login roles</span>
+          </label>
+          {reviewQuery.isError && (
+            <p role="alert" className="text-destructive">
+              {errorText(reviewQuery.error)}{" "}
+              <Button size="xs" variant="outline" onClick={() => void reviewQuery.refetch()}>
+                Retry
+              </Button>
+            </p>
+          )}
+          {review ? (
+            <BranchReview databaseId={databaseId} branchId={branch.id} review={review} canFix />
+          ) : (
+            !reviewQuery.isError && <p className="text-muted-foreground">Loading the review…</p>
+          )}
+          <div className="flex gap-2">
+            <Button size="sm" disabled={busy || !review} onClick={() => void acknowledgeReview()}>
+              Acknowledge
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => open("none")}>
+              Close
             </Button>
           </div>
         </div>

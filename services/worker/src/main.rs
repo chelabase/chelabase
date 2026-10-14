@@ -4,7 +4,7 @@ use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
     DataApiDatabaseRequest, JobEnvelope, MemberRolesReconcileRequest,
     MemberRolesReply, NatsConfig, SUBJECT_MEMBER_ROLES_ENQUEUE,
-    SUBJECT_MEMBER_ROLES_HAND_OVER, SUBJECT_MEMBER_ROLES_RECONCILE,
+    SUBJECT_MEMBER_ROLES_HAND_OVER, SUBJECT_MEMBER_ROLES_RECONCILE, SUBJECT_REVIEW, ReviewReply,
     RESET_NOT_APPLIED, ResetPasswordReply, ResetPasswordRequest, ResyncBranchRequest, RoleReply,
     RoleRequest, RoleSessionsReply, SUBJECT_ROLE_SESSIONS,
     SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
@@ -28,6 +28,7 @@ use worker::member_roles::{
     MEMBER_ROLES_DEADLINE, MEMBER_ROLES_ENQUEUE_DELAY, member_hand_over_reply, member_roles_reply,
 };
 use worker::resync::{PendingResyncs, TOUCHED_RESYNC_DELAY};
+use worker::review::{REVIEW_DEADLINE, review_reply};
 
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 /// Hard cap on one reset, below the orchestrator's NATS request timeout (`RESET_TIMEOUT`,
@@ -102,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_resync_branch(worker.clone(), nats.clone()));
     tokio::spawn(serve_member_roles_reconcile(worker.clone(), nats.clone()));
     tokio::spawn(serve_member_roles_hand_over(worker.clone(), nats.clone()));
+    tokio::spawn(serve_review(worker.clone(), nats.clone()));
     tokio::spawn(serve_member_roles_enqueue(worker.clone(), nats.clone()));
     tokio::spawn(member_roles_sweep_loop(worker.clone()));
     tokio::spawn(reconcile_loop(worker.clone(), js.clone()));
@@ -637,6 +639,34 @@ async fn serve_member_roles_hand_over(worker: Arc<RealWorker>, client: async_nat
                 let body = serde_json::to_vec(&reply).unwrap_or_default();
                 if let Err(err) = client.publish(reply_to, body.into()).await {
                     warn!("member-role hand-over reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+/// Serves the protection review and its fixes (request/reply with a [`ReviewReply`]).
+async fn serve_review(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_REVIEW, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("review subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_REVIEW, "serving protection reviews");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply: ReviewReply = review_reply(worker, &message.payload, REVIEW_DEADLINE).await;
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("review reply failed: {err}");
                 }
             }
         });

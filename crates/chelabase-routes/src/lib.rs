@@ -229,6 +229,55 @@ pub mod orchestrator {
         Access::Project(Admin),
     );
 
+    /// The branch's guard exemptions: login roles the "guard login roles" switch leaves alone.
+    pub const LIST_GUARD_EXEMPTIONS: Endpoint = key_endpoint(
+        "orchestrator.list_guard_exemptions",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/guard-exemptions",
+        Access::Project(Developer),
+    );
+
+    /// Exempts a role, by name, from the branch's login-role guard (idempotent).
+    pub const PUT_GUARD_EXEMPTION: Endpoint = key_endpoint(
+        "orchestrator.put_guard_exemption",
+        Method::Put,
+        "/v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
+        Access::Project(Admin),
+    );
+
+    /// Removes a role's exemption (idempotent).
+    pub const DELETE_GUARD_EXEMPTION: Endpoint = key_endpoint(
+        "orchestrator.delete_guard_exemption",
+        Method::Delete,
+        "/v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
+        Access::Project(Admin),
+    );
+
+    /// The branch's review: code owned by non-Admin roles that can run in someone else's
+    /// session, across its databases.
+    pub const GET_BRANCH_REVIEW: Endpoint = key_endpoint(
+        "orchestrator.get_branch_review",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/review",
+        Access::Project(Developer),
+    );
+
+    /// Stores the current review as acknowledged.
+    pub const ACKNOWLEDGE_BRANCH_REVIEW: Endpoint = key_endpoint(
+        "orchestrator.acknowledge_branch_review",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/review/acknowledge",
+        Access::Project(Admin),
+    );
+
+    /// Reassigns one review item to the owner, or drops it.
+    pub const FIX_BRANCH_REVIEW_ITEM: Endpoint = key_endpoint(
+        "orchestrator.fix_branch_review_item",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/review/fix",
+        Access::Project(Admin),
+    );
+
     /// The branch's Postgres databases: the main one first.
     pub const LIST_BRANCH_DATABASES: Endpoint = key_endpoint(
         "orchestrator.list_branch_databases",
@@ -973,6 +1022,12 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::BRANCH_RESTORE,
     orchestrator::DELETE_BRANCH,
     orchestrator::UPDATE_BRANCH,
+    orchestrator::LIST_GUARD_EXEMPTIONS,
+    orchestrator::PUT_GUARD_EXEMPTION,
+    orchestrator::DELETE_GUARD_EXEMPTION,
+    orchestrator::GET_BRANCH_REVIEW,
+    orchestrator::ACKNOWLEDGE_BRANCH_REVIEW,
+    orchestrator::FIX_BRANCH_REVIEW_ITEM,
     orchestrator::LIST_BRANCH_DATABASES,
     orchestrator::LIST_KEYS,
     orchestrator::CREATE_KEY,
@@ -1710,6 +1765,13 @@ mod tests {
             ("orchestrator.branch_restore", BRANCH),
             ("orchestrator.delete_branch", BRANCH),
             ("orchestrator.update_branch", Access::Project(Admin)),
+            // Protected branches (P3): reads Developer, writes Admin.
+            ("orchestrator.list_guard_exemptions", Access::Project(Developer)),
+            ("orchestrator.put_guard_exemption", Access::Project(Admin)),
+            ("orchestrator.delete_guard_exemption", Access::Project(Admin)),
+            ("orchestrator.get_branch_review", Access::Project(Developer)),
+            ("orchestrator.acknowledge_branch_review", Access::Project(Admin)),
+            ("orchestrator.fix_branch_review_item", Access::Project(Admin)),
             // Databases.
             ("orchestrator.get_database", Access::Project(Viewer)),
             ("orchestrator.create_database", Access::Project(Admin)),

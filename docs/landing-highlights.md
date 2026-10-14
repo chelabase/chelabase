@@ -116,5 +116,31 @@ Branch `neon-fork-round-2`; fork branch `round-2` on `chelabase/neon`. Spec `doc
   - CLI unit tests (184), covering slugs, the registry and FIFO slots (stress-tested 20×), the stack env, process stop, purge safety and the migration.
   - Offline guards for the compose shape, the recipes, runner-only live tests and retired names.
   - A live pass on branch stacks: every live suite, all 12 e2e runs, and `neon-e2e` on two stacks at once with neither losing a compute. The slot cap made a third `up` wait and time out naming both stacks, and `wt-remove` purges left nothing behind. A fresh stack comes up seeded in about 1.5 minutes from a cold worktree. A browser pass covered sign-in, Zitadel's console, hot reload, Mailpit, docs and landing.
-- **Status:** branch `workbench-isolation`, awaiting the merge decision (2026-10-14).
+- **Status:** merged to `main` 2026-10-14; main runs on the workbench.
 
+
+### Protected branches that can't be bypassed (PB)
+
+- **Problem:** TE-A's guard stopped Developers' member logins from changing a protected branch's schema, but anyone logging in directly with another Postgres login role could still do it. And code planted while the branch was unprotected (a trigger, a rule, a SECURITY DEFINER function, a function called from a policy or a default) runs inside an Admin's session later, where no guard applies.
+- **What we built:**
+  - **A per-branch "guard login roles" switch.** With it on, every login role except the owner, Admins' member logins and per-branch exemptions is refused schema changes. The rule is enforced inside Postgres by the guard's event triggers, from the role's first statement, roles created later from SQL included. It follows who logged in, so removing a role's LOGIN mid-session doesn't free its open sessions.
+  - **Exemptions,** stored per branch by name. One is honored only for a role no guarded role can administer, so a guarded login can't create its own exempt role.
+  - **New databases carry the guard:** it lives in `template1`, and creating a database asks for a reconcile.
+  - **Inheritance and recovery:** child branches copy the parent's switch and exemptions, and a periodic sweep over every branch puts back any setting a lost update left stale.
+  - **A review**, run by the worker with platform rights over every live database. It lists code owned by anyone but the owner that can run in someone else's session: triggers, rules, SECURITY DEFINER functions, and functions reachable from policies, defaults, checks, index expressions, generated columns, views, operators, domains, range types or any SECURITY DEFINER caller.
+  - **Protect and acknowledge need the review's current hash.** The hash includes each object's definition, so a body replaced in place shows up as changed.
+  - **Fixes in place:** reassign to the owner, or drop, re-checked against the worker's own scan first.
+  - **Studio:** the review sits in the Protect and Protection panels, with a "Review changed" badge and exemption switches in the Roles panel.
+- **What it unlocks:** a production branch whose schema only Admins and merges can change, through any client, with a reviewed answer to "what code here can run as me?" before protecting it.
+- **Evidence:**
+  - A live test that tries every known escape on a real compute:
+    - databases made from `template1` and `template0`;
+    - a role created under an exempt name;
+    - an honored exemption still allowed.
+  - A live NOLOGIN-flip test, and the scan's live tests (every reason kind, fixes, body digests).
+  - Hostile exemption names, which reach the guard only as hex.
+  - The full live pass on the merged branch: `live_db` 189, `review_live` 2, `member_roles_live` 24, `roles_live` 42, the orchestrator's live API tests 26, and `sql-editor-e2e`.
+  - `just check` green.
+  - Not yet seen in a browser: Studio's create form didn't respond on the branch stack, an issue outside this step.
+- **Known residual:** a database a guarded login makes from `template0` is unguarded until the reconcile its creation asks for (seconds). Closing it needs the fork and is queued for the next fork round, with REASSIGN OWNED.
+- **Status:** on branch `protected-branches`, awaiting the merge decision (2026-10-14).

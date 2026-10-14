@@ -23,6 +23,11 @@ export interface BranchRole {
   /** The most connections the role may hold at once; `-1` is no limit. */
   connection_limit: number;
   created_at: string;
+  /**
+     * Listed in the branch's guard exemptions (by name): on a protected branch with "guard
+     * login roles" on, this login role may still change the schema.
+     */
+  guard_exempt: boolean;
   /** INHERIT: the role uses its groups' privileges without `SET ROLE`. */
   inherit: boolean;
   /**

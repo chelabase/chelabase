@@ -25,7 +25,7 @@ use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{
     RoleNameError, check_any_role_name, check_login_role_name, is_membership_reserved, is_reserved_target,
 };
-use chelabase_types::{ApiJson, ApiPath};
+use chelabase_types::{ApiJson, ApiPath, BranchId};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -95,10 +95,14 @@ pub(crate) struct BranchRole {
     /// Those of `member_of` with the ADMIN option: the role can grant the group on (I2). A role
     /// holding it is Admin-only to grant (R30).
     member_admin: Vec<String>,
+    /// Listed in the branch's guard exemptions (by name): on a protected branch with "guard
+    /// login roles" on, this login role may still change the schema.
+    guard_exempt: bool,
 }
 
 impl BranchRole {
-    fn new(row: RoleRow, keys: &[DataKeyRecord]) -> Self {
+    fn new(row: RoleRow, keys: &[DataKeyRecord], exemptions: &[String]) -> Self {
+        let guard_exempt = exemptions.contains(&row.name);
         let blocked_keys = if row.level == RoleLevel::OwnerLevel {
             keys.iter()
                 .filter(|k| k.kind == DataKeyKind::Secret && k.revoked_at.is_none() && k.role == row.name)
@@ -123,8 +127,22 @@ impl BranchRole {
             member_of: row.attributes.member_of,
             member_no_set: row.attributes.member_no_set,
             member_admin: row.attributes.member_admin,
+            guard_exempt,
         }
     }
+}
+
+/// The branch's guard exemptions for the role views; a failed read is logged and is a 500
+/// (callers after a write fall back to none).
+async fn exemptions_of<M, J>(state: &AppState<M, J>, branch: BranchId) -> Result<Vec<String>, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    state.metadata.list_guard_exemptions(branch).await.map_err(|err| {
+        error!(branch_id = %branch, "list guard exemptions for roles: {err}");
+        ApiError::internal()
+    })
 }
 
 fn yes() -> bool {
@@ -433,7 +451,11 @@ where
             return ApiError::internal().into_response();
         }
     };
-    Json(rows.into_iter().map(|row| BranchRole::new(row, &keys)).collect::<Vec<_>>()).into_response()
+    let exemptions = match exemptions_of(&state, branch.id).await {
+        Ok(exemptions) => exemptions,
+        Err(err) => return err.into_response(),
+    };
+    Json(rows.into_iter().map(|row| BranchRole::new(row, &keys, &exemptions)).collect::<Vec<_>>()).into_response()
 }
 
 #[utoipa::path(
@@ -505,9 +527,12 @@ where
         owner_level = request.owner_level,
         "login role created"
     );
+    // The role exists now: a failed read of the exemptions must not answer the create with a
+    // 500 (a retry would find the name taken), so it shows none.
+    let exemptions = exemptions_of(&state, branch.id).await.unwrap_or_default();
     match state.metadata.list_roles(&endpoint).await {
         Ok(rows) => match rows.into_iter().find(|r| r.name == request.name) {
-            Some(row) => (StatusCode::CREATED, Json(BranchRole::new(row, &[]))).into_response(),
+            Some(row) => (StatusCode::CREATED, Json(BranchRole::new(row, &[], &exemptions))).into_response(),
             None => {
                 error!(branch_id = %branch.id, role = %request.name, "created role is not listed");
                 ApiError::internal().into_response()
@@ -706,9 +731,11 @@ where
     }
     info!(request_id = %principal.request_id, branch_id = %branch.id, %role, "role changed");
     let keys = state.metadata.list_data_keys(branch.id).await.unwrap_or_default();
+    // As the keys: the change is done, so a failed read shows no exemption.
+    let exemptions = exemptions_of(&state, branch.id).await.unwrap_or_default();
     match state.metadata.list_roles(&endpoint).await {
         Ok(rows) => match rows.into_iter().find(|r| r.name == role) {
-            Some(row) => (StatusCode::ACCEPTED, Json(BranchRole::new(row, &keys))).into_response(),
+            Some(row) => (StatusCode::ACCEPTED, Json(BranchRole::new(row, &keys, &exemptions))).into_response(),
             // A role made in SQL without a password has no row: the change is done all the same.
             None => StatusCode::ACCEPTED.into_response(),
         },

@@ -35,7 +35,11 @@
 //!   nothing), and [`crate::schema_guard::schema_guard_sql`] runs first in every database
 //!   where [`crate::schema_guard::schema_guard_check_sql`] doesn't find it current. The marker
 //!   is never a granted role: [`MemberRoleStep::Lock`] / [`MemberRoleStep::Unlock`] alone
-//!   manage it, and `Lock` comes before any grant of the role (fail closed).
+//!   manage it, and `Lock` comes before any grant of the role (fail closed). The guard is
+//!   rendered with the branch's settings (PB: `guard_logins` and its exemptions). An
+//!   unprotected branch carries no guard: where
+//!   [`crate::schema_guard::schema_guard_present_sql`] finds one,
+//!   [`crate::schema_guard::schema_unguard_sql`] removes it.
 //! - **Order (I1):** each role's revocations (and the end of its sessions) run first, as their
 //!   own script, so a failing grant never skips a revoke; then creates, passwords and grants;
 //!   then drops.
@@ -69,7 +73,10 @@ use uuid::Uuid;
 
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::resync::{PendingResyncs, SYSTEM_DATABASE};
-use crate::schema_guard::{schema_guard_check_sql, schema_guard_sql};
+use crate::schema_guard::{
+    GuardSettings, schema_guard_check_sql, schema_guard_present_sql, schema_guard_sql,
+    schema_unguard_sql,
+};
 use crate::{OWNER_ROLE, Worker, credentials};
 
 /// How long an enqueued reconcile waits before it runs: a burst of changes is one run.
@@ -441,8 +448,9 @@ pub fn drop_role_sql(role: &str) -> String {
 }
 
 /// Every role with its owner-level flag (R16), the member roles with their attributes,
-/// settings, password and memberships, every other role's `SET` memberships, and the
-/// connectable databases with their owners. The comment is the fakes' needle. Role grants made
+/// settings, password and memberships, every other role's `SET` memberships, the
+/// connectable databases with their owners, and for the protected-branch guard (PB R12, R13)
+/// the superusers, every ADMIN membership and `template1` (when it takes connections). The comment is the fakes' needle. Role grants made
 /// by a superuser are recorded as made by the bootstrap superuser (OID 10): those are the
 /// reconciler's own.
 pub fn member_catalog_sql() -> String {
@@ -488,7 +496,15 @@ WHERE d.datallowconn AND NOT d.datistemplate \
 UNION ALL \
 SELECT DISTINCT 'l ' || {rname} || ' ' || CASE WHEN s.dbid = 0 THEN '-' ELSE coalesce({dname}, '-') END \
 FROM pg_shdepend s JOIN pg_roles r ON r.oid = s.refobjid LEFT JOIN pg_database d ON d.oid = s.dbid \
-WHERE s.refclassid = 'pg_authid'::regclass AND starts_with(r.rolname::text, 'cb_m_');",
+WHERE s.refclassid = 'pg_authid'::regclass AND starts_with(r.rolname::text, 'cb_m_') \
+UNION ALL \
+SELECT 'S ' || {rname} FROM pg_roles r WHERE r.rolsuper \
+UNION ALL \
+SELECT 'A ' || {mname} || ' ' || {gname} \
+FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid \
+WHERE a.admin_option \
+UNION ALL \
+SELECT 'g ' || {dname} FROM pg_database d WHERE d.datname = 'template1' AND d.datallowconn;",
         rname = h("r.rolname"),
         mname = h("m.rolname"),
         gname = h("g.rolname"),
@@ -526,6 +542,13 @@ pub struct MemberCatalog {
     /// I-A: where each member role still owns or holds something (`pg_shdepend`): a database
     /// by name, or `None` for shared objects (any database cleans those up).
     pub leftovers: BTreeMap<String, BTreeSet<Option<String>>>,
+    /// The superusers (PB R13: never guarded).
+    pub superusers: BTreeSet<String>,
+    /// `member → roles it holds ADMIN on` (PB R13).
+    pub admin_edges: BTreeMap<String, BTreeSet<String>>,
+    /// Databases that get the protected-branch guard but no member-role work: `template1`, so
+    /// a `CREATE DATABASE` copies the guard (PB R12).
+    pub guard_only_databases: Vec<String>,
 }
 
 fn unhex(field: &str) -> Result<String, String> {
@@ -635,6 +658,17 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
                 let database = optional(fields.next())?;
                 catalog.leftovers.entry(role).or_default().insert(database);
             }
+            Some("S") => {
+                catalog.superusers.insert(field(fields.next())?);
+            }
+            Some("A") => {
+                let member = field(fields.next())?;
+                let role = field(fields.next())?;
+                catalog.admin_edges.entry(member).or_default().insert(role);
+            }
+            Some("g") => {
+                catalog.guard_only_databases.push(field(fields.next())?);
+            }
             _ => {
                 return Err(format!(
                     "an unexpected line {line:?} in the member-role catalog"
@@ -668,7 +702,46 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
         role.settings.sort();
     }
     catalog.databases.sort();
+    catalog.guard_only_databases.sort();
     Ok(catalog)
+}
+
+/// PB R13 (pure): the exemptions the guard honors, and the names it doesn't. An exemption is
+/// honored only for a role that exists and on which no guarded role holds ADMIN, directly or
+/// through any chain of memberships (whatever their options: Postgres finds ADMIN through every
+/// membership). Guarded here: every login role that isn't a superuser, the owner or a member
+/// role (`cb_m_`, guarded by the marker; its granted roles hold no ADMIN), the exemptions
+/// included, with every role it reaches. Otherwise a guarded role could take over an exempt
+/// role (a password, `SET ROLE`) or make one under an exempt name.
+pub fn honored_exemptions(
+    catalog: &MemberCatalog,
+    exempt: &[String],
+) -> (BTreeSet<String>, Vec<String>) {
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    for login in catalog.login.iter().filter(|r| {
+        !catalog.superusers.contains(*r)
+            && r.as_str() != OWNER_ROLE
+            && !r.starts_with(MEMBER_ROLE_PREFIX)
+    }) {
+        if !reached.contains(login) {
+            reached.extend(reach(&catalog.all_edges, login));
+        }
+    }
+    let administered: BTreeSet<&String> = reached
+        .iter()
+        .filter_map(|r| catalog.admin_edges.get(r))
+        .flatten()
+        .collect();
+    let mut honored = BTreeSet::new();
+    let mut skipped = Vec::new();
+    for name in exempt {
+        if catalog.roles.contains(name) && !administered.contains(name) {
+            honored.insert(name.clone());
+        } else {
+            skipped.push(name.clone());
+        }
+    }
+    (honored, skipped)
 }
 
 /// Every role reached from `from` through `edges`, `from` included. With a catalog's
@@ -980,6 +1053,37 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     .collect(),
                 Err(e) => return failed(format!("reading the member roles' rows: {e}")),
             };
+        // PB: a protected branch's guard settings (S3: installed whatever the switch), with
+        // only the exemptions no guarded role could take over (R13).
+        let guard_settings = if record.protected {
+            match self.metadata.guard_exemptions(branch).await {
+                Ok(exempt) => {
+                    let (honored, skipped) = honored_exemptions(&catalog, &exempt);
+                    for name in skipped {
+                        warn!(branch_id = %branch, exemption = name, "protected branch: an exemption isn't honored (no such role, or a guarded role administers it)");
+                    }
+                    Some(GuardSettings {
+                        guard_logins: record.guard_logins,
+                        exempt: honored,
+                    })
+                }
+                Err(e) => return failed(format!("reading the guard exemptions: {e}")),
+            }
+        } else {
+            None
+        };
+        // R12: the guard also goes into `template1` (a `CREATE DATABASE` copies it), and
+        // leaves it with protection; member-role work never goes there. R17: only a superuser
+        // can change template1's guard, so it can't drift: it is touched (checked, then
+        // installed or removed) only in a run that installs or removes the guard in another
+        // database. Those come last (`true`: guard-only).
+        let guard_databases: Vec<(&str, bool)> = catalog
+            .databases
+            .iter()
+            .map(|(db, _)| (db.as_str(), false))
+            .chain(catalog.guard_only_databases.iter().map(|db| (db.as_str(), true)))
+            .collect();
+        let mut guard_changed = false;
 
         // Desired, with passwords.
         let mut wanted: Vec<Wanted> = Vec::new();
@@ -1095,12 +1199,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // P6: on a protected branch the DDL guard goes into every database before the role
         // steps: checked on every run, installed wherever the check doesn't answer that the
         // current guard is in place (a database made since gets it; a dropped or changed
-        // trigger comes back). An unprotected branch keeps whatever triggers it has: nobody
-        // holds the marker there.
-        if record.protected {
-            let check = schema_guard_check_sql();
-            let guard = schema_guard_sql();
-            for (db, _) in &catalog.databases {
+        // trigger comes back; a settings change rewrites the bodies). PB S2: an unprotected
+        // branch carries no guard (its login rule would refuse login roles there): a
+        // read-only presence check in every database, and the guard removed where found.
+        if let Some(settings) = &guard_settings {
+            let check = schema_guard_check_sql(settings);
+            let guard = schema_guard_sql(settings);
+            for &(db, guard_only) in &guard_databases {
+                if guard_only && !guard_changed {
+                    continue;
+                }
                 match self.computes.admin_sql(&ep, db, &check).await {
                     Ok(out) if out.lines().any(|l| l.trim() == "t") => continue,
                     Ok(_) => {}
@@ -1108,9 +1216,30 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         debug!(branch_id = %branch, database = db, "member roles: checking the DDL guard failed ({e:#}); installing it");
                     }
                 }
+                guard_changed = true;
                 if let Err(e) = self.computes.admin_sql(&ep, db, &guard).await {
                     warn!(branch_id = %branch, database = db, "member roles: installing the DDL guard failed: {e:#}");
                     failures.push(format!("guarding {db}: {e:#}"));
+                }
+            }
+        } else {
+            let present = schema_guard_present_sql();
+            let unguard = schema_unguard_sql();
+            for &(db, guard_only) in &guard_databases {
+                if guard_only && !guard_changed {
+                    continue;
+                }
+                match self.computes.admin_sql(&ep, db, &present).await {
+                    Ok(out) if out.lines().any(|l| l.trim() == "t") => {}
+                    Ok(_) => continue,
+                    Err(e) => {
+                        debug!(branch_id = %branch, database = db, "member roles: checking for a DDL guard failed ({e:#}); removing any");
+                    }
+                }
+                guard_changed = true;
+                if let Err(e) = self.computes.admin_sql(&ep, db, &unguard).await {
+                    warn!(branch_id = %branch, database = db, "member roles: removing the DDL guard failed: {e:#}");
+                    failures.push(format!("unguarding {db}: {e:#}"));
                 }
             }
         }
@@ -1418,7 +1547,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// I2: one pass of the periodic sweep, the backstop for lost or failed reconciles: every
-    /// ready branch of a tenant with members (or with member-role rows) is reconciled once.
+    /// ready normal branch of a live database is reconciled once (PB R12: members or not, as
+    /// the protected-branch guard's backstop too).
     /// Returns `(done, failed)`.
     pub async fn sweep_member_roles_once(&self) -> (usize, usize) {
         let branches = match self.metadata.member_role_branches().await {

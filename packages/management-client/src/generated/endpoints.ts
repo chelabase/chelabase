@@ -25,6 +25,7 @@ import type {
 
 import type {
   AccessEventPage,
+  AcknowledgeReviewRequest,
   AppUser,
   AppUserPage,
   AppUserSession,
@@ -69,6 +70,7 @@ import type {
   GetSqlSchemaParams,
   GetTableParams,
   GrantOverride,
+  GuardExemptions,
   InstanceSettings,
   InviteDelivery,
   InviteResult,
@@ -96,6 +98,9 @@ import type {
   ResentInvite,
   RestoreAccepted,
   RestoreRequest,
+  Review,
+  ReviewFixRequest,
+  ReviewFixResponse,
   RoleSessions,
   RunSqlRequest,
   SavedQuery,
@@ -883,8 +888,8 @@ export const getUpdateBranchUrl = (id: string,
 }
 
 /**
- * Sets the branch's `protected` flag. A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included.
- * @summary Protect or unprotect a branch
+ * Sets the branch's `protected` flag and its `guard_logins` switch (at least one of them). A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included. Protecting runs the branch's review (`getBranchReview`) on its running compute: when the review lists anything, `review_hash` must be its current `hash` (else 409 `review_changed` with the current review), and the review is stored as acknowledged. On a protected branch with `guard_logins` on, login roles other than the owner, member logins and the branch's guard exemptions can't change the schema. Every change reconciles the branch's member roles and its guard.
+ * @summary Protect or unprotect a branch, or switch its login-role guard
  */
 export const updateBranch = async (id: string,
     branchId: string,
@@ -952,7 +957,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type UpdateBranchMutationVariables = {id: string;branchId: string;data: UpdateBranchRequest}
 
     /**
- * @summary Protect or unprotect a branch
+ * @summary Protect or unprotect a branch, or switch its login-role guard
  */
 export const useUpdateBranch = <TError = ErrorType<ErrorEnvelope>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateBranch>>, TError,UpdateBranchMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
@@ -1540,6 +1545,274 @@ export function useListBranchDatabases<TData = Awaited<ReturnType<typeof listBra
 
 
 
+
+export const getListGuardExemptionsUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/guard-exemptions`
+}
+
+/**
+ * The login roles, by name, that the branch's "guard login roles" switch leaves alone: on a protected branch with `guard_logins` on, they may still change the schema. Sorted by name (byte order). A new branch copies its parent's.
+ * @summary List a branch's guard exemptions
+ */
+export const listGuardExemptions = async (id: string,
+    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<GuardExemptions> => {
+
+  return customFetch<GuardExemptions>(getListGuardExemptionsUrl(id,branchId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListGuardExemptionsQueryKey = (id: string,
+    branchId: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/guard-exemptions`
+    ] as const;
+    }
+
+
+export const getListGuardExemptionsQueryOptions = <TData = Awaited<ReturnType<typeof listGuardExemptions>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listGuardExemptions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListGuardExemptionsQueryKey(id,branchId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listGuardExemptions>>> = ({ signal }) => listGuardExemptions(id,branchId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listGuardExemptions>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListGuardExemptionsQueryResult = NonNullable<Awaited<ReturnType<typeof listGuardExemptions>>>
+export type ListGuardExemptionsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListGuardExemptions<TData = Awaited<ReturnType<typeof listGuardExemptions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listGuardExemptions>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listGuardExemptions>>,
+          TError,
+          Awaited<ReturnType<typeof listGuardExemptions>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListGuardExemptions<TData = Awaited<ReturnType<typeof listGuardExemptions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listGuardExemptions>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listGuardExemptions>>,
+          TError,
+          Awaited<ReturnType<typeof listGuardExemptions>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListGuardExemptions<TData = Awaited<ReturnType<typeof listGuardExemptions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listGuardExemptions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a branch's guard exemptions
+ */
+
+export function useListGuardExemptions<TData = Awaited<ReturnType<typeof listGuardExemptions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listGuardExemptions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListGuardExemptionsQueryOptions(id,branchId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getPutGuardExemptionUrl = (id: string,
+    branchId: string,
+    role: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/guard-exemptions/${encodeURIComponent(String(role))}`
+}
+
+/**
+ * Adds `role`, by name, to the branch's guard exemptions (idempotent). The role need not exist: a role dropped and made again in SQL keeps its exemption, a renamed one loses it. Reconciles the branch's guard.
+ * @summary Exempt a login role from a branch's guard
+ */
+export const putGuardExemption = async (id: string,
+    branchId: string,
+    role: string, options?: Parameters<typeof customFetch>[1]): Promise<GuardExemptions> => {
+
+  return customFetch<GuardExemptions>(getPutGuardExemptionUrl(id,branchId,role),
+  {
+    ...options,
+    method: 'PUT'
+
+
+  }
+);}
+
+
+
+
+
+export const getPutGuardExemptionMutationKey = () => ['putGuardExemption'] as const;
+
+export const getPutGuardExemptionMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putGuardExemption>>, TError,PutGuardExemptionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof putGuardExemption>>, TError,PutGuardExemptionMutationVariables, TContext> => {
+
+const mutationKey = getPutGuardExemptionMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof putGuardExemption>>, PutGuardExemptionMutationVariables> = (props) => {
+          const {id,branchId,role} = props ?? {};
+
+          return  putGuardExemption(id,branchId,role,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PutGuardExemptionMutationResult = NonNullable<Awaited<ReturnType<typeof putGuardExemption>>>
+
+    export type PutGuardExemptionMutationError = ErrorType<ErrorEnvelope>
+    export type PutGuardExemptionMutationVariables = {id: string;branchId: string;role: string}
+
+    /**
+ * @summary Exempt a login role from a branch's guard
+ */
+export const usePutGuardExemption = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putGuardExemption>>, TError,PutGuardExemptionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof putGuardExemption>>,
+        TError,
+        PutGuardExemptionMutationVariables,
+        TContext
+      > => {
+      return useMutation(getPutGuardExemptionMutationOptions(options), queryClient);
+    }
+
+export const getDeleteGuardExemptionUrl = (id: string,
+    branchId: string,
+    role: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/guard-exemptions/${encodeURIComponent(String(role))}`
+}
+
+/**
+ * Removes `role` from the branch's guard exemptions (idempotent). Reconciles the branch's guard.
+ * @summary Remove a login role's guard exemption
+ */
+export const deleteGuardExemption = async (id: string,
+    branchId: string,
+    role: string, options?: Parameters<typeof customFetch>[1]): Promise<GuardExemptions> => {
+
+  return customFetch<GuardExemptions>(getDeleteGuardExemptionUrl(id,branchId,role),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteGuardExemptionMutationKey = () => ['deleteGuardExemption'] as const;
+
+export const getDeleteGuardExemptionMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteGuardExemption>>, TError,DeleteGuardExemptionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteGuardExemption>>, TError,DeleteGuardExemptionMutationVariables, TContext> => {
+
+const mutationKey = getDeleteGuardExemptionMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteGuardExemption>>, DeleteGuardExemptionMutationVariables> = (props) => {
+          const {id,branchId,role} = props ?? {};
+
+          return  deleteGuardExemption(id,branchId,role,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteGuardExemptionMutationResult = NonNullable<Awaited<ReturnType<typeof deleteGuardExemption>>>
+
+    export type DeleteGuardExemptionMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteGuardExemptionMutationVariables = {id: string;branchId: string;role: string}
+
+    /**
+ * @summary Remove a login role's guard exemption
+ */
+export const useDeleteGuardExemption = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteGuardExemption>>, TError,DeleteGuardExemptionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteGuardExemption>>,
+        TError,
+        DeleteGuardExemptionMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteGuardExemptionMutationOptions(options), queryClient);
+    }
 
 export const getListKeysUrl = (id: string,
     branchId: string,) => {
@@ -2710,6 +2983,300 @@ export const useRestoreBranch = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getRestoreBranchMutationOptions(options), queryClient);
+    }
+
+export const getGetBranchReviewUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/review`
+}
+
+/**
+ * The worker scans every live database of the branch, as `cloud_admin`, for code owned by a non-Admin role that can run in someone else's session (an Admin's included): triggers whose function or table such a role owns, rules on its relations, and its functions that are SECURITY DEFINER or reached from a policy, a default or generated column, a check, an index, a view, a trigger, a rule, a range type or another such function. Each item has a stable `key`, its `reasons`, and `new` when a list was acknowledged that didn't hold it. `hash` is what protecting (`review_hash`), acknowledging and fixing confirm. Needs the branch's compute running.
+ * @summary Review the code that can run in someone else's session
+ */
+export const getBranchReview = async (id: string,
+    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<Review> => {
+
+  return customFetch<Review>(getGetBranchReviewUrl(id,branchId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetBranchReviewQueryKey = (id: string,
+    branchId: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/review`
+    ] as const;
+    }
+
+
+export const getGetBranchReviewQueryOptions = <TData = Awaited<ReturnType<typeof getBranchReview>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchReview>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetBranchReviewQueryKey(id,branchId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getBranchReview>>> = ({ signal }) => getBranchReview(id,branchId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getBranchReview>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetBranchReviewQueryResult = NonNullable<Awaited<ReturnType<typeof getBranchReview>>>
+export type GetBranchReviewQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetBranchReview<TData = Awaited<ReturnType<typeof getBranchReview>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchReview>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getBranchReview>>,
+          TError,
+          Awaited<ReturnType<typeof getBranchReview>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetBranchReview<TData = Awaited<ReturnType<typeof getBranchReview>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchReview>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getBranchReview>>,
+          TError,
+          Awaited<ReturnType<typeof getBranchReview>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetBranchReview<TData = Awaited<ReturnType<typeof getBranchReview>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchReview>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Review the code that can run in someone else's session
+ */
+
+export function useGetBranchReview<TData = Awaited<ReturnType<typeof getBranchReview>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getBranchReview>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetBranchReviewQueryOptions(id,branchId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getAcknowledgeBranchReviewUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/review/acknowledge`
+}
+
+/**
+ * Stores the current review as acknowledged: its `hash` becomes the branch's `review_acknowledged_hash`, and its items stop being `new`. `hash` must be the current review's.
+ * @summary Acknowledge a branch's review
+ */
+export const acknowledgeBranchReview = async (id: string,
+    branchId: string,
+    acknowledgeReviewRequest: AcknowledgeReviewRequest, options?: Parameters<typeof customFetch>[1]): Promise<Review> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Review>(getAcknowledgeBranchReviewUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(acknowledgeReviewRequest)
+  }
+);}
+
+
+
+
+
+export const getAcknowledgeBranchReviewMutationKey = () => ['acknowledgeBranchReview'] as const;
+
+export const getAcknowledgeBranchReviewMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof acknowledgeBranchReview>>, TError,AcknowledgeBranchReviewMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof acknowledgeBranchReview>>, TError,AcknowledgeBranchReviewMutationVariables, TContext> => {
+
+const mutationKey = getAcknowledgeBranchReviewMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof acknowledgeBranchReview>>, AcknowledgeBranchReviewMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  acknowledgeBranchReview(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AcknowledgeBranchReviewMutationResult = NonNullable<Awaited<ReturnType<typeof acknowledgeBranchReview>>>
+    export type AcknowledgeBranchReviewMutationBody = AcknowledgeReviewRequest
+    export type AcknowledgeBranchReviewMutationError = ErrorType<ErrorEnvelope>
+    export type AcknowledgeBranchReviewMutationVariables = {id: string;branchId: string;data: AcknowledgeReviewRequest}
+
+    /**
+ * @summary Acknowledge a branch's review
+ */
+export const useAcknowledgeBranchReview = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof acknowledgeBranchReview>>, TError,AcknowledgeBranchReviewMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof acknowledgeBranchReview>>,
+        TError,
+        AcknowledgeBranchReviewMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAcknowledgeBranchReviewMutationOptions(options), queryClient);
+    }
+
+export const getFixBranchReviewItemUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/review/fix`
+}
+
+/**
+ * The worker scans the branch again, checks `hash` against it, and runs one fix in the item's database in its own transaction with `lock_timeout` 5 s: `reassign` gives the item's function (a trigger's function; a rule's relation) to the owner (`ALTER … OWNER TO`), after which the Admin answers for its code and a SECURITY DEFINER function runs as the owner; `drop` drops the function, trigger or rule `RESTRICT` (never cascading). Answers with the SQL it ran and the review after it.
+ * @summary Fix one item of a branch's review
+ */
+export const fixBranchReviewItem = async (id: string,
+    branchId: string,
+    reviewFixRequest: ReviewFixRequest, options?: Parameters<typeof customFetch>[1]): Promise<ReviewFixResponse> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<ReviewFixResponse>(getFixBranchReviewItemUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(reviewFixRequest)
+  }
+);}
+
+
+
+
+
+export const getFixBranchReviewItemMutationKey = () => ['fixBranchReviewItem'] as const;
+
+export const getFixBranchReviewItemMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof fixBranchReviewItem>>, TError,FixBranchReviewItemMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof fixBranchReviewItem>>, TError,FixBranchReviewItemMutationVariables, TContext> => {
+
+const mutationKey = getFixBranchReviewItemMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof fixBranchReviewItem>>, FixBranchReviewItemMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  fixBranchReviewItem(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type FixBranchReviewItemMutationResult = NonNullable<Awaited<ReturnType<typeof fixBranchReviewItem>>>
+    export type FixBranchReviewItemMutationBody = ReviewFixRequest
+    export type FixBranchReviewItemMutationError = ErrorType<ErrorEnvelope>
+    export type FixBranchReviewItemMutationVariables = {id: string;branchId: string;data: ReviewFixRequest}
+
+    /**
+ * @summary Fix one item of a branch's review
+ */
+export const useFixBranchReviewItem = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof fixBranchReviewItem>>, TError,FixBranchReviewItemMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof fixBranchReviewItem>>,
+        TError,
+        FixBranchReviewItemMutationVariables,
+        TContext
+      > => {
+      return useMutation(getFixBranchReviewItemMutationOptions(options), queryClient);
     }
 
 export const getListRolesUrl = (id: string,

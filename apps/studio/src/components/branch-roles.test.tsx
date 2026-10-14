@@ -21,6 +21,7 @@ const role = (over: Partial<BranchRole> & { name: string }): BranchRole => ({
   member_of: [],
   member_no_set: [],
   member_admin: [],
+  guard_exempt: false,
   ...over,
 });
 const owner = role({ name: "chelabase_owner", origin: "owner", level: "owner_level" });
@@ -323,5 +324,31 @@ describe("BranchRoles", () => {
     await userEvent.click((await rowOf("ops")).getByRole("button", { name: "Reveal ops" }));
     await screen.findByText("ops-password-xyz");
     expect(cachedState(queryClient)).not.toContain("password-xyz");
+  });
+});
+
+describe("login guard exemptions (PB)", () => {
+  const EXEMPT = (name: string) => `/v1/databases/db/branches/br/guard-exemptions/${name}`;
+
+  it("exempt_toggle_puts_and_deletes", async () => {
+    const exempt = { ...reader, guard_exempt: true };
+    const put = vi.fn(() => jsonResponse({ exemptions: ["analyst", "reporting"] }));
+    const del = vi.fn(() => jsonResponse({ exemptions: [] }));
+    renderWithQuery(<BranchRoles databaseId="db" branchId="br" />, {
+      fetch: fakeFetch({
+        [`GET ${ROLES}`]: () => jsonResponse([owner, exempt, sqlRole]),
+        [`PUT ${EXEMPT("analyst")}`]: put,
+        [`DELETE ${EXEMPT("reporting")}`]: del,
+      }),
+    });
+    const on = await screen.findByRole("switch", { name: "Exempt reporting from the login guard" });
+    expect(on).toBeChecked();
+    const off = screen.getByRole("switch", { name: "Exempt analyst from the login guard" });
+    expect(off).not.toBeChecked();
+    expect(screen.queryByRole("switch", { name: `Exempt ${owner.name} from the login guard` })).toBeNull();
+    await userEvent.click(off);
+    await vi.waitFor(() => expect(put).toHaveBeenCalled());
+    await userEvent.click(on);
+    await vi.waitFor(() => expect(del).toHaveBeenCalled());
   });
 });

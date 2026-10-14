@@ -6,6 +6,7 @@ pub mod role_name;
 pub mod role_password;
 pub mod role_settings;
 pub mod mode_policy;
+pub mod protection;
 pub mod access;
 pub mod api_error;
 pub mod table_api;

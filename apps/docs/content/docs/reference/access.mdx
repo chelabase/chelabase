@@ -78,6 +78,9 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/console/schema` | Zitadel token | Act as: Viewer and the role in your set |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/data-api/schema` | Zitadel token | Project Viewer |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/databases` | Zitadel token | Project Viewer |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions` | Zitadel token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Zitadel token | Project Admin |
+| PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Zitadel token | Project Admin |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/keys` | Zitadel token | Project Viewer |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/keys` | Zitadel token | Project Developer |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}` | Zitadel token | Project Developer |
@@ -91,6 +94,9 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-password` | Zitadel token | Project Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-to-parent` | Zitadel token | Branch: Developer unprotected, Admin protected |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/restore` | Zitadel token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/review` | Zitadel token | Project Developer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/review/acknowledge` | Zitadel token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/review/fix` | Zitadel token | Project Admin |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles` | Zitadel token | Project Viewer |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles` | Zitadel token | Project Admin |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Zitadel token | Project Admin |

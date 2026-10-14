@@ -26,6 +26,8 @@ const mk = (over: Partial<BranchSummary> & { name: string; id: string }): Branch
   error: null,
   protected: false,
   main_database_missing: false,
+  guard_logins: true,
+  review_acknowledged_hash: null,
   ...over,
 });
 const main = mk({ id: "m", name: "main" });
@@ -395,7 +397,10 @@ describe("BranchActions protection", () => {
 
   it("protect_toggle_confirms_and_patches", async () => {
     const patch = vi.fn(() => jsonResponse({ ...dev, protected: true }));
-    const { fetch } = setup(dev, [main, dev], { [PATCH]: patch });
+    const { fetch } = setup(dev, [main, dev], {
+      [PATCH]: patch,
+      ["GET /v1/databases/db/branches/d/review"]: () => jsonResponse({ items: [], hash: "e0", acknowledged_hash: null }),
+    });
     await userEvent.click(btn("Protect"));
     expect(
       screen.getByText(
@@ -406,7 +411,7 @@ describe("BranchActions protection", () => {
     await userEvent.click(btn("Confirm protect"));
     await vi.waitFor(() => expect(patch).toHaveBeenCalled());
     const call = fetch.calls.find((r) => r.method === "PATCH")!;
-    expect(await call.clone().json()).toEqual({ protected: true });
+    expect(await call.clone().json()).toEqual({ protected: true, review_hash: "e0" });
   });
 
   it("unprotect patches without a confirm", async () => {
@@ -555,5 +560,200 @@ describe("BranchActions merges", () => {
     expect(screen.getByRole("link", { name: "Open the merge" })).toHaveAttribute("href", "/app/projects/p1/databases/db/merges/m3");
     // The half-applied merge still owns the pair: no second merge into main.
     expect(btn("Merge into main")).toBeDisabled();
+  });
+});
+
+describe("protected branches (PB)", () => {
+  const PATCH = "PATCH /v1/databases/db/branches/d";
+  const REVIEW = "GET /v1/databases/db/branches/d/review";
+  const ACK = "POST /v1/databases/db/branches/d/review/acknowledge";
+  const FIX = "POST /v1/databases/db/branches/d/review/fix";
+  const planted = {
+    key: "web1/function/public.planted()",
+    database: "web1",
+    kind: "function",
+    schema: "public",
+    name: "planted",
+    identity: "",
+    function: "public.planted()",
+    owner: "dev",
+    reasons: [
+      { kind: "security_definer", via: null },
+      { kind: "policy", via: "public.t.p" },
+    ],
+    opaque_body: true,
+    new: false,
+  };
+  const review = (over: object = {}) => ({ items: [planted], hash: "h1", acknowledged_hash: null, ...over });
+
+  it("protect_shows_the_review_and_sends_its_hash", async () => {
+    const patch = vi.fn(() => jsonResponse({ ...dev, protected: true, review_acknowledged_hash: "h1" }));
+    const { fetch } = setup(dev, [main, dev], { [REVIEW]: () => jsonResponse(review()), [PATCH]: patch });
+    await userEvent.click(btn("Protect"));
+    expect(await screen.findByText("public.planted()")).toBeInTheDocument();
+    expect(screen.getByText("security definer")).toBeInTheDocument();
+    expect(screen.getByText("policy public.t.p")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Guard login roles" })).toBeChecked();
+    await userEvent.click(btn("Confirm protect"));
+    await vi.waitFor(() => expect(patch).toHaveBeenCalled());
+    const call = fetch.calls.find((r) => r.method === "PATCH")!;
+    expect(await call.clone().json()).toEqual({ protected: true, review_hash: "h1" });
+  });
+
+  it("protect_sends_the_switch_when_changed", async () => {
+    const patch = vi.fn(() => jsonResponse({ ...dev, protected: true, guard_logins: false }));
+    const { fetch } = setup(dev, [main, dev], {
+      [REVIEW]: () => jsonResponse(review({ items: [], hash: "e0" })),
+      [PATCH]: patch,
+    });
+    await userEvent.click(btn("Protect"));
+    await userEvent.click(await screen.findByRole("switch", { name: "Guard login roles" }));
+    await userEvent.click(btn("Confirm protect"));
+    await vi.waitFor(() => expect(patch).toHaveBeenCalled());
+    const call = fetch.calls.find((r) => r.method === "PATCH")!;
+    expect(await call.clone().json()).toEqual({ protected: true, review_hash: "e0", guard_logins: false });
+  });
+
+  it("protect_shows_the_changed_review_on_review_changed", async () => {
+    const later = { ...planted, key: "web1/function/public.later()", name: "later", function: "public.later()", new: true };
+    const patch = vi.fn(() =>
+      jsonResponse(
+        { error: { code: "review_changed", message: "changed", review: review({ items: [planted, later], hash: "h2" }) } },
+        409,
+      ),
+    );
+    setup(dev, [main, dev], { [REVIEW]: () => jsonResponse(review()), [PATCH]: patch });
+    await userEvent.click(btn("Protect"));
+    await screen.findByText("public.planted()");
+    await userEvent.click(btn("Confirm protect"));
+    expect(await screen.findByText("The review changed since you loaded it. Check the list again.")).toBeInTheDocument();
+    expect(await screen.findByText("public.later()")).toBeInTheDocument();
+  });
+
+  it("reassign_confirms_then_posts_the_fix", async () => {
+    const fix = vi.fn(() =>
+      jsonResponse({ sql: "ALTER ROUTINE public.planted() OWNER TO postgres;", review: review({ items: [], hash: "e0" }) }),
+    );
+    const { fetch } = setup(dev, [main, dev], { [REVIEW]: () => jsonResponse(review()), [FIX]: fix });
+    await userEvent.click(btn("Protect"));
+    await userEvent.click(await screen.findByRole("button", { name: "Reassign public.planted()" }));
+    expect(
+      screen.getByText("The owner takes this code over. A SECURITY DEFINER function then runs as the owner."),
+    ).toBeInTheDocument();
+    expect(fix).not.toHaveBeenCalled();
+    await userEvent.click(btn("Confirm reassign"));
+    await vi.waitFor(() => expect(fix).toHaveBeenCalled());
+    const call = fetch.calls.find((r) => r.method === "POST" && r.url.endsWith("/review/fix"))!;
+    expect(await call.clone().json()).toEqual({ key: planted.key, action: "reassign", hash: "h1" });
+  });
+
+  it("protection_panel_toggles_and_acknowledges", async () => {
+    const guarded = { ...dev, protected: true, review_acknowledged_hash: "h0" };
+    const patch = vi.fn(() => jsonResponse({ ...guarded, guard_logins: false }));
+    const ack = vi.fn(() => jsonResponse(review({ acknowledged_hash: "h1" })));
+    const { fetch } = setup(guarded, [main, guarded], {
+      [REVIEW]: () => jsonResponse(review({ acknowledged_hash: "h0", items: [{ ...planted, new: true }] })),
+      [PATCH]: patch,
+      [ACK]: ack,
+    });
+    expect(await screen.findByText("Review changed")).toBeInTheDocument();
+    await userEvent.click(btn("Protection"));
+    await userEvent.click(await screen.findByRole("switch", { name: "Guard login roles" }));
+    await vi.waitFor(() => expect(patch).toHaveBeenCalled());
+    expect(await fetch.calls.find((r) => r.method === "PATCH")!.clone().json()).toEqual({ guard_logins: false });
+    await userEvent.click(btn("Acknowledge"));
+    await vi.waitFor(() => expect(ack).toHaveBeenCalled());
+    expect(await fetch.calls.find((r) => r.url.endsWith("/review/acknowledge"))!.clone().json()).toEqual({ hash: "h1" });
+  });
+
+  it("no_badge_when_the_review_is_acknowledged", async () => {
+    const guarded = { ...dev, protected: true, review_acknowledged_hash: "h1" };
+    const { fetch } = setup(guarded, [main, guarded], { [REVIEW]: () => jsonResponse(review({ acknowledged_hash: "h1" })) });
+    await vi.waitFor(() => expect(sent(fetch)).toContain("GET /v1/databases/db/branches/d/review"));
+    expect(screen.queryByText("Review changed")).toBeNull();
+  });
+
+  it("an_unprotected_branch_loads_no_review_until_protect_opens", () => {
+    const { fetch } = setup(dev, [main, dev], { [REVIEW]: () => jsonResponse(review()) });
+    expect(sent(fetch)).not.toContain("GET /v1/databases/db/branches/d/review");
+  });
+});
+
+describe("protected branches (PB): T5 review fixes", () => {
+  const REVIEW = "GET /v1/databases/db/branches/d/review";
+  const ACK = "POST /v1/databases/db/branches/d/review/acknowledge";
+  const FIX = "POST /v1/databases/db/branches/d/review/fix";
+  const item = (name: string, isNew = false) => ({
+    key: `web1/function/public.${name}()`,
+    database: "web1",
+    kind: "function",
+    schema: "public",
+    name,
+    identity: "",
+    function: `public.${name}()`,
+    owner: "dev",
+    reasons: [{ kind: "security_definer", via: null }],
+    opaque_body: true,
+    new: isNew,
+  });
+  const guarded = { ...dev, protected: true, review_acknowledged_hash: "h1" };
+  const current = { items: [item("planted")], hash: "h1", acknowledged_hash: "h1" };
+  const changed = (review: object) =>
+    jsonResponse({ error: { code: "review_changed", message: "changed", review } }, 409);
+  const later = { items: [item("planted"), item("later", true)], hash: "h2", acknowledged_hash: "h1" };
+
+  // Finding 1: a fix answered review_changed shows the new list and says so.
+  it("a_fix_answered_review_changed_shows_the_new_list", async () => {
+    setup(guarded, [main, guarded], { [REVIEW]: () => jsonResponse(current), [FIX]: () => changed(later) });
+    await userEvent.click(btn("Protection"));
+    await userEvent.click(await screen.findByRole("button", { name: "Reassign public.planted()" }));
+    await userEvent.click(btn("Confirm reassign"));
+    expect(await screen.findByText("The review changed since you loaded it. Check the list again.")).toBeInTheDocument();
+    expect(await screen.findByText("public.later()")).toBeInTheDocument();
+  });
+
+  // Finding 1: so does an acknowledge.
+  it("an_acknowledge_answered_review_changed_shows_the_new_list", async () => {
+    setup(guarded, [main, guarded], { [REVIEW]: () => jsonResponse(current), [ACK]: () => changed(later) });
+    await userEvent.click(btn("Protection"));
+    await userEvent.click(await screen.findByRole("button", { name: "Acknowledge" }));
+    expect(await screen.findByText("The review changed since you loaded it. Check the list again.")).toBeInTheDocument();
+    expect(await screen.findByText("public.later()")).toBeInTheDocument();
+  });
+
+  // Finding 2: a review that can't load says why at once and offers a retry.
+  it("a_review_that_cannot_load_offers_a_retry", async () => {
+    const unavailable: FakeHandler = () =>
+      jsonResponse({ error: { code: "unavailable", message: "the branch's compute isn't running" } }, 503);
+    setup(dev, [main, dev], {
+      [REVIEW]: sequence(unavailable, () => jsonResponse({ items: [item("planted")], hash: "h1", acknowledged_hash: null })),
+    });
+    await userEvent.click(btn("Protect"));
+    await userEvent.click(await screen.findByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("public.planted()")).toBeInTheDocument();
+    expect(btn("Confirm protect")).toBeEnabled();
+  });
+
+  // Finding 4: the fix confirm takes focus.
+  it("the_fix_confirm_takes_focus", async () => {
+    setup(guarded, [main, guarded], { [REVIEW]: () => jsonResponse(current) });
+    await userEvent.click(btn("Protection"));
+    await userEvent.click(await screen.findByRole("button", { name: "Drop public.planted()" }));
+    expect(btn("Confirm drop")).toHaveFocus();
+  });
+});
+
+describe("protected branches (PB): end-of-step", () => {
+  const REVIEW = "GET /v1/databases/db/branches/d/review";
+
+  // End-of-step Minor: a protected branch whose review can't load (a suspended compute) says so
+  // on its row instead of hiding the badge.
+  it("a_badge_review_that_cannot_load_says_so", async () => {
+    const guarded = { ...dev, protected: true, review_acknowledged_hash: "h1" };
+    setup(guarded, [main, guarded], {
+      [REVIEW]: () => jsonResponse({ error: { code: "unavailable", message: "the branch's compute isn't running" } }, 503),
+    });
+    expect(await screen.findByText("Review unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("Review changed")).toBeNull();
   });
 });

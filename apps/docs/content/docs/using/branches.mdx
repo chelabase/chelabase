@@ -66,3 +66,62 @@ Protect a branch in Studio's branch settings, or with `PATCH /v1/databases/{id}/
 - Delete and reset-to-parent are refused with 409 `branch_protected` while a branch is protected.
 - Deleting the database, or the project that holds it, is refused too.
 - Restore is allowed. The owner and the roles made in Studio or through the API keep their current passwords; roles made in SQL are as they were at the restore point, passwords included (a role made after it is gone).
+
+### What protecting blocks
+
+A protected branch refuses schema changes from member logins that aren't Admins. A member login is the login a project member gets on a branch (`cb_m_<id>`). Postgres refuses the statement with SQLSTATE `42501` and the hint `chelabase:branch_protected`. Temporary objects, `REFRESH MATERIALIZED VIEW` and `REINDEX` stay allowed for everyone.
+
+Each branch also has a **guard login roles** switch (`guard_logins`). When the switch is on and the branch is protected, every login role on the branch is refused schema changes in the same way, from its first statement, including roles created later from SQL. Superusers, the owner, the member logins of Admins and the roles exempted on that branch are not refused. The member logins of non-Admins are refused whatever the switch says.
+
+The guard is in every database of the branch, and in `template1`, so a database made with `CREATE DATABASE` is guarded from the start. A database made from `template0` is unguarded for the few seconds until the reconcile its creation asks for has run.
+
+### Exemptions
+
+Exemptions are per branch and are listed by role name. `GET /v1/databases/{id}/branches/{branch_id}/guard-exemptions` lists them. `PUT .../guard-exemptions/{role}` adds a name and `DELETE .../guard-exemptions/{role}` removes it; both are idempotent. In Studio, the branch's roles list has a "Login guard" column with an "Exempt `<name>` from the login guard" switch on each login role. A name may be listed before the role exists, and it is 1 to 63 bytes with no NUL. Because exemptions match by name, a role that is dropped and re-created keeps its exemption, and a renamed role loses it.
+
+An exemption is honored only for a role that exists and that no guarded role can administer: if a guarded role holds ADMIN on it, directly or through a chain of role memberships, the exemption is not in effect (the platform logs a warning). Otherwise a guarded role could take the exempt role over, or create a role under an exempt name and log in as it. A role a guarded role creates is administered by its creator, so its exemption isn't honored.
+
+The switch and the exemptions can be set on any branch. They take effect only while the branch is protected.
+
+### Where the settings come from
+
+A new branch copies its parent's switch and exemptions when it is created. The copy is dormant until the branch is protected. A branch with no parent (main) starts with the switch on and no exemptions.
+
+### The review
+
+Protecting also requires a review. The review lists code owned by an untrusted role that can run in an Admin's session, because that code can change the schema when an Admin runs something. Only superusers and the owner role itself are trusted; any other role is untrusted, including members of the owner (the guard treats them the same way). The review is a catalog scan of every database on the branch. It lists:
+
+- triggers and rules whose function or table is owned by an untrusted role;
+- SECURITY DEFINER functions owned by an untrusted role;
+- functions owned by an untrusted role that are reached from policies, column and domain defaults, generated columns, CHECK constraints, index expressions and predicates, views, operators, range types, triggers, rules, or other listed functions, including the functions a SECURITY DEFINER function calls.
+
+Objects from extensions, and objects in `pg_catalog`, `information_schema` and the platform's reserved schemas, are skipped. A PL/pgSQL or dynamic body can't be followed past its text, so such a function is listed by its reach and marked as opaque. Each item shows its database, kind, schema, name, identity, owner, the reasons it is listed, and a stable key.
+
+The review has a hash, computed over the current list. To protect a branch whose list isn't empty, send the hash as `review_hash`. A missing or stale hash is refused with 409 `review_changed`, and the response's `error.review` holds the current review. Protecting stores the hash as acknowledged. An item that wasn't in the list last acknowledged is marked `new`. `POST .../review/acknowledge` with `{"hash": "..."}` stores the current list as acknowledged without changing anything. Studio's branch list shows a "Review changed" badge on a protected branch whose current hash differs from the acknowledged one, and "Review unavailable" when the review can't be loaded (for example, the branch's compute isn't running). The hash covers each item's definition too, so replacing a function's body in place changes it.
+
+### Fixing an item
+
+Each fix works on one item and carries the item's key and the review hash. A stale hash is refused with 409 `review_changed`. A fix runs with the platform's rights, not the owner's, so that it can reach an object the owner isn't a member of. It can only touch items that the scan found.
+
+- **Reassign** gives the code to the branch owner. For a trigger, the function is reassigned; for a rule, its table is reassigned. The owner then holds that code, and a SECURITY DEFINER function runs as the owner from then on. The Admin who reassigns answers for what the code does. Studio warns about this before the fix runs.
+- **Drop** removes a trigger, rule or function with `RESTRICT`. If other objects depend on it, the fix is refused with 409 `has_dependents`, and the message names them. Nothing is removed with them.
+
+Each fix runs in its own transaction with a 5-second lock timeout (409 `lock_timeout`; retry it). A Postgres refusal is returned as 400 `schema_change_failed`, with the SQLSTATE and message. A successful fix returns the SQL it ran and the new review.
+
+The review and its fixes need the branch's compute to be running. When it isn't, the scan answers 503 `unavailable`.
+
+### Routes
+
+All routes are under `/v1/databases/{id}/branches/{branch_id}`. Reads need the Developer role on the project; writes need Admin.
+
+| Method and path | Access | What it does |
+|---|---|---|
+| `PATCH` | Admin | Sets `protected`, `guard_logins` or `review_hash`. At least one of `protected` and `guard_logins` is needed, and `review_hash` is accepted only with `protected: true`; otherwise 422. |
+| `GET /review` | Developer | Returns the review, its hash, the acknowledged hash and each item's `new` flag. |
+| `POST /review/acknowledge` | Admin | Body `{"hash"}`. Stores the current review as acknowledged. |
+| `POST /review/fix` | Admin | Body `{"key", "action", "hash"}`, where `action` is `reassign` or `drop`. |
+| `GET /guard-exemptions` | Developer | Lists the exempt role names. |
+| `PUT /guard-exemptions/{role}` | Admin | Exempts a role name on this branch. |
+| `DELETE /guard-exemptions/{role}` | Admin | Removes an exemption. |
+
+Each write that changes the switch or the exemptions updates the branch's member roles. The errors that matter here are `review_changed` (409, with `error.review`), `has_dependents` (409, on a drop), `lock_timeout` (409, retry) and `schema_change_failed` (400, with `sqlstate`). See the [error reference](/docs/reference/errors) for the full list.

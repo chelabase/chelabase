@@ -973,9 +973,18 @@ fn all_scripts(w: &FakeWorker) -> Vec<(String, String)> {
         .collect()
 }
 
-/// [`all_scripts`] without the per-database cleanups every reconcile runs (R31).
-fn scripts(w: &FakeWorker) -> Vec<(String, String)> {
+/// [`all_scripts`] without the read-only guard presence check every unprotected reconcile
+/// runs in each database (PB S2): what changes anything.
+fn changing_scripts(w: &FakeWorker) -> Vec<(String, String)> {
     all_scripts(w)
+        .into_iter()
+        .filter(|(_, s)| !s.starts_with(crate::schema_guard::GUARD_PRESENT_MARK))
+        .collect()
+}
+
+/// [`changing_scripts`] without the per-database cleanups every reconcile runs (R31).
+fn scripts(w: &FakeWorker) -> Vec<(String, String)> {
+    changing_scripts(w)
         .into_iter()
         .filter(|(_, s)| !s.contains(CLEANUP_MARK))
         .collect()
@@ -1195,7 +1204,7 @@ async fn a_removed_member_role_is_dropped_everywhere_and_its_row_removed() {
     // R31: the member last acted as billing.
     w.metadata.state().acted_roles.insert((member, branch.as_uuid()), "billing".into());
     assert!(done(&w.reconcile_member_roles(branch, None).await));
-    let calls = all_scripts(&w);
+    let calls = changing_scripts(&w);
     assert_eq!(calls.len(), 4, "{calls:?}");
     assert!(calls[0].1.contains(&format!(
         "ALTER ROLE {role} NOLOGIN;\n{}",
@@ -1481,7 +1490,7 @@ async fn every_reconcile_hands_leftovers_to_the_last_acted_role_then_drops() {
         &format!("{answer}{}", leftovers(&[(&role, Some("app")), (&role, None)])),
     );
     assert!(done(&w.reconcile_member_roles(branch, None).await));
-    let calls = all_scripts(&w);
+    let calls = changing_scripts(&w);
     assert_eq!(calls.len(), 4, "{calls:?}");
     assert_eq!(calls[0], ("app".to_string(), cleanup_script(&role, Some("sales"))));
     assert_eq!(calls[1], ("postgres".to_string(), cleanup_script(&role, Some("sales"))));
@@ -1502,7 +1511,7 @@ async fn every_reconcile_hands_leftovers_to_the_last_acted_role_then_drops() {
         .answer(),
     );
     assert!(done(&w.reconcile_member_roles(branch, None).await));
-    assert_eq!(all_scripts(&w), Vec::<(String, String)>::new());
+    assert_eq!(changing_scripts(&w), Vec::<(String, String)>::new());
 }
 
 /// R31, the sweep backstop: a converged member role whose hand-over never ran (leftovers, no
@@ -1529,7 +1538,7 @@ async fn a_converged_reconcile_cleans_up_a_missed_hand_over() {
     );
     assert!(done(&w.reconcile_member_roles(branch, None).await));
     assert_eq!(
-        all_scripts(&w),
+        changing_scripts(&w),
         vec![("other".to_string(), cleanup_script(&role, Some("billing")))]
     );
 }
@@ -1717,7 +1726,7 @@ async fn a_failed_reconcile_is_retried() {
     ));
 }
 
-/// I2: the sweep reconciles every ready branch of a tenant with members.
+/// I2: the sweep reconciles every ready branch (PB end-of-step R12: members or not).
 #[tokio::test]
 async fn the_sweep_reconciles_every_branch_with_members() {
     let (w, _journal) = worker();
@@ -1732,9 +1741,9 @@ async fn the_sweep_reconciles_every_branch_with_members() {
             &cat(&["!postgres", "billing"]),
         );
     }
-    // A database of a tenant without members isn't visited.
+    // A database of a tenant without members is visited too (R12: the guard's backstop).
     ready_database(&w).await;
-    assert_eq!(w.sweep_member_roles_once().await, (2, 0));
+    assert_eq!(w.sweep_member_roles_once().await, (3, 0));
     let rows = w.metadata.state().member_roles.clone();
     let mut branches: Vec<Uuid> = rows.iter().map(|r| r.branch_id).collect();
     branches.sort();
@@ -1793,7 +1802,9 @@ async fn an_unprotected_branch_runs_no_guard() {
     let (branch, ep, _member) = setup(&w, &["billing"]).await;
     w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
     assert!(done(&w.reconcile_member_roles(branch, None).await));
-    assert!(all_scripts(&w).iter().all(|(_, s)| !s.contains("chelabase_schema_guard") && !s.contains("chelabase_schema_locked")));
+    // Only the read-only presence check (PB T3), which answers nothing here: no install, no removal.
+    let all = all_scripts(&w);
+    assert!(all.iter().filter(|(_, s)| !s.starts_with(crate::schema_guard::GUARD_PRESENT_MARK)).all(|(_, s)| !s.contains("chelabase_schema_guard") && !s.contains("chelabase_schema_locked")), "{all:?}");
 }
 
 // --- T7, the implementer's own -----------------------------------------------------------
@@ -2041,4 +2052,225 @@ async fn the_guard_is_installed_only_where_it_is_not_current() {
     assert_eq!(checked, ["analytics", "app"]);
     let installed: Vec<&str> = all.iter().filter(|(_, s)| s.contains("chelabase_schema_guard_ddl") && !s.contains("chelabase: schema guard check")).map(|(db, _)| db.as_str()).collect();
     assert_eq!(installed, ["analytics"], "app's guard is current");
+}
+
+// --- Protected branches: the login-role guard (PB, T3) ---------------------------------------
+
+use crate::schema_guard::{
+    GUARD_CHECK_MARK, GUARD_PRESENT_MARK, GuardSettings, UNGUARD_MARK, schema_unguard_sql,
+};
+
+fn guard_settings(on: bool, exempt: &[&str]) -> GuardSettings {
+    GuardSettings { guard_logins: on, exempt: exempt.iter().map(|e| e.to_string()).collect() }
+}
+
+#[tokio::test]
+async fn a_protected_branch_guards_with_its_settings() {
+    for on in [true, false] {
+        let (w, _journal) = worker();
+        let (branch, ep, _member) = setup(&w, &["billing"]).await;
+        {
+            let mut state = w.metadata.state();
+            let record = state.branches.get_mut(&branch).unwrap();
+            record.protected = true;
+            record.guard_logins = on;
+            state.guard_exemptions.insert(branch, vec!["deploy".into(), "Ci Bot".into()]);
+        }
+        // PB end-of-step R13: exemptions are honored only for roles that exist.
+        let answer = Cat { roles: &["!postgres", "billing", "@deploy", "@Ci Bot"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres")] }.answer();
+        w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+        assert!(done(&w.reconcile_member_roles(branch, None).await));
+        let settings = guard_settings(on, &["Ci Bot", "deploy"]);
+        let all = all_scripts(&w);
+        assert!(all.iter().any(|(db, s)| db == "app" && *s == schema_guard_check_sql(&settings)), "{on}: {all:?}");
+        assert!(all.iter().any(|(db, s)| db == "app" && *s == schema_guard_sql(&settings)), "{on}: {all:?}");
+        assert!(!all.iter().any(|(_, s)| s.starts_with(GUARD_PRESENT_MARK) || s.starts_with(UNGUARD_MARK)));
+    }
+}
+
+#[tokio::test]
+async fn an_unprotected_branch_removes_a_guard_where_it_finds_one() {
+    let (w, _journal) = worker();
+    let (branch, ep, _member) = setup(&w, &["billing"]).await;
+    let answer = Cat { roles: &["!postgres", "billing"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres"), ("analytics", "postgres")] }.answer();
+    w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+    w.computes.answer_in("app", GUARD_PRESENT_MARK, "t");
+    w.computes.answer_in("analytics", GUARD_PRESENT_MARK, "f");
+    assert!(done(&w.reconcile_member_roles(branch, None).await));
+    let all = all_scripts(&w);
+    let checked: Vec<&str> = all.iter().filter(|(_, s)| s.starts_with(GUARD_PRESENT_MARK)).map(|(db, _)| db.as_str()).collect();
+    assert_eq!(checked, ["analytics", "app"]);
+    let removed: Vec<&str> = all.iter().filter(|(_, s)| *s == schema_unguard_sql()).map(|(db, _)| db.as_str()).collect();
+    assert_eq!(removed, ["app"]);
+    assert!(!all.iter().any(|(_, s)| s.contains("CREATE EVENT TRIGGER")));
+}
+
+#[tokio::test]
+async fn a_failed_removal_fails_the_run_but_the_roles_still_apply() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
+    w.computes.answer(GUARD_PRESENT_MARK, "t");
+    w.computes.fail_when(UNGUARD_MARK);
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert!(matches!(&reply, MemberRolesReply::Failed { message } if message.contains("unguarding")), "{reply:?}");
+    let role = member_role_name(member);
+    assert!(texts(&w).iter().any(|s| s.contains(&format!("CREATE ROLE {role}"))), "{:?}", texts(&w));
+}
+
+// --- Protected branches: end-of-step (R12, R13) -------------------------------------------
+
+#[test]
+fn the_catalog_reads_superusers_admin_edges_and_template1() {
+    let out = format!(
+        "{}S {}\nA {} {}\ng {}\n",
+        cat(&["!postgres", "@esc", "deploy"]),
+        h("cloud_admin"),
+        h("esc"),
+        h("deploy"),
+        h("template1"),
+    );
+    let catalog = parse_member_catalog(&out).unwrap();
+    assert_eq!(catalog.superusers, set(&["cloud_admin"]));
+    assert_eq!(catalog.admin_edges, edges(&[("esc", "deploy")]));
+    assert_eq!(catalog.guard_only_databases, ["template1"]);
+    assert_eq!(catalog.databases, [("app".to_string(), "postgres".to_string())], "member-role work keeps its list");
+    let sql = member_catalog_sql();
+    assert!(sql.contains("SELECT 'S ' || "), "{sql}");
+    assert!(sql.contains("WHERE a.admin_option"), "{sql}");
+    assert!(sql.contains("d.datname = 'template1' AND d.datallowconn"), "{sql}");
+}
+
+fn exemption_catalog(login: &[&str], admin: &[(&str, &str)], member_of: &[(&str, &str)]) -> MemberCatalog {
+    let mut catalog = MemberCatalog {
+        roles: set(&["postgres", "cloud_admin", "cb_m_a", "deploy", "ci", "esc", "grp", "lonely"]),
+        superusers: set(&["cloud_admin"]),
+        login: set(login),
+        admin_edges: edges(admin),
+        all_edges: edges(member_of),
+        ..MemberCatalog::default()
+    };
+    for (m, r) in admin {
+        catalog.all_edges.entry(m.to_string()).or_default().insert(r.to_string());
+    }
+    catalog
+}
+
+fn names(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn an_exemption_is_honored_only_for_an_existing_role_no_guarded_role_administers() {
+    let logins = ["postgres", "cloud_admin", "cb_m_a", "deploy", "ci", "esc"];
+    // Nobody administers them: both honored; a name with no role isn't.
+    let catalog = exemption_catalog(&logins, &[], &[]);
+    let (honored, skipped) = honored_exemptions(&catalog, &names(&["deploy", "ci", "ghost"]));
+    assert_eq!(honored, set(&["ci", "deploy"]));
+    assert_eq!(skipped, ["ghost"]);
+    // A guarded login holds ADMIN on `deploy` directly.
+    let catalog = exemption_catalog(&logins, &[("esc", "deploy")], &[]);
+    let (honored, skipped) = honored_exemptions(&catalog, &names(&["deploy", "ci"]));
+    assert_eq!((honored, skipped), (set(&["ci"]), names(&["deploy"])));
+    // Through a chain: `esc` is a member of the NOLOGIN `grp`, which holds ADMIN on `ci`.
+    let catalog = exemption_catalog(&logins, &[("grp", "ci")], &[("esc", "grp")]);
+    let (honored, skipped) = honored_exemptions(&catalog, &names(&["deploy", "ci"]));
+    assert_eq!((honored, skipped), (set(&["deploy"]), names(&["ci"])));
+    // Another exemption is guarded too: `ci` administering `deploy` un-honors `deploy`.
+    let catalog = exemption_catalog(&logins, &[("ci", "deploy")], &[]);
+    let (honored, _) = honored_exemptions(&catalog, &names(&["deploy", "ci"]));
+    assert_eq!(honored, set(&["ci"]));
+}
+
+#[test]
+fn the_owner_superusers_member_logins_and_unreached_groups_may_administer_an_exemption() {
+    let logins = ["postgres", "cloud_admin", "cb_m_a", "deploy", "esc"];
+    for holder in ["postgres", "cloud_admin", "cb_m_a", "lonely"] {
+        let catalog = exemption_catalog(&logins, &[(holder, "deploy")], &[]);
+        let (honored, skipped) = honored_exemptions(&catalog, &names(&["deploy"]));
+        assert_eq!(honored, set(&["deploy"]), "{holder}");
+        assert!(skipped.is_empty(), "{holder}");
+    }
+    // A group no login reaches is harmless; once a guarded login joins it, it isn't.
+    let catalog = exemption_catalog(&logins, &[("grp", "deploy")], &[]);
+    assert_eq!(honored_exemptions(&catalog, &names(&["deploy"])).0, set(&["deploy"]));
+    let catalog = exemption_catalog(&logins, &[("grp", "deploy")], &[("esc", "grp")]);
+    assert!(honored_exemptions(&catalog, &names(&["deploy"])).0.is_empty());
+    // A guarded login that is a member of the owner reaches what the owner administers.
+    let catalog = exemption_catalog(&logins, &[("postgres", "deploy")], &[("esc", "postgres")]);
+    assert!(honored_exemptions(&catalog, &names(&["deploy"])).0.is_empty());
+}
+
+#[tokio::test]
+async fn the_guard_renders_only_honored_exemptions() {
+    let (w, _journal) = worker();
+    let (branch, ep, _member) = setup(&w, &["billing"]).await;
+    {
+        let mut state = w.metadata.state();
+        let record = state.branches.get_mut(&branch).unwrap();
+        record.protected = true;
+        record.guard_logins = true;
+        state.guard_exemptions.insert(branch, vec!["deploy".into(), "ghost".into(), "owned".into()]);
+    }
+    let answer = format!(
+        "{}A {} {}\n",
+        Cat { roles: &["!postgres", "billing", "@deploy", "@owned", "@esc"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres")] }.answer(),
+        h("esc"),
+        h("owned"),
+    );
+    w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+    assert!(done(&w.reconcile_member_roles(branch, None).await));
+    let settings = guard_settings(true, &["deploy"]);
+    let all = all_scripts(&w);
+    assert!(all.iter().any(|(db, s)| db == "app" && *s == schema_guard_sql(&settings)), "{all:?}");
+}
+
+#[tokio::test]
+async fn the_guard_goes_into_template1_and_leaves_it_with_protection() {
+    for protected in [true, false] {
+        let (w, _journal) = worker();
+        let (branch, ep, _member) = setup(&w, &["billing"]).await;
+        w.metadata.state().branches.get_mut(&branch).unwrap().protected = protected;
+        let answer = format!("{}g {}\n", cat(&["!postgres", "billing"]), h("template1"));
+        w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+        w.computes.answer(GUARD_PRESENT_MARK, "t");
+        assert!(done(&w.reconcile_member_roles(branch, None).await));
+        let all = all_scripts(&w);
+        let settings = guard_settings(true, &[]);
+        let in_template1: Vec<&str> = all.iter().filter(|(db, _)| db == "template1").map(|(_, s)| s.as_str()).collect();
+        if protected {
+            assert!(in_template1.contains(&schema_guard_sql(&settings).as_str()), "{all:?}");
+        } else {
+            assert!(in_template1.contains(&schema_unguard_sql().as_str()), "{all:?}");
+        }
+        // Member-role work (leftover cleanups, drops) never goes there.
+        assert!(in_template1.iter().all(|s| s.starts_with(GUARD_CHECK_MARK) || s.starts_with(GUARD_PRESENT_MARK) || s.contains("chelabase_schema_guard_ddl") || *s == schema_unguard_sql()), "{in_template1:?}");
+    }
+}
+
+// PB end-of-step R17: template1 is touched only in a run that had to install or remove the guard
+// in another database (a session in template1 makes a concurrent CREATE DATABASE fail, and only
+// a superuser can change template1's guard, so it can't drift on its own).
+#[tokio::test]
+async fn template1_is_touched_only_when_another_database_changed() {
+    for (protected, needle, answer, touched) in [
+        (true, GUARD_CHECK_MARK, "t", false),
+        (true, GUARD_CHECK_MARK, "f", true),
+        (false, GUARD_PRESENT_MARK, "f", false),
+        (false, GUARD_PRESENT_MARK, "t", true),
+    ] {
+        let (w, _journal) = worker();
+        let (branch, ep, _member) = setup(&w, &["billing"]).await;
+        w.metadata.state().branches.get_mut(&branch).unwrap().protected = protected;
+        let catalog = format!(
+            "{}g {}\n",
+            Cat { roles: &["!postgres", "billing"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres")] }.answer(),
+            h("template1")
+        );
+        w.computes.answer_at(&ep, "chelabase: member roles", &catalog);
+        w.computes.answer_in("app", needle, answer);
+        assert!(done(&w.reconcile_member_roles(branch, None).await), "{protected} {answer}");
+        let in_template1: Vec<String> = all_scripts(&w).into_iter().filter(|(db, _)| db == "template1").map(|(_, s)| s).collect();
+        assert_eq!(!in_template1.is_empty(), touched, "protected {protected}, app answered {answer}: {in_template1:?}");
+    }
 }

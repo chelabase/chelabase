@@ -21,6 +21,12 @@ export interface Branch {
   /** @nullable */
   error: string | null;
   /**
+     * The "guard login roles" switch: on a protected branch, login roles other than the
+     * owner, member logins and the branch's guard exemptions can't change the schema. Copied
+     * from the parent when the branch is made.
+     */
+  guard_logins: boolean;
+  /**
      * Where the branch's history begins (null when unknown); Studio's lower bound for a point.
      * @nullable
      */
@@ -46,5 +52,11 @@ export interface Branch {
      * its database can't be deleted. Set with `updateBranch`.
      */
   protected: boolean;
+  /**
+     * The review hash last acknowledged (by protecting or `acknowledgeBranchReview`); null
+     * when none was.
+     * @nullable
+     */
+  review_acknowledged_hash: string | null;
   status: BranchStatus;
 }

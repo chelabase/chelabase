@@ -89,6 +89,7 @@ Two more refusals use general codes. A grant or override below Admin that lists 
 | 500 | `credentials_unavailable` | Stored credentials can't be opened with the current secrets key. |
 | 409 | `owner_password_unknown` | The owner's password was set in SQL; reset it first. |
 | 409 | `branch_merge_busy` | A schema merge holds this branch as its source or target (it is rehearsing, applying, finishing, or failed half applied in its online phase), or a rehearsal's throwaway branch still hangs off it, so reset, restore and delete are refused. `error.merge_id` names the merge; `error.rehearsal_branch_id` names the throwaway branch. |
+| 409 | `review_changed` | The branch's review (code owned by roles other than the owner or a superuser that can run in someone else's session) differs from the hash the request carries: protecting without `review_hash` while the list isn't empty, or with a stale one, and a stale `hash` on acknowledge or fix. `error.review` carries the current review (its items and `hash`). |
 
 ### Table API
 

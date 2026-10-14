@@ -1221,17 +1221,14 @@ impl MetadataClient {
             .collect::<Result<Vec<_>, sqlx::Error>>()?)
     }
 
-    /// The branches the member-role sweep visits: ready `normal` branches of live databases
-    /// whose tenant has an active member, or that still hold member-role rows.
+    /// The branches the member-role sweep visits: every ready `normal` branch of a live
+    /// database, members or not (PB R12: the sweep is also the protected-branch guard's
+    /// backstop, so a member-less tenant's guard settings converge too).
     pub async fn member_role_branches(&self) -> Result<Vec<Uuid>, MetadataError> {
         Ok(sqlx::query_scalar(
             "SELECT b.id FROM branches b JOIN databases d ON d.id = b.database_id
-             JOIN projects p ON p.id = d.project_id
              WHERE b.status = 'ready' AND b.kind = 'normal'
                AND d.status NOT IN ('deleting', 'deleted')
-               AND (EXISTS (SELECT 1 FROM members m
-                            WHERE m.tenant_id = p.tenant_id AND m.status = 'active')
-                    OR EXISTS (SELECT 1 FROM member_branch_roles r WHERE r.branch_id = b.id))
              ORDER BY b.id",
         )
         .fetch_all(&self.pool)

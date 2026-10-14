@@ -896,8 +896,8 @@
         "tags": [
           "branches"
         ],
-        "summary": "Protect or unprotect a branch",
-        "description": "Sets the branch's `protected` flag. A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included.",
+        "summary": "Protect or unprotect a branch, or switch its login-role guard",
+        "description": "Sets the branch's `protected` flag and its `guard_logins` switch (at least one of them). A protected branch can't be deleted or reset to its parent, and its database can't be deleted, until it is unprotected. Restore still works. Only `normal` branches can be protected, main included. Protecting runs the branch's review (`getBranchReview`) on its running compute: when the review lists anything, `review_hash` must be its current `hash` (else 409 `review_changed` with the current review), and the review is stored as acknowledged. On a protected branch with `guard_logins` on, login roles other than the owner, member logins and the branch's guard exemptions can't change the schema. Every change reconciles the branch's member roles and its guard.",
         "operationId": "updateBranch",
         "parameters": [
           {
@@ -933,7 +933,7 @@
         },
         "responses": {
           "200": {
-            "description": "The branch with its new flag",
+            "description": "The branch with its new settings",
             "content": {
               "application/json": {
                 "schema": {
@@ -983,7 +983,7 @@
             }
           },
           "409": {
-            "description": "`backup_branch`: a restore backup can't be protected; `branch_not_ready`: the branch is being deleted",
+            "description": "`backup_branch`: a restore backup can't be protected; `branch_not_ready`: the branch is being deleted (or, to protect, isn't ready); `review_changed`: protecting without `review_hash` while the review lists anything, or with a stale one (`error.review`: the current review)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1003,7 +1003,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: an unknown or missing field, or `protected` isn't a boolean",
+            "description": "`invalid_request`: an unknown field, a field of the wrong type, neither `protected` nor `guard_logins`, or `review_hash` without `protected: true`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1014,6 +1014,26 @@
           },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: to protect, the branch's compute isn't running or can't be reached, so the review couldn't run (`Retry-After`); `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer the review in time",
             "content": {
               "application/json": {
                 "schema": {
@@ -1724,6 +1744,359 @@
           },
           "409": {
             "description": "`backup_branch`: a restore backup has no compute",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/guard-exemptions": {
+      "get": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "List a branch's guard exemptions",
+        "description": "The login roles, by name, that the branch's \"guard login roles\" switch leaves alone: on a protected branch with `guard_logins` on, they may still change the schema. Sorted by name (byte order). A new branch copies its parent's.",
+        "operationId": "listGuardExemptions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The exemptions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardExemptions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}": {
+      "put": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "Exempt a login role from a branch's guard",
+        "description": "Adds `role`, by name, to the branch's guard exemptions (idempotent). The role need not exist: a role dropped and made again in SQL keeps its exemption, a renamed one loses it. Reconciles the branch's guard.",
+        "operationId": "putGuardExemption",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "The role's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The exemptions after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardExemptions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no guard; `branch_not_ready`: the branch is being deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: `role` is empty, over 63 bytes or has a NUL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "Remove a login role's guard exemption",
+        "description": "Removes `role` from the branch's guard exemptions (idempotent). Reconciles the branch's guard.",
+        "operationId": "deleteGuardExemption",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "The role's name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The exemptions after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardExemptions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no guard; `branch_not_ready`: the branch is being deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: `role` is empty, over 63 bytes or has a NUL",
             "content": {
               "application/json": {
                 "schema": {
@@ -3555,6 +3928,453 @@
           },
           "503": {
             "description": "`worker_unavailable`: the worker or job queue can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/review": {
+      "get": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "Review the code that can run in someone else's session",
+        "description": "The worker scans every live database of the branch, as `cloud_admin`, for code owned by a non-Admin role that can run in someone else's session (an Admin's included): triggers whose function or table such a role owns, rules on its relations, and its functions that are SECURITY DEFINER or reached from a policy, a default or generated column, a check, an index, a view, a trigger, a rule, a range type or another such function. Each item has a stable `key`, its `reasons`, and `new` when a list was acknowledged that didn't hold it. `hash` is what protecting (`review_hash`), acknowledging and fixing confirm. Needs the branch's compute running.",
+        "operationId": "getBranchReview",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Review"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the scan couldn't run (the compute isn't running or can't be reached; the message says why; `Retry-After`); `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/review/acknowledge": {
+      "post": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "Acknowledge a branch's review",
+        "description": "Stores the current review as acknowledged: its `hash` becomes the branch's `review_acknowledged_hash`, and its items stop being `new`. `hash` must be the current review's.",
+        "operationId": "acknowledgeBranchReview",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcknowledgeReviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The review as acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Review"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`review_changed`: the review's hash isn't `hash` (`error.review`: the current review); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body is valid JSON but not `{ \"hash\" }`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the scan couldn't run (the compute isn't running or can't be reached; the message says why; `Retry-After`); `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/review/fix": {
+      "post": {
+        "tags": [
+          "branches"
+        ],
+        "summary": "Fix one item of a branch's review",
+        "description": "The worker scans the branch again, checks `hash` against it, and runs one fix in the item's database in its own transaction with `lock_timeout` 5 s: `reassign` gives the item's function (a trigger's function; a rule's relation) to the owner (`ALTER … OWNER TO`), after which the Admin answers for its code and a SECURITY DEFINER function runs as the owner; `drop` drops the function, trigger or rule `RESTRICT` (never cascading). Answers with the SQL it ran and the review after it.",
+        "operationId": "fixBranchReviewItem",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewFixRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The SQL that ran and the review after it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewFixResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON; `schema_change_failed`: Postgres refused the fix, with `sqlstate` and `message`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist, or the review has no item `key`; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`review_changed`: the review's hash isn't `hash` (`error.review`: the current review); `has_dependents`: other objects depend on what a drop removes (2BP01; `message` names them); `lock_timeout`: a lock wasn't granted within 5 s (retry); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body is valid JSON but not `{ \"key\", \"action\", \"hash\" }` (`action`: `reassign` or `drop`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the scan couldn't run (the compute isn't running or can't be reached; the message says why; `Retry-After`); `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
             "content": {
               "application/json": {
                 "schema": {
@@ -12164,6 +12984,19 @@
           }
         }
       },
+      "AcknowledgeReviewRequest": {
+        "type": "object",
+        "description": "`POST …/review/acknowledge`.",
+        "required": [
+          "hash"
+        ],
+        "properties": {
+          "hash": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "AfterMerge": {
         "type": "string",
         "description": "What the merge does when it is done with the branch.",
@@ -12421,6 +13254,8 @@
           "history_start",
           "error",
           "protected",
+          "guard_logins",
+          "review_acknowledged_hash",
           "main_database_missing"
         ],
         "properties": {
@@ -12446,6 +13281,10 @@
               "string",
               "null"
             ]
+          },
+          "guard_logins": {
+            "type": "boolean",
+            "description": "The \"guard login roles\" switch: on a protected branch, login roles other than the\nowner, member logins and the branch's guard exemptions can't change the schema. Copied\nfrom the parent when the branch is made."
           },
           "history_start": {
             "type": [
@@ -12495,6 +13334,13 @@
           "protected": {
             "type": "boolean",
             "description": "A protected branch can't be deleted or reset to its parent (restore still works), and\nits database can't be deleted. Set with `updateBranch`."
+          },
+          "review_acknowledged_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The review hash last acknowledged (by protecting or `acknowledgeBranchReview`); null\nwhen none was."
           },
           "status": {
             "$ref": "#/components/schemas/BranchStatus"
@@ -12575,7 +13421,8 @@
           "bypass_rls",
           "member_of",
           "member_no_set",
-          "member_admin"
+          "member_admin",
+          "guard_exempt"
         ],
         "properties": {
           "blocked_keys": {
@@ -12597,6 +13444,10 @@
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "guard_exempt": {
+            "type": "boolean",
+            "description": "Listed in the branch's guard exemptions (by name): on a protected branch with \"guard\nlogin roles\" on, this login role may still change the schema."
           },
           "inherit": {
             "type": "boolean",
@@ -14361,7 +15212,8 @@
           "index_build_failed",
           "lock_timeout",
           "schema_change_failed",
-          "has_dependents"
+          "has_dependents",
+          "review_changed"
         ]
       },
       "ErrorEnvelope": {
@@ -14404,6 +15256,14 @@
           }
         },
         "additionalProperties": false
+      },
+      "FixAction": {
+        "type": "string",
+        "description": "What a fix does to an item.",
+        "enum": [
+          "reassign",
+          "drop"
+        ]
       },
       "FkAction": {
         "type": "string",
@@ -14542,6 +15402,21 @@
           }
         ],
         "description": "JSON: `\"public\"` or `{\"role\": \"anon\"}`."
+      },
+      "GuardExemptions": {
+        "type": "object",
+        "description": "A branch's guard exemptions, by role name.",
+        "required": [
+          "exemptions"
+        ],
+        "properties": {
+          "exemptions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       },
       "Identity": {
         "type": "object",
@@ -16897,6 +17772,177 @@
           }
         }
       },
+      "Review": {
+        "type": "object",
+        "description": "A branch's review: the items, their hash and the hash last acknowledged.",
+        "required": [
+          "items",
+          "hash"
+        ],
+        "properties": {
+          "acknowledged_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hash": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReviewItem"
+            }
+          }
+        }
+      },
+      "ReviewFixRequest": {
+        "type": "object",
+        "description": "`POST …/review/fix`.",
+        "required": [
+          "key",
+          "action",
+          "hash"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/FixAction"
+          },
+          "hash": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReviewFixResponse": {
+        "type": "object",
+        "description": "The SQL a fix ran and the review after it.",
+        "required": [
+          "sql",
+          "review"
+        ],
+        "properties": {
+          "review": {
+            "$ref": "#/components/schemas/Review"
+          },
+          "sql": {
+            "type": "string"
+          }
+        }
+      },
+      "ReviewItem": {
+        "type": "object",
+        "description": "One listed item.",
+        "required": [
+          "key",
+          "database",
+          "kind",
+          "schema",
+          "name",
+          "identity",
+          "owner",
+          "reasons",
+          "opaque_body"
+        ],
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string",
+            "description": "The md5 hex of the item's definition (`pg_get_functiondef`, `pg_get_triggerdef` or\n`pg_get_ruledef`; `prosrc` for an aggregate), so a body replaced in place changes the\nreview's hash."
+          },
+          "function": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The function a fix targets, `%I.%I(<identity args>)`: the function itself, or a trigger's function; None for a rule."
+          },
+          "identity": {
+            "type": "string",
+            "description": "A function's identity arguments; a trigger's or rule's relation."
+          },
+          "key": {
+            "type": "string",
+            "description": "`<database>/<kind>/<schema>.<name>(<identity>)`."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ReviewItemKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "new": {
+            "type": "boolean",
+            "description": "Not in the list last acknowledged (set by the orchestrator)."
+          },
+          "opaque_body": {
+            "type": "boolean",
+            "description": "A function whose body can't be followed (not SQL-standard)."
+          },
+          "owner": {
+            "type": "string"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReviewReason"
+            }
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "ReviewItemKind": {
+        "type": "string",
+        "description": "What a review item is.",
+        "enum": [
+          "function",
+          "rule",
+          "trigger"
+        ]
+      },
+      "ReviewReason": {
+        "type": "object",
+        "description": "One reason, with the referencing object's name (`None` for `security_definer`).",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ReviewReasonKind"
+          },
+          "via": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ReviewReasonKind": {
+        "type": "string",
+        "description": "Why an item can run in someone else's session.",
+        "enum": [
+          "security_definer",
+          "trigger",
+          "rule",
+          "policy",
+          "default",
+          "generated",
+          "check",
+          "index",
+          "view",
+          "called_by",
+          "type"
+        ]
+      },
       "RlsSpec": {
         "type": "object",
         "properties": {
@@ -17861,13 +18907,28 @@
       },
       "UpdateBranchRequest": {
         "type": "object",
-        "required": [
-          "protected"
-        ],
+        "description": "At least one of `protected` and `guard_logins`; `review_hash` only with `protected: true`.",
         "properties": {
+          "guard_logins": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The \"guard login roles\" switch (see the branch's `guard_logins`)."
+          },
           "protected": {
-            "type": "boolean",
-            "description": "`true` refuses deleting the branch, resetting it to its parent and deleting its\ndatabase; restore still works."
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`true` refuses deleting the branch, resetting it to its parent and deleting its\ndatabase; restore still works. Protecting runs the branch's review (it needs a running\ncompute) and needs `review_hash` when the review lists anything."
+          },
+          "review_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `hash` of the review (`getBranchReview`) the caller saw; stored as acknowledged."
           }
         },
         "additionalProperties": false

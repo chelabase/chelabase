@@ -270,6 +270,11 @@ fn body_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> Option<Value> {
     // Bodies a typed extractor (or a body read before the check) must accept.
     let typed = [
         (r::UPDATE_BRANCH.name, json!({ "protected": false })),
+        (r::ACKNOWLEDGE_BRANCH_REVIEW.name, json!({ "hash": "h" })),
+        (
+            r::FIX_BRANCH_REVIEW_ITEM.name,
+            json!({ "key": "k", "action": "drop", "hash": "h" }),
+        ),
         (
             r::CONSOLE_QUERY.name,
             json!({ "role": role, "tree": { "v": 1, "op": "select", "from": "notes" } }),
