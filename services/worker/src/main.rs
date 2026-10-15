@@ -106,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_review(worker.clone(), nats.clone()));
     tokio::spawn(serve_member_roles_enqueue(worker.clone(), nats.clone()));
     tokio::spawn(member_roles_sweep_loop(worker.clone()));
+    tokio::spawn(cert_sweep_loop(worker.clone()));
     tokio::spawn(reconcile_loop(worker.clone(), js.clone()));
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
@@ -673,8 +674,23 @@ async fn serve_review(worker: Arc<RealWorker>, client: async_nats::Client) {
     }
 }
 
-/// T8 I2: every `CHELABASE_MEMBER_ROLES_SWEEP_SECS`, every branch of a tenant with members is
-/// reconciled: the backstop for reconcile publishes that were lost (core NATS, no redelivery)
+/// RT3-7: at start and then daily, every running compute's server certificate and the
+/// orchestrator's client pair are renewed when due.
+async fn cert_sweep_loop(worker: Arc<RealWorker>) {
+    let mut ticks = tokio::time::interval(worker::certs::CERT_SWEEP_EVERY);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let (renewed, failed) = worker.renew_certs_once(std::time::SystemTime::now()).await;
+        if failed > 0 {
+            warn!(renewed, failed, "certificate sweep: some renewals failed; the next sweep retries");
+        }
+    }
+}
+
+/// T8 I2: every `CHELABASE_MEMBER_ROLES_SWEEP_SECS`, every ready normal branch is reconciled
+/// (members or not: the protected-branch guard and born-closed databases need it too): the
+/// backstop for reconcile publishes that were lost (core NATS, no redelivery)
 /// or whose retries all failed.
 async fn member_roles_sweep_loop(worker: Arc<RealWorker>) {
     let every = worker.member_roles_sweep_every;
@@ -712,7 +728,7 @@ async fn serve_member_roles_enqueue(worker: Arc<RealWorker>, client: async_nats:
                 Ok(request) => {
                     let branch = BranchId::from(request.branch_id);
                     if let MemberRolesReply::Failed { message } = worker
-                        .reconcile_member_roles_soon(&pending, branch, MEMBER_ROLES_ENQUEUE_DELAY)
+                        .reconcile_member_roles_soon(&pending, branch, MEMBER_ROLES_ENQUEUE_DELAY, request.from_ddl)
                         .await
                     {
                         warn!(branch_id = %branch, "member-role reconcile: {message}");

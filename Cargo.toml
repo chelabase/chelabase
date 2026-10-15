@@ -85,11 +85,13 @@ aes-gcm = "0.11.1"
 ed25519-dalek = { version = "3.0.0", features = ["pem"] }
 getrandom = "0.4.3"
 hex = "0.4.3"
-# Our fork of 0.7.18, branch chelabase/transaction-status (step 6e, on top of step 6d's
-# simple-query tags): simple queries expose command tags, the empty-query marker and column
-# types, and `Client::transaction_status` tells whether a transaction may be open. Upstream
-# PRs pending; return to crates.io once they're released.
-tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "60016594a76606abf661581a48b4d1d42ed29d2d", default-features = false, features = ["runtime"] }
+# Our fork of 0.7.18, branch chelabase/sasl-verified (on top of chelabase/transaction-status,
+# step 6e, and step 6d's simple-query tags): simple queries expose command tags, the
+# empty-query marker and column types, `Client::transaction_status` tells whether a
+# transaction may be open, and a failed connect says whether the server's SCRAM final message
+# verified, whether TLS setup failed and whether channel binding was refused (fork round 3,
+# U9). Upstream PRs pending; return to crates.io once they're released.
+tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "9a1b048b6359f24ed7db8754a6dc30a13457cdd4", default-features = false, features = ["runtime"] }
 pg_query = "6.2.1"
 tokio-util = "0.7.19"
 moka = { version = "0.12.16", features = ["future", "sync"] }
@@ -98,6 +100,12 @@ pbkdf2 = "0.13.0"
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
+# Fork round 3: compute TLS (a platform CA, compute server and orchestrator client certificates).
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+x509-parser = "0.18.1"
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+tokio-postgres-rustls-improved = { version = "0.17.1", default-features = false, features = ["aws-lc-rs"] }
+tar = "0.4.46"
 stringprep = "0.1.5"
 deadpool-postgres = { version = "0.14.2", default-features = false, features = ["rt_tokio_1"] }
 
@@ -119,9 +127,9 @@ opt-level = 3
 opt-level = 3
 
 # deadpool-postgres depends on crates.io tokio-postgres; route it to our fork so the bench
-# harness has one tokio-postgres (the fork, chelabase/transaction-status) in the build.
+# harness has one tokio-postgres (the fork, chelabase/sasl-verified) in the build.
 [patch.crates-io]
-tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "60016594a76606abf661581a48b4d1d42ed29d2d" }
+tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "9a1b048b6359f24ed7db8754a6dc30a13457cdd4" }
 # pingora 0.9.0 plus the websocket upgrade race fix (chelabase/pingora branch
 # chelabase/websocket-upgrade-race): an empty request's end of body, read after the upstream's
 # 101, no longer closes the upgraded connection. Regression test: the gateway's

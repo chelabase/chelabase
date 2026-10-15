@@ -32,6 +32,8 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
+# The pools' TLS to computes, verified against the platform CA (U15).
+tokio-postgres-rustls-improved = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 utoipa = { workspace = true }
@@ -45,6 +47,8 @@ chelabase-nats = { workspace = true }
 # The OpenAPI document's registry test.
 chelabase-routes = { workspace = true }
 chelabase-neon = { workspace = true }
+# U15 (f5b) tests: the fake compute's TLS server (`crates/chelabase-query/tests/common/tls_pg.rs`).
+rustls = { workspace = true }
 chelabase-secrets = { workspace = true }
 chrono = { workspace = true }
 # The live tests' own admin sessions (the service itself runs on tokio-postgres).

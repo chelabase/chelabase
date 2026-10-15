@@ -1,7 +1,7 @@
 //! W2 core: slug, registry, slots, stack env and argv (spec section 1).
 
 use super::argv::{Compose, nextest_archive_args, nextest_run_args};
-use super::env::{StackEnvInput, render_stack_env};
+use super::env::{StackEnvInput, control_net, render_stack_env};
 use super::registry::{Entry, MAIN_GATEWAY_PORT, MAIN_PROXY_PORT, Registry, with_registry};
 use super::slots::{
     SlotOptions, acquire_slot, cap_from_env, reap, release_slot, ticket_name, wait_from_env,
@@ -101,6 +101,7 @@ fn entry(slug: &str, gw: u16, pg: u16, running: Option<u64>) -> Entry {
         proxy_port: pg,
         created_at: 1,
         running_since: running,
+        control_slot: None,
     }
 }
 
@@ -423,6 +424,7 @@ fn input<'a>() -> StackEnvInput<'a> {
         docker_gid: 973,
         image: "chelabase-workbench:abc123def456",
         extra: &[],
+        control_slot: 1,
     }
 }
 
@@ -647,4 +649,59 @@ fn an_empty_selection_archives_the_workspace() {
         nextest_archive_args(&[], Path::new("/a.tar.zst")),
         ["nextest", "archive", "--archive-file", "/a.tar.zst", "--workspace"]
     );
+}
+
+#[test]
+fn the_stack_env_carries_the_control_network() {
+    let env = parse(&render_stack_env(EXAMPLE, &input()));
+    for (k, v) in [
+        ("CHELABASE_COMPUTE_CONTROL_NETWORK", "chelabase-feat-x_control"),
+        ("CHELABASE_CONTROL_SUBNET", "10.213.4.0/22"),
+        ("CHELABASE_CONTROL_COMPUTE_RANGE", "10.213.6.0/23"),
+        ("CHELABASE_ORCHESTRATOR_CONTROL_IP", "10.213.4.10"),
+        ("CHELABASE_RUNNER_CONTROL_IP", "10.213.4.11"),
+        ("CHELABASE_MEMBER_LOGIN_CIDRS", "10.213.4.10/32,10.213.4.11/32"),
+        ("CHELABASE_COMPUTE_CA_DIR", "/m/.chelabase/compute-ca"),
+        ("CHELABASE_COMPUTE_TLS_DIR", "/m/.chelabase/orchestrator-tls"),
+    ] {
+        assert_eq!(env.get(k).map(String::as_str), Some(v), "{k}");
+    }
+    let main = control_net(0);
+    assert_eq!(
+        (main.subnet.as_str(), main.compute_range.as_str(), main.orchestrator_ip.as_str(), main.runner_ip.as_str()),
+        ("10.213.0.0/22", "10.213.2.0/23", "10.213.0.10", "10.213.0.11")
+    );
+    assert_eq!(control_net(63).subnet, "10.213.252.0/22");
+}
+
+// U15 (f5b). Invariant: every connection Chelabase opens to a compute uses TLS verified against
+// the platform CA. The auth and rest containers get the CA certificate alone (`ca.crt`, mounted
+// read-only; the directory also holds `ca.key`, which only the worker and the runner see), so
+// the stack env names the file, not the directory: `CHELABASE_COMPUTE_CA_FILE`.
+#[test]
+fn the_stack_env_names_the_ca_certificate_file_for_auth_and_rest() {
+    let env = parse(&render_stack_env(EXAMPLE, &input()));
+    assert_eq!(
+        env.get("CHELABASE_COMPUTE_CA_FILE").map(String::as_str),
+        Some("/m/.chelabase/compute-ca/ca.crt")
+    );
+}
+
+#[test]
+fn every_registered_stack_gets_its_own_control_slot() {
+    let mut r = Registry::default();
+    let main = r.ensure("main", Path::new("/m"), 1, |_| true).unwrap();
+    assert_eq!(main.control_slot, Some(0));
+    let a = r.ensure("feat-a", Path::new("/m/.worktrees/feat-a"), 2, |_| true).unwrap();
+    let b = r.ensure("feat-b", Path::new("/m/.worktrees/feat-b"), 3, |_| true).unwrap();
+    let slots = [main.control_slot, a.control_slot, b.control_slot];
+    assert!(slots.iter().all(Option::is_some));
+    let mut unique = slots.to_vec();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "{slots:?}");
+    let old: Registry = serde_json::from_str(r#"{"stacks":[{"slug":"feat-c","checkout":"/m/.worktrees/feat-c","gateway_port":8140,"proxy_port":4540,"created_at":1,"running_since":null}]}"#).unwrap();
+    let mut old = old;
+    let c = old.ensure("feat-c", Path::new("/m/.worktrees/feat-c"), 4, |_| true).unwrap();
+    assert!(c.control_slot.is_some(), "an old registry entry gets a slot");
 }

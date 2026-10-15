@@ -2,6 +2,8 @@
 //! controller, a compute, and the data API roles and bootstrap inside it.
 
 use chelabase_metadata::{DatabaseStatus, NewEndpoint};
+use anyhow::anyhow;
+use chelabase_neon::reconfigure::ComputeCtlStatus;
 use chelabase_neon::{ComputeBackend, ComputeStatus, NeonId};
 use chelabase_secrets::{Purpose, seal_credential};
 use chelabase_types::{BranchId, DatabaseId};
@@ -16,6 +18,23 @@ use crate::{OWNER_ROLE, Worker, credentials};
 
 /// How long a new compute may take to answer (the worker's `ready_timeout` in production).
 pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most a wait may stretch to while compute_ctl reports a live state (`init`,
+/// `configuration_pending`, …): longer than RT3-14's 2-minute migration timeout, so a compute
+/// that is migrating isn't given up on at [`READY_TIMEOUT`].
+pub const READY_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether compute_ctl's `failed` error is a migration failure that no retry fixes
+/// (`migration N failed: …`, `migrations could not run: …`, U3): the wait ends at once. Any
+/// other failure (a transient start error, which the container's `unless-stopped` restart
+/// recovers) is polled on until the deadline.
+pub fn is_fatal_migration_error(error: &str) -> bool {
+    error.contains("migrations could not run")
+        || error.split("migration ").skip(1).any(|rest| {
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            digits > 0 && rest[digits..].starts_with(" failed")
+        })
+}
 
 /// The idempotent SQL run as cloud_admin in every new database: the data API's roles, and with
 /// `owner_superuser` the owner made SUPERUSER. compute_ctl never drops roles it doesn't know,
@@ -43,6 +62,17 @@ GRANT anon, authenticated TO authenticator;
         sql.push_str(&format!("ALTER ROLE {OWNER_ROLE} SUPERUSER;\n"));
     }
     sql
+}
+
+/// Why [`Worker::wait_until_ready`]'s look found the compute not ready.
+enum NotReady {
+    /// compute_ctl reported `failed` with this error.
+    Failed(String),
+    /// compute_ctl reports a live, non-failed state (migrating, configuring): the wait may
+    /// stretch to [`READY_CAP`].
+    Live(anyhow::Error),
+    /// Not yet (or compute_ctl or the database can't be reached yet).
+    Yet(anyhow::Error),
 }
 
 /// `ep-` + 12 random lowercase hex characters.
@@ -272,15 +302,28 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         Ok(Built::Compute)
     }
 
-    /// Step 5: the compute has applied its spec once the new database answers. A compute
-    /// whose container exited (or is gone) never will: that ends the wait at once (T14 M5),
-    /// rather than at the deadline.
+    /// Step 5: the compute is ready when compute_ctl says `running` (its migrations are done,
+    /// D6) and the database answers. Only a fatal migration error from compute_ctl
+    /// ([`is_fatal_migration_error`]) ends the wait at once; any other `failed` keeps the
+    /// polling going to the deadline (and is reported if it is the last thing seen), as does a
+    /// status that can't be read. While compute_ctl reports a live state the deadline is
+    /// `max(ready_cap, ready_timeout)` from the start rather than `ready_timeout`. A compute
+    /// whose container exited (or is gone) never will be ready: that ends the wait at once
+    /// (T14 M5), rather than at the deadline.
     pub(crate) async fn wait_until_ready(&self, ep: &str, database_name: &str) -> Result<(), String> {
-        let deadline = Instant::now() + self.ready_timeout;
+        let started = Instant::now();
+        // Once compute_ctl has been seen in a live state the stretch holds, whatever the
+        // later looks say (a status read that fails mid-migration doesn't end it).
+        let mut seen_live = false;
         loop {
-            let err = match self.computes.admin_sql(ep, database_name, "SELECT 1").await {
-                Ok(_) => return Ok(()),
-                Err(err) => err,
+            let (err, live) = match self.ready_once(ep, database_name).await {
+                Ok(()) => return Ok(()),
+                Err(NotReady::Failed(error)) if is_fatal_migration_error(&error) => {
+                    return Err(format!("waiting for the compute: compute_ctl failed: {error}"));
+                }
+                Err(NotReady::Failed(error)) => (anyhow!("compute_ctl failed: {error}"), false),
+                Err(NotReady::Live(err)) => (err, true),
+                Err(NotReady::Yet(err)) => (err, false),
             };
             match self.computes.status(ep).await {
                 Ok(None) => {
@@ -298,11 +341,60 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 // Running, starting, or unknown: keep polling until the deadline.
                 _ => {}
             }
-            if Instant::now() >= deadline {
+            // The wait stretches to the cap only while compute_ctl reports a live state.
+            seen_live |= live;
+            let wait = if seen_live {
+                self.ready_cap.max(self.ready_timeout)
+            } else {
+                self.ready_timeout
+            };
+            if started.elapsed() >= wait {
                 return Err(format!("waiting for the compute: {err:#}"));
             }
             tokio::time::sleep(self.ready_poll).await;
         }
+    }
+
+    /// One look: compute_ctl `running`, then `SELECT 1`.
+    async fn ready_once(&self, ep: &str, database_name: &str) -> Result<(), NotReady> {
+        let control_addr = self
+            .computes
+            .control_addr(ep)
+            .await
+            .map_err(|e| NotReady::Yet(e.context("finding compute_ctl")))?;
+        let Some(control_addr) = control_addr else {
+            // Not running: the database's own error is the useful one.
+            return Err(NotReady::Yet(
+                match self.computes.admin_sql(ep, database_name, "SELECT 1").await {
+                    Ok(_) => anyhow!("compute_ctl isn't reachable (the compute isn't running)"),
+                    Err(e) => e,
+                },
+            ));
+        };
+        match self
+            .pusher
+            .status(control_addr, ep)
+            .await
+            .map_err(|e| NotReady::Yet(e.context("reading compute_ctl's status")))?
+        {
+            ComputeCtlStatus::Running => {}
+            ComputeCtlStatus::Failed(error) => return Err(NotReady::Failed(error)),
+            // compute_ctl's states that lead to `running`: initialising and configuring.
+            // `empty` and the termination states never do.
+            ComputeCtlStatus::Other(state)
+                if matches!(state.as_str(), "init" | "configuration_pending" | "configuration") =>
+            {
+                return Err(NotReady::Live(anyhow!("compute_ctl is {state}, not running")));
+            }
+            ComputeCtlStatus::Other(state) => {
+                return Err(NotReady::Yet(anyhow!("compute_ctl is {state}, not running")));
+            }
+        }
+        self.computes
+            .admin_sql(ep, database_name, "SELECT 1")
+            .await
+            .map(|_| ())
+            .map_err(NotReady::Yet)
     }
 
     /// Provision's teardown. A failure is logged only: the endpoint row stays, and reconcile
@@ -413,7 +505,7 @@ mod tests {
     use chelabase_metadata::DatabaseStatus;
     use chelabase_secrets::{Purpose, open_credential};
 
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::fakes::{FakeWorker, Journal, STORAGE_CAUSE, entries, position, worker};
@@ -992,5 +1084,33 @@ GRANT anon, authenticated TO authenticator;
         w.metadata.state().fail = Some("get_database");
         let id = w.metadata.insert_database("app", DatabaseStatus::Pending);
         assert!(w.handle_provision(id, "app").await.is_err());
+    }
+
+    // D6: ready means compute_ctl says running AND the database answers.
+    #[tokio::test]
+    async fn ready_needs_running_as_well_as_select_1() {
+        let (mut w, _journal) = worker();
+        w.ready_timeout = Duration::from_millis(60);
+        w.computes.create("ep-s", "t").await.unwrap();
+        w.pusher.set_status("ep-s", chelabase_neon::reconfigure::ComputeCtlStatus::Other("init".into()));
+        let err = w.wait_until_ready("ep-s", "app").await.unwrap_err();
+        assert!(err.contains("init"), "{err}");
+        w.pusher.set_status("ep-s", chelabase_neon::reconfigure::ComputeCtlStatus::Running);
+        w.wait_until_ready("ep-s", "app").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_compute_ctl_ends_the_wait_at_once() {
+        let (mut w, _journal) = worker();
+        w.ready_timeout = Duration::from_secs(5);
+        w.computes.create("ep-f", "t").await.unwrap();
+        w.pusher.set_status(
+            "ep-f",
+            chelabase_neon::reconfigure::ComputeCtlStatus::Failed("migration 2 failed: boom".into()),
+        );
+        let started = Instant::now();
+        let err = w.wait_until_ready("ep-f", "app").await.unwrap_err();
+        assert!(err.contains("migration 2 failed: boom"), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
     }
 }

@@ -79,6 +79,19 @@ use crate::schema_guard::{
 };
 use crate::{OWNER_ROLE, Worker, credentials};
 
+/// The comment `branch_protected_check_sql` carries (the fakes' needle).
+pub const BRANCH_PROTECTED_CHECK_MARK: &str = "-- chelabase: branch protected check";
+
+/// Reads `neon.branch_protected` from a fresh session (U14): `on` once the compute's backends
+/// run with the protected spec.
+pub fn branch_protected_check_sql() -> String {
+    format!("{BRANCH_PROTECTED_CHECK_MARK}\nSHOW neon.branch_protected;")
+}
+
+/// How often, and how long between looks, a protect confirms the flag took effect.
+const FLAG_CONFIRM_TRIES: u32 = 20;
+const FLAG_CONFIRM_DELAY: Duration = Duration::from_millis(100);
+
 /// How long an enqueued reconcile waits before it runs: a burst of changes is one run.
 pub const MEMBER_ROLES_ENQUEUE_DELAY: Duration = Duration::from_secs(1);
 
@@ -450,7 +463,8 @@ pub fn drop_role_sql(role: &str) -> String {
 /// Every role with its owner-level flag (R16), the member roles with their attributes,
 /// settings, password and memberships, every other role's `SET` memberships, the
 /// connectable databases with their owners, and for the protected-branch guard (PB R12, R13)
-/// the superusers, every ADMIN membership and `template1` (when it takes connections). The comment is the fakes' needle. Role grants made
+/// the superusers, every ADMIN membership and `template1` (when it takes connections), and the
+/// closed or `neon.born_closed`-marked databases (`c` lines). The comment is the fakes' needle. Role grants made
 /// by a superuser are recorded as made by the bootstrap superuser (OID 10): those are the
 /// reconciler's own.
 pub fn member_catalog_sql() -> String {
@@ -504,7 +518,20 @@ SELECT 'A ' || {mname} || ' ' || {gname} \
 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid \
 WHERE a.admin_option \
 UNION ALL \
-SELECT 'g ' || {dname} FROM pg_database d WHERE d.datname = 'template1' AND d.datallowconn;",
+SELECT 'g ' || {dname} FROM pg_database d WHERE d.datname = 'template1' AND d.datallowconn \
+UNION ALL \
+SELECT 't ' || {dname} FROM pg_database d \
+WHERE d.datistemplate AND d.datallowconn AND d.datname <> 'template1' \
+UNION ALL \
+SELECT 'c ' || {dname} || ' ' || CASE WHEN d.datallowconn THEN 't' ELSE 'f' END || ' ' || \
+CASE WHEN d.datistemplate THEN 't' ELSE 'f' END || ' ' || \
+CASE WHEN {marked} THEN 't' ELSE 'f' END \
+FROM pg_database d WHERE NOT d.datallowconn OR {marked};",
+        // The marker is a Postgres bool (the C side reads it with `parse_bool`: any spelling of
+        // on, true, yes or 1 and their unambiguous prefixes, in any case).
+        marked = "EXISTS (SELECT 1 FROM pg_db_role_setting s, unnest(s.setconfig) c \
+WHERE s.setdatabase = d.oid AND s.setrole = 0 AND starts_with(c, 'neon.born_closed=') \
+AND lower(split_part(c, '=', 2)) IN ('on', 'true', 'yes', '1', 't', 'tr', 'tru', 'y', 'ye'))",
         rname = h("r.rolname"),
         mname = h("m.rolname"),
         gname = h("g.rolname"),
@@ -549,6 +576,92 @@ pub struct MemberCatalog {
     /// Databases that get the protected-branch guard but no member-role work: `template1`, so
     /// a `CREATE DATABASE` copies the guard (PB R12).
     pub guard_only_databases: Vec<String>,
+    /// Every database that doesn't take connections or carries the `neon.born_closed` marker,
+    /// by name (D5, U2).
+    pub closed_databases: Vec<ClosedDatabase>,
+    /// Open user templates (`datistemplate AND datallowconn`, not `template1`), by name: a
+    /// non-superuser can connect to them (and `CREATE DATABASE … TEMPLATE` copies them), so a
+    /// protected branch guards them too (RT3-5).
+    pub open_templates: Vec<String>,
+}
+
+/// One `c` line of the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedDatabase {
+    pub name: String,
+    pub allow_connections: bool,
+    pub template: bool,
+    /// Carries `neon.born_closed=on`: closed by Chelabase's born-closed rule, to be opened
+    /// once guarded.
+    pub born_closed: bool,
+}
+
+/// What the reconcile does for one closed or marked database ([`plan_closed_databases`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosedStep {
+    /// The database takes the protected-branch guard. The reconcile builds its guard list
+    /// from the catalog directly (every closed non-template database, protected or not, so an
+    /// unprotected branch's unguard loop sees them too); this step records the plan only.
+    Guard(String),
+    /// Allow connections and drop the marker; only after the database is guarded (protected)
+    /// or at once (unprotected).
+    Open(String),
+    /// The database is open: drop the stale marker.
+    ResetMarker(String),
+    /// A closed template: left alone.
+    Skip(String),
+}
+
+/// Pure. Protected: a closed non-template database is guarded, and opened only when marked
+/// (U2: an owner's close is respected); a marked open one loses the marker; a closed template
+/// is skipped. Unprotected: a marked closed non-template database is opened (no guard), a
+/// marked open one loses the marker, a marked closed template is skipped, an unmarked closed
+/// one is left alone. By database name.
+pub fn plan_closed_databases(closed: &[ClosedDatabase], protected: bool) -> Vec<ClosedStep> {
+    use ClosedStep::*;
+    let mut sorted: Vec<&ClosedDatabase> = closed.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut steps = Vec::new();
+    for d in sorted {
+        let name = d.name.clone();
+        if d.allow_connections {
+            if d.born_closed {
+                steps.push(ResetMarker(name));
+            }
+        } else if d.template {
+            if protected || d.born_closed {
+                steps.push(Skip(name));
+            }
+        } else if protected {
+            steps.push(Guard(name.clone()));
+            if d.born_closed {
+                steps.push(Open(name));
+            }
+        } else if d.born_closed {
+            steps.push(Open(name));
+        }
+    }
+    steps
+}
+
+/// Opens a born-closed database and drops its marker (the marker last, so a failure between
+/// the two leaves the database for the next run to finish).
+pub fn open_born_closed_sql(database: &str) -> String {
+    format!(
+        "ALTER DATABASE {} ALLOW_CONNECTIONS true;\n{}",
+        quoted(database),
+        reset_born_closed_sql(database)
+    )
+}
+
+/// Drops the `neon.born_closed` marker.
+pub fn reset_born_closed_sql(database: &str) -> String {
+    format!("ALTER DATABASE {} RESET neon.born_closed;", quoted(database))
+}
+
+/// Always double-quoted (these statements are matched by their text).
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn unhex(field: &str) -> Result<String, String> {
@@ -669,6 +782,17 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
             Some("g") => {
                 catalog.guard_only_databases.push(field(fields.next())?);
             }
+            Some("t") => {
+                catalog.open_templates.push(field(fields.next())?);
+            }
+            Some("c") => {
+                catalog.closed_databases.push(ClosedDatabase {
+                    name: field(fields.next())?,
+                    allow_connections: flag(fields.next())?,
+                    template: flag(fields.next())?,
+                    born_closed: flag(fields.next())?,
+                });
+            }
             _ => {
                 return Err(format!(
                     "an unexpected line {line:?} in the member-role catalog"
@@ -703,6 +827,8 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
     }
     catalog.databases.sort();
     catalog.guard_only_databases.sort();
+    catalog.open_templates.sort();
+    catalog.closed_databases.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(catalog)
 }
 
@@ -884,6 +1010,7 @@ impl MemberRoleRequests {
             let body = match serde_json::to_vec(&MemberRolesReconcileRequest {
                 branch_id: branch.as_uuid(),
                 member_id: None,
+                from_ddl: false,
             }) {
                 Ok(body) => body,
                 Err(e) => {
@@ -1001,6 +1128,30 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         branch: BranchId,
         member: Option<Uuid>,
     ) -> MemberRolesReply {
+        self.reconcile_member_roles_seen(branch, member).await.0
+    }
+
+    /// [`Self::reconcile_member_roles`], and whether the run found a database that is
+    /// `born_closed` and still closed: the DDL receiver's run retries once when it found none
+    /// (RT3-11).
+    async fn reconcile_member_roles_seen(
+        &self,
+        branch: BranchId,
+        member: Option<Uuid>,
+    ) -> (MemberRolesReply, bool) {
+        let mut found_born_closed = false;
+        let reply = self
+            .reconcile_member_roles_run(branch, member, &mut found_born_closed)
+            .await;
+        (reply, found_born_closed)
+    }
+
+    async fn reconcile_member_roles_run(
+        &self,
+        branch: BranchId,
+        member: Option<Uuid>,
+        found_born_closed: &mut bool,
+    ) -> MemberRolesReply {
         let record = match self.metadata.get_branch(branch).await {
             Ok(Some(b)) => b,
             Ok(None) => return failed("the branch doesn't exist"),
@@ -1019,6 +1170,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Ok(lock) => lock,
             Err(e) => return failed(format!("locking the endpoint: {e}")),
         };
+        // U14: a protected branch's compute refuses databases born open from here on, before
+        // any guard goes in or the catalog is read (a database born open in between would be
+        // missing from the list). Fails closed: no flag, no guarding, no opening.
+        if record.protected
+            && let Err(e) = self.ensure_flag(&ep, branch, true).await
+        {
+            warn!(branch_id = %branch, "member roles: turning the protection flag on failed: {e:#}");
+            return failed(format!("turning the protection flag on: {e:#}"));
+        }
         let catalog = match self
             .computes
             .admin_sql(&ep, SYSTEM_DATABASE, &member_catalog_sql())
@@ -1077,13 +1237,32 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // can change template1's guard, so it can't drift: it is touched (checked, then
         // installed or removed) only in a run that installs or removes the guard in another
         // database. Those come last (`true`: guard-only).
+        // D5, U2: the closed databases a protected branch guards join the list (a superuser
+        // connects to them), before the guard-only ones.
+        let closed_steps = plan_closed_databases(&catalog.closed_databases, record.protected);
+        *found_born_closed = catalog
+            .closed_databases
+            .iter()
+            .any(|d| d.born_closed && !d.allow_connections);
         let guard_databases: Vec<(&str, bool)> = catalog
             .databases
             .iter()
             .map(|(db, _)| (db.as_str(), false))
+            .chain(catalog.open_templates.iter().map(|db| (db.as_str(), false)))
+            // A closed non-template database (the owner's close, or born closed): a superuser
+            // connects to it to install the guard (protected) or remove a leftover one.
+            .chain(
+                catalog
+                    .closed_databases
+                    .iter()
+                    .filter(|d| !d.allow_connections && !d.template)
+                    .map(|d| (d.name.as_str(), false)),
+            )
             .chain(catalog.guard_only_databases.iter().map(|db| (db.as_str(), true)))
             .collect();
         let mut guard_changed = false;
+        // The databases whose guard is in place (found or installed) in this run.
+        let mut guarded: BTreeSet<&str> = BTreeSet::new();
 
         // Desired, with passwords.
         let mut wanted: Vec<Wanted> = Vec::new();
@@ -1210,16 +1389,24 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     continue;
                 }
                 match self.computes.admin_sql(&ep, db, &check).await {
-                    Ok(out) if out.lines().any(|l| l.trim() == "t") => continue,
+                    Ok(out) if out.lines().any(|l| l.trim() == "t") => {
+                        guarded.insert(db);
+                        continue;
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         debug!(branch_id = %branch, database = db, "member roles: checking the DDL guard failed ({e:#}); installing it");
                     }
                 }
                 guard_changed = true;
-                if let Err(e) = self.computes.admin_sql(&ep, db, &guard).await {
-                    warn!(branch_id = %branch, database = db, "member roles: installing the DDL guard failed: {e:#}");
-                    failures.push(format!("guarding {db}: {e:#}"));
+                match self.computes.admin_sql(&ep, db, &guard).await {
+                    Ok(_) => {
+                        guarded.insert(db);
+                    }
+                    Err(e) => {
+                        warn!(branch_id = %branch, database = db, "member roles: installing the DDL guard failed: {e:#}");
+                        failures.push(format!("guarding {db}: {e:#}"));
+                    }
                 }
             }
         } else {
@@ -1241,6 +1428,40 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     warn!(branch_id = %branch, database = db, "member roles: removing the DDL guard failed: {e:#}");
                     failures.push(format!("unguarding {db}: {e:#}"));
                 }
+            }
+            // U14: the guards are gone; the compute may stop refusing databases born open. Not
+            // while one failed to go (the run is failed and the sweep tries again).
+            if failures.is_empty()
+                && let Err(e) = self.ensure_flag(&ep, branch, false).await
+            {
+                warn!(branch_id = %branch, "member roles: turning the protection flag off failed: {e:#}");
+                failures.push(format!("turning the protection flag off: {e:#}"));
+            }
+        }
+        // D5, U2: databases born closed are opened once guarded (a failed install leaves the
+        // database closed and the run failed); a stale marker is dropped.
+        for step in &closed_steps {
+            let (db, sql) = match step {
+                ClosedStep::Guard(_) | ClosedStep::Skip(_) => continue,
+                ClosedStep::Open(db) => {
+                    if record.protected && !guarded.contains(db.as_str()) {
+                        continue;
+                    }
+                    (db, open_born_closed_sql(db))
+                }
+                ClosedStep::ResetMarker(db) => {
+                    // A marker comes off an open database only once it is guarded.
+                    if record.protected && !guarded.contains(db.as_str()) {
+                        continue;
+                    }
+                    (db, reset_born_closed_sql(db))
+                }
+            };
+            let script = format!("SET search_path = pg_catalog, pg_temp;\n{sql}");
+            if let Err(e) = self.computes.admin_sql(&ep, SYSTEM_DATABASE, &script).await {
+                warn!(branch_id = %branch, database = db, "member roles: opening a born-closed database failed: {e:#}");
+                failures.push(format!("opening {db}: {e:#}"));
+                continue;
             }
         }
         let mut revokes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
@@ -1367,6 +1588,57 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 })
                 .collect(),
         }
+    }
+
+    /// Whether a fresh session on the compute reads `neon.branch_protected = on`.
+    async fn flag_is_on(&self, ep: &str) -> anyhow::Result<bool> {
+        let out = self
+            .computes
+            .admin_sql(ep, SYSTEM_DATABASE, &branch_protected_check_sql())
+            .await?;
+        Ok(out.lines().any(|l| l.trim().eq_ignore_ascii_case("on")))
+    }
+
+    /// Brings the compute's `neon.branch_protected` to `protected` (a reconfigure with the
+    /// branch's protection in the spec), under the endpoint's lock. Turning it on is confirmed
+    /// from a fresh session (`pg_ctl reload` returns before every backend has absorbed the
+    /// change) for a bounded time; a flag that doesn't take effect is an error. Turning it off
+    /// is only a push, and only when the flag is on.
+    async fn ensure_flag(&self, ep: &str, branch: BranchId, protected: bool) -> anyhow::Result<()> {
+        // `None`: the flag can't be read. Turning it on pushes (and confirms); turning it off
+        // pushes too, an idempotent settle of a flag we can't see.
+        let state = self.flag_is_on(ep).await.ok();
+        if state == Some(protected) {
+            return Ok(());
+        }
+        self.push_protection(ep, protected).await?;
+        if !protected {
+            return Ok(());
+        }
+        for _ in 0..FLAG_CONFIRM_TRIES {
+            if self.flag_is_on(ep).await.unwrap_or(false) {
+                return Ok(());
+            }
+            tokio::time::sleep(FLAG_CONFIRM_DELAY).await;
+        }
+        anyhow::bail!("branch {branch}: the compute doesn't report neon.branch_protected = on")
+    }
+
+    /// Pushes the endpoint's spec with `protected` as its protection to the running compute.
+    async fn push_protection(&self, ep: &str, protected: bool) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let endpoint = self
+            .metadata
+            .neon_endpoint(ep)
+            .await?
+            .context("the endpoint is gone")?;
+        let (roles, _) = self.metadata.neon_roles_versioned(ep).await?;
+        let control_addr = self
+            .control_addr_bounded(ep)
+            .await?
+            .context("the compute isn't running")?;
+        self.build_and_push_spec(&endpoint, roles, control_addr, protected)
+            .await
     }
 
     /// A member role gone: locked out and its sessions ended, then in each database its
@@ -1511,11 +1783,24 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         tries: u32,
         first_delay: Duration,
     ) -> MemberRolesReply {
+        self.reconcile_member_roles_retrying_seen(branch, tries, first_delay)
+            .await
+            .0
+    }
+
+    /// [`Self::reconcile_member_roles_retrying`], with whether the last run found a closed
+    /// database.
+    async fn reconcile_member_roles_retrying_seen(
+        &self,
+        branch: BranchId,
+        tries: u32,
+        first_delay: Duration,
+    ) -> (MemberRolesReply, bool) {
         let mut delay = first_delay;
-        let mut reply = failed("never tried");
+        let mut reply = (failed("never tried"), false);
         for attempt in 1..=tries.max(1) {
-            reply = self.reconcile_member_roles(branch, None).await;
-            let MemberRolesReply::Failed { message } = &reply else {
+            reply = self.reconcile_member_roles_seen(branch, None).await;
+            let MemberRolesReply::Failed { message } = &reply.0 else {
                 return reply;
             };
             if attempt < tries {
@@ -1530,20 +1815,40 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// An enqueued reconcile (`chelabase.member_roles.reconcile`): waits `delay` (a burst is
     /// one run), then reconciles the whole branch, retried with backoff
     /// ([`MEMBER_ROLES_TRIES`]). A call while another for the branch waits returns at once:
-    /// the waiting one covers it.
+    /// the waiting one covers it. `from_ddl`: the DDL receiver asked (see
+    /// `MemberRolesReconcileRequest::from_ddl`).
     pub async fn reconcile_member_roles_soon(
         &self,
         pending: &PendingResyncs,
         branch: BranchId,
         delay: Duration,
+        from_ddl: bool,
     ) -> MemberRolesReply {
-        if !pending.claim(branch) {
+        if !pending.claim_marked(branch, from_ddl) {
             return MemberRolesReply::Done { roles: Vec::new() };
         }
         tokio::time::sleep(delay).await;
-        pending.release(branch);
-        self.reconcile_member_roles_retrying(branch, MEMBER_ROLES_TRIES, MEMBER_ROLES_RETRY_DELAY)
-            .await
+        // Whether a DDL request is among those this run covers, merged ones included.
+        let from_ddl = pending.release_marked(branch);
+        let (reply, found_born_closed) = self
+            .reconcile_member_roles_retrying_seen(branch, MEMBER_ROLES_TRIES, MEMBER_ROLES_RETRY_DELAY)
+            .await;
+        // RT3-11: the DDL that asked for this run may not have been visible yet (a `CREATE
+        // DATABASE` is forwarded before it commits). A run that found no closed database
+        // looks once more, once; a run nobody's DDL asked for doesn't.
+        // The born-closed rule (and so the retry) is a protected branch's.
+        let protected = matches!(self.metadata.get_branch(branch).await, Ok(Some(b)) if b.protected);
+        if from_ddl
+            && protected
+            && matches!(reply, MemberRolesReply::Done { .. })
+            && !found_born_closed
+        {
+            tokio::time::sleep(delay).await;
+            return self
+                .reconcile_member_roles_retrying(branch, MEMBER_ROLES_TRIES, MEMBER_ROLES_RETRY_DELAY)
+                .await;
+        }
+        reply
     }
 
     /// I2: one pass of the periodic sweep, the backstop for lost or failed reconciles: every

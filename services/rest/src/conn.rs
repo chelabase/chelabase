@@ -31,6 +31,9 @@ use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+use chelabase_query::server_tls::ServerTls;
+use tokio_postgres_rustls_improved::MakeRustlsConnect;
+
 /// How long connection info is trusted.
 pub const INFO_TTL: Duration = Duration::from_secs(60);
 /// A request naming a database the cached info doesn't serve fetches the info again when it
@@ -81,6 +84,10 @@ pub struct ServedDatabase {
 pub struct ConnInfo {
     pub host: String,
     pub port: u16,
+    /// The name the compute's server certificate carries
+    /// (`<endpoint_id>.compute.chelabase.internal`): `host` is then its IP, dialled, and the
+    /// connection is TLS verified against the platform CA as this name (U15).
+    pub server_name: Option<String>,
     /// The main database's name.
     pub database: String,
     pub user: String,
@@ -101,12 +108,14 @@ impl ConnInfo {
         (
             &self.host,
             self.port,
+            &self.server_name,
             &self.user,
             &self.password,
             self.settings.max_connections,
         ) == (
             &other.host,
             other.port,
+            &other.server_name,
             &other.user,
             &other.password,
             other.settings.max_connections,
@@ -120,6 +129,8 @@ impl ConnInfo {
 struct WireConnInfo {
     host: String,
     port: u16,
+    #[serde(default)]
+    server_name: Option<String>,
     database: String,
     user: String,
     password: String,
@@ -151,6 +162,7 @@ impl From<WireConnInfo> for ConnInfo {
         ConnInfo {
             host: w.host,
             port: w.port,
+            server_name: w.server_name,
             database: w.database,
             user: w.user,
             password: w.password,
@@ -169,6 +181,7 @@ impl fmt::Debug for ConnInfo {
         f.debug_struct("ConnInfo")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("server_name", &self.server_name)
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"<redacted>")
@@ -302,12 +315,24 @@ struct DbPool {
 }
 
 impl DbPool {
+    #[cfg(test)]
     fn new(info: Arc<ConnInfo>, config: tokio_postgres::Config, max_size: usize) -> Self {
+        Self::with_connector(info, config, max_size, None)
+    }
+
+    /// A pool whose connections use `connector` (TLS verified against the platform CA), or
+    /// none (plain: the fakes).
+    fn with_connector(
+        info: Arc<ConnInfo>,
+        config: tokio_postgres::Config,
+        max_size: usize,
+        connector: Option<MakeRustlsConnect>,
+    ) -> Self {
         DbPool {
             info,
             #[cfg(test)]
             config: config.clone(),
-            pool: build_pool(config, max_size),
+            pool: build_pool_with(config, max_size, connector),
             last_used: std::sync::Mutex::new(tokio::time::Instant::now()),
             opening: AtomicUsize::new(0),
         }
@@ -344,11 +369,17 @@ impl Drop for Opening<'_> {
     }
 }
 
-/// How a pool for `database` of `info` connects.
+/// How a pool for `database` of `info` connects, plain (`host` dialled as given).
 fn pg_config(info: &ConnInfo, database: &str) -> tokio_postgres::Config {
+    let mut config = base_config(info, database);
+    config.host(&info.host);
+    config
+}
+
+/// Everything but where: the caller sets the host (plain) or the TLS target.
+fn base_config(info: &ConnInfo, database: &str) -> tokio_postgres::Config {
     let mut config = tokio_postgres::Config::new();
     config
-        .host(&info.host)
         .port(info.port)
         .user(&info.user)
         .password(&info.password)
@@ -358,19 +389,54 @@ fn pg_config(info: &ConnInfo, database: &str) -> tokio_postgres::Config {
     config
 }
 
-/// A pool of up to `max_size` connections opened with `config`: no TLS (the compute is on
-/// the private network), `Fast` recycling (only a closed connection is dropped), a wait
+/// How a pool for `database` of `info` connects (U15): a named target (`server_name`) over TLS
+/// verified against `server_tls` (its IP dialled, its name verified); an unnamed one plain,
+/// only without a CA (the fakes). A target that can't be verified is refused, never dialled.
+fn connect_config(
+    info: &ConnInfo,
+    database: &str,
+    server_tls: Option<&ServerTls>,
+) -> Result<(tokio_postgres::Config, Option<MakeRustlsConnect>), ConnError> {
+    match (&info.server_name, server_tls) {
+        (Some(name), Some(tls)) => {
+            let mut config = base_config(info, database);
+            tls.configure(&mut config, &info.host, name)
+                .map_err(|e| ConnError::Unreachable(format!("compute TLS: {e}")))?;
+            Ok((config, Some(tls.connector())))
+        }
+        (Some(_), None) => Err(ConnError::Unreachable(
+            "no CA to verify the compute's TLS against".into(),
+        )),
+        (None, Some(_)) => Err(ConnError::Unreachable(
+            "no certificate name to verify the compute's TLS against".into(),
+        )),
+        (None, None) => Ok((pg_config(info, database), None)),
+    }
+}
+
+/// A plain pool ([`build_pool_with`] without a connector).
+#[cfg(test)]
+fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Pool {
+    build_pool_with(config, max_size, None)
+}
+
+/// A pool of up to `max_size` connections opened with `config`: TLS through `connector`
+/// (plain without one: the fakes only), `Fast` recycling (only a closed connection is dropped), a wait
 /// for a free connection capped at [`ACQUIRE_TIMEOUT`]. Each connection's statement cache
 /// is bounded by the lease that prepares through it
 /// ([`chelabase_query::pipeline::STATEMENT_CACHE_CAP`]).
-fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Pool {
-    let manager = Manager::from_config(
-        config,
-        tokio_postgres::NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
+fn build_pool_with(
+    config: tokio_postgres::Config,
+    max_size: usize,
+    connector: Option<MakeRustlsConnect>,
+) -> Pool {
+    let manager_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    let manager = match connector {
+        Some(connector) => Manager::from_config(config, connector, manager_config),
+        None => Manager::from_config(config, tokio_postgres::NoTls, manager_config),
+    };
     Pool::builder(manager)
         .max_size(max_size)
         .runtime(Runtime::Tokio1)
@@ -543,6 +609,8 @@ pub struct Pools<S> {
     pools: Arc<PoolCache>,
     slots: moka::future::Cache<Uuid, Arc<BranchSlots>>,
     permits: Arc<Semaphore>,
+    /// The platform CA computes are verified against (U15); `None` only for the fakes.
+    server_tls: Option<ServerTls>,
 }
 
 /// Failing to open a connection, before any statement: worth a fresh look at where the
@@ -590,6 +658,16 @@ impl<S: ConnSource> Pools<S> {
                 .time_to_idle(POOL_IDLE)
                 .build(),
             permits: Arc::new(Semaphore::new(max_connections)),
+            server_tls: None,
+        }
+    }
+
+    /// Like [`Self::new`], verifying every compute against `server_tls` (U15): the service's
+    /// pools. A target without a certificate name is refused before any connection.
+    pub fn with_server_tls(source: S, max_connections: usize, server_tls: ServerTls) -> Self {
+        Pools {
+            server_tls: Some(server_tls),
+            ..Self::new(source, max_connections)
         }
     }
 
@@ -639,22 +717,28 @@ impl<S: ConnSource> Pools<S> {
 
     /// The pool of `database` for `info`, rebuilt when the branch's address, credentials or
     /// size changed.
-    async fn pool(&self, branch: Uuid, database: &str, info: &Arc<ConnInfo>) -> Arc<DbPool> {
+    async fn pool(
+        &self,
+        branch: Uuid,
+        database: &str,
+        info: &Arc<ConnInfo>,
+    ) -> Result<Arc<DbPool>, ConnError> {
         let key = (branch, database.to_owned());
         if let Some(p) = self.pools.get(&key).await
             && p.info.same_server(info)
             && !p.pool.is_closed()
         {
-            return p;
+            return Ok(p);
         }
-        let config = pg_config(info, database);
-        let p = Arc::new(DbPool::new(
+        let (config, connector) = connect_config(info, database, self.server_tls.as_ref())?;
+        let p = Arc::new(DbPool::with_connector(
             info.clone(),
             config,
             info.settings.max_connections.max(1) as usize,
+            connector,
         ));
         self.pools.insert(key, p.clone()).await;
-        p
+        Ok(p)
     }
 
     /// The branch's slots and pools, resized in place when `max_connections` changed.
@@ -730,7 +814,7 @@ impl<S: ConnSource> Pools<S> {
                 return Err(AcquireError::NotServed);
             }
             let slots = self.branch(branch, &info).await;
-            let pool = self.pool(branch, database, &info).await;
+            let pool = self.pool(branch, database, &info).await?;
             slots.register(&pool);
             let permits = self.permits(&slots.slots).await?;
             *pool.last_used.lock().expect("last_used") = tokio::time::Instant::now();
@@ -788,7 +872,7 @@ impl<S: ConnSource> Pools<S> {
         let info = self.info(branch).await.unwrap();
         let slots = self.branch(branch, &info).await;
         for d in &info.databases {
-            slots.register(&self.pool(branch, &d.name, &info).await);
+            slots.register(&self.pool(branch, &d.name, &info).await.unwrap());
         }
     }
 
@@ -811,6 +895,7 @@ pub(crate) mod test_support {
         ConnInfo {
             host: "127.0.0.1".into(),
             port: 1,
+            server_name: None,
             database: "main".into(),
             user: "authenticator".into(),
             password: "pw".into(),
@@ -1097,12 +1182,12 @@ mod tests {
         let pools = Pools::new(RefusedSource, 10);
         let branch = Uuid::new_v4();
         let info = pools.info(branch).await.unwrap();
-        let main = pools.pool(branch, "main", &info).await;
-        let analytics = pools.pool(branch, "analytics", &info).await;
+        let main = pools.pool(branch, "main", &info).await.unwrap();
+        let analytics = pools.pool(branch, "analytics", &info).await.unwrap();
         assert!(!Arc::ptr_eq(&main, &analytics));
         assert_eq!(main.config.get_dbname(), Some("main"));
         assert_eq!(analytics.config.get_dbname(), Some("analytics"));
-        assert!(Arc::ptr_eq(&main, &pools.pool(branch, "main", &info).await));
+        assert!(Arc::ptr_eq(&main, &pools.pool(branch, "main", &info).await.unwrap()));
 
         let slots = pools.slots(branch, &info).await;
         assert!(Arc::ptr_eq(&slots, &pools.slots(branch, &info).await));
@@ -1198,6 +1283,7 @@ mod tests {
         let info = ConnInfo {
             host: parsed.host_str().unwrap().into(),
             port: parsed.port().unwrap_or(5432),
+            server_name: None,
             database: a.clone(),
             user: parsed.username().into(),
             password: parsed.password().unwrap_or_default().into(),

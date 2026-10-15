@@ -7,6 +7,45 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
+## Neon fork round 3 (2026-10-15, in progress: tested, awaiting the merge decision)
+
+Branch `neon-fork-round-3`; spec `docs/superpowers/specs/2026-10-15-neon-fork-round-3-design.md`; plan and full history `docs/superpowers/plans/2026-10-15-neon-fork-round-3.md`. Fork heads: `chelabase/neon` `round-3` `629166cee`, `chelabase/postgres` `round-3-v17` `76ce76278c5`, `chelabase/rust-postgres` `chelabase/sasl-verified` `9a1b048b`.
+
+### Realtime decoding that only ever sees primary keys
+
+- **Problem:** realtime (RT1) needs to know which rows changed without reading row contents or creating publications in the customer's database; upstream offers `pgoutput`/`test_decoding`, which emit whole rows.
+- **What we built:** `chelabase_keys`, a logical decoding output plugin in our Postgres fork that emits only the primary-key values of inserted, updated and deleted rows (as UTF-8 whatever the database encoding; SQL_ASCII refused), with a memory budget, and a locked-down `chelabase_realtime` replication login: temporary `chelabase_keys` slots it created only, no SQL, no startup parameters, hot-standby feedback ignored on logical slots.
+- **What it unlocks:** RT1's row-change stream filtered by each viewer's RLS, with nothing installed in the customer's schema.
+- **Evidence:** `chelabase_keys` regression suite (keys, kinds, limits, edges, encoding: 5/5), Python suites `test_chelabase_keys`, `test_chelabase_realtime_role` (including an invariant test over every replication command and message type the login can send), `test_chelabase_f2_edges`; live `compute_fork_live` (the realtime slot goes with a compute restart).
+
+### Commits can't be acknowledged by an impostor standby
+
+- **Problem:** in the original Neon base, any replication client could name itself `walproposer` (or match `*`) and become the synchronous standby, acknowledging WAL the safekeepers never stored.
+- **What we built:** while the walproposer runs, only it can be a synchronous standby; client walsenders always get priority 0. Plain Postgres (no walproposer) keeps stock synchronous replication.
+- **Evidence:** Python tests on a compute (a client named `walproposer` stays async, the walproposer stays sync) and on plain Postgres (stock behaviour); the flag is a C global, not a setting (tests: `SHOW`/`SET` fail).
+
+### Team member logins locked to the platform
+
+- **Problem:** per-member Postgres logins (`cb_m_*`) could be altered by a database owner or the member itself (a password, a granted role), and could log in from anywhere on the compute network; the reconcile only undid it later.
+- **What we built:** only a superuser can change a member role (every `ALTER ROLE`/`GRANT`/`CREATE ROLE … IN ROLE` form, nested SQL included); member logins are accepted only from the orchestrator's addresses **and** with a client certificate from a platform CA. Computes serve TLS with per-compute certificates; the orchestrator, auth and the data API all connect over verified TLS 1.3, and a certificate refusal is told apart from a wrong password.
+- **Evidence:** `test_member_role_guard`, `test_member_logins_hba`, `member_roles_live` (30/30, including a model test over random owner and admin actions), rust-postgres `sasl_verified` (12 + 2), orchestrator error-classification table tests, `app-users-e2e`, `rest_live`.
+
+### New databases on a protected branch are born closed
+
+- **Problem:** a database created from SQL on a protected branch was open, without the schema guard, until the next reconcile.
+- **What we built:** while the branch is protected (a flag set by the platform, not a setting a session can change), every non-superuser `CREATE DATABASE` is born closed; Chelabase guards it, then opens it. Opening or templating a database is refused; renaming the branch's main database is refused too.
+- **Evidence:** exhaustive Python matrices (flag on/off × session database kind × template × role), `member_roles_live` born-closed tests, the worker's exhaustive reconcile table test.
+
+### No migration race at compute start
+
+- **Problem:** compute_ctl ran its migrations after reporting `running`, so the data API setup could collide with them (`tuple concurrently updated`, seen in 6g and TE-B1).
+- **What we built:** migrations run before `running`, never forwarded to the control plane, and a failure that leaves a privilege-removing migration unapplied stops the start; the worker waits for `running`.
+- **Evidence:** `test_compute_migrations`, `test_ddl_forwarding_invalid_db`, the worker's wait-loop tests; the live pass's provisioning suites.
+
+### Deferred
+
+- A temporary slot's pageserver copy outlives a compute restart (found by this round's live pass): the first item of the next fork round, before RT1 runs on real computes.
+
 ## Landing split (2026-10-08, shipped)
 
 Merged into `main` 2026-10-08. Spec `docs/superpowers/specs/2026-10-08-landing-split-design.md`; plan `docs/superpowers/plans/2026-10-08-landing-split.md`.

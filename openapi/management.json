@@ -15213,7 +15213,8 @@
           "lock_timeout",
           "schema_change_failed",
           "has_dependents",
-          "review_changed"
+          "review_changed",
+          "compute_tls_failed"
         ]
       },
       "ErrorEnvelope": {

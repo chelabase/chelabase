@@ -300,6 +300,10 @@ pub struct MemberRolesReconcileRequest {
     pub branch_id: Uuid,
     #[serde(default)]
     pub member_id: Option<Uuid>,
+    /// The DDL receiver asked for this run (a `CREATE DATABASE` it forwarded may not be visible
+    /// yet): the worker looks once more when the first look found nothing to open (RT3-11).
+    #[serde(default)]
+    pub from_ddl: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1623,7 +1627,7 @@ mod tests {
         assert_eq!(SUBJECT_MEMBER_ROLES_RECONCILE, "chelabase.rpc.member_roles.reconcile");
         assert_eq!(SUBJECT_MEMBER_ROLES_ENQUEUE, "chelabase.member_roles.reconcile");
         let (branch_id, member_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let request = MemberRolesReconcileRequest { branch_id, member_id: Some(member_id) };
+        let request = MemberRolesReconcileRequest { branch_id, member_id: Some(member_id), from_ddl: false };
         let back: MemberRolesReconcileRequest =
             serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
         assert_eq!((back.branch_id, back.member_id), (branch_id, Some(member_id)));
@@ -1631,6 +1635,21 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "branch_id": branch_id, "member_id": null }))
                 .unwrap();
         assert_eq!(whole.member_id, None);
+        // T9 I2: `from_ddl` marks a run the DDL receiver asked for (the RT3-11 retry applies to
+        // it only). An old publisher, which never sends it, means false.
+        assert!(!whole.from_ddl, "absent means false");
+        let from_ddl: MemberRolesReconcileRequest = serde_json::from_value(
+            serde_json::json!({ "branch_id": branch_id, "member_id": null, "from_ddl": true }),
+        )
+        .unwrap();
+        assert!(from_ddl.from_ddl);
+        let wire = serde_json::to_value(&MemberRolesReconcileRequest {
+            branch_id,
+            member_id: None,
+            from_ddl: true,
+        })
+        .unwrap();
+        assert_eq!(wire["from_ddl"], serde_json::json!(true), "the field's name on the wire");
         let done = MemberRolesReply::Done {
             roles: vec![MemberRoleApplied {
                 member_id,

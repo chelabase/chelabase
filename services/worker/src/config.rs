@@ -1,11 +1,13 @@
 //! The worker's environment, and wiring the real ports into a [`Worker`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 
 use chelabase_metadata::MetadataClient;
+use chelabase_neon::compute_tls::ComputeCa;
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::{ComputeSettings, DockerBackend, StorconClient};
@@ -60,6 +62,17 @@ pub struct WorkerConfig {
     /// containers no endpoint row records. Listing is scoped to the stack, so this is an
     /// opt-out for debugging, not a guard against other stacks.
     pub remove_orphans: bool,
+    /// `CHELABASE_COMPUTE_CONTROL_NETWORK` (default `chelabase_control`): the network the
+    /// orchestrator reaches computes on; member logins come from its addresses there.
+    pub compute_control_network: String,
+    /// `CHELABASE_COMPUTE_CA_DIR` (default `.chelabase/compute-ca`): `ca.crt` and `ca.key`.
+    pub compute_ca_dir: PathBuf,
+    /// `CHELABASE_COMPUTE_TLS_DIR` (default `.chelabase/orchestrator-tls`): where the worker
+    /// writes the orchestrator's client pair.
+    pub compute_tls_dir: PathBuf,
+    /// `CHELABASE_MEMBER_LOGIN_CIDRS`: the addresses member logins may come from. `None` when
+    /// unset ([`build`] refuses to start); empty means no address rule.
+    pub member_login_cidrs: Option<Vec<String>>,
 }
 
 /// The value of `name`, or `None` when it's unset or blank.
@@ -124,6 +137,23 @@ impl WorkerConfig {
                 non_blank(&get, "CHELABASE_MEMBER_ROLES_SWEEP_SECS"),
             )?,
             remove_orphans: remove_orphans(non_blank(&get, "CHELABASE_WORKER_REMOVE_ORPHANS"))?,
+            compute_control_network: or_default(
+                "CHELABASE_COMPUTE_CONTROL_NETWORK",
+                "chelabase_control",
+            ),
+            compute_ca_dir: PathBuf::from(or_default(
+                "CHELABASE_COMPUTE_CA_DIR",
+                ".chelabase/compute-ca",
+            )),
+            compute_tls_dir: PathBuf::from(or_default(
+                "CHELABASE_COMPUTE_TLS_DIR",
+                ".chelabase/orchestrator-tls",
+            )),
+            // Read raw: an empty value is "no address rule", not "unset".
+            member_login_cidrs: match get("CHELABASE_MEMBER_LOGIN_CIDRS") {
+                None => None,
+                Some(raw) => Some(chelabase_neon::spec::parse_member_login_cidrs(Some(&raw))?),
+            },
         };
         check_control_plane_uri(&config.control_plane_uri)?;
         Ok(config)
@@ -238,6 +268,18 @@ pub fn build(
 ) -> anyhow::Result<RealWorker> {
     // First, so a missing key pair names `just zitadel-bootstrap` before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
+    let cidrs = config.member_login_cidrs.clone().ok_or_else(|| {
+        anyhow!(
+            "CHELABASE_MEMBER_LOGIN_CIDRS is unset: set it to the addresses member logins come \
+             from (comma-separated CIDRs), or to an empty value for no address rule"
+        )
+    })?;
+    let ca = Arc::new(ComputeCa::load(&config.compute_ca_dir).with_context(|| {
+        format!(
+            "loading the compute CA from {} (CHELABASE_COMPUTE_CA_DIR; `just zitadel-bootstrap` creates it)",
+            config.compute_ca_dir.display()
+        )
+    })?);
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -260,6 +302,8 @@ pub fn build(
             network: config.compute_network.clone(),
             control_plane_uri: config.control_plane_uri.clone(),
             stack: config.stack.clone(),
+            control_network: config.compute_control_network.clone(),
+            ca: Some(ca.clone()),
         })?,
         cache: ProxyCache::new(&config.valkey_url)?,
         pusher: HttpPusher { http, signer },
@@ -269,6 +313,7 @@ pub fn build(
         control_plane_uri: config.control_plane_uri.clone(),
         ready_poll: Duration::from_millis(500),
         ready_timeout: crate::provision::READY_TIMEOUT,
+        ready_cap: crate::provision::READY_CAP,
         claim_refresh: DEFAULT_CLAIM_REFRESH,
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
@@ -280,6 +325,11 @@ pub fn build(
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
         member_role_requests: Default::default(),
+        member_logins: chelabase_neon::spec::MemberLogins::orchestrator(cidrs),
+        cert_sweep: Some(crate::certs::CertSweep {
+            ca,
+            tls_dir: config.compute_tls_dir.clone(),
+        }),
     })
 }
 
@@ -608,5 +658,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("CHELABASE_AUTH_HOST"), "{err}");
+    }
+
+    use std::path::PathBuf;
+
+    #[test]
+    fn config_reads_the_round_3_settings() {
+        let d = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert_eq!(d.compute_control_network, "chelabase_control");
+        assert_eq!(d.compute_ca_dir, PathBuf::from(".chelabase/compute-ca"));
+        assert_eq!(d.compute_tls_dir, PathBuf::from(".chelabase/orchestrator-tls"));
+        assert_eq!(d.member_login_cidrs, None, "unset: build() refuses to start");
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_COMPUTE_CONTROL_NETWORK", "chelabase-feat-x_control"),
+            ("CHELABASE_COMPUTE_CA_DIR", "/m/.chelabase/compute-ca"),
+            ("CHELABASE_COMPUTE_TLS_DIR", "/m/.chelabase/orchestrator-tls"),
+            ("CHELABASE_MEMBER_LOGIN_CIDRS", "10.213.4.10/32,10.213.4.11/32"),
+        ]))
+        .unwrap();
+        assert_eq!(c.compute_control_network, "chelabase-feat-x_control");
+        assert_eq!(c.compute_ca_dir, PathBuf::from("/m/.chelabase/compute-ca"));
+        assert_eq!(c.compute_tls_dir, PathBuf::from("/m/.chelabase/orchestrator-tls"));
+        assert_eq!(c.member_login_cidrs, Some(vec!["10.213.4.10/32".to_string(), "10.213.4.11/32".to_string()]));
+        let empty = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_MEMBER_LOGIN_CIDRS", "")])).unwrap();
+        assert_eq!(empty.member_login_cidrs, Some(vec![]), "empty: no address rule");
+        assert!(WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_MEMBER_LOGIN_CIDRS", "nope")])).is_err());
     }
 }

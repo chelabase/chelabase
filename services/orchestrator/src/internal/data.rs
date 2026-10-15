@@ -134,6 +134,9 @@ where
         "host": addr.ip().to_string(),
         "port": addr.port(),
         "database": database,
+        // U15: rest dials `host` and verifies the compute as this name, the only one its
+        // certificate carries.
+        "server_name": chelabase_neon::compute_tls::server_name(endpoint),
         "user": "authenticator",
         "password": password,
         "status": row.status.as_str(),

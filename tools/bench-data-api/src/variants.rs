@@ -1282,6 +1282,7 @@ mod tests {
         ConnInfo {
             host: "127.0.0.1".into(),
             port: 1,
+            server_name: None,
             database: "main".into(),
             user: "authenticator".into(),
             password: "x".into(),

@@ -59,6 +59,11 @@ pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
     if config.compute_jwt_dir.is_relative() {
         config.compute_jwt_dir = workspace_root().join(&config.compute_jwt_dir);
     }
+    for dir in [&mut config.compute_ca_dir, &mut config.compute_tls_dir] {
+        if dir.is_relative() {
+            *dir = workspace_root().join(&*dir);
+        }
+    }
     let metadata = MetadataClient::connect(&MetadataConfig {
         database_url: std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
             "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()

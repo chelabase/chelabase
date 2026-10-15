@@ -105,6 +105,8 @@ check:
     scripts/tests/entry-sh.sh
     scripts/tests/stack-urls.sh
     scripts/tests/workbench-compose.sh
+    scripts/tests/compose-key-visibility.sh
+    scripts/tests/compose-mask-probe.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
     cargo check --workspace

@@ -7,16 +7,20 @@
 //! session couldn't write. Names in SQL are always quoted; values are bind parameters.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
+use tokio_postgres::config::{ChannelBinding, SslMode};
 use tokio_postgres::{NoTls, TransactionStatus};
+use tokio_postgres_rustls_improved::MakeRustlsConnect;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use crate::error::DbFields;
+use crate::server_tls::ServerTls;
 
 /// The role the sync connects as.
 pub const SYNC_ROLE: &str = "chelabase_auth_sync";
@@ -39,6 +43,47 @@ pub struct SyncTarget {
     pub password: String,
     pub schema: String,
     pub table: String,
+    /// The name the compute's server certificate carries
+    /// (`<endpoint_id>.compute.chelabase.internal`): `host` is then its IP, dialled, and the
+    /// connection is TLS verified against the platform CA as this name (U15; the auth
+    /// service's sync, [`PgUsersDb::with_server_tls`]). A target without it is reached plain
+    /// only by a db without a CA (the fakes).
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// TLS to the compute (the orchestrator's sync, on the control network: T10 I3). Never
+    /// serialized: a target sent to another service arrives without it and connects plain.
+    #[serde(skip)]
+    pub tls: Option<SyncTls>,
+}
+
+/// TLS for a sync connection: `host` is then the compute's address (an IP) and `server_name`
+/// the name its certificate carries. The connection asks for TLS first and requires it and
+/// channel binding: it never falls back to plaintext.
+#[derive(Clone)]
+pub struct SyncTls {
+    /// The compute's certificate name.
+    pub server_name: String,
+    /// The client pair and the CA the compute is checked against.
+    pub connector: MakeRustlsConnect,
+    /// The client pair's fingerprint (taken from the same snapshot as `connector`): a renewed
+    /// pair is another pool.
+    pub fingerprint: [u8; 32],
+}
+
+impl PartialEq for SyncTls {
+    fn eq(&self, other: &Self) -> bool {
+        self.server_name == other.server_name && self.fingerprint == other.fingerprint
+    }
+}
+
+impl fmt::Debug for SyncTls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let fingerprint: String = self.fingerprint.iter().map(|b| format!("{b:02x}")).collect();
+        f.debug_struct("SyncTls")
+            .field("server_name", &self.server_name)
+            .field("fingerprint", &fingerprint)
+            .finish()
+    }
 }
 
 impl fmt::Debug for SyncTarget {
@@ -52,6 +97,8 @@ impl fmt::Debug for SyncTarget {
             .field("password", &"<hidden>")
             .field("schema", &self.schema)
             .field("table", &self.table)
+            .field("server_name", &self.server_name)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -172,6 +219,9 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// idle pool is dropped by the cache's time-to-idle (two connections don't need a reaper).
 pub struct PgUsersDb {
     pools: moka::future::Cache<(Uuid, [u8; 32]), Pool>,
+    /// The platform CA a named target ([`SyncTarget::server_name`]) is verified against;
+    /// `None` refuses named targets (and reaches unnamed ones plain: the fakes).
+    server_tls: Option<ServerTls>,
 }
 
 impl Default for PgUsersDb {
@@ -181,39 +231,84 @@ impl Default for PgUsersDb {
 }
 
 impl PgUsersDb {
+    /// Without a CA: only unnamed targets, plain (tests and fakes; never a service's sync).
     pub fn new() -> Self {
         PgUsersDb {
             pools: moka::future::Cache::builder()
                 .max_capacity(256)
                 .time_to_idle(Duration::from_secs(600))
                 .build(),
+            server_tls: None,
         }
     }
 
-    /// The branch's pool; a changed password, address or database makes a new one.
-    async fn pool(&self, t: &SyncTarget) -> Pool {
-        let mut h = Sha256::new();
-        h.update(t.password.as_bytes());
-        h.update(format!("{}:{}", t.host, t.port).as_bytes());
-        h.update(t.database.as_bytes());
-        let key = (t.branch_id, <[u8; 32]>::from(h.finalize()));
-        self.pools
-            .get_with(key, async {
-                let mut config = tokio_postgres::Config::new();
+    /// With the platform CA (U15): every target must carry a `server_name` (or the
+    /// orchestrator's own [`SyncTls`]); one without is refused before any connection.
+    pub fn with_server_tls(server_tls: ServerTls) -> Self {
+        PgUsersDb {
+            server_tls: Some(server_tls),
+            ..Self::new()
+        }
+    }
+
+    /// The branch's pool ([`pool_key`]). A TLS target whose `host` isn't an IP address, or a
+    /// target this db can't verify, is refused before any connection.
+    async fn pool(&self, t: &SyncTarget) -> Result<Pool, UserRowError> {
+        let mut config = tokio_postgres::Config::new();
+        config
+            .port(t.port)
+            .user(&t.user)
+            .password(&t.password)
+            .dbname(&t.database)
+            .application_name("chelabase-auth");
+        let connector = match (&t.tls, &t.server_name, &self.server_tls) {
+            // The orchestrator's sync: its client pair, on the control network.
+            (Some(tls), _, _) => {
+                let addr: IpAddr = t.host.parse().map_err(|_| {
+                    UserRowError::Unavailable(format!(
+                        "the compute's address {:?} isn't an IP address",
+                        t.host
+                    ))
+                })?;
                 config
-                    .host(&t.host)
-                    .port(t.port)
-                    .user(&t.user)
-                    .password(&t.password)
-                    .dbname(&t.database)
-                    .application_name("chelabase-auth");
-                let manager = Manager::from_config(
-                    config,
-                    NoTls,
-                    ManagerConfig {
-                        recycling_method: RecyclingMethod::Fast,
-                    },
-                );
+                    .host(&tls.server_name)
+                    .hostaddr(addr)
+                    .ssl_mode(SslMode::Require)
+                    .channel_binding(ChannelBinding::Require);
+                Some(tls.connector.clone())
+            }
+            // U15: the compute verified against the platform CA as its certificate's name.
+            (None, Some(name), Some(server_tls)) => {
+                server_tls
+                    .configure(&mut config, &t.host, name)
+                    .map_err(|e| UserRowError::Unavailable(e.to_string()))?;
+                Some(server_tls.connector())
+            }
+            (None, Some(_), None) => {
+                return Err(UserRowError::Unavailable(
+                    "no CA to verify the compute's TLS against".into(),
+                ));
+            }
+            (None, None, Some(_)) => {
+                return Err(UserRowError::Unavailable(
+                    "no certificate name to verify the compute's TLS against".into(),
+                ));
+            }
+            (None, None, None) => {
+                config.host(&t.host);
+                None
+            }
+        };
+        Ok(self
+            .pools
+            .get_with(pool_key(t), async move {
+                let manager_config = ManagerConfig {
+                    recycling_method: RecyclingMethod::Fast,
+                };
+                let manager = match connector {
+                    Some(connector) => Manager::from_config(config, connector, manager_config),
+                    None => Manager::from_config(config, NoTls, manager_config),
+                };
                 Pool::builder(manager)
                     .max_size(2)
                     .runtime(Runtime::Tokio1)
@@ -222,8 +317,36 @@ impl PgUsersDb {
                     .build()
                     .expect("a pool with a runtime set always builds")
             })
-            .await
+            .await)
     }
+}
+
+/// A pool's key: the branch, and a hash of what its connections are made with (the password,
+/// the address, the database, and the TLS identity: plain, or the compute's certificate name
+/// and the client pair's fingerprint). A change to any of them is a new pool.
+fn pool_key(t: &SyncTarget) -> (Uuid, [u8; 32]) {
+    let mut h = Sha256::new();
+    h.update(t.password.as_bytes());
+    h.update(b"\n");
+    h.update(format!("{}:{}", t.host, t.port).as_bytes());
+    h.update(b"\n");
+    h.update(t.database.as_bytes());
+    h.update(b"\n");
+    if let Some(name) = &t.server_name {
+        h.update(b"name ");
+        h.update(name.as_bytes());
+        h.update(b"\n");
+    }
+    match &t.tls {
+        None => h.update(b"plain"),
+        Some(tls) => {
+            h.update(b"tls ");
+            h.update(tls.server_name.as_bytes());
+            h.update(b" ");
+            h.update(tls.fingerprint);
+        }
+    }
+    (t.branch_id, h.finalize().into())
 }
 
 /// A pooled connection inside an open transaction. It goes back to the pool only once its
@@ -285,7 +408,7 @@ impl UsersDb for PgUsersDb {
         target: &SyncTarget,
         row: &NewUserRow,
     ) -> Result<Box<dyn PendingInsert>, UserRowError> {
-        let pool = self.pool(target).await;
+        let pool = self.pool(target).await?;
         let conn = pool
             .get()
             .await
@@ -504,9 +627,146 @@ mod tests {
             password: "hunter2".into(),
             schema: "s".into(),
             table: "t".into(),
+            server_name: None,
+            tls: None,
         };
         let d = format!("{t:?}");
         assert!(!d.contains("hunter2"), "{d}");
         assert!(d.contains("host") && d.contains("\"h\""), "{d}");
+    }
+
+    // ---- T10 I3: the orchestrator's sync reaches the compute's control address over TLS ----
+
+    fn connector() -> tokio_postgres_rustls_improved::MakeRustlsConnect {
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        tokio_postgres_rustls_improved::MakeRustlsConnect::new(config)
+    }
+
+    fn target(port: u16, tls: Option<SyncTls>) -> SyncTarget {
+        SyncTarget {
+            branch_id: uuid::Uuid::nil(),
+            host: "127.0.0.1".into(),
+            port,
+            database: "d".into(),
+            user: SYNC_ROLE.into(),
+            password: "pw".into(),
+            schema: "public".into(),
+            table: "users".into(),
+            server_name: None,
+            tls,
+        }
+    }
+
+    fn tls(server_name: &str, fingerprint: u8) -> SyncTls {
+        SyncTls {
+            server_name: server_name.into(),
+            connector: connector(),
+            fingerprint: [fingerprint; 32],
+        }
+    }
+
+    // The TLS half is the orchestrator's own: it never goes on the wire to the auth service
+    // (which keeps reaching computes on the default network as before).
+    #[test]
+    fn the_tls_half_is_never_serialized() {
+        let t = target(5432, Some(tls("ep-a.compute.chelabase.internal", 1)));
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("tls").is_none(), "{json}");
+        let back: SyncTarget = serde_json::from_value(json).unwrap();
+        assert!(back.tls.is_none());
+        let d = format!("{t:?}");
+        assert!(d.contains("ep-a.compute.chelabase.internal"), "{d}");
+    }
+
+    // A renewed client pair, another compute name or TLS on/off is another pool.
+    #[test]
+    fn the_pool_key_carries_the_tls_identity() {
+        let plain = pool_key(&target(5432, None));
+        let a = pool_key(&target(5432, Some(tls("ep-a.compute.chelabase.internal", 1))));
+        assert_eq!(a, pool_key(&target(5432, Some(tls("ep-a.compute.chelabase.internal", 1)))));
+        for other in [
+            plain,
+            pool_key(&target(5432, Some(tls("ep-a.compute.chelabase.internal", 2)))),
+            pool_key(&target(5432, Some(tls("ep-b.compute.chelabase.internal", 1)))),
+        ] {
+            assert_ne!(a, other);
+        }
+    }
+
+    // With TLS set, the first bytes are an SSLRequest, and a server that refuses TLS gets no
+    // plaintext startup (and so no password): the insert fails as unavailable.
+    #[tokio::test]
+    async fn a_tls_target_asks_for_tls_and_never_falls_back_to_plaintext() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            // The pool may try more than once; every attempt must start the same way.
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+            {
+                let mut first = [0u8; 8];
+                if socket.read_exact(&mut first).await.is_err() {
+                    continue;
+                }
+                seen.push(first);
+                let _ = socket.write_all(b"N").await;
+                let mut rest = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut rest))
+                    .await;
+                assert!(rest.is_empty(), "plaintext after a refused SSLRequest: {rest:?}");
+            }
+            seen
+        });
+        let db = PgUsersDb::new();
+        let row = NewUserRow {
+            id: uuid::Uuid::nil(),
+            email: "a@x.test".into(),
+            email_verified: true,
+            data: serde_json::Map::new(),
+        };
+        let t = target(port, Some(tls("ep-a.compute.chelabase.internal", 1)));
+        let err = match db.begin_insert(&t, &row).await {
+            Ok(_) => panic!("a server without TLS can't take the insert"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, UserRowError::Unavailable(_)), "{err:?}");
+        drop(db);
+        let seen = server.await.unwrap();
+        assert!(!seen.is_empty(), "the pool connected");
+        let ssl_request = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+        for first in seen {
+            assert_eq!(first, ssl_request, "an SSLRequest first");
+        }
+    }
+
+    // A TLS target needs the compute's address as an IP (its name goes to the certificate
+    // check): a host name is refused before any connection, never resolved and tried plain.
+    #[tokio::test]
+    async fn a_tls_target_without_an_ip_address_is_refused_before_connecting() {
+        let db = PgUsersDb::new();
+        let row = NewUserRow {
+            id: uuid::Uuid::nil(),
+            email: "a@x.test".into(),
+            email_verified: true,
+            data: serde_json::Map::new(),
+        };
+        let mut t = target(5432, Some(tls("ep-a.compute.chelabase.internal", 1)));
+        t.host = "compute.example".into();
+        let err = match db.begin_insert(&t, &row).await {
+            Ok(_) => panic!("a host name can't take a TLS insert"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, UserRowError::Unavailable(m) if m.contains("isn't an IP address")),
+            "{err:?}"
+        );
+        assert_eq!(db.pools.entry_count(), 0, "no pool was made");
     }
 }

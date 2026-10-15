@@ -57,6 +57,7 @@ Any project route can answer the first four rows. See [Access per route](/docs/r
 | 410 | `invite_revoked` | The invite was revoked. |
 | 503 | `invite_incomplete` | The code was accepted but a later step failed. `error.accept_ticket` lets the page retry without the spent code. |
 | 503 | `member_role_reconcile_failed` | The caller's Postgres role on this branch couldn't be prepared right now. Comes with `Retry-After`; try again. |
+| 503 | `compute_tls_failed` | Chelabase couldn't open a verified TLS connection to this branch's compute, or the compute refused the connection's address or client certificate. Comes with `Retry-After`; try again. If it persists, the operator should check the compute CA and the orchestrator's client certificate. |
 
 Two more refusals use general codes. A grant or override below Admin that lists an owner-level, `LOGIN` or reserved role, or a role whose chain reaches one, is 422 `invalid_request`, and so is a grant at any level (Admin too) whose role chain holds `ADMIN` on another role; the message names the role, its chain and the database (`error.role`, `error.chain`, `error.database_id`), and invites and approvals also name the grant's project (`error.project_id`). A Developer who acts as such a role, or creates a data key bound to one, gets 403 `forbidden` with `required: "admin"`.
 

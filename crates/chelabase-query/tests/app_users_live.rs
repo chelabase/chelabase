@@ -74,6 +74,9 @@ impl Scratch {
             password: "chelabase".into(),
             schema,
             table: "users".into(),
+            // The metadata database, not a compute: plain.
+            server_name: None,
+            tls: None,
         };
         Scratch {
             admin,

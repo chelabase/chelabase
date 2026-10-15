@@ -1,26 +1,34 @@
 //! Creating, inspecting and removing computes, and running admin SQL inside them.
 
 use std::future::Future;
+use std::io::Read as _;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 use bollard::Docker;
 use bollard::errors::Error as DockerError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerCreateBody, ContainerStateStatusEnum, HostConfig, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerStateStatusEnum, HostConfig, NetworkConnectRequest,
+    RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, ListContainersOptions, RemoveContainerOptions, StartContainerOptions,
+    CreateContainerOptions, DownloadFromContainerOptions, ListContainersOptions,
+    RemoveContainerOptions, StartContainerOptions, UploadToContainerOptions,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use crate::compute::{
     COMPUTE_TOKEN_ENV, ComputeLocator, DockerLocator, ENDPOINT_LABEL, STACK_LABEL,
     compute_ctl_args, container_name, list_filters,
 };
+use crate::compute_tls::{ComputeCa, IssuedCert, TLS_UPLOAD_ROOT, tls_files_tar};
+
+/// The largest file [`DockerBackend::read_file`] reads (certificates are a few KiB).
+const READ_FILE_LIMIT: u64 = 1024 * 1024;
 
 const ADMIN_SQL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -89,6 +97,13 @@ pub struct ComputeSettings {
     pub control_plane_uri: String,
     /// The stack the computes belong to: in their names and labels, and the only ones listed.
     pub stack: String,
+    /// The network the orchestrator reaches computes' Postgres on (member logins come from
+    /// its address there). A compute joins it after create, before start; when it is
+    /// `network` itself there is nothing to join.
+    pub control_network: String,
+    /// The CA that issues each compute's server certificate at create. `None` where computes
+    /// are never created (the orchestrator): [`ComputeBackend::create`] then fails.
+    pub ca: Option<Arc<ComputeCa>>,
 }
 
 /// Lifecycle of computes plus admin SQL inside them.
@@ -99,6 +114,19 @@ pub trait ComputeBackend: ComputeLocator {
         compute_token: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
     fn delete(&self, endpoint_id: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// The contents of the file at `path` in the compute's container (at most 1 MiB).
+    fn read_file(
+        &self,
+        endpoint_id: &str,
+        path: &str,
+    ) -> impl Future<Output = anyhow::Result<Vec<u8>>> + Send;
+    /// Writes `server` and the CA certificate into the compute's TLS directory; compute_ctl
+    /// notices the new certificate and reloads Postgres with it.
+    fn upload_tls(
+        &self,
+        endpoint_id: &str,
+        server: &IssuedCert,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
     fn status(
         &self,
         endpoint_id: &str,
@@ -279,8 +307,86 @@ impl DockerBackend {
         })
     }
 
+    /// A backend over an existing Docker client (tests aim one at a mock engine).
+    pub fn with_docker(settings: ComputeSettings, docker: Docker) -> Self {
+        Self {
+            locator: DockerLocator::with_docker(docker, &settings.network, &settings.stack),
+            settings,
+        }
+    }
+
     fn docker(&self) -> &Docker {
         &self.locator.docker
+    }
+
+    fn ca(&self) -> anyhow::Result<&ComputeCa> {
+        self.settings
+            .ca
+            .as_deref()
+            .context("no compute CA configured: this backend can't issue compute certificates")
+    }
+
+    /// Extracts `tar` at [`TLS_UPLOAD_ROOT`] in container `name` (created or running).
+    async fn upload_tls_tar(&self, name: &str, tar: Vec<u8>) -> anyhow::Result<()> {
+        self.docker()
+            .upload_to_container(
+                name,
+                Some(UploadToContainerOptions {
+                    path: TLS_UPLOAD_ROOT.to_string(),
+                    ..Default::default()
+                }),
+                bollard::body_full(tar.into()),
+            )
+            .await
+            .with_context(|| format!("uploading the TLS files into {name}"))
+    }
+
+    async fn upload_tls_inner(&self, endpoint_id: &str, server: &IssuedCert) -> anyhow::Result<()> {
+        let tar = tls_files_tar(server, self.ca()?.cert_pem())?;
+        let name = container_name(&self.settings.stack, endpoint_id);
+        self.upload_tls_tar(&name, tar).await
+    }
+
+    async fn read_file_inner(&self, endpoint_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        let name = container_name(&self.settings.stack, endpoint_id);
+        let mut archive = Vec::new();
+        let mut stream = self.docker().download_from_container(
+            &name,
+            Some(DownloadFromContainerOptions {
+                path: path.to_string(),
+            }),
+        );
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .with_context(|| format!("reading {path} from {name}"))?
+        {
+            archive.extend_from_slice(&chunk);
+            // The archive carries headers and padding besides the file.
+            if archive.len() as u64 > READ_FILE_LIMIT + 64 * 1024 {
+                bail!("{path} in {name} is over {READ_FILE_LIMIT} bytes");
+            }
+        }
+        let mut entries = tar::Archive::new(archive.as_slice());
+        for entry in entries
+            .entries()
+            .with_context(|| format!("reading the archive of {path} from {name}"))?
+        {
+            let entry = entry.with_context(|| format!("reading the archive of {path} from {name}"))?;
+            if entry.header().entry_type() != tar::EntryType::Regular {
+                continue;
+            }
+            let mut body = Vec::new();
+            entry
+                .take(READ_FILE_LIMIT + 1)
+                .read_to_end(&mut body)
+                .with_context(|| format!("reading {path} from {name}"))?;
+            if body.len() as u64 > READ_FILE_LIMIT {
+                bail!("{path} in {name} is over {READ_FILE_LIMIT} bytes");
+            }
+            return Ok(body);
+        }
+        bail!("{path} in {name} isn't a regular file")
     }
 
     async fn remove(&self, name: &str) -> Result<(), DockerError> {
@@ -383,8 +489,14 @@ impl ComputeLocator for DockerBackend {
 }
 
 impl ComputeBackend for DockerBackend {
+    /// Create → join the control network → upload the TLS files → start, so compute_ctl finds
+    /// its certificate at once.
     async fn create(&self, endpoint_id: &str, compute_token: &str) -> anyhow::Result<()> {
         let name = container_name(&self.settings.stack, endpoint_id);
+        // Issued before anything is created: without a CA no compute is made.
+        let ca = self.ca()?;
+        let server = ca.issue_server(endpoint_id, SystemTime::now())?;
+        let tls = tls_files_tar(&server, ca.cert_pem())?;
         let body = create_body(endpoint_id, compute_token, &self.settings);
         let create = || {
             self.docker().create_container(
@@ -405,11 +517,45 @@ impl ComputeBackend for DockerBackend {
             other => other,
         }
         .with_context(|| format!("creating container {name}"))?;
-        self.docker()
-            .start_container(&created.id, None::<StartContainerOptions>)
-            .await
-            .with_context(|| format!("starting container {name}"))?;
+        // Everything after the container exists: a failure removes it again (best effort; the
+        // step's own error is what the caller sees), so no stopped container is left behind.
+        let steps = async {
+            if self.settings.control_network != self.settings.network {
+                self.docker()
+                    .connect_network(
+                        &self.settings.control_network,
+                        NetworkConnectRequest {
+                            container: created.id.clone(),
+                            endpoint_config: None,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "connecting {name} to network {}",
+                            self.settings.control_network
+                        )
+                    })?;
+            }
+            self.upload_tls_tar(&created.id, tls).await?;
+            self.docker()
+                .start_container(&created.id, None::<StartContainerOptions>)
+                .await
+                .with_context(|| format!("starting container {name}"))
+        };
+        if let Err(e) = steps.await {
+            let _ = self.remove(&created.id).await;
+            return Err(e);
+        }
         Ok(())
+    }
+
+    async fn read_file(&self, endpoint_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.read_file_inner(endpoint_id, path).await
+    }
+
+    async fn upload_tls(&self, endpoint_id: &str, server: &IssuedCert) -> anyhow::Result<()> {
+        self.upload_tls_inner(endpoint_id, server).await
     }
 
     async fn delete(&self, endpoint_id: &str) -> anyhow::Result<()> {
@@ -520,6 +666,15 @@ pub mod fake {
         /// `(endpoint, needle, stdout)`: like `answers_at`, but each answers once (the first
         /// match is used up); tried before every other answer.
         pub answers_once: Mutex<Vec<(String, String, String)>>,
+        /// `(endpoint, path)` → the bytes `read_file` returns (see [`FakeBackend::set_file`]);
+        /// a path not set is an error, like a file missing in the container.
+        pub files: Mutex<HashMap<(String, String), Vec<u8>>>,
+        /// Every `upload_tls` that got through: the endpoint and the server certificate.
+        pub tls_uploads: Mutex<Vec<(String, crate::compute_tls::IssuedCert)>>,
+        /// `upload_tls` fails with this message.
+        pub fail_upload: Mutex<Option<String>>,
+        /// `(database, needle)` set by [`FakeBackend::fail_in`].
+        fail_in_needles: Mutex<Vec<(String, String)>>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -573,6 +728,20 @@ pub mod fake {
         /// earlier needles).
         pub fn fail_when(&self, needle: &str) {
             lock(&self.fail_needles).push(needle.to_string());
+        }
+
+        /// From now on, SQL run in `database` containing `needle` fails with "injected failure"
+        /// (other databases are unaffected).
+        pub fn fail_in(&self, database: &str, needle: &str) {
+            lock(&self.fail_in_needles).push((database.to_string(), needle.to_string()));
+        }
+
+        /// The file `path` of `endpoint_id`'s container reads as `contents`.
+        pub fn set_file(&self, endpoint_id: &str, path: &str, contents: &[u8]) {
+            lock(&self.files).insert(
+                (endpoint_id.to_string(), path.to_string()),
+                contents.to_vec(),
+            );
         }
 
         /// From now on, SQL containing `needle` times out ([`SqlTimedOut`]); with `runs`, after
@@ -659,6 +828,25 @@ pub mod fake {
             Ok(())
         }
 
+        async fn read_file(&self, endpoint_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+            match lock(&self.files).get(&(endpoint_id.to_string(), path.to_string())) {
+                Some(bytes) => Ok(bytes.clone()),
+                None => bail!("no such file {path} in {endpoint_id}"),
+            }
+        }
+
+        async fn upload_tls(
+            &self,
+            endpoint_id: &str,
+            server: &crate::compute_tls::IssuedCert,
+        ) -> anyhow::Result<()> {
+            if let Some(message) = lock(&self.fail_upload).clone() {
+                bail!(message);
+            }
+            lock(&self.tls_uploads).push((endpoint_id.to_string(), server.clone()));
+            Ok(())
+        }
+
         async fn delete(&self, endpoint_id: &str) -> anyhow::Result<()> {
             self.record(format!("compute.delete {endpoint_id}"));
             if let Some(message) = lock(&self.fail_delete).clone() {
@@ -708,6 +896,12 @@ pub mod fake {
                 bail!(message);
             }
             if lock(&self.fail_needles).iter().any(|n| sql.contains(n)) {
+                bail!("injected failure");
+            }
+            if lock(&self.fail_in_needles)
+                .iter()
+                .any(|(db, n)| db == database && sql.contains(n))
+            {
                 bail!("injected failure");
             }
             let timeout = lock(&self.timeout_needles)
@@ -783,7 +977,17 @@ mod tests {
             network: "chelabase-feat-x_default".to_string(),
             control_plane_uri: "http://orchestrator:8083".to_string(),
             stack: "feat-x".to_string(),
+            control_network: "chelabase-feat-x_control".to_string(),
+            ca: None,
         }
+    }
+
+    // The orchestrator's backend has no CA: creating a compute fails before Docker is asked.
+    #[tokio::test]
+    async fn create_without_a_ca_fails_before_docker() {
+        let backend = DockerBackend::connect(settings()).unwrap();
+        let err = backend.create("ep-abc123", "t").await.unwrap_err();
+        assert!(format!("{err:#}").contains("no compute CA"), "{err:#}");
     }
 
     #[test]

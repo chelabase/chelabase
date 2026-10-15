@@ -11,6 +11,8 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 **The internal listener is separate.** Machine-to-machine routes (for Neon's proxy, `compute_ctl`, the storage controller, `rest` and `auth`) are on their own listener, bound to loopback by default, each caller with its own bearer token. Nothing on it goes through the gateway. The default bearer values in a development setup are fixed strings and must not be used outside local development.
 
+**Member logins.** Member roles (`cb_m_*`) log in to a compute only from the orchestrator's address, presenting the orchestrator's client certificate and the member's password. The address rule takes its list from `CHELABASE_MEMBER_LOGIN_CIDRS`; an empty value turns the rule off, and the certificates are then the only check. Workbench stacks also admit the test runner's address, next to the orchestrator's. Replication clients can't become synchronous standbys of a compute.
+
 **Management API.** Callers present a Zitadel access token, which the gateway verifies against Zitadel's keys. Another tenant's resources answer exactly like missing ones (404 `not_found`).
 
 **Data API keys.** Chelabase stores only the SHA-256 of a key and its first 12 characters. A secret key is shown once and Chelabase keeps no copy; the public key is also stored encrypted so Studio can show it again. Keys resolve to a role, and `rest` refuses to run a request as an owner-level role (one that is a superuser or has `CREATEROLE`, `CREATEDB` or `REPLICATION`, or belongs to `neon_superuser`). A role with `BYPASSRLS` alone is allowed: its key reads past row-level security, and the key list marks it. Revocation takes effect within 30 seconds. Unknown-key lookups are rate limited per client address.

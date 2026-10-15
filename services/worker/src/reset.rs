@@ -74,6 +74,84 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.apply_pending_locked(endpoint_id, &[]).await
     }
 
+    /// Whether the branch linked to the endpoint is protected: every spec the worker pushes
+    /// carries it (U14). An endpoint without a live branch (a static compute, or a branch being
+    /// deleted) isn't; a branch that can't be read is an error (never a default of `false`).
+    pub(crate) async fn endpoint_branch_protected(&self, endpoint_id: &str) -> anyhow::Result<bool> {
+        let Some(branch) = self
+            .metadata
+            .endpoint_branch(endpoint_id)
+            .await
+            .context("finding the endpoint's branch")?
+        else {
+            return Ok(false);
+        };
+        let record = self
+            .metadata
+            .get_branch(branch)
+            .await
+            .context("reading the branch's protection")?
+            .with_context(|| format!("branch {branch} of {endpoint_id} has no record"))?;
+        Ok(record.protected)
+    }
+
+    /// The endpoint's control address, bounded: a hung Docker daemon must not keep the
+    /// endpoint's lock forever. `None` when the compute isn't running.
+    pub(crate) async fn control_addr_bounded(
+        &self,
+        endpoint_id: &str,
+    ) -> anyhow::Result<Option<std::net::SocketAddr>> {
+        tokio::time::timeout(DOCKER_TIMEOUT, self.computes.control_addr(endpoint_id))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "Docker didn't answer within {}s while finding the compute for {endpoint_id}",
+                    DOCKER_TIMEOUT.as_secs()
+                )
+            })?
+            .with_context(|| format!("finding the compute for {endpoint_id}"))
+    }
+
+    /// Builds the endpoint's spec (with `protected` as the branch's protection) and pushes it
+    /// to the running compute at `control_addr`: the one place the worker does so. The caller
+    /// holds the endpoint's lock; the push is bounded.
+    pub(crate) async fn build_and_push_spec(
+        &self,
+        endpoint: &chelabase_metadata::NeonEndpoint,
+        roles: Vec<chelabase_metadata::NeonRole>,
+        control_addr: std::net::SocketAddr,
+        protected: bool,
+    ) -> anyhow::Result<()> {
+        let endpoint_id = endpoint.id.as_str();
+        let databases = self
+            .metadata
+            .neon_databases(endpoint_id)
+            .await
+            .context("loading the databases")?;
+        let config = chelabase_neon::spec::stored_endpoint_config(
+            &self.storage,
+            endpoint,
+            roles,
+            databases,
+            self.pusher.jwks(),
+            Some(chelabase_neon::spec::ddl_url(
+                &self.control_plane_uri,
+                endpoint_id,
+            )),
+            &self.member_logins,
+            protected,
+        )
+        .await
+        .context("building the spec")?;
+        tokio::time::timeout(
+            DOCKER_TIMEOUT * 4,
+            self.pusher.push(control_addr, endpoint_id, &config),
+        )
+        .await
+        .map_err(|_| anyhow!("compute_ctl didn't take the spec in time"))?
+        .context("pushing the spec")
+    }
+
     /// [`Self::apply_pending`] for a caller that already holds `endpoint_id`'s lock. Publishes
     /// `/password_updated` for every role row on the endpoint plus `also_publish` (a deleted
     /// role's name), since a retry doesn't know which role changed.
@@ -104,40 +182,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
         // Step 2: a compute that isn't running pulls the current spec when it boots.
         // Bounded: a hung Docker daemon would otherwise keep the endpoint's lock forever.
-        let control_addr =
-            tokio::time::timeout(DOCKER_TIMEOUT, self.computes.control_addr(endpoint_id))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "Docker didn't answer within {}s while finding the compute for \
-                         {endpoint_id}",
-                        DOCKER_TIMEOUT.as_secs()
-                    )
-                })?
-                .with_context(|| format!("finding the compute for {endpoint_id}"))?;
+        let control_addr = self.control_addr_bounded(endpoint_id).await?;
         if let Some(control_addr) = control_addr {
-            let databases = self
-                .metadata
-                .neon_databases(endpoint_id)
-                .await
-                .context("loading the databases")?;
-            let config = chelabase_neon::spec::stored_endpoint_config(
-                &self.storage,
-                &endpoint,
-                roles,
-                databases,
-                self.pusher.jwks(),
-                Some(chelabase_neon::spec::ddl_url(
-                    &self.control_plane_uri,
-                    endpoint_id,
-                )),
-            )
-            .await
-            .context("building the spec")?;
-            self.pusher
-                .push(control_addr, endpoint_id, &config)
-                .await
-                .context("pushing the spec")?;
+            let protected = self.endpoint_branch_protected(endpoint_id).await?;
+            self.build_and_push_spec(&endpoint, roles, control_addr, protected)
+                .await?;
         }
 
         // Step 3.

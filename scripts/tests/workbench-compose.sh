@@ -71,10 +71,7 @@ for s in gateway auth rest studio zitadel mailpit metadata-db; do
 done
 
 for s in orchestrator worker gateway auth rest runner; do
-  for k in secrets gateway auth neon; do
-    [[ "$(q ".services[\"$s\"].volumes[] | select(.source == \"/m/.chelabase/$k\") | \"\(.target) \(.read_only // false)\"")" == "/m/.chelabase/$k true" ]] ||
-      fail "$s mounts the $k keys read-only at their own path"
-  done
+  # Which key files each service sees: compose-key-visibility.sh (U10).
   [[ "$(q ".services[\"$s\"].volumes[] | select(.source == \"/m/.chelabase/stacks/feat-x\") | \"\(.target) \(.read_only // false)\"")" == "/m/.chelabase/stacks/feat-x false" ]] ||
     fail "$s mounts the state dir read-write at its own path"
 done
@@ -121,4 +118,14 @@ grep -q 'pnpm@12\.6\.0' "$df" || fail "pnpm 12.6.0 through corepack"
 for tool in ca-certificates curl jq postgresql-client docker-ce-cli; do
   grep -q "$tool" "$df" || fail "the image has $tool"
 done
+[[ "$(q '.networks.control.ipam.config[0].subnet')" == 10.213.4.0/22 ]] || fail "the control network has the stack's subnet"
+[[ "$(q '.networks.control.ipam.config[0].ip_range')" == 10.213.6.0/23 ]] || fail "computes get addresses from the upper /23"
+[[ "$(q '.services.orchestrator.networks.control.ipv4_address')" == 10.213.4.10 ]] || fail "the orchestrator's static control address"
+[[ "$(q '.services.runner.networks.control.ipv4_address')" == 10.213.4.11 ]] || fail "the runner's static control address"
+[[ "$(q '.services.orchestrator.networks | keys | join(" ")')" == "control default" ]] || fail "the orchestrator is on both networks"
+[[ "$(q '.services.worker.networks | keys | join(" ")')" == "default" ]] || fail "the worker isn't on the control network"
+ca_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/compute-ca")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/compute-ca" and .read_only == true))"] | sort | join(" ")')"
+[[ "$ca_mounts" == "runner:true worker:false" ]] || fail "compute-ca: rw for the worker, ro for the runner (R-T9a), nobody else; got: $ca_mounts"
+tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/orchestrator-tls")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/orchestrator-tls" and .read_only == true))"] | sort | join(" ")')"
+[[ "$tls_mounts" == "orchestrator:true runner:true worker:false" ]] || fail "orchestrator-tls: rw for the worker, ro for the orchestrator and runner; got: $tls_mounts"
 echo "workbench-compose: ok"

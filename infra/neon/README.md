@@ -21,6 +21,8 @@ layers contain the new `NeonWalRecord::MultixactOffsetCreateWithNext` variant (e
 the pageserver image back to a pin from before round 2 (`956332507a7b` or older) makes those pages
 unreadable. Never roll the pageserver back to a pre-round-2 pin once a round-2 image has run.
 
+**Round 3 (published 2026-10-15, `629166ceef60-dev`):** `NEON_REF` pins `chelabase/neon` `629166ceef600938559ff39a1a95a7217e2cc0d2` (Postgres v17 at `chelabase/postgres` `76ce76278c5`); the images are pinned by digest in `infra/compose/docker-compose.yml`, built on the build-tools image `ghcr.io/chelabase/neon-build-tools:328cc68f1c26`. `chelabase_keys` is a logical decoding output plugin for the realtime feed in the Postgres fork (`contrib/chelabase_keys`). The `chelabase_realtime` role is restricted to that feed by the fork, identified by role name. Member roles (`cb_m_*`) can be changed only by a superuser and log in to a compute only from the orchestrator, by source address and client certificate. `REASSIGN OWNED` fires the DDL event triggers, so the protected-branch guard covers ownership moves. On a protected branch, a database a non-superuser creates is born closed and opens once the guard is installed. compute_ctl applies its migrations before it reports `running`, and the worker waits for `running` as well as `SELECT 1`. The Rust toolchain moves to 1.99.0 and the AWS SDK crates are upgraded, which takes rustls 0.21 out of the tree; the S3 client keeps the SDK's default flexible checksums. Published images will be tagged `<sha12>-dev`, where `<sha12>` is the first 12 characters of the fork commit.
+
 ## Pull (default)
 
 `just workbench up` pulls `ghcr.io/chelabase/neon-storage` and `ghcr.io/chelabase/neon-compute-v17`

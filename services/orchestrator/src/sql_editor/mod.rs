@@ -8,6 +8,8 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::{AppState, JobPort, MetadataPort};
 
 pub mod events;
+#[cfg(test)]
+pub(crate) mod fake_pg;
 pub mod guard;
 pub mod registry;
 pub mod run;

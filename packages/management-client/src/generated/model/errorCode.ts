@@ -108,4 +108,5 @@ export const ErrorCode = {
   schema_change_failed: 'schema_change_failed',
   has_dependents: 'has_dependents',
   review_changed: 'review_changed',
+  compute_tls_failed: 'compute_tls_failed',
 } as const;

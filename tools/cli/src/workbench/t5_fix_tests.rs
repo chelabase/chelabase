@@ -146,6 +146,7 @@ fn a_running_slot_is_refreshed() {
         proxy_port: 4500,
         created_at: 1,
         running_since: running,
+        control_slot: None,
     };
     with_registry(dir.path(), |r| {
         r.stacks = vec![e("a", Some(10)), e("b", None)];

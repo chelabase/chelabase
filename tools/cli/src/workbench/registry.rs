@@ -30,7 +30,14 @@ pub struct Entry {
     pub created_at: u64,
     /// Unix seconds since the stack took its slot; `None` when stopped.
     pub running_since: Option<u64>,
+    /// The stack's control-network slot `k` (0..=63): its subnet is `10.213.{4k}.0/22`. Kept until
+    /// purge; entries from before the control network get one on the next `ensure`.
+    #[serde(default)]
+    pub control_slot: Option<u8>,
 }
+
+/// The control-network slots (`main` takes 0).
+pub const CONTROL_SLOTS: RangeInclusive<u8> = 0..=63;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registry {
@@ -59,6 +66,10 @@ impl Registry {
         now: u64,
         free: impl Fn(u16) -> bool,
     ) -> anyhow::Result<Entry> {
+        if self.get(slug).is_some_and(|e| e.control_slot.is_none()) {
+            let slot = self.pick_slot(slug)?;
+            self.get_mut(slug).expect("checked above").control_slot = Some(slot);
+        }
         if let Some(e) = self.get_mut(slug) {
             if e.checkout != checkout {
                 if e.checkout.exists() {
@@ -80,6 +91,7 @@ impl Registry {
             let proxy = self.pick(PROXY_PORTS, "proxy", |e| e.proxy_port, &free)?;
             (gateway, proxy)
         };
+        let control_slot = Some(self.pick_slot(slug)?);
         let entry = Entry {
             slug: slug.to_string(),
             checkout: checkout.to_path_buf(),
@@ -87,9 +99,26 @@ impl Registry {
             proxy_port,
             created_at: now,
             running_since: None,
+            control_slot,
         };
         self.stacks.push(entry.clone());
         Ok(entry)
+    }
+
+    /// `main` gets slot 0 when it is free; any other stack the lowest slot no entry holds.
+    fn pick_slot(&self, slug: &str) -> anyhow::Result<u8> {
+        let taken = |slot: u8| self.stacks.iter().any(|e| e.control_slot == Some(slot));
+        let mut slots = CONTROL_SLOTS.filter(|s| !taken(*s));
+        let first = if slug == MAIN {
+            slots.next()
+        } else {
+            // Keep 0 for `main` while any other slot is left.
+            slots.find(|s| *s != 0).or_else(|| (!taken(0)).then_some(0))
+        };
+        first.with_context(|| {
+            "no free control-network slot left (64 stacks): purge a stack you no longer need \
+             (`just workbench purge --stack <slug>`)"
+        })
     }
 
     fn pick(

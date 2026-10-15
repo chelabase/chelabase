@@ -63,6 +63,7 @@ fn a_remote_base_names_its_branchs_stack() {
         proxy_port: 4501,
         created_at: 1,
         running_since: None,
+        control_slot: None,
     });
     assert_eq!(base_stack_slug("origin/feat/x", &reg).unwrap(), "feat-x");
     assert_eq!(base_stack_slug("origin/feat-x", &reg).unwrap(), "feat-x");

@@ -16,6 +16,16 @@ pub struct InternalConfig {
     pub storcon_url: String,
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
+    /// `CHELABASE_COMPUTE_CONTROL_NETWORK` (default `chelabase_control`): the network the
+    /// console and the SQL editor reach computes on, over TLS.
+    pub compute_control_network: String,
+    /// `CHELABASE_COMPUTE_TLS_DIR` (default `.chelabase/orchestrator-tls`): the client pair the
+    /// worker renews; the editor presents it to computes.
+    pub compute_tls_dir: PathBuf,
+    /// `CHELABASE_MEMBER_LOGIN_CIDRS`: where member logins come from, as the computes' spec
+    /// carries it. `None` when unset ([`Self::member_logins`] refuses to start); read raw, so an
+    /// empty value is `Some([])`, "no address rule".
+    pub member_login_cidrs: Option<Vec<String>>,
     /// `CHELABASE_CONTROL_PLANE_URI`: how computes reach this listener; the DDL receiver's URL
     /// (`neon.console_url`) is built from it.
     pub control_plane_uri: String,
@@ -65,6 +75,17 @@ impl InternalConfig {
             storcon_url: or("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             compute_jwt_dir: PathBuf::from(or("CHELABASE_COMPUTE_JWT_DIR", ".chelabase/neon")),
             compute_network: or("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
+            compute_control_network: or(
+                "CHELABASE_COMPUTE_CONTROL_NETWORK",
+                "chelabase_control",
+            ),
+            compute_tls_dir: PathBuf::from(or(
+                "CHELABASE_COMPUTE_TLS_DIR",
+                ".chelabase/orchestrator-tls",
+            )),
+            member_login_cidrs: get("CHELABASE_MEMBER_LOGIN_CIDRS")
+                .map(|raw| chelabase_neon::spec::parse_member_login_cidrs(Some(&raw)))
+                .transpose()?,
             control_plane_uri: check_control_plane_uri(or(
                 "CHELABASE_CONTROL_PLANE_URI",
                 "http://orchestrator:8083",
@@ -119,6 +140,16 @@ impl InternalConfig {
                 tracing::warn!(file = %file.display(), "reading the Zitadel admin PAT: {err}");
                 None
             }
+        }
+    }
+
+    /// What every compute's spec says about member logins: the configured CIDRs and the
+    /// orchestrator's certificate CN. Unset `CHELABASE_MEMBER_LOGIN_CIDRS` is the startup error.
+    pub fn member_logins(&self) -> Result<chelabase_neon::spec::MemberLogins> {
+        match &self.member_login_cidrs {
+            Some(cidrs) => Ok(chelabase_neon::spec::MemberLogins::orchestrator(cidrs.clone())),
+            None => chelabase_neon::spec::parse_member_login_cidrs(None)
+                .map(chelabase_neon::spec::MemberLogins::orchestrator),
         }
     }
 
@@ -177,6 +208,9 @@ impl std::fmt::Debug for InternalConfig {
             .field("storcon_url", &self.storcon_url)
             .field("compute_jwt_dir", &self.compute_jwt_dir)
             .field("compute_network", &self.compute_network)
+            .field("compute_control_network", &self.compute_control_network)
+            .field("compute_tls_dir", &self.compute_tls_dir)
+            .field("member_login_cidrs", &self.member_login_cidrs)
             .field("control_plane_uri", &self.control_plane_uri)
             .field("stack", &self.stack)
             // A URL with credentials (`redis://:pw@host`) isn't shown.
@@ -219,6 +253,36 @@ mod tests {
         assert_eq!(c.compute_network, "chelabase_default");
         assert_eq!(c.stack, "main");
         assert_eq!(c.control_plane_uri.as_str(), "http://orchestrator:8083");
+    }
+
+    #[test]
+    fn compute_tls_settings_and_member_login_cidrs() {
+        let c = InternalConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(c.compute_control_network, "chelabase_control");
+        assert_eq!(c.compute_tls_dir, PathBuf::from(".chelabase/orchestrator-tls"));
+        // Unset: read as None, and asking for the logins is the startup error.
+        assert_eq!(c.member_login_cidrs, None);
+        assert!(format!("{:#}", c.member_logins().unwrap_err()).contains("CHELABASE_MEMBER_LOGIN_CIDRS"));
+        let with = |value: &'static str| {
+            InternalConfig::from_lookup(move |k| {
+                (k == "CHELABASE_MEMBER_LOGIN_CIDRS").then(|| value.to_string())
+            })
+        };
+        // Empty (even blank) is "no address rule", not unset.
+        let empty = with("").unwrap().member_logins().unwrap();
+        assert!(empty.allowed_cidrs.is_empty());
+        assert_eq!(empty.client_cns, ["chelabase-orchestrator"]);
+        let listed = with("10.0.0.0/8, fd00::/8").unwrap().member_logins().unwrap();
+        assert_eq!(listed.allowed_cidrs, ["10.0.0.0/8", "fd00::/8"]);
+        assert!(with("not-a-cidr").is_err());
+        let c = InternalConfig::from_lookup(|k| match k {
+            "CHELABASE_COMPUTE_CONTROL_NETWORK" => Some("s_control".into()),
+            "CHELABASE_COMPUTE_TLS_DIR" => Some("/m/tls".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.compute_control_network, "s_control");
+        assert_eq!(c.compute_tls_dir, PathBuf::from("/m/tls"));
     }
 
     #[test]

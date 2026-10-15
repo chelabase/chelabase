@@ -281,9 +281,24 @@ type Schemas = (Arc<Schema>, Vec<Arc<RoleView>>, String, Arc<ConnInfo>);
 impl<S: ConnSource> Engine<S> {
     /// `max_connections` caps connections across every branch. Responses are capped at
     /// [`DEFAULT_MAX_RESPONSE_BYTES`] ([`Self::with_max_response_bytes`] changes it).
+    /// No CA: computes are reached plain (the fakes only; the service uses
+    /// [`Self::with_server_tls`]).
     pub fn new(source: S, max_connections: usize) -> Self {
+        Self::with_pools(Pools::new(source, max_connections))
+    }
+
+    /// Every compute's TLS verified against `server_tls` (U15): the service's engine.
+    pub fn with_server_tls(
+        source: S,
+        max_connections: usize,
+        server_tls: chelabase_query::server_tls::ServerTls,
+    ) -> Self {
+        Self::with_pools(Pools::with_server_tls(source, max_connections, server_tls))
+    }
+
+    fn with_pools(pools: Pools<S>) -> Self {
         Engine {
-            pools: Pools::new(source, max_connections),
+            pools,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             cache: QueryCache::default(),
             owner_level: owner_level_cache(),

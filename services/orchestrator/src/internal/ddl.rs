@@ -76,13 +76,20 @@ impl ResyncPort for async_nats::Client {
 
     fn reconcile_member_roles(&self, branch: BranchId) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
-            let body = serde_json::to_vec(&MemberRolesReconcileRequest {
-                branch_id: branch.as_uuid(),
-                member_id: None,
-            })?;
+            let body = serde_json::to_vec(&ddl_reconcile_request(branch))?;
             self.publish(SUBJECT_MEMBER_ROLES_ENQUEUE, body.into()).await?;
             Ok(())
         })
+    }
+}
+
+/// The reconcile the receiver asks for after a DDL statement: the whole branch, marked
+/// `from_ddl` (the one run the worker's RT3-11 retry applies to).
+pub(crate) fn ddl_reconcile_request(branch: BranchId) -> MemberRolesReconcileRequest {
+    MemberRolesReconcileRequest {
+        branch_id: branch.as_uuid(),
+        member_id: None,
+        from_ddl: true,
     }
 }
 
@@ -1760,3 +1767,7 @@ mod tests {
         assert!(t.len() <= text::MAX);
     }
 }
+
+#[cfg(test)]
+#[path = "ddl_f4_tests.rs"]
+mod f4_tests;

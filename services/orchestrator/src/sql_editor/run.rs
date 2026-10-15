@@ -17,7 +17,10 @@ use futures_util::{Stream, StreamExt, stream};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_postgres::error::{DbError, ErrorPosition, SqlState};
-use tokio_postgres::{AsyncMessage, Client, NoTls, SimpleQueryMessage};
+use tokio_postgres::config::{ChannelBinding, SslMode};
+use tokio_postgres::tls::TlsStream;
+use tokio_postgres::{AsyncMessage, Client, Connection, NoTls, Socket, SimpleQueryMessage};
+use chelabase_neon::compute_tls::ClientTls;
 use tokio_util::sync::CancellationToken;
 
 use super::events::{ColumnInfo, Outcome, RunEvent};
@@ -109,6 +112,21 @@ pub struct RunTarget {
     pub user: String,
     pub password: String,
     pub database: String,
+    pub tls: RunTls,
+}
+
+/// How a connection to the compute is secured.
+#[derive(Clone)]
+pub enum RunTls {
+    /// No TLS (the metadata database in tests).
+    Plain,
+    /// TLS to a compute on the control network: `host` is the compute's certificate name,
+    /// `hostaddr` its control address; the server certificate is checked against our CA and
+    /// `client`'s pair is presented (the compute requires it for member logins).
+    Compute {
+        server_name: String,
+        client: Arc<ClientTls>,
+    },
 }
 
 /// What to run.
@@ -138,6 +156,7 @@ pub type AfterRun = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// backend's process id.
 pub struct Connected {
     client: Client,
+    tls: RunTls,
     notices: mpsc::Receiver<DbError>,
     pid: i32,
     started: String,
@@ -172,6 +191,9 @@ impl Connected {
 /// Why [`connect`] failed.
 #[derive(Debug)]
 pub enum ConnectError {
+    /// A failure before the server answered: the TLS handshake, the certificate check, or no
+    /// client pair loaded.
+    Tls(String),
     /// No answer from the compute (refused, timed out, broken).
     Unreachable(String),
     /// The server answered with an error (authentication, missing database, ...): its
@@ -182,6 +204,7 @@ pub enum ConnectError {
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConnectError::Tls(m) => write!(f, "the TLS connection to the compute failed: {m}"),
             ConnectError::Unreachable(m) => write!(f, "the compute can't be reached: {m}"),
             ConnectError::Rejected { code, message } => {
                 write!(f, "the compute refused the connection ({code}): {message}")
@@ -192,28 +215,136 @@ impl fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
-/// A fresh NoTls connection (R6), `application_name` = [`APPLICATION_NAME`], connect timeout 5 s.
+/// A fresh connection (R6), TLS per `target.tls`, `application_name` = [`APPLICATION_NAME`],
+/// connect timeout 5 s.
 pub async fn connect(target: &RunTarget) -> Result<Connected, ConnectError> {
     let mut config = tokio_postgres::Config::new();
     config
-        .host(target.addr.ip().to_string())
         .port(target.addr.port())
         .user(&target.user)
         .password(&target.password)
         .dbname(&target.database)
         .application_name(APPLICATION_NAME)
         .connect_timeout(CONNECT_TIMEOUT);
-    let (client, mut connection) =
-        config
-            .connect(NoTls)
-            .await
-            .map_err(|err| match err.as_db_error() {
-                Some(db) => ConnectError::Rejected {
-                    code: db.code().code().to_string(),
-                    message: db.message().to_string(),
-                },
-                None => ConnectError::Unreachable(err.to_string()),
-            })?;
+    match &target.tls {
+        RunTls::Plain => {
+            config.host(target.addr.ip().to_string());
+            let (client, connection) = config
+                .connect(NoTls)
+                .await
+                .map_err(|err| connect_error(&err, &target.tls))?;
+            finish(client, connection, target.tls.clone()).await
+        }
+        RunTls::Compute {
+            server_name,
+            client: tls,
+        } => {
+            config
+                .host(server_name)
+                .hostaddr(target.addr.ip())
+                .ssl_mode(SslMode::Require)
+                .channel_binding(ChannelBinding::Require);
+            let (client, connection) = config
+                .connect(tls.connector())
+                .await
+                .map_err(|err| connect_error(&err, &target.tls))?;
+            finish(client, connection, target.tls.clone()).await
+        }
+    }
+}
+
+/// The error text with its sources (rustls' reason sits in the source chain).
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(next) = source {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        source = next.source();
+    }
+    text
+}
+
+/// The `rustls::Error` under `err`, if any: anywhere in its source chain, including inside an
+/// `io::Error` (whose `source` skips the error it wraps, so `get_ref` is read too).
+fn rustls_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    if let Some(found) = err.downcast_ref::<rustls::Error>() {
+        return Some(found);
+    }
+    if let Some(inner) = err
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        && let Some(found) = rustls_error(inner)
+    {
+        return Some(found);
+    }
+    err.source().and_then(rustls_error)
+}
+
+/// Whether `err` is a plain I/O failure (an `io::Error` with no TLS error in it) under a
+/// `Kind::Tls` error: the connection was reset or closed during the handshake.
+fn is_plain_io(err: &tokio_postgres::Error) -> bool {
+    use std::error::Error as _;
+    err.source()
+        .is_some_and(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        && rustls_error(err).is_none()
+}
+
+/// Classifies a failed connect by type, never by message text (fork round 3, T10 I2/m4, U9).
+///
+/// Invariant: on a compute connection ([`RunTls::Compute`]) it is [`ConnectError::Tls`] iff the
+/// TLS layer or the compute's post-password certificate check refused it:
+/// - TLS setup failed (`Error::is_tls`), except a plain reset or close during the handshake;
+/// - a `rustls::Error` anywhere under it (a TLS 1.3 alert such as `unknown_ca` arrives on the
+///   first read after the handshake, as an I/O error);
+/// - channel binding was refused (`Error::is_channel_binding_refused`);
+/// - 28P01 after the server's SCRAM final message verified (`Error::sasl_verified`): the
+///   password was right, so the refusal is `clientcert=verify-full`'s (a CN mismatch).
+///
+/// Any other server error is [`ConnectError::Rejected`] (a wrong password, a stale role),
+/// everything else [`ConnectError::Unreachable`]. A plain connection's failures are never `Tls`.
+pub(crate) fn connect_error(err: &tokio_postgres::Error, tls: &RunTls) -> ConnectError {
+    let compute = matches!(tls, RunTls::Compute { .. });
+    if let Some(db) = err.as_db_error() {
+        if compute && err.sasl_verified() && *db.code() == SqlState::INVALID_PASSWORD {
+            return ConnectError::Tls(format!(
+                "the compute refused the connection after the password verified, at its \
+                 client certificate check ({}): {}",
+                db.code().code(),
+                db.message()
+            ));
+        }
+        return ConnectError::Rejected {
+            code: db.code().code().to_string(),
+            message: db.message().to_string(),
+        };
+    }
+    let text = error_chain(err);
+    let tls_failure = compute
+        && ((err.is_tls() && !is_plain_io(err))
+            || rustls_error(err).is_some()
+            || err.is_channel_binding_refused());
+    if tls_failure {
+        // rustls' reason goes to the log, whatever its wrapper's words.
+        match rustls_error(err) {
+            Some(reason) if !text.contains(&reason.to_string()) => {
+                ConnectError::Tls(format!("{text}: {reason}"))
+            }
+            _ => ConnectError::Tls(text),
+        }
+    } else {
+        ConnectError::Unreachable(text)
+    }
+}
+
+async fn finish<S>(
+    client: Client,
+    mut connection: Connection<Socket, S>,
+    tls: RunTls,
+) -> Result<Connected, ConnectError>
+where
+    S: TlsStream + Unpin + Send + 'static,
+{
     let (tx, notices) = mpsc::channel(NOTICE_BUFFER);
     tokio::spawn(async move {
         let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
@@ -226,17 +357,13 @@ pub async fn connect(target: &RunTarget) -> Result<Connected, ConnectError> {
             }
         }
     });
-    let backend = backend_of(&client).await.map_err(|err| match err.as_db_error() {
-        Some(db) => ConnectError::Rejected {
-            code: db.code().code().to_string(),
-            message: db.message().to_string(),
-        },
-        None => ConnectError::Unreachable(err.to_string()),
-    })?;
+    let backend = backend_of(&client)
+        .await
+        .map_err(|err| connect_error(&err, &tls))?;
     let (pid, started) = parse_backend(backend).ok_or_else(|| {
         ConnectError::Unreachable("the server didn't say which backend this is".into())
     })?;
-    Ok(Connected { client, notices, pid, started })
+    Ok(Connected { client, tls, notices, pid, started })
 }
 
 /// This connection's backend: its pid and `backend_start`, as the server sent them.
@@ -343,6 +470,7 @@ async fn drive(
     let started = Instant::now();
     let Connected {
         client,
+        tls,
         mut notices,
         ..
     } = connected;
@@ -365,7 +493,15 @@ async fn drive(
         Err(stop) => {
             // The backend may still be busy: stop it before the connection goes.
             let cancel = client.cancel_token();
-            let _ = tokio::time::timeout(CONNECT_TIMEOUT, cancel.cancel_query(NoTls)).await;
+            let _ = match &tls {
+                RunTls::Plain => {
+                    tokio::time::timeout(CONNECT_TIMEOUT, cancel.cancel_query(NoTls)).await
+                }
+                RunTls::Compute { client: tls, .. } => {
+                    tokio::time::timeout(CONNECT_TIMEOUT, cancel.cancel_query(tls.connector()))
+                        .await
+                }
+            };
             match stop {
                 Stop::Gone => None,
                 Stop::Cancelled => Some(Outcome::Cancelled),
@@ -625,6 +761,88 @@ fn error_event(statement: usize, err: &tokio_postgres::Error) -> RunEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_editor::fake_pg::{self, Want};
+
+    fn is(want: Want, got: &ConnectError) -> bool {
+        match (want, got) {
+            (Want::Tls, ConnectError::Tls(_)) => true,
+            (Want::Unreachable, ConnectError::Unreachable(_)) => true,
+            (Want::Rejected(want), ConnectError::Rejected { code, .. }) => want == code,
+            _ => false,
+        }
+    }
+
+    // T10 I2/m4, U9 (fork round 3, final fix round). Invariant: a compute connection failure
+    // is `ConnectError::Tls` iff the TLS layer or the post-password certificate check refused
+    // it, judged by type (`Error::is_tls`, a `rustls::Error` anywhere under it, including
+    // inside an `io::Error`, `Error::is_channel_binding_refused`, a 28P01 after
+    // `Error::sasl_verified`), never by message text; a plain connection's failures are never
+    // `Tls`. Exhaustive over every error kind `connect` returns (`fake_pg::TABLE`).
+    #[tokio::test]
+    async fn connect_errors_are_classified_by_type() {
+        let compute = fake_pg::compute_tls();
+        for &(case, on_compute, on_plain) in fake_pg::TABLE {
+            for (tls, want, label) in [
+                (&compute, on_compute, "compute"),
+                (&RunTls::Plain, on_plain, "plain"),
+            ] {
+                let err = case.error().await;
+                let got = connect_error(&err, tls);
+                assert!(is(want, &got), "{case:?} on a {label} connection: want {want:?}, got {got:?}");
+                // The reason goes to the log: a typed TLS failure keeps rustls' words.
+                if let (ConnectError::Tls(message), Some(reason)) = (&got, fake_pg::tls_reason(case))
+                {
+                    assert!(message.contains(reason), "{case:?}: {message}");
+                }
+            }
+        }
+    }
+
+    // m4: a reset is a reset, during the handshake or after it, whatever the words say.
+    #[tokio::test]
+    async fn a_plain_reset_is_never_a_tls_failure() {
+        let compute = fake_pg::compute_tls();
+        for case in [
+            fake_pg::Case::HandshakeReset,
+            fake_pg::Case::ResetAfterHandshake,
+        ] {
+            let got = connect_error(&case.error().await, &compute);
+            assert!(matches!(got, ConnectError::Unreachable(_)), "{case:?}: {got:?}");
+        }
+    }
+
+    /// A wrapper error with a source, as a connector adds context.
+    #[derive(Debug)]
+    struct Wrapped(Box<dyn std::error::Error + Send + Sync>);
+
+    impl fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("wrapped")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&*self.0)
+        }
+    }
+
+    // An `io::Error`'s `source` skips the error it wraps, so a rustls error behind two of
+    // them (with a wrapper between) is found only through `get_ref`; a plain I/O error at the
+    // same depth isn't one.
+    #[test]
+    fn rustls_errors_are_found_behind_nested_io_errors() {
+        let alert = rustls::Error::AlertReceived(rustls::AlertDescription::UnknownCA);
+        let deep = std::io::Error::other(Wrapped(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            alert.clone(),
+        ))));
+        assert_eq!(rustls_error(&deep), Some(&alert));
+        let plain = std::io::Error::other(Wrapped(Box::new(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        ))));
+        assert_eq!(rustls_error(&plain), None);
+    }
 
     #[test]
     fn row_cost_is_a_lower_bound_of_the_json() {

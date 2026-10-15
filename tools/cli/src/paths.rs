@@ -91,6 +91,22 @@ pub fn neon_dir() -> PathBuf {
     repo_root().join(".chelabase/neon")
 }
 
+/// The platform CA for compute TLS (`ca.crt`, `ca.key`).
+pub fn compute_ca_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELABASE_COMPUTE_CA_DIR") {
+        return PathBuf::from(dir);
+    }
+    repo_root().join(".chelabase/compute-ca")
+}
+
+/// The orchestrator's client pair (`current/` -> `v<secs>/`).
+pub fn orchestrator_tls_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELABASE_COMPUTE_TLS_DIR") {
+        return PathBuf::from(dir);
+    }
+    repo_root().join(".chelabase/orchestrator-tls")
+}
+
 pub fn gateway_dir() -> PathBuf {
     if let Ok(dir) = env::var("CHELABASE_GATEWAY_DIR") {
         return PathBuf::from(dir);

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use chelabase_auth::internal::InternalVerifier;
+use chelabase_query::server_tls::ServerTls;
 use rest::app::{AppState, Config, internal_router, router};
 use rest::conn::InternalSource;
 use rest::exec::Engine;
@@ -18,10 +19,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let config = Config::from_env()?;
+    // U15: every compute is verified against the platform CA; no CA, no start.
+    let server_tls = ServerTls::from_ca_file(&config.compute_ca)?;
     let state = Arc::new(AppState {
-        engine: Engine::new(
+        engine: Engine::with_server_tls(
             InternalSource::new(&config.internal_url, &config.internal_token),
             config.max_connections,
+            server_tls,
         )
         .with_max_response_bytes(config.max_response_bytes),
         verifier: InternalVerifier::from_env()?,

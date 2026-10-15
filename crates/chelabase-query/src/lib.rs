@@ -21,6 +21,7 @@ pub mod openapi;
 pub mod pipeline;
 pub mod query;
 pub mod schema;
+pub mod server_tls;
 pub mod shape;
 pub mod sql;
 

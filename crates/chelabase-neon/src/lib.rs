@@ -4,6 +4,7 @@
 
 pub mod backend;
 pub mod compute;
+pub mod compute_tls;
 pub mod id;
 pub mod jwt;
 pub mod lsn;

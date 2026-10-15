@@ -14,9 +14,9 @@
 # Pinned by digest; `chelabase workbench up` overrides these with a local `just neon-build` when
 # present. The packages are public on ghcr.io (infra/neon/README.md).
 x-neon-images:
-  neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:c8d1bb68b81f-dev@sha256:66b57f9ebe0f25d410da3d0f20638823f1cce0f6b3bdfad2dca419dd82f16010}
+  neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:629166ceef60-dev@sha256:75794bed0c2fe5d447964735edb3eac21e55c45562a00c344fb4bb1a88509419}
   # The image of the compute containers the worker starts (CHELABASE_COMPUTE_IMAGE); pinned here.
-  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/neon-compute-v17:c8d1bb68b81f-dev@sha256:c1aa3e248f22d5da7cdfe002cbd95bd86477bcef1dcc06cb57c3ea46391ff493}
+  compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/neon-compute-v17:629166ceef60-dev@sha256:281c47327e04fbc5db58f3d9a24a2ced0c74e0d03907260f2c6290f6db3e436b}
 
 # S3 credentials for SeaweedFS. Local dev only.
 x-neon-s3-env: &neon-s3-env
@@ -53,26 +53,107 @@ x-checkout-rw: &checkout-rw
   type: bind
   source: ${CHELABASE_CHECKOUT}
   target: ${CHELABASE_CHECKOUT}
-x-keys-secrets: &keys-secrets
-  type: bind
-  source: ${CHELABASE_KEYS_DIR:?set by chelabase workbench (stack.env)}/secrets
-  target: ${CHELABASE_KEYS_DIR}/secrets
+# Machine keys, one file at its own path per service that reads it (U10): a service sees exactly
+# the key files it reads and nothing else under the keys dir. `.chelabase` inside every checkout
+# mount is masked first (an empty tmpfs; on the main stack the keys dir is that directory), then
+# the narrow mounts go on top (Docker applies mounts by target depth). A missing file fails the
+# start (create_host_path: false) instead of Docker making a directory.
+# Both masks are read-only tmpfs. The first covers the keys dir itself: in a worktree
+# `<checkout>/.chelabase` is a symlink to it, Docker follows the link, and it orders mounts by the
+# unresolved target depth, so a mask at the link's path would tie with the key mounts and hide
+# them; a mask at the (shallower) keys dir never does. The second covers `<checkout>/.chelabase`
+# when that is a different directory; the CLI sets CHELABASE_CHECKOUT_MASK to its path then, and
+# the default (the keys dir) makes it the same mount point as the first, which Compose merges.
+x-keys-mask: &keys-mask
+  type: tmpfs
+  target: ${CHELABASE_KEYS_DIR:?set by chelabase workbench (stack.env)}
   read_only: true
-x-keys-gateway: &keys-gateway
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/gateway
-  target: ${CHELABASE_KEYS_DIR}/gateway
+x-checkout-mask: &checkout-mask
+  type: tmpfs
+  target: ${CHELABASE_CHECKOUT_MASK:-${CHELABASE_KEYS_DIR}}
   read_only: true
-x-keys-auth: &keys-auth
+x-key-secrets: &key-secrets
   type: bind
-  source: ${CHELABASE_KEYS_DIR}/auth
-  target: ${CHELABASE_KEYS_DIR}/auth
+  source: ${CHELABASE_KEYS_DIR}/secrets/secrets.key
+  target: ${CHELABASE_KEYS_DIR}/secrets/secrets.key
   read_only: true
-x-keys-neon: &keys-neon
+  bind: {create_host_path: false}
+x-key-internal-signing: &key-internal-signing
   type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon
-  target: ${CHELABASE_KEYS_DIR}/neon
+  source: ${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem
+  target: ${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem
   read_only: true
+  bind: {create_host_path: false}
+x-key-internal-verify: &key-internal-verify
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem
+  target: ${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem
+  read_only: true
+  bind: {create_host_path: false}
+x-key-cookie: &key-cookie
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/auth/cookie.key
+  target: ${CHELABASE_KEYS_DIR}/auth/cookie.key
+  read_only: true
+  bind: {create_host_path: false}
+x-key-app-jwt-private: &key-app-jwt-private
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/auth/app-jwt.key
+  target: ${CHELABASE_KEYS_DIR}/auth/app-jwt.key
+  read_only: true
+  bind: {create_host_path: false}
+x-key-app-jwt-public: &key-app-jwt-public
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/auth/app-jwt.pub
+  target: ${CHELABASE_KEYS_DIR}/auth/app-jwt.pub
+  read_only: true
+  bind: {create_host_path: false}
+x-key-compute-jwt-private: &key-compute-jwt-private
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem
+  target: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem
+  read_only: true
+  bind: {create_host_path: false}
+x-key-compute-jwt-public: &key-compute-jwt-public
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub
+  target: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub
+  read_only: true
+  bind: {create_host_path: false}
+# The platform CA's certificate alone (never ca.key): auth and rest verify every compute's TLS
+# against it (U15, CHELABASE_COMPUTE_CA_FILE).
+x-key-compute-ca-cert: &key-compute-ca-cert
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/compute-ca/ca.crt
+  target: ${CHELABASE_KEYS_DIR}/compute-ca/ca.crt
+  read_only: true
+  bind: {create_host_path: false}
+# The platform CA (ca.crt, ca.key): the worker issues each compute's server certificate (rw);
+# the runner reads it, ro (R-T9a, the live tests that check computes' certificates).
+x-keys-compute-ca-rw: &keys-compute-ca-rw
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/compute-ca
+  target: ${CHELABASE_KEYS_DIR}/compute-ca
+  bind: {create_host_path: false}
+x-keys-compute-ca-ro: &keys-compute-ca-ro
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/compute-ca
+  target: ${CHELABASE_KEYS_DIR}/compute-ca
+  read_only: true
+  bind: {create_host_path: false}
+# The orchestrator's client pair. The directory itself is mounted, never `current` or a file, so
+# the worker's atomic swap of the `current` symlink is visible to the readers.
+x-keys-orchestrator-tls-rw: &keys-orchestrator-tls-rw
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/orchestrator-tls
+  target: ${CHELABASE_KEYS_DIR}/orchestrator-tls
+  bind: {create_host_path: false}
+x-keys-orchestrator-tls-ro: &keys-orchestrator-tls-ro
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/orchestrator-tls
+  target: ${CHELABASE_KEYS_DIR}/orchestrator-tls
+  read_only: true
+  bind: {create_host_path: false}
 x-state: &state
   type: bind
   source: ${CHELABASE_STACK_DIR}
@@ -487,12 +568,21 @@ services:
       - CHELABASE_PASSWORD_STRENGTH
       - CHELABASE_BRANCH_DATABASE_CAP
     group_add: ["${CHELABASE_DOCKER_GID:?set by chelabase workbench (stack.env)}"]
+    # On both networks: the default one for the apps, `control` (static address) for its TLS
+    # connections to computes.
+    networks:
+      default: {}
+      control:
+        ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:?set by chelabase workbench (stack.env)}
     volumes:
       - *checkout-ro
-      - *keys-secrets
-      - *keys-gateway
-      - *keys-auth
-      - *keys-neon
+      - *keys-mask
+      - *checkout-mask
+      - *key-secrets
+      - *key-internal-verify
+      - *key-compute-jwt-private
+      - *key-compute-jwt-public
+      - *keys-orchestrator-tls-ro
       - *state
       - *docker-sock
     healthcheck:
@@ -519,10 +609,13 @@ services:
     group_add: ["${CHELABASE_DOCKER_GID}"]
     volumes:
       - *checkout-ro
-      - *keys-secrets
-      - *keys-gateway
-      - *keys-auth
-      - *keys-neon
+      - *keys-mask
+      - *checkout-mask
+      - *key-secrets
+      - *key-compute-jwt-private
+      - *key-compute-jwt-public
+      - *keys-compute-ca-rw
+      - *keys-orchestrator-tls-rw
       - *state
       - *docker-sock
     healthcheck:
@@ -570,10 +663,10 @@ services:
           - ${CHELABASE_LANDING_HOST_NAME:?set by chelabase workbench (stack.env)}
     volumes:
       - *checkout-ro
-      - *keys-secrets
-      - *keys-gateway
-      - *keys-auth
-      - *keys-neon
+      - *keys-mask
+      - *checkout-mask
+      - *key-internal-signing
+      - *key-app-jwt-public
       - *state
     healthcheck:
       <<: *app-health
@@ -593,10 +686,13 @@ services:
       - *demo-env
     volumes:
       - *checkout-ro
-      - *keys-secrets
-      - *keys-gateway
-      - *keys-auth
-      - *keys-neon
+      - *keys-mask
+      - *checkout-mask
+      - *key-cookie
+      - *key-app-jwt-private
+      - *key-app-jwt-public
+      - *key-internal-verify
+      - *key-compute-ca-cert
       - *state
     # auth has no health route: any HTTP answer (even a 404) means it is serving.
     healthcheck:
@@ -614,10 +710,10 @@ services:
       - *demo-env
     volumes:
       - *checkout-ro
-      - *keys-secrets
-      - *keys-gateway
-      - *keys-auth
-      - *keys-neon
+      - *keys-mask
+      - *checkout-mask
+      - *key-internal-verify
+      - *key-compute-ca-cert
       - *state
     # rest has no health route: any HTTP answer (even a 404) means it is serving.
     healthcheck:
@@ -640,6 +736,8 @@ services:
       CHELABASE_STUDIO_PORT: "3000"
     volumes:
       - *checkout-rw
+      - *keys-mask
+      - *checkout-mask
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_STUDIO_HOST_NAME}", "http://127.0.0.1:3000/"]
@@ -652,6 +750,8 @@ services:
       - *stack-env
     volumes:
       - *checkout-rw
+      - *keys-mask
+      - *checkout-mask
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_DOCS_HOST_NAME}", "http://127.0.0.1:3001/"]
@@ -664,6 +764,8 @@ services:
       - *stack-env
     volumes:
       - *checkout-rw
+      - *keys-mask
+      - *checkout-mask
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_LANDING_HOST_NAME}", "http://127.0.0.1:3002/"]
@@ -684,18 +786,37 @@ services:
       # e.g. `CHELABASE_LIVE_ENDPOINT=ep-… just workbench test -p chelabase-neon …`.
       - CHELABASE_LIVE_ENDPOINT
     group_add: ["${CHELABASE_DOCKER_GID}"]
+    # The static address is in the member-login rule's address list.
+    networks:
+      default: {}
+      control:
+        ipv4_address: ${CHELABASE_RUNNER_CONTROL_IP:?set by chelabase workbench (stack.env)}
     volumes:
       - *checkout-rw
-      - *keys-secrets
-      - *keys-gateway
-      - *keys-auth
-      - *keys-neon
+      - *keys-mask
+      - *checkout-mask
+      - *key-secrets
+      - *key-compute-jwt-private
+      - *key-compute-jwt-public
+      - *key-app-jwt-private
+      - *key-app-jwt-public
+      - *keys-compute-ca-ro
+      - *keys-orchestrator-tls-ro
       - *state
       - *docker-sock
       - type: bind
         source: ${CHELABASE_NEXTEST_BIN:-/usr/local/bin/cargo-nextest}
         target: /usr/local/bin/cargo-nextest
         read_only: true
+
+networks:
+  # Orchestrator and test runner to computes (<project>_control). A fixed subnet per stack from
+  # the registry's control slot; computes take addresses from the upper /23 only.
+  control:
+    ipam:
+      config:
+        - subnet: ${CHELABASE_CONTROL_SUBNET:?set by chelabase workbench (stack.env)}
+          ip_range: ${CHELABASE_CONTROL_COMPUTE_RANGE:?set by chelabase workbench (stack.env)}
 
 volumes:
   metadata_pg_data:

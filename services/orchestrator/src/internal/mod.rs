@@ -397,6 +397,9 @@ pub struct InternalState<M, L> {
     pub app_jobs: Arc<dyn app::AppJobPort>,
     /// What the mode allows (the sign-up gate answers `platform` when it refuses).
     pub policy: chelabase_types::mode_policy::ModePolicy,
+    /// Where member logins may come from and which client certificates they present: the
+    /// `member_logins` of every compute spec served.
+    pub member_logins: chelabase_neon::spec::MemberLogins,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router

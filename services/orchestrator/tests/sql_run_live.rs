@@ -8,7 +8,7 @@ use chelabase_types::role_name::member_hand_over_sql;
 use futures_util::StreamExt;
 use orchestrator::sql_editor::events::{Outcome, RunEvent};
 use orchestrator::sql_editor::registry::{Canceller, Cancelled, RunGuard, RunRegistry};
-use orchestrator::sql_editor::run::{self, RunSpec, RunTarget};
+use orchestrator::sql_editor::run::{self, RunSpec, RunTarget, RunTls};
 use orchestrator::sql_editor::{APPLICATION_NAME, MAX_RESPONSE_BYTES, MAX_ROWS_PER_STATEMENT};
 use tokio_postgres::NoTls;
 use uuid::Uuid;
@@ -82,6 +82,7 @@ impl Scratch {
                 user: owner,
                 password,
                 database,
+                tls: RunTls::Plain,
             },
             registry: RunRegistry::default(),
             branch: BranchId::new(),
@@ -655,6 +656,7 @@ impl MemberRole {
                 user,
                 password,
                 database: s.target.database.clone(),
+                tls: RunTls::Plain,
             },
             group,
         }

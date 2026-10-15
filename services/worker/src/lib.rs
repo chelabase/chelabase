@@ -17,10 +17,15 @@ pub mod branch_create;
 pub mod branch_delete;
 pub mod branch_job;
 pub mod branch_switch;
+pub mod certs;
 pub mod config;
 pub mod credentials;
 pub mod data_api;
 pub mod delete;
+#[cfg(test)]
+mod f4_coder_tests;
+#[cfg(test)]
+mod f4_tests;
 #[cfg(test)]
 mod fakes;
 pub mod member_roles;
@@ -48,7 +53,9 @@ pub const OWNER_ROLE: &str = "postgres";
 /// branch's compute whose endpoint records a lower version.
 /// - 1: `neon.console_url` (DDL forwarding) and `createrole_self_grant`.
 /// - 2: `neon.protected_databases` (the branch's main database can't be dropped).
-pub const COMPUTE_SETTINGS_VERSION: i32 = 2;
+/// - 3: TLS (a server certificate uploaded before start), the control network and the branch
+///   protection flag (`neon.branch_protected`).
+pub const COMPUTE_SETTINGS_VERSION: i32 = 3;
 
 /// Everything the lifecycle needs.
 pub struct Worker<M, S, C, N, P> {
@@ -68,6 +75,9 @@ pub struct Worker<M, S, C, N, P> {
     pub ready_poll: Duration,
     /// How long provisioning waits for a new compute (60 s in production).
     pub ready_timeout: Duration,
+    /// How far the wait stretches while compute_ctl reports a live state (5 minutes in
+    /// production).
+    pub ready_cap: Duration,
     /// How often a long reset or restore step refreshes the branch's claim (60 s in
     /// production), well inside reconcile's stale threshold.
     pub claim_refresh: Duration,
@@ -99,4 +109,9 @@ pub struct Worker<M, S, C, N, P> {
     /// Member-role reconcile requests (`chelabase.member_roles.reconcile`), connected by the
     /// process.
     pub member_role_requests: member_roles::MemberRoleRequests,
+    /// Who may log in as a member role, pushed with every spec: `CHELABASE_MEMBER_LOGIN_CIDRS`
+    /// and the orchestrator's certificate CN.
+    pub member_logins: chelabase_neon::spec::MemberLogins,
+    /// What the daily certificate sweep needs; `None` where there is no CA (the fakes).
+    pub cert_sweep: Option<certs::CertSweep>,
 }

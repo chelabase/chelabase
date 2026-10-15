@@ -473,6 +473,7 @@ impl MemberRolesQueue for NatsPorts {
         let body = serde_json::to_vec(&MemberRolesReconcileRequest {
             branch_id: branch.as_uuid(),
             member_id: None,
+            from_ddl: false,
         })?;
         self.client
             .publish(SUBJECT_MEMBER_ROLES_ENQUEUE, body.into())

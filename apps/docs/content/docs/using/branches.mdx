@@ -73,7 +73,7 @@ A protected branch refuses schema changes from member logins that aren't Admins.
 
 Each branch also has a **guard login roles** switch (`guard_logins`). When the switch is on and the branch is protected, every login role on the branch is refused schema changes in the same way, from its first statement, including roles created later from SQL. Superusers, the owner, the member logins of Admins and the roles exempted on that branch are not refused. The member logins of non-Admins are refused whatever the switch says.
 
-The guard is in every database of the branch, and in `template1`, so a database made with `CREATE DATABASE` is guarded from the start. A database made from `template0` is unguarded for the few seconds until the reconcile its creation asks for has run.
+The guard is in every database of the branch, and in `template1`. On a protected branch a non-superuser's `CREATE DATABASE` or `ALTER DATABASE` that sets `ALLOW_CONNECTIONS` or `IS_TEMPLATE` is refused with `42501` and the hint `chelabase:branch_protected`. Every other database a non-superuser creates there is born closed, whichever database the session is in, and opens once Chelabase has installed the guard there, usually within seconds. A database closed before the branch was protected stays closed while the branch is protected; unprotect the branch to reopen it. Renaming the branch's main database, or renaming another database to its name, is refused for non-superusers.
 
 ### Exemptions
 

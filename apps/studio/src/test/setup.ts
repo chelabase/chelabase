@@ -1,10 +1,17 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, configure } from "@testing-library/react";
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
 
 // findBy*/waitFor default to 1 s, which the editor's first renders overran under a loaded machine
 // (the full suite in parallel); 5 s keeps failures quick while absorbing the load.
 configure({ asyncUtilTimeout: 5_000 });
+
+// `vi.waitFor` is vitest's own poller and ignores the line above: its default is 1 s. The editor's
+// dry run is debounced 400 ms and then answered by a fake fetch, so a 1 s wait lost the race under
+// load. Same 5 s budget unless a test passes its own.
+const waitFor = vi.waitFor.bind(vi);
+vi.waitFor = ((cb: Parameters<typeof waitFor>[0], options?: Parameters<typeof waitFor>[1]) =>
+  waitFor(cb, typeof options === "number" ? options : { timeout: 5_000, ...options })) as typeof vi.waitFor;
 
 // jsdom doesn't implement scrolling; the router's scroll restoration calls these.
 if (typeof window !== "undefined") {

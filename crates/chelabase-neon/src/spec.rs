@@ -4,8 +4,10 @@
 //! `compute_api::responses::ControlPlaneConfigResponse`.
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::compute_tls::{CA_CERT_PATH, SERVER_CERT_PATH, SERVER_KEY_PATH};
 use crate::id::NeonId;
 use crate::storcon::{StorconClient, StorconError};
 
@@ -53,6 +55,61 @@ impl ComputeMode {
     }
 }
 
+/// Where member roles (`cb_m_*`) may log in from, as the fork's `ComputeSpec.member_logins`:
+/// compute_ctl writes one `hostssl … clientcert=verify-full map=chelabase_member` line per CIDR
+/// (`all` when the list is empty: no address rule) and one `pg_ident.conf` line per CN.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberLogins {
+    pub allowed_cidrs: Vec<String>,
+    pub client_cns: Vec<String>,
+}
+
+impl MemberLogins {
+    /// The orchestrator's certificate CN and the given CIDRs.
+    pub fn orchestrator(allowed_cidrs: Vec<String>) -> Self {
+        Self {
+            allowed_cidrs,
+            client_cns: vec![crate::compute_tls::ORCHESTRATOR_CN.to_string()],
+        }
+    }
+}
+
+/// `CHELABASE_MEMBER_LOGIN_CIDRS`: a comma-separated list of `<ipv4|ipv6>/<prefix>`. Unset is
+/// an error (the services refuse to start); empty (or blank) is the empty list, "no address
+/// rule". Entries are trimmed; an empty entry or anything else is an error naming it.
+pub fn parse_member_login_cidrs(raw: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let Some(raw) = raw else {
+        anyhow::bail!(
+            "CHELABASE_MEMBER_LOGIN_CIDRS is unset: set it to the addresses member logins come \
+             from (comma-separated CIDRs), or to an empty value for no address rule"
+        );
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|entry| {
+            let entry = entry.trim();
+            check_cidr(entry)
+                .with_context(|| format!("CHELABASE_MEMBER_LOGIN_CIDRS entry {entry:?}"))?;
+            Ok(entry.to_string())
+        })
+        .collect()
+}
+
+fn check_cidr(entry: &str) -> anyhow::Result<()> {
+    let (addr, prefix) = entry
+        .split_once('/')
+        .context("not <address>/<prefix>")?;
+    let addr: std::net::IpAddr = addr.parse().context("not an IP address")?;
+    let max: u8 = if addr.is_ipv4() { 32 } else { 128 };
+    let digits = !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_digit());
+    match prefix.parse::<u8>() {
+        Ok(p) if digits && p <= max => Ok(()),
+        _ => anyhow::bail!("the prefix isn't a number from 0 to {max}"),
+    }
+}
+
 pub struct SpecInputs<'a> {
     /// Our endpoint id; compute_ctl uses it as the cluster id and name.
     pub endpoint_id: &'a str,
@@ -69,6 +126,10 @@ pub struct SpecInputs<'a> {
     /// URL to the Chelabase console (neon.console_url setting if Some).
     pub console_url: Option<String>,
     pub mode: ComputeMode,
+    /// The member-login rules every compute gets.
+    pub member_logins: MemberLogins,
+    /// The branch is protected: the compute refuses databases born open (`neon.branch_protected`).
+    pub branch_protected: bool,
 }
 
 /// Where an attached tenant lives; `StorconClient` in production, a fake in tests.
@@ -99,6 +160,7 @@ pub struct Endpoint<'a> {
 
 /// [`endpoint_config`] for an endpoint's rows as chelabase-metadata stores them.
 #[cfg(feature = "metadata")]
+#[allow(clippy::too_many_arguments)]
 pub async fn stored_endpoint_config(
     placement: &impl Placement,
     endpoint: &chelabase_metadata::NeonEndpoint,
@@ -106,6 +168,8 @@ pub async fn stored_endpoint_config(
     databases: Vec<chelabase_metadata::NeonDatabase>,
     jwks: Value,
     console_url: Option<String>,
+    member_logins: &MemberLogins,
+    branch_protected: bool,
 ) -> anyhow::Result<Value> {
     endpoint_config(
         placement,
@@ -131,11 +195,14 @@ pub async fn stored_endpoint_config(
             .collect(),
         jwks,
         console_url,
+        member_logins,
+        branch_protected,
     )
     .await
 }
 
 /// `config_response` for a stored endpoint, with storage placement from `placement`.
+#[allow(clippy::too_many_arguments)]
 pub async fn endpoint_config(
     placement: &impl Placement,
     endpoint: Endpoint<'_>,
@@ -143,6 +210,8 @@ pub async fn endpoint_config(
     databases: Vec<DatabaseSpec>,
     jwks: Value,
     console_url: Option<String>,
+    member_logins: &MemberLogins,
+    branch_protected: bool,
 ) -> anyhow::Result<Value> {
     let tenant: NeonId = endpoint.tenant_id.parse().context("stored tenant id")?;
     let timeline: NeonId = endpoint.timeline_id.parse().context("stored timeline id")?;
@@ -159,6 +228,8 @@ pub async fn endpoint_config(
         jwks,
         console_url,
         mode: endpoint.mode,
+        member_logins: member_logins.clone(),
+        branch_protected,
     }))
 }
 
@@ -236,8 +307,19 @@ pub fn config_response(inputs: &SpecInputs<'_>) -> Value {
                 "settings": settings,
             },
             "delta_operations": [],
+            // Every compute serves TLS with the certificate the worker uploads before start.
+            "features": ["tls_experimental"],
+            "member_logins": inputs.member_logins,
+            "branch_protected": inputs.branch_protected,
         },
-        "compute_ctl_config": { "jwks": inputs.jwks },
+        "compute_ctl_config": {
+            "jwks": inputs.jwks,
+            "tls": {
+                "key_path": SERVER_KEY_PATH,
+                "cert_path": SERVER_CERT_PATH,
+                "ca_path": CA_CERT_PATH,
+            },
+        },
     })
 }
 
@@ -267,6 +349,8 @@ mod tests {
             jwks: json!({ "keys": [{ "kid": "k" }] }),
             console_url: None,
             mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
         });
         assert_eq!(v["status"], "attached");
         assert_eq!(v["spec"]["tenant_id"], "00000000000000000000000000000001");
@@ -345,6 +429,8 @@ mod tests {
             }],
             json!({"keys": [{"kid": "k"}]}),
             None,
+            &logins(),
+            false,
         )
         .await
         .unwrap();
@@ -366,7 +452,7 @@ mod tests {
         let placement = FakePlacement {
             pageserver: Err("no pageserver"),
         };
-        let err = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None)
+        let err = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins(), false)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("no pageserver"), "{err:#}");
@@ -377,7 +463,7 @@ mod tests {
         let placement = FakePlacement {
             pageserver: Ok(String::new()),
         };
-        let err = endpoint_config(&placement, endpoint("nope"), vec![], vec![], json!({}), None)
+        let err = endpoint_config(&placement, endpoint("nope"), vec![], vec![], json!({}), None, &logins(), false)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("stored tenant id"), "{err:#}");
@@ -408,6 +494,8 @@ mod tests {
             jwks: json!({}),
             console_url: None,
             mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
         });
         let roles = v["spec"]["cluster"]["roles"].as_array().unwrap();
 
@@ -443,6 +531,8 @@ mod tests {
             jwks: json!({}),
             console_url: Some("http://studio.chelabase.localhost:8000".into()),
             mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting = settings.iter().find(|s| s["name"] == "neon.console_url");
@@ -461,6 +551,8 @@ mod tests {
             jwks: json!({}),
             console_url: None,
             mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
         });
         let settings2 = v2["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting2 = settings2.iter().find(|s| s["name"] == "neon.console_url");
@@ -483,6 +575,8 @@ mod tests {
             jwks: json!({}),
             console_url: None,
             mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let grant_setting = settings.iter().find(|s| s["name"] == "createrole_self_grant");
@@ -505,6 +599,8 @@ mod tests {
             jwks: json!({}),
             console_url: None,
             mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
         };
         let protected = |v: &Value| {
             v["spec"]["cluster"]["settings"]
@@ -585,6 +681,8 @@ mod tests {
             jwks: json!({}),
             console_url: None,
             mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
         });
         // Primary is the fork's default: the only addition to the old spec is `mode`.
         assert_eq!(v["spec"]["mode"], "Primary");
@@ -593,9 +691,12 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "branch_protected",
                 "cluster",
                 "delta_operations",
+                "features",
                 "format_version",
+                "member_logins",
                 "mode",
                 "pageserver_connstring",
                 "safekeeper_connstrings",
@@ -604,5 +705,138 @@ mod tests {
                 "timeline_id"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn endpoint_config_carries_the_member_logins() {
+        let placement = FakePlacement {
+            pageserver: Ok("postgresql://no_user@ps:6400".into()),
+        };
+        let logins = MemberLogins::orchestrator(vec!["10.213.0.10/32".into()]);
+        let v = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            v["spec"]["member_logins"],
+            json!({"allowed_cidrs": ["10.213.0.10/32"], "client_cns": ["chelabase-orchestrator"]})
+        );
+    }
+
+    #[test]
+    fn cidr_prefixes_are_plain_numbers() {
+        for bad in ["10.0.0.1/+32", "10.0.0.1/", "/32", "fd00::1/129", "10.0.0.1/32/1", ",10.0.0.1/32"] {
+            assert!(parse_member_login_cidrs(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(parse_member_login_cidrs(Some("  ")).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_member_login_cidrs(Some("0.0.0.0/0")).unwrap(), ["0.0.0.0/0"]);
+    }
+
+    fn logins() -> MemberLogins {
+        MemberLogins {
+            allowed_cidrs: vec!["10.213.4.10/32".into(), "10.213.4.11/32".into()],
+            client_cns: vec!["chelabase-orchestrator".into()],
+        }
+    }
+
+    fn inputs_for_tests<'a>(tenant: &'a NeonId, timeline: &'a NeonId) -> SpecInputs<'a> {
+        SpecInputs {
+            endpoint_id: "ep-a",
+            tenant_id: tenant,
+            timeline_id: timeline,
+            pageserver_connstring: "postgresql://no_user@ps:6400".into(),
+            safekeeper_connstrings: vec![],
+            roles: vec![],
+            databases: vec![],
+            jwks: json!({}),
+            console_url: None,
+            mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
+        }
+    }
+
+    // U14: the branch's protection reaches the compute as `spec.branch_protected` (the fork's
+    // `ComputeSpec.branch_protected: bool`, `#[serde(default)]`), always present, from the
+    // branch's protection.
+    #[test]
+    fn the_spec_carries_the_branchs_protection_under_the_forks_field_name() {
+        let tenant = NeonId::from(Uuid::from_u128(1));
+        let timeline = NeonId::from(Uuid::from_u128(2));
+        for protected in [true, false] {
+            let v = config_response(&SpecInputs {
+                branch_protected: protected,
+                ..inputs_for_tests(&tenant, &timeline)
+            });
+            assert_eq!(v["spec"]["branch_protected"], json!(protected));
+            // A top-level `spec` field, not a cluster setting (compute_ctl writes the GUC itself).
+            let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
+            assert!(
+                !settings.iter().any(|s| s["name"] == "neon.branch_protected"),
+                "{settings:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_config_passes_the_protection_through() {
+        let placement = FakePlacement {
+            pageserver: Ok("postgresql://no_user@ps:6400".into()),
+        };
+        for protected in [true, false] {
+            let v = endpoint_config(
+                &placement,
+                endpoint(TENANT),
+                vec![],
+                vec![],
+                json!({}),
+                None,
+                &logins(),
+                protected,
+            )
+            .await
+            .unwrap();
+            assert_eq!(v["spec"]["branch_protected"], json!(protected));
+        }
+    }
+
+    #[test]
+    fn every_compute_gets_tls_and_the_member_login_rules() {
+        let tenant = NeonId::from(Uuid::from_u128(1));
+        let timeline = NeonId::from(Uuid::from_u128(2));
+        let v = config_response(&SpecInputs {
+            endpoint_id: "ep-a",
+            tenant_id: &tenant,
+            timeline_id: &timeline,
+            pageserver_connstring: "postgresql://no_user@ps:6400".into(),
+            safekeeper_connstrings: vec![],
+            roles: vec![],
+            databases: vec![],
+            jwks: json!({}),
+            console_url: None,
+            mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
+        });
+        assert_eq!(v["spec"]["features"], json!(["tls_experimental"]));
+        assert_eq!(
+            v["compute_ctl_config"]["tls"],
+            json!({
+                "key_path": "/var/db/chelabase/tls/server.key",
+                "cert_path": "/var/db/chelabase/tls/server.crt",
+                "ca_path": "/var/db/chelabase/tls/ca.crt",
+            })
+        );
+        assert_eq!(
+            v["spec"]["member_logins"],
+            json!({
+                "allowed_cidrs": ["10.213.4.10/32", "10.213.4.11/32"],
+                "client_cns": ["chelabase-orchestrator"],
+            })
+        );
+        // An empty list is "no address rule" (Kubernetes), still sent as an empty list.
+        let mut empty = logins();
+        empty.allowed_cidrs.clear();
+        let v = config_response(&SpecInputs { member_logins: empty, ..inputs_for_tests(&tenant, &timeline) });
+        assert_eq!(v["spec"]["member_logins"]["allowed_cidrs"], json!([]));
     }
 }

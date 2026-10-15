@@ -179,23 +179,44 @@ pub const TOUCHED_RESYNC_DELAY: Duration = Duration::from_secs(3);
 /// per branch per process; with several workers each queue message goes to one of them).
 #[derive(Default)]
 pub struct PendingResyncs {
-    waiting: std::sync::Mutex<std::collections::HashSet<BranchId>>,
+    /// The waiting branches; the flag is whether a request from the DDL receiver is among the
+    /// ones the waiting run covers (it gets the RT3-11 retry).
+    waiting: std::sync::Mutex<std::collections::HashMap<BranchId, bool>>,
 }
 
 impl PendingResyncs {
     /// True when the caller now owns the branch's pending run; false when one is waiting.
     pub(crate) fn claim(&self, branch: BranchId) -> bool {
-        self.waiting
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(branch)
+        self.claim_marked(branch, false)
+    }
+
+    /// [`Self::claim`], noting `from_ddl` on the branch's run whether the caller owns it or
+    /// merges into a waiting one.
+    pub(crate) fn claim_marked(&self, branch: BranchId, from_ddl: bool) -> bool {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        match waiting.entry(branch) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() |= from_ddl;
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(from_ddl);
+                true
+            }
+        }
     }
 
     pub(crate) fn release(&self, branch: BranchId) {
+        self.release_marked(branch);
+    }
+
+    /// Ends the branch's wait; whether a DDL request was among those the run covers.
+    pub(crate) fn release_marked(&self, branch: BranchId) -> bool {
         self.waiting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&branch);
+            .remove(&branch)
+            .unwrap_or(false)
     }
 }
 

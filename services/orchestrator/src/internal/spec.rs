@@ -3,6 +3,7 @@
 //! is stored. compute_ctl retries 503. [`authorize_compute`] is shared with the DDL receiver.
 
 use super::{InternalState, NeonMetadataPort, bearer, constant_time_eq};
+use anyhow::Context as _;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,6 +27,7 @@ pub(crate) async fn endpoint_config<M: NeonMetadataPort, L: ComputeLocator>(
 ) -> anyhow::Result<Value> {
     let roles = state.metadata.neon_roles(&endpoint.id).await?;
     let databases = state.metadata.neon_databases(&endpoint.id).await?;
+    let branch_protected = branch_protected(state, &endpoint.id).await?;
     chelabase_neon::spec::stored_endpoint_config(
         &state.storcon,
         endpoint,
@@ -36,8 +38,29 @@ pub(crate) async fn endpoint_config<M: NeonMetadataPort, L: ComputeLocator>(
             &state.control_plane_uri,
             &endpoint.id,
         )),
+        &state.member_logins,
+        branch_protected,
     )
     .await
+}
+
+/// Whether the branch linked to the endpoint is protected: the spec of a restarted or
+/// recreated compute carries it, so the compute never starts with the flag off while the
+/// branch is protected. An endpoint without a branch (a static compute) isn't protected; a
+/// branch that can't be read fails the spec (fail closed), never `false`.
+async fn branch_protected<M: NeonMetadataPort, L: ComputeLocator>(
+    state: &InternalState<M, L>,
+    endpoint_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(branch) = state.metadata.endpoint_branch(endpoint_id).await? else {
+        return Ok(false);
+    };
+    let record = state
+        .metadata
+        .get_branch(branch)
+        .await?
+        .with_context(|| format!("branch {branch} of {endpoint_id} has no record"))?;
+    Ok(record.protected)
 }
 
 /// The endpoint whose compute token `headers` carries. 401 for no token, a wrong one or an

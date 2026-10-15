@@ -1,6 +1,10 @@
 //! `chelabase neon …`: helpers for the Neon compute path (roadmap step 3).
 
+pub mod compute_ca;
 pub mod compute_jwt;
+
+#[cfg(test)]
+mod ca_f6_tests;
 
 use anyhow::Result;
 use std::io::Read;

@@ -133,11 +133,13 @@ pub enum ErrorCode {
     HasDependents,
     /// The branch's review list changed since the hash the request carries.
     ReviewChanged,
+    /// The TLS or certificate check between the orchestrator and the compute failed.
+    ComputeTlsFailed,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 96] = [
+    pub const ALL: [ErrorCode; 97] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantNotBound,
@@ -234,6 +236,7 @@ impl ErrorCode {
         Self::SchemaChangeFailed,
         Self::HasDependents,
         Self::ReviewChanged,
+        Self::ComputeTlsFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -334,6 +337,7 @@ impl ErrorCode {
             Self::SchemaChangeFailed => "schema_change_failed",
             Self::HasDependents => "has_dependents",
             Self::ReviewChanged => "review_changed",
+            Self::ComputeTlsFailed => "compute_tls_failed",
         }
     }
 }
@@ -436,7 +440,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 96] = [
+    const ALL: [(ErrorCode, &str); 97] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -533,6 +537,7 @@ mod tests {
         (ErrorCode::SchemaChangeFailed, "schema_change_failed"),
         (ErrorCode::HasDependents, "has_dependents"),
         (ErrorCode::ReviewChanged, "review_changed"),
+        (ErrorCode::ComputeTlsFailed, "compute_tls_failed"),
     ];
 
     #[test]

@@ -30,3 +30,6 @@ mod stack_target_tests;
 
 #[cfg(test)]
 mod stack_fix_tests;
+
+#[cfg(test)]
+mod f6_tests;

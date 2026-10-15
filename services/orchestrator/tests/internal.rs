@@ -1096,6 +1096,7 @@ async fn spawn_with_app(
             .map(|base| Zitadel::new(&base, chelabase_zitadel::mock::ADMIN_TOKEN)),
         app_jobs: Arc::new(app.jobs),
         policy: chelabase_types::mode_policy::ModePolicy::new(app.mode),
+        member_logins: Default::default(),
     });
     let addr = serve(build_internal_router(state)).await;
     Internal {
@@ -1943,6 +1944,7 @@ async fn connection_opens_the_authenticator_password() {
             "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
             "port": 55432,
             "database": "web1",
+            "server_name": "ep-1.compute.chelabase.internal",
             "user": "authenticator",
             "password": "auth-pw",
             "status": "ready",
@@ -4010,6 +4012,7 @@ async fn branch_info_for_auth_branch_targets_itself() {
                 "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
                 "port": 55432,
                 "database": "shop",
+                "server_name": "ep-main.compute.chelabase.internal",
                 "user": "chelabase_auth_sync",
                 "password": SYNC_PW,
                 "schema": "public",
@@ -4042,7 +4045,56 @@ async fn branch_info_for_other_database_targets_auth_main() {
         assert_eq!(body["sync"]["branch_id"], json!(w.main));
         assert_eq!(body["sync"]["port"], json!(55432));
         assert_eq!(body["sync"]["password"], json!(SYNC_PW));
+        assert_eq!(
+            body["sync"]["server_name"],
+            json!("ep-main.compute.chelabase.internal"),
+            "{branch}: the name the target's own compute certificate carries"
+        );
     }
+}
+
+// U15 (f5b). Invariant: every connection Chelabase opens to a compute uses TLS verified against
+// the platform CA. The auth service and rest dial the compute's default-network IP, but its
+// certificate carries only the DNS name `<endpoint>.compute.chelabase.internal`, so the
+// orchestrator sends that name (`chelabase_neon::compute_tls::server_name`) with every target:
+// `sync.server_name` for the app-users sync and `server_name` for the data API connection.
+
+// A target is never sent without the name it is verified against: no address means a null
+// sync (as before), not a sync with a host and no name.
+#[tokio::test]
+async fn app_sync_is_null_rather_than_nameless_when_the_compute_has_no_address() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    w.locator.pg.lock().unwrap().remove("ep-main");
+    let (status, body) = a
+        .app
+        .get(&format!("/internal/app/branches/{}", w.main), Some(APP_AUTH_TOKEN))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["sync"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn connection_carries_the_name_of_the_endpoint_it_points_at() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-xyz".into(), "127.0.0.1:55432".parse().unwrap());
+    let mut row = connection_row(BranchStatus::Ready, Some("ep-xyz"), None);
+    row.authenticator_password_enc =
+        Some(seal_credential(&app.key, &row.branch_id.to_string(), Purpose::Authenticator, "auth-pw"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app
+        .get(&format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()), Some(REST_TOKEN))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        body["server_name"],
+        json!(chelabase_neon::compute_tls::server_name("ep-xyz")),
+        "{body}"
+    );
+    // The host stays the address the pair dials: the name is for the certificate check only.
+    assert_eq!(body["host"], json!(std::net::Ipv4Addr::LOCALHOST.to_string()));
 }
 
 #[tokio::test]
@@ -4790,4 +4842,50 @@ async fn describe_invite_closed_is_404() {
     assert_eq!(ask("0".repeat(64)).await, closed);
     invite_fixture(&neon, Some([0; 32]));
     assert_eq!(ask(token_hash_hex("t")).await, closed);
+}
+
+// R-F4a: a compute that restarts or is recreated pulls its spec here, so the spec carries the
+// branch's protection (the compute refuses databases born open). A failed read of it fails the
+// request: never `false` by default.
+#[tokio::test]
+async fn the_pulled_spec_carries_the_branchs_protection() {
+    let (neon, branch) = ddl_neon();
+    let mut record = branch_record(
+        branch,
+        DatabaseId::new(),
+        None,
+        BranchKind::Normal,
+        BranchStatus::Ready,
+        Some("ep-d"),
+    );
+    neon.app.lock().unwrap().branches.push(record.clone());
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), &storcon(true).await).await;
+    let (status, body) = app.get(&spec_path("ep-d"), Some(COMPUTE_TOKEN)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["spec"]["branch_protected"], json!(false));
+    // Protected: the flag is on.
+    record.protected = true;
+    neon.app.lock().unwrap().branches[0] = record;
+    let (status, body) = app.get(&spec_path("ep-d"), Some(COMPUTE_TOKEN)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["spec"]["branch_protected"], json!(true));
+}
+
+#[tokio::test]
+async fn an_endpoint_without_a_branch_is_not_protected() {
+    let neon = FakeNeon::default();
+    neon.add("ep-a", TENANT, TIMELINE);
+    let app = spawn_internal(neon, FakeLocator::default(), &storcon(true).await).await;
+    let (status, body) = app.get(&spec_path("ep-a"), Some(COMPUTE_TOKEN)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["spec"]["branch_protected"], json!(false));
+}
+
+#[tokio::test]
+async fn a_branch_whose_protection_cant_be_read_fails_the_spec() {
+    // The endpoint links to a branch the metadata has no record of.
+    let (neon, _branch) = ddl_neon();
+    let app = spawn_internal(neon, FakeLocator::default(), &storcon(true).await).await;
+    let (status, _) = app.get(&spec_path("ep-d"), Some(COMPUTE_TOKEN)).await;
+    assert_eq!(status, 503, "fail closed, not branch_protected = false");
 }

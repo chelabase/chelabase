@@ -2,7 +2,9 @@
 //! `docker compose` call goes through [`Compose`], so it names the stack's project.
 
 use super::argv::{Compose, nextest_archive_args, nextest_run_args};
-use super::env::{StackEnvInput, example_scheme, render_stack_env};
+use super::env::{
+    StackEnvInput, check_control_subnet, example_scheme, parse_network_inspect, render_stack_env,
+};
 use super::migrate::migrate_main_layout;
 use super::registry::{Entry, Registry, port_is_free, with_registry};
 use super::slots::{
@@ -697,6 +699,34 @@ fn up_stack(stack: &Stack, with: &[Site]) -> anyhow::Result<()> {
     }
 }
 
+/// Before anything is built: no other Docker network may overlap the slot's control subnet.
+fn check_control_network(stack: &Stack, slot: u8) -> anyhow::Result<()> {
+    let ids = output(docker(vec!["network".into(), "ls".into(), "-q".into()]))?;
+    let ids: Vec<String> = ids.split_whitespace().map(str::to_string).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // One network at a time: one removed since `ls` must not fail `up`.
+    let mut networks = Vec::new();
+    for id in ids {
+        let out = docker(vec!["network".into(), "inspect".into(), id.clone()])
+            .output()
+            .context("running docker network inspect")?;
+        networks.extend(parse_network_inspect(
+            &id,
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        )?);
+    }
+    check_control_subnet(
+        &stack.slug,
+        slot,
+        &format!("{}_control", stack.project),
+        &networks,
+    )
+}
+
 fn take_slot(stack: &Stack) -> anyhow::Result<()> {
     let opts = SlotOptions {
         cap: cap_from_env(std::env::var("CHELABASE_WORKBENCH_SLOTS").ok().as_deref())?,
@@ -740,6 +770,12 @@ fn start_stack(
     phases: &Phases,
 ) -> anyhow::Result<()> {
     let keys = stack.main.join(".chelabase");
+    phases.run("control network", || {
+        let slot = entry
+            .control_slot
+            .context("the registry entry has no control slot")?;
+        check_control_network(stack, slot)
+    })?;
     // Whether the apps were already running: `compose up` leaves a running container as it is,
     // so its binary and env files are only picked up by a recreate (T5 review I2).
     let was_running = stack.has_running_containers()?;
@@ -777,6 +813,9 @@ fn start_stack(
             docker_gid: docker_gid()?,
             image: &image,
             extra: &extra,
+            control_slot: entry
+                .control_slot
+                .context("the registry entry has no control slot")?,
         };
         write_file(&stack.env_file, &render_stack_env(example, &input))?;
         let h = hosts(&stack.slug, entry.gateway_port);
@@ -797,6 +836,8 @@ fn start_stack(
             &keys.join("secrets"),
             &auth,
             &keys.join("neon"),
+            &keys.join("compute-ca"),
+            &keys.join("orchestrator-tls"),
         )
         .map(|_| ())
     })?;

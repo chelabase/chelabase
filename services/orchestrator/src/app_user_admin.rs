@@ -13,7 +13,9 @@ use axum::{
 use chrono::{DateTime, Utc};
 use chelabase_metadata::{AppUsersStatus, ProjectRecord};
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
-use chelabase_query::app_users::{NewUserRow, SYNC_ROLE, SyncTarget, UserRowError};
+use chelabase_query::app_users::{NewUserRow, SYNC_ROLE, SyncTarget, SyncTls, UserRowError};
+use crate::console::run_tls;
+use crate::sql_editor::run::RunTls;
 use chelabase_secrets::open_role_password;
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::{ApiJson, ApiPath, BranchId};
@@ -458,6 +460,10 @@ where
                 "stored credentials can't be decrypted with the current secrets key; restore the original CHELABASE_SECRETS_KEY file",
             )
         })?;
+    // T10 I3: the compute's control address over the same TLS as every other compute
+    // connection (its certificate name, our client pair); no pair loaded is 503
+    // `compute_tls_failed` (R-T10a), never a plaintext connection.
+    let tls = sync_tls(run_tls(state, main.id, endpoint)?);
     let addr = match state.locator.postgres_addr(endpoint).await {
         Ok(Some(addr)) => addr,
         Ok(None) => return Err(ApiError::new(503, ErrorCode::Unavailable, "the main branch's compute isn't running; try again")),
@@ -475,7 +481,26 @@ where
         password,
         schema: auth.schema_name,
         table: auth.table_name,
+        // Its own client pair (`tls`) verifies the compute on the control network.
+        server_name: None,
+        tls,
     })
+}
+
+/// The sync's TLS for `tls`: the compute's certificate name, and the connector and fingerprint
+/// of one snapshot of the client pair (T10 m3). `None` for a plain connection (tests).
+fn sync_tls(tls: RunTls) -> Option<SyncTls> {
+    match tls {
+        RunTls::Plain => None,
+        RunTls::Compute { server_name, client } => {
+            let snapshot = client.snapshot();
+            Some(SyncTls {
+                server_name,
+                connector: snapshot.connector(),
+                fingerprint: snapshot.fingerprint(),
+            })
+        }
+    }
 }
 
 async fn create<M, J>(

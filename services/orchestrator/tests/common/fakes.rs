@@ -2347,6 +2347,24 @@ async fn spawn_app_custom(
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
     operator_org: Option<&str>,
 ) -> TestApp {
+    spawn_app_with_compute_tls(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, None)
+        .await
+}
+
+/// Like [`spawn_app_custom`], with the orchestrator's compute client pair (`None`: plain
+/// connections, as in every other test).
+#[allow(clippy::too_many_arguments)]
+async fn spawn_app_with_compute_tls(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    cap: u32,
+    zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
+    operator_org: Option<&str>,
+    compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
+) -> TestApp {
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
     let locator = FakeLocator::default();
@@ -2372,6 +2390,7 @@ async fn spawn_app_custom(
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes: orchestrator::DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES,
         studio_url: STUDIO_URL.into(),
+        compute_tls,
     });
     let probe: Router = Router::new()
         .route(INSTANCE_PROBE, axum::routing::get(instance_probe))

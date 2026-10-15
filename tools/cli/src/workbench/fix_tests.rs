@@ -16,6 +16,7 @@ fn entry(slug: &str, gw: u16, pg: u16, running: Option<u64>) -> Entry {
         proxy_port: pg,
         created_at: 1,
         running_since: running,
+        control_slot: None,
     }
 }
 

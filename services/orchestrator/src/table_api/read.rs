@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::access::Target;
 use crate::console::{owner_pool_for, pool_failure, RETRY_AFTER_SECS};
+use crate::sql_editor::run::RunTls;
 use crate::branches::unprocessable;
 use crate::sql_editor::{load_authorized, pick_pg_database, reconcile_member_role};
 use crate::{roles, AppState, AuthPrincipal, JobPort, MetadataPort};
@@ -122,7 +123,7 @@ where
         .await
         .map_err(|e| Box::new(e.into_response()))?;
     let owner = roles::owner_name(&record).to_owned();
-    let pool = owner_pool_for(state, &branch, &row, &owner)
+    let (pool, tls) = owner_pool_for(state, &branch, &row, &owner)
         .await
         .map_err(|e| Box::new(e.into_response()))?;
     let rid = principal.request_id.as_str();
@@ -134,7 +135,7 @@ where
     let login_member = member.filter(|_| subject != owner);
     let mut reconciled = false;
     loop {
-        match (read_once(&pool, &subject, &script, rid).await, login_member) {
+        match (read_once(&pool, &tls, &subject, &script, rid).await, login_member) {
             (Ok(Read::Document(json)), _) => return Ok(json),
             (Ok(Read::NoLogin), Some(member)) if !reconciled => {
                 reconcile_member_role(state, branch.id, member)
@@ -163,12 +164,13 @@ enum Read {
 /// The CONNECT check as `subject`, then (when it passes) `script`, on one pooled connection.
 async fn read_once(
     pool: &deadpool_postgres::Pool,
+    tls: &RunTls,
     subject: &str,
     script: &str,
     rid: &str,
 ) -> Result<Read, QueryFailure> {
     // Not marked done on failure: the connection is closed rather than pooled.
-    let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid))?);
+    let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, tls))?);
     let client = lease.client();
     client
         .simple_query(READ_TIMEOUT_SQL)

@@ -35,6 +35,7 @@ use futures_util::future::BoxFuture;
 use chelabase_metadata::{BranchDatabase, DataApiState, DatabaseOrigin, ServedDatabase};
 
 use crate::Worker;
+use chelabase_neon::reconfigure::ComputeCtlStatus;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -478,6 +479,24 @@ impl FakeMetadata {
         lock(&self.state)
     }
 
+    /// The branch linked to the endpoint, as the orchestrator's `endpoint_branch` reads it: a
+    /// deleting or deleted branch is excluded. Journaled as `metadata.endpoint_branch`; the
+    /// `WorkerMetadata::endpoint_branch` impl delegates here.
+    pub async fn endpoint_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<BranchId>, MetadataError> {
+        let state = self.write("endpoint_branch")?;
+        Ok(state
+            .branches
+            .values()
+            .find(|b| {
+                b.endpoint_id.as_deref() == Some(endpoint_id)
+                    && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted)
+            })
+            .map(|b| b.id))
+    }
+
     /// A database row with the given status and nothing else, and its main branch (same id
     /// and status), as `insert_database_pending` makes them.
     pub fn insert_database(&self, name: &str, status: DatabaseStatus) -> DatabaseId {
@@ -783,6 +802,10 @@ impl WorkerMetadata for FakeMetadata {
             state.begin_delete(id);
         }
         Ok(state.databases.get(&id).cloned())
+    }
+
+    async fn endpoint_branch(&self, endpoint_id: &str) -> Result<Option<BranchId>, MetadataError> {
+        FakeMetadata::endpoint_branch(self, endpoint_id).await
     }
 
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -3541,7 +3564,28 @@ pub struct FakePusher {
     pub on_push: Mutex<Option<OnPush>>,
     /// `(endpoint, config)` of every push that got through.
     pub pushed: Mutex<Vec<(String, serde_json::Value)>>,
+    /// compute_ctl's status per endpoint; `Running` when not set.
+    pub statuses: Mutex<std::collections::HashMap<String, ComputeCtlStatus>>,
+    /// Statuses answered once each, in order, before `statuses` applies again (see
+    /// [`FakePusher::script_statuses`]).
+    pub status_queue: Mutex<std::collections::HashMap<String, std::collections::VecDeque<ComputeCtlStatus>>>,
+    /// `status` fails with this message (compute_ctl unreachable).
+    pub fail_status: Mutex<Option<String>>,
+    /// `status` fails with this message once the scripted statuses are used up.
+    pub fail_status_after_queue: Mutex<Option<String>>,
     pub journal: Journal,
+}
+
+impl FakePusher {
+    pub fn set_status(&self, endpoint_id: &str, status: ComputeCtlStatus) {
+        lock(&self.statuses).insert(endpoint_id.to_string(), status);
+    }
+
+    /// The next `statuses.len()` reads of `endpoint_id`'s status answer these, in order; later
+    /// reads answer [`FakePusher::set_status`]'s value (`Running` when unset).
+    pub fn script_statuses(&self, endpoint_id: &str, statuses: Vec<ComputeCtlStatus>) {
+        lock(&self.status_queue).insert(endpoint_id.to_string(), statuses.into());
+    }
 }
 
 impl SpecPusher for FakePusher {
@@ -3565,6 +3609,29 @@ impl SpecPusher for FakePusher {
         }
         lock(&self.pushed).push((endpoint_id.to_string(), config.clone()));
         Ok(())
+    }
+
+    async fn status(
+        &self,
+        _control_addr: SocketAddr,
+        endpoint_id: &str,
+    ) -> anyhow::Result<ComputeCtlStatus> {
+        if let Some(message) = lock(&self.fail_status).clone() {
+            anyhow::bail!(message);
+        }
+        if let Some(next) = lock(&self.status_queue)
+            .get_mut(endpoint_id)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Ok(next);
+        }
+        if let Some(message) = lock(&self.fail_status_after_queue).clone() {
+            anyhow::bail!(message);
+        }
+        Ok(lock(&self.statuses)
+            .get(endpoint_id)
+            .cloned()
+            .unwrap_or(ComputeCtlStatus::Running))
     }
 }
 
@@ -3606,6 +3673,10 @@ pub fn worker() -> (FakeWorker, Journal) {
             fail: Mutex::default(),
             on_push: Mutex::default(),
             pushed: Mutex::default(),
+            statuses: Mutex::default(),
+            status_queue: Mutex::default(),
+            fail_status: Mutex::default(),
+            fail_status_after_queue: Mutex::default(),
             journal: journal.clone(),
         },
         key: SecretKey::generate(),
@@ -3619,6 +3690,8 @@ pub fn worker() -> (FakeWorker, Journal) {
         control_plane_uri: "http://orchestrator:8083".to_string(),
         ready_poll: Duration::from_millis(1),
         ready_timeout: Duration::from_millis(20),
+        // No longer than the timeout: the wait extends only when a test raises it.
+        ready_cap: Duration::from_millis(20),
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
@@ -3630,6 +3703,8 @@ pub fn worker() -> (FakeWorker, Journal) {
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
         member_role_requests: Default::default(),
+        member_logins: chelabase_neon::spec::MemberLogins::orchestrator(Vec::new()),
+        cert_sweep: None,
     };
     (worker, journal)
 }

@@ -9,6 +9,7 @@ use chelabase_types::mode_policy::ModePolicy;
 use chelabase_types::role_settings::RoleSettings;
 use chelabase_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
+use orchestrator::compute_tls::ComputeTls;
 use orchestrator::{build_router, AppState, Console, NatsPorts, ProxyAddress, RestInternal};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
     let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
     let internal_config = InternalConfig::from_env()?;
+    // Unset is a startup error (P13); empty means no address rule.
+    let member_logins = internal_config.member_logins()?;
     let signer = internal_config.load_signer()?;
     let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
     entry.check_mode(mode).map_err(anyhow::Error::new)?;
@@ -91,7 +94,12 @@ async fn main() -> anyhow::Result<()> {
         zitadel: internal_config.load_zitadel(),
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
         policy: ModePolicy::new(mode),
+        member_logins,
     });
+
+    // The console and the SQL editor reach computes over TLS on the control network.
+    let compute_tls = Arc::new(ComputeTls::new(internal_config.compute_tls_dir.clone()));
+    compute_tls.spawn_reload();
 
     let state = AppState {
         metadata,
@@ -108,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),
         data_api_database_cap,
         locator: Arc::new(DockerLocator::connect(
-            &internal_config.compute_network,
+            &internal_config.compute_control_network,
             &internal_config.stack,
         )?),
         console: Console::default(),
@@ -117,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
         studio_url: entry.studio_origin(),
+        compute_tls: Some(compute_tls),
     };
 
     let app = build_router(Arc::new(state));

@@ -18,6 +18,7 @@ fn render(slug: &str) -> HashMap<String, String> {
         docker_gid: 973,
         image: "chelabase-workbench:abc",
         extra: &[],
+        control_slot: 1,
     };
     render_stack_env("CHELABASE_PUBLIC_SCHEME=http\n", &input)
         .lines()

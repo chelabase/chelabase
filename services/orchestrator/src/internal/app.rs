@@ -288,6 +288,9 @@ where
         "host": addr.ip().to_string(),
         "port": addr.port(),
         "database": row.pg_database,
+        // U15: the auth service dials `host` and verifies the compute as this name, the
+        // only one its certificate carries.
+        "server_name": chelabase_neon::compute_tls::server_name(endpoint),
         "user": SYNC_ROLE,
         "password": password,
         "schema": auth.schema_name,

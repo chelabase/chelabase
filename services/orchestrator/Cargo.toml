@@ -49,6 +49,8 @@ reqwest = { workspace = true }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }
 deadpool-postgres = { workspace = true }
+# A compute connect failure is classified by type: a `rustls::Error` under it is a TLS one.
+rustls = { workspace = true }
 subtle = { workspace = true }
 hmac = { workspace = true }
 utoipa = { workspace = true }

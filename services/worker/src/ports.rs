@@ -45,6 +45,12 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         id: DatabaseId,
         status: DatabaseStatus,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// The live branch linked to `endpoint_id` (not deleting or deleted); `None` for an
+    /// endpoint without one (a static compute).
+    fn endpoint_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<Option<BranchId>, MetadataError>> + Send;
     fn get_branch(
         &self,
         id: BranchId,
@@ -682,6 +688,10 @@ impl WorkerMetadata for MetadataClient {
         status: DatabaseStatus,
     ) -> Result<bool, MetadataError> {
         MetadataClient::set_status(self, id, status).await
+    }
+
+    async fn endpoint_branch(&self, endpoint_id: &str) -> Result<Option<BranchId>, MetadataError> {
+        MetadataClient::endpoint_branch(self, endpoint_id).await
     }
 
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -1657,6 +1667,12 @@ pub trait SpecPusher: Send + Sync + 'static {
         endpoint_id: &str,
         config: &serde_json::Value,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// compute_ctl's own view of the compute (`GET /status`).
+    fn status(
+        &self,
+        control_addr: SocketAddr,
+        endpoint_id: &str,
+    ) -> impl Future<Output = anyhow::Result<chelabase_neon::reconfigure::ComputeCtlStatus>> + Send;
 }
 
 /// [`SpecPusher`] over compute_ctl's `/configure`.
@@ -1677,6 +1693,15 @@ impl SpecPusher for HttpPusher {
         config: &serde_json::Value,
     ) -> anyhow::Result<()> {
         chelabase_neon::reconfigure::push(&self.http, control_addr, &self.signer, endpoint_id, config)
+            .await
+    }
+
+    async fn status(
+        &self,
+        control_addr: SocketAddr,
+        endpoint_id: &str,
+    ) -> anyhow::Result<chelabase_neon::reconfigure::ComputeCtlStatus> {
+        chelabase_neon::reconfigure::status(&self.http, control_addr, &self.signer, endpoint_id)
             .await
     }
 }

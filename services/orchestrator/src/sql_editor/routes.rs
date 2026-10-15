@@ -36,7 +36,7 @@ use super::run::{self, ConnectError, Connected, Finished, RunSpec, RunTarget};
 use super::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, guard, invalid_sql, schema};
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
 use crate::console::{
-    OWNER_PASSWORD_UNKNOWN, compute_addr, database_not_found, owner_target, pick_database,
+    OWNER_PASSWORD_UNKNOWN, compute_addr, compute_tls_failed, database_not_found, run_tls, owner_target, pick_database,
     unavailable,
 };
 use crate::access::{authorize, deny_to_api, Authorized, RoleGraph, Target};
@@ -212,8 +212,29 @@ enum MemberLogin {
     Refused(ApiError),
 }
 
-fn member_login_refusal(branch: BranchId, err: ConnectError) -> MemberLogin {
+/// What a refused member-role login on `endpoint_id` means; every log line names the branch
+/// and the endpoint (RT3-7).
+fn member_login_refusal(branch: BranchId, endpoint_id: &str, err: ConnectError) -> MemberLogin {
     match &err {
+        // RT3-7: the compute's TLS or address/certificate rule refused us (U9: a 28P01 after a
+        // verified SCRAM final message is the certificate check's, and `connect_error` makes
+        // it `Tls`); a forced reconcile can't help, so none is run.
+        ConnectError::Tls(_) => {
+            warn!(branch_id = %branch, %endpoint_id, "member login: {err}");
+            MemberLogin::Refused(compute_tls_failed())
+        }
+        ConnectError::Rejected { code, message }
+            if code == "28000"
+                && (message.contains("pg_hba.conf rejects connection")
+                    || message.contains("certificate")) =>
+        {
+            warn!(
+                branch_id = %branch,
+                %endpoint_id,
+                "member login refused by the compute's TLS rules: {err}"
+            );
+            MemberLogin::Refused(compute_tls_failed())
+        }
         ConnectError::Rejected { code, .. } if code == "28P01" || code == "28000" => MemberLogin::Retry,
         // No CONNECT on this Postgres database: the member's own limit, not a broken role.
         ConnectError::Rejected { code, .. } if code == "42501" => MemberLogin::Refused(
@@ -224,7 +245,7 @@ fn member_login_refusal(branch: BranchId, err: ConnectError) -> MemberLogin {
             )
             .with_extra("required", serde_json::json!("connect")),
         ),
-        _ => MemberLogin::Refused(connect_failure(branch, err)),
+        _ => MemberLogin::Refused(connect_failure(branch, endpoint_id, err)),
     }
 }
 
@@ -274,6 +295,7 @@ where
     if graph.as_ref().is_some_and(|g| g.refusal(role).is_some()) {
         return if admin_may { as_owner(Some(role)).await } else { Err(role_forbidden(role)) };
     }
+    let endpoint_id = branch.endpoint_id.as_deref().unwrap_or_default();
     for force in [false, true] {
         let target = match member_session_target(
             state, authorized, principal, graph.as_deref(), branch, pg_database, role, force,
@@ -292,9 +314,13 @@ where
             Ok(connected) => {
                 return Ok(Session { connected, set_role: Some(role.to_owned()), member });
             }
-            Err(err) => match member_login_refusal(branch.id, err) {
+            Err(err) => match member_login_refusal(branch.id, endpoint_id, err) {
                 MemberLogin::Retry => {
-                    warn!(branch_id = %branch.id, "member role login refused; reconciling it");
+                    warn!(
+                        branch_id = %branch.id,
+                        %endpoint_id,
+                        "member role login refused; reconciling it"
+                    );
                 }
                 MemberLogin::Refused(api) => return Err(api),
             },
@@ -366,7 +392,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let request = MemberRolesReconcileRequest { branch_id: branch.as_uuid(), member_id: Some(member) };
+    let request = MemberRolesReconcileRequest { branch_id: branch.as_uuid(), member_id: Some(member), from_ddl: false };
     match state.js.reconcile_member_roles(request).await {
         Ok(MemberRolesReply::Done { roles }) => Ok(roles.into_iter().find(|r| r.member_id == member)),
         Ok(MemberRolesReply::Failed { message }) => {
@@ -488,11 +514,13 @@ where
         }
     }
     let addr = compute_addr(state, branch.id, endpoint).await?;
+    let tls = run_tls(state, branch.id, endpoint)?;
     Ok(RunTarget {
         addr,
         user: role_name,
         password,
         database: pg_database.to_owned(),
+        tls,
     })
 }
 
@@ -513,21 +541,33 @@ where
         user: target.user,
         password: target.password,
         database: database.to_owned(),
+        tls: target.tls,
     };
+    let endpoint_id = branch.endpoint_id.as_deref().unwrap_or_default();
     run::connect(&target)
         .await
-        .map_err(|err| connect_failure(branch.id, err))
+        .map_err(|err| connect_failure(branch.id, endpoint_id, err))
 }
 
-/// The answer for a failed editor connection, by the server's SQLSTATE when it answered.
-fn connect_failure(branch: BranchId, err: ConnectError) -> ApiError {
+/// The answer for a failed editor connection to `endpoint_id`, by the server's SQLSTATE when it
+/// answered; every log line names the branch and the endpoint (RT3-7).
+fn connect_failure(branch: BranchId, endpoint_id: &str, err: ConnectError) -> ApiError {
     match err {
+        ConnectError::Tls(message) => {
+            warn!(branch_id = %branch, %endpoint_id, "SQL editor connect, TLS: {message}");
+            compute_tls_failed()
+        }
         ConnectError::Unreachable(message) => {
-            warn!(branch_id = %branch, "SQL editor connect: {message}");
+            warn!(branch_id = %branch, %endpoint_id, "SQL editor connect: {message}");
             unavailable("the branch's compute can't be reached right now; try again")
         }
         ConnectError::Rejected { code, message } => {
-            warn!(branch_id = %branch, code = %code, "SQL editor connect refused: {message}");
+            warn!(
+                branch_id = %branch,
+                %endpoint_id,
+                code = %code,
+                "SQL editor connect refused: {message}"
+            );
             match code.as_str() {
                 // The sealed password is the one Chelabase set: it was changed in SQL.
                 "28P01" => conflict(ErrorCode::OwnerPasswordUnknown, OWNER_PASSWORD_UNKNOWN),
@@ -537,7 +577,12 @@ fn connect_failure(branch: BranchId, err: ConnectError) -> ApiError {
                     "the branch's compute is out of connections or resources; try again",
                 ),
                 _ => {
-                    error!(branch_id = %branch, code = %code, "SQL editor connect refused: {message}");
+                    error!(
+                        branch_id = %branch,
+                        %endpoint_id,
+                        code = %code,
+                        "SQL editor connect refused: {message}"
+                    );
                     ApiError::internal()
                 }
             }
@@ -1040,6 +1085,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_editor::fake_pg::{self, Case};
+
+    /// The endpoint every refusal's log line names (RT3-7, T10 m2).
+    const EP: &str = "ep-log-1";
 
     fn rejected(code: &str) -> ConnectError {
         ConnectError::Rejected {
@@ -1066,18 +1115,18 @@ mod tests {
             ),
         ] {
             let label = format!("{err:?}");
-            let api = connect_failure(branch, err);
+            let api = connect_failure(branch, EP, err);
             assert_eq!((api.status, api.code), (status, code), "{label}");
             if status == 503 {
                 assert_eq!(api.retry_after, Some(RETRY_AFTER_SECS), "{label}");
             }
         }
         assert_eq!(
-            connect_failure(branch, rejected("3D000")).message,
+            connect_failure(branch, EP, rejected("3D000")).message,
             "database not found"
         );
         assert_eq!(
-            connect_failure(branch, rejected("28P01")).message,
+            connect_failure(branch, EP, rejected("28P01")).message,
             OWNER_PASSWORD_UNKNOWN
         );
     }
@@ -1107,15 +1156,15 @@ mod tests {
         let rejected = |code: &str| ConnectError::Rejected { code: code.into(), message: "no".into() };
         let branch = BranchId::new();
         for code in ["28P01", "28000"] {
-            assert!(matches!(member_login_refusal(branch, rejected(code)), MemberLogin::Retry), "{code}");
+            assert!(matches!(member_login_refusal(branch, EP, rejected(code)), MemberLogin::Retry), "{code}");
         }
-        let MemberLogin::Refused(api) = member_login_refusal(branch, rejected("42501")) else {
+        let MemberLogin::Refused(api) = member_login_refusal(branch, EP, rejected("42501")) else {
             panic!("42501 isn't a refusal");
         };
         assert_eq!((api.status, api.code), (403, ErrorCode::Forbidden));
         assert_eq!(api.extra, vec![("required".to_string(), serde_json::json!("connect"))]);
         for (code, status) in [("3D000", 404), ("57P03", 503), ("XX000", 500)] {
-            let MemberLogin::Refused(api) = member_login_refusal(branch, rejected(code)) else {
+            let MemberLogin::Refused(api) = member_login_refusal(branch, EP, rejected(code)) else {
                 panic!("{code}");
             };
             assert_eq!(api.status, status, "{code}");
@@ -1154,5 +1203,162 @@ mod tests {
             within(Duration::from_secs(1), async { 7 }).await.unwrap(),
             7
         );
+    }
+
+    // RT3-7: a TLS or certificate problem is a typed 503 without the forced reconcile (it
+    // can't help); any other refused login keeps today's path.
+    // U9 (replaces T10's third message, `certificate validation … CN mismatch`, which
+    // Postgres never sends: a CN mismatch reaches the client only as 28P01, after a SCRAM final
+    // message that verified, `auth.c:294-298`, `:2789-2800`).
+    #[tokio::test]
+    async fn tls_and_hba_refusals_are_compute_tls_failed() {
+        let branch = BranchId::new();
+        let tls = |e: ConnectError| match member_login_refusal(branch, EP, e) {
+            MemberLogin::Refused(api) => (api.status, api.code, api.retry_after.is_some()),
+            MemberLogin::Retry => panic!("a TLS problem isn't a stale role"),
+        };
+        assert_eq!(
+            tls(ConnectError::Tls("invalid peer certificate: UnknownIssuer".into())),
+            (503, ErrorCode::ComputeTlsFailed, true)
+        );
+        for message in [
+            "pg_hba.conf rejects connection for host \"10.213.4.12\", user \"cb_m_ab\", database \"app\", SSL encryption",
+            "connection requires a valid client certificate",
+        ] {
+            let rejected = ConnectError::Rejected { code: "28000".into(), message: message.into() };
+            assert_eq!(tls(rejected), (503, ErrorCode::ComputeTlsFailed, true), "{message}");
+        }
+        let compute = fake_pg::compute_tls();
+        // U9: the password verified, the certificate check refused us.
+        let cn_mismatch = run::connect_error(&Case::VerifiedThen28P01.error().await, &compute);
+        assert_eq!(tls(cn_mismatch), (503, ErrorCode::ComputeTlsFailed, true));
+        // A 28P01 without a verified final message is a wrong password: a stale role.
+        let wrong = run::connect_error(&Case::WrongPassword.error().await, &compute);
+        assert!(matches!(member_login_refusal(branch, EP, wrong), MemberLogin::Retry));
+        let stale = ConnectError::Rejected { code: "28000".into(), message: "role \"cb_m_ab\" is not permitted to log in".into() };
+        assert!(matches!(member_login_refusal(branch, EP, stale), MemberLogin::Retry));
+    }
+
+    /// How a refusal ends, for the invariant table.
+    #[derive(Debug, PartialEq)]
+    enum Answer {
+        /// 503 `compute_tls_failed` with `retry_after`, no reconcile.
+        TlsFailed,
+        /// A stale role: one forced reconcile.
+        Retry,
+        /// Any other answer.
+        Other(u16, ErrorCode),
+    }
+
+    fn answer(api: ApiError) -> Answer {
+        if api.code == ErrorCode::ComputeTlsFailed {
+            assert_eq!((api.status, api.retry_after.is_some()), (503, true), "{api:?}");
+            Answer::TlsFailed
+        } else {
+            Answer::Other(api.status, api.code)
+        }
+    }
+
+    // Invariant (fork round 3, final fix round; T10 I1, I2, m1, m4 and U9): a compute connection
+    // failure is `compute_tls_failed` iff the TLS layer or the post-password certificate check
+    // refused it; a wrong password or a stale role is never `compute_tls_failed`, and a TLS
+    // failure never triggers a reconcile. Every case of `fake_pg::TABLE`, through
+    // `connect_error` as a compute connection, for a member login and for the owner's.
+    #[tokio::test]
+    async fn compute_tls_failed_iff_tls_or_the_certificate_check_refused() {
+        use Case::*;
+        use Answer::{Other, Retry, TlsFailed};
+        let branch = BranchId::new();
+        let compute = fake_pg::compute_tls();
+        for &(case, _, _) in fake_pg::TABLE {
+            let (member, owner) = match case {
+                TlsRefusedByServer | HandshakeUnknownIssuer | HandshakeNested
+                | AlertAfterHandshake | ChannelBindingRefused | VerifiedThen28P01 => {
+                    (TlsFailed, TlsFailed)
+                }
+                Refused | Timeout | HandshakeReset | ResetAfterHandshake | Closed
+                | UnexpectedMessage | Malformed | NoPassword | BadServerSignature => (
+                    Other(503, ErrorCode::Unavailable),
+                    Other(503, ErrorCode::Unavailable),
+                ),
+                WrongPassword => (Retry, Other(409, ErrorCode::OwnerPasswordUnknown)),
+                // The compute's address rule (RT3-7) for a member; the owner's line has none.
+                HbaRejects => (TlsFailed, Other(500, ErrorCode::Internal)),
+                VerifiedThenNotPermitted => (Retry, Other(500, ErrorCode::Internal)),
+                VerifiedThenNoConnect => {
+                    (Other(403, ErrorCode::Forbidden), Other(500, ErrorCode::Internal))
+                }
+                VerifiedThenTooMany => (
+                    Other(503, ErrorCode::Unavailable),
+                    Other(503, ErrorCode::Unavailable),
+                ),
+                VerifiedThenNoDatabase => {
+                    (Other(404, ErrorCode::NotFound), Other(404, ErrorCode::NotFound))
+                }
+            };
+            let err = run::connect_error(&case.error().await, &compute);
+            let got = match member_login_refusal(branch, EP, err) {
+                MemberLogin::Retry => Retry,
+                MemberLogin::Refused(api) => answer(api),
+            };
+            assert_eq!(got, member, "{case:?}, member login");
+            let err = run::connect_error(&case.error().await, &compute);
+            assert_eq!(answer(connect_failure(branch, EP, err)), owner, "{case:?}, owner");
+        }
+    }
+
+    /// A `tracing` writer into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // RT3-7, T10 m2: every refused connection's log line names the branch and the endpoint.
+    #[test]
+    fn refusal_logs_name_the_endpoint() {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let branch = BranchId::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let errors = || {
+                [
+                    ConnectError::Tls("invalid peer certificate: UnknownIssuer".into()),
+                    ConnectError::Unreachable("refused".into()),
+                    ConnectError::Rejected {
+                        code: "28000".into(),
+                        message: "pg_hba.conf rejects connection for host \"10.213.4.12\"".into(),
+                    },
+                    rejected("28P01"),
+                    rejected("XX000"),
+                    rejected("53300"),
+                ]
+            };
+            for err in errors() {
+                let _ = member_login_refusal(branch, EP, err);
+            }
+            for err in errors() {
+                let _ = connect_failure(branch, EP, err);
+            }
+        });
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() >= 8, "{text}");
+        for line in lines {
+            assert!(line.contains(&format!("branch_id={branch}")), "{line}");
+            assert!(line.contains(&format!("endpoint_id={EP}")), "{line}");
+        }
     }
 }

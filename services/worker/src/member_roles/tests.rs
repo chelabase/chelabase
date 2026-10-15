@@ -969,7 +969,7 @@ fn all_scripts(w: &FakeWorker) -> Vec<(String, String)> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(_, _, s)| !s.contains("chelabase: member roles"))
+        .filter(|(_, _, s)| !s.contains("chelabase: member roles") && !s.contains(BRANCH_PROTECTED_CHECK_MARK))
         .map(|(_, db, s)| (db.clone(), s.clone()))
         .collect()
 }
@@ -1676,6 +1676,7 @@ async fn a_run_past_the_deadline_goes_on() {
     let payload = serde_json::to_vec(&MemberRolesReconcileRequest {
         branch_id: branch.as_uuid(),
         member_id: None,
+        from_ddl: false,
     })
     .unwrap();
     let reply = member_roles_reply(w.clone(), &payload, Duration::from_millis(50)).await;
@@ -1787,6 +1788,8 @@ async fn a_protected_branch_locks_developers_and_guards_every_database() {
     let (w, _journal) = worker();
     let (branch, ep, member) = setup(&w, &["billing"]).await;
     w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    // U14: the compute already carries the protection flag (the flag tests cover the rest).
+    w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
     let answer = Cat { roles: &["!postgres", "billing"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres"), ("analytics", "postgres")] }.answer();
     w.computes.answer_at(&ep, "chelabase: member roles", &answer);
     assert!(done(&w.reconcile_member_roles(branch, None).await));
@@ -1889,6 +1892,8 @@ async fn a_protected_branch_leaves_an_admin_unlocked_and_unlocks_one_who_became_
     let (w, _journal) = worker();
     let (branch, ep, member) = setup(&w, &["billing"]).await;
     w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    // U14: the compute already carries the protection flag (the flag tests cover the rest).
+    w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
     // The member is an Admin now; its role still holds our marker.
     let db = w.metadata.state().branches.get(&branch).unwrap().database_id;
     let project = w.metadata.database(db).project_id.as_uuid();
@@ -1916,6 +1921,8 @@ async fn a_failed_guard_fails_the_run_but_the_roles_still_apply() {
     let (w, _journal) = worker();
     let (branch, ep, member) = setup(&w, &["billing"]).await;
     w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    // U14: the compute already carries the protection flag (the flag tests cover the rest).
+    w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
     w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
     w.computes.fail_when("CREATE EVENT TRIGGER chelabase_schema_guard_ddl");
     let reply = w.reconcile_member_roles(branch, None).await;
@@ -2043,6 +2050,8 @@ async fn the_guard_is_installed_only_where_it_is_not_current() {
     let (w, _journal) = worker();
     let (branch, ep, _member) = setup(&w, &["billing"]).await;
     w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    // U14: the compute already carries the protection flag (the flag tests cover the rest).
+    w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
     let answer = Cat { roles: &["!postgres", "billing"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres"), ("analytics", "postgres")] }.answer();
     w.computes.answer_at(&ep, "chelabase: member roles", &answer);
     w.computes.answer_in("app", "chelabase: schema guard check", "t");
@@ -2077,6 +2086,7 @@ async fn a_protected_branch_guards_with_its_settings() {
             record.guard_logins = on;
             state.guard_exemptions.insert(branch, vec!["deploy".into(), "Ci Bot".into()]);
         }
+        w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
         // PB end-of-step R13: exemptions are honored only for roles that exist.
         let answer = Cat { roles: &["!postgres", "billing", "@deploy", "@Ci Bot"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres")] }.answer();
         w.computes.answer_at(&ep, "chelabase: member roles", &answer);
@@ -2213,6 +2223,7 @@ async fn the_guard_renders_only_honored_exemptions() {
         record.guard_logins = true;
         state.guard_exemptions.insert(branch, vec!["deploy".into(), "ghost".into(), "owned".into()]);
     }
+    w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
     let answer = format!(
         "{}A {} {}\n",
         Cat { roles: &["!postgres", "billing", "@deploy", "@owned", "@esc"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres")] }.answer(),
@@ -2232,6 +2243,7 @@ async fn the_guard_goes_into_template1_and_leaves_it_with_protection() {
         let (w, _journal) = worker();
         let (branch, ep, _member) = setup(&w, &["billing"]).await;
         w.metadata.state().branches.get_mut(&branch).unwrap().protected = protected;
+        w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, if protected { "on" } else { "off" });
         let answer = format!("{}g {}\n", cat(&["!postgres", "billing"]), h("template1"));
         w.computes.answer_at(&ep, "chelabase: member roles", &answer);
         w.computes.answer(GUARD_PRESENT_MARK, "t");
@@ -2263,6 +2275,7 @@ async fn template1_is_touched_only_when_another_database_changed() {
         let (w, _journal) = worker();
         let (branch, ep, _member) = setup(&w, &["billing"]).await;
         w.metadata.state().branches.get_mut(&branch).unwrap().protected = protected;
+        w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, if protected { "on" } else { "off" });
         let catalog = format!(
             "{}g {}\n",
             Cat { roles: &["!postgres", "billing"], memberships: &[], edges: &[], passwords: &[], databases: &[("app", "postgres")] }.answer(),
@@ -2289,4 +2302,67 @@ fn every_role_leaves_out_the_data_api_roles_unless_named() {
         roles: RoleSet::Only([PgRole::Named("anon".into()), PgRole::Named("billing".into())].into_iter().collect()),
     };
     assert_eq!(granted_roles(&named, &catalog).0, set(&["anon", "billing"]));
+}
+
+fn closed(name: &str, allow: bool, template: bool, born: bool) -> ClosedDatabase {
+    ClosedDatabase { name: name.into(), allow_connections: allow, template, born_closed: born }
+}
+
+#[test]
+fn the_catalog_lists_closed_and_marked_databases() {
+    let sql = member_catalog_sql();
+    // (The marker is matched as a Postgres bool, so the exact spelling is no longer in the text;
+    // `the_born_closed_marker_is_matched_as_a_postgres_bool` pins the accepted spellings.)
+    assert!(sql.contains("neon.born_closed"), "{sql}");
+    assert!(sql.contains("NOT d.datallowconn"), "{sql}");
+    let h = |s: &str| hex::encode(s.as_bytes());
+    let out = format!("c {} f f t\nc {} f f f\nc {} t f t\nc {} f t f\n", h("born"), h("shut"), h("opened"), h("template0"));
+    let catalog = parse_member_catalog(&out).unwrap();
+    assert_eq!(
+        catalog.closed_databases,
+        vec![
+            closed("born", false, false, true),
+            closed("opened", true, false, true),
+            closed("shut", false, false, false),
+            closed("template0", false, true, false),
+        ]
+    );
+    assert!(parse_member_catalog(&format!("c {} f f", h("x"))).is_err(), "a short line");
+}
+
+#[test]
+fn closed_databases_on_a_protected_branch_are_guarded_and_only_marked_ones_opened() {
+    use ClosedStep::*;
+    let dbs = [
+        closed("born", false, false, true),
+        closed("opened", true, false, true),
+        closed("shut", false, false, false),
+        closed("template0", false, true, false),
+        closed("tmark", false, true, true),
+    ];
+    assert_eq!(
+        plan_closed_databases(&dbs, true),
+        vec![
+            Guard("born".into()),
+            Open("born".into()),
+            ResetMarker("opened".into()),
+            Guard("shut".into()),
+            Skip("template0".into()),
+            Skip("tmark".into()),
+        ]
+    );
+    assert_eq!(
+        plan_closed_databases(&dbs, false),
+        vec![Open("born".into()), ResetMarker("opened".into()), Skip("tmark".into())]
+    );
+    assert!(plan_closed_databases(&[], true).is_empty());
+}
+
+#[test]
+fn opening_resets_the_marker_with_quoted_names() {
+    let sql = open_born_closed_sql("we\"ird");
+    let open = sql.find("ALTER DATABASE \"we\"\"ird\" ALLOW_CONNECTIONS true;").expect(&sql);
+    let reset = sql.find("ALTER DATABASE \"we\"\"ird\" RESET neon.born_closed;").expect(&sql);
+    assert!(open < reset, "{sql}");
+    assert_eq!(reset_born_closed_sql("db"), "ALTER DATABASE \"db\" RESET neon.born_closed;");
 }

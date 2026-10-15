@@ -21,6 +21,128 @@ pub struct StackEnvInput<'a> {
     pub image: &'a str,
     /// Written last; a key already present is replaced in place.
     pub extra: &'a [(String, String)],
+    /// The stack's control-network slot (`Entry::control_slot`).
+    pub control_slot: u8,
+}
+
+/// One stack's control network: the subnet Compose creates, the range computes get addresses
+/// from, and the static addresses of the orchestrator and the test runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlNet {
+    pub subnet: String,
+    pub compute_range: String,
+    pub orchestrator_ip: String,
+    pub runner_ip: String,
+}
+
+/// Slot `k` (0..=63): subnet `10.213.{4k}.0/22`, computes from the upper `/23`
+/// (`10.213.{4k+2}.0/23`), the orchestrator at `.10` and the runner at `.11` of the first `/24`.
+pub fn control_net(slot: u8) -> ControlNet {
+    let base = u16::from(slot) * 4;
+    ControlNet {
+        subnet: format!("10.213.{base}.0/22"),
+        compute_range: format!("10.213.{}.0/23", base + 2),
+        orchestrator_ip: format!("10.213.{base}.10"),
+        runner_ip: format!("10.213.{base}.11"),
+    }
+}
+
+/// One Docker network and the subnets of its `IPAM.Config`, as `docker network inspect` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkSubnets {
+    pub name: String,
+    pub subnets: Vec<String>,
+}
+
+/// Parses the output of `docker network inspect <all networks>` (a JSON array). `IPAM.Config`
+/// may be null or missing, and an entry may lack `Subnet`: those add no subnet.
+pub fn parse_network_subnets(json: &str) -> anyhow::Result<Vec<NetworkSubnets>> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("docker network inspect: {e}"))?;
+    let networks = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("docker network inspect: expected a JSON array"))?;
+    Ok(networks
+        .iter()
+        .map(|n| NetworkSubnets {
+            name: n["Name"].as_str().unwrap_or_default().to_string(),
+            subnets: n["IPAM"]["Config"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["Subnet"].as_str().map(str::to_string))
+                .collect(),
+        })
+        .collect())
+}
+
+fn parse_cidr_v4(cidr: &str) -> Option<(u32, u32)> {
+    let (addr, prefix) = cidr.split_once('/')?;
+    let addr: std::net::Ipv4Addr = addr.parse().ok()?;
+    let prefix: u32 = prefix.parse().ok().filter(|p| *p <= 32)?;
+    Some((u32::from(addr), prefix))
+}
+
+/// Whether two IPv4 CIDRs share an address. Host bits are ignored; IPv6 and unparsable input
+/// never overlap.
+pub fn cidr_overlaps(a: &str, b: &str) -> bool {
+    let (Some((a, pa)), Some((b, pb))) = (parse_cidr_v4(a), parse_cidr_v4(b)) else {
+        return false;
+    };
+    let prefix = pa.min(pb);
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    (a ^ b) & mask == 0
+}
+
+/// Refuses a start when a network other than the stack's own (`own_network`) holds an IPv4 subnet
+/// overlapping the slot's control subnet: Docker would fail the stack's network with "Pool
+/// overlaps" after the images and builds, and the message would not name the slot.
+pub fn check_control_subnet(
+    slug: &str,
+    slot: u8,
+    own_network: &str,
+    networks: &[NetworkSubnets],
+) -> anyhow::Result<()> {
+    let wanted = control_net(slot).subnet;
+    for net in networks.iter().filter(|n| n.name != own_network) {
+        if let Some(subnet) = net.subnets.iter().find(|s| cidr_overlaps(s, &wanted)) {
+            anyhow::bail!(
+                "stack {slug} (control slot {slot}) needs the subnet {wanted}, but the Docker network {} holds {subnet}; remove that network (`docker network rm {}`) or free the slot",
+                net.name,
+                net.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `docker network inspect <id>` for one network: a successful run is parsed; a network removed
+/// since `docker network ls` ("No such network", "network … not found") yields none; any other
+/// failure is an error naming the network.
+pub fn parse_network_inspect(
+    id: &str,
+    ok: bool,
+    stdout: &str,
+    stderr: &str,
+) -> anyhow::Result<Vec<NetworkSubnets>> {
+    if ok {
+        return parse_network_subnets(stdout);
+    }
+    let lower = stderr.to_lowercase();
+    if lower.contains("no such network") || lower.contains("not found") {
+        return Ok(Vec::new());
+    }
+    anyhow::bail!("docker network inspect {id} failed: {}", stderr.trim())
+}
+
+/// The path to mask in the containers besides the keys dir: `<checkout>/.chelabase` when it exists
+/// and is not the keys dir (a worktree's symlink to it resolves there, and the keys dir is masked
+/// anyway). `None` when it is the keys dir, or absent.
+pub fn checkout_mask(checkout: &Path, keys_dir: &Path) -> Option<std::path::PathBuf> {
+    let link = checkout.join(".chelabase");
+    let resolved = link.canonicalize().ok()?;
+    let keys = keys_dir.canonicalize().unwrap_or_else(|_| keys_dir.to_path_buf());
+    (resolved != keys && link != keys_dir).then_some(link)
 }
 
 /// The app tier's addresses inside the stack: service-name URLs and `0.0.0.0` listen addresses.
@@ -199,6 +321,25 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
         "CHELABASE_COMPUTE_NETWORK",
         format!("{}_default", input.project),
     );
+    let control = control_net(input.control_slot);
+    lines.set(
+        "CHELABASE_COMPUTE_CONTROL_NETWORK",
+        format!("{}_control", input.project),
+    );
+    lines.set("CHELABASE_CONTROL_SUBNET", control.subnet.as_str());
+    lines.set(
+        "CHELABASE_CONTROL_COMPUTE_RANGE",
+        control.compute_range.as_str(),
+    );
+    lines.set(
+        "CHELABASE_ORCHESTRATOR_CONTROL_IP",
+        control.orchestrator_ip.as_str(),
+    );
+    lines.set("CHELABASE_RUNNER_CONTROL_IP", control.runner_ip.as_str());
+    lines.set(
+        "CHELABASE_MEMBER_LOGIN_CIDRS",
+        format!("{}/32,{}/32", control.orchestrator_ip, control.runner_ip),
+    );
     lines.set(
         "CHELABASE_ZITADEL_ACTIONS_ENDPOINT",
         "http://orchestrator:8083/internal/zitadel/events",
@@ -212,7 +353,21 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
     ] {
         lines.set(key, path(&keys_dir.join(dir)));
     }
+    if let Some(mask) = checkout_mask(input.checkout, &keys_dir) {
+        lines.set("CHELABASE_CHECKOUT_MASK", path(&mask));
+    }
     lines.set("CHELABASE_COMPUTE_JWT_DIR", path(&keys_dir.join("neon")));
+    lines.set("CHELABASE_COMPUTE_CA_DIR", path(&keys_dir.join("compute-ca")));
+    // U15: auth and rest verify computes against the CA certificate alone (only it is mounted
+    // into them, never ca.key).
+    lines.set(
+        "CHELABASE_COMPUTE_CA_FILE",
+        path(&keys_dir.join("compute-ca").join("ca.crt")),
+    );
+    lines.set(
+        "CHELABASE_COMPUTE_TLS_DIR",
+        path(&keys_dir.join("orchestrator-tls")),
+    );
     // The machine keys every app reads at startup. The gateway starts before the first bootstrap
     // (bootstrap reaches Zitadel through it), so these can't wait for demo.env.
     let gateway_dir = keys_dir.join("gateway");
@@ -286,4 +441,26 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::checkout_mask;
+
+    #[test]
+    fn the_second_mask_only_exists_for_a_different_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path().join("m");
+        let keys = main.join(".chelabase");
+        let wt = main.join(".worktrees/x");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        assert_eq!(checkout_mask(&wt, &keys), None, "no .chelabase in the checkout");
+        std::os::unix::fs::symlink(&keys, wt.join(".chelabase")).unwrap();
+        assert_eq!(checkout_mask(&wt, &keys), None, "a symlink to the keys dir");
+        assert_eq!(checkout_mask(&main, &keys), None, "the checkout holds the keys dir");
+        let other = t.path().join("o");
+        std::fs::create_dir_all(other.join(".chelabase")).unwrap();
+        assert_eq!(checkout_mask(&other, &keys), Some(other.join(".chelabase")));
+    }
 }

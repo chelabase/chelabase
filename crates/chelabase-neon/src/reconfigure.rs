@@ -40,3 +40,54 @@ pub async fn push(
     }
     Ok(())
 }
+
+/// compute_ctl's own view of the compute (`GET /status`, `ComputeStatusResponse.status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComputeCtlStatus {
+    /// Postgres is up and compute_ctl finished starting it (migrations included).
+    Running,
+    /// The start failed; compute_ctl's `error`.
+    Failed(String),
+    /// Any other state (`init`, `configuration_pending`, …), as compute_ctl names it.
+    Other(String),
+}
+
+#[derive(serde::Deserialize)]
+struct StatusBody {
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// compute_ctl's status of `endpoint_id`'s compute, with the token [`push`] uses. An
+/// unreachable compute_ctl or an answer other than 2xx is an error.
+pub async fn status(
+    http: &reqwest::Client,
+    control_addr: SocketAddr,
+    signer: &ComputeSigner,
+    endpoint_id: &str,
+) -> anyhow::Result<ComputeCtlStatus> {
+    let resp = http
+        .get(format!("http://{control_addr}/status"))
+        .bearer_auth(signer.token_for(endpoint_id)?)
+        .send()
+        .await
+        .with_context(|| format!("GET /status of compute {endpoint_id}"))?;
+    let code = resp.status();
+    if !code.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("compute {endpoint_id} /status returned {code}: {text}");
+    }
+    let body: StatusBody = resp
+        .json()
+        .await
+        .with_context(|| format!("reading the /status of compute {endpoint_id}"))?;
+    Ok(match body.status.as_str() {
+        "running" => ComputeCtlStatus::Running,
+        "failed" => ComputeCtlStatus::Failed(
+            body.error
+                .unwrap_or_else(|| "compute_ctl reported failed without an error".to_string()),
+        ),
+        _ => ComputeCtlStatus::Other(body.status),
+    })
+}

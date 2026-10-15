@@ -14,6 +14,7 @@ use anyhow::Context;
 use chelabase_auth::app_token::AppTokenSigner;
 use chelabase_auth::internal::InternalVerifier;
 use chelabase_query::app_users::{PgUsersDb, UsersDb};
+use chelabase_query::server_tls::ServerTls;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -64,11 +65,14 @@ impl AppUsers {
             .map_err(|e| anyhow::anyhow!("app token keys: {e}"))?;
         let admin_pat = std::fs::read_to_string(&c.admin_pat_file)
             .with_context(|| format!("read {}", c.admin_pat_file.display()))?;
+        // U15: the sync verifies every compute against the platform CA.
+        let server_tls = ServerTls::from_ca_file(&c.compute_ca)
+            .map_err(|e| anyhow::anyhow!("CHELABASE_COMPUTE_CA_FILE: {e}"))?;
         Ok(Self::new(
             verifier,
             InternalClient::new(&c.internal_url, &c.internal_token),
             signer,
-            Arc::new(PgUsersDb::new()),
+            Arc::new(PgUsersDb::with_server_tls(server_tls)),
             Zitadel::new(issuer, admin_pat.trim()),
             c.access_ttl,
         ))

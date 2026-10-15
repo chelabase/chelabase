@@ -170,6 +170,9 @@ pub struct AppConfig {
     /// Zitadel's admin token: the login client can't delete users (P32), and a sign-up whose
     /// commit fails deletes the user it made.
     pub admin_pat_file: PathBuf,
+    /// The platform CA's certificate (`CHELABASE_COMPUTE_CA_FILE`): the app-users sync verifies
+    /// every compute's TLS against it (U15).
+    pub compute_ca: PathBuf,
 }
 
 pub const DEFAULT_APP_ACCESS_TTL_SECS: u64 = 900;
@@ -248,7 +251,13 @@ impl AppConfig {
         if admin_pat_file.is_none() {
             missing.push("CHELABASE_ZITADEL_ADMIN_PAT_FILE");
         }
-        let (Some(verify_key), Some(admin_pat_file)) = (verify_key, admin_pat_file) else {
+        let compute_ca = get("CHELABASE_COMPUTE_CA_FILE");
+        if compute_ca.is_none() {
+            missing.push("CHELABASE_COMPUTE_CA_FILE");
+        }
+        let (Some(verify_key), Some(admin_pat_file), Some(compute_ca)) =
+            (verify_key, admin_pat_file, compute_ca)
+        else {
             tracing::warn!("app users are off: {} not set", missing.join(" and "));
             return Ok(None);
         };
@@ -271,6 +280,7 @@ impl AppConfig {
                 .unwrap_or_else(|| DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()),
             verify_key: verify_key.into(),
             admin_pat_file: admin_pat_file.into(),
+            compute_ca: compute_ca.into(),
         }))
     }
 }
@@ -287,11 +297,12 @@ mod tests {
         move |name| map.get(name).cloned()
     }
 
-    const FULL: [(&str, &str); 4] = [
+    const FULL: [(&str, &str); 5] = [
         ("CHELABASE_APP_JWT_PRIVATE_KEY", "/k/app-jwt.key"),
         ("CHELABASE_APP_JWT_PUBLIC_KEY", "/k/app-jwt.pub"),
         ("CHELABASE_INTERNAL_VERIFY_KEY", "/k/internal.pub"),
         ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/k/admin.pat"),
+        ("CHELABASE_COMPUTE_CA_FILE", "/k/compute-ca/ca.crt"),
     ];
 
     // M9: a platform instance refuses the development internal bearer; self-hosted allows it.

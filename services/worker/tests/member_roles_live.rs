@@ -478,14 +478,22 @@ impl Fx {
         password: &str,
         script: &str,
     ) -> Result<String, String> {
-        let addr = self
-            .worker
-            .computes
+        let control = std::env::var("CHELABASE_COMPUTE_CONTROL_NETWORK").expect("CHELABASE_COMPUTE_CONTROL_NETWORK");
+        let stack = std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into());
+        let addr = chelabase_neon::DockerLocator::connect(&control, &stack)
+            .unwrap()
             .postgres_addr(ep)
             .await
-            .expect("the compute's Postgres address")
-            .expect("a published Postgres port");
-        let conn = format!("host={} port={} dbname={database} sslmode=prefer", addr.ip(), addr.port());
+            .expect("the compute's control address")
+            .expect("on the control network");
+        let tls = std::env::var("CHELABASE_COMPUTE_TLS_DIR").expect("CHELABASE_COMPUTE_TLS_DIR");
+        let conn = format!(
+            "host={} hostaddr={} port={} dbname={database} sslmode=verify-full channel_binding=require \
+             sslrootcert={tls}/current/ca.crt sslcert={tls}/current/client.crt sslkey={tls}/current/client.key",
+            chelabase_neon::compute_tls::server_name(ep),
+            addr.ip(),
+            addr.port()
+        );
         psql(&conn, user, password, script).await
     }
 
@@ -497,20 +505,7 @@ impl Fx {
         password: &str,
         script: &str,
     ) -> Result<String, String> {
-        let addr = self
-            .worker
-            .computes
-            .postgres_addr(ep)
-            .await
-            .expect("the compute's Postgres address")
-            .expect("a published Postgres port");
-        let conn = format!(
-            "host={} port={} dbname={} sslmode=prefer",
-            addr.ip(),
-            addr.port(),
-            self.database
-        );
-        psql(&conn, user, password, script).await
+        self.direct_in(ep, &self.database, user, password, script).await
     }
 
     /// As member `m`'s role on main, in the main database.
@@ -627,7 +622,7 @@ enum Op {
     OwnerLevel(usize, bool),
     /// The owner makes `a` a member of `b` (SET), or revokes it.
     Chain(usize, usize, bool),
-    /// The owner grants a pool role straight to a member role.
+    /// The owner tries to grant a pool role straight to a member role (refused, D3).
     OwnerGrantsToMember(usize, usize),
     /// The owner makes `a` hold ADMIN (no SET) on `b` (N2).
     AdminChain(usize, usize),
@@ -826,7 +821,13 @@ async fn apply(fx: &Fx, model: &mut Model, op: &Op) {
         Op::OwnerGrantsToMember(m, i) => {
             let role = member_role_name(fx.members[*m].id);
             if role_exists(fx, &role).await && role_exists(fx, POOL[*i]).await {
-                fx.as_owner(&format!("GRANT {} TO {role};", POOL[*i])).await;
+                // Spec D3: a member role is managed by Chelabase, so no non-superuser (the owner
+                // included) can grant to it. The refusal changes nothing; the model stays as is.
+                let err = fx
+                    .try_owner("postgres", &format!("GRANT {} TO {role};", POOL[*i]))
+                    .await
+                    .expect_err("a grant to a member role is refused");
+                assert!(err.contains("42501") && err.contains("is managed by Chelabase"), "{err}");
             }
         }
         Op::AdminChain(a, b) => {
@@ -1406,18 +1407,13 @@ async fn escape_attempts_fail() {
         ] {
             assert_set_role_refused(fx.as_member(m, attempt).await, attempt);
         }
-        // N3: a member role can't change its own password: the receiver refuses the forwarded
-        // change as a reserved name, and the transaction fails.
+        // N3: a member role can't change its own password: the compute refuses the statement
+        // (spec D3: a member role is managed by Chelabase), and the transaction fails.
         let err = fx
             .as_member(m, "ALTER ROLE CURRENT_USER PASSWORD 'mine-0123456789';")
             .await
             .expect_err("a self password change is refused");
-        assert!(
-            err.contains(&format!(
-                "the role name \"{role}\" is reserved by Chelabase"
-            )),
-            "{err}"
-        );
+        assert!(err.contains("is managed by Chelabase"), "{err}");
         assert_eq!(
             fx.as_member(m, "SELECT 1;").await.unwrap(),
             "1",
@@ -1722,8 +1718,9 @@ async fn leftovers_and_password(fx: &Fx, role: &str) -> (Vec<String>, String) {
 }
 
 /// M-g, through the worker's hand-over itself (`hand_over_member_role`, the RPC's body): a
-/// session as the member role leaves a table, a privilege and role settings (everywhere and in
-/// this database), and can't set a password of its own; the hand-over gives the table to the
+/// session as the member role leaves a table and a privilege, a superuser leaves role settings
+/// (everywhere and in this database; the member can't set them, spec D3), and the member can't set
+/// a password of its own; the hand-over gives the table to the
 /// acted role, drops the rest, resets the settings and puts the row's password back (M-e).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the workbench stack"]
@@ -1747,24 +1744,28 @@ async fn a_hand_over_through_the_rpc_holds_the_invariant_and_restores_the_passwo
                 .await
                 .unwrap()
         );
-        fx.as_member(
-            m,
+        fx.as_member(m, "CREATE TABLE public.ho_left (id int);")
+            .await
+            .expect("the member's session");
+        // Role settings can't be made from the member's session (spec D3), so the leftover
+        // settings come from a superuser: the hand-over's RESET ALL still has to clear them.
+        fx.sql_on(
+            &fx.ep,
+            &fx.database,
             &format!(
-                "CREATE TABLE public.ho_left (id int);\n\
-                 ALTER ROLE CURRENT_USER SET work_mem = '1MB';\n\
-                 ALTER ROLE CURRENT_USER IN DATABASE {db} SET work_mem = '2MB';",
+                "ALTER ROLE {role} SET work_mem = '1MB'; \
+                 ALTER ROLE {role} IN DATABASE {db} SET work_mem = '2MB';",
                 db = fx.database
             ),
         )
-        .await
-        .expect("the member's session");
-        // A password of its own is refused at once (the control plane owns member roles'
-        // passwords, as the self-password test shows); the hand-over still writes the row's back.
+        .await;
+        // A password of its own is refused at once (a member role is managed by Chelabase, as the
+        // self-password test shows); the hand-over still writes the row's back.
         let err = fx
             .as_member(m, "ALTER ROLE CURRENT_USER PASSWORD 'changed-by-the-run';")
             .await
             .expect_err("a self password change is refused");
-        assert!(err.contains("is reserved by Chelabase"), "{err}");
+        assert!(err.contains("is managed by Chelabase"), "{err}");
         let reply = fx
             .worker
             .hand_over_member_role(&MemberRoleHandOverRequest {
@@ -2125,13 +2126,19 @@ async fn no_guarded_session_escapes_the_guard() {
         let refused = |out: &Result<String, String>| out.as_ref().is_err_and(|e| e.contains("42501") && e.contains("branch is protected"));
         // The honored exemption works.
         fx.direct(&fx.ep, "pb_trusted", "pb-trusted-pass", "CREATE TABLE public.pb_esc_ok (id int); DROP TABLE public.pb_esc_ok;").await.unwrap();
-        // 1. A database the guarded role makes from template1 is guarded at once (no reconcile).
+        // 1. A database the guarded role makes (a non-superuser on the protected branch) is born
+        //    closed (U1), whatever its template; the reconcile its creation asks for guards and
+        //    opens it. Until then nobody can connect, so there is no unguarded window.
         fx.direct(&fx.ep, "pb_esc", "pb-esc-pass", "CREATE DATABASE pb_esc_one;").await.unwrap();
+        assert_eq!(fx.allow_conn("pb_esc_one").await, ("f".into(), "neon.born_closed=on".into()));
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.allow_conn("pb_esc_one").await, ("t".into(), "-".into()));
+        assert_eq!(fx.guard_triggers("pb_esc_one").await, "2");
         let out = fx.direct_in(&fx.ep, "pb_esc_one", "pb_esc", "pb-esc-pass", "CREATE TABLE public.t (id int);").await;
-        assert!(refused(&out), "template1: {out:?}");
-        // 2. One made from template0 is guarded once the reconcile its creation asks for has run
-        //    (the orchestrator's DDL receiver asks; the window until then is the fork round's).
+        assert!(refused(&out), "template1 after its reconcile: {out:?}");
+        // 2. One made from template0 is born closed too, guarded and opened by the reconcile.
         fx.direct(&fx.ep, "pb_esc", "pb-esc-pass", "CREATE DATABASE pb_esc_zero TEMPLATE template0;").await.unwrap();
+        assert_eq!(fx.allow_conn("pb_esc_zero").await, ("f".into(), "neon.born_closed=on".into()));
         fx.reconcile(fx.main).await;
         let out = fx.direct_in(&fx.ep, "pb_esc_zero", "pb_esc", "pb-esc-pass", "CREATE TABLE public.t (id int);").await;
         assert!(refused(&out), "template0 after its reconcile: {out:?}");
@@ -2154,6 +2161,169 @@ async fn no_guarded_session_escapes_the_guard() {
         fx.sql_on(&fx.ep, &fx.database, "REVOKE CREATE ON SCHEMA public FROM pb_esc, pb_trusted, pb_ghost; DROP ROLE pb_ghost; DROP ROLE pb_trusted; DROP ROLE pb_esc;").await;
         fx.metadata.remove_guard_exemption(fx.main, "pb_ghost").await.unwrap();
         fx.metadata.remove_guard_exemption(fx.main, "pb_trusted").await.unwrap();
+    })
+    .await;
+}
+
+impl Fx {
+    /// The old way in: straight to the compute on the default network, no certificate.
+    async fn direct_plain(&self, ep: &str, user: &str, password: &str, script: &str) -> Result<String, String> {
+        let addr = self.worker.computes.postgres_addr(ep).await.unwrap().expect("address");
+        let conn = format!("host={} port={} dbname={} sslmode=prefer", addr.ip(), addr.port(), self.database);
+        psql(&conn, user, password, script).await
+    }
+
+    async fn try_owner(&self, database: &str, sql: &str) -> Result<String, String> {
+        self.worker
+            .computes
+            .admin_sql(&self.ep, database, &format!("SET ROLE postgres;\n{sql}"))
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    async fn allow_conn(&self, db: &str) -> (String, String) {
+        let allow = self.sql(&format!("SELECT datallowconn FROM pg_database WHERE datname = '{db}';")).await;
+        let marker = self
+            .sql(&format!(
+                "SELECT coalesce((SELECT array_to_string(s.setconfig, ',') FROM pg_db_role_setting s \
+                 JOIN pg_database d ON d.oid = s.setdatabase WHERE d.datname = '{db}' AND s.setrole = 0), '-');"
+            ))
+            .await;
+        (allow.trim().to_string(), marker.trim().to_string())
+    }
+
+    async fn guard_triggers(&self, db: &str) -> String {
+        self.sql_on(&self.ep, db, "SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_schema_guard%';")
+            .await
+            .trim()
+            .to_string()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the round-3 images"]
+async fn member_roles_cannot_be_changed_from_sql() {
+    live(|fx| async move {
+        let m = fx.members[0].id;
+        fx.grant(m, PlatformRole::Developer, &["billing"]).await;
+        fx.reconcile(fx.main).await;
+        let role = member_role_name(m);
+        for sql in ["ALTER ROLE CURRENT_USER PASSWORD 'x';", "ALTER ROLE CURRENT_USER SET work_mem = '1MB';"] {
+            let err = fx.as_member(m, sql).await.unwrap_err();
+            assert!(err.contains("is managed by Chelabase"), "{sql}: {err}");
+        }
+        for sql in [format!("ALTER ROLE {role} RENAME TO cb_x;"), format!("GRANT sales TO {role};")] {
+            let err = fx.try_owner("postgres", &sql).await.unwrap_err();
+            assert!(err.contains("is managed by Chelabase"), "{sql}: {err}");
+        }
+        fx.as_member(m, "SELECT 1;").await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the round-3 images"]
+async fn member_logins_need_the_orchestrator_identity() {
+    live(|fx| async move {
+        let m = fx.members[0].id;
+        fx.grant(m, PlatformRole::Developer, &["billing"]).await;
+        fx.reconcile(fx.main).await;
+        let role = member_role_name(m);
+        let password = fx.password(fx.main, &role).await;
+        fx.direct(&fx.ep, &role, &password, "SELECT 1;").await.unwrap();
+        let plain = fx.direct_plain(&fx.ep, &role, &password, "SELECT 1;").await.unwrap_err();
+        assert!(plain.contains("pg_hba.conf rejects connection"), "{plain}");
+        let local = fx
+            .worker
+            .computes
+            .admin_sql_with(&fx.ep, "postgres", "SELECT 1;", &chelabase_neon::SqlOpts { user: Some(role.clone()), ..chelabase_neon::SqlOpts::admin_default() })
+            .await
+            .unwrap_err();
+        assert!(format!("{local:#}").contains("pg_hba.conf rejects connection"), "{local:#}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the round-3 images"]
+async fn reassign_owned_is_guarded_on_a_protected_branch() {
+    live(|fx| async move {
+        let dev = fx.members[0].id;
+        fx.sql_on(&fx.ep, &fx.database, "GRANT sales TO billing; CREATE TABLE public.ro (id int); ALTER TABLE public.ro OWNER TO billing;").await;
+        fx.grant(dev, PlatformRole::Developer, &["billing"]).await;
+        fx.reconcile(fx.main).await;
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        let err = fx.as_member(dev, "SET ROLE billing; REASSIGN OWNED BY billing TO sales;").await.unwrap_err();
+        assert!(err.contains("42501") && err.contains("chelabase:branch_protected"), "{err}");
+        let owner = fx.sql_on(&fx.ep, &fx.database, "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro';").await;
+        assert_eq!(owner.trim(), "billing");
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.as_member(dev, "SET ROLE billing; REASSIGN OWNED BY billing TO sales;").await.unwrap();
+        fx.sql_on(&fx.ep, &fx.database, "DROP TABLE public.ro; REVOKE sales FROM billing;").await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the round-3 images"]
+async fn a_database_from_template0_is_born_closed_then_guarded() {
+    live(|fx| async move {
+        let dev = fx.members[0].id;
+        fx.grant(dev, PlatformRole::Developer, &["billing"]).await;
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.try_owner("postgres", "CREATE DATABASE bc1 TEMPLATE template0;").await.unwrap();
+        assert_eq!(fx.allow_conn("bc1").await, ("f".into(), "neon.born_closed=on".into()));
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.allow_conn("bc1").await, ("t".into(), "-".into()));
+        assert_eq!(fx.guard_triggers("bc1").await, "2");
+        fx.sql_on(&fx.ep, "bc1", "GRANT CREATE ON DATABASE bc1 TO billing;").await;
+        let role = member_role_name(dev);
+        let password = fx.password(fx.main, &role).await;
+        let err = fx.direct_in(&fx.ep, "bc1", &role, &password, "SET ROLE billing; CREATE SCHEMA s1;").await.unwrap_err();
+        assert!(err.contains("chelabase:branch_protected"), "{err}");
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.sql("DROP DATABASE bc1;").await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the round-3 images"]
+async fn a_closed_database_is_guarded_but_stays_closed() {
+    live(|fx| async move {
+        fx.sql("CREATE DATABASE shut OWNER postgres;").await;
+        fx.sql("ALTER DATABASE shut ALLOW_CONNECTIONS false;").await;
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.guard_triggers("shut").await, "2");
+        assert_eq!(fx.allow_conn("shut").await, ("f".into(), "-".into()));
+        let err = fx.try_owner("postgres", "ALTER DATABASE shut ALLOW_CONNECTIONS true;").await.unwrap_err();
+        assert!(err.contains("set by Chelabase"), "{err}");
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.try_owner("postgres", "ALTER DATABASE shut ALLOW_CONNECTIONS true;").await.unwrap();
+        fx.sql("DROP DATABASE shut;").await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the round-3 images"]
+async fn born_closed_opens_without_a_guard_when_unprotected() {
+    live(|fx| async move {
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        fx.try_owner("postgres", "CREATE DATABASE bc2;").await.unwrap();
+        assert_eq!(fx.allow_conn("bc2").await.0, "f");
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.allow_conn("bc2").await, ("t".into(), "-".into()));
+        assert_eq!(fx.guard_triggers("bc2").await, "0");
+        fx.sql("DROP DATABASE bc2;").await;
     })
     .await;
 }

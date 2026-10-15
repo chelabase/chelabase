@@ -25,8 +25,9 @@ describe("column strip and structure", () => {
     await user.click(within(form).getByRole("radio", { name: "Value" }));
     await user.type(within(form).getByLabelText("Default value"), "0");
     await user.click(within(form).getByRole("checkbox", { name: "Not null" }));
-    await vi.waitFor(async () => expect((await bodies(f, "POST", SC)).length).toBeGreaterThan(0), { timeout: 2000 });
-    expect(within(within(form).getByRole("region", { name: "SQL preview" })).getByText("SQL 0")).toBeInTheDocument();
+    // The dry run's answer renders the statements: wait for that (the request being sent is not the answer).
+    expect(await within(within(form).getByRole("region", { name: "SQL preview" })).findByText("SQL 0")).toBeInTheDocument();
+    expect((await bodies(f, "POST", SC)).length).toBeGreaterThan(0);
     await user.click(within(form).getByRole("button", { name: "Add to changes" }));
     const panel = await screen.findByRole("complementary", { name: "Pending changes" });
     expect(within(panel).getByRole("heading", { name: "Pending changes · 1" })).toBeInTheDocument();
@@ -34,7 +35,7 @@ describe("column strip and structure", () => {
     const strip = screen.getByRole("list", { name: "Columns" });
     expect(within(strip).getByRole("button", { name: "discount_cents int8, new" })).toBeInTheDocument();
     const apply = within(panel).getByRole("button", { name: "Apply 1 change" });
-    await vi.waitFor(() => expect(apply).toBeEnabled(), { timeout: 2000 });
+    await vi.waitFor(() => expect(apply).toBeEnabled());
     await user.click(apply);
     expect(await screen.findByRole("status")).toHaveTextContent("Applied 1 change to public.invoices");
     const real = (await bodies(f, "POST", SC)).filter((b) => !b.dry_run);

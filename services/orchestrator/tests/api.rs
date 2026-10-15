@@ -5680,6 +5680,97 @@ async fn create_user_inserts_then_creates_then_commits() {
     assert_eq!(syncs[0].project_id, au.project.id);
 }
 
+// ---- T10 I3: the app-users sync reaches the compute's control address over TLS ----
+
+/// [`au_env`] (with Zitadel) whose orchestrator has `compute_tls`; also the main branch's
+/// endpoint id.
+async fn au_env_tls(compute_tls: Arc<orchestrator::compute_tls::ComputeTls>) -> (Au, String) {
+    let metadata = FakeMetadata::default();
+    let jobs = FakeJobs::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let project = metadata.create_project(tenant, "Web").await.unwrap();
+    let db = project_database(tenant, project.id, DatabaseStatus::Ready);
+    let endpoint = db.main.endpoint_id.clone().expect("the main branch has an endpoint");
+    let (db_id, main) = (db.database_id, db.main.id);
+    metadata.insert_database(db);
+    metadata.add_branch_db(main, "web1", "owner", DatabaseOrigin::Main);
+    metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::On);
+    let udb = FakeUsersDb::default();
+    let mock = MockZitadel::start().await;
+    *udb.probe.lock().unwrap() = Some(mock.inner.clone());
+    let zitadel = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    let app = spawn_app_with_compute_tls(
+        metadata.clone(),
+        jobs.clone(),
+        "http://127.0.0.1:9",
+        Mode::SelfHosted,
+        10,
+        Some(zitadel),
+        Arc::new(udb.clone()),
+        None,
+        Some(compute_tls),
+    )
+    .await;
+    let au = Au { app, metadata, jobs, tenant, project, db: db_id, main, mock: Some(mock), udb };
+    (au, endpoint)
+}
+
+/// A compute client pair written into a fresh directory (kept alive with the guard).
+fn written_client_pair() -> (tempfile::TempDir, Arc<orchestrator::compute_tls::ComputeTls>) {
+    use chelabase_neon::compute_tls::{ComputeCa, ORCHESTRATOR_CN, write_client_pair};
+    let dir = tempfile::tempdir().unwrap();
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+    let pair = ca.issue_client(ORCHESTRATOR_CN, now).unwrap();
+    write_client_pair(dir.path(), &pair, ca.cert_pem(), now).unwrap();
+    let tls = Arc::new(orchestrator::compute_tls::ComputeTls::new(dir.path().to_path_buf()));
+    (dir, tls)
+}
+
+// The sync's target carries the same compute TLS as every other compute connection: the
+// compute's certificate name and the loaded client pair (taken from one snapshot).
+#[tokio::test]
+async fn app_user_sync_reaches_the_compute_over_tls() {
+    let (_dir, compute_tls) = written_client_pair();
+    let fingerprint = compute_tls.get().expect("the pair is loaded").fingerprint();
+    let (au, endpoint) = au_env_tls(compute_tls).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "new@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!(status, 201, "{body}");
+    let target = au.udb.targets.lock().unwrap()[0].clone();
+    let tls = target.tls.as_ref().expect("the sync uses TLS to the compute");
+    assert_eq!(tls.server_name, chelabase_neon::compute_tls::server_name(&endpoint));
+    assert_eq!(tls.fingerprint, fingerprint);
+    // The address stays the compute's (control) address.
+    assert_eq!((target.host.as_str(), target.port), (std::net::Ipv4Addr::LOCALHOST.to_string().as_str(), 55432));
+}
+
+// R-T10a: no client pair loaded yet is 503 `compute_tls_failed`, never a plaintext
+// connection; the log names the branch and the endpoint (RT3-7, T10 m2).
+#[tokio::test]
+async fn app_user_sync_without_a_client_pair_is_compute_tls_failed() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let empty = tempfile::tempdir().unwrap();
+    let compute_tls = Arc::new(orchestrator::compute_tls::ComputeTls::new(empty.path().to_path_buf()));
+    let (au, endpoint) = au_env_tls(compute_tls).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "new@x.test", "password": AU_PASSWORD}))).await;
+    assert_eq!((status, code_of(&body)), (503, "compute_tls_failed"), "{body}");
+    assert!(au.udb.journal().is_empty(), "no connection was tried: {:?}", au.udb.journal());
+    assert!(au.mock().user("new@x.test").is_none());
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("no compute client certificate loaded"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains(&format!("branch_id={}", au.main)), "{line}");
+    assert!(line.contains(&format!("endpoint_id={endpoint}")), "{line}");
+}
+
 #[tokio::test]
 async fn create_user_email_verified_false_is_passed_on() {
     let au = au_env(true).await;
@@ -6644,7 +6735,7 @@ async fn sql_run_reconciles_when_stale() {
         assert_eq!(asked.len(), i + 1, "{case}");
         assert_eq!(
             asked[i],
-            MemberRolesReconcileRequest { branch_id: main.as_uuid(), member_id: Some(dev) },
+            MemberRolesReconcileRequest { branch_id: main.as_uuid(), member_id: Some(dev), from_ddl: false },
             "{case}"
         );
         // The reconcile's row is the one used: the next run is fresh.

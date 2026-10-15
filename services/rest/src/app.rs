@@ -53,6 +53,9 @@ pub struct Config {
     pub max_connections: usize,
     /// The largest query response (`CHELABASE_REST_MAX_RESPONSE_BYTES`, default 16 MiB).
     pub max_response_bytes: usize,
+    /// The platform CA's certificate (`CHELABASE_COMPUTE_CA_FILE`, required): every compute
+    /// is verified against it (U15).
+    pub compute_ca: std::path::PathBuf,
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -76,6 +79,17 @@ impl Config {
                 &crate::exec::DEFAULT_MAX_RESPONSE_BYTES.to_string(),
             )
             .parse()?,
+            compute_ca: std::env::var("CHELABASE_COMPUTE_CA_FILE")
+                .ok()
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "CHELABASE_COMPUTE_CA_FILE is unset: rest verifies every compute's TLS \
+                         against the platform CA certificate"
+                    )
+                })?
+                .into(),
         })
     }
 }

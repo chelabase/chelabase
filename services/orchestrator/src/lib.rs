@@ -40,6 +40,7 @@ use uuid::Uuid;
 pub mod access;
 mod branches;
 mod console;
+pub mod compute_tls;
 mod data_api_databases;
 mod app_user_admin;
 mod app_users;
@@ -1606,6 +1607,9 @@ pub struct AppState<M, J> {
     pub table_api_dry_run_max_bytes: i64,
     /// `CHELABASE_STUDIO_HOST` with the public scheme (no trailing `/`): invite links go to its `/accept-invite`.
     pub studio_url: String,
+    /// The orchestrator's client pair for TLS to computes (RT3-7); `None` connects without TLS
+    /// (tests only: `main` always sets it).
+    pub compute_tls: Option<Arc<compute_tls::ComputeTls>>,
 }
 
 /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.

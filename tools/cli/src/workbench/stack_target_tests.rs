@@ -16,6 +16,7 @@ fn entry(slug: &str, running: bool) -> Entry {
         proxy_port: 4501,
         created_at: 1,
         running_since: running.then_some(2),
+        control_slot: None,
     }
 }
 

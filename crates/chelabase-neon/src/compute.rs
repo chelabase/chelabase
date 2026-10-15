@@ -154,6 +154,14 @@ impl DockerLocator {
         })
     }
 
+    pub fn with_docker(docker: Docker, network: &str, stack: &str) -> Self {
+        Self {
+            docker,
+            network: network.to_string(),
+            stack: stack.to_string(),
+        }
+    }
+
     pub(crate) async fn inspect(
         &self,
         endpoint_id: &str,

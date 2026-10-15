@@ -40,6 +40,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
+use crate::sql_editor::run::{ConnectError, RunTls, connect_error};
+use chelabase_neon::compute_tls::ClientTlsSnapshot;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -103,8 +105,9 @@ impl<L: ComputeLocator> PostgresAddr for L {
     }
 }
 
-/// An owner pool's key. `fingerprint` is SHA-256 over the sealed owner password and the
-/// compute's `host:port`, so a new password or a moved compute is a new pool.
+/// An owner pool's key. `fingerprint` is SHA-256 over the sealed owner password, the
+/// compute's `host:port` and the client certificate's fingerprint (when the connection uses
+/// TLS), so a new password, a moved compute or a renewed certificate is a new pool.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OwnerPoolKey {
     pub branch: BranchId,
@@ -113,11 +116,45 @@ pub struct OwnerPoolKey {
 }
 
 impl OwnerPoolKey {
-    pub fn new(branch: BranchId, database: &str, sealed_password: &str, addr: SocketAddr) -> Self {
+    pub fn new(
+        branch: BranchId,
+        database: &str,
+        sealed_password: &str,
+        addr: SocketAddr,
+        tls: &RunTls,
+    ) -> Self {
+        let identity = match tls {
+            RunTls::Plain => None,
+            RunTls::Compute { server_name, client } => {
+                Some((server_name.as_str(), client.fingerprint()))
+            }
+        };
+        Self::with_identity(branch, database, sealed_password, addr, identity)
+    }
+
+    /// The key for a connection secured as `identity` (the compute's certificate name and the
+    /// client pair's fingerprint), or plain (`None`).
+    fn with_identity(
+        branch: BranchId,
+        database: &str,
+        sealed_password: &str,
+        addr: SocketAddr,
+        identity: Option<(&str, [u8; 32])>,
+    ) -> Self {
         let mut hash = Sha256::new();
         hash.update(sealed_password.as_bytes());
         hash.update(b"\n");
         hash.update(addr.to_string().as_bytes());
+        hash.update(b"\n");
+        match identity {
+            None => hash.update(b"plain"),
+            Some((server_name, fingerprint)) => {
+                hash.update(b"tls ");
+                hash.update(server_name.as_bytes());
+                hash.update(b" ");
+                hash.update(fingerprint);
+            }
+        }
         OwnerPoolKey {
             branch,
             database: database.to_owned(),
@@ -161,10 +198,26 @@ impl Console {
     /// ([`owner_manager_config`]; each request resets the session itself). Each
     /// connection's statement cache is bounded by the [`Lease`] that prepares through it
     /// ([`chelabase_query::pipeline::STATEMENT_CACHE_CAP`]).
-    async fn owner_pool(&self, key: OwnerPoolKey, config: tokio_postgres::Config) -> Pool {
+    ///
+    /// `client` is the pair the key's fingerprint was taken from (T10 m3: one snapshot, so a
+    /// reload between the two reads can't pair one certificate's key with another's
+    /// connector); `None` connects plain.
+    async fn owner_pool(
+        &self,
+        key: OwnerPoolKey,
+        config: tokio_postgres::Config,
+        client: Option<ClientTlsSnapshot>,
+    ) -> Pool {
         self.pools
             .get_with(key, async move {
-                let manager = Manager::from_config(config, NoTls, owner_manager_config());
+                let manager = match client {
+                    None => Manager::from_config(config, NoTls, owner_manager_config()),
+                    // The pool's key carries the client pair's fingerprint, so a renewed
+                    // pair makes a new pool with a connector of its own.
+                    Some(client) => {
+                        Manager::from_config(config, client.connector(), owner_manager_config())
+                    }
+                };
                 Pool::builder(manager)
                     .max_size(OWNER_POOL_CONNECTIONS as usize)
                     .runtime(Runtime::Tokio1)
@@ -257,6 +310,17 @@ pub(crate) fn data_api_disabled(name: &str) -> ApiError {
 
 pub(crate) fn database_not_found() -> ApiError {
     ApiError::not_found("database not found")
+}
+
+/// 503 `compute_tls_failed`: the TLS or certificate check against the compute failed (the
+/// reason is logged, not sent).
+pub(crate) fn compute_tls_failed() -> ApiError {
+    ApiError::new(
+        503,
+        ErrorCode::ComputeTlsFailed,
+        "the secure connection to the branch's compute failed; try again",
+    )
+    .retry_after(RETRY_AFTER_SECS)
 }
 
 pub(crate) fn unavailable(message: &str) -> ApiError {
@@ -447,6 +511,7 @@ pub(crate) struct OwnerTarget {
     pub user: String,
     pub password: String,
     pub sealed: String,
+    pub tls: RunTls,
 }
 
 /// The owner's address and credentials on `branch`: 409 `owner_password_unknown` when
@@ -494,12 +559,41 @@ where
         }
     };
     let addr = compute_addr(state, branch.id, endpoint_id).await?;
+    let tls = run_tls(state, branch.id, endpoint_id)?;
     Ok(OwnerTarget {
         addr,
         user: owner.to_string(),
         password,
         sealed: sealed.to_string(),
+        tls,
     })
+}
+
+/// How to secure a connection to `endpoint_id`'s compute: TLS with the orchestrator's client
+/// pair, or 503 `compute_tls_failed` when no pair is loaded. `Plain` only when the state has no
+/// compute TLS at all (tests; `main` always sets it).
+pub(crate) fn run_tls<M, J>(
+    state: &AppState<M, J>,
+    branch: chelabase_types::BranchId,
+    endpoint_id: &str,
+) -> Result<RunTls, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let Some(compute_tls) = &state.compute_tls else {
+        return Ok(RunTls::Plain);
+    };
+    match compute_tls.get() {
+        Some(client) => Ok(RunTls::Compute {
+            server_name: chelabase_neon::compute_tls::server_name(endpoint_id),
+            client,
+        }),
+        None => {
+            warn!(branch_id = %branch, %endpoint_id, "no compute client certificate loaded");
+            Err(compute_tls_failed())
+        }
+    }
 }
 
 /// The Postgres address of the branch's compute: 503 when it isn't running or can't be found.
@@ -524,13 +618,14 @@ where
     }
 }
 
-/// The owner pool of `row`'s database on `branch`; errors as [`owner_target`].
+/// The owner pool of `row`'s database on `branch` and how its connections are secured (for
+/// [`pool_failure`]); errors as [`owner_target`].
 pub(crate) async fn owner_pool_for<M, J>(
     state: &AppState<M, J>,
     branch: &chelabase_metadata::BranchRecord,
     row: &BranchDatabase,
     owner: &str,
-) -> Result<Pool, ApiError>
+) -> Result<(Pool, RunTls), ApiError>
 where
     M: MetadataPort,
     J: JobPort,
@@ -538,27 +633,47 @@ where
     let target = owner_target(state, branch, owner).await?;
     let mut config = tokio_postgres::Config::new();
     config
-        .host(target.addr.ip().to_string())
         .port(target.addr.port())
         .user(&target.user)
         .password(&target.password)
         .dbname(&row.name)
         .application_name(APPLICATION_NAME);
-    Ok(state
-        .console
-        .owner_pool(
-            OwnerPoolKey::new(branch.id, &row.name, &target.sealed, target.addr),
-            config,
-        )
-        .await)
+    // One snapshot of the client pair for both the key and the connector (T10 m3).
+    let (identity, client) = match &target.tls {
+        RunTls::Plain => {
+            config.host(target.addr.ip().to_string());
+            (None, None)
+        }
+        RunTls::Compute { server_name, client } => {
+            config
+                .host(server_name)
+                .hostaddr(target.addr.ip())
+                .ssl_mode(tokio_postgres::config::SslMode::Require)
+                .channel_binding(tokio_postgres::config::ChannelBinding::Require);
+            let snapshot = client.snapshot();
+            (Some((server_name.as_str(), snapshot.fingerprint())), Some(snapshot))
+        }
+    };
+    let key = OwnerPoolKey::with_identity(branch.id, &row.name, &target.sealed, target.addr, identity);
+    let pool = state.console.owner_pool(key, config, client).await;
+    Ok((pool, target.tls))
 }
 
 /// A pooled connection failure as the data API answers it: a pool that timed out or was
 /// closed under the request is a 503 (`Retry-After`), like any moment the database is out of
-/// reach; a driver error from connecting or recycling goes through [`QueryFailure::from_pg`].
-pub(crate) fn pool_failure(err: PoolError, request_id: &str) -> QueryFailure {
+/// reach; a driver error from connecting or recycling goes through [`QueryFailure::from_pg`],
+/// except a compute connection's TLS failure (`connect_error`'s classification over `tls`, T10
+/// m1): 503 `compute_tls_failed`, its reason logged with the request id.
+pub(crate) fn pool_failure(err: PoolError, request_id: &str, tls: &RunTls) -> QueryFailure {
     match err {
-        PoolError::Backend(e) => QueryFailure::from_pg(&e, request_id),
+        PoolError::Backend(e) => match connect_error(&e, tls) {
+            ConnectError::Tls(reason) => {
+                warn!(request_id, "owner pool, the TLS connection to the compute failed: {reason}");
+                let api = compute_tls_failed();
+                QueryFailure::new(StatusCode::SERVICE_UNAVAILABLE, api.code.as_str(), api.message)
+            }
+            _ => QueryFailure::from_pg(&e, request_id),
+        },
         PoolError::Timeout(_) | PoolError::Closed => QueryFailure::unreachable(request_id, err),
         other => QueryFailure::internal(request_id, other),
     }
@@ -580,7 +695,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let pool = match owner_pool_for(state, branch, row, owner).await {
+    let (pool, tls) = match owner_pool_for(state, branch, row, owner).await {
         Ok(pool) => pool,
         Err(err) => return err.into_response(),
     };
@@ -592,7 +707,7 @@ where
     };
     let rid = principal.request_id.as_str();
     let result: Result<String, QueryFailure> = async {
-        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid))?);
+        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, &tls))?);
         let out = chelabase_query::run(
             &lease,
             &state.console.cache,
@@ -730,7 +845,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let pool = match owner_pool_for(state, branch, row, owner).await {
+    let (pool, tls) = match owner_pool_for(state, branch, row, owner).await {
         Ok(pool) => pool,
         Err(err) => return err.into_response(),
     };
@@ -742,7 +857,7 @@ where
     };
     let rid = principal.request_id.as_str();
     let result: Result<Value, QueryFailure> = async {
-        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid))?);
+        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, &tls))?);
         let read = chelabase_query::schema_for(
             &lease,
             &state.console.cache,
@@ -973,19 +1088,21 @@ mod tests {
     fn pool_key_changes_with_the_sealed_password_and_the_address() {
         let branch = BranchId::new();
         let addr: SocketAddr = "127.0.0.1:55001".parse().unwrap();
-        let key = OwnerPoolKey::new(branch, "web1", "v1:sealed-a", addr);
-        assert_eq!(key, OwnerPoolKey::new(branch, "web1", "v1:sealed-a", addr));
+        let plain = RunTls::Plain;
+        let key = OwnerPoolKey::new(branch, "web1", "v1:sealed-a", addr, &plain);
+        assert_eq!(key, OwnerPoolKey::new(branch, "web1", "v1:sealed-a", addr, &plain));
         // A reset (a new sealed value), a moved compute, another database or branch: a new pool.
         for other in [
-            OwnerPoolKey::new(branch, "web1", "v1:sealed-b", addr),
+            OwnerPoolKey::new(branch, "web1", "v1:sealed-b", addr, &plain),
             OwnerPoolKey::new(
                 branch,
                 "web1",
                 "v1:sealed-a",
                 "127.0.0.1:55002".parse().unwrap(),
+                &plain,
             ),
-            OwnerPoolKey::new(branch, "analytics", "v1:sealed-a", addr),
-            OwnerPoolKey::new(BranchId::new(), "web1", "v1:sealed-a", addr),
+            OwnerPoolKey::new(branch, "analytics", "v1:sealed-a", addr, &plain),
+            OwnerPoolKey::new(BranchId::new(), "web1", "v1:sealed-a", addr, &plain),
         ] {
             assert_ne!(key, other);
         }
@@ -1019,7 +1136,7 @@ mod tests {
     /// 503 with `Retry-After`, like any moment the database is out of reach.
     #[test]
     fn a_closed_owner_pool_is_503_with_retry_after() {
-        let response = data_api_failure(pool_failure(PoolError::Closed, "rid"));
+        let response = data_api_failure(pool_failure(PoolError::Closed, "rid", &RunTls::Plain));
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "2");
     }
@@ -1027,10 +1144,40 @@ mod tests {
     /// Waiting too long for an owner connection is the same 503.
     #[test]
     fn an_owner_pool_timeout_is_503_with_retry_after() {
-        let failure = pool_failure(PoolError::Timeout(deadpool_postgres::TimeoutType::Wait), "rid");
+        let failure = pool_failure(PoolError::Timeout(deadpool_postgres::TimeoutType::Wait), "rid", &RunTls::Plain);
         let response = data_api_failure(failure);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "2");
+    }
+
+    // T10 m1, under the classification invariant: an owner pool's connect failure on a
+    // compute connection is 503 `compute_tls_failed` exactly when `connect_error` calls it a
+    // TLS failure; every other failure keeps `QueryFailure::from_pg`'s answer.
+    #[tokio::test]
+    async fn owner_pool_tls_failures_are_compute_tls_failed() {
+        use crate::sql_editor::fake_pg::{self, Want};
+        let compute = fake_pg::compute_tls();
+        for &(case, on_compute, on_plain) in fake_pg::TABLE {
+            for (tls, want) in [(&compute, on_compute), (&RunTls::Plain, on_plain)] {
+                let failure = pool_failure(PoolError::Backend(case.error().await), "rid", tls);
+                if want == Want::Tls {
+                    assert_eq!(
+                        (failure.status, failure.code),
+                        (StatusCode::SERVICE_UNAVAILABLE, "compute_tls_failed"),
+                        "{case:?}"
+                    );
+                    let response = data_api_failure(failure);
+                    assert_eq!(response.headers()[header::RETRY_AFTER], "2", "{case:?}");
+                } else {
+                    let before = QueryFailure::from_pg(&case.error().await, "rid");
+                    assert_eq!(
+                        (failure.status, failure.code),
+                        (before.status, before.code),
+                        "{case:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

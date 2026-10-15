@@ -171,12 +171,17 @@ where
     let (private, public) = generate_keypair_pem();
     let internal_token = env_or("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal");
     let state = Arc::new(AppState {
-        engine: Engine::new(
+        // U15: the orchestrator names each compute's certificate; verify it as rest does.
+        engine: Engine::with_server_tls(
             InternalSource::new(
                 &env_or("CHELABASE_INTERNAL_URL", "http://orchestrator:8083"),
                 &internal_token,
             ),
             200,
+            chelabase_query::server_tls::ServerTls::from_ca_file(std::path::Path::new(
+                &std::env::var("CHELABASE_COMPUTE_CA_FILE").expect("CHELABASE_COMPUTE_CA_FILE"),
+            ))
+            .expect("the platform CA certificate"),
         )
         .with_max_response_bytes(max_response_bytes),
         verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),

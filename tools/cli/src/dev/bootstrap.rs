@@ -3,9 +3,9 @@
 use crate::dev::env_files::{DemoEnv, render_demo_env, render_studio_env};
 use crate::dev::zitadel::HttpZitadel;
 use crate::dev::{app_keys, internal_keys, secrets_key, steps, tenant};
-use crate::neon::compute_jwt;
+use crate::neon::{compute_ca, compute_jwt};
 use crate::paths::{
-    auth_dir, demo_tenant_id, entry, gateway_dir, neon_dir, secrets_dir, studio_env_file,
+    auth_dir, compute_ca_dir, demo_tenant_id, entry, gateway_dir, neon_dir, orchestrator_tls_dir, secrets_dir, studio_env_file,
     zitadel_dir,
 };
 use anyhow::{Context, Result, bail};
@@ -84,7 +84,22 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
         cookie_key,
         compute_jwt,
         app_jwt,
-    } = ensure_machine_keys(&gateway_dir(), &secrets_dir(), &cookie_dir, &neon_dir())?;
+        compute_ca,
+        orchestrator_tls,
+    } = ensure_machine_keys(
+        &gateway_dir(),
+        &secrets_dir(),
+        &cookie_dir,
+        &neon_dir(),
+        &compute_ca_dir(),
+        &orchestrator_tls_dir(),
+    )?;
+
+    info!(
+        "compute CA in {}, orchestrator client pair in {}",
+        compute_ca.dir.display(),
+        orchestrator_tls.display()
+    );
 
     let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat", 45, TOKEN_POLL).await?;
     let login_client = zdir.join("login-client.pat");
@@ -210,18 +225,37 @@ pub struct MachineKeys {
     pub cookie_key: std::path::PathBuf,
     pub compute_jwt: compute_jwt::ComputeJwtPaths,
     pub app_jwt: app_keys::AppKeyPaths,
+    pub compute_ca: compute_ca::ComputeCaPaths,
+    /// The directory holding the orchestrator's client pair (`current/` inside it).
+    pub orchestrator_tls: std::path::PathBuf,
 }
 
 /// Creates the machine keys that are missing (never overwrites one): the gateway's internal key
-/// pair, the secrets key, auth's cookie key and app-JWT pair, and the compute-JWT pair. The
+/// pair, the secrets key, auth's cookie key and app-JWT pair, the compute-JWT pair, the compute
+/// CA and the orchestrator's first client pair (renewed by the worker's sweep). The
 /// workbench runs this before any container mounts the key dirs.
 pub fn ensure_machine_keys(
     gateway: &Path,
     secrets: &Path,
     auth: &Path,
     neon: &Path,
+    compute_ca_dir: &Path,
+    orchestrator_tls: &Path,
 ) -> Result<MachineKeys> {
+    let compute_ca = compute_ca::ensure(compute_ca_dir)?;
+    std::fs::create_dir_all(orchestrator_tls)
+        .with_context(|| format!("mkdir {}", orchestrator_tls.display()))?;
+    let orchestrator_tls = orchestrator_tls
+        .canonicalize()
+        .with_context(|| format!("resolve {}", orchestrator_tls.display()))?;
+    compute_ca::ensure_client_pair(
+        &compute_ca.dir,
+        &orchestrator_tls,
+        std::time::SystemTime::now(),
+    )?;
     Ok(MachineKeys {
+        compute_ca,
+        orchestrator_tls,
         internal: internal_keys::ensure(gateway)?,
         secrets: secrets_key::ensure(secrets)?,
         cookie_key: secrets_key::ensure_file(auth, secrets_key::COOKIE_KEY_FILE)?,
