@@ -2963,8 +2963,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pingora-cache"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d2b5ad1877a7e0656d1fbcca0375aae46a7b17b71efe1956203c81f3ad4f013"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "ahash",
  "arrayvec",
@@ -2999,8 +2998,7 @@ dependencies = [
 [[package]]
 name = "pingora-core"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fd4d1ddc6d6dbc1a97164ce13c301980c25c35422aab87b512c4c8b5123729b"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "ahash",
  "async-trait",
@@ -3050,14 +3048,12 @@ dependencies = [
 [[package]]
 name = "pingora-error"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6399da6e698035093d6b458707df5f3ea5292858816b99d4b2624d96b4f567f"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 
 [[package]]
 name = "pingora-header-serde"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e824dac9612e4b807e55981c2d6b665b6f936a8b4b75ee0ce1922373e93243"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "bytes",
  "http",
@@ -3072,8 +3068,7 @@ dependencies = [
 [[package]]
 name = "pingora-http"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac9876e8775ebeb5d91262be4daaaf26d21a8932f53402106ed280867fe4c4f4"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "bytes",
  "http",
@@ -3083,8 +3078,7 @@ dependencies = [
 [[package]]
 name = "pingora-lru"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aff106b6d8a53a746a23a6304e25709b3f2e580841ffe3176acc1979095b3806"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "ahash",
  "arrayvec",
@@ -3100,8 +3094,7 @@ dependencies = [
 [[package]]
 name = "pingora-pool"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f9276b751bf2f908d24c73b8f23fcf05c2102fe373513457deb8868e17ef238"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "crossbeam-queue",
  "dashmap",
@@ -3116,8 +3109,7 @@ dependencies = [
 [[package]]
 name = "pingora-proxy"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2467265ad39b56230b56149f1c03ca510f46c4bf4a25d6d4b7345e0f06cc46e7"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3139,8 +3131,7 @@ dependencies = [
 [[package]]
 name = "pingora-runtime"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89aed2e58b34196682bdc2370c4293f908dece5741c56f5f5ba1018f55de68f2"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "log",
  "once_cell",
@@ -3153,8 +3144,7 @@ dependencies = [
 [[package]]
 name = "pingora-timeout"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a1dac05d3ebf3ec1be4748d7ef391c48baa886181ce0f1b564ef8fa569243e3"
+source = "git+https://github.com/chelabase/pingora?rev=210aa72c06a69e3d6da0e778cfac873b16bbe424#210aa72c06a69e3d6da0e778cfac873b16bbe424"
 dependencies = [
  "once_cell",
  "parking_lot",

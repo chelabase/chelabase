@@ -1205,15 +1205,14 @@ mod tests {
 
     #[test]
     fn docs_routes_are_public() {
-        for (path, name) in [("/v1/openapi.json", "orchestrator.openapi_json")] {
-            match match_endpoint(Scope::Api, "GET", path) {
-                Match::Found(ep) => {
-                    assert_eq!(ep.name, name);
-                    assert_eq!(ep.policy.auth, Auth::Public, "{path}");
-                    assert_eq!(ep.service, Service::Orchestrator);
-                }
-                other => panic!("{path}: expected Found, got {other:?}"),
+        let path = "/v1/openapi.json";
+        match match_endpoint(Scope::Api, "GET", path) {
+            Match::Found(ep) => {
+                assert_eq!(ep.name, "orchestrator.openapi_json");
+                assert_eq!(ep.policy.auth, Auth::Public, "{path}");
+                assert_eq!(ep.service, Service::Orchestrator);
             }
+            other => panic!("{path}: expected Found, got {other:?}"),
         }
     }
 

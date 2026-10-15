@@ -155,4 +155,4 @@ Branch `neon-fork-round-2`; fork branch `round-2` on `chelabase/neon`. Spec `doc
   - **Act as a role.** Reads and writes run as one of your granted Postgres roles; a project Admin holds every role of their project (narrowable per database), and the data API's `anon`/`authenticated` only when a grant names them.
   - **Honest defaults:** new tables offer "Turn RLS on" and say plainly what the data API exposes while RLS is off.
 - **Evidence:** Studio 1 370+ unit and property tests; `just check` green; live: the orchestrator API suite 449/449, `rest_live` 37/38 (the one failure is the known, parked compute_ctl migration race during provisioning), `sql-editor-e2e` and `console-e2e` green with the new act-as rules; browser passes as an Admin and a Developer.
-- **Status:** ready to merge (2026-10-14), awaiting the user's decision.
+- **Status:** merged to `main` 2026-10-14.

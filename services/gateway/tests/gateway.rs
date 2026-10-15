@@ -631,6 +631,61 @@ async fn the_studio_host_passes_websocket_upgrades() {
     assert_eq!(&echo, b"ping");
 }
 
+/// A raw upstream whose 101 is already in the gateway's receive buffer when the gateway
+/// starts proxying: it answers every connection with 101 before reading the request (from
+/// the gateway's side, the same as a fast upstream answering while the gateway thread is
+/// preempted between writing the request head and its first read). Then it reads the
+/// request head and echoes 4 bytes.
+async fn spawn_eager_upgrade_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                    .await
+                    .unwrap();
+                let head = read_head(&mut sock).await.to_ascii_lowercase();
+                assert!(head.contains("upgrade: websocket"), "{head}");
+                let mut buf = [0u8; 4];
+                sock.read_exact(&mut buf).await.unwrap();
+                sock.write_all(&buf).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The gateway must not end an upgraded connection on the client request's own end of body
+/// (an empty GET's), whichever of that and the upstream's 101 it handles first. Each round
+/// trip used to lose that race about half the time; 32 sequential ones prove the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_websocket_upgrade_survives_a_101_that_beats_the_request_end() {
+    let jwks = MockJwks::start().await;
+    let (api, _) = spawn_upstream().await;
+    let studio = spawn_eager_upgrade_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&api, &jwks, &[("CHELABASE_STUDIO_UPSTREAM", studio.as_str())]).await;
+    let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+    for round in 0..32 {
+        let mut sock = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        let request = format!(
+            "GET /@vite/client HTTP/1.1\r\nHost: {STUDIO_HOST}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        sock.write_all(request.as_bytes()).await.unwrap();
+        let head = tokio::time::timeout(Duration::from_secs(10), read_head(&mut sock)).await.unwrap();
+        assert!(head.starts_with("HTTP/1.1 101"), "round {round}: {head}");
+        sock.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        let read = tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut echo)).await.unwrap();
+        assert!(read.is_ok(), "round {round}: the upgraded connection was closed: {read:?}");
+        assert_eq!(&echo, b"ping", "round {round}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_site_upstream_down_is_502_plain_text() {
     let jwks = MockJwks::start().await;

@@ -122,3 +122,13 @@ opt-level = 3
 # harness has one tokio-postgres (the fork, chelabase/transaction-status) in the build.
 [patch.crates-io]
 tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "60016594a76606abf661581a48b4d1d42ed29d2d" }
+# pingora 0.9.0 plus the websocket upgrade race fix (chelabase/pingora branch
+# chelabase/websocket-upgrade-race): an empty request's end of body, read after the upstream's
+# 101, no longer closes the upgraded connection. Regression test: the gateway's
+# a_websocket_upgrade_survives_a_101_that_beats_the_request_end.
+# From git, pingora-proxy takes its pingora-* siblings from the same checkout (path deps), so the
+# ones the gateway names directly come from the same rev too; otherwise their types would differ.
+pingora-proxy = { git = "https://github.com/chelabase/pingora", rev = "210aa72c06a69e3d6da0e778cfac873b16bbe424" }
+pingora-core = { git = "https://github.com/chelabase/pingora", rev = "210aa72c06a69e3d6da0e778cfac873b16bbe424" }
+pingora-http = { git = "https://github.com/chelabase/pingora", rev = "210aa72c06a69e3d6da0e778cfac873b16bbe424" }
+pingora-error = { git = "https://github.com/chelabase/pingora", rev = "210aa72c06a69e3d6da0e778cfac873b16bbe424" }
