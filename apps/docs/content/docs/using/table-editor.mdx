@@ -35,6 +35,47 @@ A table has two views: **Rows** and **Structure**.
 - **Row panel:** the icon at a row's left, or Enter on it, opens that row in a side panel with a field per column: a **NULL** toggle on nullable columns, **Now** on date and time fields, enum selects, JSON fields in a small code editor. A foreign key field has **Pick…**, which searches the referenced table as the same role, and **Open**, which goes to the referenced table. Above 30 columns the panel has **Filter fields**. **Save row** writes only the changed fields; **Delete row** asks first, and says so when no row was deleted (the row is hidden from the role you act as, or already gone).
 - **Insert row:** opens the panel empty. Defaults show as placeholders, and generated and identity columns can't be edited. Saving with no field filled inserts a row of defaults. The menu beside it has **Insert with all defaults**.
 
+## Live rows and presence
+
+While you look at a table, Studio joins its live channel for the role you act as; changing **Act as** leaves and rejoins. The bar shows **Live** when changes are arriving, or **Live updates paused · reason** when they aren't. Live updates come from the [realtime service](/docs/architecture/realtime), which tells Studio which rows changed; Studio then reads those rows again as your role, so you see only what that role can read.
+
+- **A row on your page changes:** the row is replaced in place and the cells that changed flash briefly (no flash under reduced motion). A row that no longer matches your filter or your role's view fades out.
+- **A new row you aren't showing:** a chip reads **N new rows · Show**; **Show** reads the page and the count again.
+- **A row is deleted:** it is struck through, and removed on the next page read.
+- **Changes Studio can't pin to rows** (a bulk change, a table without a primary key, a truncate, or a missed update): the page and the count are read again after a short delay.
+- **An editor or row panel is open on a row that changes:** your edit is never overwritten. The field shows **Changed since you started**, with the row's current value on hover.
+
+Other members looking at the same table appear as presence. Another member's selected cell has a box in their colour and their row is lightly tinted; hover for their name, email and the role they act as. A cell they are editing is filled, and opening an editor on that cell says who is editing it. An avatar stack in the table bar shows up to five members, then the count of the rest. Your own selection isn't drawn.
+
+### Live updates paused
+
+The reason follows the dot:
+
+| Reason | Meaning |
+| --- | --- |
+| no free slot | the database has no free replication slot for realtime (it keeps at least half of them for you); it retries after 30 seconds, doubling the wait up to 5 minutes |
+| waiting for a slot | the slot is being created |
+| can't connect to the database | realtime couldn't connect to the compute |
+| read-only compute | the compute is read-only, so changes can't be followed |
+| not a table | the relation isn't an ordinary table |
+| the compute is stopping | the compute is being stopped or restarted |
+| reconnecting | the socket is down; Studio reconnects with a backoff |
+| not supported for this database | live updates aren't available for this database |
+| no access / not found | your role no longer has access, or the table is gone |
+| too many live tables | you hit the channel limit for one socket (50) |
+| unavailable | realtime or something it depends on is unavailable |
+
+When live updates come back, Studio reads the page again. While they are paused, the grid doesn't update by itself; reload to see changes. Lists that Studio polls (the branch list, your projects) fall back to their usual polling; while live updates are running they poll only every 30 seconds, and project events update them at once.
+
+## Saving over someone else's change
+
+A cell save or a **Save row** also sends the value each edited column had when you started editing, so a save fails instead of overwriting a change made meanwhile. When nothing is saved because the row differs, Studio re-reads the row:
+
+- **Changed by someone else:** "The row changed after you started editing. Nothing was saved." A dialog lists each column with **Theirs** and **Yours**. **Take theirs** keeps their values; **Overwrite** saves again by primary key alone, replacing them.
+- **Not saved:** "This row was deleted or is hidden from this role." The row is gone for the role you act as; **Close** returns to the grid.
+
+Columns whose type has no equality operator (`json`, `xml`, geometric types, and arrays of them) can't be compared: a save that edits them is not checked, and the dialog says **No conflict check for this column type** with the columns.
+
 ## Selecting and deleting rows
 
 Row checkboxes and the header checkbox select the loaded page. The bar then offers:

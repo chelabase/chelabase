@@ -59,32 +59,32 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// role created under the name since the key was made, sets `''` instead, which no role can
 /// be named (Postgres refuses zero-length names), so the preamble fails as for a missing role
 /// and nothing runs as anyone. The check and the `SET ROLE` are one expression: no window.
-pub const PREAMBLE_SQL: &str = "SELECT set_config('role', CASE WHEN $4::int8 IS NULL OR \
-     (SELECT r.oid::int8 FROM pg_catalog.pg_roles r WHERE r.rolname = $1) = $4::int8 \
+pub const PREAMBLE_SQL: &str = "SELECT pg_catalog.set_config('role', CASE WHEN $4::pg_catalog.int8 IS NULL OR \
+     (SELECT r.oid::pg_catalog.int8 FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) $1) OPERATOR(pg_catalog.=) $4::pg_catalog.int8 \
      THEN $1 ELSE '' END, true), \
-     set_config('request.jwt.claims', $2, true), set_config('statement_timeout', $3, true), \
-     set_config('transaction_timeout', $3, true), \
-     (SELECT version::text FROM chelabase.schema_version)";
+     pg_catalog.set_config('request.jwt.claims', $2, true), pg_catalog.set_config('statement_timeout', $3, true), \
+     pg_catalog.set_config('transaction_timeout', $3, true), \
+     (SELECT version::pg_catalog.text FROM chelabase.schema_version)";
 
 /// The owner's preamble: no role and no claims (the connection's own user runs the
 /// request), `$1` the statement and transaction timeout in ms (`text`). It returns the
 /// user's name (the role its view and plans are cached under) and the schema version.
-pub const OWNER_PREAMBLE_SQL: &str = "SELECT set_config('statement_timeout', $1, true), \
-     set_config('transaction_timeout', $1, true), current_user::text, \
-     (SELECT version::text FROM chelabase.schema_version)";
+pub const OWNER_PREAMBLE_SQL: &str = "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+     pg_catalog.set_config('transaction_timeout', $1, true), current_user::pg_catalog.text, \
+     (SELECT version::pg_catalog.text FROM chelabase.schema_version)";
 
 /// [`PREAMBLE_SQL`] in the pipeline: `$5` (`uuid`) the version the request was planned
 /// against, asserted (`CB001` when the database's differs) rather than read.
-pub const GUARDED_PREAMBLE_SQL: &str = "SELECT set_config('role', CASE WHEN $4::int8 IS NULL OR \
-     (SELECT r.oid::int8 FROM pg_catalog.pg_roles r WHERE r.rolname = $1) = $4::int8 \
+pub const GUARDED_PREAMBLE_SQL: &str = "SELECT pg_catalog.set_config('role', CASE WHEN $4::pg_catalog.int8 IS NULL OR \
+     (SELECT r.oid::pg_catalog.int8 FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) $1) OPERATOR(pg_catalog.=) $4::pg_catalog.int8 \
      THEN $1 ELSE '' END, true), \
-     set_config('request.jwt.claims', $2, true), set_config('statement_timeout', $3, true), \
-     set_config('transaction_timeout', $3, true), \
+     pg_catalog.set_config('request.jwt.claims', $2, true), pg_catalog.set_config('statement_timeout', $3, true), \
+     pg_catalog.set_config('transaction_timeout', $3, true), \
      chelabase.assert_schema_version($5)";
 
 /// [`OWNER_PREAMBLE_SQL`] in the pipeline: `$2` (`uuid`) the version asserted.
-pub const OWNER_GUARDED_PREAMBLE_SQL: &str = "SELECT set_config('statement_timeout', $1, true), \
-     set_config('transaction_timeout', $1, true), current_user::text, \
+pub const OWNER_GUARDED_PREAMBLE_SQL: &str = "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+     pg_catalog.set_config('transaction_timeout', $1, true), current_user::pg_catalog.text, \
      chelabase.assert_schema_version($2)";
 
 /// How long a database found without the guard functions runs sequentially before the
@@ -412,6 +412,30 @@ pub async fn with_transaction<C: QueryClient + ?Sized, T>(
             Err(failure)
         }
     }
+}
+
+/// The sequential path's transaction opening, for callers that run their own statements
+/// (the console, the realtime check): [`with_transaction`] and the [`preamble`] for `run_as`
+/// (`statement_timeout_ms` from `settings`), then `f` with the connection and the schema
+/// version the preamble read; the `COMMIT` (or `ROLLBACK`) and the trailing reset are
+/// [`with_transaction`]'s. A preamble that fails (a dropped role, a database without
+/// `chelabase.schema_version`: 503, naming `database` as the sequential path's does) never
+/// runs `f` and never commits.
+pub async fn console_session<C: QueryClient + ?Sized, T>(
+    client: &C,
+    database: &str,
+    run_as: RunAs<'_>,
+    settings: &RunSettings,
+    request_id: &str,
+    f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
+) -> Result<T, QueryFailure> {
+    with_transaction(client, settings.reset_sql, request_id, async |c| {
+        let pre = preamble(c, run_as, settings.statement_timeout_ms, request_id)
+            .await
+            .map_err(|f| in_database(f, database))?;
+        f(c, &pre.version).await
+    })
+    .await
 }
 
 /// What the preamble read.
@@ -771,6 +795,7 @@ pub(crate) fn plan_params<'a>(
         .map(|bind| {
             Ok(match resolve_bind(op, bind, max_rows) {
                 Some(BindValue::Text(v)) => Box::new(v) as Param<'a>,
+                Some(BindValue::TextArray(v)) => Box::new(v),
                 Some(BindValue::Json(v)) => Box::new(v),
                 Some(BindValue::Int(v)) => Box::new(v),
                 None => {
@@ -790,6 +815,7 @@ pub(crate) fn pg_type(t: ParamType) -> Type {
         ParamType::Text => Type::TEXT,
         ParamType::Jsonb => Type::JSONB,
         ParamType::Int8 => Type::INT8,
+        ParamType::TextArray => Type::TEXT_ARRAY,
     }
 }
 
@@ -924,8 +950,9 @@ mod tests {
     /// checks the name only. One expression, so there is no window between check and use.
     #[test]
     fn preamble_binds_the_role_to_its_oid() {
-        let guard = "set_config('role', CASE WHEN $4::int8 IS NULL OR \
-             (SELECT r.oid::int8 FROM pg_catalog.pg_roles r WHERE r.rolname = $1) = $4::int8 \
+        let guard = "pg_catalog.set_config('role', CASE WHEN $4::pg_catalog.int8 IS NULL OR \
+             (SELECT r.oid::pg_catalog.int8 FROM pg_catalog.pg_roles r \
+             WHERE r.rolname OPERATOR(pg_catalog.=) $1) OPERATOR(pg_catalog.=) $4::pg_catalog.int8 \
              THEN $1 ELSE '' END, true)";
         assert!(PREAMBLE_SQL.starts_with(&format!("SELECT {guard}, ")), "{PREAMBLE_SQL}");
         assert!(GUARDED_PREAMBLE_SQL.starts_with(&format!("SELECT {guard}, ")), "{GUARDED_PREAMBLE_SQL}");
@@ -938,9 +965,9 @@ mod tests {
     fn owner_preamble_sets_no_role() {
         assert_eq!(
             OWNER_PREAMBLE_SQL,
-            "SELECT set_config('statement_timeout', $1, true), \
-             set_config('transaction_timeout', $1, true), current_user::text, \
-             (SELECT version::text FROM chelabase.schema_version)"
+            "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
+             pg_catalog.set_config('transaction_timeout', $1, true), current_user::pg_catalog.text, \
+             (SELECT version::pg_catalog.text FROM chelabase.schema_version)"
         );
         assert!(!OWNER_PREAMBLE_SQL.contains("'role'"));
         assert!(!OWNER_PREAMBLE_SQL.contains("request.jwt.claims"));
@@ -966,6 +993,7 @@ mod tests {
         let col = |name: &str, ty: &str| ColumnInfo {
             name: name.into(),
             type_sql: ty.into(),
+            type_qualified: String::new(),
             array: false,
             text_like: false,
             generated: false,
@@ -1015,14 +1043,14 @@ mod tests {
         assert_eq!(
             GUARDED_PREAMBLE_SQL,
             PREAMBLE_SQL.replace(
-                "(SELECT version::text FROM chelabase.schema_version)",
+                "(SELECT version::pg_catalog.text FROM chelabase.schema_version)",
                 "chelabase.assert_schema_version($5)"
             )
         );
         assert_eq!(
             OWNER_GUARDED_PREAMBLE_SQL,
             OWNER_PREAMBLE_SQL.replace(
-                "(SELECT version::text FROM chelabase.schema_version)",
+                "(SELECT version::pg_catalog.text FROM chelabase.schema_version)",
                 "chelabase.assert_schema_version($2)"
             )
         );

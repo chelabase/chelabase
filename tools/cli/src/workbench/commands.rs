@@ -40,19 +40,24 @@ impl Site {
 }
 
 /// The Rust apps the stack runs from `<checkout>/target/debug`.
-const RUST_APPS: [&str; 5] = ["orchestrator", "worker", "gateway", "auth", "rest"];
+pub(super) const RUST_APPS: [&str; 6] =
+    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
+/// The apps that read the bootstrap's `demo.env` (the OIDC audiences, the demo ids).
+pub(super) const DEMO_ENV_READERS: &[&str] =
+    &["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
 /// Every app container (the Rust apps and Studio; the sites are added by `--with`).
-const APPS: [&str; 6] = [
+pub(super) const APPS: [&str; 7] = [
     "orchestrator",
     "worker",
     "gateway",
     "auth",
     "rest",
+    "realtime",
     "studio",
 ];
 /// The long-running infra services. Their one-shot helpers (`create-bucket`, `proxy-tls`,
 /// `register-safekeepers`) start as dependencies of the services that wait on them.
-const INFRA: &[&str] = &[
+pub(super) const INFRA: &[&str] = &[
     "metadata-db",
     "nats",
     "valkey",
@@ -60,6 +65,8 @@ const INFRA: &[&str] = &[
     "seaweedfs",
     "storage-broker",
     "safekeeper1",
+    "safekeeper2",
+    "safekeeper3",
     "storcon-db",
     "storage-controller",
     "pageserver",
@@ -68,7 +75,8 @@ const INFRA: &[&str] = &[
 /// Started with the infra: the bootstrap reaches Zitadel through the gateway.
 const FRONT: &[&str] = &["zitadel", "mailpit", "gateway"];
 /// Started after the first bootstrap.
-const LATE_APPS: &[&str] = &["orchestrator", "worker", "auth", "rest", "studio"];
+pub(super) const LATE_APPS: &[&str] =
+    &["orchestrator", "worker", "auth", "rest", "realtime", "studio"];
 /// A stack that took its slot this recently is alive even with no running container: `up` is
 /// still building the image and the binaries (T3 review I2).
 const REAP_GRACE: u64 = 15 * 60;
@@ -462,8 +470,8 @@ fn parse_env_pairs(pairs: &[String]) -> anyhow::Result<Vec<(String, String)>> {
         .collect()
 }
 
-/// The services named by `restart` (all five Rust apps when none), checked.
-fn restart_targets(apps: &[String]) -> anyhow::Result<Vec<String>> {
+/// The services named by `restart` (every Rust app when none), checked.
+pub(super) fn restart_targets(apps: &[String]) -> anyhow::Result<Vec<String>> {
     if apps.is_empty() {
         return Ok(RUST_APPS.iter().map(|a| a.to_string()).collect());
     }
@@ -838,8 +846,23 @@ fn start_stack(
             &keys.join("neon"),
             &keys.join("compute-ca"),
             &keys.join("orchestrator-tls"),
-        )
-        .map(|_| ())
+        )?;
+        // RT1 T1 (R11, S1, S27): the service secrets (created once, never overwritten), the
+        // NATS and Valkey auth files rendered from them, and the storage NeonJWTs derived from
+        // the compute-JWT key pair. Before any container starts: compose mounts them.
+        crate::dev::stack_secrets::ensure(&keys)?;
+        super::service_auth::write_storage_auth(&keys)?;
+        super::service_auth::write_auth_files(&keys, &stack.state)?;
+        // A demo.env from before still names the public bearers, which the apps would now
+        // refuse next to their <NAME>_FILE: drop them before the front tier is created.
+        let demo = stack.state.join("zitadel/demo.env");
+        if let Ok(text) = std::fs::read_to_string(&demo)
+            && let Some(scrubbed) = crate::dev::env_files::without_legacy_bearers(&text)
+        {
+            std::fs::write(&demo, scrubbed)
+                .with_context(|| format!("writing {}", demo.display()))?;
+        }
+        Ok(())
     })?;
 
     // The env files the apps read at create time; recreated below when the bootstrap changed
@@ -874,6 +897,11 @@ fn start_stack(
         vec!["--profile", "sites"]
     };
     phases.run("apps", || compose_up(stack, &profiles, &late))?;
+    // After the apps: the worker that would recreate a removed compute is now the one that
+    // starts computes on the compute network.
+    phases.run("computes off the compute network", || {
+        remove_computes_off_network(&stack.slug, &super::env::compute_network(&stack.project))
+    })?;
 
     // The Actions target, now its host (the orchestrator) resolves, and the tenant bind, now the
     // orchestrator has migrated the metadata database it writes to.
@@ -923,7 +951,7 @@ type EnvFile = (PathBuf, Option<Vec<u8>>, &'static [&'static str]);
 
 /// The env files bootstrap writes and the services that read them at create time.
 fn app_env_files(stack: &Stack) -> Vec<EnvFile> {
-    const DEMO_USERS: &[&str] = &["orchestrator", "worker", "gateway", "auth", "rest"];
+    const DEMO_USERS: &[&str] = DEMO_ENV_READERS;
     const ACTIONS_USERS: &[&str] = &["orchestrator"];
     const STUDIO_USERS: &[&str] = &["studio"];
     [
@@ -1254,6 +1282,40 @@ fn remove_legacy_computes() -> anyhow::Result<()> {
         })
         .collect();
     remove_containers(&legacy)
+}
+
+/// The computes in `ps` (`docker ps` lines `<name>\t<network,network…>`) that aren't attached to
+/// `network`.
+pub fn computes_off_network(ps: &str, network: &str) -> Vec<String> {
+    ps.lines()
+        .filter_map(|line| {
+            let (name, networks) = line.split_once('\t').unwrap_or((line, ""));
+            let name = name.trim().trim_start_matches('/');
+            (!name.is_empty() && !networks.split(',').any(|n| n.trim() == network))
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// Removes the computes of `slug` that aren't on its compute network (`network`). A stack
+/// started before RT1 T1 ran its computes on `<project>_default`, without a storage token in
+/// their spec: once the storage services check NeonJWT and the worker locates computes on the
+/// compute network, such a compute can neither read its pages nor be reached. The worker's
+/// reconcile (every 30 s) creates each missing compute again, on the compute network and with
+/// a fresh spec; its data is in the pageserver and safekeepers, not in the container.
+fn remove_computes_off_network(slug: &str, network: &str) -> anyhow::Result<()> {
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "ps",
+        "-a",
+        "--filter",
+        &format!("label={ENDPOINT_LABEL}"),
+        "--filter",
+        &format!("label={STACK_LABEL}={slug}"),
+        "--format",
+        "{{.Names}}\t{{.Networks}}",
+    ]);
+    remove_containers(&computes_off_network(&output(cmd)?, network))
 }
 
 /// Removes every compute of `slug` (by the stack label), running or not.
@@ -1666,7 +1728,46 @@ fn in_runner(
         ("CURL_HOME".into(), stack.runner_dir().display().to_string()),
     ];
     env.extend(extra.iter().cloned());
+    let mut ps = Command::new("docker");
+    ps.args(runner_ps_args(&stack.project));
+    busy_runner(&stack.slug, &output(ps)?)?;
     pass_through(runner_command(stack, checkout, &env, cmd)?)
+}
+
+/// The `docker` arguments that list `project`'s running runner containers, one name per line.
+pub(crate) fn runner_ps_args(project: &str) -> Vec<String> {
+    [
+        "ps",
+        "--filter",
+        &format!("label=com.docker.compose.project={project}"),
+        "--filter",
+        "label=com.docker.compose.service=runner",
+        "--format",
+        "{{.Names}}",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Refuses a run while `ps_output` ([`runner_ps_args`]) lists a running runner: the runner has
+/// one fixed address on the control network (the member-login rule lists it), so a second one
+/// would fail inside Docker.
+pub(crate) fn busy_runner(slug: &str, ps_output: &str) -> anyhow::Result<()> {
+    let running: Vec<&str> = ps_output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if running.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the stack {slug} is busy: its runner ({}) is running another `workbench test`/`run`. \
+         A stack has one runner (it has one fixed address on the control network), so only one \
+         run at a time; wait for that run to finish, then try again",
+        running.join(", ")
+    )
 }
 
 /// The proxy container's address on the stack network (`<project>_default`).

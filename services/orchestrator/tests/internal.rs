@@ -81,6 +81,8 @@ struct FakeNeon {
     signup: Arc<Mutex<HashMap<String, (bool, bool)>>>,
     /// Zitadel user id -> the user's open invite (a closed one is simply absent).
     invites: Arc<Mutex<HashMap<String, InviteDescription>>>,
+    /// RT1 T6: Zitadel org id -> the tenant bound to it.
+    tenants: Arc<Mutex<HashMap<String, TenantId>>>,
 }
 
 /// The app-user rows the fake holds.
@@ -608,6 +610,11 @@ impl NeonMetadataPort for FakeNeon {
         Ok(self.invites.lock().unwrap().get(zitadel_user_id).cloned())
     }
 
+    async fn tenant_by_org(&self, zitadel_org_id: &str) -> Result<Option<TenantId>, MetadataError> {
+        self.check()?;
+        Ok(self.tenants.lock().unwrap().get(zitadel_org_id).copied())
+    }
+
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
         self.check()?;
         Ok(self.app.lock().unwrap().branches.iter().find(|b| b.id == id).cloned())
@@ -999,6 +1006,7 @@ struct AppSetup {
     jobs: FakeJobs,
     resync: FakeResync,
     mode: Mode,
+    rt_events: FakeRtEvents,
 }
 
 impl Default for AppSetup {
@@ -1010,7 +1018,38 @@ impl Default for AppSetup {
             jobs: FakeJobs::default(),
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
+            rt_events: FakeRtEvents::default(),
         }
+    }
+}
+
+/// RT1 T6: realtime's bearer on the internal listener's reused routes.
+const REALTIME_TOKEN: &str = "realtime-token";
+
+/// Records each realtime event the internal routes publish.
+#[derive(Clone, Default)]
+struct FakeRtEvents {
+    project: Arc<Mutex<Vec<(uuid::Uuid, chelabase_nats::rt::ProjectEvent)>>>,
+    access: Arc<Mutex<Vec<chelabase_nats::rt::AccessEvent>>>,
+}
+
+impl orchestrator::internal::realtime::RtEvents for FakeRtEvents {
+    fn project(
+        &self,
+        project_id: uuid::Uuid,
+        event: chelabase_nats::rt::ProjectEvent,
+    ) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.project.lock().unwrap().push((project_id, event));
+            Ok(())
+        })
+    }
+
+    fn access(&self, event: chelabase_nats::rt::AccessEvent) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.access.lock().unwrap().push(event);
+            Ok(())
+        })
     }
 }
 
@@ -1077,6 +1116,8 @@ async fn spawn_with_app(
         storcon_token: STORCON_TOKEN.into(),
         data_keys_token: DATA_KEYS_TOKEN.into(),
         rest_token: REST_TOKEN.into(),
+        realtime_token: REALTIME_TOKEN.into(),
+        rt_events: Arc::new(app.rt_events),
         secrets: key.clone(),
         roles,
         cache: Arc::new(cache),
@@ -3746,10 +3787,13 @@ struct AppApp {
     app: Internal,
     neon: FakeNeon,
     jobs: FakeJobs,
+    /// RT1 T6: the realtime events the routes published.
+    rt_events: FakeRtEvents,
 }
 
 async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<&MockZitadel>) -> AppApp {
     let jobs = FakeJobs::default();
+    let rt_events = FakeRtEvents::default();
     let app = spawn_with_app(
         world.neon.clone(),
         world.locator.clone(),
@@ -3764,6 +3808,7 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
             jobs: jobs.clone(),
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
+            rt_events: rt_events.clone(),
         },
     )
     .await;
@@ -3771,6 +3816,7 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
         app,
         neon: world.neon.clone(),
         jobs,
+        rt_events,
     }
 }
 
@@ -4888,4 +4934,221 @@ async fn a_branch_whose_protection_cant_be_read_fails_the_spec() {
     let app = spawn_internal(neon, FakeLocator::default(), &storcon(true).await).await;
     let (status, _) = app.get(&spec_path("ep-d"), Some(COMPUTE_TOKEN)).await;
     assert_eq!(status, 503, "fail closed, not branch_protected = false");
+}
+
+// --- RT1 T6: realtime's bearer, the realtime routes' absence here, and the events ------------
+
+// R10: realtime reads connection info and key lookups with its own token
+// (`require_any_bearer`); each route keeps its own caller's token too.
+#[tokio::test]
+async fn realtime_token_reaches_connection_info_and_key_lookups() {
+    let neon = FakeNeon::default();
+    let branch = BranchId::new();
+    neon.data_keys.lock().unwrap().push((
+        sha("chk_sec_rt"),
+        DataKeyLookup { key_id: KEY_ID, branch_id: branch, project_id: PROJECT_ID, kind: DataKeyKind::Secret, role: "reporting".into(), databases: None, role_oid: None },
+    ));
+    let row = connection_row(BranchStatus::Ready, Some("ep-rt"), None);
+    let connected = row.branch_id;
+    neon.connections.lock().unwrap().insert(connected, row);
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+
+    let keys = format!("/internal/data/keys/{}", hex::encode(sha("chk_sec_rt")));
+    assert_eq!(app.get(&keys, Some(REALTIME_TOKEN)).await.0, 200, "realtime's token on key lookups");
+    assert_eq!(app.get(&keys, Some(DATA_KEYS_TOKEN)).await.0, 200, "the gateway's still works");
+    assert_eq!(app.get(&keys, Some(REST_TOKEN)).await.0, 401, "rest's still doesn't");
+
+    let unknown = format!("/internal/data/branches/{}/connection", BranchId::new().as_uuid());
+    assert_eq!(app.get(&unknown, Some(REALTIME_TOKEN)).await.0, 404, "past the bearer: an unknown branch");
+    let conn = format!("/internal/data/branches/{}/connection", connected.as_uuid());
+    let (realtime, _) = app.get(&conn, Some(REALTIME_TOKEN)).await;
+    let (rest, _) = app.get(&conn, Some(REST_TOKEN)).await;
+    assert_ne!(realtime, 401, "realtime's token on connection info");
+    assert_eq!(realtime, rest, "the same answer as rest's");
+    assert_eq!(app.get(&conn, Some(DATA_KEYS_TOKEN)).await.0, 401);
+    assert_eq!(app.get(&conn, Some("wrong")).await.0, 401);
+}
+
+// R10: realtime's token opens only those two routes on this listener.
+#[tokio::test]
+async fn realtime_token_opens_nothing_else_here() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let app = &a.app;
+    let gets = [
+        format!("{ACCESS}?endpointish=ep-x&role=app&session_id=1"),
+        format!("{WAKE}?endpointish=ep-x&session_id=1"),
+        "/internal/signup/allowed?org_id=o1".to_string(),
+        spec_path("ep-x"),
+    ];
+    for path in &gets {
+        assert_eq!(app.get(path, Some(REALTIME_TOKEN)).await.0, 401, "GET {path}");
+    }
+    for path in [ATTACH, SAFEKEEPERS] {
+        assert_eq!(app.put(path, Some(REALTIME_TOKEN), "{}").await, 401, "PUT {path}");
+    }
+    assert_eq!(app.post_json("/internal/invites/describe", Some(REALTIME_TOKEN), json!({})).await.0, 401);
+    for (method, path, body) in auth_routes(&w) {
+        assert_eq!(call(app, method, &path, Some(REALTIME_TOKEN), &body).await, 401, "{method} {path}");
+    }
+    let (status, _, _) = app.ddl("ep-x", Some(REALTIME_TOKEN), "{}").await;
+    assert_eq!(status, 401, "the DDL receiver takes only the compute's token");
+}
+
+// S15: the realtime routes live on the public listener's state; the listener computes reach
+// never serves them, whatever the token.
+#[tokio::test]
+async fn the_internal_listener_serves_no_realtime_route() {
+    let app = spawn_internal(FakeNeon::default(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    for route in ["authorize", "projects", "visible"] {
+        let path = format!("/internal/realtime/{route}");
+        for token in [Some(REALTIME_TOKEN), Some(REST_TOKEN), None] {
+            let (status, _) = app.post_json(&path, token, json!({ "token": "x" })).await;
+            assert_eq!(status, 404, "POST {path} with {token:?}");
+        }
+    }
+}
+
+/// [`ddl_neon`] with the branch's database and project known, and its events recorded.
+async fn ddl_events_app() -> (Internal, FakeNeon, FakeRtEvents, BranchId, DatabaseId, ProjectId) {
+    let (neon, branch) = ddl_neon();
+    let (db, project) = (DatabaseId::new(), ProjectId::new());
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.branches.push(branch_record(branch, db, Some(BranchId::new()), BranchKind::Normal, BranchStatus::Ready, Some("ep-d")));
+        rows.db_projects.insert(db, project);
+    }
+    neon.edit(|s| {
+        s.dbs.insert("other".into(), ("postgres".into(), DatabaseOrigin::Sql));
+    });
+    let events = FakeRtEvents::default();
+    let app = spawn_with_app(
+        neon.clone(),
+        FakeLocator::default(),
+        "http://127.0.0.1:9",
+        rules(Mode::SelfHosted, false),
+        FakeCache::default(),
+        "http://127.0.0.1:9",
+        AppSetup { rt_events: events.clone(), ..AppSetup::default() },
+    )
+    .await;
+    (app, neon, events, branch, db, project)
+}
+
+// P10 / spec 5.3: a Postgres database made or dropped inside a branch is a project event,
+// published after the receiver's own metadata write (the delta arrives at the creating
+// transaction's pre-commit; an aborted CREATE DATABASE costs Studio one refetch).
+#[tokio::test]
+async fn ddl_database_create_drop_and_rename_publish_pg_database_events() {
+    use chelabase_nats::rt::ProjectEvent;
+    let (app, _neon, events, branch, db, project) = ddl_events_app().await;
+    let (database_id, branch_id) = (db.as_uuid(), branch.as_uuid());
+    let created = |name: &str| (project.as_uuid(), ProjectEvent::PgDatabaseCreated { database_id, branch_id, name: name.into() });
+    let dropped = |name: &str| (project.as_uuid(), ProjectEvent::PgDatabaseDropped { database_id, branch_id, name: name.into() });
+
+    let (status, _, body) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "set", "name": "fresh", "owner": "postgres" })]))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(|| events.project.lock().unwrap().len() == 1).await, "{:?}", events.project.lock().unwrap());
+    assert_eq!(*events.project.lock().unwrap(), vec![created("fresh")]);
+
+    let (status, _, _) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "del", "name": "fresh" })])).await;
+    assert_eq!(status, 200);
+    assert!(wait_until(|| events.project.lock().unwrap().len() == 2).await);
+    assert_eq!(events.project.lock().unwrap()[1], dropped("fresh"));
+
+    // A rename is the old name dropped and the new one made, in one delta.
+    let (status, _, _) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "set", "name": "renamed", "old_name": "other" })]))
+        .await;
+    assert_eq!(status, 200);
+    assert!(wait_until(|| events.project.lock().unwrap().len() == 4).await, "{:?}", events.project.lock().unwrap());
+    let mut last: Vec<_> = events.project.lock().unwrap()[2..].to_vec();
+    last.sort_by_key(|(_, e)| format!("{e:?}"));
+    let mut want = vec![created("renamed"), dropped("other")];
+    want.sort_by_key(|(_, e)| format!("{e:?}"));
+    assert_eq!(last, want);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(events.project.lock().unwrap().len(), 4, "one event each");
+    assert!(events.access.lock().unwrap().is_empty(), "no access event from a database change");
+}
+
+// RT1 final fix round (batch B, T6 hardening): `ALTER DATABASE … OWNER TO` sends the same
+// `set` as a `CREATE DATABASE`; for a database the branch already has it is no new database,
+// so no `pg_database.created` (realtime and Studio would refetch for nothing).
+#[tokio::test]
+async fn ddl_owner_change_of_a_known_database_publishes_no_pg_database_event() {
+    use chelabase_nats::rt::ProjectEvent;
+    let (app, _neon, events, branch, db, project) = ddl_events_app().await;
+    let (database_id, branch_id) = (db.as_uuid(), branch.as_uuid());
+    let (status, _, body) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "set", "name": "fresh", "owner": "postgres" })]))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(wait_until(|| events.project.lock().unwrap().len() == 1).await, "{:?}", events.project.lock().unwrap());
+    assert_eq!(
+        *events.project.lock().unwrap(),
+        vec![(project.as_uuid(), ProjectEvent::PgDatabaseCreated { database_id, branch_id, name: "fresh".into() })]
+    );
+    // The owner changes, twice; the main database's too.
+    for (name, owner) in [("fresh", "app_owner"), ("fresh", "postgres"), ("neondb", "postgres")] {
+        let (status, _, body) = app
+            .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "set", "name": name, "owner": owner })]))
+            .await;
+        assert_eq!(status, 200, "{name}: {body}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let published = events.project.lock().unwrap().clone();
+    assert_eq!(published.len(), 1, "an owner change is no new database: {published:?}");
+}
+
+// None on failure: a refused delta, a metadata error, a role-only delta.
+#[tokio::test]
+async fn ddl_refused_failed_or_role_only_deltas_publish_no_pg_database_event() {
+    let (app, neon, events, _, _, _) = ddl_events_app().await;
+    // Renaming the main database away is refused (409).
+    let (status, _, _) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "set", "name": "elsewhere", "old_name": "neondb" })]))
+        .await;
+    assert_eq!(status, 409);
+    let (status, _, _) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![set("app_rw", STRONG, SCRAM)])).await;
+    assert_eq!(status, 200);
+    *neon.fail.lock().unwrap() = true;
+    let (status, _, _) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "set", "name": "fresh", "owner": "postgres" })]))
+        .await;
+    assert_eq!(status, 503);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(events.project.lock().unwrap().is_empty(), "{:?}", events.project.lock().unwrap());
+}
+
+// W18: a member's Zitadel user removed, deactivated or locked changes what they may reach: an
+// access event for the tenant bound to that org, naming the member (`sub` = the user id).
+#[tokio::test]
+async fn webhook_member_user_events_publish_an_access_event() {
+    use chelabase_nats::rt::AccessEvent;
+    let w = app_world();
+    let tenant = TenantId::new();
+    w.neon.tenants.lock().unwrap().insert("tenant-org".into(), tenant);
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    // Zitadel ids are numeric strings, not uuids.
+    let kinds = ["user.removed", "user.deactivated", "user.locked"];
+    for kind in kinds {
+        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
+        assert_eq!(a.app.event(&body, signed(&body)).await, 200, "{kind}");
+    }
+    assert!(eventually(|| a.rt_events.access.lock().unwrap().len() == kinds.len()).await, "{:?}", a.rt_events.access.lock().unwrap());
+    for ev in a.rt_events.access.lock().unwrap().iter() {
+        assert_eq!(*ev, AccessEvent { tenant_id: tenant.as_uuid(), member_sub: Some("284617".into()) });
+    }
+    // A bad signature, an org no tenant has, and an app-users org publish no access event.
+    let body = user_event("user.removed", "tenant-org", "284617", chrono::Utc::now());
+    assert_eq!(a.app.event(&body, Some("nonsense".into())).await, 401);
+    for org in ["no-such-org", ORG] {
+        let body = user_event("user.removed", org, &uuid::Uuid::new_v4().to_string(), chrono::Utc::now());
+        assert_eq!(a.app.event(&body, signed(&body)).await, 200, "{org}");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(a.rt_events.access.lock().unwrap().len(), kinds.len());
 }

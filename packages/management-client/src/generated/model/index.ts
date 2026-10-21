@@ -170,6 +170,7 @@ export * from './putGrantOverrideRequest.ts';
 export * from './putGrantRequest.ts';
 export * from './recomputeRequest.ts';
 export * from './rehearseRequest.ts';
+export * from './relation.ts';
 export * from './resendInviteRequest.ts';
 export * from './resentInvite.ts';
 export * from './resolutionBody.ts';

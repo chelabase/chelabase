@@ -193,6 +193,8 @@ async fn harness_opts(verification: bool, min_ms: u64, app_on: bool) -> H {
         secure_cookies: false,
         min_response: Duration::from_millis(min_ms),
         mode: auth::config::Mode::SelfHosted,
+        // The test client connects from loopback: it stands in for the gateway.
+        trusted_proxies: auth::guard::TrustedProxies::parse("127.0.0.1,::1").unwrap(),
     };
     let state = Arc::new(AppState {
         zitadel: Zitadel::new(&mock.base, TOKEN),
@@ -205,7 +207,14 @@ async fn harness_opts(verification: bool, min_ms: u64, app_on: bool) -> H {
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     H {
         mock,
         internal,

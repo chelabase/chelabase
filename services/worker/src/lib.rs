@@ -36,12 +36,16 @@ pub mod point;
 pub mod project_delete;
 pub mod ports;
 pub mod provision;
+pub mod realtime;
 pub mod reconcile;
 pub mod reset;
 pub mod resync;
 pub mod review;
 pub mod role_sessions;
 pub mod roles;
+#[cfg(test)]
+mod rt1_tests;
+pub mod rt_events;
 pub mod safekeepers;
 pub mod schema_base;
 pub mod settings;
@@ -55,7 +59,9 @@ pub const OWNER_ROLE: &str = "postgres";
 /// - 2: `neon.protected_databases` (the branch's main database can't be dropped).
 /// - 3: TLS (a server certificate uploaded before start), the control network and the branch
 ///   protection flag (`neon.branch_protected`).
-pub const COMPUTE_SETTINGS_VERSION: i32 = 3;
+/// - 4: realtime (RT1 P14): `max_replication_slots`/`max_wal_senders` 20 and
+///   `max_slot_wal_keep_size` 1 GB.
+pub const COMPUTE_SETTINGS_VERSION: i32 = 4;
 
 /// Everything the lifecycle needs.
 pub struct Worker<M, S, C, N, P> {
@@ -114,4 +120,7 @@ pub struct Worker<M, S, C, N, P> {
     pub member_logins: chelabase_neon::spec::MemberLogins,
     /// What the daily certificate sweep needs; `None` where there is no CA (the fakes).
     pub cert_sweep: Option<certs::CertSweep>,
+    /// The `chelabase_realtime` role's password (`CHELABASE_REALTIME_PG_PASSWORD_FILE`, RT1
+    /// T5). `None`: the role is neither created nor granted anything (the fakes by default).
+    pub realtime_password: Option<String>,
 }

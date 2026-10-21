@@ -3,7 +3,7 @@
 //! (TE-A T4): one table ([`table_sql`]), the object list ([`objects_sql`]) and the type catalog
 //! ([`types_sql`]), which run as the database owner (a non-superuser).
 
-use chelabase_types::table_api::{ObjectSummary, TypeEntry};
+use chelabase_types::table_api::{ObjectKind, ObjectSummary, TypeEntry};
 use serde::Deserialize;
 
 use crate::error::SchemaError;
@@ -81,6 +81,81 @@ pub fn parse_table(json: &str) -> Result<Option<Table>, SchemaError> {
     m.tables.push(table(raw)?);
     m.normalize();
     Ok(m.tables.pop())
+}
+
+/// One read-only relation's object over `pg_class c JOIN ns n JOIN pg_roles o`, in
+/// [`TABLE_OBJECT_SQL`]'s shape: its columns only, every other list empty. It reads `pg_class`,
+/// `pg_attribute` and the columns' defaults and identity sequences, never a view's or rule's
+/// definition or a foreign table's options.
+const RELATION_OBJECT_SQL: &str = include_str!("catalog_parts/relation.sql");
+
+/// One relation of any kind the object list shows ([`objects_sql`]):
+/// `{"server_version_num": …, "kind": <ObjectKind or null>, "table": <object or null>}`.
+///
+/// - An ordinary table the model reads (`tabs`) is [`table_sql`]'s object, kind `table`.
+/// - A table that inherits from another (which `tabs` leaves out, since the schema merge doesn't
+///   model inheritance) is the same full object, kind `table`: its catalog rows describe it as
+///   Postgres has it, inherited columns and CHECK constraints included.
+/// - A partitioned table, view, materialized view or foreign table is
+///   [`RELATION_OBJECT_SQL`]'s columns-only object.
+///
+/// Partitions, extension members and the schemas the model leaves out (`ns`) are `null`, as the
+/// object list leaves them out. Its own read-only transaction, run as the database owner.
+pub fn relation_sql(schema: &str, name: &str) -> String {
+    let (schema, name) = (name_literal(schema), name_literal(name));
+    format!(
+        "{HEAD_SQL}{TABS_SQL}    AND n.nspname = {schema} AND c.relname = {name}\n),\n\
+         inherits AS (\n  SELECT c.oid, c.relname, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity,\n         \
+         c.relpersistence, c.reloptions, n.nspname,\n         \
+         (c.oid = (SELECT oid FROM users_tab)) IS TRUE AS is_users\n  \
+         FROM pg_class c JOIN ns n ON n.oid = c.relnamespace\n  \
+         WHERE c.relkind = 'r' AND NOT c.relispartition\n    \
+         AND NOT EXISTS (SELECT FROM ext e WHERE e.classid = 'pg_class'::regclass AND e.objid = c.oid)\n    \
+         AND EXISTS (SELECT FROM pg_inherits ih WHERE ih.inhrelid = c.oid)\n    \
+         AND n.nspname = {schema} AND c.relname = {name}\n),\n\
+         tables_j AS (\n  SELECT {TABLE_OBJECT_SQL} AS j\n  \
+         FROM (SELECT * FROM tabs UNION ALL SELECT * FROM inherits) t JOIN pg_roles o ON o.oid = t.relowner\n),\n\
+         others_j AS (\n  SELECT CASE c.relkind WHEN 'p' THEN 'partitioned_table'\n                        \
+         WHEN 'v' THEN 'view'\n                        \
+         WHEN 'm' THEN 'materialized_view'\n                        \
+         WHEN 'f' THEN 'foreign_table' END AS kind,\n  \
+         {RELATION_OBJECT_SQL} AS j\n  \
+         FROM pg_class c\n  JOIN ns n ON n.oid = c.relnamespace\n  JOIN pg_roles o ON o.oid = c.relowner\n  \
+         WHERE c.relkind IN ('p', 'v', 'm', 'f') AND NOT c.relispartition\n    \
+         AND NOT EXISTS (SELECT FROM ext e WHERE e.classid = 'pg_class'::regclass AND e.objid = c.oid)\n    \
+         AND n.nspname = {schema} AND c.relname = {name}\n)\n\
+         SELECT jsonb_build_object(\n  'server_version_num', current_setting('server_version_num')::int,\n  \
+         'kind', coalesce((SELECT 'table'::text FROM tables_j), (SELECT kind FROM others_j)),\n  \
+         'table', coalesce((SELECT j FROM tables_j), (SELECT j FROM others_j))\n)::text;\nCOMMIT;\n",
+    )
+}
+
+/// Parses [`relation_sql`]'s output; refuses a server major other than
+/// [`crate::SUPPORTED_SERVER_MAJOR`] and a kind other than the object list's. An ordinary table
+/// is normalized as [`parse_table`] normalizes it; every other kind keeps its columns only (its
+/// constraints, indexes, policies, grants and options are emptied, whatever the document held).
+pub fn parse_relation(json: &str) -> Result<Option<Relation>, SchemaError> {
+    let major = server_major(json)?;
+    let raw: RawRelationDocument = serde_json::from_str(json).map_err(parse_error)?;
+    let (kind, raw) = match (raw.kind, raw.table) {
+        (None, None) => return Ok(None),
+        (Some(kind), Some(raw)) => (kind, raw),
+        (Some(_), None) => return Err(SchemaError::Parse("a relation kind without its object".into())),
+        (None, Some(_)) => return Err(SchemaError::Parse("a relation object without its kind".into())),
+    };
+    let mut table = table(raw)?;
+    if kind != ObjectKind::Table {
+        table.constraints.clear();
+        table.indexes.clear();
+        table.policies.clear();
+        table.grants.clear();
+        table.options.clear();
+    }
+    let mut m = SchemaModel::empty(major);
+    m.tables.push(table);
+    m.normalize();
+    let table = m.tables.pop().expect("the one table pushed");
+    Ok(Some(Relation { kind, table }))
 }
 
 /// The table API's object list: `{"server_version_num": …, "objects": [ObjectSummary…]}`. Runs as
@@ -492,6 +567,12 @@ struct RawCatalog {
 
 #[derive(Deserialize)]
 struct RawTableDocument {
+    table: Option<RawTable>,
+}
+
+#[derive(Deserialize)]
+struct RawRelationDocument {
+    kind: Option<ObjectKind>,
     table: Option<RawTable>,
 }
 
@@ -1229,6 +1310,270 @@ mod tests {
         let whole = parse_catalog(&doc.to_string()).unwrap();
         let one = json!({ "server_version_num": 170005, "table": doc["tables"][0] });
         assert_eq!(parse_table(&one.to_string()).unwrap().as_ref(), whole.tables.first());
+    }
+
+    // --- gc: `GET …/tables/{schema}/{table}` answers, read-only, for every kind the object
+    // list shows (`relation_sql` / `parse_relation`, `model::Relation`). `table_sql` and
+    // `parse_table` stay the ordinary-table read that the row and DDL paths use.
+
+    use chelabase_types::table_api::ObjectKind;
+
+    /// Every [`ObjectKind`]; the match fails to compile when a kind is added, so this list
+    /// (and the tests over it) can't fall behind the object list.
+    fn every_object_kind() -> [ObjectKind; 5] {
+        let all = [
+            ObjectKind::Table,
+            ObjectKind::PartitionedTable,
+            ObjectKind::View,
+            ObjectKind::MaterializedView,
+            ObjectKind::ForeignTable,
+        ];
+        for k in all {
+            match k {
+                ObjectKind::Table
+                | ObjectKind::PartitionedTable
+                | ObjectKind::View
+                | ObjectKind::MaterializedView
+                | ObjectKind::ForeignTable => {}
+            }
+        }
+        all
+    }
+
+    fn kind_text(kind: ObjectKind) -> String {
+        serde_json::to_value(kind).unwrap().as_str().unwrap().to_string()
+    }
+
+    /// [`relation_sql`]'s document: `{"server_version_num", "kind", "table"}`, the object in
+    /// [`table_sql`]'s shape. Columns out of attnum order; every list the non-table kinds drop is
+    /// filled, so the parser is seen to drop them.
+    fn relation_document(kind: Option<&str>) -> Value {
+        let mut placed_at = column(1, "placed_at");
+        placed_at["data_type"] = json!("timestamp with time zone");
+        placed_at["type_oid"] = json!(1184);
+        let mut id = column(2, "id");
+        id["data_type"] = json!("uuid");
+        id["type_oid"] = json!(2950);
+        id["not_null"] = json!(true);
+        let mut amount = column(3, "amount");
+        amount["data_type"] = json!("numeric(12,2)");
+        amount["type_oid"] = json!(1700);
+        let note = column(4, "note");
+        let mut object = document(170005)["tables"][0].clone();
+        object["name"] = json!("orders_v");
+        object["schema"] = json!("public");
+        object["columns"] = json!([amount, note, id, placed_at]);
+        json!({ "server_version_num": 170005, "kind": kind, "table": object })
+    }
+
+    #[test]
+    fn parse_relation_reads_every_object_kind() {
+        for kind in every_object_kind() {
+            let doc = relation_document(Some(&kind_text(kind)));
+            let r = parse_relation(&doc.to_string())
+                .unwrap_or_else(|e| panic!("{kind:?}: {e:?}"))
+                .unwrap_or_else(|| panic!("{kind:?}: none"));
+            assert_eq!(r.kind, kind);
+            assert_eq!((r.table.schema.as_str(), r.table.name.as_str()), ("public", "orders_v"));
+            // Columns by attnum, with format_type's text and attnotnull.
+            let columns: Vec<(i16, &str, &str, bool)> = r
+                .table
+                .columns
+                .iter()
+                .map(|c| (c.attnum, c.name.as_str(), c.data_type.as_str(), c.not_null))
+                .collect();
+            assert_eq!(
+                columns,
+                [
+                    (1, "placed_at", "timestamp with time zone", false),
+                    (2, "id", "uuid", true),
+                    (3, "amount", "numeric(12,2)", false),
+                    (4, "note", "integer", false),
+                ],
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// An ordinary table reads exactly as [`parse_table`] reads it: constraints, indexes,
+    /// policies, grants and options kept.
+    #[test]
+    fn parse_relation_reads_a_table_as_parse_table_does() {
+        let doc = relation_document(Some("table"));
+        let r = parse_relation(&doc.to_string()).unwrap().expect("a table");
+        let one = json!({ "server_version_num": 170005, "table": doc["table"] });
+        assert_eq!(Some(r.table), parse_table(&one.to_string()).unwrap());
+        assert_eq!(r.kind, ObjectKind::Table);
+    }
+
+    /// A view, materialized view, foreign table or partitioned table is read-only: its columns
+    /// only. Constraints, indexes, policies, grants and options are empty lists (required fields
+    /// of the generated `Table` type), whatever the document carried.
+    #[test]
+    fn parse_relation_keeps_only_columns_for_other_kinds() {
+        for kind in every_object_kind().into_iter().filter(|k| *k != ObjectKind::Table) {
+            let doc = relation_document(Some(&kind_text(kind)));
+            let r = parse_relation(&doc.to_string()).unwrap().unwrap();
+            let t = &r.table;
+            assert!(t.constraints.is_empty(), "{kind:?}: {:?}", t.constraints);
+            assert!(t.indexes.is_empty(), "{kind:?}: {:?}", t.indexes);
+            assert!(t.policies.is_empty(), "{kind:?}: {:?}", t.policies);
+            assert!(t.grants.is_empty(), "{kind:?}: {:?}", t.grants);
+            assert!(t.options.is_empty(), "{kind:?}: {:?}", t.options);
+            assert_eq!(t.columns.len(), 4, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn parse_relation_of_nothing_is_none() {
+        assert_eq!(
+            parse_relation(r#"{"server_version_num": 170004, "kind": null, "table": null}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_relation(r#"{"server_version_num": 160004, "kind": null, "table": null}"#),
+            Err(SchemaError::UnsupportedServer(16))
+        );
+    }
+
+    /// A relation of a kind the endpoint doesn't serve (sequence, index, composite type, toast,
+    /// or no kind at all) is never parsed into an answer.
+    #[test]
+    fn parse_relation_refuses_other_kinds() {
+        for kind in [Some("sequence"), Some("index"), Some("composite_type"), Some("toast"), Some("S"), None] {
+            let doc = relation_document(kind);
+            assert!(parse_relation(&doc.to_string()).is_err(), "{kind:?}");
+        }
+    }
+
+    /// The response is the `Table` object with `kind` beside its fields (flattened), so a
+    /// client reading the generated `Table` type keeps working.
+    #[test]
+    fn a_relation_serializes_as_a_table_with_its_kind() {
+        let r = parse_relation(&relation_document(Some("view")).to_string()).unwrap().unwrap();
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["kind"], "view", "{v}");
+        assert_eq!(v["name"], "orders_v", "{v}");
+        assert!(v.get("table").is_none(), "flattened: {v}");
+        for list in ["constraints", "indexes", "policies", "grants", "options"] {
+            assert_eq!(v[list], json!([]), "{list} in {v}");
+        }
+        assert_eq!(v["columns"][2]["data_type"], "numeric(12,2)", "{v}");
+        let mut table = serde_json::to_value(&r.table).unwrap();
+        table.as_object_mut().unwrap().insert("kind".into(), json!("view"));
+        assert_eq!(v, table, "exactly the table's fields plus kind");
+    }
+
+    #[test]
+    fn relation_sql_is_one_read_only_transaction() {
+        let sql = relation_sql("public", "t");
+        let parsed = pg_query::parse(&sql).unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        assert_eq!(parsed.protobuf.stmts.len(), 7, "BEGIN, 3 × SET, DO, SELECT, COMMIT");
+        assert!(sql.starts_with(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSET LOCAL search_path = pg_catalog;\n"
+        ));
+        assert!(sql.trim_end().ends_with("COMMIT;"));
+    }
+
+    #[test]
+    fn relation_sql_names_its_target_safely() {
+        let sql = relation_sql("we'ird", "Na\"me");
+        assert!(sql.contains("'we''ird'"), "{sql}");
+        assert!(sql.contains("'Na\"me'"), "{sql}");
+        let sql = relation_sql("pub\0lic", "t");
+        assert!(!sql.contains('\0'));
+        assert!(!sql.contains("'pub"), "a NUL name matches nothing: {sql}");
+        assert!(sql.contains("= NULL"), "{sql}");
+    }
+
+    /// An ordinary table reads as [`table_sql`] reads it (the same `tabs` rules and object);
+    /// the other kinds come from the object list's schemas (`ns`) without extension members, as
+    /// the object list finds them.
+    #[test]
+    fn relation_sql_reads_tables_and_scopes_as_the_object_list() {
+        let sql = relation_sql("public", "t");
+        assert!(sql.contains(HEAD_SQL));
+        assert!(sql.contains(TABS_SQL));
+        assert!(sql.contains(TABLE_OBJECT_SQL));
+        let ext = "NOT EXISTS (SELECT FROM ext e WHERE e.classid = 'pg_class'::regclass AND e.objid = c.oid)";
+        assert!(OBJECTS_SQL.contains(ext));
+        assert!(sql.matches(ext).count() >= 2, "tables and the other kinds both leave out extension members: {sql}");
+        let scoped = "JOIN ns n ON n.oid = c.relnamespace";
+        assert!(TABS_SQL.contains(scoped) && OBJECTS_SQL.contains(scoped));
+        assert!(sql.matches(scoped).count() >= 2, "the other kinds are read from `ns` too: {sql}");
+    }
+
+    /// Nothing reads a view's or rule's definition, or a foreign table's, server's or user
+    /// mapping's options (file names, hosts, credentials).
+    #[test]
+    fn relation_sql_never_reads_definitions_or_foreign_options() {
+        let sql = relation_sql("public", "t");
+        for leak in [
+            "pg_get_viewdef",
+            "pg_get_ruledef",
+            "pg_rewrite",
+            "ev_action",
+            "pg_views",
+            "pg_matviews",
+            "pg_foreign_table",
+            "ftoptions",
+            "pg_foreign_server",
+            "srvoptions",
+            "pg_user_mapping",
+            "umoptions",
+            "attfdwoptions",
+        ] {
+            assert!(!sql.contains(leak), "{leak} in {sql}");
+        }
+    }
+
+    // --- gc (coder): edges beyond the RED set.
+
+    /// Every relation the object list lists answers: a table that inherits from another (which
+    /// `tabs` leaves out) is read with the full table object as kind `table`, while `table_sql`
+    /// (the row and DDL paths) still leaves it out.
+    #[test]
+    fn relation_sql_reads_an_inheriting_table_as_a_table() {
+        let sql = relation_sql("public", "child");
+        assert!(sql.contains("AND EXISTS (SELECT FROM pg_inherits ih WHERE ih.inhrelid = c.oid)"), "{sql}");
+        assert!(sql.contains("FROM (SELECT * FROM tabs UNION ALL SELECT * FROM inherits) t"), "{sql}");
+        assert!(sql.contains("(SELECT 'table'::text FROM tables_j)"), "{sql}");
+        assert!(!table_sql("public", "child").contains("inherits AS"));
+        // The object list's kinds and partition rule, and nothing else.
+        assert!(OBJECTS_SQL.contains("c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition"));
+        assert!(sql.contains("c.relkind IN ('p', 'v', 'm', 'f') AND NOT c.relispartition"), "{sql}");
+        assert!(sql.contains("c.relkind = 'r' AND NOT c.relispartition"), "{sql}");
+        // Each of the three sources names the target.
+        assert_eq!(sql.matches("AND n.nspname = 'public' AND c.relname = 'child'").count(), 3, "{sql}");
+    }
+
+    /// A kind without its object, or an object without its kind, is a malformed document, never
+    /// an answer or a 404.
+    #[test]
+    fn parse_relation_refuses_a_half_document() {
+        let doc = relation_document(Some("view"));
+        let no_object = json!({ "server_version_num": 170005, "kind": "view", "table": null });
+        assert!(matches!(parse_relation(&no_object.to_string()), Err(SchemaError::Parse(_))));
+        let no_kind = json!({ "server_version_num": 170005, "kind": null, "table": doc["table"] });
+        assert!(matches!(parse_relation(&no_kind.to_string()), Err(SchemaError::Parse(_))));
+        // A missing `kind` key reads as null.
+        let absent = json!({ "server_version_num": 170005, "table": null });
+        assert_eq!(parse_relation(&absent.to_string()).unwrap(), None);
+    }
+
+    /// The read-only object is the table object's shape with every list but the columns fixed
+    /// empty: no ACL, option, constraint, index or policy is read for those kinds.
+    #[test]
+    fn relation_object_sql_reads_columns_only() {
+        for empty in ["'options', '[]'::jsonb", "'acl', '[]'::jsonb", "'constraints', '[]'::jsonb", "'indexes', '[]'::jsonb", "'policies', '[]'::jsonb"] {
+            assert!(RELATION_OBJECT_SQL.contains(empty), "{empty}");
+        }
+        for table_only in ["aclexplode", "pg_constraint", "pg_index", "pg_policy", "reloptions"] {
+            assert!(!RELATION_OBJECT_SQL.contains(table_only), "{table_only}");
+        }
+        assert!(RELATION_OBJECT_SQL.contains("format_type(a.atttypid, a.atttypmod)"));
+        assert!(RELATION_OBJECT_SQL.contains("ORDER BY a.attnum"));
+        assert!(RELATION_OBJECT_SQL.contains("NOT a.attisdropped"));
     }
 
     /// The type catalog leaves out pseudo-types, arrays and relations' row types.

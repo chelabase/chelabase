@@ -39,6 +39,10 @@ pub struct ColumnInfo {
     pub name: String,
     /// `format_type` output, e.g. `numeric(10,2)`, `public.mood`, `text[]`.
     pub type_sql: String,
+    /// The column's type by schema and name, each quoted, without modifiers, e.g.
+    /// `"pg_catalog"."int8"`, `"public"."mood"`, `"pg_catalog"."_text"` (an array type is its
+    /// own `_` type). What a console `"parse": true` condition casts to.
+    pub type_qualified: String,
     pub array: bool,
     /// `like`/`ilike` are allowed (text, varchar, char, citext and the like).
     pub text_like: bool,
@@ -83,6 +87,7 @@ pub enum ParamType {
     Text,
     Jsonb,
     Int8,
+    TextArray,
 }
 
 impl Plan {
@@ -92,6 +97,7 @@ impl Plan {
             .iter()
             .map(|b| match b {
                 Bind::Text(_) => ParamType::Text,
+                Bind::TextArray(_) => ParamType::TextArray,
                 Bind::Json(_) => ParamType::Jsonb,
                 Bind::Limit { .. } | Bind::Offset { .. } => ParamType::Int8,
             })
@@ -144,6 +150,8 @@ impl From<String> for Built {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bind {
     Text(Path),
+    /// A `text[]` parameter: the value is an array of strings (console `in` with `text`).
+    TextArray(Path),
     Json(Path),
     Limit { op: Option<usize> },
     Offset { op: Option<usize> },
@@ -154,6 +162,7 @@ pub enum Bind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindValue<'a> {
     Text(Option<Cow<'a, str>>),
+    TextArray(Vec<&'a str>),
     Json(&'a Value),
     Int(i64),
 }
@@ -230,6 +239,13 @@ pub fn resolve_bind<'a>(op: &'a Op, bind: &Bind, max_rows: i64) -> Option<BindVa
             Value::String(s) => Some(Cow::Borrowed(s.as_str())),
             other => Some(Cow::Owned(other.to_string())),
         }),
+        Bind::TextArray(path) => BindValue::TextArray(
+            resolve(op, path)?
+                .as_array()?
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?,
+        ),
         Bind::Json(path) => BindValue::Json(resolve(op, path)?),
         Bind::Limit { op: index } => {
             let limit = match sub_op(op, *index)? {
@@ -452,9 +468,10 @@ impl<'c, C: Catalog> Planner<'c, C> {
                 let mut out = Vec::new();
                 let mut names = HashSet::new();
                 for item in items {
-                    let (col, alias) = match item {
-                        SelectItem::Col(c) => (c, None),
-                        SelectItem::Aliased { col, alias } => (col, Some(alias)),
+                    let (col, alias, as_text) = match item {
+                        SelectItem::Col(c) => (c, None, false),
+                        SelectItem::Aliased { col, alias } => (col, Some(alias), false),
+                        SelectItem::TextOf { col, alias } => (col, Some(alias), true),
                     };
                     let column = self.column(table, col)?;
                     let output = alias.unwrap_or(&column.name);
@@ -463,9 +480,14 @@ impl<'c, C: Catalog> Planner<'c, C> {
                             "\"select\" names `{output}` twice; give one an alias"
                         )));
                     }
+                    let cast = if as_text { "::text" } else { "" };
                     out.push(match alias {
                         None => quote_ident(&column.name),
-                        Some(a) => format!("{} AS {}", quote_ident(&column.name), quote_ident(a)),
+                        Some(a) => format!(
+                            "{}{cast} AS {}",
+                            quote_ident(&column.name),
+                            quote_ident(a)
+                        ),
                     });
                 }
                 out.join(", ")
@@ -614,10 +636,56 @@ impl<'c, C: Catalog> Planner<'c, C> {
                 at.pop();
                 Ok(format!("NOT ({inner})"))
             }
-            Filter::Cond { col, op, value } => {
+            Filter::Cond {
+                col,
+                op,
+                value,
+                text,
+                parse,
+            } => {
                 let column = self.column(table, col)?;
                 let c = quote_ident(&column.name);
                 let slot = Slot::Where(at.clone());
+                if *text && *parse {
+                    return Err(invalid("`text` and `parse` are two ways to compare: use one"));
+                }
+                if *parse {
+                    // Console only: the column against bound text parsed as the column's own
+                    // (schema-qualified) type, so the column's index can serve it.
+                    if column.array {
+                        return Err(invalid(format!(
+                            "`parse` isn't supported on the array column `{}`",
+                            column.name
+                        )));
+                    }
+                    let ty = &column.type_qualified;
+                    return match op {
+                        CondOp::Eq => {
+                            let p = self.bind(Bind::Text(self.path(slot)));
+                            Ok(format!("{c} = CAST({p} AS {ty})"))
+                        }
+                        CondOp::In => {
+                            let p = self.bind(Bind::TextArray(self.path(slot)));
+                            Ok(format!("{c} = ANY (CAST({p} AS {ty}[]))"))
+                        }
+                        _ => Err(invalid("`parse` goes with `eq` and `in` only")),
+                    };
+                }
+                if *text {
+                    // Console only: the column's text against bound text, byte-wise.
+                    let lhs = format!("{c}::text COLLATE \"C\"");
+                    return match op {
+                        CondOp::Eq => {
+                            let p = self.bind(Bind::Text(self.path(slot)));
+                            Ok(format!("{lhs} = CAST({p} AS text)"))
+                        }
+                        CondOp::In => {
+                            let p = self.bind(Bind::TextArray(self.path(slot)));
+                            Ok(format!("{lhs} = ANY (CAST({p} AS text[]))"))
+                        }
+                        _ => Err(invalid("`text` goes with `eq` and `in` only")),
+                    };
+                }
                 let jsonb = column.type_sql == "jsonb" && !column.array;
                 let ty = cast_type(&column.type_sql);
                 let cmp = match op {

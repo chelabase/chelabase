@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8a4c4cbee8263f3472749e61953fda3dcd3a8935c67fd94fa7739de4856597e1 # shrinks to initial = Pg { roles: [RoleModel { usage: false, select: None, bypassrls: false, owns_table: false, tz: None, path: None }, RoleModel { usage: false, select: None, bypassrls: false, owns_table: false, tz: None, path: None }, RoleModel { usage: true, select: Table, bypassrls: false, owns_table: false, tz: None, path: None }], rls: true, force: false, policy: HourBefore(5), db_tz: -7, db_path: A, allow_a: {}, allow_b: {}, rows: {1: Row { tag: 0, hour_utc: 0 }, 2: Row { tag: 0, hour_utc: 0 }} }, steps = [(Insert { id: 0, tag: 0, hour: 2 }, None), (DbTz(0), Some(ViewPick { visible: 0, hidden: 157, ghost: None })), (Insert { id: 0, tag: 0, hour: 0 }, Some(ViewPick { visible: 85, hidden: 0, ghost: None })), (Delete { id: 0 }, None)]

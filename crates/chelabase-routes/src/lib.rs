@@ -43,6 +43,7 @@ pub enum Service {
     Orchestrator,
     Auth,
     Rest,
+    Realtime,
 }
 
 impl Service {
@@ -52,6 +53,7 @@ impl Service {
             Service::Orchestrator => "orchestrator",
             Service::Auth => "auth",
             Service::Rest => "rest",
+            Service::Realtime => "realtime",
         }
     }
 }
@@ -108,6 +110,9 @@ pub struct Endpoint {
     pub scope: Scope,
     pub service: Service,
     pub policy: Policy,
+    /// The route takes a websocket upgrade (a GET). Every other API route answers an
+    /// `Upgrade` request with 400 at the gateway.
+    pub websocket: bool,
 }
 
 pub mod orchestrator {
@@ -137,6 +142,7 @@ pub mod orchestrator {
                 cors: Cors::None,
                 access: Access::Public,
             },
+            websocket: false,
         }
     }
 
@@ -872,6 +878,7 @@ pub mod orchestrator {
                 cors: Cors::Studio,
                 access,
             },
+            websocket: false,
         }
     }
 }
@@ -891,6 +898,7 @@ pub mod rest {
             cors: Cors::Any,
             access: Access::DataKey,
         },
+        websocket: false,
     };
 
     pub const SCHEMA: Endpoint = Endpoint {
@@ -904,6 +912,7 @@ pub mod rest {
             cors: Cors::Any,
             access: Access::DataKey,
         },
+        websocket: false,
     };
 }
 
@@ -925,6 +934,7 @@ pub mod auth {
             scope: Scope::Api,
             service: Service::Auth,
             policy: POLICY,
+            websocket: false,
         }
     }
 
@@ -957,6 +967,7 @@ pub mod auth {
             scope: Scope::Api,
             service: Service::Auth,
             policy: APP_POLICY,
+            websocket: false,
         }
     }
 
@@ -993,6 +1004,42 @@ pub mod auth {
             cors: Cors::Any,
             access: Access::Public,
         },
+        websocket: false,
+    };
+}
+
+/// Realtime (S18), served by `realtime`.
+pub mod realtime {
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+
+    /// Mints a socket ticket for the signed-in user; project membership is checked at join.
+    pub const TICKET: Endpoint = Endpoint {
+        name: "realtime.ticket",
+        method: Method::Post,
+        path: "/v1/realtime/tickets",
+        scope: Scope::Api,
+        service: Service::Realtime,
+        policy: Policy {
+            auth: Auth::Management,
+            cors: Cors::Studio,
+            access: Access::SignedIn,
+        },
+        websocket: false,
+    };
+
+    /// The websocket. Public at the gateway: the one-shot ticket in the query is the credential.
+    pub const SOCKET: Endpoint = Endpoint {
+        name: "realtime.socket",
+        method: Method::Get,
+        path: "/v1/realtime/socket",
+        scope: Scope::Api,
+        service: Service::Realtime,
+        policy: Policy {
+            auth: Auth::Public,
+            cors: Cors::None,
+            access: Access::Public,
+        },
+        websocket: true,
     };
 }
 
@@ -1126,6 +1173,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     auth::APP_CHANGE_EMAIL,
     auth::APP_CHANGE_PASSWORD,
     auth::APP_JWKS,
+    realtime::TICKET,
+    realtime::SOCKET,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1849,6 +1898,9 @@ mod tests {
             ("auth.app_change_email", Access::DataKey),
             ("auth.app_change_password", Access::DataKey),
             ("auth.app_jwks", Access::Public),
+            // Realtime (RT1 T3, S18): membership is checked at join, not here.
+            ("realtime.ticket", Access::SignedIn),
+            ("realtime.socket", Access::Public),
         ];
         for (name, access) in table {
             let ep = ENDPOINTS
@@ -1861,5 +1913,92 @@ mod tests {
             assert!(table.iter().any(|(n, _)| *n == ep.name), "{} has no row in the table", ep.name);
         }
         assert_eq!(table.len(), ENDPOINTS.len());
+    }
+
+    // ---- RT1 T3: realtime endpoints (S18) ----
+
+    fn declared(method: Method, path: &str) -> &'static Endpoint {
+        ENDPOINTS
+            .iter()
+            .find(|e| e.method == method && e.path == path)
+            .unwrap_or_else(|| panic!("{} {path} is not in ENDPOINTS", method.as_str()))
+    }
+
+    #[test]
+    fn realtime_service_has_its_stable_name() {
+        assert_eq!(Service::Realtime.name(), "realtime");
+    }
+
+    #[test]
+    fn realtime_ticket_endpoint_is_a_studio_management_post() {
+        let ep = declared(Method::Post, "/v1/realtime/tickets");
+        assert_eq!(ep.service, Service::Realtime);
+        assert_eq!(ep.scope, Scope::Api);
+        assert_eq!(
+            ep.policy,
+            Policy { auth: Auth::Management, cors: Cors::Studio, access: Access::SignedIn }
+        );
+        assert!(!ep.websocket, "the ticket route is plain HTTP");
+    }
+
+    #[test]
+    fn realtime_socket_endpoint_is_a_public_websocket_get_without_cors() {
+        let ep = declared(Method::Get, "/v1/realtime/socket");
+        assert_eq!(ep.service, Service::Realtime);
+        assert_eq!(ep.scope, Scope::Api);
+        assert_eq!(
+            ep.policy,
+            Policy { auth: Auth::Public, cors: Cors::None, access: Access::Public }
+        );
+        assert!(ep.websocket);
+    }
+
+    #[test]
+    fn exactly_the_socket_route_is_a_websocket_and_it_is_a_get() {
+        let sockets: Vec<_> = ENDPOINTS.iter().filter(|e| e.websocket).collect();
+        assert_eq!(sockets.len(), 1, "{sockets:?}");
+        assert_eq!(sockets[0].path, "/v1/realtime/socket");
+        assert_eq!(sockets[0].method, Method::Get, "an upgrade is a GET");
+    }
+
+    #[test]
+    fn the_realtime_service_owns_exactly_the_two_realtime_routes() {
+        let mut paths: Vec<_> = ENDPOINTS
+            .iter()
+            .filter(|e| e.service == Service::Realtime)
+            .map(|e| (e.method, e.path))
+            .collect();
+        paths.sort_by_key(|(_, p)| *p);
+        assert_eq!(
+            paths,
+            [(Method::Get, "/v1/realtime/socket"), (Method::Post, "/v1/realtime/tickets")]
+        );
+        // And no other service claims a realtime path.
+        for ep in ENDPOINTS.iter().filter(|e| e.path.starts_with("/v1/realtime")) {
+            assert_eq!(ep.service, Service::Realtime, "{}", ep.name);
+        }
+    }
+
+    #[test]
+    fn realtime_routes_match_only_their_own_method_and_exact_path() {
+        assert_eq!(
+            match_endpoint(Scope::Api, "GET", "/v1/realtime/socket"),
+            Match::Found(declared(Method::Get, "/v1/realtime/socket"))
+        );
+        assert_eq!(
+            match_endpoint(Scope::Api, "POST", "/v1/realtime/tickets"),
+            Match::Found(declared(Method::Post, "/v1/realtime/tickets"))
+        );
+        assert_eq!(
+            match_endpoint(Scope::Api, "POST", "/v1/realtime/socket"),
+            Match::MethodNotAllowed(vec![Method::Get])
+        );
+        assert_eq!(
+            match_endpoint(Scope::Api, "GET", "/v1/realtime/tickets"),
+            Match::MethodNotAllowed(vec![Method::Post])
+        );
+        for path in ["/v1/realtime", "/v1/realtime/", "/v1/realtime/socket/x", "/v1/realtime/tickets/x", "/v1/realtime/other"] {
+            assert_eq!(match_endpoint(Scope::Api, "GET", path), Match::NotFound, "{path}");
+        }
     }
 }

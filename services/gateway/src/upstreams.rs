@@ -5,12 +5,14 @@ use chelabase_routes::Service;
 use std::collections::HashMap;
 
 const DEFAULT_REST: &str = "127.0.0.1:8085";
+const DEFAULT_REALTIME: &str = "127.0.0.1:8087";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstreams {
     orchestrator: String,
     auth: String,
     rest: String,
+    realtime: String,
     /// The pass-through sites that have an upstream.
     sites: HashMap<Site, String>,
 }
@@ -21,6 +23,7 @@ impl Upstreams {
             orchestrator: authority_from_url(orchestrator_url)?,
             auth: authority_from_url(auth_url)?,
             rest: DEFAULT_REST.to_string(),
+            realtime: DEFAULT_REALTIME.to_string(),
             sites: HashMap::new(),
         })
     }
@@ -28,6 +31,12 @@ impl Upstreams {
     /// Where `rest` (the data API) lives.
     pub fn with_rest(mut self, rest_url: &str) -> Result<Self, String> {
         self.rest = authority_from_url(rest_url)?;
+        Ok(self)
+    }
+
+    /// Where `realtime` (the websocket service) lives.
+    pub fn with_realtime(mut self, realtime_url: &str) -> Result<Self, String> {
+        self.realtime = authority_from_url(realtime_url)?;
         Ok(self)
     }
 
@@ -42,6 +51,7 @@ impl Upstreams {
             Service::Orchestrator => &self.orchestrator,
             Service::Auth => &self.auth,
             Service::Rest => &self.rest,
+            Service::Realtime => &self.realtime,
         }
     }
 
@@ -120,6 +130,18 @@ mod tests {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
         for bad in ["https://studio:3000", "http://studio", "http://studio:3000/app"] {
             assert!(upstreams.clone().with_site(Site::Studio, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn realtime_has_its_own_upstream_checked_like_the_others() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        assert_eq!(upstreams.addr(Service::Realtime), "127.0.0.1:8087");
+        let set = upstreams.clone().with_realtime("http://realtime:9000/").unwrap();
+        assert_eq!(set.addr(Service::Realtime), "realtime:9000");
+        assert_eq!(set.addr(Service::Rest), "127.0.0.1:8085");
+        for bad in ["https://realtime:9000", "http://realtime", "http://realtime:9000/x"] {
+            assert!(upstreams.clone().with_realtime(bad).is_err(), "{bad}");
         }
     }
 }

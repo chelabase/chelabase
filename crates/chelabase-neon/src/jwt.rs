@@ -18,16 +18,63 @@ const TOKEN_TTL_SECS: u64 = 300;
 pub const PRIVATE_KEY_FILE: &str = "compute-jwt.pem";
 pub const PUBLIC_KEY_FILE: &str = "compute-jwt.pub";
 
+/// The public key as SPKI PEM, derived from [`PUBLIC_KEY_FILE`] by the workbench: the pageserver,
+/// safekeepers and storage controller verify storage tokens against it.
+pub const PUBLIC_PEM_FILE: &str = "compute-jwt.pub.pem";
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     compute_id: String,
     exp: u64,
 }
 
+/// What a storage token opens (Neon's `utils::auth::Scope`; the pageserver, safekeepers and
+/// storage controller check it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageScope {
+    /// One tenant's data on the pageserver and safekeepers: what a compute holds.
+    Tenant(crate::NeonId),
+    /// Every pageserver API (the storage controller's calls).
+    PageServerApi,
+    /// Every safekeeper API (the pageserver's WAL reads, the storage controller, peers).
+    SafekeeperData,
+    /// The pageserver's upcalls to the storage controller.
+    GenerationsApi,
+    /// Every storage controller route.
+    Admin,
+    /// The storage controller's infrastructure routes (node registration).
+    Infra,
+}
+
+impl StorageScope {
+    fn name(&self) -> &'static str {
+        match self {
+            StorageScope::Tenant(_) => "tenant",
+            StorageScope::PageServerApi => "pageserverapi",
+            StorageScope::SafekeeperData => "safekeeperdata",
+            StorageScope::GenerationsApi => "generations_api",
+            StorageScope::Admin => "admin",
+            StorageScope::Infra => "infra",
+        }
+    }
+}
+
+/// Neon's storage claims: no `exp` (a compute presents its token on every reconnect for its
+/// whole life), no `compute_id` or `aud` (compute_ctl never takes one), `tenant_id` only on a
+/// tenant token.
+#[derive(Serialize)]
+struct StorageClaims<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
+    scope: &'a str,
+}
+
 pub struct ComputeSigner {
     key: EncodingKey,
     /// Base64url (no padding) Ed25519 public key: the JWK `x` parameter.
     public_x: String,
+    /// The same public key as SPKI PEM.
+    public_pem: String,
     kid: String,
 }
 
@@ -40,9 +87,11 @@ impl ComputeSigner {
         let public_x = public_x.trim();
         // From the trimmed key, so a trailing newline in a key file can't change the kid.
         let kid = hex::encode(&Sha256::digest(public_x.as_bytes())[..8]);
+        let public_pem = spki_pem(public_x)?;
         let signer = Self {
             key,
             public_x: public_x.to_string(),
+            public_pem,
             kid,
         };
         let token = signer.token_for("self-test")?;
@@ -76,11 +125,49 @@ impl ComputeSigner {
         Ok(jsonwebtoken::encode(&header, &claims, &self.key)?)
     }
 
+    /// The public key as SPKI PEM (`-----BEGIN PUBLIC KEY-----`), as Neon's `JwtAuth` reads it.
+    pub fn public_key_pem(&self) -> &str {
+        &self.public_pem
+    }
+
+    /// A storage token for `scope`, without expiry. Ed25519 signatures are deterministic, so
+    /// the same scope always gives the same token.
+    pub fn storage_token(&self, scope: &StorageScope) -> anyhow::Result<String> {
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(self.kid.clone());
+        let claims = StorageClaims {
+            tenant_id: match scope {
+                StorageScope::Tenant(tenant) => Some(tenant.to_string()),
+                _ => None,
+            },
+            scope: scope.name(),
+        };
+        Ok(jsonwebtoken::encode(&header, &claims, &self.key)?)
+    }
+
     fn verify(&self, token: &str) -> anyhow::Result<String> {
         let key = DecodingKey::from_ed_components(&self.public_x)?;
         let data = jsonwebtoken::decode::<Claims>(token, &key, &Validation::new(Algorithm::EdDSA))?;
         Ok(data.claims.compute_id)
     }
+}
+
+/// The SPKI PEM of a base64url (no padding) Ed25519 public key.
+fn spki_pem(public_x: &str) -> anyhow::Result<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::VerifyingKey;
+    use ed25519_dalek::pkcs8::EncodePublicKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+
+    let bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(public_x)
+        .context("the public key isn't base64url")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("the public key isn't 32 bytes"))?;
+    let key = VerifyingKey::from_bytes(&bytes).context("the public key isn't an Ed25519 point")?;
+    key.to_public_key_pem(LineEnding::LF)
+        .context("encoding the public key as PEM")
 }
 
 /// A fresh Ed25519 key pair for [`ComputeSigner::new`]: the PKCS#8 PEM private key and the
@@ -100,6 +187,12 @@ pub fn generate_keypair() -> (String, String) {
         .expect("PKCS#8 PEM")
         .to_string();
     (pem, URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()))
+}
+
+/// A storage token for `scope`, signed with the key pair in `dir` (live tests and tools that
+/// call the storage controller or the safekeepers).
+pub fn storage_token_from_dir(dir: &std::path::Path, scope: &StorageScope) -> anyhow::Result<String> {
+    load_signer(dir)?.storage_token(scope)
 }
 
 /// The key pair `chelabase dev bootstrap` writes into `dir`.

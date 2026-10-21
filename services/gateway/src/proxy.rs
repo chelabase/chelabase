@@ -79,11 +79,7 @@ impl ProxyHttp for Gateway {
         let method = req.method.as_str().to_owned();
         let path = req.uri.path().to_owned();
         let headers = req.headers.clone();
-        let host = headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| req.uri.authority().map(|a| a.as_str().to_string()));
+        let host = request_host(req);
 
         let client_ip = session
             .client_addr()
@@ -105,11 +101,45 @@ impl ProxyHttp for Gateway {
         ctx.host = host;
         match handled.outcome {
             Outcome::Proxy(plan) => {
+                // W17: only a websocket route takes an upgrade, and only a websocket one, and
+                // only on HTTP/1.1. Pingora's `is_upgrade_req` looks at HTTP/1.1 alone, so the
+                // `Upgrade` header is checked on every version: on HTTP/1.0 it is refused,
+                // never forwarded.
+                //
+                // The gateway serves HTTP/1 only. HTTP/2 has a second way to open a socket,
+                // extended CONNECT (RFC 8441: `:method CONNECT` with a `:protocol` pseudo-header,
+                // no `Upgrade` header at all), which this check doesn't see; enabling h2 must
+                // refuse extended CONNECT here on every non-websocket route.
+                if asks_upgrade(session.req_header()) {
+                    let req = session.req_header();
+                    if !plan.endpoint.websocket
+                        || req.version != http::Version::HTTP_11
+                        || !is_websocket_upgrade(&req.headers)
+                    {
+                        // The route's CORS headers, so Studio's browser can read the 400.
+                        let resp = GatewayResponse {
+                            status: 400,
+                            headers: plan.response_headers.clone(),
+                            body: Some(error_json("invalid_request", "this route does not take a protocol upgrade")),
+                        };
+                        write_gateway_response(session, &resp, &ctx.request_id).await?;
+                        return Ok(true);
+                    }
+                    // Both directions of the socket may sit idle up to an hour (S18); the
+                    // client side is read through the body reader, whose default is 60 s.
+                    session.set_read_timeout(Some(WEBSOCKET_READ_TIMEOUT));
+                }
                 ctx.plan = Some(plan);
                 Ok(false)
             }
             Outcome::Site(site) => {
                 ctx.site = Some(site);
+                // A site takes any upgrade, but only on HTTP/1.1 (Pingora would forward an
+                // HTTP/1.0 `Upgrade` without treating the connection as upgraded).
+                if asks_upgrade(session.req_header()) && session.req_header().version != http::Version::HTTP_11 {
+                    write_plain_response(session, 400, &ctx.request_id).await?;
+                    return Ok(true);
+                }
                 // An upgraded connection (a websocket) reads the client through the body
                 // reader, whose default idle limit is 60 s.
                 if session.is_upgrade_req() {
@@ -139,7 +169,14 @@ impl ProxyHttp for Gateway {
                 );
                 (addr, timeout)
             }
-            (None, Some(plan)) => (self.upstreams.addr(plan.endpoint.service), self.read_timeout),
+            (None, Some(plan)) => {
+                let timeout = if plan.endpoint.websocket && session.is_upgrade_req() {
+                    WEBSOCKET_READ_TIMEOUT
+                } else {
+                    self.read_timeout
+                };
+                (self.upstreams.addr(plan.endpoint.service), timeout)
+            }
             (None, None) => return Err(Error::explain(ErrorType::InternalError, "no proxy plan")),
         };
         if ctx.candidates.is_empty() {
@@ -267,6 +304,14 @@ impl ProxyHttp for Gateway {
         }
     }
 
+    /// W16: what pingora puts in its error logs. The default prints the request line, query
+    /// included, and the realtime ticket travels in the query; this is method, path, host.
+    fn request_summary(&self, session: &Session, _ctx: &RequestCtx) -> String {
+        let req = session.req_header();
+        let host = request_host(req);
+        format!("{} {}, Host: {}", req.method, req.uri.path(), host.as_deref().unwrap_or("-"))
+    }
+
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut RequestCtx) {
         let req = session.req_header();
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
@@ -286,6 +331,29 @@ impl ProxyHttp for Gateway {
             duration_ms = ctx.started.elapsed().as_millis() as u64,
             "request"
         );
+    }
+}
+
+/// The request's host: its `Host` header, else an absolute-form target's authority.
+fn request_host(req: &RequestHeader) -> Option<String> {
+    req.headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri.authority().map(|a| a.as_str().to_string()))
+}
+
+/// Whether the request carries an `Upgrade` header, on any HTTP version.
+fn asks_upgrade(req: &RequestHeader) -> bool {
+    req.headers.contains_key(http::header::UPGRADE)
+}
+
+/// Whether the request's `Upgrade` header asks for exactly a websocket.
+fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
+    let mut values = headers.get_all(http::header::UPGRADE).iter();
+    match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().is_ok_and(|v| v.trim().eq_ignore_ascii_case("websocket")),
+        _ => false,
     }
 }
 
@@ -420,6 +488,26 @@ fn failure_status(source: &ErrorSource, etype: &ErrorType) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upgrade_headers(values: &[&str]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for v in values {
+            h.append(http::header::UPGRADE, http::HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn only_a_single_websocket_upgrade_value_is_accepted() {
+        assert!(is_websocket_upgrade(&upgrade_headers(&["websocket"])));
+        assert!(is_websocket_upgrade(&upgrade_headers(&["WebSocket"])));
+        assert!(is_websocket_upgrade(&upgrade_headers(&[" websocket "])));
+        assert!(!is_websocket_upgrade(&upgrade_headers(&["h2c"])));
+        assert!(!is_websocket_upgrade(&upgrade_headers(&["websocket, h2c"])));
+        assert!(!is_websocket_upgrade(&upgrade_headers(&["websocket", "h2c"])));
+        assert!(!is_websocket_upgrade(&upgrade_headers(&[""])));
+        assert!(!is_websocket_upgrade(&http::HeaderMap::new()));
+    }
 
     #[tokio::test]
     async fn resolves_hostnames_to_socket_addresses() {

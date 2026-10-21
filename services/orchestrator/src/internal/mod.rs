@@ -9,6 +9,7 @@ mod ddl;
 mod hooks;
 mod invite;
 mod proxy;
+pub mod realtime;
 mod signup;
 mod spec;
 
@@ -189,6 +190,12 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         zitadel_user_id: &str,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError>> + Send;
+
+    /// The tenant bound to this Zitadel org, if any (the webhook's access events, RT1 T6).
+    fn tenant_by_org(
+        &self,
+        zitadel_org_id: &str,
+    ) -> impl Future<Output = Result<Option<chelabase_types::TenantId>, MetadataError>> + Send;
 }
 
 /// A tenant's sign-up state.
@@ -353,6 +360,12 @@ impl NeonMetadataPort for MetadataClient {
             has_members: MetadataClient::tenant_has_members(self, tenant).await?,
         }))
     }
+    async fn tenant_by_org(
+        &self,
+        zitadel_org_id: &str,
+    ) -> Result<Option<chelabase_types::TenantId>, MetadataError> {
+        MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await
+    }
 }
 
 pub struct InternalState<M, L> {
@@ -369,6 +382,10 @@ pub struct InternalState<M, L> {
     pub data_keys_token: String,
     /// The REST service's token for connection info.
     pub rest_token: String,
+    /// Realtime's token: connection info and key lookups too (`require_any_bearer`, R10).
+    pub realtime_token: String,
+    /// Publishes realtime's events (the DDL hook's `pg_database.*`, the webhook's access ones).
+    pub rt_events: Arc<dyn realtime::RtEvents>,
     /// Opens the `authenticator` passwords handed to the REST service, and re-seals an API
     /// role's password when SQL renames it.
     pub secrets: SecretKey,
@@ -429,25 +446,29 @@ where
             storcon_token,
             require_bearer,
         ));
-    let data_keys_token: Arc<str> = state.data_keys_token.as_str().into();
+    // Realtime reads key lookups and connection info too (R10), with its own token.
+    let realtime_token: Arc<str> = state.realtime_token.as_str().into();
+    let data_keys_tokens: Arc<[Arc<str>]> =
+        Arc::new([state.data_keys_token.as_str().into(), realtime_token.clone()]);
     let data_keys = Router::new()
         .route("/internal/data/keys/{sha256}", get(data::key_lookup::<M, L>))
         .route_layer(middleware::from_fn_with_state(
-            data_keys_token,
-            require_bearer,
+            data_keys_tokens,
+            require_any_bearer,
         ));
     let signup_token: Arc<str> = state.app_auth_token.as_str().into();
     let signup = Router::new()
         .route("/internal/signup/allowed", get(signup::allowed::<M, L>))
         .route("/internal/invites/describe", post(invite::describe::<M, L>))
         .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));
-    let rest_token: Arc<str> = state.rest_token.as_str().into();
+    let rest_tokens: Arc<[Arc<str>]> =
+        Arc::new([state.rest_token.as_str().into(), realtime_token]);
     let rest = Router::new()
         .route(
             "/internal/data/branches/{id}/connection",
             get(data::branch_connection::<M, L>),
         )
-        .route_layer(middleware::from_fn_with_state(rest_token, require_bearer));
+        .route_layer(middleware::from_fn_with_state(rest_tokens, require_any_bearer));
     Router::new()
         .route("/health", get(health))
         .route(
@@ -483,22 +504,25 @@ pub(crate) fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
 }
 
 /// Runs before extractors, so a caller without the token learns nothing about the body format.
-async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: Next) -> Response {
+pub(crate) async fn require_bearer(State(token): State<Arc<str>>, request: Request, next: Next) -> Response {
     match bearer(request.headers()) {
-        Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => next.run(request).await,
+        // An empty bearer never matches, even a token left empty by mistake.
+        Some(t) if !t.is_empty() && constant_time_eq(t.as_bytes(), token.as_bytes()) => {
+            next.run(request).await
+        }
         _ => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
 /// Like [`require_bearer`], for routes two callers share.
-async fn require_any_bearer(
+pub(crate) async fn require_any_bearer(
     State(tokens): State<Arc<[Arc<str>]>>,
     request: Request,
     next: Next,
 ) -> Response {
     match bearer(request.headers()) {
         // Every token is compared, so timing doesn't show which one matched.
-        Some(t) if tokens
+        Some(t) if !t.is_empty() && tokens
             .iter()
             .fold(false, |hit, token| constant_time_eq(t.as_bytes(), token.as_bytes()) | hit) =>
         {

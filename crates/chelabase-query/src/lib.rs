@@ -20,17 +20,19 @@ mod fake_pg;
 pub mod openapi;
 pub mod pipeline;
 pub mod query;
+pub mod realtime;
+pub mod roles;
 pub mod schema;
 pub mod server_tls;
 pub mod shape;
 pub mod sql;
 
 pub use engine::{
-    QueryCache, RunAs, RunSettings, SchemaKey, load_schema, run, schema_for, with_transaction,
+    QueryCache, RunAs, RunSettings, SchemaKey, console_session, load_schema, run, schema_for, with_transaction,
 };
 pub use error::QueryFailure;
 pub use pipeline::{Lease, QueryClient};
-pub use query::{Op, Parsed, QueryError, parse};
+pub use query::{Op, ParseMode, Parsed, QueryError, parse, parse_with};
 pub use schema::{RoleView, Schema, introspect, role_view, visibility};
 pub use shape::shape_hash;
 pub use sql::plan;

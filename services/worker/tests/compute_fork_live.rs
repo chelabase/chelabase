@@ -22,6 +22,17 @@ use worker::ports::SpecPusher;
 mod common;
 use common::{cleanup, setup};
 
+/// The realtime role with a password these tests know. Since RT1 T5 the worker makes the role
+/// at provisioning; before, nothing did: both cases end with the role and this password.
+const REALTIME_ROLE_WITH_TEST_PASSWORD: &str = "DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'chelabase_realtime') THEN
+    CREATE ROLE chelabase_realtime LOGIN REPLICATION NOBYPASSRLS NOINHERIT;
+  END IF;
+END
+$$;
+ALTER ROLE chelabase_realtime PASSWORD 'rt-live-pw';";
+
 struct Db {
     worker: RealWorker,
     metadata: MetadataClient,
@@ -171,7 +182,7 @@ async fn chelabase_keys_ships_and_decodes() {
 #[ignore = "needs the workbench stack on the round-3 images"]
 async fn realtime_role_is_restricted() {
     with_db(|db| async move {
-        db.sql("postgres", "CREATE ROLE chelabase_realtime LOGIN REPLICATION NOBYPASSRLS NOINHERIT PASSWORD 'rt-live-pw';").await;
+        db.sql("postgres", REALTIME_ROLE_WITH_TEST_PASSWORD).await;
         let normal = db.conninfo("chelabase_realtime", "rt-live-pw", false).await;
         let repl = db.conninfo("chelabase_realtime", "rt-live-pw", true).await;
         let err = db.psql(&normal, "SELECT 1;").await.unwrap_err();
@@ -195,7 +206,7 @@ async fn realtime_role_is_restricted() {
 #[ignore = "needs the workbench stack on the round-3 images"]
 async fn realtime_slot_goes_with_a_compute_restart() {
     with_db(|db| async move {
-        db.sql("postgres", "CREATE ROLE chelabase_realtime LOGIN REPLICATION NOBYPASSRLS NOINHERIT PASSWORD 'rt-live-pw';").await;
+        db.sql("postgres", REALTIME_ROLE_WITH_TEST_PASSWORD).await;
         let repl = db.conninfo("chelabase_realtime", "rt-live-pw", true).await;
         let mut child = tokio::process::Command::new("psql")
             .args([repl.as_str(), "-X", "-qtA"])

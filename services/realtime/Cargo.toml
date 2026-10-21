@@ -1,0 +1,60 @@
+[package]
+name = "realtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase realtime: tickets, one WebSocket per tab, table and project channels, presence across instances"
+
+[lib]
+name = "realtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "realtime"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = { workspace = true }
+anyhow = { workspace = true }
+# T8: the lease and slot-index buckets (S4).
+async-nats = { workspace = true, features = ["kv"] }
+async-trait = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chelabase-auth = { workspace = true }
+chelabase-nats = { workspace = true }
+# T8: the check SQL (`realtime`), `console_session` and `OWNER_LEVEL_SQL`.
+chelabase-query = { workspace = true }
+chelabase-types = { workspace = true }
+dotenvy = { workspace = true }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+redis = { workspace = true }
+reqwest = { workspace = true }
+# The process-wide aws-lc-rs provider for Valkey TLS (S7).
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+# T8: the replication session (CopyBoth, `PgLsn`) and the check pools.
+tokio-postgres = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# The JWKS mock (OidcVerifier tests) and the gateway's identity signer (ticket requests).
+chelabase-auth = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+# T8: the §4 invariant model test.
+proptest = { workspace = true }
+# Paused time for the TTL tests.
+tokio = { workspace = true, features = ["test-util"] }
+# The tests' WebSocket client: the version axum's `ws` uses, so the tree has one tungstenite.
+tokio-tungstenite = "0.29.0"

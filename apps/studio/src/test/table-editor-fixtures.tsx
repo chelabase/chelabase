@@ -2,6 +2,7 @@ import { vi } from "vitest";
 import userEvent from "@testing-library/user-event";
 import type { Table } from "@chelabase/management-client";
 import { TableEditor } from "@/components/table-editor/table-editor";
+import type { RealtimeClient } from "@/lib/realtime/types";
 import type { EditorParams } from "@/lib/table-editor/context";
 import { invoices } from "@/lib/table-editor/test-tables";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "./fake-fetch";
@@ -71,7 +72,40 @@ export const schemaChanges: FakeHandler = async (req) => {
   return jsonResponse({ dry_run: !!body.dry_run, committed: !body.dry_run, would_succeed: body.dry_run ? true : null, statements });
 };
 
+type TextItem = { text_of: string; as: string };
+/** What the server adds for a select's `text_of` items (S9): each column's text under its alias (null stays null). */
+export function addTextAliases(tree: { select?: unknown } | undefined, row: Record<string, unknown>): Record<string, unknown> {
+  const items = Array.isArray(tree?.select) ? (tree.select as unknown[]).filter((i): i is TextItem => typeof i === "object" && i !== null && "text_of" in i) : [];
+  if (items.length === 0) return row;
+  // A row may carry `$text`, the session text of columns whose JSON form differs (timestamps, numerics).
+  const { $text, ...plain } = row as Record<string, unknown> & { $text?: Record<string, string> };
+  const out: Record<string, unknown> = { ...plain };
+  for (const i of items) out[i.as] = plain[i.text_of] === null || plain[i.text_of] === undefined ? null : ($text?.[i.text_of] ?? String(plain[i.text_of]));
+  return out;
+}
+/** A console handler whose select answers carry the `text_of` aliases the request asked for (the server's part). */
+export function serverAliases(handler: FakeHandler): FakeHandler {
+  return async (req) => {
+    const copy = req.clone();
+    const res = await handler(req);
+    const body = (await copy.json().catch(() => null)) as { tree?: { op?: string; select?: unknown } } | null;
+    if (!res.ok || body?.tree?.op !== "select") return res;
+    const rows = (await res.clone().json()) as Record<string, unknown>[];
+    if (!Array.isArray(rows)) return res;
+    return jsonResponse(rows.map((r) => addTextAliases(body.tree, r)));
+  };
+}
+/** Applies a by-key `where` (`eq` / `in` with `parse: true`, or `text: true`) to rows; any other where returns them all. */
+export function filterByTextKey(where: any, rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (!where || (where.parse !== true && where.text !== true)) return rows;
+  if ("eq" in where) return rows.filter((r) => String(r[where.col]) === where.eq);
+  if (Array.isArray(where.in)) return rows.filter((r) => where.in.includes(String(r[where.col])));
+  return rows;
+}
+
 export interface EditorSetup {
+  /** The tab's realtime client (a FakeRealtime); none = no realtime. */
+  realtime?: RealtimeClient;
   me?: ReturnType<typeof meAs>;
   params?: EditorParams;
   table?: Table;
@@ -80,7 +114,7 @@ export interface EditorSetup {
   routes?: Record<string, FakeHandler>;
 }
 export function editorRoutes(o: EditorSetup = {}): Record<string, FakeHandler> {
-  return {
+  const routes: Record<string, FakeHandler> = {
     "GET /v1/me": () => jsonResponse(o.me ?? meAs("admin")),
     // The real list carries `ProjectInfo` (no databases); databases come from `/v1/me` (`tenant.projects`).
     "GET /v1/projects": () => jsonResponse(PROJECTS.map(({ databases: _, ...p }) => ({ ...p, app_users: null, error: null, created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-01T00:00:00Z" }))),
@@ -92,15 +126,21 @@ export function editorRoutes(o: EditorSetup = {}): Record<string, FakeHandler> {
     [`GET ${B}/types`]: () => jsonResponse(TYPES),
     [`GET ${T}`]: () => jsonResponse(o.table ?? invoices()),
     [`GET ${B}/tables/public/customers`]: () => jsonResponse(invoices({ name: "customers" } as Partial<Table>)),
-    [`POST ${B}/console/query`]: () => jsonResponse(o.rows ?? ROWS),
+    [`POST ${B}/console/query`]: async (req) => {
+      const b = (await req.clone().json()) as { tree: { op: string; where?: unknown } };
+      return jsonResponse(b.tree.op === "select" ? filterByTextKey(b.tree.where, o.rows ?? ROWS) : (o.rows ?? ROWS));
+    },
     [`POST ${B}/schema-changes`]: schemaChanges,
     ...o.routes,
   };
+  const consoleKey = `POST ${B}/console/query`;
+  routes[consoleKey] = serverAliases(routes[consoleKey]);
+  return routes;
 }
 export function renderEditor(o: EditorSetup = {}) {
   const navigate = vi.fn();
   const f: FakeFetch = fakeFetch(editorRoutes(o));
-  const result = renderWithQuery(<TableEditor params={o.params ?? FULL} navigate={navigate} />, { fetch: f });
+  const result = renderWithQuery(<TableEditor params={o.params ?? FULL} navigate={navigate} />, { fetch: f, realtime: o.realtime });
   return { ...result, f, navigate, user: userEvent.setup() };
 }
 /** The JSON bodies of the requests to `path` with `method`, in order. */

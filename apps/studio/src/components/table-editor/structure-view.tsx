@@ -1,12 +1,14 @@
-import type { ReactNode } from "react";
+import { useEffect, useReducer, type ReactNode } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
-import type { Grant, Policy, RoleRef, Table } from "@chelabase/management-client";
+import { getGetTableQueryKey, useGetTable, type Grant, type Policy, type RoleRef, type Table } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import type { Mark, ProjectedColumn } from "@/lib/table-editor/changeset";
 import { errorText } from "@/lib/errors";
 import { useTableEditor } from "@/lib/table-editor/store";
 import { cn } from "@/lib/utils";
 import { AddConstraintButton, ConstraintActions } from "./constraints-section";
+import { READ_ONLY_KIND, ROWS_QUERY } from "./rows-view";
 import { TableActions } from "./table-actions";
 import type { TableTarget } from "./target";
 import { useTableStructure } from "./use-structure";
@@ -15,9 +17,13 @@ export interface StructureViewProps {
   target: TableTarget;
   /** Why structure can't be changed here (protected branch, Viewer), or null. */
   reason?: string | null;
+  /** The object's kind from the object list (`view`, …), for an object that isn't an editable table. */
+  kind?: string;
 }
 
 const READ_ONLY = "Read-only here for now";
+/** The last part of the query key a non-table object's definition is cached under. */
+const OBJECT_DEFINITION = "object-definition";
 
 const KIND_TEXT = { primary_key: "primary key", unique: "unique", foreign_key: "foreign key", check: "check", exclusion: "exclusion" } as const;
 
@@ -62,7 +68,97 @@ function identityText(base: Table, c: ProjectedColumn): string | null {
  * The Structure tab: Columns (a row opens its form), Constraints, the read-only Indexes, Policies and
  * Grants, and the Table's own settings. Pending changes show with their marks.
  */
-export function StructureView({ target, reason: structureReason = null }: StructureViewProps) {
+export function StructureView(props: StructureViewProps) {
+  return props.target.notTable ? <ObjectStructure target={props.target} kind={props.kind} /> : <TableStructureView {...props} />;
+}
+
+/**
+ * The Structure tab of an object that isn't an editable table (a view, materialized view, foreign or partitioned
+ * table): its columns with their SQL types, read-only, from the table endpoint (asked here only, never on the Rows
+ * tab). When the endpoint can't answer, the columns are the names its rows came back with on the Rows tab.
+ */
+function ObjectStructure({ target, kind }: { target: TableTarget; kind?: string }) {
+  const { databaseId, branchId, database, schema, table } = target;
+  const params = database ? { database } : undefined;
+  // Its own cache entry (under the table's key, so a refresh of the table's queries reaches it): the Rows tab's
+  // disabled table queries must never pick a view's definition up from the cache. Not retried: a failure falls back
+  // to the names. Fresh for the app's default 10s, set here so leaving the tab and coming back doesn't ask again.
+  const got = useGetTable(databaseId, branchId, schema, table, params, {
+    query: { retry: false, staleTime: 10_000, queryKey: [...getGetTableQueryKey(databaseId, branchId, schema, table, params), OBJECT_DEFINITION] },
+  });
+  const note = READ_ONLY_KIND[kind ?? ""] ?? "This object is read-only here.";
+  return (
+    <div className="min-h-0 flex-1 space-y-8 overflow-auto p-4">
+      {got.data ? (
+        <>
+          <p className="text-[13px] text-chalk-dim">{note}</p>
+          <Section title="Columns">
+            {got.data.columns.length === 0 ? (
+              <Empty>No columns</Empty>
+            ) : (
+              <table className="w-full border-collapse text-left text-[13px]">
+                <thead className="text-xs text-chalk-dim">
+                  <tr>
+                    <th className={cn(rowClass, "font-normal")}>Name</th>
+                    <th className={cn(rowClass, "font-normal")}>Type</th>
+                    <th className={cn(rowClass, "font-normal")}>Null</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {got.data.columns.map((c) => (
+                    <tr key={c.name} data-column={c.name}>
+                      <td className={cn(rowClass, "font-mono text-chalk")}>{c.name}</td>
+                      <td data-testid="column-type" className={cn(rowClass, "font-mono text-chalk-dim")}>
+                        {c.data_type}
+                      </td>
+                      <td className={cn(rowClass, "text-chalk-dim")}>{c.not_null ? "not null" : "null"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </Section>
+        </>
+      ) : got.error ? (
+        <ColumnNames target={target} note={note} />
+      ) : (
+        <p className="text-[13px] text-chalk-dim">Loading the columns…</p>
+      )}
+    </div>
+  );
+}
+
+/** The fallback when the definition can't be read: the column names the object's rows came back with. */
+function ColumnNames({ target, note }: { target: TableTarget; note: string }) {
+  const queryClient = useQueryClient();
+  // Read again whenever the query cache changes (the rows may arrive after this tab opened).
+  const [, cacheChanged] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => queryClient.getQueryCache().subscribe(cacheChanged), [queryClient]);
+  const { databaseId, branchId, database, role, schema, table } = target;
+  const pages = queryClient.getQueriesData<{ rows?: Record<string, unknown>[] }>({ queryKey: [ROWS_QUERY, databaseId, branchId, database, role, `${schema}.${table}`] });
+  const first = pages.map(([, page]) => page?.rows?.[0]).find((r) => r !== undefined);
+  const names = first ? Object.keys(first) : [];
+  return (
+    <>
+      <p className="text-[13px] text-chalk-dim">
+        <span>{note}</span> <span>Column types aren&apos;t available for this object.</span>
+      </p>
+      <Section title="Columns">
+        {names.length === 0 ? (
+          <Empty>No rows read yet, so no columns to show.</Empty>
+        ) : (
+          <ul className="space-y-1 font-mono text-[13px] text-chalk">
+            {names.map((n) => (
+              <li key={n}>{n}</li>
+            ))}
+          </ul>
+        )}
+      </Section>
+    </>
+  );
+}
+
+function TableStructureView({ target, reason: structureReason = null }: StructureViewProps) {
   const { base, projected, error, reason: dropped } = useTableStructure(target);
   // A staged drop of the table leaves only the changes panel to work with.
   const reason = structureReason ?? dropped;

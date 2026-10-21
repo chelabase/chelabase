@@ -393,6 +393,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
+        // A reset or restore can bring back a catalog without the realtime role, or with an
+        // older password.
+        self.ensure_realtime(ep, &database_name).await;
         self.bootstrap_served_on(branch, ep, &database_name, &[])
             .await
             .map(|_| ())

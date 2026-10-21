@@ -35,9 +35,10 @@ The Rust workspace holds the control plane; a pnpm workspace holds Studio, this 
 | Worker | Runs the jobs: provisions computes, resets, bootstraps the data API, reconciles | [Neon](/docs/architecture/neon) |
 | rest | The data API engine: turns a JSON query into SQL and runs it | [Data API](/docs/architecture/data-api) |
 | auth | Sign-in backend for Studio and for app users | [Studio](/docs/architecture/studio), [App users](/docs/architecture/app-users) |
+| realtime | Live rows and presence over a WebSocket | [Realtime](/docs/architecture/realtime) |
 | Studio | The web app | [Studio](/docs/architecture/studio) |
 
-Zitadel is the identity provider, NATS JetStream carries the jobs, a metadata Postgres holds the control plane's own state, Valkey backs the proxy's cache invalidation and Mailpit catches local email.
+Zitadel is the identity provider, NATS JetStream carries the jobs, a metadata Postgres holds the control plane's own state, Valkey backs the proxy's cache invalidation and realtime's tickets, and Mailpit catches local email.
 
 ## How a request travels
 
@@ -60,6 +61,7 @@ This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, pre
   <Card title="Data API" href="/docs/architecture/data-api">The request flow, the schema model and the benchmark.</Card>
   <Card title="App users" href="/docs/architecture/app-users">Identity, tokens and how users are synced.</Card>
   <Card title="SQL editor" href="/docs/architecture/sql-editor">Execution, the guard, limits and audit.</Card>
+  <Card title="Realtime" href="/docs/architecture/realtime">Live rows, presence, ports, settings and secrets.</Card>
   <Card title="Neon" href="/docs/architecture/neon">The storage stack, the proxy and local ports.</Card>
   <Card title="API generation" href="/docs/architecture/api-generation">OpenAPI documents, generated clients and the reference UI.</Card>
   <Card title="Security" href="/docs/architecture/security">Trust boundaries and security notes.</Card>

@@ -2,6 +2,8 @@ import { useEffect, useRef, type ReactNode } from "react";
 import type { ObjectSummary } from "@chelabase/management-client";
 import type { RowAccess } from "@/lib/table-editor/access";
 import type { EditorParams } from "@/lib/table-editor/context";
+import { Button } from "@/components/ui/button";
+import { Modal } from "@/components/ui/dialog";
 import { useTableEditor } from "@/lib/table-editor/store";
 import { ChangesPanel } from "./changes-panel";
 import { ColumnFormPanel } from "./column-form";
@@ -24,9 +26,12 @@ export interface EditorPanelProps {
   totalBytes?: number | null;
 }
 
-/** Asks before the page unloads while any table has pending changes (they live in this tab only). */
-function useUnloadGuard() {
-  const pending = useTableEditor((s) => Object.keys(s.changesets).length > 0);
+/**
+ * Asks before the page unloads (the browser's own prompt) while any table has pending changes (they live in this tab
+ * only) or the row panel holds an unsaved draft.
+ */
+export function useUnloadGuard() {
+  const pending = useTableEditor((s) => Object.keys(s.changesets).length > 0 || s.rowDraft !== null);
   useEffect(() => {
     if (!pending) return;
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -52,7 +57,7 @@ export function EditorPanel({ target, access, object, params, navigate, structur
   const tableKey = target?.key ?? null;
   const previous = useRef(tableKey);
   useEffect(() => {
-    if (previous.current !== tableKey && panel.kind === "row") openPanel("closed");
+    if (previous.current !== tableKey && panel.kind === "row") openPanel("closed", undefined, { discard: true });
     previous.current = tableKey;
   }, [tableKey, panel.kind, openPanel]);
   const count = useTableEditor((s) => (target ? (s.changesets[target.key]?.edits.length ?? 0) : 0));
@@ -92,6 +97,27 @@ export function EditorPanel({ target, access, object, params, navigate, structur
     <PanelFrame key={`changes:${target.key}`} label="Pending changes" heading={heading} strip={heading}>
       <ChangesPanel target={target} reason={structureReason} totalBytes={totalBytes} onApplied={onApplied} />
     </PanelFrame>
+  );
+}
+
+/**
+ * "Discard changes to row N?": asked before anything drops the row panel's unsaved draft (`guardDiscard`). Escape and
+ * the dialog's own close keep editing.
+ */
+export function DiscardPrompt() {
+  const ask = useTableEditor((s) => s.discardAsk);
+  const answer = useTableEditor((s) => s.answerDiscard);
+  return (
+    <Modal open={ask !== null} onOpenChange={(open) => !open && answer(false)} title={ask?.title ?? ""} description="Your edits to this row haven't been saved.">
+      <div className="flex justify-end gap-2">
+        <Button variant="ghost" onClick={() => answer(false)}>
+          Keep editing
+        </Button>
+        <Button variant="destructive" onClick={() => answer(true)}>
+          Discard
+        </Button>
+      </div>
+    </Modal>
   );
 }
 

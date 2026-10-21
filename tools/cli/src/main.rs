@@ -165,9 +165,9 @@ enum WorkbenchCli {
         #[arg(long, value_delimiter = ',')]
         with: Vec<Site>,
     },
-    /// Rebuild and recreate apps (the five Rust apps when none is named)
+    /// Rebuild and recreate apps (the six Rust apps when none is named)
     Restart {
-        /// orchestrator, worker, gateway, auth, rest, studio, docs, landing
+        /// orchestrator, worker, gateway, auth, rest, realtime, studio, docs, landing
         apps: Vec<String>,
     },
     /// Stop a stack (its data stays) and release its slot

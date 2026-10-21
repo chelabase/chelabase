@@ -13,8 +13,36 @@ import { signOut } from "@/lib/sign-out";
 import { useStudioEnv } from "@/lib/env-context";
 import { useLoginClient } from "@/lib/login-client/use-login-client";
 import { createReauthGuard, restartSignInOnce, type ReauthGuard } from "@/lib/reauth";
+import { createRealtimeClient } from "@/lib/realtime/client";
+import { RealtimeContext } from "@/lib/realtime/context";
+import type { RealtimeClient } from "@/lib/realtime/types";
 
 export const Route = createFileRoute("/app")({ component: AppPage });
+
+/**
+ * The tab's realtime client while signed in. It opens its socket only when a page first joins a
+ * channel; every renewed token goes out as an `auth` frame (`userLoaded`), and signing out closes
+ * it for good (W32).
+ */
+function useRealtimeClient(apiUrl: string, authRef: RefObject<AuthContextProps>, signedIn: boolean, token: string | undefined): RealtimeClient | null {
+  const [client, setClient] = useState<RealtimeClient | null>(null);
+  useEffect(() => {
+    if (!signedIn) return;
+    const c = createRealtimeClient({ apiUrl, token: authRef.current.user?.access_token });
+    const detach = c.attachAuth(authRef.current.events);
+    setClient(c);
+    return () => {
+      detach();
+      c.close();
+      setClient(null);
+    };
+  }, [apiUrl, authRef, signedIn]);
+  // A token stored before the listener was attached (the events cover every later renewal).
+  useEffect(() => {
+    if (client && token) client.setToken(token);
+  }, [client, token]);
+  return client;
+}
 
 /**
  * Points the management client at this Studio's API with the signed-in user's token.
@@ -46,6 +74,7 @@ function AppPage() {
   const [guard] = useState(() => createReauthGuard(window.sessionStorage));
 
   useConfigureManagementClient(env.apiUrl, authRef, guard);
+  const realtime = useRealtimeClient(env.apiUrl, authRef, auth.isAuthenticated, auth.user?.access_token);
 
   const name = auth.user?.profile.name;
   const email = auth.user?.profile.email;
@@ -73,11 +102,13 @@ function AppPage() {
     <QueryClientProvider client={queryClient}>
       {/* The token value (not a getter) so pages re-render when it refreshes. */}
       <AccessTokenContext.Provider value={auth.user?.access_token}>
-        <AppSessionContext.Provider value={session}>
-          <SignedInApp profile={session.profile} onSignOut={session.onSignOut}>
-            <Outlet />
-          </SignedInApp>
-        </AppSessionContext.Provider>
+        <RealtimeContext.Provider value={realtime}>
+          <AppSessionContext.Provider value={session}>
+            <SignedInApp profile={session.profile} onSignOut={session.onSignOut}>
+              <Outlet />
+            </SignedInApp>
+          </AppSessionContext.Provider>
+        </RealtimeContext.Provider>
       </AccessTokenContext.Provider>
     </QueryClientProvider>
   );

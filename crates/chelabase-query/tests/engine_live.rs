@@ -507,3 +507,191 @@ async fn a_dropped_request_leaves_a_transaction_that_is_not_committed() {
     assert_eq!(state(&mut s.admin, s.pid).await, "idle");
     s.finish().await;
 }
+
+/// RT1 T4 (R18, W5): the console's text forms compare and read values by their text, so a
+/// numeric `1.50`, a bigint past 2^53, a timestamptz and a text with quotes and a backslash
+/// round-trip exactly (a JSON number or a re-parsed timestamp would not). Run it with:
+/// just workbench test -p chelabase-query --test engine_live -- --run-ignored only text_forms_compare_by_text
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn text_forms_compare_by_text() {
+    use chelabase_query::query::{ParseMode, parse, parse_with};
+    use serde_json::{Value, json};
+
+    let note = r#"O'Brien "x" \ end"#;
+    let mut s = Scratch::new().await;
+    s.sql(
+        "CREATE TABLE public.vals (id bigint PRIMARY KEY, num numeric(10,2), big bigint, \
+         ts timestamptz, note text);
+         INSERT INTO public.vals VALUES
+           (1, 1.50, 9007199254740993, '2026-10-16 12:00:00.5+00', 'O''Brien \"x\" \\ end'),
+           (2, 2.50, 9007199254740992, '2026-10-17 00:00:00+00', 'obrien'),
+           (3, NULL, NULL, NULL, NULL);",
+    )
+    .await;
+
+    async fn console(s: &Scratch, tree: Value) -> Value {
+        let op = parse_with(tree.to_string().as_bytes(), ParseMode::Console)
+            .unwrap_or_else(|e| panic!("{tree} should parse in console mode: {e}"))
+            .op;
+        let out = run(
+            &s.client,
+            &s.cache,
+            (s.branch, "main"),
+            RunAs::Owner { user: &s.user },
+            &settings(),
+            1 << 20,
+            &op,
+            "rid-text",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tree}: {} {}", e.code, e.message));
+        serde_json::from_str(&out).unwrap()
+    }
+    async fn ids(s: &Scratch, filter: Value) -> Vec<i64> {
+        let rows = console(
+            s,
+            json!({"v": 1, "op": "select", "from": "vals", "select": ["id"],
+                   "where": filter, "orderBy": [{"col": "id"}]}),
+        )
+        .await;
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect()
+    }
+    let text = |col: &str, values: Value| json!({"col": col, "in": values, "text": true});
+    let eq = |col: &str, v: &str| json!({"col": col, "eq": v, "text": true});
+
+    // Reading: every value comes back as its exact text, NULL as null.
+    let rows = console(
+        &s,
+        json!({"v": 1, "op": "select", "from": "vals", "orderBy": [{"col": "id"}],
+               "select": [{"text_of": "id", "as": "id_t"}, {"text_of": "num", "as": "num_t"},
+                          {"text_of": "big", "as": "big_t"}, {"text_of": "ts", "as": "ts_t"},
+                          {"text_of": "note", "as": "note_t"}]}),
+    )
+    .await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["id_t"], "1");
+    assert_eq!(rows[0]["num_t"], "1.50");
+    assert_eq!(rows[0]["big_t"], "9007199254740993");
+    assert_eq!(rows[0]["note_t"], note);
+    assert_eq!(rows[1]["num_t"], "2.50");
+    assert_eq!(rows[1]["big_t"], "9007199254740992");
+    for col in ["num_t", "big_t", "ts_t", "note_t"] {
+        assert_eq!(rows[2][col], Value::Null, "{col}");
+    }
+    assert!(rows[0]["ts_t"].as_str().unwrap().starts_with("2026-10-16 "), "{}", rows[0]["ts_t"]);
+    let ts = rows[0]["ts_t"].as_str().unwrap().to_owned();
+
+    // Comparing: by text, not by value.
+    assert_eq!(ids(&s, eq("num", "1.50")).await, vec![1]);
+    assert_eq!(ids(&s, eq("num", "1.5")).await, Vec::<i64>::new(), "1.5 is not the text 1.50");
+    assert_eq!(ids(&s, eq("num", "1.500")).await, Vec::<i64>::new());
+    assert_eq!(ids(&s, text("num", json!(["1.50", "2.50"]))).await, vec![1, 2]);
+    assert_eq!(ids(&s, eq("big", "9007199254740993")).await, vec![1]);
+    assert_eq!(ids(&s, eq("big", "9007199254740992")).await, vec![2]);
+    assert_eq!(ids(&s, eq("ts", &ts)).await, vec![1]);
+    assert_eq!(
+        ids(&s, eq("ts", "2026-10-16T12:00:00.5Z")).await,
+        Vec::<i64>::new(),
+        "the same instant in another spelling is another text"
+    );
+    assert_eq!(ids(&s, eq("note", note)).await, vec![1]);
+    assert_eq!(ids(&s, text("note", json!(["obrien", note]))).await, vec![1, 2]);
+    // COLLATE "C": exact, case-sensitive, byte-wise.
+    assert_eq!(ids(&s, eq("note", "OBRIEN")).await, Vec::<i64>::new());
+    // NULL rows never equal a text.
+    assert_eq!(ids(&s, eq("num", "")).await, Vec::<i64>::new());
+    // Mixed with ordinary conditions, and negated.
+    assert_eq!(
+        ids(&s, json!({"and": [eq("num", "1.50"), {"col": "big", "gt": 5}]})).await,
+        vec![1]
+    );
+    assert_eq!(
+        ids(&s, json!({"not": eq("note", note)})).await,
+        vec![2],
+        "NOT of a comparison with NULL is not true"
+    );
+    // The same trees are refused by the data API's parser.
+    let refused = json!({"v": 1, "op": "select", "from": "vals", "where": eq("num", "1.50")});
+    assert!(parse(refused.to_string().as_bytes()).is_err());
+    s.finish().await;
+}
+
+/// RT1 gf (item 3): what the console puts on the wire for a `numeric`. The row JSON keeps Postgres's own
+/// literal (scale and every digit), and NaN and the infinities are quoted strings, exactly as Postgres prints
+/// them; so Studio's `2.5` for `2.50` is lost in the browser, not here. The `text_of` read answers the same
+/// texts. Run it with:
+/// just workbench test -p chelabase-query --test engine_live -- --run-ignored only numeric_wire_keeps_postgres_text
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn numeric_wire_keeps_postgres_text() {
+    use serde_json::{Value, json};
+
+    let mut s = Scratch::new().await;
+    s.sql(
+        "CREATE TABLE public.money (id bigint PRIMARY KEY, price numeric(12,2), wide numeric);
+         INSERT INTO public.money VALUES
+           (1, 2.50, 12345678901234567890.12),
+           (2, 5.00, 0.10),
+           (3, 'NaN', 'Infinity'),
+           (4, NULL, '-Infinity');",
+    )
+    .await;
+    let (out, _) = s
+        .run(
+            json!({"v": 1, "op": "select", "from": "money", "orderBy": [{"col": "id"}]}),
+            1 << 20,
+        )
+        .await;
+    let body = out.unwrap();
+    for literal in [
+        r#""price":2.50"#,
+        r#""price":5.00"#,
+        r#""wide":12345678901234567890.12"#,
+        r#""wide":0.10"#,
+        r#""price":"NaN""#,
+        r#""wide":"Infinity""#,
+        r#""price":null"#,
+        r#""wide":"-Infinity""#,
+    ] {
+        assert!(body.contains(literal), "{literal} is Postgres's own literal in {body}");
+    }
+
+    let op = chelabase_query::parse_with(
+        json!({"v": 1, "op": "select", "from": "money", "orderBy": [{"col": "id"}],
+               "select": [{"text_of": "price", "as": "p"}, {"text_of": "wide", "as": "w"}]})
+        .to_string()
+        .as_bytes(),
+        chelabase_query::ParseMode::Console,
+    )
+    .unwrap()
+    .op;
+    let out = run(
+        &s.client,
+        &s.cache,
+        (s.branch, "main"),
+        RunAs::Owner { user: &s.user },
+        &settings(),
+        1 << 20,
+        &op,
+        "rid-numeric",
+    )
+    .await
+    .unwrap();
+    let rows: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        rows,
+        json!([
+            {"p": "2.50", "w": "12345678901234567890.12"},
+            {"p": "5.00", "w": "0.10"},
+            {"p": "NaN", "w": "Infinity"},
+            {"p": null, "w": "-Infinity"},
+        ])
+    );
+    s.finish().await;
+}

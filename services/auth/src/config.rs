@@ -26,6 +26,8 @@ pub struct Config {
     pub secure_cookies: bool,
     pub min_response: Duration,
     pub mode: Mode,
+    /// `CHELABASE_AUTH_TRUSTED_PROXY`: the proxies (the gateway) whose `X-Forwarded-For` counts.
+    pub trusted_proxies: crate::guard::TrustedProxies,
 }
 
 fn var(name: &str) -> Result<String> {
@@ -41,10 +43,6 @@ fn truthy(value: Option<&str>) -> bool {
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
-}
-
-fn flag(name: &str) -> bool {
-    truthy(std::env::var(name).ok().as_deref())
 }
 
 /// Self-hosted mode creates sign-ups with the email already verified; platform mode sends a
@@ -65,8 +63,9 @@ fn secure_cookies(scheme: Scheme, overridden: Option<&str>) -> bool {
     }
 }
 
-/// auth rate-limits on the rightmost `X-Forwarded-For` entry, which only the gateway can
-/// set if nothing else can reach auth: a non-loopback address needs an explicit opt-in.
+/// auth rate-limits on the rightmost `X-Forwarded-For` entry from a trusted proxy and on the TCP
+/// peer otherwise: a non-loopback address needs the proxy named, or every gateway request would
+/// share the gateway's address.
 fn check_listen(listen: &str, trusted_proxy: bool) -> Result<()> {
     let host = listen.rsplit_once(':').map_or(listen, |(h, _)| h);
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -78,9 +77,9 @@ fn check_listen(listen: &str, trusted_proxy: bool) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "CHELABASE_AUTH_ADDR={listen} is reachable without the gateway, so clients could forge \
-         X-Forwarded-For. Bind to loopback, or set CHELABASE_AUTH_TRUSTED_PROXY=true if only a \
-         proxy that appends X-Forwarded-For can reach it."
+        "CHELABASE_AUTH_ADDR={listen} is reachable without the gateway. Bind to loopback, or \
+         set CHELABASE_AUTH_TRUSTED_PROXY to the proxy that appends X-Forwarded-For (its host \
+         name or address, e.g. gateway): only its forwarded header is believed."
     )
 }
 
@@ -134,7 +133,11 @@ impl Config {
             .unwrap_or(DEFAULT_MIN_RESPONSE_MS);
         let listen =
             std::env::var("CHELABASE_AUTH_ADDR").unwrap_or_else(|_| "127.0.0.1:8084".into());
-        check_listen(&listen, flag("CHELABASE_AUTH_TRUSTED_PROXY"))?;
+        let trusted_proxies = crate::guard::TrustedProxies::parse(
+            &std::env::var("CHELABASE_AUTH_TRUSTED_PROXY").unwrap_or_default(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        check_listen(&listen, !trusted_proxies.is_empty())?;
         Ok(Self {
             listen,
             issuer: entry.issuer(),
@@ -151,6 +154,7 @@ impl Config {
             mode,
             secure_cookies,
             min_response: Duration::from_millis(min_ms),
+            trusted_proxies,
         })
     }
 }
@@ -185,7 +189,7 @@ impl AppConfig {
     ///
     /// Each falls back to its development default, with a warning, because a deployment that
     /// forgets them would otherwise talk to the wrong address or use a publicly known bearer.
-    pub fn internal_from_env() -> (String, String) {
+    pub fn internal_from_env() -> Result<(String, String)> {
         let get = |name: &str| {
             std::env::var(name)
                 .ok()
@@ -196,13 +200,15 @@ impl AppConfig {
             tracing::warn!("CHELABASE_INTERNAL_URL is not set; the sign-up gate uses {DEFAULT_INTERNAL_URL}");
             DEFAULT_INTERNAL_URL.into()
         });
-        let token = get("CHELABASE_APP_AUTH_INTERNAL_TOKEN").unwrap_or_else(|| {
-            tracing::warn!(
-                "CHELABASE_APP_AUTH_INTERNAL_TOKEN is not set; the sign-up gate uses the development token"
-            );
-            DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()
-        });
-        (url, token)
+        let token = chelabase_types::secret_env::env_secret("CHELABASE_APP_AUTH_INTERNAL_TOKEN")
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "CHELABASE_APP_AUTH_INTERNAL_TOKEN(_FILE) is not set; the sign-up gate uses the development token"
+                );
+                DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()
+            });
+        Ok((url, token))
     }
 
     /// M9: a platform instance doesn't start with the development bearer (the variable unset).
@@ -234,6 +240,9 @@ impl AppConfig {
     }
 
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let internal_token =
+            chelabase_types::secret_env::lookup_secret(&get, "CHELABASE_APP_AUTH_INTERNAL_TOKEN")
+                .map_err(anyhow::Error::msg)?;
         let get = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let (Some(private_key), Some(public_key)) = (
             get("CHELABASE_APP_JWT_PRIVATE_KEY"),
@@ -276,7 +285,7 @@ impl AppConfig {
             public_key: public_key.into(),
             access_ttl: Duration::from_secs(access_ttl),
             internal_url: get("CHELABASE_INTERNAL_URL").unwrap_or_else(|| DEFAULT_INTERNAL_URL.into()),
-            internal_token: get("CHELABASE_APP_AUTH_INTERNAL_TOKEN")
+            internal_token: internal_token
                 .unwrap_or_else(|| DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()),
             verify_key: verify_key.into(),
             admin_pat_file: admin_pat_file.into(),

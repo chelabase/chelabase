@@ -2,12 +2,14 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_neon::{ComputeBackend, NeonId};
 use chelabase_secrets::SecretKey;
 use chelabase_types::DatabaseId;
 use worker::config::{RealWorker, WorkerConfig, build};
+use worker::rt_events::{NoopPublisher, RtPublisher};
 
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -54,6 +56,13 @@ pub fn pageserver_container() -> String {
 }
 
 pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
+    setup_with(Arc::new(NoopPublisher)).await
+}
+
+/// [`setup`] with realtime's events going to `publisher` (RT1 T5, S20).
+pub async fn setup_with(
+    publisher: Arc<dyn RtPublisher>,
+) -> (RealWorker, MetadataClient, WorkerConfig) {
     let mut config =
         WorkerConfig::from_env().expect("worker config (is CHELABASE_COMPUTE_IMAGE set?)");
     if config.compute_jwt_dir.is_relative() {
@@ -64,6 +73,11 @@ pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
             *dir = workspace_root().join(&*dir);
         }
     }
+    if let Some(file) = config.realtime_pg_password_file.as_mut()
+        && file.is_relative()
+    {
+        *file = workspace_root().join(&*file);
+    }
     let metadata = MetadataClient::connect(&MetadataConfig {
         database_url: std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
             "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()
@@ -73,7 +87,7 @@ pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
     .expect("metadata database");
     let key =
         SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (run through just workbench test)");
-    let worker = build(&config, metadata.clone(), key).expect("worker");
+    let worker = build(&config, metadata.clone(), key, publisher).expect("worker");
     (worker, metadata, config)
 }
 

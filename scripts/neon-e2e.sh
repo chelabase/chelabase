@@ -195,7 +195,7 @@ for i in $(seq 60); do
 done
 db_id=""
 [[ -z "$(docker ps -aq --filter "label=chelabase.dev/stack=$CHELABASE_STACK" --filter "label=chelabase.dev/endpoint-id=$ep")" ]] || die "the compute container of endpoint $ep still exists"
-status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "$STORCON/control/v1/tenant/$tenant")" ||
+status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "${STORAGE_AUTH[@]}" "$STORCON/control/v1/tenant/$tenant")" ||
   die "the storage controller didn't answer"
 [[ "$status" == 404 ]] || die "tenant $tenant still exists (HTTP $status)"
 rows="$(metadata_sql -v ep="$ep" <<<"SELECT count(*) FROM neon_endpoints WHERE id = :'ep';")"

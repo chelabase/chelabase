@@ -2,7 +2,7 @@
 # Live check that deletes reclaim safekeeper storage (needs the stack: just workbench up). Safekeeper
 # timelines are created by the storage controller (--timelines-onto-safekeepers), so deleting a
 # database, a branch or a timeline superseded by reset-to-parent deletes the safekeeper's copy too:
-# 1. a new database has its tenant/timeline on safekeeper1;
+# 1. a new database has its tenant/timeline on every safekeeper (safekeeper1..3: the controller places it on all three);
 # 2. reset-to-parent removes the branch's old timeline, keeps the new one and main's;
 # 3. deleting a branch removes only its timeline;
 # 4. restore keeps main's new timeline and the backup's old one;
@@ -10,7 +10,7 @@
 # 6. deleting the database removes the tenant's directory and its S3 prefix, and the storage
 #    controller forgets the tenant: storcon-db keeps no timelines or
 #    safekeeper_timeline_pending_ops rows for it.
-# "Removed" means: safekeeper1 answers 404 for it, /data/<tenant>/<timeline> is gone and no object
+# "Removed" means: every safekeeper answers 404 for it, /data/<tenant>/<timeline> is gone on each and no object
 # is left under s3://neon/safekeeper/<tenant>/<timeline>/, within 60 s.
 # S3 uses marker objects: the safekeeper uploads a short-lived timeline's WAL only after
 # --partial-backup-timeout (15 min), so the prefix is empty in a short run. Before each delete a
@@ -147,19 +147,56 @@ wait_storcon_clean() {
 }
 
 # --- the safekeeper and SeaweedFS views ---
-sk() { docker exec -i "$CHELABASE_COMPOSE_PROJECT-safekeeper1-1" "$@"; }
-# sk_has <tenant> <timeline>: safekeeper1 lists the timeline.
+# RT1 (storage auth, user 2026-10-16): the stack runs three safekeepers and the storage controller
+# places every timeline on all three (--timeline-safekeeper-count=3), so each check below covers
+# every one of them: a timeline left on safekeeper2 or safekeeper3 is a leak too.
+SAFEKEEPERS=(safekeeper1 safekeeper2 safekeeper3)
+# sk <safekeeper> <cmd…>: run in that safekeeper's container.
+sk() {
+  local name="$1"
+  shift
+  docker exec -i "$CHELABASE_COMPOSE_PROJECT-$name-1" "$@"
+}
+# sk_curl <safekeeper> <curl args>: curl in that safekeeper with its own NeonJWT (its HTTP API
+# checks one).
+# shellcheck disable=SC2016 # expanded inside the container
+sk_curl() {
+  local name="$1"
+  shift
+  sk "$name" sh -c 'exec curl -H "Authorization: Bearer $(cat /run/safekeeper-data.jwt)" "$@"' _ "$@"
+}
+# sk_status <safekeeper> <tenant> <timeline>: that safekeeper's HTTP status for the timeline.
+sk_status() { sk_curl "$1" -s -o /dev/null -w '%{http_code}' "http://localhost:7676/v1/tenant/$2/timeline/$3"; }
+# sk_has <tenant> <timeline>: every safekeeper lists the timeline.
 sk_has() {
-  [[ "$(sk curl -s -o /dev/null -w '%{http_code}' "http://localhost:7676/v1/tenant/$1/timeline/$2")" == 200 ]]
+  local s
+  for s in "${SAFEKEEPERS[@]}"; do [[ "$(sk_status "$s" "$1" "$2")" == 200 ]] || return 1; done
 }
-# sk_gone <tenant> <timeline>: the safekeeper API answers 404 (a failed call or 000 is not "gone").
+# sk_missing <tenant> <timeline>: the safekeepers that don't list it (for messages).
+sk_missing() {
+  local s out=()
+  for s in "${SAFEKEEPERS[@]}"; do [[ "$(sk_status "$s" "$1" "$2")" == 200 ]] || out+=("$s"); done
+  echo "${out[*]}"
+}
+# sk_gone <tenant> <timeline>: every safekeeper's API answers 404 (a failed call or 000 is not "gone").
 sk_gone() {
-  [[ "$(sk curl -s -o /dev/null -w '%{http_code}' "http://localhost:7676/v1/tenant/$1/timeline/$2")" == 404 ]]
+  local s
+  for s in "${SAFEKEEPERS[@]}"; do [[ "$(sk_status "$s" "$1" "$2")" == 404 ]] || return 1; done
 }
-# sk_dir_has <path under /data>
-sk_dir_has() { [[ "$(sk sh -c 'test -e "$1" && echo y || echo n' _ "/data/$1")" == y ]]; }
-# sk_dir_gone <path under /data>: the exec worked and the path is absent.
-sk_dir_gone() { [[ "$(sk sh -c 'test -e "$1" && echo y || echo n' _ "/data/$1")" == n ]]; }
+# sk_tenant_gone <tenant>: no safekeeper lists a timeline of the tenant.
+sk_tenant_gone() {
+  local s
+  for s in "${SAFEKEEPERS[@]}"; do
+    [[ "$(sk_curl "$s" -sf "http://localhost:7676/v1/tenant/timeline" | jq -r --arg t "$1" '[.[] | select(.tenant_id == $t)] | length')" == 0 ]] || return 1
+  done
+}
+# sk_dir_gone <path under /data>: on every safekeeper the exec worked and the path is absent.
+sk_dir_gone() {
+  local s
+  for s in "${SAFEKEEPERS[@]}"; do
+    [[ "$(sk "$s" sh -c 'test -e "$1" && echo y || echo n' _ "/data/$1")" == n ]] || return 1
+  done
+}
 # aws_sk <args>: the AWS CLI in the safekeeper container (it has the S3 credentials).
 aws_sk() { docker exec -i "$CHELABASE_COMPOSE_PROJECT-safekeeper1-1" aws --endpoint-url http://seaweedfs:8333 "$@"; }
 # s3_ls <path under safekeeper/>: the objects under that prefix (empty when none); dies when
@@ -181,17 +218,17 @@ marker_stays() {
   [[ "$(s3_ls "$2/$3")" == *marker* ]] || die "$1: the S3 marker under $2/$3 is gone"
   pass "$1: S3 marker under $2/$3 is still there"
 }
-# wait_present <tenant> <timeline>: until safekeeper1 lists it (the compute created or the
-# controller placed it), 60 s at most.
+# wait_present <tenant> <timeline>: until every safekeeper lists it (the controller placed it),
+# 60 s at most.
 wait_present() {
   for _ in $(seq 60); do
     sk_has "$1" "$2" && return 0
     sleep 1
   done
-  die "safekeeper1 does not list $1/$2 after 60 s"
+  die "$1/$2 is not on $(sk_missing "$1" "$2") after 60 s (the controller places it on all three)"
 }
 # wait_removed <what> <tenant> <timeline>: until the timeline (or, with an empty timeline, the whole
-# tenant) is gone from safekeeper1's API and disk and from S3, 60 s at most.
+# tenant) is gone from every safekeeper's API and disk and from S3, 60 s at most.
 wait_removed() {
   local what="$1" tenant="$2" tl="$3" path="$2" api_gone dir_gone s3_gone out
   [[ -z "$tl" ]] || path="$2/$3"
@@ -200,28 +237,28 @@ wait_removed() {
     if [[ -n "$tl" ]]; then
       sk_gone "$tenant" "$tl" || api_gone=no
     else
-      [[ "$(sk curl -sf "http://localhost:7676/v1/tenant/timeline" | jq -r --arg t "$tenant" '[.[] | select(.tenant_id == $t)] | length')" == 0 ]] || api_gone=no
+      sk_tenant_gone "$tenant" || api_gone=no
     fi
     sk_dir_gone "$path" || dir_gone=no
     out="$(s3_ls "$path")"
     [[ -z "$out" ]] || s3_gone=no
     if [[ "$api_gone$dir_gone$s3_gone" == yesyesyes ]]; then
-      pass "$what: removed from safekeeper1 (API, /data/$path, S3)"
+      pass "$what: removed from ${SAFEKEEPERS[*]} (API, /data/$path) and S3"
       return 0
     fi
     sleep 1
   done
-  die "$what: still on safekeeper1 after 60 s (api gone: $api_gone, /data/$path gone: $dir_gone, S3 empty: $s3_gone)"
+  die "$what: still there after 60 s (gone from every safekeeper's API: $api_gone, /data/$path gone from every safekeeper: $dir_gone, S3 empty: $s3_gone)"
 }
 # stays <what> <tenant> <timeline>
 stays() {
-  sk_has "$2" "$3" || die "$1: safekeeper1 lost $2/$3"
-  pass "$1: $2/$3 is still on safekeeper1"
+  sk_has "$2" "$3" || die "$1: $(sk_missing "$2" "$3") lost $2/$3"
+  pass "$1: $2/$3 is still on ${SAFEKEEPERS[*]}"
   marker_stays "$1" "$2" "$3"
 }
 
-# 1. A database: main's timeline is on safekeeper1.
-sk true || die "cannot exec in safekeeper1"
+# 1. A database: main's timeline is on every safekeeper.
+for s in "${SAFEKEEPERS[@]}"; do sk "$s" true || die "cannot exec in $s"; done
 name="e2e_$(hex 2)"
 status="$(api POST /v1/databases "$(jq -nc --arg t "$DEMO_TENANT_ID" --arg p "$DEMO_PROJECT_ID" --arg n "$name" \
   '{tenant_id: $t, project_id: $p, name: $n}')")"
@@ -235,7 +272,7 @@ main_tl="$(timeline_of "$main_id")"
 [[ "$tenant" =~ ^[0-9a-f]{32}$ && "$main_tl" =~ ^[0-9a-f]{32}$ ]] || die "no tenant/timeline ids ($tenant, $main_tl)"
 psql_on "$main_id" "CREATE TABLE t (v text); INSERT INTO t VALUES ('A');"
 wait_present "$tenant" "$main_tl"
-pass "database $name: main's timeline $tenant/$main_tl is on safekeeper1"
+pass "database $name: main's timeline $tenant/$main_tl is on ${SAFEKEEPERS[*]}"
 put_marker "main" "$tenant" "$main_tl"
 
 # 2. A branch with its own timeline; reset-to-parent supersedes and deletes the old one.
@@ -243,7 +280,7 @@ dev_id="$(create_branch dev "$main_id")"
 psql_on "$dev_id" "INSERT INTO t VALUES ('B');"
 dev_tl="$(timeline_of "$dev_id")"
 wait_present "$tenant" "$dev_tl"
-pass "branch dev: timeline $dev_tl is on safekeeper1"
+pass "branch dev: timeline $dev_tl is on ${SAFEKEEPERS[*]}"
 put_marker "branch dev" "$tenant" "$dev_tl"
 ok POST "/v1/databases/$db_id/branches/$dev_id/reset-to-parent" 202
 wait_branch "$dev_id" ready

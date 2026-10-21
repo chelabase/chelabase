@@ -114,12 +114,21 @@ impl ModePolicy {
     /// `Err` (a message for the startup error) when `token` is the development bearer and this
     /// mode doesn't allow it. The message never repeats the token.
     pub fn check_internal_token(&self, token: &str) -> Result<(), String> {
-        if token == DEV_APP_AUTH_INTERNAL_TOKEN && !self.default_internal_token_allowed() {
-            return Err(
-                "CHELABASE_APP_AUTH_INTERNAL_TOKEN is unset or the development default, which is public: \
+        self.check_dev_bearer(
+            "CHELABASE_APP_AUTH_INTERNAL_TOKEN",
+            token,
+            &[DEV_APP_AUTH_INTERNAL_TOKEN],
+        )
+    }
+
+    /// `Err` naming `var` when `token` is one of the public development bearers `dev_values`
+    /// and this mode doesn't allow them. The message never repeats the token.
+    pub fn check_dev_bearer(&self, var: &str, token: &str, dev_values: &[&str]) -> Result<(), String> {
+        if !self.default_internal_token_allowed() && dev_values.contains(&token) {
+            return Err(format!(
+                "{var} is unset or a development default, which is public: \
                  platform mode needs its own secret"
-                    .into(),
-            );
+            ));
         }
         Ok(())
     }

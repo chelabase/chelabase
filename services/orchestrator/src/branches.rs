@@ -16,6 +16,7 @@ use chelabase_metadata::{
     BranchDatabase, BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome,
     CreateBranchOutcome, DataApiState, DatabaseOrigin, DatabaseRecord, NewBranch, SettingsPatch,
 };
+use chelabase_nats::rt::ProjectEvent;
 use chelabase_nats::{BranchJob, DatabaseSettingsJob, JobEnvelope, PointInTime};
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{ApiJson, ApiPath, BranchId};
@@ -517,18 +518,33 @@ where
             return ApiError::internal().into_response();
         }
     }
+    // P10: the branch row exists (creating, or failed below if its job can't be queued).
+    // Announced once the job is queued or the failure written, in one ordered publish with
+    // the failure.
+    let created = ProjectEvent::BranchCreated { database_id: database_id.as_uuid(), branch_id: branch_id.as_uuid() };
     let job = JobEnvelope {
         job_id: Uuid::new_v4(),
         payload: BranchJob::Create { branch_id, at },
     };
     if let Err(err) = state.js.publish_branch(&job).await {
         error!(%database_id, %branch_id, "publish branch job failed: {err}");
-        let _ = state
+        let mut events = vec![created];
+        if state
             .metadata
             .set_branch_failed(branch_id, &format!("publish failed: {err}"))
-            .await;
+            .await
+            .is_ok()
+        {
+            events.push(ProjectEvent::BranchStatus {
+                database_id: database_id.as_uuid(),
+                branch_id: branch_id.as_uuid(),
+                status: "failed".into(),
+            });
+        }
+        crate::internal::realtime::spawn_project(state.rt_events.clone(), record.project_id.as_uuid(), events);
         return enqueue_failed().into_response();
     }
+    crate::internal::realtime::project_changed(&state.rt_events, record.project_id, created);
     info!(request_id = %principal.request_id, %database_id, %branch_id, name = %request.name, "accepted create branch");
     match state.metadata.get_branch(branch_id).await {
         Ok(Some(branch)) => (
@@ -731,6 +747,21 @@ fn protected_refusal() -> ApiError {
     conflict(ErrorCode::BranchProtected, "this branch is protected; unprotect it first")
 }
 
+/// P10/W18: a reset or restore moved the branch to `resetting` and its job is queued (a claim
+/// whose job couldn't be queued is released and announces nothing; neither does a delete's
+/// claim, whose own event follows).
+fn publish_resetting<M, J>(state: &AppState<M, J>, record: &DatabaseRecord, branch: BranchId) {
+    crate::internal::realtime::project_changed(
+        &state.rt_events,
+        record.project_id,
+        ProjectEvent::BranchStatus {
+            database_id: record.database_id.as_uuid(),
+            branch_id: branch.as_uuid(),
+            status: BranchStatus::Resetting.as_str().to_string(),
+        },
+    );
+}
+
 /// Puts a claimed branch back to ready.
 async fn release<M, J>(state: &AppState<M, J>, id: BranchId)
 where
@@ -823,6 +854,7 @@ where
         return enqueue_failed().into_response();
     }
     info!(request_id = %principal.request_id, branch_id = %branch.id, "reset to parent requested");
+    publish_resetting(&state, &record, branch.id);
     (
         StatusCode::ACCEPTED,
         Json(OperationAccepted { status: "resetting" }),
@@ -932,6 +964,7 @@ where
         return enqueue_failed().into_response();
     }
     info!(request_id = %principal.request_id, branch_id = %branch.id, %backup_id, "restore requested");
+    publish_resetting(&state, &record, branch.id);
     (
         StatusCode::ACCEPTED,
         Json(RestoreAccepted {
@@ -1060,6 +1093,12 @@ where
             return ApiError::internal().into_response();
         }
     }
+    // P10: the branch is going (`deleting`); the worker reports nothing more for it here.
+    crate::internal::realtime::project_changed(
+        &state.rt_events,
+        record.project_id,
+        ProjectEvent::BranchDeleted { database_id: record.database_id.as_uuid(), branch_id: branch.id.as_uuid() },
+    );
     merges::cancel_drafts(&state, branch.id).await;
     let job = JobEnvelope {
         job_id: Uuid::new_v4(),

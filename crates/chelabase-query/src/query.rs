@@ -2,6 +2,7 @@
 //! parsed into [`Op`]. Values stay [`serde_json::Value`] until binding; the planner
 //! addresses them with a [`Path`].
 
+use std::cell::Cell;
 use std::fmt;
 
 use serde::Deserialize;
@@ -13,6 +14,9 @@ pub const MAX_ALIAS_BYTES: usize = 63;
 
 /// Most operations one batch may hold.
 pub const MAX_BATCH: usize = 50;
+
+/// The most values a console `in` list (`"text": true` or `"parse": true`) holds.
+pub const MAX_CONSOLE_IN: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
@@ -93,6 +97,8 @@ pub struct Select {
 pub enum SelectItem {
     Col(String),
     Aliased { col: String, alias: String },
+    /// Console only: `{"text_of": col, "as": alias}`, the column as its `::text`.
+    TextOf { col: String, alias: String },
 }
 
 impl<'de> Deserialize<'de> for SelectItem {
@@ -106,16 +112,26 @@ impl<'de> Deserialize<'de> for SelectItem {
         }
         match Value::deserialize(d)? {
             Value::String(col) => Ok(SelectItem::Col(col)),
-            v @ Value::Object(_) => {
-                let a = Aliased::deserialize(v).map_err(de::Error::custom)?;
-                // Postgres truncates identifiers to 63 bytes (two aliases could collide
-                // after the duplicate check), rejects `""` and can't hold a NUL.
-                if a.alias.is_empty() || a.alias.len() > MAX_ALIAS_BYTES || a.alias.contains('\0') {
+            Value::Object(mut m) if console_mode() && m.contains_key("text_of") => {
+                let text_of = m.remove("text_of");
+                let alias = m.remove("as");
+                if let Some(other) = m.keys().next() {
                     return Err(de::Error::custom(format!(
-                        "alias {:?} must be 1 to {MAX_ALIAS_BYTES} bytes without NUL",
-                        a.alias
+                        "unknown field `{other}` in a `text_of` item: expected `text_of` and `as`"
                     )));
                 }
+                let (Some(Value::String(col)), Some(Value::String(alias))) = (text_of, alias)
+                else {
+                    return Err(de::Error::custom(
+                        "a `text_of` item is {\"text_of\": <column>, \"as\": <alias>}",
+                    ));
+                };
+                check_alias(&alias)?;
+                Ok(SelectItem::TextOf { col, alias })
+            }
+            v @ Value::Object(_) => {
+                let a = Aliased::deserialize(v).map_err(de::Error::custom)?;
+                check_alias(&a.alias)?;
                 Ok(SelectItem::Aliased {
                     col: a.col,
                     alias: a.alias,
@@ -126,6 +142,17 @@ impl<'de> Deserialize<'de> for SelectItem {
             )),
         }
     }
+}
+
+/// Postgres truncates identifiers to 63 bytes (two aliases could collide after the
+/// duplicate check), rejects `""` and can't hold a NUL.
+fn check_alias<E: de::Error>(alias: &str) -> Result<(), E> {
+    if alias.is_empty() || alias.len() > MAX_ALIAS_BYTES || alias.contains('\0') {
+        return Err(E::custom(format!(
+            "alias {alias:?} must be 1 to {MAX_ALIAS_BYTES} bytes without NUL"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -251,6 +278,12 @@ pub enum Filter {
         col: String,
         op: CondOp,
         value: Value,
+        /// Console only (`"text": true`): compares the column's `::text` by `COLLATE "C"`.
+        text: bool,
+        /// Console only (`"parse": true`, with `eq`/`in` and string values, never with
+        /// `text`): compares the column with the text cast to the column's own type, so an
+        /// index on the column can serve the condition.
+        parse: bool,
     },
 }
 
@@ -315,6 +348,22 @@ fn filter_from(v: Value) -> Result<Filter, String> {
             );
         }
     };
+    // Console only: `"text": true` or `"parse": true` beside `eq`/`in`.
+    let (text, parse) = if console_mode() {
+        let mut flag = |name: &str| match m.remove(name) {
+            None => Ok(false),
+            Some(Value::Bool(true)) => Ok(true),
+            Some(_) => Err(format!("`{name}` on `{col}` is true")),
+        };
+        (flag("text")?, flag("parse")?)
+    } else {
+        (false, false)
+    };
+    if text && parse {
+        return Err(format!(
+            "`text` and `parse` on `{col}` are two ways to compare: use one"
+        ));
+    }
     if m.len() != 1 {
         return Err(format!(
             "a filter on `{col}` has exactly one operator (eq, neq, lt, lte, gt, gte, in, is, like, ilike)"
@@ -352,7 +401,34 @@ fn filter_from(v: Value) -> Result<Filter, String> {
             _ => format!("`{key}` on `{col}` can't compare with null: use \"is\": null"),
         });
     }
-    Ok(Filter::Cond { col, op, value })
+    if text || parse {
+        let flag = if text { "text" } else { "parse" };
+        let strings = match (&op, &value) {
+            (CondOp::Eq, Value::String(_)) => true,
+            (CondOp::In, Value::Array(items)) => items.iter().all(Value::is_string),
+            _ => false,
+        };
+        if !strings {
+            return Err(format!(
+                "`{flag}` on `{col}` goes with `eq` or `in` and string values only"
+            ));
+        }
+        if let Value::Array(items) = &value
+            && items.len() > MAX_CONSOLE_IN
+        {
+            return Err(format!(
+                "`in` on `{col}` holds at most {MAX_CONSOLE_IN} values, got {}",
+                items.len()
+            ));
+        }
+    }
+    Ok(Filter::Cond {
+        col,
+        op,
+        value,
+        text,
+        parse,
+    })
 }
 
 /// The address of one value inside an [`Op`]: what a [`crate::sql::Bind`] points at.
@@ -420,6 +496,44 @@ pub struct Parsed {
 /// `"v": 1` or leave it out. Only the top level may name a `"database"` (a batch runs in
 /// one database).
 pub fn parse(body: &[u8]) -> Result<Parsed, QueryError> {
+    parse_with(body, ParseMode::DataApi)
+}
+
+/// Which grammar a route parses: the data API's, or the console's, which adds `text_of`
+/// and `"text": true`. Chosen by the route, never by the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseMode {
+    DataApi,
+    Console,
+}
+
+thread_local! {
+    static MODE: Cell<ParseMode> = const { Cell::new(ParseMode::DataApi) };
+}
+
+fn console_mode() -> bool {
+    MODE.with(Cell::get) == ParseMode::Console
+}
+
+/// Restores the previous mode when parsing ends, however it ends.
+struct ModeGuard(ParseMode);
+
+impl ModeGuard {
+    fn set(mode: ParseMode) -> Self {
+        ModeGuard(MODE.with(|m| m.replace(mode)))
+    }
+}
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        MODE.with(|m| m.set(self.0));
+    }
+}
+
+/// [`parse`] under `mode`. The deserializers read the mode from a thread-local set for the
+/// length of this synchronous call; nothing in the body can change it.
+pub fn parse_with(body: &[u8], mode: ParseMode) -> Result<Parsed, QueryError> {
+    let _guard = ModeGuard::set(mode);
     let mut tree: Value = serde_json::from_slice(body)?;
     let database = match tree.as_object_mut().and_then(|o| o.remove("database")) {
         None => None,

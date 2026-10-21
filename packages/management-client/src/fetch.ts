@@ -93,20 +93,75 @@ export const customFetch = async <T>(url: string, options: RequestInit): Promise
 
 type Reviver = (this: unknown, key: string, value: unknown, context?: { source?: string }) => unknown;
 
+/** A number whose source text a double doesn't print back identically, until `parseExact` decides its form. */
+class Literal {
+  constructor(
+    readonly value: number,
+    readonly source: string,
+  ) {}
+}
+
+/** A nested number (inside a json/jsonb value) stays a number unless digits would be lost. */
+function nestedForm(n: Literal): number | string {
+  // At most 15 significant digits in plain decimal form always survive a double (`1.50` reads as 1.5).
+  if (/^-?\d+(\.\d+)?$/.test(n.source) && n.source.replace(/^-/, "").replace(".", "").replace(/^0+/, "").length <= 15) return n.value;
+  return n.source;
+}
+
+/** Sets an own field as `JSON.parse` does (a `__proto__` key stays a plain field, never the prototype). */
+function put(o: Record<string, unknown>, k: string, v: unknown): void {
+  Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true });
+}
+
+/** Replaces every `Literal` below `value` (in place) by its nested form. */
+function settleNested(value: unknown): unknown {
+  if (value instanceof Literal) return nestedForm(value);
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) value[i] = settleNested(value[i]);
+  } else if (value !== null && typeof value === "object") {
+    const o = value as Record<string, unknown>;
+    for (const k of Object.keys(o)) {
+      const v = o[k];
+      const next = settleNested(v);
+      if (next !== v) put(o, k, next);
+    }
+  }
+  return value;
+}
+
 /**
- * Parses JSON without losing digits: a number that doesn't read back identically from a double
- * (an int8 or numeric the server wrote in full) comes back as its source text. Runtimes without
- * source-text access fall back to plain `JSON.parse`.
+ * Parses the console's rows without losing what Postgres wrote. A column value (a field of a row: an object in the
+ * top-level array) that is a number stays a JS number only when `String(number)` is exactly its source text; otherwise
+ * it comes back as that source text (`2.50`, `1e+20`, `-0`, digits a double can't hold), so Studio shows, edits and
+ * saves Postgres's own literal. Numbers nested inside a column's json/jsonb value stay numbers (`{"n":1.50}` reads as
+ * `{"n":1.5}`) unless a double would lose digits, which come back as their source text. Runtimes without source-text
+ * access fall back to plain `JSON.parse`.
  */
 export function parseExact(text: string): unknown {
+  let literals = 0;
   const reviver: Reviver = (_key, value, context) => {
     const source = context?.source;
-    if (typeof value !== "number" || typeof source !== "string") return value;
-    // At most 15 significant digits in plain decimal form always survive a double.
-    if (/^-?\d+(\.\d+)?$/.test(source) && source.replace(/^-/, "").replace(".", "").replace(/^0+/, "").length <= 15) return value;
-    return String(value) === source ? value : source;
+    if (typeof value !== "number" || typeof source !== "string" || String(value) === source) return value;
+    literals++;
+    return new Literal(value, source);
   };
-  return (JSON.parse as (t: string, r: Reviver) => unknown)(text, reviver);
+  const parsed = (JSON.parse as (t: string, r: Reviver) => unknown)(text, reviver);
+  if (literals === 0) return parsed;
+  if (!Array.isArray(parsed)) return settleNested(parsed);
+  for (let i = 0; i < parsed.length; i++) {
+    const row: unknown = parsed[i];
+    if (row === null || typeof row !== "object" || Array.isArray(row) || row instanceof Literal) {
+      parsed[i] = settleNested(row);
+      continue;
+    }
+    const fields = row as Record<string, unknown>;
+    for (const k of Object.keys(fields)) {
+      const v = fields[k];
+      const next = v instanceof Literal ? v.source : settleNested(v);
+      if (next !== v) put(fields, k, next);
+    }
+  }
+  return parsed;
 }
 
 /**

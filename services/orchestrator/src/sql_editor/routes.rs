@@ -62,12 +62,14 @@ const RETRY_AFTER_SECS: u32 = 2;
 /// The longest a schema read may take, its settings and 12 queries together.
 const SCHEMA_DEADLINE: Duration = Duration::from_secs(35);
 /// Roles the editor never runs as (besides any `pg_` name).
-const RESERVED_ROLES: [&str; 5] = [
+const RESERVED_ROLES: [&str; 6] = [
     "cloud_admin",
     "neon_superuser",
     "authenticator",
     "chelabase_admin",
     "chelabase_auth_sync",
+    // RT1 P15: realtime's replication login.
+    "chelabase_realtime",
 ];
 
 pub(crate) fn routes<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>
@@ -1089,6 +1091,14 @@ mod tests {
 
     /// The endpoint every refusal's log line names (RT3-7, T10 m2).
     const EP: &str = "ep-log-1";
+
+    // RT1 S23/P15: realtime's replication login is a system role the editor never runs as,
+    // named in the explicit list (not only caught by the `chelabase_` prefix).
+    #[test]
+    fn the_realtime_role_is_reserved() {
+        assert!(RESERVED_ROLES.contains(&"chelabase_realtime"), "{RESERVED_ROLES:?}");
+        assert!(invalid_role(Some("chelabase_realtime")).is_some());
+    }
 
     fn rejected(code: &str) -> ConnectError {
         ConnectError::Rejected {

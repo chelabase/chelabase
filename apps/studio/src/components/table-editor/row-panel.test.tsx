@@ -24,7 +24,7 @@ describe("row panel", () => {
     await user.click(await screen.findByRole("option", { name: "paid" }));
     await user.click(within(panel).getByRole("button", { name: "Save row" }));
     await vi.waitFor(async () => expect(await writes(f)).toHaveLength(1));
-    expect((await writes(f))[0].tree).toEqual({ v: 1, op: "update", table: "public.invoices", set: { amount_cents: 47000, status: "paid" }, where: { col: "id", eq: "81c4-2" }, returning: "*" });
+    expect((await writes(f))[0].tree).toEqual({ v: 1, op: "update", table: "public.invoices", set: { amount_cents: 47000, status: "paid" }, where: { and: [{ col: "id", eq: "81c4-2", parse: true }, { col: "amount_cents", eq: "45000", text: true }, { col: "status", eq: "open", text: true }] }, returning: "*" });
   });
 
   it("null_toggle_sends_null", async () => {
@@ -81,7 +81,7 @@ describe("row panel", () => {
     const dialog = await screen.findByRole("dialog", { name: "Delete this row?" });
     await user.click(within(dialog).getByRole("button", { name: "Delete row" }));
     await vi.waitFor(async () => expect(await writes(f)).toHaveLength(1));
-    expect((await writes(f))[0].tree).toEqual({ v: 1, op: "delete", from: "public.invoices", where: { col: "id", eq: "c2d1-3" }, returning: ["id"] });
+    expect((await writes(f))[0].tree).toEqual({ v: 1, op: "delete", from: "public.invoices", where: { col: "id", eq: "c2d1-3", parse: true }, returning: ["id"] });
   });
 
   it("collapse_keeps_the_draft", async () => {
@@ -108,7 +108,9 @@ describe("row panel", () => {
     const answer: FakeHandler = async (req) => {
       const b = await req.clone().json();
       if (b.tree.op !== "select") return jsonResponse([]);
-      return b.tree.select ? jsonResponse([{ id: "3f9a-1", customer_id: "c-1", status: "paid", amount_cents: 12900 }]) : jsonResponse({ error: { code: "too_large", message: "big" } }, 413);
+      // S9: every read lists its columns (plus text_of items); the full list, memo included, is too large.
+      const names = ((b.tree.select ?? []) as unknown[]).filter((i) => typeof i === "string");
+      return names.includes("memo") ? jsonResponse({ error: { code: "too_large", message: "big" } }, 413) : jsonResponse([{ id: "3f9a-1", customer_id: "c-1", status: "paid", amount_cents: 12900 }]);
     };
     const cellFetch = vi.fn(() => jsonResponse({ value: "very long memo", bytes: 9000000, data_type: "text" }));
     const { f, user } = renderEditor({ routes: { [`POST ${Q}`]: answer, [`POST ${T}/cell`]: cellFetch } });
@@ -117,7 +119,9 @@ describe("row panel", () => {
     const req = (cellFetch.mock.calls[0] as unknown as [Request])[0];
     expect(await req.clone().json()).toEqual({ database: null, role: null, key: { id: "3f9a-1" }, column: "memo" });
     const last = (await bodies(f, "POST", Q)).at(-1);
-    expect(last.tree.select).toEqual(["id", "customer_id", "status", "amount_cents"]);
+    expect(last.tree.select.slice(0, 4)).toEqual(["id", "customer_id", "status", "amount_cents"]);
+    expect(last.tree.select).not.toContain("memo");
+    expect(last.tree.select).toContainEqual({ text_of: "id", as: "$pk0" });
     expect(last.tree.limit).toBe(1);
   });
 });

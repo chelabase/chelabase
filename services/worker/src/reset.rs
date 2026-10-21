@@ -140,6 +140,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             )),
             &self.member_logins,
             protected,
+            self.pusher.signer(),
         )
         .await
         .context("building the spec")?;

@@ -5,6 +5,7 @@ pub mod commands;
 pub mod env;
 pub mod migrate;
 pub mod registry;
+pub mod service_auth;
 pub mod slots;
 pub mod slug;
 pub mod target;
@@ -33,3 +34,12 @@ mod stack_fix_tests;
 
 #[cfg(test)]
 mod f6_tests;
+
+#[cfg(test)]
+mod r11_tests;
+
+#[cfg(test)]
+mod r11_edge_tests;
+
+#[cfg(test)]
+mod fa_tests;

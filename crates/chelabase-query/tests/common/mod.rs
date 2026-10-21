@@ -17,6 +17,7 @@ fn col(name: &str, type_sql: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.into(),
         type_sql: type_sql.into(),
+        type_qualified: String::new(),
         array: false,
         text_like: false,
         generated: false,

@@ -242,6 +242,10 @@ pub struct FakeState {
     /// PB: each branch's login-role guard exemptions, in stored order (missing key: none). A
     /// new branch and a restore's backup copy their source's.
     pub guard_exemptions: HashMap<BranchId, Vec<String>>,
+    /// RT1 T5: `mark_deleted` / `mark_branch_deleted` remove the row instead of tombstoning it,
+    /// so nothing can be read about it once the write returned (the publisher wrapper must
+    /// read its ids before the write).
+    pub purge_on_mark_deleted: bool,
     get_calls: u32,
     get_branch_calls: HashMap<BranchId, u32>,
 }
@@ -808,6 +812,20 @@ impl WorkerMetadata for FakeMetadata {
         FakeMetadata::endpoint_branch(self, endpoint_id).await
     }
 
+    async fn compute_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<(BranchId, BranchKind)>, MetadataError> {
+        let state = self.read("compute_branch")?;
+        Ok(state
+            .branches
+            .values()
+            .find(|b| {
+                b.endpoint_id.as_deref() == Some(endpoint_id) && b.status != BranchStatus::Deleted
+            })
+            .map(|b| (b.id, b.kind)))
+    }
+
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
         let mut state = self.read("get_branch")?;
         let calls = state.get_branch_calls.entry(id).or_default();
@@ -1051,6 +1069,9 @@ impl WorkerMetadata for FakeMetadata {
         if let Some(db) = state.databases.get_mut(&id) {
             db.status = DatabaseStatus::Deleted;
         }
+        if state.purge_on_mark_deleted {
+            state.databases.remove(&id);
+        }
         Ok(())
     }
 
@@ -1059,6 +1080,9 @@ impl WorkerMetadata for FakeMetadata {
         if let Some(b) = state.branches.get_mut(&id) {
             b.status = BranchStatus::Deleted;
             b.owner_password_enc = None;
+        }
+        if state.purge_on_mark_deleted {
+            state.branches.remove(&id);
         }
         Ok(())
     }
@@ -3574,6 +3598,14 @@ pub struct FakePusher {
     /// `status` fails with this message once the scripted statuses are used up.
     pub fail_status_after_queue: Mutex<Option<String>>,
     pub journal: Journal,
+    /// A throwaway compute-JWT key pair (specs sign their storage token with it).
+    pub signer: chelabase_neon::ComputeSigner,
+}
+
+/// A fresh compute-JWT key pair for fakes.
+pub fn fake_signer() -> chelabase_neon::ComputeSigner {
+    let (pem, x) = chelabase_neon::jwt::generate_keypair();
+    chelabase_neon::ComputeSigner::new(&pem, &x).expect("a generated key pair")
 }
 
 impl FakePusher {
@@ -3591,6 +3623,10 @@ impl FakePusher {
 impl SpecPusher for FakePusher {
     fn jwks(&self) -> serde_json::Value {
         serde_json::json!({ "keys": [] })
+    }
+
+    fn signer(&self) -> &chelabase_neon::ComputeSigner {
+        &self.signer
     }
 
     async fn push(
@@ -3678,6 +3714,7 @@ pub fn worker() -> (FakeWorker, Journal) {
             fail_status: Mutex::default(),
             fail_status_after_queue: Mutex::default(),
             journal: journal.clone(),
+            signer: fake_signer(),
         },
         key: SecretKey::generate(),
         owner_superuser: false,
@@ -3705,6 +3742,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         member_role_requests: Default::default(),
         member_logins: chelabase_neon::spec::MemberLogins::orchestrator(Vec::new()),
         cert_sweep: None,
+        realtime_password: None,
     };
     (worker, journal)
 }

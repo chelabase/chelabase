@@ -54,7 +54,7 @@ describe("T3 fix round", () => {
     await user.clear(input);
     await user.type(input, "46000{Enter}");
     await vi.waitFor(async () => expect(await writes(f)).toHaveLength(1));
-    expect((await writes(f))[0].tree.where).toEqual({ col: "id", eq: "81c4-2" });
+    expect((await writes(f))[0].tree.where).toEqual({ and: [{ col: "id", eq: "81c4-2", parse: true }, { col: "amount_cents", eq: "45000", text: true }] });
   });
 
   it("I2_rows_read_as_another_role_are_not_shown_while_the_new_role_loads", async () => {

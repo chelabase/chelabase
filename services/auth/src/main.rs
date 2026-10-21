@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     let signup_gate = {
-        let c = AppConfig::internal_from_env();
+        let c = AppConfig::internal_from_env()?;
         AppConfig::check_internal_token(config.mode, &c.1)?;
         auth::app_users::InternalClient::new(&c.0, &c.1)
     };
@@ -49,6 +49,11 @@ async fn main() -> anyhow::Result<()> {
         config,
         limiter: RateLimiter::default(),
     });
-    axum::serve(listener, router(state)).await?;
+    // The TCP peer decides whose X-Forwarded-For counts (only the trusted proxy's).
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

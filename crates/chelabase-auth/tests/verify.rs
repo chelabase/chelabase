@@ -49,6 +49,8 @@ async fn tampered_signature_is_rejected() {
     assert_invalid_token_containing(verifier.verify(&tampered).await, "InvalidSignature");
 }
 
+// RT1 S14: expiry is its own error, so realtime can answer `token_expired` (wait for the
+// renewal) rather than `forbidden` (leave the channel).
 #[tokio::test]
 async fn expired_token_is_rejected() {
     let mock = MockJwks::start().await;
@@ -60,7 +62,75 @@ async fn expired_token_is_rejected() {
         chelabase_auth::CLAIM_ORG_ID: "org-1",
     }));
 
-    assert_invalid_token_containing(verifier.verify(&token).await, "ExpiredSignature");
+    let err = verifier.verify(&token).await.unwrap_err();
+    assert!(matches!(err, AuthError::Expired), "got {err:?}");
+}
+
+// RT1 S14: the leeway stays 60 s; only a token past it is `Expired`.
+#[tokio::test]
+async fn a_token_within_the_leeway_still_verifies_and_carries_its_exp() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let exp = now() - 20;
+    let token = mock.sign(json!({
+        "sub": "user-1",
+        "iss": mock.issuer(),
+        "exp": exp,
+        chelabase_auth::CLAIM_ORG_ID: "org-1",
+    }));
+    let claims = verifier.verify(&token).await.expect("within the 60 s leeway");
+    assert_eq!(claims.exp, exp as u64);
+}
+
+// RT1 S14: `VerifiedClaims.exp` is the token's `exp` in unix seconds.
+#[tokio::test]
+async fn verified_claims_carry_the_tokens_exp() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let exp = now() + 300;
+    let token = mock.sign(json!({
+        "sub": "user-1",
+        "iss": mock.issuer(),
+        "exp": exp,
+        "email": "a@x.test",
+        "name": "A",
+        chelabase_auth::CLAIM_ORG_ID: "org-1",
+    }));
+    let claims = verifier.verify(&token).await.expect("should verify");
+    assert_eq!(claims.exp, exp as u64);
+    assert_eq!((claims.email.as_deref(), claims.name.as_deref()), (Some("a@x.test"), Some("A")));
+}
+
+// RT1 S14: the JWKS fetch gives up after 3 s, so a hung Zitadel makes an authorize answer
+// `unavailable` well inside realtime's 20 s budget instead of hanging it.
+#[tokio::test]
+async fn a_hung_jwks_endpoint_fails_within_its_timeout() {
+    use axum::{routing::get, Router};
+    let app = Router::new().route(
+        "/oauth/v2/keys",
+        get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            "never"
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let verifier = JwtVerifier::new(chelabase_auth::ZitadelAuthConfig {
+        issuer: format!("http://{addr}"),
+        jwks_url: format!("http://{addr}/oauth/v2/keys"),
+        audiences: vec![],
+    });
+    let mock = MockJwks::start().await;
+    let token = mock.token_for_org("user-1", "org-1", 300);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), verifier.verify(&token)).await;
+    let waited = started.elapsed();
+    let Ok(result) = result else {
+        panic!("verify waited more than 8 s on a hung JWKS endpoint (no fetch timeout)");
+    };
+    assert!(matches!(result, Err(AuthError::Jwks(_))), "got {result:?}");
+    assert!(waited >= std::time::Duration::from_millis(2500), "gave up after {waited:?}, before 3 s");
 }
 
 #[tokio::test]

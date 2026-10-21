@@ -12,7 +12,7 @@ use chelabase_query::{Lease, QueryClient, QueryFailure};
 use chelabase_routes::orchestrator as ep;
 use chelabase_schema::SchemaError;
 use chelabase_schema::catalog;
-use chelabase_schema::model::Table;
+use chelabase_schema::model::Relation;
 use chelabase_types::access::{Access, Grant, PlatformRole, RoleSet};
 use chelabase_types::role_name::member_role_name;
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
@@ -300,8 +300,8 @@ where
     path = "/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}",
     operation_id = "getTable",
     tag = "tables",
-    summary = "One ordinary table's structure",
-    description = "The table's columns, constraints, indexes, triggers, policies, privileges and comment, as the schema merge reads them. Only ordinary tables are returned: a view, a partition child or a missing table is 404 (the object list's `editable` says why).",
+    summary = "One table's or other relation's structure",
+    description = "Any relation the object list shows, with its `kind`. An ordinary table (`kind: table`) carries its columns, constraints, indexes, policies, privileges, options and comment, as the schema merge reads them; a table that inherits from another is read the same way. A view, materialized view, foreign table or partitioned table is read-only: its columns (in `attnum` order, with `format_type`'s text and `not_null`) and comment, every other list empty; a view's definition and a foreign table's options are never returned. A partition, an index, a sequence, a composite type, a relation in a schema the object list leaves out, or a missing one is 404.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -310,11 +310,11 @@ where
         TableReadQuery,
     ),
     responses(
-        (status = 200, description = "The table", body = Table),
+        (status = 200, description = "The relation and its kind", body = Relation),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
-        (status = 404, description = "`not_found`: the database (or another tenant's), the branch, the Postgres database or the table doesn't exist, or it isn't an ordinary table", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's), the branch, the Postgres database or the relation doesn't exist, or it isn't one the object list shows", body = ErrorEnvelope),
         (status = 409, description = "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the query string is malformed", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -337,16 +337,16 @@ where
         &principal,
         ReadRequest { id, branch_id, access: ep::GET_TABLE.policy.access },
         query,
-        catalog::table_sql(&schema, &table),
+        catalog::relation_sql(&schema, &table),
     )
     .await
     {
         Ok(json) => json,
         Err(response) => return *response,
     };
-    match catalog::parse_table(&json) {
-        Ok(Some(table)) => (StatusCode::OK, axum::Json(table)).into_response(),
-        Ok(None) => ApiError::not_found("no such table, or not an ordinary table").into_response(),
+    match catalog::parse_relation(&json) {
+        Ok(Some(relation)) => (StatusCode::OK, axum::Json(relation)).into_response(),
+        Ok(None) => ApiError::not_found("no such table or relation").into_response(),
         Err(err) => unreadable(err),
     }
 }

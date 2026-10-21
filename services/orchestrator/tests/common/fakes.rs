@@ -2218,6 +2218,91 @@ impl PostgresAddr for FakeLocator {
     }
 }
 
+/// RT1 T6: realtime's bearer on the test app's `/internal/realtime/*` routes.
+const REALTIME_TOKEN: &str = "realtime-internal-token";
+
+/// One event the orchestrator published for realtime.
+#[derive(Clone, Debug, PartialEq)]
+enum RtPublished {
+    Project(uuid::Uuid, chelabase_nats::rt::ProjectEvent),
+    Access(chelabase_nats::rt::AccessEvent),
+}
+
+/// Records every realtime event; with `fail`, each publish fails (after recording it).
+#[derive(Clone, Default)]
+struct FakeRtEvents {
+    published: Arc<Mutex<Vec<RtPublished>>>,
+    fail: Arc<Mutex<bool>>,
+}
+
+// Used by `realtime.rs`, not by every file that includes the fakes.
+#[allow(dead_code)]
+impl FakeRtEvents {
+    fn all(&self) -> Vec<RtPublished> {
+        self.published.lock().unwrap().clone()
+    }
+
+    /// The access events, in order.
+    fn access(&self) -> Vec<chelabase_nats::rt::AccessEvent> {
+        self.all()
+            .into_iter()
+            .filter_map(|e| match e {
+                RtPublished::Access(a) => Some(a),
+                RtPublished::Project(..) => None,
+            })
+            .collect()
+    }
+
+    /// The project events, in order.
+    fn project(&self) -> Vec<(uuid::Uuid, chelabase_nats::rt::ProjectEvent)> {
+        self.all()
+            .into_iter()
+            .filter_map(|e| match e {
+                RtPublished::Project(p, ev) => Some((p, ev)),
+                RtPublished::Access(_) => None,
+            })
+            .collect()
+    }
+
+    fn clear(&self) {
+        self.published.lock().unwrap().clear();
+    }
+}
+
+impl orchestrator::internal::realtime::RtEvents for FakeRtEvents {
+    fn project(
+        &self,
+        project_id: uuid::Uuid,
+        event: chelabase_nats::rt::ProjectEvent,
+    ) -> orchestrator::internal::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.published.lock().unwrap().push(RtPublished::Project(project_id, event));
+            anyhow::ensure!(!*self.fail.lock().unwrap(), "nats is down");
+            Ok(())
+        })
+    }
+
+    fn access(
+        &self,
+        event: chelabase_nats::rt::AccessEvent,
+    ) -> orchestrator::internal::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.published.lock().unwrap().push(RtPublished::Access(event));
+            anyhow::ensure!(!*self.fail.lock().unwrap(), "nats is down");
+            Ok(())
+        })
+    }
+}
+
+/// A verifier for apps that don't test realtime: its JWKS URL is the discard port.
+fn unused_oidc() -> chelabase_auth::ZitadelAuthConfig {
+    chelabase_auth::ZitadelAuthConfig {
+        issuer: "http://issuer.invalid".into(),
+        jwks_url: "http://127.0.0.1:9/oauth/v2/keys".into(),
+        audiences: vec![],
+    }
+}
+
 /// A running orchestrator plus the signer standing in for the gateway.
 struct TestApp {
     base: String,
@@ -2228,6 +2313,9 @@ struct TestApp {
     locator: FakeLocator,
     /// The orchestrator's state (the SQL editor's run registry).
     state: Arc<AppState<FakeMetadata, FakeJobs>>,
+    /// RT1 T6: what the orchestrator published for realtime.
+    #[allow(dead_code)]
+    rt_events: FakeRtEvents,
 }
 
 impl TestApp {
@@ -2365,6 +2453,48 @@ async fn spawn_app_with_compute_tls(
     operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
 ) -> TestApp {
+    spawn_app_core(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, unused_oidc())
+        .await
+}
+
+/// RT1 T6: an app whose realtime routes verify members' tokens against `oidc` (a mock JWKS).
+#[allow(dead_code)]
+async fn spawn_app_oidc(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    oidc: chelabase_auth::ZitadelAuthConfig,
+) -> TestApp {
+    spawn_app_core(
+        metadata,
+        jobs,
+        rest_url,
+        mode,
+        10,
+        None,
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+        None,
+        None,
+        oidc,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_app_core(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    cap: u32,
+    zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
+    operator_org: Option<&str>,
+    compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
+    oidc: chelabase_auth::ZitadelAuthConfig,
+) -> TestApp {
+    let rt_events = FakeRtEvents::default();
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
     let locator = FakeLocator::default();
@@ -2391,6 +2521,11 @@ async fn spawn_app_with_compute_tls(
         table_api_dry_run_max_bytes: orchestrator::DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES,
         studio_url: STUDIO_URL.into(),
         compute_tls,
+        realtime: orchestrator::internal::realtime::RealtimeAuth {
+            token: REALTIME_TOKEN.into(),
+            verifier: chelabase_auth::JwtVerifier::new(oidc),
+        },
+        rt_events: Arc::new(rt_events.clone()),
     });
     let probe: Router = Router::new()
         .route(INSTANCE_PROBE, axum::routing::get(instance_probe))
@@ -2409,6 +2544,7 @@ async fn spawn_app_with_compute_tls(
         key,
         locator,
         state,
+        rt_events,
     }
 }
 

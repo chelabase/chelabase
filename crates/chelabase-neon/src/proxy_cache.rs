@@ -37,6 +37,55 @@ impl ProxyCache {
         })
     }
 
+    /// `redis://host:port` (no credentials in it), logging in as the ACL user `user` with
+    /// `password` exactly as given (`AUTH user password` on every connection; never through
+    /// the URL, which would mangle `@`, `:`, `/` or `%`). Nothing is contacted yet.
+    pub fn with_auth(url: &str, user: &str, password: &str) -> anyhow::Result<Self> {
+        use redis::IntoConnectionInfo;
+        anyhow::ensure!(!user.is_empty(), "the Valkey user is empty");
+        anyhow::ensure!(!password.is_empty(), "the Valkey password for {user} is empty");
+        let info = url.into_connection_info().context("Valkey URL")?;
+        anyhow::ensure!(
+            info.redis_settings().username().is_none(),
+            "the Valkey URL carries a user; pass the credentials apart"
+        );
+        let settings = info
+            .redis_settings()
+            .clone()
+            .set_username(user)
+            .set_password(password);
+        Ok(Self {
+            client: redis::Client::open(info.set_redis_settings(settings))
+                .context("Valkey URL")?,
+        })
+    }
+
+    /// From `CHELABASE_VALKEY_USER` and `CHELABASE_VALKEY_PASSWORD_FILE` (one trailing newline
+    /// ignored) when the user is set, else without credentials. `lookup` reads a variable.
+    pub fn from_lookup(
+        url: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        let get = |name: &str| lookup(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        match (
+            get("CHELABASE_VALKEY_USER"),
+            get("CHELABASE_VALKEY_PASSWORD_FILE"),
+        ) {
+            (None, None) => Self::new(url),
+            (Some(user), Some(path)) => {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("CHELABASE_VALKEY_PASSWORD_FILE={path}"))?;
+                Self::with_auth(url, &user, text.trim_end_matches(['\n', '\r']))
+            }
+            (Some(_), None) => {
+                anyhow::bail!("CHELABASE_VALKEY_USER is set without CHELABASE_VALKEY_PASSWORD_FILE")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("CHELABASE_VALKEY_PASSWORD_FILE is set without CHELABASE_VALKEY_USER")
+            }
+        }
+    }
+
     /// Tells every proxy to drop its cached secret for `role`. Returns how many subscribers
     /// got the message; 0 means no proxy is listening, and the old secret stays cached until
     /// its TTL runs out. Connecting and publishing together give up after 5 s.

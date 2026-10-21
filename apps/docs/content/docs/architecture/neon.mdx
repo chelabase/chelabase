@@ -10,11 +10,16 @@ Chelabase runs Neon's storage stack and Neon's compute, from its own hard fork (
 Docker Compose (`infra/compose/docker-compose.yml`) starts, besides the control plane's own dependencies:
 
 - **SeaweedFS**, an S3-compatible object store, with a `neon` bucket for the safekeeper's WAL backups;
-- the **storage broker**, one **safekeeper** (enough for local development), the **storage controller** (with its own Postgres) and the **pageserver**;
+- the **storage broker**, three **safekeepers** (`safekeeper1` to `safekeeper3`, each with its WAL on its own volume), the **storage controller** (with its own Postgres) and the **pageserver**. The storage controller runs without `--dev`, which puts every timeline on three safekeepers;
 - **Neon's proxy**, which terminates TLS and speaks Postgres wire and SQL over HTTP;
-- **Valkey**, for the proxy's cache invalidation and query cancel.
+- **Valkey**, for the proxy's cache invalidation and query cancel, and for [realtime](/docs/architecture/realtime)'s tickets and counters;
+- **NATS**, for the control plane's jobs and events and for realtime. Both NATS and Valkey require credentials (see [Security](/docs/architecture/security#service-credentials)).
 
-The worker starts one compute container per database (and per branch) through the Docker socket, from the compute image pinned in Compose. Each compute reaches its storage through the pageserver and safekeepers, and reports to the control plane.
+The worker starts one compute container per database (and per branch) through the Docker socket, from the compute image pinned in Compose. Each compute reaches its storage through the pageserver and safekeepers, and reports to the control plane. The Neon services run as the stack's own uid, whatever the host's.
+
+### Storage authentication
+
+The pageserver, the safekeepers and the storage controller check a NeonJWT on their page service, WAL service and HTTP APIs. `just workbench up` derives the credentials from the stack's compute-JWT key pair: its public key as a PEM file (`compute-jwt.pub.pem`) that the three services verify with, and one scoped token per caller under `.chelabase/neon/storage-tokens/` (`pageserver-api.jwt`, `safekeeper-data.jwt`, `generations-api.jwt`, `storcon-admin.jwt`). A compute presents its tenant token; the storage controller, the pageserver and the safekeepers present the scoped ones to each other. The tokens are mode 0600 and, being Ed25519, regenerate to the same bytes.
 
 The storage controller creates each safekeeper timeline and deletes it (local WAL and the S3 backup) with the database, branch or superseded timeline. `just storage-leak-e2e` checks that deleting reclaims the storage. The image pins and the build and bump procedure are in [`infra/neon/README.md`](https://github.com/chelabase/chelabase/blob/main/infra/neon/README.md).
 
@@ -51,21 +56,30 @@ Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4
 | rest | `rest:8085` | Data API engine (via the gateway at `/data/v1`) |
 | rest internal | `rest:8086` | The orchestrator's schema and console calls to `rest` |
 | metadata Postgres | `metadata-db:5432` | Control-plane metadata |
-| NATS (with JetStream) | `nats:4222` (monitor 8222) | Provision queue and jobs |
+| NATS (with JetStream) | `nats:4222` (monitor 8222) | Provision queue, jobs and events; one credentialed user per service |
+| Realtime | `realtime:8087`, `realtime:8088` | Live rows and presence: the socket and tickets (via the gateway), and `/health` |
 | Zitadel | `zitadel:8080` | Console: `http://auth.chelabase.localhost:8000/ui/console` |
 | Zitadel Postgres | `zitadel-db:5432` | Zitadel's own database |
 | Mailpit | `mailpit:8025` | Local email inbox (verification codes, resets) |
 | Neon storage controller | `storage-controller:1234` | Tenants and timelines |
 | Neon pageserver | `pageserver:9898` | Pageserver HTTP API |
-| Neon safekeeper | `safekeeper1:7676` | Safekeeper HTTP API |
+| Neon safekeepers | `safekeeper1:7676`, `safekeeper2:7676`, `safekeeper3:7676` | Safekeeper HTTP APIs (WAL on 5454) |
 | Neon proxy | `proxy:4432`, `proxy:4444` | Postgres wire; WebSocket and SQL over HTTP |
-| Valkey | `valkey:6379` | Proxy cache invalidation and query cancel |
+| Valkey | `valkey:6379` | Proxy cache invalidation and query cancel; realtime tickets and counters; ACL users only |
 
-The storage APIs (storcon `:1234`, pageserver `:9898`, safekeeper `:7676`) are unauthenticated, so anything on the stack's network can delete or inspect data; they are not published on the host. Platform mode will need authentication on them; it isn't built yet.
+The storage APIs (storcon `:1234`, pageserver `:9898`, safekeepers `:7676`) require a NeonJWT, and none is published on the host. Three routes stay open even with NeonJWT on, and are known gaps for the next Neon fork round: `/profile/cpu` and `/profile/heap` on the pageserver and safekeepers, and `/metrics` on both. `/v1/status` is public by design.
 
 Run `just workbench psql`, `just workbench exec <service> <cmd>` and `just workbench test|run` to reach those addresses from your checkout. [`infra/compose/.env.example`](https://github.com/chelabase/chelabase/blob/main/infra/compose/.env.example) holds the documented defaults that `just workbench up` renders each stack's env file from.
 
-Computes join only the stack's network. The orchestrator's internal listener is reached by its service name (`http://orchestrator:8083`), so no address needs to be picked per Docker flavour.
+## The compute network
+
+Each stack has a `<project>_compute` network, apart from the stack's default one. Computes join only it (and `control`, the orchestrator's and test runner's path to them), never the default network. On it, besides the computes: the pageserver and the three safekeepers, which computes read and stream to; the orchestrator, whose hooks listener computes call; and the clients that dial computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). Not on it: NATS, Valkey, every database container, Zitadel, Mailpit, SeaweedFS, the storage broker and controller, the gateway and Studio. Every listener of a member of this network needs a credential or is public by design (health, OpenAPI); `scripts/compute-network-e2e.sh` probes each one.
+
+Two gaps remain, both for the next Neon fork round: `compute_ctl`'s internal server on `compute:3081` has no authentication and is reachable from other computes, and tenant storage tokens have no expiry (rotating them means a new key pair). The orchestrator's internal listener is reached by its service name (`http://orchestrator:8083`), so no address needs to be picked per Docker flavour.
+
+### Upgrading a stack
+
+A stack that started before the compute network existed upgrades on its next `just workbench up`. `up` creates the new secrets (existing ones are never rewritten), renders the NATS and Valkey credential files and the storage tokens, starts `safekeeper2` and `safekeeper3`, and removes any compute that isn't on `<project>_compute`. The worker's reconcile (every 30 s) creates each removed compute again with a fresh spec; a compute's data lives in the pageserver and safekeepers, not in its container. The Neon services run as the stack's uid: the pageserver and safekeepers change the owner of an older root-owned `/data` once, on their first start.
 
 ## Checks
 

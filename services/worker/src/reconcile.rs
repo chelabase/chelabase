@@ -723,7 +723,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(|_| format!("enabling {name}: timed out"))
             }
-            Action::Resync(id, _) => self.resync(*id).await,
+            // The health-check batch also brings the realtime role current: the backfill of
+            // branches made before it, and a rotated password (logged on failure only).
+            Action::Resync(id, ep) => {
+                self.apply_realtime_role(ep).await;
+                self.resync(*id).await
+            }
             // After a RecreateBranchCompute in the same pass, the push can reach the new container
             // before compute_ctl listens and fail. That heals itself: the flag stays set, the
             // next pass retries, and meanwhile the new compute boots with the current spec.

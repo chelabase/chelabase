@@ -24,6 +24,7 @@ workbench *args:
 # Offline tests for the old-name -> Chelabase rename script (scripts/rename-chelabase.sh)
 rename-test:
     scripts/tests/rename-chelabase.sh
+    scripts/tests/rename-chelabase-isolation.sh
 
 # Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind, tenant admin)
 zitadel-bootstrap admin_email="":
@@ -107,6 +108,8 @@ check:
     scripts/tests/workbench-compose.sh
     scripts/tests/compose-key-visibility.sh
     scripts/tests/compose-mask-probe.sh
+    scripts/tests/compose-neon-uid-probe.sh
+    scripts/tests/compose-secret-argv.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
     cargo check --workspace
@@ -239,6 +242,11 @@ storage-leak-e2e:
 # refresh rotation and reuse, a user deleted, the project deleted with its org
 app-users-e2e:
     cargo run -q -p chelabase -- workbench run scripts/app-users-e2e.sh
+
+# Live check of what a compute can reach (RT1 R11): no NATS, Valkey or databases; every listener
+# on the compute network needs a credential or is public by design
+compute-network-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/compute-network-e2e.sh
 
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke
 data-e2e:

@@ -9,6 +9,7 @@
     "app-users",
     "sql-editor",
     "table-api",
+    "realtime",
     "schema-merge",
     "neon",
     "api-generation",

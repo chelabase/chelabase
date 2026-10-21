@@ -13,7 +13,14 @@ fn client() -> StorconClient {
     let url = std::env::var("STORCON_URL")
         .or_else(|_| std::env::var("CHELABASE_STORCON_URL"))
         .unwrap_or_else(|_| "http://storage-controller:1234".to_string());
-    StorconClient::new(&url, 0)
+    // The storage controller runs without --dev: an admin NeonJWT from the compute-JWT key pair.
+    let dir = std::env::var("CHELABASE_COMPUTE_JWT_DIR").unwrap_or_else(|_| ".chelabase/neon".into());
+    let token = chelabase_neon::jwt::storage_token_from_dir(
+        std::path::Path::new(&dir),
+        &chelabase_neon::jwt::StorageScope::Admin,
+    )
+    .expect("the compute-JWT key pair (CHELABASE_COMPUTE_JWT_DIR)");
+    StorconClient::new(&url, 0).with_token(token)
 }
 
 #[tokio::test]

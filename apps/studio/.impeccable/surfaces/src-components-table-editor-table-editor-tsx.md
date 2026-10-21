@@ -38,6 +38,16 @@ Loading, empty table, no tables, no data API (rows gated, "Enable data API"), pr
 - Durable DESIGN.md additions at finish: zebra rows and column hairlines for data grids.
 - Open for the spec: exact component split, TanStack Table/Virtual versions under pnpm's release-age rule.
 
+## 6. Presence and live state (RT1)
+
+- **Live state, table bar** (before Sort and Filter): a seafoam square and "Live", or a hollow chalk-dim square and "Live updates paused · <reason>" (no free slot, reconnecting, unavailable, read-only compute…). Shown once the table channel answers; nothing while it hasn't.
+- **Avatar stack**, beside it: square initials chips in each member's colour, ink text, at most 5 then "+N" in chalk-dim; hover or focus shows the tag (name, email, "acting as <role>" or "the owner").
+- **Presence on the grid** (one layer over the rows, never taking clicks meant for cells): another member's selected cell gets a 2px inset box in their colour, their row a 7% tint; while they edit, the box fills at 18%. The viewer's own selection (any tab) is never drawn: sand stays theirs alone.
+- **Colours:** 8 lagoon hues by `color_seed % 8`: seafoam, method-get blue, palm, method-put violet, method-patch yellow, shell, shell-light, chalk-dim. Sand (own selection, actions) and coral (hazard) are never presence colours.
+- **Live rows:** a spliced cell flashes seafoam once (1.4 s fade); under `prefers-reduced-motion` it gets a still seafoam hairline instead, and the presence boxes jump rather than glide. A keyed delete strikes its row through (coral line) until the next page read; a row that left the view fades to 40%. Inserts off the page: a status line "N new rows · Show".
+- **Open editor, row changed:** the field keeps the viewer's text; a seafoam "Changed since you started" chip under it shows the new value on hover. Another member editing the same cell: "Ana is editing this cell" under the field.
+- **Conflict dialog** ("Changed by someone else"): Column / Theirs / Yours table in mono, NULL in chalk-dim; "Take theirs" (ghost) and "Overwrite" (destructive). A row gone or hidden: "Not saved" with the deleted-or-hidden line and Close. Columns the check can't compare get "No conflict check for this column type: …".
+
 ## Direction contract
 
 THESIS: The table's columns stay in sight as a typed strip over its rows, so structure and data are one surface; refuses the default of a data grid with structure hidden in a separate settings page.

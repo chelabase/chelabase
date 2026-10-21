@@ -473,3 +473,94 @@ async fn console_route_checks_the_bearer_the_body_and_the_database() {
     assert_eq!(json["error"]["code"], "unknown_database");
     assert_eq!(json["error"]["message"], UNKNOWN_DATABASE);
 }
+
+/// Trees that use the console-only forms (RT1 T4: `text_of` select items, `"text": true`
+/// filters), each as it stands in a select.
+fn console_only_trees() -> Vec<Value> {
+    vec![
+        serde_json::json!({ "v": 1, "op": "select", "from": "t",
+            "select": [{ "text_of": "id", "as": "id_text" }, "name"] }),
+        serde_json::json!({ "v": 1, "op": "select", "from": "t",
+            "where": { "col": "id", "eq": "9007199254740993", "text": true } }),
+        serde_json::json!({ "v": 1, "op": "count", "from": "t",
+            "where": { "col": "id", "in": ["1", "2"], "text": true } }),
+        serde_json::json!({ "v": 1, "op": "batch", "ops": [
+            { "op": "select", "from": "t" },
+            { "op": "delete", "from": "t", "where": { "col": "id", "eq": "1", "text": true } },
+        ] }),
+    ]
+}
+
+/// The data API route refuses the console-only forms as plain invalid queries (like any
+/// unknown key), before any connection, for every kind of key and however the body is shaped:
+/// the grammar mode is the route's, not the body's.
+#[tokio::test]
+async fn the_data_route_refuses_the_console_only_forms_before_any_connection() {
+    let h = harness(served).await;
+    for kind in [DataKeyKind::Public, DataKeyKind::Secret] {
+        let token = h.token("rest", Some(kind));
+        for tree in console_only_trees() {
+            let mut bodies = vec![tree.clone()];
+            // A body that tries to ask for the console grammar.
+            for (field, value) in [
+                ("mode", serde_json::json!("console")),
+                ("console", serde_json::json!(true)),
+                ("parse_mode", serde_json::json!("Console")),
+            ] {
+                let mut with_field = tree.clone();
+                with_field[field] = value;
+                bodies.push(with_field);
+            }
+            let mut named = tree.clone();
+            named["database"] = serde_json::json!("main");
+            bodies.push(named);
+            for body in bodies {
+                let (status, _, json) = h.post(Some(&token), serde_json::to_vec(&body).unwrap()).await;
+                assert_eq!(status, 400, "{body}: {json}");
+                assert_eq!(json["error"]["code"], "invalid_query", "{body}");
+            }
+        }
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0, "a refusal must not reach a connection");
+}
+
+/// The console route takes the same trees: they get past the parser and on to the database
+/// lookup (an unserved database is a 404). Sibling fields in the request or the tree can't
+/// change which grammar is used.
+#[tokio::test]
+async fn the_console_route_accepts_the_console_only_forms() {
+    let h = harness(served).await;
+    let path = format!("/internal/console/{}/query", Uuid::new_v4());
+    for tree in console_only_trees() {
+        let request = serde_json::json!({ "role": "editor", "database": "ghost", "tree": tree });
+        let (status, json) = h.internal_post(&path, Some(TOKEN), request).await;
+        assert_eq!(status, 404, "{tree}: {json}");
+        assert_eq!(json["error"]["code"], "unknown_database", "{tree}");
+        // A request field naming the data API grammar changes nothing (it isn't a field).
+        let request = serde_json::json!({
+            "role": "editor", "database": "ghost", "tree": tree, "mode": "DataApi",
+        });
+        let (status, json) = h.internal_post(&path, Some(TOKEN), request).await;
+        assert_eq!(status, 404, "{tree}: {json}");
+        // Inside the tree an unknown field stays an unknown field.
+        let mut with_field = tree.clone();
+        with_field["mode"] = serde_json::json!("DataApi");
+        let request = serde_json::json!({ "role": "editor", "database": "ghost", "tree": with_field });
+        let (status, json) = h.internal_post(&path, Some(TOKEN), request).await;
+        assert_eq!(status, 400, "{with_field}: {json}");
+        assert_eq!(json["error"]["code"], "invalid_query");
+    }
+    // Still the console's grammar, no looser: a bad form is a 400 here too.
+    for bad in [
+        serde_json::json!({ "v": 1, "op": "select", "from": "t", "select": [{ "text_of": "id" }] }),
+        serde_json::json!({ "v": 1, "op": "select", "from": "t",
+            "where": { "col": "id", "gt": "1", "text": true } }),
+        serde_json::json!({ "v": 1, "op": "select", "from": "t",
+            "where": { "col": "id", "eq": 1, "text": true } }),
+    ] {
+        let request = serde_json::json!({ "role": "editor", "database": "main", "tree": bad });
+        let (status, json) = h.internal_post(&path, Some(TOKEN), request).await;
+        assert_eq!(status, 400, "{bad}: {json}");
+        assert_eq!(json["error"]["code"], "invalid_query", "{bad}");
+    }
+}

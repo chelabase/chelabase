@@ -232,7 +232,7 @@ for ep in $(sort -u "$tmp/endpoints"); do
   [[ "$(metadata_sql -v ep="$ep" <<<"SELECT count(*) FROM neon_endpoints WHERE id = :'ep';")" == 0 ]] ||
     die "endpoint $ep still has a row in neon_endpoints"
 done
-status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "$STORCON/control/v1/tenant/$tenant")" ||
+status="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "${STORAGE_AUTH[@]}" "$STORCON/control/v1/tenant/$tenant")" ||
   die "the storage controller didn't answer"
 [[ "$status" == 404 ]] || die "tenant $tenant (and its timelines) still exists (HTTP $status)"
 left="$(metadata_sql -v id="$main_id" <<<"SELECT count(*) FROM branches WHERE database_id = :'id' AND status <> 'deleted';")"

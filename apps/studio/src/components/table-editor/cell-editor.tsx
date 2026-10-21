@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type MutableRefObject, type ReactNode } from "react";
 import { closeBrackets } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, insertNewlineAndIndent } from "@codemirror/commands";
 import { bracketMatching } from "@codemirror/language";
@@ -10,8 +10,12 @@ import { cn } from "@/lib/utils";
 
 /** What an editor saves: a text the caller parses for the column's type, or NULL. */
 export type CellValue = { null: true } | { null: false; text: string };
-/** Where the active cell goes after a save: nowhere, or the next/previous cell (Tab, Shift+Tab). */
-export type Move = "none" | "next" | "prev";
+/**
+ * Where the active cell goes after a save: nowhere, the next/previous cell (Tab, Shift+Tab), out of the grid
+ * (a pointer-down outside the body cells: the editor closes, the active cell clears, focus stays where it went),
+ * or to the body cell a pointer-down pressed (the grid knows which).
+ */
+export type Move = "none" | "next" | "prev" | "out" | "press";
 
 export interface CellEditorProps {
   column: RowColumn;
@@ -21,6 +25,30 @@ export interface CellEditorProps {
   error: string | null;
   onCommit: (value: CellValue, move: Move) => void;
   onCancel: () => void;
+  /**
+   * Set while the editor is open: commits it with the given move ("out" or "press"), unchanged values included (the
+   * caller closes the editor without a save then); true when it did. Does nothing (false) while a save is in flight or
+   * for the value a failed save just tried.
+   */
+  leaveRef?: MutableRefObject<((move: "out" | "press") => boolean) | null>;
+  /** Lines under the field (the live "changed since you started" marker, another member editing). */
+  children?: ReactNode;
+}
+
+/** The editor error's width bounds, in px: 320 (20rem) with room to spare, never under 120. */
+export const ERROR_MAX_WIDTH = 320;
+export const ERROR_MIN_WIDTH = 120;
+/** The gap the error keeps from the viewport's right edge. */
+export const ERROR_EDGE_GAP = 8;
+
+/**
+ * The error's max width for a cell starting at `left` in a viewport, keeping an 8px gap from its right edge (the 120px
+ * floor wins over the gap); an unmeasured viewport gives the full width.
+ */
+export function errorRoom(left: number, viewport: { right: number; width: number }): number {
+  if (viewport.width <= 0) return ERROR_MAX_WIDTH;
+  const room = Math.floor(viewport.right - left - ERROR_EDGE_GAP);
+  return Math.min(ERROR_MAX_WIDTH, Math.max(ERROR_MIN_WIDTH, room));
 }
 
 const field =
@@ -31,7 +59,7 @@ const field =
  * a text field otherwise. Enter saves, Escape cancels, Tab saves and moves; leaving the field
  * saves a changed value. Nullable columns offer "Set NULL".
  */
-export function CellEditor({ column, initial, busy, error, onCommit, onCancel }: CellEditorProps) {
+export function CellEditor({ column, initial, busy, error, onCommit, onCancel, leaveRef, children }: CellEditorProps) {
   const temporal = temporalKind(column.desc);
   // What the control shows at first: date/time inputs take their own value format.
   const shownInitial = temporal ? toInputValue(temporal, initial) : initial;
@@ -90,6 +118,47 @@ export function CellEditor({ column, initial, busy, error, onCommit, onCancel }:
     if (current === shownInitial || current === tried.current) return;
     commit("none", current);
   }
+
+  // A pointer-down outside the editor (outside the grid's body cells, or on another body cell): like leaving the
+  // field, but an unchanged value closes the editor too.
+  const leave = (move: "out" | "press") => {
+    if (done.current || busy || text === tried.current) return false;
+    commit(move);
+    return true;
+  };
+  const leaveNow = useRef(leave);
+  leaveNow.current = leave;
+  useLayoutEffect(() => {
+    if (!leaveRef) return;
+    const run = (move: "out" | "press") => leaveNow.current(move);
+    leaveRef.current = run;
+    return () => {
+      if (leaveRef.current === run) leaveRef.current = null;
+    };
+  }, [leaveRef]);
+
+  // The error box hangs below the cell, left-aligned on it: no wider than the grid's visible room to its right.
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const [errorWidth, setErrorWidth] = useState(ERROR_MAX_WIDTH);
+  useLayoutEffect(() => {
+    if (!error) return;
+    const box = boxRef.current;
+    const scroller = box?.closest<HTMLElement>("[data-grid-scroll]");
+    if (!box || !scroller) return setErrorWidth(ERROR_MAX_WIDTH);
+    const measure = () => {
+      const rect = scroller.getBoundingClientRect();
+      // The visible right edge: without the vertical scrollbar when the viewport is laid out.
+      const right = scroller.clientWidth > 0 ? rect.left + scroller.clientLeft + scroller.clientWidth : rect.right;
+      setErrorWidth(errorRoom(box.getBoundingClientRect().left, { right, width: rect.width }));
+    };
+    measure();
+    scroller.addEventListener("scroll", measure, { passive: true });
+    window.addEventListener("resize", measure);
+    return () => {
+      scroller.removeEventListener("scroll", measure);
+      window.removeEventListener("resize", measure);
+    };
+  }, [error]);
 
   const common = {
     "aria-label": column.name,
@@ -168,7 +237,7 @@ export function CellEditor({ column, initial, busy, error, onCommit, onCancel }:
   }
 
   return (
-    <div data-editor="" className="absolute inset-x-0 top-0 z-30 flex min-h-9 flex-col">
+    <div ref={boxRef} data-editor="" className="absolute inset-x-0 top-0 z-30 flex min-h-9 flex-col">
       <div className="flex min-h-9 items-stretch bg-ink">
         <div className="min-w-0 flex-1">{control}</div>
         {column.desc.nullable && (
@@ -188,10 +257,11 @@ export function CellEditor({ column, initial, busy, error, onCommit, onCancel }:
         )}
       </div>
       {error && (
-        <p role="alert" className="w-max max-w-80 border border-coral/60 bg-deep px-2 py-1 font-sans text-xs whitespace-normal text-coral">
+        <p role="alert" style={{ maxWidth: errorWidth }} className="w-max border border-coral/60 bg-deep px-2 py-1 font-sans text-xs whitespace-normal text-coral">
           {error}
         </p>
       )}
+      {children}
     </div>
   );
 }

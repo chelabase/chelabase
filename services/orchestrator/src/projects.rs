@@ -436,6 +436,17 @@ where
             return ApiError::internal().into_response();
         }
     };
+    // P10: every member's access to the project goes (a whole-tenant access event, S28), and
+    // so do its databases.
+    crate::internal::realtime::access_changed(&state.rt_events, principal.tenant_id, None);
+    crate::internal::realtime::spawn_project(
+        state.rt_events.clone(),
+        record.id.as_uuid(),
+        started
+            .iter()
+            .map(|d| chelabase_nats::rt::ProjectEvent::DatabaseDeleted { database_id: d.as_uuid() })
+            .collect(),
+    );
     // A publish failure is only logged: the worker's reconcile retries the database deletes
     // and republishes the project job.
     for database_id in started {

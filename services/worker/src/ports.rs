@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use chelabase_metadata::{
-    AppSession, BranchAuthSync, ClaimOutcome, ProjectAuth, ProjectRecord,
+    AppSession, BranchAuthSync, BranchKind, ClaimOutcome, ProjectAuth, ProjectRecord,
     BranchConnectionRow, BranchDatabase, BranchDeleteOutcome, BranchRecord, BranchStatus, DataKeyRecord,
     DatabaseRecord, DatabaseSettings, DatabaseStatus, EndpointLock, EndpointState,
     InsertRoleOutcome, LiveBranch, LiveDatabase, MetadataClient, MetadataError, NeonDatabase,
@@ -51,6 +51,13 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = Result<Option<BranchId>, MetadataError>> + Send;
+    /// RT1 T5: the branch linked to `endpoint_id` and its kind, a deleting one included (a
+    /// delete stops the compute after it began); `None` for a deleted branch or an endpoint
+    /// without one (a static compute).
+    fn compute_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<Option<(BranchId, BranchKind)>, MetadataError>> + Send;
     fn get_branch(
         &self,
         id: BranchId,
@@ -692,6 +699,13 @@ impl WorkerMetadata for MetadataClient {
 
     async fn endpoint_branch(&self, endpoint_id: &str) -> Result<Option<BranchId>, MetadataError> {
         MetadataClient::endpoint_branch(self, endpoint_id).await
+    }
+
+    async fn compute_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<(BranchId, BranchKind)>, MetadataError> {
+        MetadataClient::compute_branch(self, endpoint_id).await
     }
 
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -1661,6 +1675,9 @@ impl CacheNotifier for ProxyCache {
 pub trait SpecPusher: Send + Sync + 'static {
     /// The keys computes accept control-plane tokens from.
     fn jwks(&self) -> serde_json::Value;
+    /// The compute-JWT key pair: it also signs each compute's storage token (its spec's
+    /// `storage_auth_token`).
+    fn signer(&self) -> &ComputeSigner;
     fn push(
         &self,
         control_addr: SocketAddr,
@@ -1684,6 +1701,10 @@ pub struct HttpPusher {
 impl SpecPusher for HttpPusher {
     fn jwks(&self) -> serde_json::Value {
         self.signer.jwks()
+    }
+
+    fn signer(&self) -> &ComputeSigner {
+        &self.signer
     }
 
     async fn push(

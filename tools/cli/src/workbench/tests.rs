@@ -486,7 +486,11 @@ fn the_stack_env_keeps_the_example_and_overlays_the_stack() {
         ("CHELABASE_NATS_URL", "nats://nats:4222"),
         ("CHELABASE_VALKEY_URL", "redis://valkey:6379"),
         ("CHELABASE_STORCON_URL", "http://storage-controller:1234"),
-        ("CHELABASE_SAFEKEEPER_HTTP", "1=http://safekeeper1:7676"),
+        // RT1 T1 (user): three safekeepers, so the storage controller runs without --dev.
+        (
+            "CHELABASE_SAFEKEEPER_HTTP",
+            "1=http://safekeeper1:7676,2=http://safekeeper2:7676,3=http://safekeeper3:7676",
+        ),
         ("CHELABASE_INTERNAL_URL", "http://orchestrator:8083"),
         ("CHELABASE_REST_INTERNAL_URL", "http://rest:8086"),
         ("CHELABASE_ORCHESTRATOR_URL", "http://orchestrator:8081"),
@@ -503,9 +507,11 @@ fn the_stack_env_keeps_the_example_and_overlays_the_stack() {
         ("CHELABASE_AUTH_ADDR", "0.0.0.0:8084"),
         ("CHELABASE_REST_ADDR", "0.0.0.0:8085"),
         ("CHELABASE_REST_INTERNAL_ADDR", "0.0.0.0:8086"),
-        ("CHELABASE_AUTH_TRUSTED_PROXY", "true"),
+        // RT1 T1 ruling (e): only the gateway's forwarded headers are trusted.
+        ("CHELABASE_AUTH_TRUSTED_PROXY", "gateway"),
         ("CHELABASE_CONTROL_PLANE_URI", "http://orchestrator:8083"),
-        ("CHELABASE_COMPUTE_NETWORK", "chelabase-feat-x_default"),
+        // RT1 T1 (P4/W14): computes get the stack's own network.
+        ("CHELABASE_COMPUTE_NETWORK", "chelabase-feat-x_compute"),
         (
             "CHELABASE_ZITADEL_ACTIONS_ENDPOINT",
             "http://orchestrator:8083/internal/zitadel/events",
@@ -572,7 +578,7 @@ fn main_renders_todays_hosts_and_network() {
     i.state = Path::new("/m/.chelabase/stacks/main");
     let env = parse(&render_stack_env(EXAMPLE, &i));
     assert_eq!(env["CHELABASE_STUDIO_HOST"], "studio.chelabase.localhost:8000");
-    assert_eq!(env["CHELABASE_COMPUTE_NETWORK"], "chelabase_default");
+    assert_eq!(env["CHELABASE_COMPUTE_NETWORK"], "chelabase_compute");
     assert_eq!(env["CHELABASE_PROXY_PORT"], "4432");
     assert_eq!(env["CHELABASE_CLI"], "/m/target/debug/chelabase");
 }
@@ -704,4 +710,42 @@ fn every_registered_stack_gets_its_own_control_slot() {
     let mut old = old;
     let c = old.ensure("feat-c", Path::new("/m/.worktrees/feat-c"), 4, |_| true).unwrap();
     assert!(c.control_slot.is_some(), "an old registry entry gets a slot");
+}
+
+// --- RT1 T7: the realtime service is wired like rest (pre-flight §4) -------------------------
+
+// The gateway's upstream and realtime's listeners inside the stack (spec §1, S1, S18).
+#[test]
+fn the_stack_env_carries_realtimes_addresses() {
+    let env = parse(&render_stack_env(EXAMPLE, &input()));
+    for (k, v) in [
+        ("CHELABASE_REALTIME_URL", "http://realtime:8087"),
+        ("CHELABASE_REALTIME_ADDR", "0.0.0.0:8087"),
+        ("CHELABASE_REALTIME_INTERNAL_ADDR", "0.0.0.0:8088"),
+    ] {
+        assert_eq!(env.get(k).map(String::as_str), Some(v), "{k}");
+    }
+    // S1: realtime's credentials are its own compose `environment:`, never stack.env.
+    for k in [
+        "CHELABASE_REALTIME_TICKET_KEY_FILE",
+        "CHELABASE_REALTIME_INTERNAL_TOKEN_FILE",
+        "CHELABASE_REALTIME_PG_PASSWORD_FILE",
+        "CHELABASE_VALKEY_TLS",
+    ] {
+        assert!(!env.contains_key(k), "{k} is not in stack.env");
+    }
+}
+
+// `up` builds, records and restarts realtime with the other Rust apps; it starts after the first
+// bootstrap with the late apps and reads demo.env (the OIDC audiences) like the gateway.
+#[test]
+fn realtime_is_one_of_the_stacks_rust_apps() {
+    use super::commands::{APPS, DEMO_ENV_READERS, INFRA, LATE_APPS, RUST_APPS, restart_targets};
+    assert!(RUST_APPS.contains(&"realtime"), "{RUST_APPS:?}");
+    assert!(APPS.contains(&"realtime"), "{APPS:?}");
+    assert!(LATE_APPS.contains(&"realtime"), "{LATE_APPS:?}");
+    assert!(DEMO_ENV_READERS.contains(&"realtime"), "{DEMO_ENV_READERS:?}");
+    assert!(!INFRA.contains(&"realtime"));
+    assert!(restart_targets(&[]).unwrap().contains(&"realtime".to_string()), "restart with no app named");
+    assert_eq!(restart_targets(&["realtime".into()]).unwrap(), ["realtime"]);
 }

@@ -3,6 +3,7 @@
 use http::HeaderMap;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -69,8 +70,118 @@ impl RateLimiter {
     }
 }
 
+/// The client's address for rate limits: the rightmost `X-Forwarded-For` entry (the one the
+/// gateway appended from its TCP peer) when `peer` is a trusted proxy, else `peer` itself. A
+/// compute on the compute network reaches auth directly, so its forwarded header never counts
+/// (RT1 T1 ruling (e)). IPv4-mapped IPv6 peers are compared and written as IPv4.
+pub fn client_ip_from(headers: &HeaderMap, peer: IpAddr, trusted: &[IpAddr]) -> String {
+    let peer = peer.to_canonical();
+    if trusted.iter().any(|t| t.to_canonical() == peer) {
+        let forwarded = client_ip(headers);
+        if forwarded != "unknown" {
+            return forwarded;
+        }
+    }
+    peer.to_string()
+}
+
+/// `CHELABASE_AUTH_TRUSTED_PROXY`: the proxies whose `X-Forwarded-For` auth believes, as a
+/// comma-separated list of IP addresses or host names (the stack: `gateway`). Names are resolved
+/// at most every 10 s, so a recreated gateway's new address is picked up; a failed lookup trusts
+/// nobody until the next one (fail closed: its callers are then rate-limited as the gateway).
+#[derive(Clone, Default)]
+pub struct TrustedProxies {
+    inner: std::sync::Arc<TrustedInner>,
+}
+
+#[derive(Default)]
+struct TrustedInner {
+    addrs: Vec<IpAddr>,
+    names: Vec<String>,
+    resolved: Mutex<Option<(Instant, Vec<IpAddr>)>>,
+}
+
+const RESOLVE_EVERY: Duration = Duration::from_secs(10);
+
+impl TrustedProxies {
+    /// Parses the setting; blank is nobody. `true`, `1`, `yes`, `on` (which once meant "trust
+    /// every peer") are refused: name the proxy instead.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut addrs = Vec::new();
+        let mut names = Vec::new();
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            if matches!(
+                entry.to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on" | "false" | "0" | "no" | "off"
+            ) {
+                return Err(format!(
+                    "CHELABASE_AUTH_TRUSTED_PROXY={raw:?}: name the proxy (its host name or IP \
+                     address, e.g. gateway), not a switch: only its X-Forwarded-For is believed"
+                ));
+            }
+            match entry.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+                Ok(ip) => addrs.push(ip),
+                Err(_) if is_host_name(entry) => names.push(entry.to_ascii_lowercase()),
+                Err(_) => {
+                    return Err(format!(
+                        "CHELABASE_AUTH_TRUSTED_PROXY: {entry:?} is neither an IP address nor a host name"
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            inner: std::sync::Arc::new(TrustedInner {
+                addrs,
+                names,
+                resolved: Mutex::new(None),
+            }),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.addrs.is_empty() && self.inner.names.is_empty()
+    }
+
+    /// The trusted addresses now: the literal ones and the names' current addresses.
+    pub async fn current(&self) -> Vec<IpAddr> {
+        let mut out = self.inner.addrs.clone();
+        if self.inner.names.is_empty() {
+            return out;
+        }
+        if let Some((at, ips)) = self.inner.resolved.lock().expect("trusted lock").as_ref()
+            && at.elapsed() < RESOLVE_EVERY
+        {
+            out.extend_from_slice(ips);
+            return out;
+        }
+        let mut ips = Vec::new();
+        for name in &self.inner.names {
+            match tokio::net::lookup_host((name.as_str(), 0)).await {
+                Ok(found) => ips.extend(found.map(|a| a.ip().to_canonical())),
+                Err(e) => tracing::warn!("CHELABASE_AUTH_TRUSTED_PROXY: resolving {name}: {e}"),
+            }
+        }
+        *self.inner.resolved.lock().expect("trusted lock") = Some((Instant::now(), ips.clone()));
+        out.extend(ips);
+        out
+    }
+}
+
+fn is_host_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
 /// The rightmost `X-Forwarded-For` entry: the one the gateway appended from the TCP peer.
-/// Entries to its left come from the client and can be forged.
+/// Entries to its left come from the client and can be forged. Only meaningful on a request
+/// [`client_ip_from`] has already rewritten (the router's forwarded-header layer does).
 pub fn client_ip(headers: &HeaderMap) -> String {
     headers
         .get_all("x-forwarded-for")

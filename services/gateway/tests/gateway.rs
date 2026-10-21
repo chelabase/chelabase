@@ -377,6 +377,27 @@ async fn undeclared_path_is_404_and_never_proxied() {
     assert!(stack.upstream_saw().is_none());
 }
 
+// RT1 S15: the orchestrator's `/internal/realtime/*` routes sit on its public listener, which
+// the gateway proxies to; the gateway never routes them (no endpoint declares them), with or
+// without a bearer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_internal_routes_are_404_and_never_proxied() {
+    let stack = start_stack().await;
+    for route in ["authorize", "projects", "visible"] {
+        for bearer in [None, Some("realtime-internal-token")] {
+            let mut req = reqwest::Client::new()
+                .post(format!("{}/internal/realtime/{route}", stack.base))
+                .json(&serde_json::json!({ "token": "x" }));
+            if let Some(bearer) = bearer {
+                req = req.bearer_auth(bearer);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 404, "{route} {bearer:?}");
+        }
+    }
+    assert!(stack.upstream_saw().is_none());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_method_is_405_with_allow() {
     let stack = start_stack().await;
@@ -1012,4 +1033,107 @@ async fn a_hung_site_request_times_out_like_the_api() {
         .await
         .expect("the gateway answers before the client gives up");
     assert_eq!(resp.status(), 504);
+}
+
+// ---- RT1 T3 (S18, W17): the realtime socket route and upgrades elsewhere ----
+
+fn upgrade_head(target: &str, host: &str, extra: &str) -> String {
+    format!(
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n"
+    )
+}
+
+fn gateway_port(base: &str) -> u16 {
+    base.rsplit(':').next().unwrap().parse().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgrade_on_a_non_websocket_api_route_is_400_and_never_reaches_the_upstream() {
+    let stack = start_stack().await;
+    let port = gateway_port(&stack.base);
+    let host = format!("127.0.0.1:{port}");
+    for target in ["/v1/me", "/health"] {
+        let mut sock = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
+        let extra = format!("Authorization: {}\r\n", stack.bearer());
+        sock.write_all(upgrade_head(target, &host, &extra).as_bytes()).await.unwrap();
+        let head = tokio::time::timeout(Duration::from_secs(10), read_head(&mut sock)).await.unwrap();
+        assert!(head.starts_with("HTTP/1.1 400"), "{target}: {head}");
+        assert!(stack.upstream_saw().is_none(), "{target}: the upgrade reached the upstream");
+    }
+    // The same route without an upgrade is proxied as before.
+    let resp = reqwest::Client::new()
+        .get(format!("{}/v1/me", stack.base))
+        .header("authorization", stack.bearer())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(stack.upstream_saw().is_some());
+}
+
+/// A raw upstream that records the request head it gets, answers it with 101 and echoes 4 bytes.
+async fn spawn_recording_upgrade_upstream() -> (String, Arc<Mutex<Option<String>>>) {
+    let head: Arc<Mutex<Option<String>>> = Arc::default();
+    let record = head.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        *record.lock().unwrap() = Some(read_head(&mut sock).await);
+        sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        sock.read_exact(&mut buf).await.unwrap();
+        sock.write_all(&buf).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    (format!("http://{addr}"), head)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_realtime_socket_route_passes_an_upgrade_with_its_ticket_and_no_client_identity() {
+    let jwks = MockJwks::start().await;
+    let (api, api_seen) = spawn_upstream().await;
+    let (realtime, realtime_head) = spawn_recording_upgrade_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&api, &jwks, &[("CHELABASE_REALTIME_URL", realtime.as_str())]).await;
+    let port = gateway_port(&base);
+    let mut sock = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
+    let extra = format!(
+        "{IDENTITY_HEADER}: forged\r\nAuthorization: Bearer nope\r\nSec-WebSocket-Protocol: chelabase.realtime.v1\r\n"
+    );
+    sock.write_all(upgrade_head("/v1/realtime/socket?ticket=T1", &format!("127.0.0.1:{port}"), &extra).as_bytes())
+        .await
+        .unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(10), read_head(&mut sock)).await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    sock.write_all(b"ping").await.unwrap();
+    let mut echo = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut echo)).await.unwrap().unwrap();
+    assert_eq!(&echo, b"ping");
+
+    let seen = realtime_head.lock().unwrap().clone().expect("realtime was called").to_ascii_lowercase();
+    assert!(seen.starts_with("get /v1/realtime/socket?ticket=t1 http/1.1"), "{seen}");
+    assert!(!seen.contains(IDENTITY_HEADER), "a forged identity reached realtime: {seen}");
+    assert!(!seen.contains("authorization"), "{seen}");
+    assert!(seen.contains("sec-websocket-protocol: chelabase.realtime.v1"), "{seen}");
+    assert!(api_seen.lock().unwrap().is_none(), "the socket route must not go to the orchestrator");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_realtime_upstream_answers_a_socket_upgrade_with_502() {
+    // The W16 failure path (the log text itself is asserted in realtime_proxy.rs).
+    let jwks = MockJwks::start().await;
+    let (api, _) = spawn_upstream().await;
+    let (dead, _socket) = refused_upstream();
+    let (base, _verify, _gateway) = spawn_gateway_with(&api, &jwks, &[("CHELABASE_REALTIME_URL", dead.as_str())]).await;
+    let port = gateway_port(&base);
+    let mut sock = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
+    sock.write_all(upgrade_head("/v1/realtime/socket?ticket=SECRET", &format!("127.0.0.1:{port}"), "").as_bytes())
+        .await
+        .unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(10), read_head(&mut sock)).await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
 }

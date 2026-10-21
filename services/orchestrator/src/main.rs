@@ -68,11 +68,14 @@ async fn main() -> anyhow::Result<()> {
         http: reqwest::Client::new(),
     };
 
+    // The storage controller runs without --dev: an admin-scoped NeonJWT from the compute-JWT key.
+    let storcon_admin = signer.storage_token(&chelabase_neon::jwt::StorageScope::Admin)?;
     let internal_state = Arc::new(InternalState {
         metadata: metadata.clone(),
         locator: DockerLocator::connect(&internal_config.compute_network, &internal_config.stack)?,
         storcon: StorconClient::new(&internal_config.storcon_url, 0)
-            .with_timeout(Duration::from_secs(10)),
+            .with_timeout(Duration::from_secs(10))
+            .with_token(storcon_admin),
         signer,
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -81,9 +84,14 @@ async fn main() -> anyhow::Result<()> {
         storcon_token: internal_config.storcon_token.clone(),
         data_keys_token: internal_config.data_keys_token.clone(),
         rest_token: internal_config.rest_token.clone(),
+        realtime_token: internal_config.realtime_token.clone(),
+        rt_events: Arc::new(nats.clone()),
         secrets: secrets.clone(),
         roles,
-        cache: Arc::new(ProxyCache::new(&internal_config.valkey_url)?),
+        // As the `control` ACL user (CHELABASE_VALKEY_USER / CHELABASE_VALKEY_PASSWORD_FILE).
+        cache: Arc::new(ProxyCache::from_lookup(&internal_config.valkey_url, |name| {
+            std::env::var(name).ok()
+        })?),
         resync: Arc::new(nats.clone()),
         control_plane_uri: internal_config.control_plane_uri.clone(),
         rest: rest.clone(),
@@ -101,8 +109,15 @@ async fn main() -> anyhow::Result<()> {
     let compute_tls = Arc::new(ComputeTls::new(internal_config.compute_tls_dir.clone()));
     compute_tls.spawn_reload();
 
+    let rt_events: Arc<dyn orchestrator::internal::realtime::RtEvents> = Arc::new(nats.clone());
     let state = AppState {
         metadata,
+        realtime: orchestrator::internal::realtime::RealtimeAuth {
+            token: internal_config.realtime_token.clone(),
+            // The gateway's settings (issuer, JWKS URL), the same env names.
+            verifier: chelabase_auth::JwtVerifier::from_env()?,
+        },
+        rt_events,
         js: NatsPorts { js, client: nats },
         identity,
         secrets,

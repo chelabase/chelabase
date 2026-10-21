@@ -944,6 +944,20 @@ mod tests {
         assert_eq!(documented, registry);
     }
 
+    /// RT1 T3: realtime has no public OpenAPI document and its routes are not in this one
+    /// (Studio calls the ticket route with a hand-written `fetch`).
+    #[test]
+    fn document_leaves_out_the_realtime_service() {
+        assert!(
+            ENDPOINTS.iter().any(|e| e.service == Service::Realtime),
+            "the realtime routes must be declared for this guard to mean anything"
+        );
+        let doc = document();
+        for (method, path, _) in operations(&doc) {
+            assert!(!path.contains("realtime"), "{method} {path}");
+        }
+    }
+
     #[test]
     fn operation_ids_are_the_contract() {
         let doc = document();
@@ -1411,6 +1425,7 @@ mod tests {
             "PutGrantRequest",
             "RecomputeRequest",
             "RehearseRequest",
+            "Relation",
             "ResendInviteRequest",
             "ResentInvite",
             "ResolutionBody",

@@ -41,8 +41,32 @@ export interface TableEditorState {
   discard(key: string): void;
   /** After the user reviewed a changed table. */
   rebase(key: string, base: Table): void;
-  /** Also un-collapses the panel. `focus`: the column form puts focus on that field (else on Name). */
-  openPanel(kind: PanelKind, target?: { column?: string | null; row?: string | null; focus?: FormField }): void;
+  /**
+   * Also un-collapses the panel. `focus`: the column form puts focus on that field (else on Name). When it would drop
+   * the row panel's unsaved draft (another panel, another row, closed), it asks first (`discardAsk`) unless `discard`.
+   */
+  openPanel(kind: PanelKind, target?: { column?: string | null; row?: string | null; focus?: FormField }, opts?: { discard?: boolean }): void;
+  /** The row panel's unsaved draft while it has one (published by the panel; a collapsed panel keeps it). */
+  rowDraft: RowDraft | null;
+  setRowDraft(draft: RowDraft): void;
+  /** Forgets the draft this panel published (`id`); another panel's is kept. */
+  clearRowDraft(id: number): void;
+  /** Bumped by a Discard: the row panel remounts empty (its key includes it). */
+  rowDraftEpoch: number;
+  /** The rows on screen (their keys and the first one's number), for the discard prompt's "row N". */
+  pageRows: { table: string; keys: readonly (string | null)[]; first: number } | null;
+  setPageRows(rows: { table: string; keys: readonly (string | null)[]; first: number } | null): void;
+  /** Runs `run` now, or asks first ("Discard changes to row N?") while the row panel holds an unsaved draft. */
+  guardDiscard(run: () => void): void;
+  /**
+   * The same question as a promise (the route blocker: Back, Forward, a link away): true once Discard drops the draft
+   * (or at once when there is none), false on Keep editing.
+   */
+  askDiscard(): Promise<boolean>;
+  /** The question being asked, or null. `cancel` runs on Keep editing (or when another question replaces it). */
+  discardAsk: { title: string; run: () => void; cancel?: () => void } | null;
+  /** The answer: Discard drops the draft, then runs what was asked; Keep editing changes nothing. */
+  answerDiscard(discard: boolean): void;
   /** The column form acted on the panel's focus request. */
   consumeFocus(): void;
   setCollapsed(collapsed: boolean): void;
@@ -66,6 +90,28 @@ export interface TableEditorState {
   exactRows: Record<string, number>;
   /** null forgets it (a full page showed the table may have grown past it). */
   setExactRows(key: string, rows: number | null): void;
+  /**
+   * The last row number on screen per changeset key (the page's offset + its rows): the table has at least that many
+   * rows, so a smaller row estimate is shown as this count instead.
+   */
+  shownRows: Record<string, number>;
+  setShownRows(key: string, rows: number | null): void;
+}
+
+export interface RowDraft {
+  /** The publishing panel instance. */
+  id: number;
+  /** The changeset key of its table. */
+  table: string;
+  /** The row's key; null for a New row panel. */
+  row: string | null;
+}
+
+/** The discard prompt's title for this draft, given the rows on screen. */
+export function discardTitle(draft: RowDraft, pageRows: TableEditorState["pageRows"]): string {
+  if (draft.row === null) return "Discard the new row?";
+  const i = pageRows && pageRows.table === draft.table ? pageRows.keys.indexOf(draft.row) : -1;
+  return i >= 0 ? `Discard changes to row ${pageRows!.first + i}?` : "Discard changes to this row?";
 }
 
 export interface ApplyFailure {
@@ -112,13 +158,48 @@ function loadDrafts(storage: Storage | null): Record<string, Changeset> {
 
 /** The editor's client state. Drafts (the changesets) live in the given storage; storage errors are ignored. */
 export function createTableEditorStore(storage: Storage | null): StoreApi<TableEditorState> {
-  const store = createStore<TableEditorState>()((set) => ({
+  const store = createStore<TableEditorState>()((set, get) => ({
     changesets: loadDrafts(storage),
     panel: CLOSED,
     actAs: {},
     selection: NO_SELECTION,
     view: "table",
-    setView: (view) => set((s) => (s.view === view ? s : { view, panel: CLOSED })),
+    setView: (view) => {
+      if (get().view === view) return;
+      get().guardDiscard(() => set({ view, panel: CLOSED }));
+    },
+    rowDraft: null,
+    setRowDraft: (draft) =>
+      set((s) => (s.rowDraft && s.rowDraft.id === draft.id && s.rowDraft.table === draft.table && s.rowDraft.row === draft.row ? s : { rowDraft: draft })),
+    clearRowDraft: (id) => set((s) => (s.rowDraft?.id === id ? { rowDraft: null } : s)),
+    rowDraftEpoch: 0,
+    pageRows: null,
+    setPageRows: (pageRows) => set({ pageRows }),
+    discardAsk: null,
+    guardDiscard: (run) => {
+      const { rowDraft, pageRows } = get();
+      if (!rowDraft) return run();
+      get().discardAsk?.cancel?.();
+      set({ discardAsk: { title: discardTitle(rowDraft, pageRows), run } });
+    },
+    askDiscard: () =>
+      new Promise<boolean>((resolve) => {
+        const { rowDraft, pageRows } = get();
+        if (!rowDraft) return resolve(true);
+        get().discardAsk?.cancel?.();
+        set({ discardAsk: { title: discardTitle(rowDraft, pageRows), run: () => resolve(true), cancel: () => resolve(false) } });
+      }),
+    answerDiscard: (discard) => {
+      const ask = get().discardAsk;
+      if (!ask) return;
+      if (!discard) {
+        set({ discardAsk: null });
+        ask.cancel?.();
+        return;
+      }
+      set((s) => ({ discardAsk: null, rowDraft: null, rowDraftEpoch: s.rowDraftEpoch + 1 }));
+      ask.run();
+    },
     dialogs: 0,
     setDialogOpen: (open) => set((s) => ({ dialogs: Math.max(0, s.dialogs + (open ? 1 : -1)) })),
     applied: null,
@@ -130,6 +211,13 @@ export function createTableEditorStore(storage: Storage | null): StoreApi<TableE
         if ((s.exactRows[key] ?? null) === rows) return s;
         const { [key]: _gone, ...rest } = s.exactRows;
         return { exactRows: rows === null ? rest : { ...rest, [key]: rows } };
+      }),
+    shownRows: {},
+    setShownRows: (key, rows) =>
+      set((s) => {
+        if ((s.shownRows[key] ?? null) === rows) return s;
+        const { [key]: _gone, ...rest } = s.shownRows;
+        return { shownRows: rows === null ? rest : { ...rest, [key]: rows } };
       }),
     addEdit: (key, base, edit) =>
       set((s) => {
@@ -161,7 +249,14 @@ export function createTableEditorStore(storage: Storage | null): StoreApi<TableE
         const current = s.changesets[key];
         return current ? { changesets: { ...s.changesets, [key]: { ...current, base: tableFingerprint(base) } } } : s;
       }),
-    openPanel: (kind, target) =>
+    openPanel: (kind, target, opts) => {
+      const { panel, rowDraft } = get();
+      // The same row (expanded if collapsed) keeps its panel and draft; anything else drops them.
+      const keeps = panel.kind === "row" && kind === "row" && (target?.row ?? null) === panel.row;
+      if (!opts?.discard && rowDraft && panel.kind === "row" && !keeps) {
+        get().guardDiscard(() => get().openPanel(kind, target, { discard: true }));
+        return;
+      }
       set(() => ({
         panel: {
           kind,
@@ -170,7 +265,8 @@ export function createTableEditorStore(storage: Storage | null): StoreApi<TableE
           row: target?.row ?? null,
           focus: target?.focus ? { field: target.focus, seq: ++focusSeq } : undefined,
         },
-      })),
+      }));
+    },
     consumeFocus: () => set((s) => (s.panel.focus === undefined ? s : { panel: { ...s.panel, focus: undefined } })),
     setCollapsed: (collapsed) => set((s) => ({ panel: { ...s.panel, collapsed } })),
     setActAs: (branchKey, role) => set((s) => ({ actAs: { ...s.actAs, [branchKey]: role } })),

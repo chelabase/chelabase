@@ -8,7 +8,7 @@
 //! created through the API or Studio, e.g. `just create-db-demo`). It uses the endpoint id
 //! (`ep-…`, the host's first label) in `CHELABASE_LIVE_ENDPOINT` when set, else the first running
 //! compute of the stack (sorted by endpoint id). It reads the stack's `CHELABASE_STACK` (default `main`), `CHELABASE_COMPUTE_NETWORK`
-//! (default `chelabase_default`) and `CHELABASE_CONTROL_PLANE_URI` (default
+//! (default `chelabase_compute`) and `CHELABASE_CONTROL_PLANE_URI` (default
 //! `http://orchestrator:8083`).
 
 use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend};
@@ -174,7 +174,7 @@ async fn admin_sql_on_a_running_compute() {
     let stack = env_or("CHELABASE_STACK", "main");
     let ep = running_endpoint(&stack).await;
     let backend = backend(
-        &env_or("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
+        &env_or("CHELABASE_COMPUTE_NETWORK", "chelabase_compute"),
         &env_or("CHELABASE_CONTROL_PLANE_URI", "http://orchestrator:8083"),
         &stack,
     );

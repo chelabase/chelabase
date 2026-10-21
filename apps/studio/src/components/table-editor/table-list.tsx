@@ -25,14 +25,25 @@ export function formatCount(n: number): string {
   return k < 1000 ? `${k}k` : `${round(n / 1_000_000)}M`;
 }
 
-const VIEW_KINDS: readonly string[] = ["view", "materialized_view"];
+/** The count line's kinds, in its order; any other kind (a table, a partitioned table) counts as a table. */
+const COUNTED: readonly { kind: string; one: string; many: string }[] = [
+  { kind: "table", one: "table", many: "tables" },
+  { kind: "view", one: "view", many: "views" },
+  { kind: "materialized_view", one: "materialized view", many: "materialized views" },
+  { kind: "foreign_table", one: "foreign table", many: "foreign tables" },
+];
 
-/** "2 tables, 1 view": each part only when it isn't zero. */
+/** "2 tables, 1 view, 1 materialized view": each kind apart, only the kinds present; "0 tables" when empty. */
 function countLine(objects: ObjectSummary[]): string {
-  const views = objects.filter((o) => VIEW_KINDS.includes(o.kind)).length;
-  const tables = objects.length - views;
-  const part = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
-  const parts = [tables > 0 && part(tables, "table", "tables"), views > 0 && part(views, "view", "views")].filter(Boolean);
+  const counts = new Map<string, number>();
+  for (const o of objects) {
+    const kind = COUNTED.some((c) => c.kind === o.kind) ? o.kind : "table";
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  const parts = COUNTED.flatMap(({ kind, one, many }) => {
+    const n = counts.get(kind) ?? 0;
+    return n > 0 ? [`${n} ${n === 1 ? one : many}`] : [];
+  });
   return parts.length > 0 ? parts.join(", ") : "0 tables";
 }
 

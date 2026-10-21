@@ -79,6 +79,8 @@ fn platform_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(logout))
 }
 
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()`: the client address
+/// rate limits key on comes from the TCP peer (see [`forwarded_for`]).
 pub fn router(state: Arc<AppState>) -> Router {
     let (platform, _) = platform_router().split_for_parts();
     let (app_users, _) = crate::app_users::flows::api_router().split_for_parts();
@@ -87,7 +89,37 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(DefaultBodyLimit::max(8 * 1024))
         // Sign-up's `data` may carry a few columns' values.
         .merge(app_users.layer(DefaultBodyLimit::max(64 * 1024)))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), forwarded_for))
         .with_state(state)
+}
+
+/// Replaces every `X-Forwarded-For` with the one client address the handlers key on
+/// ([`crate::guard::client_ip_from`]): the gateway's rightmost entry when the TCP peer is a
+/// trusted proxy, else the peer itself. Without the peer (served without connect info) the
+/// client is `unknown`, never a forwarded value (RT1 T1 ruling (e): computes reach auth directly).
+async fn forwarded_for(
+    State(state): S,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    let client = match peer {
+        Some(peer) => crate::guard::client_ip_from(
+            req.headers(),
+            peer,
+            &state.config.trusted_proxies.current().await,
+        ),
+        None => "unknown".to_string(),
+    };
+    let headers = req.headers_mut();
+    headers.remove("x-forwarded-for");
+    if let Ok(value) = axum::http::HeaderValue::from_str(&client) {
+        headers.insert("x-forwarded-for", value);
+    }
+    next.run(req).await
 }
 
 /// What the sign-in pages do next, as `{"next": "done", "redirect": …}` or `{"next": "verify"}`.

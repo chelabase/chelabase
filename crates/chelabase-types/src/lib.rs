@@ -11,6 +11,7 @@ pub mod access;
 pub mod api_error;
 pub mod table_api;
 pub mod entry;
+pub mod secret_env;
 #[cfg(feature = "axum")]
 pub mod api_extract;
 pub use api_error::{ErrorBody, ErrorCode, ErrorEnvelope};

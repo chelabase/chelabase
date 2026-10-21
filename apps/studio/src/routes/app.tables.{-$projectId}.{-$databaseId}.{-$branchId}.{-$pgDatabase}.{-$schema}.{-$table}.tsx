@@ -1,4 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { RouteDraftBlocker } from "@/components/table-editor/route-blocker";
 import { TableEditor } from "@/components/table-editor/table-editor";
 import { editorRouteParams, type EditorParams } from "@/lib/table-editor/context";
 
@@ -12,6 +13,7 @@ function TablesRoute() {
   return (
     <TableEditor
       params={params}
+      leaveGuard={RouteDraftBlocker}
       navigate={(p, opts) =>
         void navigate({
           to: "/app/tables/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}/{-$schema}/{-$table}",

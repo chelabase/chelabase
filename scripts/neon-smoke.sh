@@ -16,7 +16,7 @@ LOG_PREFIX=neon-smoke
 delete_until_gone() {
   local url="$1" status
   for _ in $(seq 120); do
-    status="$(curl -sS --max-time "$MAX_TIME" -o /dev/null -w '%{http_code}' -X DELETE "$url")" ||
+    status="$(curl -sS --max-time "$MAX_TIME" -o /dev/null -w '%{http_code}' "${STORAGE_AUTH[@]}" -X DELETE "$url")" ||
       die "DELETE $url: no answer"
     case "$status" in
       200 | 404) return 0 ;;
@@ -33,7 +33,7 @@ created=""
 cleanup() {
   local status
   if [[ -n "$created" ]]; then
-    status="$(curl -sS --max-time "$MAX_TIME" -o /dev/null -w '%{http_code}' \
+    status="$(curl -sS --max-time "$MAX_TIME" -o /dev/null -w '%{http_code}' "${STORAGE_AUTH[@]}" \
       -X DELETE "$STORCON/v1/tenant/$tenant" 2>/dev/null || true)"
     case "$status" in
       2?? | 404) ;;

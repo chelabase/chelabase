@@ -286,6 +286,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
+        self.ensure_realtime(ep, &rec.database_name).await;
         self.bootstrap_served_on(BranchId::from(id), ep, &rec.database_name, &[])
             .await
             .map(|_| ())

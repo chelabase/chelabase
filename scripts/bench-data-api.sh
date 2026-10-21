@@ -15,7 +15,10 @@ LOG_PREFIX=bench-data-api
 . scripts/lib/neon-common.sh
 GATEWAY="${GATEWAY_URL:-$CHELABASE_ENTRY_API_URL}"
 INTERNAL_URL="${CHELABASE_INTERNAL_URL:-${CHELABASE_CONTROL_PLANE_URI:-http://orchestrator:8083}}"
-INTERNAL_TOKEN="${CHELABASE_REST_INTERNAL_TOKEN:-chelabase-dev-rest-internal}"
+INTERNAL_TOKEN="$(secret_value CHELABASE_REST_INTERNAL_TOKEN)"
+# The stack's generated bearer; never a development default (the stack refuses those).
+[[ -n "$INTERNAL_TOKEN" ]] ||
+  { echo "FAIL CHELABASE_REST_INTERNAL_TOKEN (or _FILE) is unset: run this through just bench-data-api" >&2; exit 1; }
 DEMO_TENANT_ID="00000000-0000-4000-8000-000000000001"
 DEMO_PROJECT_ID="00000000-0000-4000-8000-000000000002"
 # Keep in step with NETSHOOT in tools/bench-data-api/src/netem.rs (bump both together).

@@ -13,6 +13,9 @@ pub struct InternalConfig {
     pub storcon_token: String,
     pub data_keys_token: String,
     pub rest_token: String,
+    /// `CHELABASE_REALTIME_INTERNAL_TOKEN[_FILE]`: realtime's bearer (its `/internal/realtime/*`
+    /// routes, and connection info and key lookups here).
+    pub realtime_token: String,
     pub storcon_url: String,
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
@@ -49,6 +52,18 @@ pub struct InternalConfig {
     pub zitadel_issuer: Option<String>,
 }
 
+/// Every bearer the internal listener checks, with its development default (public: a platform
+/// instance refuses each, [`InternalConfig::check_mode`]).
+pub const DEV_BEARERS: [(&str, &str); 7] = [
+    ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
+    ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
+    ("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
+    ("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
+    ("CHELABASE_REALTIME_INTERNAL_TOKEN", "chelabase-dev-realtime-internal"),
+    ("CHELABASE_APP_AUTH_INTERNAL_TOKEN", chelabase_types::mode_policy::DEV_APP_AUTH_INTERNAL_TOKEN),
+    ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "chelabase-dev-app-sessions"),
+];
+
 /// A session never lasts longer than this after it was created (and so neither can a refresh).
 pub const APP_SESSION_CAP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
@@ -57,24 +72,31 @@ impl InternalConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// Blank values count as unset.
+    /// Blank values count as unset. Each bearer is `<NAME>` or the file `<NAME>_FILE` names (the
+    /// stack mounts generated secrets, S27); unset, it is the development default.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let or = |name: &str, default: &str| {
             get(name)
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| default.to_string())
         };
+        let secret = |name: &str, default: &str| -> Result<String> {
+            Ok(chelabase_types::secret_env::lookup_secret(&get, name)
+                .map_err(|e| anyhow!(e))?
+                .unwrap_or_else(|| default.to_string()))
+        };
         Ok(Self {
             addr: or("CHELABASE_INTERNAL_ADDR", "127.0.0.1:8083")
                 .parse()
                 .context("CHELABASE_INTERNAL_ADDR is not a socket address")?,
-            proxy_token: or("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
-            storcon_token: or("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
-            data_keys_token: or("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
-            rest_token: or("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
+            proxy_token: secret(DEV_BEARERS[0].0, DEV_BEARERS[0].1)?,
+            storcon_token: secret(DEV_BEARERS[1].0, DEV_BEARERS[1].1)?,
+            data_keys_token: secret(DEV_BEARERS[2].0, DEV_BEARERS[2].1)?,
+            rest_token: secret(DEV_BEARERS[3].0, DEV_BEARERS[3].1)?,
+            realtime_token: secret(DEV_BEARERS[4].0, DEV_BEARERS[4].1)?,
             storcon_url: or("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             compute_jwt_dir: PathBuf::from(or("CHELABASE_COMPUTE_JWT_DIR", ".chelabase/neon")),
-            compute_network: or("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
+            compute_network: or("CHELABASE_COMPUTE_NETWORK", "chelabase_compute"),
             compute_control_network: or(
                 "CHELABASE_COMPUTE_CONTROL_NETWORK",
                 "chelabase_control",
@@ -95,11 +117,8 @@ impl InternalConfig {
                 chelabase_neon::DEFAULT_STACK,
             ))?,
             valkey_url: or("CHELABASE_VALKEY_URL", "redis://127.0.0.1:6379"),
-            app_auth_token: or("CHELABASE_APP_AUTH_INTERNAL_TOKEN", "chelabase-dev-app-auth"),
-            app_sessions_token: or(
-                "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN",
-                "chelabase-dev-app-sessions",
-            ),
+            app_auth_token: secret(DEV_BEARERS[5].0, DEV_BEARERS[5].1)?,
+            app_sessions_token: secret(DEV_BEARERS[6].0, DEV_BEARERS[6].1)?,
             app_refresh_ttl: refresh_ttl(&or("CHELABASE_APP_REFRESH_TTL_SECS", "2592000"))?,
             actions_signing_key: get("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY")
                 .filter(|v| !v.trim().is_empty()),
@@ -111,10 +130,31 @@ impl InternalConfig {
         })
     }
 
-    /// Startup refusals that depend on the mode (M9): a platform instance doesn't run with the
-    /// development bearer (`CHELABASE_APP_AUTH_INTERNAL_TOKEN` unset), which is public.
+    /// Startup refusals that depend on the mode (M9): a platform instance runs with none of the
+    /// internal listener's development bearers (each is public), whether its variable is unset
+    /// or set to one of them. The error names the variable, never the token.
     pub fn check_mode(&self, policy: &chelabase_types::mode_policy::ModePolicy) -> Result<()> {
-        policy.check_internal_token(&self.app_auth_token).map_err(|e| anyhow!(e))
+        let dev_values: Vec<&str> = DEV_BEARERS.iter().map(|(_, value)| *value).collect();
+        for (var, token) in self.bearers() {
+            policy
+                .check_dev_bearer(var, token, &dev_values)
+                .map_err(|e| anyhow!(e))?;
+        }
+        Ok(())
+    }
+
+    /// Every bearer the internal listener checks, with its variable, in [`DEV_BEARERS`]' order.
+    fn bearers(&self) -> [(&'static str, &str); 7] {
+        let values = [
+            self.proxy_token.as_str(),
+            self.storcon_token.as_str(),
+            self.data_keys_token.as_str(),
+            self.rest_token.as_str(),
+            self.realtime_token.as_str(),
+            self.app_auth_token.as_str(),
+            self.app_sessions_token.as_str(),
+        ];
+        std::array::from_fn(|i| (DEV_BEARERS[i].0, values[i]))
     }
 
     /// The Zitadel admin client (P2), or `None` (with a warning) when the PAT file or the
@@ -205,6 +245,7 @@ impl std::fmt::Debug for InternalConfig {
             .field("storcon_token", &"<redacted>")
             .field("data_keys_token", &"<redacted>")
             .field("rest_token", &"<redacted>")
+            .field("realtime_token", &"<redacted>")
             .field("storcon_url", &self.storcon_url)
             .field("compute_jwt_dir", &self.compute_jwt_dir)
             .field("compute_network", &self.compute_network)
@@ -250,7 +291,7 @@ mod tests {
         assert_eq!(c.rest_token, "chelabase-dev-rest-internal");
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
         assert_eq!(c.compute_jwt_dir, PathBuf::from(".chelabase/neon"));
-        assert_eq!(c.compute_network, "chelabase_default");
+        assert_eq!(c.compute_network, "chelabase_compute");
         assert_eq!(c.stack, "main");
         assert_eq!(c.control_plane_uri.as_str(), "http://orchestrator:8083");
     }
@@ -364,6 +405,30 @@ mod tests {
         assert!(shown.contains("<redacted>"), "{shown}");
     }
 
+    // RT1 T6 (S1): realtime's bearer, `<NAME>` or the file `<NAME>_FILE` names (the stack
+    // mounts `realtime/internal.token`); unset, the development default.
+    #[test]
+    fn the_realtime_token_is_read_like_the_other_bearers() {
+        let c = InternalConfig::from_lookup(|_| None).unwrap();
+        assert_eq!(c.realtime_token, "chelabase-dev-realtime-internal");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("internal.token");
+        std::fs::write(&file, "generated-realtime-token\n").unwrap();
+        let path = file.to_str().unwrap().to_string();
+        let c = InternalConfig::from_lookup(move |k| {
+            (k == "CHELABASE_REALTIME_INTERNAL_TOKEN_FILE").then(|| path.clone())
+        })
+        .unwrap();
+        assert_eq!(c.realtime_token, "generated-realtime-token");
+        let c = InternalConfig::from_lookup(|k| {
+            (k == "CHELABASE_REALTIME_INTERNAL_TOKEN").then(|| "plain-token".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.realtime_token, "plain-token");
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("plain-token"), "{shown}");
+    }
+
     #[test]
     fn app_auth_settings_have_dev_defaults() {
         let c = InternalConfig::from_lookup(|_| None).unwrap();
@@ -375,14 +440,18 @@ mod tests {
         assert_eq!(c.zitadel_issuer, None);
     }
 
-    // M9: a platform instance refuses to start with the development bearer.
+    // M9: a platform instance refuses to start with a development bearer (every one of them:
+    // `tests/fa_dev_bearers.rs`).
     #[test]
     fn platform_refuses_the_default_app_auth_token() {
         use chelabase_types::mode::Mode;
         use chelabase_types::mode_policy::ModePolicy;
         let default = InternalConfig::from_lookup(|_| None).unwrap();
         let own = InternalConfig::from_lookup(|name| {
-            (name == "CHELABASE_APP_AUTH_INTERNAL_TOKEN").then(|| "a-long-random-secret".to_string())
+            DEV_BEARERS
+                .iter()
+                .any(|(var, _)| *var == name)
+                .then(|| format!("a-long-random-secret-for-{name}"))
         })
         .unwrap();
         let (sh, pf) = (ModePolicy::new(Mode::SelfHosted), ModePolicy::new(Mode::Platform));

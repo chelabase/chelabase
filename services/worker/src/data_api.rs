@@ -493,7 +493,12 @@ fn parse_role_ok(answer: &str) -> Option<(i64, bool)> {
 }
 
 /// Roles Chelabase owns; never a secret key's.
-const RESERVED_ROLES: [&str; 3] = [AUTHENTICATOR, "chelabase_admin", crate::app_users_sql::USERS_SYNC_ROLE];
+const RESERVED_ROLES: [&str; 4] = [
+    AUTHENTICATOR,
+    "chelabase_admin",
+    crate::app_users_sql::USERS_SYNC_ROLE,
+    crate::realtime::REALTIME_ROLE,
+];
 
 /// What [`Worker::check_data_role`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -867,6 +872,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 format!("{e:#}")
             });
         let succeeded = outcome.is_ok();
+        if succeeded {
+            // W21: realtime can open the database once it's served.
+            self.grant_realtime_connect(&target.ep, &[name]).await;
+        }
         match self.metadata.finish_enable_data_api(branch, name, outcome).await {
             Ok(true) if succeeded => {
                 self.rebootstrap_if_schema_changed(branch, name, &target.row.default_schema).await;

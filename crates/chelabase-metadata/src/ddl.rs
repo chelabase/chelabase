@@ -11,7 +11,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::neon::{RoleCopy, copy_from_row};
-use crate::{DatabaseOrigin, MetadataClient, MetadataError};
+use crate::{BranchKind, DatabaseOrigin, MetadataClient, MetadataError};
 
 /// Postgres' `lock_not_available`: the `lock_timeout` ran out.
 const LOCK_NOT_AVAILABLE: &str = "55P03";
@@ -51,6 +51,24 @@ impl MetadataClient {
         .fetch_optional(&self.pool)
         .await?;
         Ok(branch.map(BranchId))
+    }
+
+    /// The branch linked to `endpoint_id` and its kind, a deleting one included (its compute is
+    /// stopped after the delete began); `None` for a deleted branch or an endpoint without one
+    /// (a static compute). RT1 T5: whose compute is stopping.
+    pub async fn compute_branch(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Option<(BranchId, BranchKind)>, MetadataError> {
+        let row: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, kind FROM branches
+             WHERE endpoint_id = $1 AND status <> 'deleted'",
+        )
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(id, kind)| Ok((BranchId(id), BranchKind::parse(&kind)?)))
+            .transpose()
     }
 
     /// Opens the receiver's transaction for `endpoint_id`: `lock_timeout` of 2 s, the linked

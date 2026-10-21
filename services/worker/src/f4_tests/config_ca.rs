@@ -24,7 +24,12 @@ async fn build_without_the_compute_ca_names_the_bootstrap() {
         database_url: "postgres://u:p@127.0.0.1:1/none".into(),
     })
     .unwrap();
-    let err = match build(&config, metadata, SecretKey::generate()) {
+    let err = match build(
+        &config,
+        metadata,
+        SecretKey::generate(),
+        std::sync::Arc::new(crate::rt_events::NoopPublisher),
+    ) {
         Ok(_) => panic!("build succeeded without a compute CA"),
         Err(err) => format!("{err:#}"),
     };

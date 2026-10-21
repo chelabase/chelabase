@@ -47,6 +47,7 @@ fn hash_op(op: &Op, h: &mut DefaultHasher) {
                         match item {
                             SelectItem::Col(c) => (0u8, c).hash(h),
                             SelectItem::Aliased { col, alias } => (1u8, col, alias).hash(h),
+                            SelectItem::TextOf { col, alias } => (2u8, col, alias).hash(h),
                         }
                     }
                 }
@@ -138,8 +139,14 @@ fn hash_filter(f: &Filter, h: &mut DefaultHasher) {
             2u8.hash(h);
             hash_filter(f, h);
         }
-        Filter::Cond { col, op, value } => {
-            (3u8, col, op).hash(h);
+        Filter::Cond {
+            col,
+            op,
+            value,
+            text,
+            parse,
+        } => {
+            (3u8, col, op, text, parse).hash(h);
             // `is` writes its constant into the SQL (IS NULL / IS TRUE / IS FALSE).
             if *op == crate::query::CondOp::Is {
                 value.as_bool().hash(h);

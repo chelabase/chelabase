@@ -8,7 +8,9 @@
 # values (its slug, ports, host names, paths, uid/gid, the workbench image).
 #
 # Reachable from the host only through the gateway's port and the proxy's Postgres port, each on
-# 127.0.0.1 and ::1. Everything else talks over the project network by service name.
+# 127.0.0.1 and ::1. Everything else talks over the project network by service name; computes get
+# their own `compute` network (see `networks:` at the end). NATS, Valkey and the storage services
+# require credentials (RT1 T1).
 
 # --- Neon storage ---
 # Pinned by digest; `chelabase workbench up` overrides these with a local `just neon-build` when
@@ -17,6 +19,21 @@ x-neon-images:
   neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:629166ceef60-dev@sha256:75794bed0c2fe5d447964735edb3eac21e55c45562a00c344fb4bb1a88509419}
   # The image of the compute containers the worker starts (CHELABASE_COMPUTE_IMAGE); pinned here.
   compute: ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/neon-compute-v17:629166ceef60-dev@sha256:281c47327e04fbc5db58f3d9a24a2ced0c74e0d03907260f2c6290f6db3e436b}
+
+# The Neon services that read the stack's 0600 secrets run as the stack's uid:gid (the files'
+# owner), whatever the host uid is; the image's own user (uid 1000) can read them only when the
+# host uid happens to be 1000. Those without a data volume set `user:`; the pageserver and the
+# safekeepers start as root only to hand their data volume (created by the image as 1000:1000)
+# to the stack's uid once, then drop to it before anything else runs.
+x-neon-as-stack-user: &neon-as-stack-user
+  - /bin/sh
+  - -c
+  - >-
+    set -e;
+    [ "$$(stat -c %u:%g /data)" = "${CHELABASE_UID}:${CHELABASE_GID}" ] ||
+    chown -R "${CHELABASE_UID}:${CHELABASE_GID}" /data;
+    exec setpriv --reuid="${CHELABASE_UID}" --regid="${CHELABASE_GID}" --clear-groups -- "$$@"
+  - neon
 
 # S3 credentials for SeaweedFS. Local dev only.
 x-neon-s3-env: &neon-s3-env
@@ -120,6 +137,162 @@ x-key-compute-jwt-public: &key-compute-jwt-public
   target: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub
   read_only: true
   bind: {create_host_path: false}
+# RT1 T1 (R11, S1, S27): the generated service secrets (`chelabase workbench up` creates each once,
+# 0600, never overwritten), each at its own path and only in the services that read it; a service
+# gets its file's path as <NAME>_FILE in its own `environment:`, never through stack.env.
+x-key-nats-orchestrator: &key-nats-orchestrator
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/nats/orchestrator.password
+  target: ${CHELABASE_KEYS_DIR}/nats/orchestrator.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-nats-worker: &key-nats-worker
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/nats/worker.password
+  target: ${CHELABASE_KEYS_DIR}/nats/worker.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-nats-realtime: &key-nats-realtime
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/nats/realtime.password
+  target: ${CHELABASE_KEYS_DIR}/nats/realtime.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-nats-runner: &key-nats-runner
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/nats/runner.password
+  target: ${CHELABASE_KEYS_DIR}/nats/runner.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-valkey-proxy: &key-valkey-proxy
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/valkey/proxy.password
+  target: ${CHELABASE_KEYS_DIR}/valkey/proxy.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-valkey-control: &key-valkey-control
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/valkey/control.password
+  target: ${CHELABASE_KEYS_DIR}/valkey/control.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-valkey-realtime: &key-valkey-realtime
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/valkey/realtime.password
+  target: ${CHELABASE_KEYS_DIR}/valkey/realtime.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-valkey-runner: &key-valkey-runner
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/valkey/runner.password
+  target: ${CHELABASE_KEYS_DIR}/valkey/runner.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-valkey-health: &key-valkey-health
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/valkey/health.password
+  target: ${CHELABASE_KEYS_DIR}/valkey/health.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-realtime-pg: &key-realtime-pg
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/realtime/pg.password
+  target: ${CHELABASE_KEYS_DIR}/realtime/pg.password
+  read_only: true
+  bind: {create_host_path: false}
+x-key-realtime-ticket: &key-realtime-ticket
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/realtime/ticket.key
+  target: ${CHELABASE_KEYS_DIR}/realtime/ticket.key
+  read_only: true
+  bind: {create_host_path: false}
+x-key-realtime-internal: &key-realtime-internal
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/realtime/internal.token
+  target: ${CHELABASE_KEYS_DIR}/realtime/internal.token
+  read_only: true
+  bind: {create_host_path: false}
+x-key-token-rest-internal: &key-token-rest-internal
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
+  target: ${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
+  read_only: true
+  bind: {create_host_path: false}
+x-key-token-data-keys: &key-token-data-keys
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/tokens/data-keys.token
+  target: ${CHELABASE_KEYS_DIR}/tokens/data-keys.token
+  read_only: true
+  bind: {create_host_path: false}
+x-key-token-app-auth: &key-token-app-auth
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+  target: ${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+  read_only: true
+  bind: {create_host_path: false}
+x-key-token-app-sessions: &key-token-app-sessions
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
+  target: ${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
+  read_only: true
+  bind: {create_host_path: false}
+x-key-token-proxy-api: &key-token-proxy-api
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
+  target: ${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
+  read_only: true
+  bind: {create_host_path: false}
+x-key-token-storcon-hook: &key-token-storcon-hook
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
+  target: ${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
+  read_only: true
+  bind: {create_host_path: false}
+# Storage auth (user, 2026-10-16): the compute-JWT public key as SPKI PEM and the scoped NeonJWTs
+# the workbench signs with the pair (<keys>/neon/storage-tokens/). The runner sees them at their
+# own paths (scripts call the storage controller); the Neon containers read them under /run.
+x-key-storage-pem: &key-storage-pem
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem
+  target: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem
+  read_only: true
+  bind: {create_host_path: false}
+x-key-storage-pageserver-api: &key-storage-pageserver-api
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt
+  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt
+  read_only: true
+  bind: {create_host_path: false}
+x-key-storage-safekeeper-data: &key-storage-safekeeper-data
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt
+  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt
+  read_only: true
+  bind: {create_host_path: false}
+x-key-storage-generations-api: &key-storage-generations-api
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt
+  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt
+  read_only: true
+  bind: {create_host_path: false}
+x-key-storage-storcon-admin: &key-storage-storcon-admin
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt
+  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt
+  read_only: true
+  bind: {create_host_path: false}
+x-run-storage-pem: &run-storage-pem
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem
+  target: /run/storage-auth.pub.pem
+  read_only: true
+  bind: {create_host_path: false}
+x-run-safekeeper-data: &run-safekeeper-data
+  type: bind
+  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt
+  target: /run/safekeeper-data.jwt
+  read_only: true
+  bind: {create_host_path: false}
 # The platform CA's certificate alone (never ca.key): auth and rest verify every compute's TLS
 # against it (U15, CHELABASE_COMPUTE_CA_FILE).
 x-key-compute-ca-cert: &key-compute-ca-cert
@@ -188,9 +361,22 @@ services:
   nats:
     image: nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
     restart: unless-stopped
-    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    # RT1 T1 (R11): one account, one user per service with its own permissions and inbox prefix
+    # (infra/compose/nats/nats.conf includes the users the workbench renders into the stack's
+    # state dir: bcrypt hashes only). No anonymous access. Not on the compute network.
+    command: ["-c", "/etc/nats/nats.conf", "--jetstream", "--store_dir=/data", "-m", "8222"]
     volumes:
       - nats_data:/data
+      - type: bind
+        source: ${CHELABASE_CHECKOUT}/infra/compose/nats/nats.conf
+        target: /etc/nats/nats.conf
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${CHELABASE_STACK_DIR}/nats/auth.conf
+        target: /etc/nats/auth.conf
+        read_only: true
+        bind: {create_host_path: false}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
       interval: 5s
@@ -198,14 +384,32 @@ services:
       retries: 10
 
   # Valkey (BSD-3-Clause, speaks the Redis protocol). Neon's proxy uses it for query cancel and
-  # for the cache-clearing messages the control plane publishes on a password change. Local dev:
-  # no auth, internal to the stack's network. Platform mode needs auth and TLS.
+  # for the cache-clearing messages the control plane publishes on a password change; realtime
+  # keeps its tickets and counters in it. RT1 T1 (P5, S6): ACL users only (`default` off), from
+  # the users file the workbench renders into the stack's state dir (SHA-256 hashes only). It runs
+  # as the stack's uid to read that 0600 file; nothing is persisted (`--save ""`: every key is
+  # short-lived). Not on the compute network. TLS is a platform-mode setting.
   valkey:
     image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
     restart: unless-stopped
-    volumes: ["valkey_data:/data"]
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    command: ["valkey-server", "--aclfile", "/etc/valkey/users.acl", "--save", "", "--appendonly", "no"]
+    volumes:
+      - valkey_data:/data
+      - type: bind
+        source: ${CHELABASE_STACK_DIR}/valkey/users.acl
+        target: /etc/valkey/users.acl
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${CHELABASE_KEYS_DIR}/valkey/health.password
+        target: /run/valkey-health.password
+        read_only: true
+        bind: {create_host_path: false}
+    # Ruling (f): the healthcheck logs in as `health`, which may only PING.
     healthcheck:
-      test: ["CMD", "valkey-cli", "ping"]
+      # The password goes through the environment (VALKEYCLI_AUTH), never valkey-cli's arguments.
+      test: ["CMD-SHELL", "VALKEYCLI_AUTH=\"$$(cat /run/valkey-health.password)\" valkey-cli --no-auth-warning --user health ping | grep -qx PONG"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -352,11 +556,17 @@ services:
       interval: 2s
       retries: 60
 
-  # One safekeeper keeps WAL on one disk; enough for local dev. The worker reads each
-  # timeline's commit LSN from its HTTP API (CHELABASE_SAFEKEEPER_HTTP, by service name).
+  # Three safekeepers, each with its WAL on its own volume: the storage controller runs without
+  # --dev, which needs every timeline on 3 (RT1 T1, user). The worker reads each timeline's
+  # commit LSN from their HTTP APIs (CHELABASE_SAFEKEEPER_HTTP, by service name). NeonJWT on the
+  # WAL service and the HTTP API (the compute presents its tenant token, the pageserver and the
+  # storage controller safekeeperdata); peers use safekeeperdata too. On the compute network:
+  # computes stream WAL to them.
   safekeeper1:
     image: *neon-image
     restart: unless-stopped
+    user: "0"
+    entrypoint: *neon-as-stack-user
     environment: *neon-s3-env
     command:
       - safekeeper
@@ -369,8 +579,90 @@ services:
       - --availability-zone=az-1
       - --broker-endpoint=http://storage-broker:50051
       - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
+      - --pg-auth-public-key-path=/run/storage-auth.pub.pem
+      - --http-auth-public-key-path=/run/storage-auth.pub.pem
+      - --auth-token-path=/run/safekeeper-data.jwt
+    networks:
+      default: {}
+      compute: {}
     volumes:
       - neon_safekeeper1_data:/data
+      - *run-storage-pem
+      - *run-safekeeper-data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      storage-broker:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+
+  safekeeper2:
+    image: *neon-image
+    restart: unless-stopped
+    user: "0"
+    entrypoint: *neon-as-stack-user
+    environment: *neon-s3-env
+    command:
+      - safekeeper
+      - --id=2
+      - -D
+      - /data
+      - --listen-pg=0.0.0.0:5454
+      - --listen-http=0.0.0.0:7676
+      - --advertise-pg=safekeeper2:5454
+      - --availability-zone=az-2
+      - --broker-endpoint=http://storage-broker:50051
+      - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
+      - --pg-auth-public-key-path=/run/storage-auth.pub.pem
+      - --http-auth-public-key-path=/run/storage-auth.pub.pem
+      - --auth-token-path=/run/safekeeper-data.jwt
+    networks:
+      default: {}
+      compute: {}
+    volumes:
+      - neon_safekeeper2_data:/data
+      - *run-storage-pem
+      - *run-safekeeper-data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      storage-broker:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+
+  safekeeper3:
+    image: *neon-image
+    restart: unless-stopped
+    user: "0"
+    entrypoint: *neon-as-stack-user
+    environment: *neon-s3-env
+    command:
+      - safekeeper
+      - --id=3
+      - -D
+      - /data
+      - --listen-pg=0.0.0.0:5454
+      - --listen-http=0.0.0.0:7676
+      - --advertise-pg=safekeeper3:5454
+      - --availability-zone=az-3
+      - --broker-endpoint=http://storage-broker:50051
+      - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
+      - --pg-auth-public-key-path=/run/storage-auth.pub.pem
+      - --http-auth-public-key-path=/run/storage-auth.pub.pem
+      - --auth-token-path=/run/safekeeper-data.jwt
+    networks:
+      default: {}
+      compute: {}
+    volumes:
+      - neon_safekeeper3_data:/data
+      - *run-storage-pem
+      - *run-safekeeper-data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
       interval: 2s
@@ -396,25 +688,51 @@ services:
       interval: 2s
       retries: 60
 
+  # Strict mode (no --dev, RT1 T1 user decision): every caller presents a NeonJWT signed with the
+  # compute-JWT key pair (PUBLIC_KEY); it presents scoped tokens to the pageserver and the
+  # safekeepers, and the generated hook token to the orchestrator. The secrets are read from
+  # their mounts by the entrypoint into the environment (the controller reads each one there
+  # when its flag is absent; a program's arguments are world-readable); the flags stay in
+  # `command`.
   storage-controller:
     image: *neon-image
     restart: unless-stopped
-    command:
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        set -e;
+        export PUBLIC_KEY="$$(cat /run/storage-auth.pub.pem)";
+        export PAGESERVER_JWT_TOKEN="$$(cat /run/pageserver-api.jwt)";
+        export SAFEKEEPER_JWT_TOKEN="$$(cat /run/safekeeper-data.jwt)";
+        export CONTROL_PLANE_JWT_TOKEN="$$(cat /run/storcon-hook.token)";
+        exec storage_controller "$$@"
       - storage_controller
-      # --dev: no JWT auth between storage components. Their ports stay on the stack's network.
-      - --dev
+    command:
       - --listen=0.0.0.0:1234
       # Attachment changes (every tenant create, too) are pushed to the orchestrator's
-      # internal listener, by service name; a tenant's reconcile waits until it answers. The
-      # token is local dev only.
+      # internal listener, by service name; a tenant's reconcile waits until it answers.
       - --control-plane-url=http://orchestrator:8083/storcon
-      - --control-plane-jwt-token=${CHELABASE_STORCON_HOOK_TOKEN:-chelabase-dev-storcon-hook}
       - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
-      # The controller creates and deletes each timeline on the safekeepers (one, here). Without
-      # these, the compute creates them implicitly and a deleted database, branch or superseded
-      # timeline leaves its WAL on the safekeeper and in S3. Count 1: the default 3 needs three.
+      # The controller creates and deletes each timeline on the safekeepers (all three).
+      # Without these, the compute creates them implicitly and a deleted database, branch or
+      # superseded timeline leaves its WAL on the safekeepers and in S3.
       - --timelines-onto-safekeepers
-      - --timeline-safekeeper-count=1
+      - --timeline-safekeeper-count=3
+    volumes:
+      - type: bind
+        source: ${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
+        target: /run/storcon-hook.token
+        read_only: true
+        bind: {create_host_path: false}
+      - *run-storage-pem
+      - type: bind
+        source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt
+        target: /run/pageserver-api.jwt
+        read_only: true
+        bind: {create_host_path: false}
+      - *run-safekeeper-data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1234/ready"]
       interval: 2s
@@ -423,30 +741,53 @@ services:
       storcon-db:
         condition: service_healthy
 
-  # Registers with the storage controller from metadata.json at startup.
+  # Registers with the storage controller from metadata.json at startup. NeonJWT on its page
+  # service and HTTP API (RT1 T1, user): computes present their tenant token, the storage
+  # controller pageserverapi. Its upcalls carry generations_api, its WAL reads from the
+  # safekeepers safekeeperdata (NEON_AUTH_TOKEN). On the compute network: computes read pages.
   pageserver:
     image: *neon-image
     restart: unless-stopped
+    user: "0"
+    entrypoint: *neon-as-stack-user
     environment: *neon-s3-env
-    entrypoint: ["/bin/sh", "-c"]
     command:
+      - /bin/sh
+      - -c
       - |
         set -e
         mkdir -p /data/.neon
         echo 'id=1' > /data/.neon/identity.toml
+        umask 077
         cat > /data/.neon/pageserver.toml <<EOT
         broker_endpoint='http://storage-broker:50051'
         pg_distrib_dir='/usr/local/'
         listen_pg_addr='0.0.0.0:6400'
         listen_http_addr='0.0.0.0:9898'
+        http_auth_type='NeonJWT'
+        pg_auth_type='NeonJWT'
+        auth_validation_public_key_path='/run/storage-auth.pub.pem'
         control_plane_api='http://storage-controller:1234/upcall/v1/'
+        control_plane_api_token='$$(cat /run/generations-api.jwt)'
         virtual_file_io_mode='buffered'
         remote_storage={ endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/pageserver' }
         EOT
         echo '{"host":"pageserver","port":6400,"http_host":"pageserver","http_port":9898,"availability_zone_id":"az-1"}' > /data/.neon/metadata.json
+        NEON_AUTH_TOKEN="$$(cat /run/safekeeper-data.jwt)"
+        export NEON_AUTH_TOKEN
         exec pageserver -D /data/.neon
+    networks:
+      default: {}
+      compute: {}
     volumes:
       - neon_pageserver_data:/data
+      - *run-storage-pem
+      - type: bind
+        source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt
+        target: /run/generations-api.jwt
+        read_only: true
+        bind: {create_host_path: false}
+      - *run-safekeeper-data
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9898/v1/status"]
       interval: 2s
@@ -459,26 +800,43 @@ services:
       create-bucket:
         condition: service_completed_successfully
 
-  # One-shot: registers the safekeepers with the storage controller and marks them Active.
+  # One-shot: registers the three safekeepers with the storage controller (with its admin
+  # NeonJWT) and marks them Active; computes get them from the storage controller.
   register-safekeepers:
     image: *neon-image
     restart: "no"
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
         S=http://storage-controller:1234
-        for ID in 1; do
-          curl -fsS -X POST -H 'Content-Type: application/json' \
+        # The bearer goes to curl in a header file (`-H @file`), never on its command line.
+        umask 077
+        H="$$(mktemp)"
+        trap 'rm -f "$$H"' EXIT
+        { printf 'Authorization: Bearer '; tr -d '\r\n' < /run/storcon-admin.jwt; echo; } > "$$H"
+        for ID in 1 2 3; do
+          curl -fsS -X POST -H 'Content-Type: application/json' -H "@$$H" \
             -d "{\"id\":$$ID,\"created_at\":\"2023-10-25T09:11:25Z\",\"updated_at\":\"2024-08-28T11:32:43Z\",\"region_id\":\"local\",\"host\":\"safekeeper$$ID\",\"port\":5454,\"http_port\":7676,\"https_port\":null,\"version\":5957,\"availability_zone_id\":\"az-$$ID\"}" \
             $$S/control/v1/safekeeper/$$ID
-          curl -fsS -X POST -H 'Content-Type: application/json' \
+          curl -fsS -X POST -H 'Content-Type: application/json' -H "@$$H" \
             -d '{"scheduling_policy":"Active"}' $$S/control/v1/safekeeper/$$ID/scheduling_policy
         done
+    volumes:
+      - type: bind
+        source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt
+        target: /run/storcon-admin.jwt
+        read_only: true
+        bind: {create_host_path: false}
     depends_on:
       storage-controller:
         condition: service_healthy
       safekeeper1:
+        condition: service_healthy
+      safekeeper2:
+        condition: service_healthy
+      safekeeper3:
         condition: service_healthy
 
   # Writes the proxy's TLS certificate once: a local CA and a *.localtest.me certificate signed
@@ -493,7 +851,10 @@ services:
       - |
         set -e
         cd /tls
+        # The proxy runs as the stack's uid (it reads the stack's 0600 secrets too).
+        owner="${CHELABASE_UID}:${CHELABASE_GID}"
         if [ -s tls.crt ] && openssl x509 -in tls.crt -noout -subject | grep -qF '*.localtest.me'; then
+          chown "$$owner" tls.key tls.crt ca.crt
           echo "certificate for *.localtest.me exists"; exit 0
         fi
         [ -s ca.key ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
@@ -504,7 +865,7 @@ services:
         openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 \
           -extfile ext.cnf -out tls.crt
         rm -f tls.csr ext.cnf
-        chown 1000:1000 tls.key tls.crt ca.crt
+        chown "$$owner" tls.key tls.crt ca.crt
         chmod 600 ca.key tls.key
         echo "issued a certificate for *.localtest.me"
     volumes: ["neon_proxy_tls:/tls"]
@@ -516,11 +877,21 @@ services:
   # secrets and compute addresses, and reaches computes on this network. Role secrets are cached
   # for at most a minute, and dropped at once when the control plane publishes
   # /password_updated to Valkey.
+  # RT1 T1 (S6, S27): it logs in to Valkey as the `proxy` ACL user and calls the orchestrator
+  # with its generated token; the entrypoint reads both from their mounts (the proxy takes the
+  # Valkey credentials only on its command line). On the compute network: it dials computes.
   proxy:
     image: *neon-image
     restart: unless-stopped
-    command:
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        export NEON_PROXY_TO_CONTROLPLANE_TOKEN="$$(cat /run/proxy-api.token)";
+        exec proxy --redis-plain=redis://proxy:$$(cat /run/valkey-proxy.password)@valkey:6379 "$$@"
       - proxy
+    command:
       - --auth-backend=control-plane
       - --auth-endpoint=http://orchestrator:8083/proxy/api/v1
       - --proxy=0.0.0.0:4432
@@ -530,13 +901,24 @@ services:
       - --tls-key=/tls/tls.key
       - --project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m
       - --redis-auth-type=plain
-      - --redis-plain=redis://valkey:6379
-    environment:
-      NEON_PROXY_TO_CONTROLPLANE_TOKEN: ${CHELABASE_PROXY_API_TOKEN:-chelabase-dev-proxy-api}
     ports:
       - "127.0.0.1:${CHELABASE_PROXY_PORT:?set by chelabase workbench (stack.env)}:4432"
       - "[::1]:${CHELABASE_PROXY_PORT}:4432"
-    volumes: ["neon_proxy_tls:/tls:ro"]
+    networks:
+      default: {}
+      compute: {}
+    volumes:
+      - neon_proxy_tls:/tls:ro
+      - type: bind
+        source: ${CHELABASE_KEYS_DIR}/valkey/proxy.password
+        target: /run/valkey-proxy.password
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
+        target: /run/proxy-api.token
+        read_only: true
+        bind: {create_host_path: false}
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/4432"]
       interval: 2s
@@ -567,13 +949,27 @@ services:
       # recreate the orchestrator with these to exercise the settings (roles_live).
       - CHELABASE_PASSWORD_STRENGTH
       - CHELABASE_BRANCH_DATABASE_CAP
+      # RT1 T1 (S1, S27): its own credentials, from its own mounts below.
+      - CHELABASE_NATS_USER=orchestrator
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/orchestrator.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_orchestrator
+      - CHELABASE_VALKEY_USER=control
+      - CHELABASE_VALKEY_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/valkey/control.password
+      - CHELABASE_REALTIME_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/realtime/internal.token
+      - CHELABASE_REST_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
+      - CHELABASE_DATA_KEYS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/data-keys.token
+      - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+      - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
+      - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
+      - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
     group_add: ["${CHELABASE_DOCKER_GID:?set by chelabase workbench (stack.env)}"]
-    # On both networks: the default one for the apps, `control` (static address) for its TLS
-    # connections to computes.
+    # The default network for the apps, `control` (static address) for its TLS connections to
+    # computes, and `compute` (P4): computes call its hooks listener (8083) as `orchestrator`.
     networks:
       default: {}
       control:
         ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:?set by chelabase workbench (stack.env)}
+      compute: {}
     volumes:
       - *checkout-ro
       - *keys-mask
@@ -583,6 +979,15 @@ services:
       - *key-compute-jwt-private
       - *key-compute-jwt-public
       - *keys-orchestrator-tls-ro
+      - *key-nats-orchestrator
+      - *key-valkey-control
+      - *key-realtime-internal
+      - *key-token-rest-internal
+      - *key-token-data-keys
+      - *key-token-app-auth
+      - *key-token-app-sessions
+      - *key-token-proxy-api
+      - *key-token-storcon-hook
       - *state
       - *docker-sock
     healthcheck:
@@ -606,7 +1011,19 @@ services:
     env_file:
       - *stack-env
       - *demo-env
+    # RT1 T1 (S1): its own credentials, from its own mounts below.
+    environment:
+      - CHELABASE_NATS_USER=worker
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/worker.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_worker
+      - CHELABASE_VALKEY_USER=control
+      - CHELABASE_VALKEY_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/valkey/control.password
+      - CHELABASE_REALTIME_PG_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/realtime/pg.password
     group_add: ["${CHELABASE_DOCKER_GID}"]
+    # P4: it dials computes (compute_ctl) on the compute network.
+    networks:
+      default: {}
+      compute: {}
     volumes:
       - *checkout-ro
       - *keys-mask
@@ -616,6 +1033,9 @@ services:
       - *key-compute-jwt-public
       - *keys-compute-ca-rw
       - *keys-orchestrator-tls-rw
+      - *key-nats-worker
+      - *key-valkey-control
+      - *key-realtime-pg
       - *state
       - *docker-sock
     healthcheck:
@@ -634,6 +1054,10 @@ services:
         condition: service_healthy
       safekeeper1:
         condition: service_healthy
+      safekeeper2:
+        condition: service_healthy
+      safekeeper3:
+        condition: service_healthy
       register-safekeepers:
         condition: service_completed_successfully
       zitadel:
@@ -649,6 +1073,10 @@ services:
     env_file:
       - *stack-env
       - *demo-env
+    # RT1 T1 (S27): the bearers it sends to the orchestrator's internal listener.
+    environment:
+      - CHELABASE_DATA_KEYS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/data-keys.token
+      - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
     ports:
       - "127.0.0.1:${CHELABASE_GATEWAY_PORT:?set by chelabase workbench (stack.env)}:${CHELABASE_GATEWAY_PORT}"
       - "[::1]:${CHELABASE_GATEWAY_PORT}:${CHELABASE_GATEWAY_PORT}"
@@ -667,6 +1095,8 @@ services:
       - *checkout-mask
       - *key-internal-signing
       - *key-app-jwt-public
+      - *key-token-data-keys
+      - *key-token-app-sessions
       - *state
     healthcheck:
       <<: *app-health
@@ -677,13 +1107,21 @@ services:
       mailpit:
         condition: service_healthy
 
-  # Studio's sign-in backend. Only the gateway reaches it (CHELABASE_AUTH_TRUSTED_PROXY).
+  # Studio's sign-in backend. On the compute network (P4: the app-users sync dials computes), so
+  # computes reach it directly: only the gateway's X-Forwarded-For counts
+  # (CHELABASE_AUTH_TRUSTED_PROXY=gateway, ruling (e)).
   auth:
     <<: *workbench
     command: ["${CHELABASE_CHECKOUT}/target/debug/auth"]
     env_file:
       - *stack-env
       - *demo-env
+    # RT1 T1 (S27): the bearer it sends to the orchestrator's internal app routes.
+    environment:
+      - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+    networks:
+      default: {}
+      compute: {}
     volumes:
       - *checkout-ro
       - *keys-mask
@@ -693,6 +1131,7 @@ services:
       - *key-app-jwt-public
       - *key-internal-verify
       - *key-compute-ca-cert
+      - *key-token-app-auth
       - *state
     # auth has no health route: any HTTP answer (even a 404) means it is serving.
     healthcheck:
@@ -708,12 +1147,20 @@ services:
     env_file:
       - *stack-env
       - *demo-env
+    # RT1 T1 (S27): its internal bearer (both ways with the orchestrator).
+    environment:
+      - CHELABASE_REST_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
+    # P4: the data API dials computes on the compute network.
+    networks:
+      default: {}
+      compute: {}
     volumes:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
       - *key-internal-verify
       - *key-compute-ca-cert
+      - *key-token-rest-internal
       - *state
     # rest has no health route: any HTTP answer (even a 404) means it is serving.
     healthcheck:
@@ -721,6 +1168,52 @@ services:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://127.0.0.1:8085/"]
     depends_on:
       metadata-db:
+        condition: service_healthy
+
+  # RT1 T7: tickets and the one WebSocket per tab, behind the gateway (8087); 8088 serves only
+  # /health. It reads demo.env for the OIDC audiences, as the gateway does, and verifies the
+  # gateway's identity on ticket requests.
+  realtime:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/realtime"]
+    env_file:
+      - *stack-env
+      - *demo-env
+    # S1: its own credentials and secrets, from its own mounts below; Valkey TLS is platform
+    # mode's (S7).
+    environment:
+      - CHELABASE_NATS_USER=realtime
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/realtime.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_realtime
+      - CHELABASE_VALKEY_USER=realtime
+      - CHELABASE_VALKEY_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/valkey/realtime.password
+      - CHELABASE_VALKEY_TLS=off
+      - CHELABASE_REALTIME_PG_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/realtime/pg.password
+      - CHELABASE_REALTIME_TICKET_KEY_FILE=${CHELABASE_KEYS_DIR}/realtime/ticket.key
+      - CHELABASE_REALTIME_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/realtime/internal.token
+    # P4: T8's replication and check connections dial computes on the compute network.
+    networks:
+      default: {}
+      compute: {}
+    volumes:
+      - *checkout-ro
+      - *keys-mask
+      - *checkout-mask
+      - *key-internal-verify
+      - *key-compute-ca-cert
+      - *key-nats-realtime
+      - *key-valkey-realtime
+      - *key-realtime-pg
+      - *key-realtime-ticket
+      - *key-realtime-internal
+      - *state
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/health"]
+    depends_on:
+      nats:
+        condition: service_healthy
+      valkey:
         condition: service_healthy
 
   # Vite dev servers from the checkout (read-write: Vite's cache lives under node_modules), bound
@@ -785,12 +1278,31 @@ services:
       # Bare names: a live test's own input, taken from the caller's env (unset when it has none),
       # e.g. `CHELABASE_LIVE_ENDPOINT=ep-… just workbench test -p chelabase-neon …`.
       - CHELABASE_LIVE_ENDPOINT
+      # RT1 T1 (S1, S27, ruling (c)): the test harness runs the worker, the orchestrator and
+      # realtime in-process (S24) and probes every user's rights, so it sees every service
+      # secret (it has the Docker socket anyway). Its own NATS and Valkey users: `runner`.
+      - CHELABASE_NATS_USER=runner
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/runner.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_runner
+      - CHELABASE_VALKEY_USER=runner
+      - CHELABASE_VALKEY_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/valkey/runner.password
+      - CHELABASE_REALTIME_PG_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/realtime/pg.password
+      - CHELABASE_REALTIME_TICKET_KEY_FILE=${CHELABASE_KEYS_DIR}/realtime/ticket.key
+      - CHELABASE_REALTIME_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/realtime/internal.token
+      - CHELABASE_REST_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
+      - CHELABASE_DATA_KEYS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/data-keys.token
+      - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+      - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
+      - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
+      - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
     group_add: ["${CHELABASE_DOCKER_GID}"]
-    # The static address is in the member-login rule's address list.
+    # The static address is in the member-login rule's address list. On the compute network:
+    # live tests dial computes like the services do.
     networks:
       default: {}
       control:
         ipv4_address: ${CHELABASE_RUNNER_CONTROL_IP:?set by chelabase workbench (stack.env)}
+      compute: {}
     volumes:
       - *checkout-rw
       - *keys-mask
@@ -802,6 +1314,29 @@ services:
       - *key-app-jwt-public
       - *keys-compute-ca-ro
       - *keys-orchestrator-tls-ro
+      - *key-nats-orchestrator
+      - *key-nats-worker
+      - *key-nats-realtime
+      - *key-nats-runner
+      - *key-valkey-proxy
+      - *key-valkey-control
+      - *key-valkey-realtime
+      - *key-valkey-runner
+      - *key-valkey-health
+      - *key-realtime-pg
+      - *key-realtime-ticket
+      - *key-realtime-internal
+      - *key-token-rest-internal
+      - *key-token-data-keys
+      - *key-token-app-auth
+      - *key-token-app-sessions
+      - *key-token-proxy-api
+      - *key-token-storcon-hook
+      - *key-storage-pem
+      - *key-storage-pageserver-api
+      - *key-storage-safekeeper-data
+      - *key-storage-generations-api
+      - *key-storage-storcon-admin
       - *state
       - *docker-sock
       - type: bind
@@ -817,6 +1352,13 @@ networks:
       config:
         - subnet: ${CHELABASE_CONTROL_SUBNET:?set by chelabase workbench (stack.env)}
           ip_range: ${CHELABASE_CONTROL_COMPUTE_RANGE:?set by chelabase workbench (stack.env)}
+  # RT1 T1 (P4, W14): the computes' own network (<project>_compute, CHELABASE_COMPUTE_NETWORK).
+  # On it: what a compute needs (pageserver, safekeepers, the orchestrator's hooks listener) and
+  # the clients that dial computes (proxy, rest, auth, worker, orchestrator, runner; realtime
+  # with T7). Never NATS, Valkey, a database, Zitadel, Mailpit, SeaweedFS, the storage broker or
+  # controller, the gateway or Studio. Every listener of its members needs a credential or is
+  # public by design (scripts/compute-network-e2e.sh audits each one).
+  compute: {}
 
 volumes:
   metadata_pg_data:
@@ -826,5 +1368,7 @@ volumes:
   neon_seaweedfs_data:
   neon_pageserver_data:
   neon_safekeeper1_data:
+  neon_safekeeper2_data:
+  neon_safekeeper3_data:
   neon_storcon_pg_data:
   neon_proxy_tls:

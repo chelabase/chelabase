@@ -1438,6 +1438,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 failures.push(format!("turning the protection flag off: {e:#}"));
             }
         }
+        // P15, W21, S22: the realtime role may open every database (an owner may revoke
+        // CONNECT from PUBLIC), granted before a born-closed one opens. Logged only on failure:
+        // the next run grants again, and nothing here waits for realtime. The closed ones come
+        // first: the script stops at its first error (a database dropped since the catalog was
+        // read), and an open one still has PUBLIC's CONNECT unless its owner revoked it.
+        let realtime_databases: Vec<&str> = catalog
+            .closed_databases
+            .iter()
+            .filter(|d| !d.template)
+            .map(|d| d.name.as_str())
+            .chain(catalog.databases.iter().map(|(db, _)| db.as_str()))
+            .filter(|db| *db != SYSTEM_DATABASE)
+            .collect();
+        self.grant_realtime_connect(&ep, &realtime_databases).await;
         // D5, U2: databases born closed are opened once guarded (a failed install leaves the
         // database closed and the run failed); a stale marker is dropped.
         for step in &closed_steps {

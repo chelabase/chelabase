@@ -58,6 +58,10 @@ use chelabase_types::access::{Deny, PlatformRole, Requested};
 
 /// Connections one owner pool holds at most.
 pub const OWNER_POOL_CONNECTIONS: u32 = 2;
+/// RT1: how many of an owner pool's connections realtime's `/internal/realtime/visible` calls
+/// may hold at once (per branch and Postgres database); the rest stay the console's.
+pub const REALTIME_OWNER_CONNECTIONS: u32 = 1;
+const _: () = assert!(REALTIME_OWNER_CONNECTIONS < OWNER_POOL_CONNECTIONS);
 /// An owner connection (and an owner pool) unused this long is closed.
 pub const OWNER_POOL_IDLE: Duration = Duration::from_secs(60);
 /// Longest wait for an owner connection.
@@ -73,7 +77,7 @@ pub(crate) const RETRY_AFTER_SECS: u32 = 2;
 /// and no temporary table (a function the owner called may have left any of them). A reset
 /// that fails discards the connection.
 pub const OWNER_RESET_SQL: &str =
-    "SET ROLE NONE; RESET ALL; SELECT pg_advisory_unlock_all(); DISCARD TEMP";
+    "SET ROLE NONE; RESET ALL; SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP";
 /// An owner pool's manager settings: `Fast` recycling (only a closed connection is dropped).
 /// Every request resets the session itself, before and after its work
 /// ([`OWNER_RESET_SQL`] as `RunSettings::reset_sql`), so a reset on checkout would only add
@@ -169,6 +173,9 @@ pub struct Console {
     pub(crate) pools: moka::future::Cache<OwnerPoolKey, Pool>,
     pub(crate) cache: QueryCache,
     checked_roles: moka::sync::Cache<(BranchId, String), ()>,
+    /// Realtime's share of each (branch, Postgres database)'s owner pool
+    /// ([`REALTIME_OWNER_CONNECTIONS`] permits).
+    realtime_slots: moka::sync::Cache<(BranchId, String), Arc<tokio::sync::Semaphore>>,
 }
 
 impl Default for Console {
@@ -188,6 +195,10 @@ impl Default for Console {
             checked_roles: moka::sync::Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(ROLE_CHECK_TTL)
+                .build(),
+            realtime_slots: moka::sync::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_idle(OWNER_POOL_IDLE)
                 .build(),
         }
     }
@@ -227,6 +238,15 @@ impl Console {
                     .expect("a pool with a runtime set always builds")
             })
             .await
+    }
+
+    /// Realtime's share of the owner pool of `database` on `branch`: a `/visible` call holds a
+    /// permit while it holds an owner connection, so realtime never takes the whole pool and
+    /// the console's own requests always find a connection.
+    pub fn realtime_slot(&self, branch: BranchId, database: &str) -> Arc<tokio::sync::Semaphore> {
+        self.realtime_slots.get_with((branch, database.to_owned()), || {
+            Arc::new(tokio::sync::Semaphore::new(REALTIME_OWNER_CONNECTIONS as usize))
+        })
     }
 
     /// Forgets the owner's cached schemas and plans of `branch` (its databases changed).
@@ -418,8 +438,11 @@ where
         or_answer!(serde_json::to_vec(&request.tree).map_err(|e| {
             data_api_failure(QueryFailure::invalid_query(format!("the tree: {e}")))
         }));
+    // The console's grammar (the route's choice, never the body's) adds `text_of` and
+    // `"text": true`.
     let parsed = or_answer!(
-        chelabase_query::parse(&tree).map_err(|e| data_api_failure(QueryFailure::from(e)))
+        chelabase_query::parse_with(&tree, chelabase_query::ParseMode::Console)
+            .map_err(|e| data_api_failure(QueryFailure::from(e)))
     );
     let name = match (request.database.as_deref(), parsed.database.as_deref()) {
         (Some(a), Some(b)) if a != b => {
@@ -881,7 +904,7 @@ where
 
 /// Asks the worker whether the console may run as `role` on the branch (it refuses owner-level
 /// roles and grants the role to `authenticator`), once per five minutes.
-async fn check_role<M, J>(
+pub(crate) async fn check_role<M, J>(
     state: &AppState<M, J>,
     branch: BranchId,
     role: &str,
@@ -1112,12 +1135,14 @@ mod tests {
 
     /// A connection handed back to an owner pool starts the next request clean: no role a
     /// function set, no setting, no advisory lock, no temporary table (rest's reset, plus
-    /// what an owner may leave behind).
+    /// what an owner may leave behind). The unlock runs after `RESET ALL`, under the login
+    /// role's `search_path` (a database-level setting the owner controls), so it is named by
+    /// schema (RT1 final fix round).
     #[test]
     fn owner_connections_are_reset_when_released() {
         assert_eq!(
             OWNER_RESET_SQL,
-            "SET ROLE NONE; RESET ALL; SELECT pg_advisory_unlock_all(); DISCARD TEMP"
+            "SET ROLE NONE; RESET ALL; SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP"
         );
     }
 

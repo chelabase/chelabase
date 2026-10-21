@@ -487,6 +487,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &rec.database_name, &bootstrap_sql(self.owner_superuser))
             .await
             .map_err(|e| format!("bootstrapping roles: {e:#}"))?;
+        // The parent's catalog may predate the realtime role, or hold an older password.
+        self.ensure_realtime(ep, &rec.database_name).await;
         let bootstrapped = self
             .bootstrap_served_on(rec.branch, ep, &rec.database_name, &[])
             .await

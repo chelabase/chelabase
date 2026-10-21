@@ -14,12 +14,15 @@ export function QueryDevtoolsPlugin() {
   );
 }
 
-/** TanStack's devtools (router and query panels), dev builds only. */
+/**
+ * TanStack's devtools (router and query panels), dev builds only. No floating trigger: every position it offers covers
+ * a Studio control (the row panel's Save, the rail, the account menu); the library's hotkey (Control+~) opens them.
+ */
 export function StudioDevtools() {
   if (!import.meta.env.DEV) return null;
   return (
     <TanStackDevtools
-      config={{ position: "bottom-right" }}
+      config={{ triggerHidden: true }}
       plugins={[
         { name: "TanStack Router", render: <TanStackRouterDevtoolsPanel /> },
         { name: "TanStack Query", render: <QueryDevtoolsPlugin /> },

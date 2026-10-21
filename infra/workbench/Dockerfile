@@ -1,6 +1,6 @@
 # The workbench image (W2): the runtime of a stack's app tier (orchestrator, worker, gateway,
-# auth, rest run the checkout's host-built debug binaries), Studio, docs and landing (the Vite
-# dev servers, from the checkout's node_modules) and the test runner. Workbench-only; not a
+# auth, rest, realtime run the checkout's host-built debug binaries), Studio, docs and landing
+# (the Vite dev servers, from the checkout's node_modules) and the test runner. Workbench-only; not a
 # self-hosting image. `chelabase workbench up` builds it as chelabase-workbench:<hash>, <hash>
 # being the first 12 hex characters of this file's SHA-256.
 #

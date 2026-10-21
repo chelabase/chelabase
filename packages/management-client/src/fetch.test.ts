@@ -125,7 +125,8 @@ describe("unconfigured", () => {
 describe("parseExact", () => {
   it("keeps numbers that don't survive a double as their source text", () => {
     const out = parseExact('[{"id":9007199254740993,"n":0.12345678901234567890,"ok":1.5,"i":42,"p":1.50,"s":"x","z":null}]') as Record<string, unknown>[];
-    expect(out[0]).toEqual({ id: "9007199254740993", n: "0.12345678901234567890", ok: 1.5, i: 42, p: 1.5, s: "x", z: null });
+    // gf item 3: `1.50` keeps its scale (it was `p: 1.5`)
+    expect(out[0]).toEqual({ id: "9007199254740993", n: "0.12345678901234567890", ok: 1.5, i: 42, p: "1.50", s: "x", z: null });
   });
 });
 

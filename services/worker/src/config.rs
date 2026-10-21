@@ -1,6 +1,6 @@
 //! The worker's environment, and wiring the real ports into a [`Worker`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +8,7 @@ use anyhow::{Context, anyhow};
 
 use chelabase_metadata::MetadataClient;
 use chelabase_neon::compute_tls::ComputeCa;
+use chelabase_neon::jwt::StorageScope;
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::{ComputeSettings, DockerBackend, StorconClient};
@@ -18,14 +19,21 @@ use chelabase_types::role_settings::RoleSettings;
 
 use crate::Worker;
 use crate::ports::{HttpPusher, RealStorage};
+use crate::rt_events::{PublishingMetadata, RtPublisher, StoppingBackend};
 use crate::safekeepers::SafekeeperSet;
 
 /// How often a running job refreshes its claim (branch jobs and merges).
 pub const DEFAULT_CLAIM_REFRESH: Duration = Duration::from_secs(60);
 
 /// The worker over the real metadata database, storage controller, Docker, Valkey and
-/// compute_ctl.
-pub type RealWorker = Worker<MetadataClient, RealStorage, DockerBackend, ProxyCache, HttpPusher>;
+/// compute_ctl, with realtime's platform events and compute-stopping signal (RT1 T5).
+pub type RealWorker = Worker<
+    PublishingMetadata<MetadataClient>,
+    RealStorage,
+    StoppingBackend<DockerBackend, MetadataClient>,
+    ProxyCache,
+    HttpPusher,
+>;
 
 /// No secrets in here, so `Debug` is safe.
 #[derive(Debug, Clone)]
@@ -41,6 +49,10 @@ pub struct WorkerConfig {
     /// `CHELABASE_STACK` (default `main`): the stack this worker's computes belong to.
     pub stack: String,
     pub valkey_url: String,
+    /// `CHELABASE_VALKEY_USER` and `CHELABASE_VALKEY_PASSWORD_FILE` (the `control` ACL user in
+    /// the stack): both or neither. The password itself is read by [`build`].
+    pub valkey_user: Option<String>,
+    pub valkey_password_file: Option<PathBuf>,
     pub compute_image: String,
     pub mode: Mode,
     pub policy: ModePolicy,
@@ -73,6 +85,9 @@ pub struct WorkerConfig {
     /// `CHELABASE_MEMBER_LOGIN_CIDRS`: the addresses member logins may come from. `None` when
     /// unset ([`build`] refuses to start); empty means no address rule.
     pub member_login_cidrs: Option<Vec<String>>,
+    /// `CHELABASE_REALTIME_PG_PASSWORD_FILE` (RT1 T5, S1): the `chelabase_realtime` role's
+    /// password, read by [`build`]. `None` when unset or blank.
+    pub realtime_pg_password_file: Option<PathBuf>,
 }
 
 /// The value of `name`, or `None` when it's unset or blank.
@@ -109,7 +124,7 @@ impl WorkerConfig {
             storcon_url: or_default("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             safekeeper_http: safekeeper_http(non_blank(&get, "CHELABASE_SAFEKEEPER_HTTP"))?,
             compute_jwt_dir: PathBuf::from(or_default("CHELABASE_COMPUTE_JWT_DIR", ".chelabase/neon")),
-            compute_network: or_default("CHELABASE_COMPUTE_NETWORK", "chelabase_default"),
+            compute_network: or_default("CHELABASE_COMPUTE_NETWORK", "chelabase_compute"),
             control_plane_uri: or_default(
                 "CHELABASE_CONTROL_PLANE_URI",
                 "http://orchestrator:8083",
@@ -119,6 +134,9 @@ impl WorkerConfig {
                 chelabase_neon::DEFAULT_STACK,
             ))?,
             valkey_url: or_default("CHELABASE_VALKEY_URL", "redis://127.0.0.1:6379"),
+            valkey_user: non_blank(&get, "CHELABASE_VALKEY_USER"),
+            valkey_password_file: non_blank(&get, "CHELABASE_VALKEY_PASSWORD_FILE")
+                .map(PathBuf::from),
             compute_image,
             mode,
             policy: ModePolicy::new(mode),
@@ -154,8 +172,15 @@ impl WorkerConfig {
                 None => None,
                 Some(raw) => Some(chelabase_neon::spec::parse_member_login_cidrs(Some(&raw))?),
             },
+            realtime_pg_password_file: non_blank(&get, REALTIME_PG_PASSWORD_FILE)
+                .map(PathBuf::from),
         };
         check_control_plane_uri(&config.control_plane_uri)?;
+        if config.valkey_user.is_some() != config.valkey_password_file.is_some() {
+            return Err(anyhow!(
+                "set both CHELABASE_VALKEY_USER and CHELABASE_VALKEY_PASSWORD_FILE, or neither"
+            ));
+        }
         Ok(config)
     }
 
@@ -259,12 +284,32 @@ pub fn zitadel_client(config: &WorkerConfig) -> Option<chelabase_zitadel::client
     }
 }
 
+/// The env var naming the `chelabase_realtime` role's password file (S1).
+const REALTIME_PG_PASSWORD_FILE: &str = "CHELABASE_REALTIME_PG_PASSWORD_FILE";
+
+/// The `chelabase_realtime` password in `file` (one trailing newline ignored). An unreadable or
+/// empty file is an error: a set variable means the stack wants the role.
+fn read_realtime_password(file: &Path) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(file)
+        .with_context(|| format!("{REALTIME_PG_PASSWORD_FILE}={}", file.display()))?;
+    let password = raw.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        return Err(anyhow!(
+            "{REALTIME_PG_PASSWORD_FILE}={} is empty",
+            file.display()
+        ));
+    }
+    Ok(password.to_string())
+}
+
 /// Wires the real ports. Nothing is contacted: Docker, Valkey and the storage controller are
-/// reached on first use.
+/// reached on first use. `publisher` carries realtime's events (S20: the process's NATS, or a
+/// no-op or the runner's NATS in tests); `build` never connects NATS itself.
 pub fn build(
     config: &WorkerConfig,
     metadata: MetadataClient,
     key: SecretKey,
+    publisher: Arc<dyn RtPublisher>,
 ) -> anyhow::Result<RealWorker> {
     // First, so a missing key pair names `just zitadel-bootstrap` before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
@@ -284,28 +329,56 @@ pub fn build(
         .timeout(Duration::from_secs(5))
         .build()
         .context("building the compute_ctl HTTP client")?;
+    // The storage controller (no --dev) and the safekeepers check NeonJWT: scoped tokens from the
+    // compute-JWT key pair.
+    let storcon_token = signer.storage_token(&StorageScope::Admin)?;
+    let safekeeper_token = signer.storage_token(&StorageScope::SafekeeperData)?;
+    let cache = match (&config.valkey_user, &config.valkey_password_file) {
+        (Some(user), Some(file)) => {
+            let password = std::fs::read_to_string(file).with_context(|| {
+                format!("CHELABASE_VALKEY_PASSWORD_FILE={}", file.display())
+            })?;
+            ProxyCache::with_auth(&config.valkey_url, user, password.trim_end_matches(['\n', '\r']))?
+        }
+        _ => ProxyCache::new(&config.valkey_url)?,
+    };
+    let realtime_password = config
+        .realtime_pg_password_file
+        .as_deref()
+        .map(read_realtime_password)
+        .transpose()?;
     Ok(Worker {
-        metadata,
+        metadata: PublishingMetadata::new(metadata.clone(), publisher.clone()),
         storage: RealStorage {
             storcon: StorconClient::new(&config.storcon_url, 0)
-                .with_timeout(Duration::from_secs(10)),
+                .with_timeout(Duration::from_secs(10))
+                .with_token(storcon_token),
             safekeepers: SafekeeperSet::new(
                 config
                     .safekeeper_http
                     .iter()
-                    .map(|(id, url)| (*id, SafekeeperClient::new(url.clone())))
+                    .map(|(id, url)| {
+                        (
+                            *id,
+                            SafekeeperClient::new(url.clone()).with_token(safekeeper_token.clone()),
+                        )
+                    })
                     .collect(),
             ),
         },
-        computes: DockerBackend::connect(ComputeSettings {
-            image: config.compute_image.clone(),
-            network: config.compute_network.clone(),
-            control_plane_uri: config.control_plane_uri.clone(),
-            stack: config.stack.clone(),
-            control_network: config.compute_control_network.clone(),
-            ca: Some(ca.clone()),
-        })?,
-        cache: ProxyCache::new(&config.valkey_url)?,
+        computes: StoppingBackend::new(
+            DockerBackend::connect(ComputeSettings {
+                image: config.compute_image.clone(),
+                network: config.compute_network.clone(),
+                control_plane_uri: config.control_plane_uri.clone(),
+                stack: config.stack.clone(),
+                control_network: config.compute_control_network.clone(),
+                ca: Some(ca.clone()),
+            })?,
+            metadata,
+            publisher,
+        ),
+        cache,
         pusher: HttpPusher { http, signer },
         key,
         owner_superuser: config.owner_superuser(),
@@ -330,6 +403,7 @@ pub fn build(
             ca,
             tls_dir: config.compute_tls_dir.clone(),
         }),
+        realtime_password,
     })
 }
 
@@ -356,7 +430,7 @@ mod tests {
         let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
         assert_eq!(c.compute_jwt_dir, PathBuf::from(".chelabase/neon"));
-        assert_eq!(c.compute_network, "chelabase_default");
+        assert_eq!(c.compute_network, "chelabase_compute");
         assert_eq!(c.control_plane_uri, "http://orchestrator:8083");
         assert_eq!(c.stack, "main");
         assert_eq!(c.valkey_url, "redis://127.0.0.1:6379");
@@ -645,7 +719,12 @@ mod tests {
             database_url: "postgres://u:p@127.0.0.1:1/none".into(),
         })
         .unwrap();
-        let err = match build(&config, metadata, SecretKey::generate()) {
+        let err = match build(
+            &config,
+            metadata,
+            SecretKey::generate(),
+            Arc::new(crate::rt_events::NoopPublisher),
+        ) {
             Ok(_) => panic!("build succeeded without JWT keys"),
             Err(err) => format!("{err:#}"),
         };

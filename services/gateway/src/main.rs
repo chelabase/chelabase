@@ -17,10 +17,9 @@ use tracing::info;
 fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gateway=info,chelabase_auth=info,pingora=warn".into()),
-        )
+        .with_env_filter(gateway::logging::env_filter(
+            std::env::var("RUST_LOG").ok().as_deref(),
+        ))
         .init();
 
     let config = GatewayConfig::from_env()?;

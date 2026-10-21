@@ -8,6 +8,8 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub mod rt;
+
 /// Subject for database provisioning jobs.
 pub const SUBJECT_PROVISION: &str = "chelabase.provision";
 
@@ -648,18 +650,108 @@ pub struct ReconcileDatabaseJob {
     pub database_id: DatabaseId,
 }
 
-/// NATS connection settings.
-#[derive(Debug, Clone)]
+/// NATS connection settings: the server, the service's user and password (R11: one user per
+/// service, no anonymous access) and its own reply-inbox prefix (`_INBOX_<user>`), so no service
+/// subscribes to another's replies.
+#[derive(Clone)]
 pub struct NatsConfig {
     pub url: String,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub inbox_prefix: Option<String>,
 }
 
-impl NatsConfig {
-    pub fn from_env() -> Result<Self, String> {
-        let url = std::env::var("CHELABASE_NATS_URL")
-            .unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
-        Ok(Self { url })
+impl std::fmt::Debug for NatsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsConfig")
+            .field("url", &self.url)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("inbox_prefix", &self.inbox_prefix)
+            .finish()
     }
+}
+
+pub const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
+
+impl NatsConfig {
+    /// From the process environment; see [`NatsConfig::from_lookup`].
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// `CHELABASE_NATS_URL` (default `nats://127.0.0.1:4222`), `CHELABASE_NATS_USER`, its
+    /// password as `CHELABASE_NATS_PASSWORD_FILE` (a file, one trailing newline ignored) or
+    /// `CHELABASE_NATS_PASSWORD`, and `CHELABASE_NATS_INBOX_PREFIX`. A user needs exactly one
+    /// password form and a password needs a user; neither means anonymous (unit tests only:
+    /// the stack's server refuses it). Blank values count as unset. Errors never contain a
+    /// password.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let get = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
+        let url = get("CHELABASE_NATS_URL")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| DEFAULT_NATS_URL.to_string());
+        let user = get("CHELABASE_NATS_USER").map(|v| v.trim().to_string());
+        let password = match (
+            get("CHELABASE_NATS_PASSWORD"),
+            get("CHELABASE_NATS_PASSWORD_FILE"),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "set CHELABASE_NATS_PASSWORD or CHELABASE_NATS_PASSWORD_FILE, not both"
+                        .to_string(),
+                );
+            }
+            (Some(plain), None) => Some(plain),
+            (None, Some(path)) => Some(read_secret_file("CHELABASE_NATS_PASSWORD_FILE", &path)?),
+            (None, None) => None,
+        };
+        match (&user, &password) {
+            (Some(_), None) => {
+                return Err("CHELABASE_NATS_USER is set without a password \
+                     (CHELABASE_NATS_PASSWORD_FILE or CHELABASE_NATS_PASSWORD)"
+                    .to_string());
+            }
+            (None, Some(_)) => {
+                return Err("a NATS password is set without CHELABASE_NATS_USER".to_string());
+            }
+            _ => {}
+        }
+        let inbox_prefix = get("CHELABASE_NATS_INBOX_PREFIX").map(|v| v.trim().to_string());
+        if let Some(prefix) = &inbox_prefix {
+            check_inbox_prefix(prefix)?;
+        }
+        Ok(Self {
+            url,
+            user,
+            password,
+            inbox_prefix,
+        })
+    }
+}
+
+/// A secret file's contents without its trailing line break; empty or unreadable is an error
+/// naming the variable and the path (never the contents).
+fn read_secret_file(var: &str, path: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{var}={path}: {e}"))?;
+    let value = text.trim_end_matches(['\n', '\r']);
+    if value.is_empty() {
+        return Err(format!("{var}={path} is empty"));
+    }
+    Ok(value.to_string())
+}
+
+/// An inbox prefix is one or more plain subject tokens: no wildcard, blank or empty token.
+fn check_inbox_prefix(prefix: &str) -> Result<(), String> {
+    let bad = prefix.split('.').any(|token| {
+        token.is_empty() || token.contains(['*', '>']) || token.chars().any(char::is_whitespace)
+    });
+    if bad {
+        return Err(format!(
+            "CHELABASE_NATS_INBOX_PREFIX={prefix:?} must be plain subject tokens (no wildcards, blanks or empty tokens)"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -676,8 +768,22 @@ pub enum NatsError {
 
 pub use async_nats::jetstream::Context as JetStreamContext;
 
+/// The connect options a config asks for: its credentials and its inbox prefix.
+pub fn connect_options(config: &NatsConfig) -> async_nats::ConnectOptions {
+    let options = match (&config.user, &config.password) {
+        (Some(user), Some(password)) => {
+            async_nats::ConnectOptions::with_user_and_password(user.clone(), password.clone())
+        }
+        _ => async_nats::ConnectOptions::new(),
+    };
+    match &config.inbox_prefix {
+        Some(prefix) => options.custom_inbox_prefix(prefix.clone()),
+        None => options,
+    }
+}
+
 pub async fn connect(config: &NatsConfig) -> Result<async_nats::Client, NatsError> {
-    Ok(async_nats::connect(&config.url).await?)
+    Ok(connect_options(config).connect(&config.url).await?)
 }
 
 /// Every subject the control stream must carry.

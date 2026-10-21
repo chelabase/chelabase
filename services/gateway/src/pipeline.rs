@@ -376,7 +376,7 @@ impl Pipeline {
     ) -> Result<String, GatewayResponse> {
         let token = bearer_token(headers).ok_or_else(|| unauthorized(&AuthError::Unauthorized))?;
         let claims = self.verifier.verify(token).await.map_err(|err| match err {
-            AuthError::Unauthorized | AuthError::InvalidToken(_) => unauthorized(&err),
+            AuthError::Unauthorized | AuthError::InvalidToken(_) | AuthError::Expired => unauthorized(&err),
             AuthError::Jwks(_) | AuthError::Config(_) => {
                 error!("auth infrastructure error: {err}");
                 json_response(503, error_json("unavailable", "auth unavailable"))

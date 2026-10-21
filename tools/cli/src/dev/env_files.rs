@@ -1,4 +1,7 @@
 //! `demo.env` (host processes) and Studio's `.env.local`.
+//!
+//! demo.env carries no internal bearer (RT1 T1, S27): every app reads it, so the stack mounts each
+//! generated bearer into the services that use it and sets `<NAME>_FILE` per service.
 
 pub struct DemoEnv<'a> {
     pub issuer: &'a str,
@@ -26,9 +29,7 @@ CHELABASE_ZITADEL_ORG_ID={}\nCHELABASE_ZITADEL_PROJECT_ID={}\nCHELABASE_ZITADEL_
 CHELABASE_DEMO_USER_ID={}\nCHELABASE_DEMO_TENANT_ID={}\nCHELABASE_INTERNAL_SIGNING_KEY={}\n\
 CHELABASE_INTERNAL_VERIFY_KEY={}\nCHELABASE_SECRETS_KEY={}\nCHELABASE_AUTH_TOKEN_FILE={}\n\
 CHELABASE_AUTH_COOKIE_KEY={}\nCHELABASE_COMPUTE_JWT_DIR={}\n\
-CHELABASE_DATA_KEYS_TOKEN=chelabase-dev-data-keys\nCHELABASE_REST_INTERNAL_TOKEN=chelabase-dev-rest-internal\n\
-CHELABASE_ZITADEL_ADMIN_PAT_FILE={}\nCHELABASE_APP_JWT_PRIVATE_KEY={}\nCHELABASE_APP_JWT_PUBLIC_KEY={}\n\
-CHELABASE_APP_AUTH_INTERNAL_TOKEN=chelabase-dev-app-auth\nCHELABASE_APP_SESSIONS_INTERNAL_TOKEN=chelabase-dev-app-sessions\n",
+CHELABASE_ZITADEL_ADMIN_PAT_FILE={}\nCHELABASE_APP_JWT_PRIVATE_KEY={}\nCHELABASE_APP_JWT_PUBLIC_KEY={}\n",
         e.issuer,
         e.issuer,
         e.audiences,
@@ -47,6 +48,33 @@ CHELABASE_APP_AUTH_INTERNAL_TOKEN=chelabase-dev-app-auth\nCHELABASE_APP_SESSIONS
         e.app_jwt_private_key,
         e.app_jwt_public_key
     )
+}
+
+/// The internal bearers a demo.env written before RT1 T1 carried (their public development
+/// values). The stack now sets `<NAME>_FILE` per service, and a service refuses both forms.
+pub const LEGACY_BEARER_KEYS: [&str; 4] = [
+    "CHELABASE_DATA_KEYS_TOKEN",
+    "CHELABASE_REST_INTERNAL_TOKEN",
+    "CHELABASE_APP_AUTH_INTERNAL_TOKEN",
+    "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN",
+];
+
+/// `text` without its [`LEGACY_BEARER_KEYS`] lines, or `None` when it has none. `up` scrubs an
+/// existing demo.env before any container is created from it (the bootstrap rewrites it later).
+pub fn without_legacy_bearers(text: &str) -> Option<String> {
+    let is_legacy = |line: &str| {
+        line.split_once('=')
+            .is_some_and(|(k, _)| LEGACY_BEARER_KEYS.contains(&k.trim()))
+    };
+    if !text.lines().any(is_legacy) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines().filter(|l| !is_legacy(l)) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 pub fn render_studio_env(
@@ -115,12 +143,8 @@ mod tests {
             app_jwt_private_key: "/a/k",
             app_jwt_public_key: "/a/p",
         });
-        for line in [
-            "CHELABASE_DATA_KEYS_TOKEN=chelabase-dev-data-keys\n",
-            "CHELABASE_REST_INTERNAL_TOKEN=chelabase-dev-rest-internal\n",
-        ] {
-            assert!(text.contains(line), "{line} in {text}");
-        }
+        // RT1 T1 (S27): the internal bearers are generated secrets mounted per service, never in
+        // demo.env (`workbench::r11_tests::demo_env_holds_no_internal_bearer`).
         // No ports in demo.env: the apps default to the dev stack's.
         for key in [
             "CHELABASE_REST_URL=",
@@ -129,6 +153,19 @@ mod tests {
         ] {
             assert!(!text.contains(key), "{key} in {text}");
         }
+    }
+
+    // RT1 T1: an older demo.env's public bearers are scrubbed; everything else is kept.
+    #[test]
+    fn legacy_bearers_are_scrubbed_from_an_older_demo_env() {
+        let old = "CHELABASE_ZITADEL_ISSUER=http://a\nCHELABASE_DATA_KEYS_TOKEN=chelabase-dev-data-keys\n\
+CHELABASE_REST_INTERNAL_TOKEN=chelabase-dev-rest-internal\nCHELABASE_SECRETS_KEY=/k\n\
+CHELABASE_APP_AUTH_INTERNAL_TOKEN=chelabase-dev-app-auth\nCHELABASE_APP_SESSIONS_INTERNAL_TOKEN=x\n";
+        let new = without_legacy_bearers(old).expect("changed");
+        assert_eq!(new, "CHELABASE_ZITADEL_ISSUER=http://a\nCHELABASE_SECRETS_KEY=/k\n");
+        assert_eq!(without_legacy_bearers(&new), None, "nothing left to scrub");
+        // A key that merely starts with one of the names is kept.
+        assert_eq!(without_legacy_bearers("CHELABASE_DATA_KEYS_TOKEN_FILE=/f\n"), None);
     }
 
     #[test]
@@ -203,8 +240,6 @@ mod tests {
             "CHELABASE_ZITADEL_ADMIN_PAT_FILE=/z/admin.pat\n",
             "CHELABASE_APP_JWT_PRIVATE_KEY=/a/app-jwt.key\n",
             "CHELABASE_APP_JWT_PUBLIC_KEY=/a/app-jwt.pub\n",
-            "CHELABASE_APP_AUTH_INTERNAL_TOKEN=chelabase-dev-app-auth\n",
-            "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN=chelabase-dev-app-sessions\n",
         ] {
             assert!(text.contains(line), "{line} in {text}");
         }

@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use chelabase_auth::internal::DataIdentity;
 use chelabase_query::engine::{self, QueryCache, RunAs, RunSettings, with_transaction};
+use chelabase_query::roles::OWNER_LEVEL_SQL;
 use chelabase_query::schema::{RoleView, Schema, Visibility};
 use chelabase_query::{Lease, QueryClient};
 use chelabase_types::data_key::DataKeyKind;
@@ -29,17 +30,6 @@ use crate::error::ApiError;
 #[cfg(test)]
 use chelabase_query::engine::SchemaKey;
 pub use chelabase_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, SCHEMA_CACHE};
-
-/// Whether role `$1` may not back a secret key (E33), exactly what the worker's create-time check
-/// refuses: superuser, an attribute that administers (CREATEROLE, CREATEDB, REPLICATION), or
-/// membership at any depth in a superuser role or one of
-/// [`chelabase_types::data_key::KEY_ROLE_REFUSED_GROUPS`] (`neon_superuser` and the system
-/// roles). BYPASSRLS alone isn't refused. No row: the role doesn't exist.
-pub const OWNER_LEVEL_SQL: &str = "SELECT r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
-    OR EXISTS (SELECT FROM pg_catalog.pg_roles s WHERE (s.rolsuper OR s.rolname IN ('neon_superuser', \
-    'chelabase_admin', 'pg_execute_server_program', 'pg_read_server_files', 'pg_write_server_files')) \
-    AND pg_catalog.pg_has_role(r.oid, s.oid, 'MEMBER')) \
-    FROM pg_catalog.pg_roles r WHERE r.rolname = $1";
 
 /// Sent just before [`OWNER_LEVEL_SQL`], in the same round trip: the check runs before the
 /// request's transaction, so it ends whatever an earlier request left open (a `ROLLBACK`,
@@ -427,7 +417,9 @@ impl<S: ConnSource> Engine<S> {
     ) -> Result<String, Failure> {
         let body = serde_json::to_vec(tree)
             .map_err(|e| ApiError::invalid_query(format!("the tree: {e}")))?;
-        let parsed = chelabase_query::parse(&body).map_err(ApiError::from)?;
+        // The console route's grammar adds the console-only forms; the route chooses it.
+        let parsed = chelabase_query::parse_with(&body, chelabase_query::ParseMode::Console)
+            .map_err(ApiError::from)?;
         let requested = match (database, parsed.database.as_deref()) {
             (Some(a), Some(b)) if a != b => {
                 return Err(ApiError::invalid_query(
@@ -654,34 +646,6 @@ mod tests {
             assert!(!e.message.contains("10.1.2.3"), "{}", e.message);
             assert_eq!((e.detail, e.hint, e.sqlstate), (None, None, None), "{code}");
         }
-    }
-
-    #[test]
-    fn owner_level_sql_is_pinned() {
-        for needle in [
-            "r.rolsuper",
-            "r.rolcreaterole",
-            "r.rolcreatedb",
-            "r.rolreplication",
-            "pg_catalog.pg_has_role(r.oid, s.oid, 'MEMBER')",
-            "FROM pg_catalog.pg_roles r WHERE r.rolname = $1",
-        ] {
-            assert!(OWNER_LEVEL_SQL.contains(needle), "{needle}: {OWNER_LEVEL_SQL}");
-        }
-        // E33: a key's role may have BYPASSRLS.
-        assert!(!OWNER_LEVEL_SQL.contains("rolbypassrls"), "{OWNER_LEVEL_SQL}");
-        // F2 fix round M7: every request refuses what the create-time check refuses: a
-        // member, at any depth, of a superuser role or of each refused group.
-        assert!(OWNER_LEVEL_SQL.contains("s.rolsuper"), "{OWNER_LEVEL_SQL}");
-        for group in chelabase_types::data_key::KEY_ROLE_REFUSED_GROUPS {
-            assert!(OWNER_LEVEL_SQL.contains(&format!("'{group}'")), "{group}: {OWNER_LEVEL_SQL}");
-        }
-        // A function call a `search_path` could shadow: only the qualified one.
-        assert_eq!(
-            OWNER_LEVEL_SQL.matches("pg_has_role(").count(),
-            OWNER_LEVEL_SQL.matches("pg_catalog.pg_has_role(").count(),
-            "{OWNER_LEVEL_SQL}"
-        );
     }
 
     /// The owner-level check runs before the request's transaction, on a connection an

@@ -63,7 +63,8 @@ async fn main() -> anyhow::Result<()> {
     let key = SecretKey::from_env()?;
     ensure_secrets_key(&metadata, &key).await?;
 
-    let worker = Arc::new(build(&config, metadata, key)?);
+    let publisher = Arc::new(worker::rt_events::NatsPublisher::new(nats.clone()));
+    let worker = Arc::new(build(&config, metadata, key, publisher)?);
     worker.resync_requests.connect(nats.clone());
     worker.member_role_requests.connect(nats.clone());
     // E33a: the secret keys' BYPASSRLS marks, right from the start.

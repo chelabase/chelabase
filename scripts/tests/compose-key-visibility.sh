@@ -26,40 +26,66 @@ universe='[
   "K/neon/compute-jwt.pem", "K/neon/compute-jwt.pub",
   "K/compute-ca/ca.crt", "K/compute-ca/ca.key",
   "K/orchestrator-tls/current/client.crt", "K/orchestrator-tls/current/client.key", "K/orchestrator-tls/current/ca.crt",
+  "K/nats/orchestrator.password", "K/nats/worker.password", "K/nats/realtime.password", "K/nats/runner.password",
+  "K/valkey/proxy.password", "K/valkey/control.password", "K/valkey/realtime.password", "K/valkey/runner.password",
+  "K/valkey/health.password",
+  "K/neon/compute-jwt.pub.pem", "K/neon/storage-tokens/pageserver-api.jwt", "K/neon/storage-tokens/safekeeper-data.jwt",
+  "K/neon/storage-tokens/generations-api.jwt", "K/neon/storage-tokens/storcon-admin.jwt",
+  "K/realtime/pg.password", "K/realtime/ticket.key", "K/realtime/internal.token",
+  "K/tokens/rest-internal.token", "K/tokens/data-keys.token", "K/tokens/app-auth.token",
+  "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
   "K/unlisted/a-future-key", "K/stacks/registry.json", "K/stacks/other/env/stack.env",
   "C/scripts/tests/workbench-compose.sh", "C/.chelabase/anything",
   "S/env/stack.env"
 ]'
 
 # service -> { path: mode }; every other (service, path) must be none.
+# RT1 T1 (S1, S27): each service sees its own NATS/Valkey password and the bearers it sends or
+# checks; the runner (the test harness, which also has the Docker socket) sees all of them.
+# RT1 T7 (S1): realtime sees the gateway's verify key (ticket requests), the platform CA's
+# certificate (T8's compute TLS), its NATS and Valkey passwords and its three realtime secrets.
 expected='{
   "orchestrator": {
     "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
     "K/secrets/secrets.key": "ro", "K/gateway/internal-verify.pem": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
-    "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro"
+    "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
+    "K/nats/orchestrator.password": "ro", "K/valkey/control.password": "ro", "K/realtime/internal.token": "ro",
+    "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
+    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
   },
   "worker": {
     "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
     "K/secrets/secrets.key": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/compute-ca/ca.crt": "rw", "K/compute-ca/ca.key": "rw",
-    "K/orchestrator-tls/current/client.crt": "rw", "K/orchestrator-tls/current/client.key": "rw", "K/orchestrator-tls/current/ca.crt": "rw"
+    "K/orchestrator-tls/current/client.crt": "rw", "K/orchestrator-tls/current/client.key": "rw", "K/orchestrator-tls/current/ca.crt": "rw",
+    "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro"
   },
   "gateway": {
     "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
-    "K/gateway/internal-signing.pem": "ro", "K/auth/app-jwt.pub": "ro"
+    "K/gateway/internal-signing.pem": "ro", "K/auth/app-jwt.pub": "ro",
+    "K/tokens/data-keys.token": "ro", "K/tokens/app-sessions.token": "ro"
   },
   "auth": {
     "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
     "K/auth/cookie.key": "ro", "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
     "K/gateway/internal-verify.pem": "ro",
-    "K/compute-ca/ca.crt": "ro"
+    "K/compute-ca/ca.crt": "ro",
+    "K/tokens/app-auth.token": "ro"
   },
   "rest": {
     "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
     "K/gateway/internal-verify.pem": "ro",
-    "K/compute-ca/ca.crt": "ro"
+    "K/compute-ca/ca.crt": "ro",
+    "K/tokens/rest-internal.token": "ro"
+  },
+  "realtime": {
+    "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
+    "K/gateway/internal-verify.pem": "ro",
+    "K/compute-ca/ca.crt": "ro",
+    "K/nats/realtime.password": "ro", "K/valkey/realtime.password": "ro",
+    "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro"
   },
   "studio": { "C/scripts/tests/workbench-compose.sh": "rw" },
   "docs": { "C/scripts/tests/workbench-compose.sh": "rw" },
@@ -70,9 +96,40 @@ expected='{
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
     "K/compute-ca/ca.crt": "ro", "K/compute-ca/ca.key": "ro",
-    "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro"
+    "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
+    "K/nats/orchestrator.password": "ro", "K/nats/worker.password": "ro", "K/nats/realtime.password": "ro", "K/nats/runner.password": "ro",
+    "K/valkey/proxy.password": "ro", "K/valkey/control.password": "ro", "K/valkey/realtime.password": "ro", "K/valkey/runner.password": "ro",
+    "K/valkey/health.password": "ro",
+    "K/neon/compute-jwt.pub.pem": "ro", "K/neon/storage-tokens/pageserver-api.jwt": "ro", "K/neon/storage-tokens/safekeeper-data.jwt": "ro",
+    "K/neon/storage-tokens/generations-api.jwt": "ro", "K/neon/storage-tokens/storcon-admin.jwt": "ro",
+    "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
+    "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
+    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
   }
 }'
+
+# Services that don't mount the checkout read their secret at a fixed path inside (an entrypoint
+# wrapper, S6): every bind whose source is a service secret, as service:source->target, for all
+# services. NATS and Valkey get none (they read hashes rendered into the stack dir).
+expected_secret_binds='[
+  "proxy:K/valkey/proxy.password->/run/valkey-proxy.password",
+  "proxy:K/tokens/proxy-api.token->/run/proxy-api.token",
+  "storage-controller:K/tokens/storcon-hook.token->/run/storcon-hook.token",
+  "storage-controller:K/neon/compute-jwt.pub.pem->/run/storage-auth.pub.pem",
+  "storage-controller:K/neon/storage-tokens/pageserver-api.jwt->/run/pageserver-api.jwt",
+  "storage-controller:K/neon/storage-tokens/safekeeper-data.jwt->/run/safekeeper-data.jwt",
+  "pageserver:K/neon/compute-jwt.pub.pem->/run/storage-auth.pub.pem",
+  "pageserver:K/neon/storage-tokens/generations-api.jwt->/run/generations-api.jwt",
+  "pageserver:K/neon/storage-tokens/safekeeper-data.jwt->/run/safekeeper-data.jwt",
+  "safekeeper1:K/neon/compute-jwt.pub.pem->/run/storage-auth.pub.pem",
+  "safekeeper1:K/neon/storage-tokens/safekeeper-data.jwt->/run/safekeeper-data.jwt",
+  "safekeeper2:K/neon/compute-jwt.pub.pem->/run/storage-auth.pub.pem",
+  "safekeeper2:K/neon/storage-tokens/safekeeper-data.jwt->/run/safekeeper-data.jwt",
+  "safekeeper3:K/neon/compute-jwt.pub.pem->/run/storage-auth.pub.pem",
+  "safekeeper3:K/neon/storage-tokens/safekeeper-data.jwt->/run/safekeeper-data.jwt",
+  "register-safekeepers:K/neon/storage-tokens/storcon-admin.jwt->/run/storcon-admin.jwt",
+  "valkey:K/valkey/health.password->/run/valkey-health.password"
+]'
 
 # $1 label, $2 checkout, $3 keys dir, $4 state dir, $5 link (1: <checkout>/.chelabase is a symlink
 # to the keys dir, as in a real worktree; Docker follows it, so a mount at the link is a mount at
@@ -131,9 +188,29 @@ $bad"
   # No whole-directory mount of a key directory (secrets, gateway, auth, neon): files only.
   bad="$(jq -r --arg k "$keys" '
     .services | to_entries[] | .key as $svc | (.value.volumes // [])[]
-    | select(.target | IN($k + "/secrets", $k + "/gateway", $k + "/auth", $k + "/neon"))
+    | select(.target | IN($k + "/secrets", $k + "/gateway", $k + "/auth", $k + "/neon",
+        $k + "/nats", $k + "/valkey", $k + "/realtime", $k + "/tokens", $k + "/neon/storage-tokens"))
     | "\($svc): \(.target)"' <<<"$config")"
   [[ -z "$bad" ]] || fail "$label: a whole key directory is mounted; got:
+$bad"
+  # RT1 T1: secrets mounted at another path (the proxy's and the storage controller's), read-only.
+  local binds want_binds
+  binds="$(jq -S -c --arg k "$keys" '
+    [.services | to_entries[] | .key as $svc | (.value.volumes // [])[]
+      | select(.type == "bind" and .source != .target)
+      | select(.source as $src | any(("/nats/", "/valkey/", "/realtime/", "/tokens/", "/neon/storage-tokens/", "/neon/compute-jwt.pub.pem") as $d | ($src | startswith($k + $d)); .))
+      | "\($svc):K/\(.source | ltrimstr($k + "/"))->\(.target)\(if (.read_only // false) then "" else ":rw" end)"]
+    | sort' <<<"$config")"
+  want_binds="$(jq -S -c 'sort' <<<"$expected_secret_binds")"
+  [[ "$binds" == "$want_binds" ]] || fail "$label: secrets mounted at another path differ; want $want_binds, got $binds"
+  # NATS and Valkey see no machine key or service secret at all (Valkey: its healthcheck's own
+  # password only, listed above).
+  bad="$(jq -r --arg k "$keys" '
+    .services | to_entries[] | select(.key | IN("nats", "valkey")) | .key as $svc | (.value.volumes // [])[]
+    | select((.source // "") | startswith($k + "/")) | select((.source | startswith($k + "/stacks/")) | not)
+    | select(.source != ($k + "/valkey/health.password"))
+    | "\($svc): \(.source)"' <<<"$config")"
+  [[ -z "$bad" ]] || fail "$label: nats or valkey mounts a key file; got:
 $bad"
   # Every checkout-mounting service masks the keys dir itself with a read-only tmpfs (the real
   # directory, which a symlinked <checkout>/.chelabase leads to), and also <checkout>/.chelabase
@@ -162,7 +239,7 @@ $tied"
   # The set of checkout-mounting services is the one the table knows.
   local mounting
   mounting="$(jq -r --arg c "$checkout" '[.services | to_entries[] | select(any(.value.volumes[]?; .target == $c)) | .key] | sort | join(" ")' <<<"$config")"
-  [[ "$mounting" == "auth docs gateway landing orchestrator rest runner studio worker" ]] ||
+  [[ "$mounting" == "auth docs gateway landing orchestrator realtime rest runner studio worker" ]] ||
     fail "$label: checkout-mounting services changed (update the table); got: $mounting"
 }
 

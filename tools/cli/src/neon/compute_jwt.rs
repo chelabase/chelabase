@@ -41,7 +41,7 @@ pub fn ensure(dir: &Path) -> Result<ComputeJwtPaths> {
 }
 
 /// A temporary name next to `path`, unique per run so concurrent runs never share one.
-pub(super) fn temp_name(path: &Path) -> PathBuf {
+pub(crate) fn temp_name(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()

@@ -761,6 +761,7 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
         roles: changed,
         branch,
         served_databases_changed,
+        known_databases,
     } = match apply(tx, &plan, &state.roles, &state.secrets, &id).await {
         Ok(applied) => applied,
         Err(Failure::Refused(message)) => return answer(StatusCode::CONFLICT, message),
@@ -786,8 +787,83 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
     if let (true, Some(branch)) = (!delta.roles.is_empty() || makes_database, branch) {
         request_member_reconcile(state.resync.clone(), branch);
     }
+    // P10: the Postgres databases made or dropped, as project events for realtime, now that
+    // this receiver's own write committed. The delta arrives at the creating transaction's
+    // pre-commit, so an aborted `CREATE DATABASE` can still be announced: realtime and Studio
+    // only invalidate on these, which costs one refetch. A `set` of a database the branch
+    // already had (`ALTER DATABASE … OWNER TO`) is no new database: no event.
+    if let Some(branch) = branch {
+        let events = pg_database_events(&delta, &known_databases);
+        if !events.is_empty() {
+            let state = state.clone();
+            tokio::spawn(async move { publish_pg_database_events(&*state, branch, events).await });
+        }
+    }
     publish(state.cache.clone(), id, changed);
     StatusCode::OK.into_response()
+}
+
+/// A Postgres database event of a delta, before the branch's ids are known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PgDatabaseChange {
+    Created(String),
+    Dropped(String),
+}
+
+/// The delta's databases as realtime's events: a `set` is made (a rename is the old name
+/// dropped and the new one made), a `del` is dropped. A `set` without a rename of a database in
+/// `known` (the branch had it when the step ran: an owner change) is no event.
+fn pg_database_events(delta: &Delta, known: &[String]) -> Vec<PgDatabaseChange> {
+    let mut out = Vec::new();
+    for d in &delta.dbs {
+        match d.op {
+            Op::Set => {
+                if let Some(old) = &d.old_name {
+                    out.push(PgDatabaseChange::Dropped(old.clone()));
+                } else if known.contains(&d.name) {
+                    continue;
+                }
+                out.push(PgDatabaseChange::Created(d.name.clone()));
+            }
+            Op::Del => out.push(PgDatabaseChange::Dropped(d.name.clone())),
+        }
+    }
+    out
+}
+
+/// Publishes `changes` on the branch's project (looked up now; a failure is logged and the
+/// events dropped: Studio's fallback poll covers them).
+async fn publish_pg_database_events<M: NeonMetadataPort, L>(
+    state: &InternalState<M, L>,
+    branch: BranchId,
+    changes: Vec<PgDatabaseChange>,
+) {
+    use chelabase_nats::rt::ProjectEvent;
+    let record = match state.metadata.get_branch(branch).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(%branch, "ddl: realtime events not published (branch): {e:#}");
+            return;
+        }
+    };
+    let project = match state.metadata.database_project(record.database_id).await {
+        Ok(Some(project)) => project,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(%branch, "ddl: realtime events not published (project): {e:#}");
+            return;
+        }
+    };
+    let (database_id, branch_id) = (record.database_id.as_uuid(), branch.as_uuid());
+    let events = changes
+        .into_iter()
+        .map(|c| match c {
+            PgDatabaseChange::Created(name) => ProjectEvent::PgDatabaseCreated { database_id, branch_id, name },
+            PgDatabaseChange::Dropped(name) => ProjectEvent::PgDatabaseDropped { database_id, branch_id, name },
+        })
+        .collect();
+    super::realtime::spawn_project(state.rt_events.clone(), project.as_uuid(), events);
 }
 
 /// Asks the worker for a resync of `branch`, off the response path.
@@ -817,6 +893,8 @@ struct Applied {
     branch: Option<BranchId>,
     /// The branch whose databases lost or renamed one, if any.
     served_databases_changed: Option<BranchId>,
+    /// The databases a `set` step found already there (an owner change, not a new database).
+    known_databases: Vec<String>,
 }
 
 enum Failure {
@@ -852,6 +930,7 @@ async fn apply<T: DdlPort>(
     let mut role_moves: Vec<Move> = Vec::new();
     let mut db_moves: Vec<Move> = Vec::new();
     let mut databases_changed = false;
+    let mut known_databases: Vec<String> = Vec::new();
     // The role cap is checked once, on the final count, so the order of a delta's steps
     // doesn't matter: only a delta that ends over the cap and above where it began is refused.
     let copies_before = if steps.iter().any(|s| {
@@ -905,6 +984,9 @@ async fn apply<T: DdlPort>(
             Step::SetDb { name, .. } => {
                 facts.db_exists = tx.has_database(name).await?;
                 facts.database_count = tx.database_count().await?;
+                if facts.db_exists {
+                    known_databases.push(name.to_string());
+                }
             }
             Step::RenameDb { .. } | Step::DelDb { .. } => {}
         }
@@ -1009,6 +1091,7 @@ async fn apply<T: DdlPort>(
         roles: changed,
         branch,
         served_databases_changed: branch.filter(|_| databases_changed),
+        known_databases,
     })
 }
 
@@ -1178,6 +1261,60 @@ mod tests {
         plain: "Tr0ub4dor&3x-horse",
         encrypted: SCRAM,
     };
+
+    // RT1 T6 (P10): a delta's databases as realtime's events: made, dropped, a rename as both,
+    // a role-only delta as none; names with quotes or dots kept as they are.
+    #[test]
+    fn pg_database_events_follow_the_delta() {
+        use PgDatabaseChange::{Created, Dropped};
+        let d = delta(
+            r#"{"dbs": [
+                {"op":"set","name":"made","owner":"postgres"},
+                {"op":"del","name":"gone"},
+                {"op":"set","name":"new.\"db\"","old_name":"old"},
+                {"op":"set","name":"owned","owner":"app"},
+                {"op":"del","name":"renamed_then_dropped","old_name":"before"}
+            ]}"#,
+        );
+        assert_eq!(
+            pg_database_events(&d, &[]),
+            vec![
+                Created("made".into()),
+                Dropped("gone".into()),
+                Dropped("old".into()),
+                Created("new.\"db\"".into()),
+                Created("owned".into()),
+                Dropped("renamed_then_dropped".into()),
+            ]
+        );
+        assert!(pg_database_events(&delta(r#"{"roles": [{"op":"del","name":"r"}]}"#), &[]).is_empty());
+        assert!(pg_database_events(&delta(r#"{}"#), &[]).is_empty());
+    }
+
+    // RT1 final fix round: a `set` of a database the branch had (an owner change) is no event;
+    // a rename onto a known name, a drop and an unknown `set` still are.
+    #[test]
+    fn a_set_of_a_known_database_is_no_event() {
+        use PgDatabaseChange::{Created, Dropped};
+        let d = delta(
+            r#"{"dbs": [
+                {"op":"set","name":"owned","owner":"app"},
+                {"op":"set","name":"fresh","owner":"app"},
+                {"op":"set","name":"owned2","old_name":"old"},
+                {"op":"del","name":"owned3"}
+            ]}"#,
+        );
+        let known = ["owned".to_string(), "owned2".to_string(), "owned3".to_string()];
+        assert_eq!(
+            pg_database_events(&d, &known),
+            vec![
+                Created("fresh".into()),
+                Dropped("old".into()),
+                Created("owned2".into()),
+                Dropped("owned3".into()),
+            ]
+        );
+    }
 
     #[test]
     fn steps_follow_neons_order() {

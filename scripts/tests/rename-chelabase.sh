@@ -4,7 +4,16 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/../rename-chelabase.sh"
+# Only the throwaway fixtures below are ever touched (RT1 final fix round, process failure:
+# an inherited GIT_DIR/GIT_WORK_TREE made `git init` re-initialise the caller's repository and
+# write core.worktree into its shared config). Every repository-local GIT_* variable goes, no
+# user or system config applies, and discovery stops at the fixtures' root
+# (scripts/tests/rename-chelabase-isolation.sh checks this).
+# shellcheck disable=SC2046 # one variable name per word
+unset $(git rev-parse --local-env-vars)
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 ROOT="$(mktemp -d)"
+export GIT_CEILING_DIRECTORIES="$ROOT"
 FAILS=0
 trap 'rm -rf "$ROOT"' EXIT
 

@@ -1,10 +1,12 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { consoleQueryExact, useGetTable, useInsertDefaultRow, useListTypes, type ObjectSummary } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
-import { buildSelect, consoleErrorText, inputKind, parseValue, whereByKey, type Tree } from "@/lib/console";
+import { buildSelect, consoleErrorText, inputKind, parseValue, type Tree } from "@/lib/console";
+import { NO_CHECK_NOTICE, conflictWhere, isComparable, splitTextRows, type Originals } from "@/lib/realtime/conflict";
+import { insertedKey, textSelectItems, whereByTextKey } from "@/lib/realtime/keys";
 import type { RowAccess } from "@/lib/table-editor/access";
 import type { EditorParams } from "@/lib/table-editor/context";
 import { smallColumns } from "@/lib/table-editor/oversized";
@@ -19,19 +21,27 @@ import {
   type RowColumn,
   type TemporalKind,
 } from "@/lib/table-editor/rows";
-import { rowKey } from "@/lib/table-editor/selection";
 import { useTableEditor } from "@/lib/table-editor/store";
 import { cn } from "@/lib/utils";
 import { JsonEditor, toInputValue } from "./cell-editor";
+import { ConflictDialog, type ConflictDialogProps } from "./conflict-dialog";
 import { FkPicker, fkOf } from "./fk-picker";
 import { LoadValueButton, cellKey, useLoadValue } from "./load-value";
 import { Picker } from "./picker";
 import { CollapseButton, CollapsedStrip } from "./panel-bits";
-import { PANEL_ROW, ROWS_QUERY, deletedNotice, rowWriteKeys } from "./rows-view";
+import { deletedNotice, panelRowKey, rowWriteKeys, seedPanelRow } from "./rows-view";
 import type { TableTarget } from "./target";
 
 /** Fields above this many get a "Filter fields" input. */
 export const FILTER_FIELDS_ABOVE = 30;
+
+/** Numbers the mounted row panels (their `RowDraft.id`). */
+let draftIds = 0;
+
+const NO_MARKS: ReadonlySet<string> = new Set();
+
+/** A read value as the panel compares it across reads: its edit text, null for NULL. */
+const readText = (v: unknown): string | null => (v === null || v === undefined ? null : editText(v));
 
 /** What a field holds while it's edited: NULL, or text the column's type parses. */
 interface Value {
@@ -43,6 +53,19 @@ interface PanelRow {
   row: Row;
   /** The row was too large: its large columns weren't read ("Load value"). */
   fallback: boolean;
+  /** The comparable columns as text, as read; absent when the row came from a write's `returning`. */
+  originals?: Originals;
+}
+
+/** A save that matched no row (§6.3). */
+interface PanelConflict {
+  state: ConflictDialogProps["state"];
+  values: Record<string, unknown>;
+  /** The row as re-read (Take theirs shows it). */
+  fresh: PanelRow | null;
+  unchecked: string[];
+  busy: boolean;
+  error: string | null;
 }
 
 const inputClass =
@@ -59,6 +82,13 @@ function nowText(kind: TemporalKind): string {
   if (kind === "time") return iso.slice(11, 19);
   if (kind === "timestamp") return iso.slice(0, 19);
   return iso;
+}
+
+/** A re-read row's value as the conflict dialog shows it: its text as read, else its JSON text; null for NULL. */
+function theirText(fresh: PanelRow, column: string): string | null {
+  if (fresh.originals && Object.hasOwn(fresh.originals, column)) return fresh.originals[column];
+  const v = fresh.row[column];
+  return v === null || v === undefined ? null : editText(v);
 }
 
 function parseField(col: RowColumn, v: Value): { ok: true; value: unknown } | { ok: false; error: string } {
@@ -86,10 +116,12 @@ export interface RowPanelHostProps {
 export function RowPanelHost(props: RowPanelHostProps) {
   const panel = useTableEditor((s) => s.panel);
   const setCollapsed = useTableEditor((s) => s.setCollapsed);
+  // A Discard remounts the panel empty.
+  const epoch = useTableEditor((s) => s.rowDraftEpoch);
   return (
     <>
       {panel.collapsed && <CollapsedStrip text={panel.row === null ? "New row" : "Row"} onExpand={() => setCollapsed(false)} />}
-      <RowPanel key={`${props.target.key}|${props.target.role ?? ""}|${panel.row ?? ""}`} {...props} rowKeyText={panel.row} hidden={panel.collapsed} />
+      <RowPanel key={`${props.target.key}|${props.target.role ?? ""}|${panel.row ?? ""}|${epoch}`} {...props} rowKeyText={panel.row} hidden={panel.collapsed} />
     </>
   );
 }
@@ -108,7 +140,7 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
   const openPanel = useTableEditor((s) => s.openPanel);
   const setCollapsed = useTableEditor((s) => s.setCollapsed);
   const dbParams = database ? { database } : undefined;
-  const structure = useGetTable(databaseId, branchId, schema, table, dbParams);
+  const structure = useGetTable(databaseId, branchId, schema, table, dbParams, { query: { enabled: !target.notTable } });
   const types = useListTypes(databaseId, branchId, dbParams);
   const tableDef = structure.data;
   const pk = useMemo(() => (tableDef ? primaryKeyOf(tableDef) : []), [tableDef]);
@@ -117,36 +149,74 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
   const send = (tree: Tree) => consoleQueryExact(databaseId, branchId, { role, database, tree });
   const fail = (err: unknown, op: "select" | "insert" | "update" | "delete") => consoleErrorText(err, { role, op });
 
+  // The comparable columns (R18): read as text with the row, the conflict check's originals.
+  const comparable = useMemo(() => {
+    const kinds = new Map((types.data?.types ?? []).map((t) => [t.oid, t.kind]));
+    const composite = new Set((tableDef?.columns ?? []).filter((c) => kinds.get(c.type_oid) === "composite").map((c) => c.name));
+    return columns.filter((c) => !pk.includes(c.name) && !composite.has(c.name) && isComparable(c.desc)).map((c) => c.name);
+  }, [columns, pk, tableDef, types.data]);
+
+  /** The row by its key, with its key and originals as text; null when no row has that key for this role. */
+  async function readRow(key: string): Promise<PanelRow | null> {
+    const where = whereByTextKey(pk, key);
+    const read = async (cols: string[]) => {
+      const sel = textSelectItems({ columns: cols, pk, originals: comparable.filter((c) => cols.includes(c)) });
+      const raw = (await send(buildSelect({ schema, table, page: 0, sort: null, filters: where, pk, pageSize: 1, columns: sel.items }))) as Row[];
+      return splitTextRows(raw, sel);
+    };
+    let fallback = false;
+    let got;
+    try {
+      got = await read(columns.map((c) => c.name));
+    } catch (err) {
+      if (!isTooLarge(err)) throw err;
+      fallback = true;
+      got = await read(smallColumns(tableDef!));
+    }
+    const i = got.keys.indexOf(key);
+    return i < 0 ? null : { row: got.rows[i], fallback, originals: got.originals[i] };
+  }
+
   // The open row, read by its key (a page change or a refresh elsewhere can't lose it).
-  const rowQueryKey = [ROWS_QUERY, databaseId, branchId, PANEL_ROW, database, role, qualified, rowKeyText];
+  const rowQueryKey = panelRowKey(target, rowKeyText);
   const rowQuery = useQuery({
     queryKey: rowQueryKey,
-    enabled: !insert && !!tableDef,
+    enabled: !insert && !!tableDef && !types.isPending,
     retry: false,
     queryFn: async (): Promise<PanelRow> => {
-      const values = JSON.parse(rowKeyText!) as unknown[];
-      const where = whereByKey(pk, Object.fromEntries(pk.map((c, i) => [c, values[i]])));
-      const read = async (cols?: string[]) =>
-        (await send(buildSelect({ schema, table, page: 0, sort: null, filters: where, pk, pageSize: 1, columns: cols }))) as Row[];
-      let fallback = false;
-      let rows: Row[];
-      try {
-        rows = await read();
-      } catch (err) {
-        if (!isTooLarge(err)) throw err;
-        fallback = true;
-        rows = await read(smallColumns(tableDef!));
-      }
-      const row = rows.find((r) => rowKey(pk, r) === rowKeyText);
-      if (!row) throw new Error("That row is no longer there (it may have been deleted, or is hidden from this role).");
-      return { row, fallback };
+      const found = await readRow(rowKeyText!);
+      if (!found) throw new Error("That row is no longer there (it may have been deleted, or is hidden from this role).");
+      return found;
     },
   });
   const current = rowQuery.data?.row ?? null;
   const fallback = rowQuery.data?.fallback ?? false;
+  // W1: the originals as the panel first read the row; later reads (a live change, a refresh) never replace them.
+  const [captured, setCaptured] = useState<Originals | null>(null);
+  if (captured === null && rowQuery.data?.originals) setCaptured(rowQuery.data.originals);
+  const [conflict, setConflict] = useState<PanelConflict | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const [draft, setDraft] = useState<Record<string, Value>>({});
   const [loaded, setLoaded] = useState<Record<string, string | null>>({});
+  // A later read of the row (a live change): the fields the viewer hasn't touched show its values, so their originals
+  // are what the viewer now sees; a touched field keeps the original it was edited from (W1).
+  const [seenData, setSeenData] = useState(rowQuery.data);
+  if (rowQuery.data !== seenData) {
+    setSeenData(rowQuery.data);
+    const fresh = rowQuery.data?.originals;
+    if (captured !== null && fresh) {
+      const next = { ...captured };
+      for (const [c, v] of Object.entries(fresh)) if (!(c in draft)) next[c] = v;
+      setCaptured(next);
+    }
+  }
+  // The live cue, only while the panel holds unsaved edits: untouched fields a live update changed ("Updated"), and
+  // edited fields whose value changed on the server since ("Changed since you started"; the save's conflict check decides).
+  const [liveMarks, setLiveMarks] = useState<ReadonlySet<string>>(NO_MARKS);
+  const [sinceMarks, setSinceMarks] = useState<ReadonlySet<string>>(NO_MARKS);
+  const unmarkLive = (names: string[]) =>
+    setLiveMarks((m) => (names.some((n) => m.has(n)) ? new Set([...m].filter((n) => !names.includes(n))) : m));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [fieldFilter, setFieldFilter] = useState("");
   const [picking, setPicking] = useState<string | null>(null);
@@ -171,6 +241,7 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
   const setValue = (name: string, v: Value) => {
     setDraft((d) => ({ ...d, [name]: v }));
     setErrors(({ [name]: _gone, ...rest }) => rest);
+    unmarkLive([name]);
   };
   /** Not editable here: the key of an open row, generated and identity-always columns, or everything without write access. */
   const lockedColumn = (col: RowColumn) => !writable || col.readOnly || (!insert && pk.includes(col.name));
@@ -182,8 +253,13 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
     return now.null !== was.null || (!now.null && now.text !== was.text);
   });
 
+  /** Cancel: asks first while the draft holds unsaved edits. */
   function close() {
     openPanel("closed");
+  }
+  /** After a confirmed delete (or an insert whose row can't be shown): nothing is left to discard. */
+  function closeDone() {
+    openPanel("closed", undefined, { discard: true });
   }
 
   async function save() {
@@ -202,6 +278,7 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
     if (Object.keys(next).length > 0) return;
     setSaving(true);
     setFailure(null);
+    setNotice(null);
     try {
       if (insert) {
         let row: Row | undefined;
@@ -214,23 +291,45 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
           row = Array.isArray(result) ? result[0] : undefined;
         }
         await refresh();
-        if (row && pk.length > 0) {
-          const key = rowKey(pk, row);
-          queryClient.setQueryData<PanelRow>([ROWS_QUERY, databaseId, branchId, PANEL_ROW, database, role, qualified, key], { row, fallback: false });
-          openPanel("row", { row: key });
-        } else {
-          close();
+        // The panel reads the new row by its text key (read back when the returned values aren't their texts).
+        const key = row ? await insertedKey({ schema, table, pk, row, types: Object.fromEntries(columns.map((c) => [c.name, c.desc])), send }).catch(() => null) : null;
+        if (key !== null && row) {
+          seedPanelRow(queryClient, target, key, row);
+          // The draft is saved: the saved row opens without asking.
+          openPanel("row", { row: key }, { discard: true });
         }
+        else closeDone();
       } else {
-        const where = whereByKey(pk, current!);
-        const result = (await send({ v: 1, op: "update", table: qualified, set: values, where, returning: "*" })) as Row[];
-        if (!Array.isArray(result) || result.length === 0) {
+        // Never without originals (review I4): after a save the row is read again first.
+        if (captured === null) return;
+        // W1: each edited column's original as the panel first read it (in the order they were edited).
+        const edited = Object.keys(draft).filter((c) => c in values);
+        const check = conflictWhere({ pk, key: rowKeyText!, edited, originals: captured });
+        const result = (await send({ v: 1, op: "update", table: qualified, set: values, where: check.where, returning: "*" })) as Row[];
+        if (!Array.isArray(result)) {
           setFailure("No row was changed (it may be hidden from this role, or gone).");
           return;
         }
-        queryClient.setQueryData<PanelRow>(rowQueryKey, { row: result[0], fallback: false });
-        setDraft({});
-        setLoaded({});
+        if (result.length === 0) {
+          // Changed since the panel opened, or gone for this role: read it again.
+          const fresh = await readRow(rowKeyText!);
+          setConflict({
+            values,
+            fresh,
+            unchecked: check.unchecked,
+            busy: false,
+            error: null,
+            state: fresh
+              ? {
+                  kind: "changed",
+                  columns: edited.map((name) => ({ name, theirs: theirText(fresh, name), yours: draft[name]?.null ? null : (draft[name]?.text ?? null) })),
+                }
+              : { kind: "gone" },
+          });
+          return;
+        }
+        saved(result);
+        if (check.unchecked.length > 0) setNotice(`${NO_CHECK_NOTICE}: ${check.unchecked.join(", ")}.`);
         await refresh();
       }
     } catch (err) {
@@ -240,13 +339,50 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
     }
   }
 
+  /** A saved update: the panel shows the returned row; its originals are captured again from the refresh's read. */
+  function saved(result: Row[]) {
+    queryClient.setQueryData<PanelRow>(rowQueryKey, { row: result[0], fallback: false });
+    setCaptured(null);
+    setDraft({});
+    setLoaded({});
+  }
+
+  async function overwrite() {
+    if (!conflict) return;
+    setConflict({ ...conflict, busy: true, error: null });
+    try {
+      const result = (await send({ v: 1, op: "update", table: qualified, set: conflict.values, where: whereByTextKey(pk, rowKeyText!), returning: "*" })) as Row[];
+      if (!Array.isArray(result) || result.length === 0) {
+        setConflict((c) => (c ? { ...c, busy: false, state: { kind: "gone" } } : c));
+        return;
+      }
+      setConflict(null);
+      saved(result);
+      await refresh();
+    } catch (err) {
+      setConflict((c) => (c ? { ...c, busy: false, error: fail(err, "update") } : c));
+    }
+  }
+
+  function takeTheirs() {
+    const fresh = conflict?.fresh;
+    if (fresh) {
+      queryClient.setQueryData<PanelRow>(rowQueryKey, fresh);
+      setCaptured(fresh.originals ?? null);
+    }
+    setDraft({});
+    setLoaded({});
+    setConflict(null);
+    void refresh();
+  }
+
   async function confirmDelete() {
     setDeleteBusy(true);
     setDeleteError(null);
     let result: unknown;
     try {
       // The delete returns the key of the row it deleted: none means it was hidden from the role, or gone.
-      result = await send({ v: 1, op: "delete", from: qualified, where: whereByKey(pk, current!), returning: pk });
+      result = await send({ v: 1, op: "delete", from: qualified, where: whereByTextKey(pk, rowKeyText!), returning: pk });
     } catch (err) {
       setDeleteBusy(false);
       setDeleteError(fail(err, "delete"));
@@ -256,7 +392,7 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
     setDeleting(false);
     const notice = deletedNotice(1, Array.isArray(result) ? result.length : null);
     if (notice) setFailure(notice);
-    else close();
+    else closeDone();
     await refresh();
   }
 
@@ -264,6 +400,8 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
   const shown = columns.length > FILTER_FIELDS_ABOVE && needle !== "" ? columns.filter((c) => c.name.toLowerCase().includes(needle)) : columns;
   const pkSummary = !insert && current ? pk.map((c) => `${c} = ${editText(current[c])}`).join(", ") : "";
   const loading = !tableDef || (!insert && rowQuery.isPending);
+  // A saved row's originals are re-read before the next save can check against them (review I4).
+  const awaitingOriginals = !insert && !loading && captured === null;
   const loadError = structure.error ?? rowQuery.error;
   const fkColumns = picking && tableDef ? fkOf(tableDef, picking) : null;
 
@@ -360,8 +498,11 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
       );
     }
     const hasValue = !nullOn && v.text !== "";
+    const edited = col.name in draft;
+    const cue = edited ? (sinceMarks.has(col.name) ? "since-started" : undefined) : liveMarks.has(col.name) ? "live" : undefined;
+    const serverNow = cue === "since-started" ? readText(current?.[col.name]) : null;
     return (
-      <div key={col.name} className="space-y-1">
+      <div key={col.name} data-field={col.name} data-changed={cue} className="space-y-1">
         <div className="flex items-baseline gap-2 font-mono text-[13px]">
           <span>{col.name}</span>
           <span className="text-xs text-chalk-dim">
@@ -369,7 +510,8 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
             {fk ? ` → ${fk.table}` : ""}
             {col.desc.nullable ? " null" : ""}
           </span>
-          {isKey && !insert && <span className="ml-auto border border-line px-1.5 font-sans text-[11px] text-chalk-dim">key</span>}
+          {cue === "live" && <span className="ml-auto font-sans text-[11px] text-seafoam">Updated</span>}
+          {isKey && !insert && <span className={cn("border border-line px-1.5 font-sans text-[11px] text-chalk-dim", cue !== "live" && "ml-auto")}>key</span>}
         </div>
         <div className="flex items-center gap-2">
           {control}
@@ -400,6 +542,14 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
             <span aria-hidden="true">NULL</span>
           </label>
         )}
+        {cue === "since-started" && (
+          <p className="flex flex-wrap items-baseline gap-x-2 text-xs">
+            <span className="border border-seafoam/60 px-1.5 text-[11px] text-seafoam">Changed since you started</span>
+            <span className="min-w-0 text-chalk-dim">
+              Now: <span className={cn("font-mono break-all whitespace-pre-wrap", serverNow === null ? "text-chalk-dim" : "text-chalk")}>{serverNow ?? "NULL"}</span>
+            </span>
+          </p>
+        )}
         {error && (
           <p role="alert" className="text-xs text-coral">
             {error}
@@ -410,6 +560,39 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
   }
 
   const dirtyCount = insert ? Object.keys(draft).length : changed.length;
+  // F6: an unsaved draft is published, so anything that would drop it asks first (and the page asks before unloading).
+  const [draftId] = useState(() => ++draftIds);
+  const setRowDraft = useTableEditor((s) => s.setRowDraft);
+  const clearRowDraft = useTableEditor((s) => s.clearRowDraft);
+  const dirty = dirtyCount > 0;
+  // A new read of the row: while dirty, mark the fields whose value it changed. A save (its returned row), a
+  // "Take theirs" or a discard leaves the panel clean, which drops every mark.
+  const [cueSeen, setCueSeen] = useState(rowQuery.data);
+  if (rowQuery.data !== cueSeen) {
+    setCueSeen(rowQuery.data);
+    const before = cueSeen?.row;
+    const after = rowQuery.data?.row;
+    if (dirty && before && after) {
+      const live = new Set(liveMarks);
+      const since = new Set(sinceMarks);
+      for (const c of columns) {
+        if (!(c.name in before) || !(c.name in after) || readText(before[c.name]) === readText(after[c.name])) continue;
+        if (c.name in draft) since.add(c.name);
+        else live.add(c.name);
+      }
+      if (live.size !== liveMarks.size) setLiveMarks(live);
+      if (since.size !== sinceMarks.size) setSinceMarks(since);
+    }
+  }
+  if (!dirty && (liveMarks.size > 0 || sinceMarks.size > 0)) {
+    setLiveMarks(NO_MARKS);
+    setSinceMarks(NO_MARKS);
+  }
+  useEffect(() => {
+    if (dirty) setRowDraft({ id: draftId, table: target.key, row: rowKeyText });
+    else clearRowDraft(draftId);
+  }, [dirty, draftId, target.key, rowKeyText, setRowDraft, clearRowDraft]);
+  useEffect(() => () => clearRowDraft(draftId), [draftId, clearRowDraft]);
   return (
     <>
       <aside
@@ -463,7 +646,13 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
             {failure}
           </p>
         )}
+        {notice && (
+          <p role="status" className="shrink-0 px-4 pb-2 text-[13px] text-chalk-dim">
+            {notice}
+          </p>
+        )}
         <p className="shrink-0 px-4 pb-2 text-[13px] text-chalk-dim">
+          {awaitingOriginals && writable && !loadError ? "Reading the saved row again… · " : ""}
           {dirtyCount === 0 ? (insert ? "Untouched fields use their defaults" : "No changes") : `${dirtyCount} ${dirtyCount === 1 ? "field" : "fields"} ${insert ? "filled" : "changed"}`}
         </p>
         <div className="flex h-[60px] shrink-0 items-center gap-2 border-t border-line-strong px-4">
@@ -477,7 +666,7 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
             Cancel
           </Button>
           {writable && (
-            <Button disabled={saving || loading || (!insert && changed.length === 0)} onClick={() => void save()}>
+            <Button disabled={saving || loading || awaitingOriginals || (!insert && changed.length === 0)} onClick={() => void save()}>
               {saving ? "Saving…" : "Save row"}
             </Button>
           )}
@@ -489,12 +678,25 @@ function RowPanel({ target, access, object, params, navigate, rowKeyText, hidden
           fk={fkColumns}
           onClose={() => setPicking(null)}
           onPick={(values) => {
+            unmarkLive(Object.keys(values));
             setDraft((d) => ({
               ...d,
               ...Object.fromEntries(Object.entries(values).map(([c, val]) => [c, val === null || val === undefined ? { null: true, text: "" } : { null: false, text: editText(val) }])),
             }));
             setPicking(null);
           }}
+        />
+      )}
+      {conflict && (
+        <ConflictDialog
+          open
+          state={conflict.state}
+          unchecked={conflict.unchecked}
+          busy={conflict.busy}
+          error={conflict.error}
+          onOverwrite={() => void overwrite()}
+          onTakeTheirs={takeTheirs}
+          onClose={() => setConflict(null)}
         />
       )}
       {deleting && (

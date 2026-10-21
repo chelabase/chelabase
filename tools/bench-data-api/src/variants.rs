@@ -245,6 +245,9 @@ async fn sqlx_run_plan(
     for bind in &p.binds {
         q = match resolve_bind(op, bind, max_rows) {
             Some(BindValue::Text(v)) => q.bind(v.map(|v| v.into_owned())),
+            Some(BindValue::TextArray(v)) => {
+                q.bind(v.into_iter().map(str::to_owned).collect::<Vec<_>>())
+            }
             Some(BindValue::Json(v)) => q.bind(sqlx::types::Json(v)),
             Some(BindValue::Int(v)) => q.bind(v),
             None => return Err(plan_misfit(bind)),
@@ -507,12 +510,13 @@ impl PreparedCache {
 }
 
 /// The parameter types a plan declares: what sqlx sends for the same binds (`text`, `jsonb`,
-/// `int8`), so the server reads the values as rest's path does.
+/// `int8`, `text[]`), so the server reads the values as rest's path does.
 pub fn bind_types(plan: &Plan) -> Vec<Type> {
     plan.binds
         .iter()
         .map(|b| match b {
             Bind::Text(_) => Type::TEXT,
+            Bind::TextArray(_) => Type::TEXT_ARRAY,
             Bind::Json(_) => Type::JSONB,
             Bind::Limit { .. } | Bind::Offset { .. } => Type::INT8,
         })
@@ -528,6 +532,7 @@ fn plan_params<'a>(op: &'a Op, plan: &Plan, max_rows: i64) -> anyhow::Result<Vec
         .map(|bind| {
             Ok(match resolve_bind(op, bind, max_rows) {
                 Some(BindValue::Text(v)) => Box::new(v) as Param<'a>,
+                Some(BindValue::TextArray(v)) => Box::new(v),
                 Some(BindValue::Json(v)) => Box::new(v),
                 Some(BindValue::Int(v)) => Box::new(v),
                 None => return Err(plan_misfit(bind)),
@@ -1122,6 +1127,30 @@ mod tests {
             "SELECT bench.cap_response(q.r, $4) FROM (SELECT x($1, $2, $3)::text) AS q(r)"
         );
         assert_eq!(bind_types(&plan), [Type::TEXT, Type::TEXT, Type::INT8]);
+    }
+
+    /// Every bind kind declares the type rest's engine declares for it (`text[]` included).
+    #[test]
+    fn bind_types_match_the_engine() {
+        let at = || Path {
+            op: None,
+            slot: Slot::Where(vec![]),
+        };
+        let plan = Plan {
+            sql: String::new(),
+            binds: vec![
+                Bind::Text(at()),
+                Bind::TextArray(at()),
+                Bind::Json(at()),
+                Bind::Limit { op: None },
+                Bind::Offset { op: None },
+            ],
+            capped_sql: String::new(),
+        };
+        assert_eq!(
+            bind_types(&plan),
+            [Type::TEXT, Type::TEXT_ARRAY, Type::JSONB, Type::INT8, Type::INT8]
+        );
     }
 
     fn real_workload() -> crate::workload::Workload {

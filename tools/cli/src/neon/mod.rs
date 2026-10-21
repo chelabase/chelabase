@@ -43,9 +43,11 @@ pub fn receivers_line(receivers: u64) -> Result<String> {
 pub async fn password_updated(endpoint: &str, role: &str) -> Result<()> {
     let url =
         std::env::var("CHELABASE_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let receivers = chelabase_neon::proxy_cache::ProxyCache::new(&url)?
-        .password_updated(endpoint, role)
-        .await?;
+    // As the caller's Valkey ACL user (the runner's: CHELABASE_VALKEY_USER/_PASSWORD_FILE).
+    let receivers =
+        chelabase_neon::proxy_cache::ProxyCache::from_lookup(&url, |n| std::env::var(n).ok())?
+            .password_updated(endpoint, role)
+            .await?;
     println!("{}", receivers_line(receivers)?);
     Ok(())
 }

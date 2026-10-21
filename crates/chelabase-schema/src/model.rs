@@ -133,6 +133,19 @@ pub struct Table {
     pub grants: Vec<Grant>,
 }
 
+/// One relation the table API's `getTable` serves: the `Table` shape with the object list's
+/// `ObjectKind` beside its fields. Only an ordinary table
+/// carries constraints, indexes, policies, grants and options; every other kind (a view, a
+/// materialized view, a foreign table, a partitioned table) is read-only and serves its columns
+/// with those lists empty.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Relation {
+    pub kind: chelabase_types::table_api::ObjectKind,
+    #[serde(flatten)]
+    pub table: Table,
+}
+
 impl Table {
     /// The table's own properties only: columns, constraints, indexes, policies and grants
     /// emptied (each of those is an item of its own in the analysis). A table snapshot

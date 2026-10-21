@@ -88,6 +88,7 @@ impl GatewayConfig {
             &or("CHELABASE_AUTH_URL", "http://127.0.0.1:8084"),
         )
         .and_then(|u| u.with_rest(&or("CHELABASE_REST_URL", "http://127.0.0.1:8085")))
+        .and_then(|u| u.with_realtime(&or("CHELABASE_REALTIME_URL", "http://127.0.0.1:8087")))
         .map_err(anyhow::Error::msg)?;
         for (site, var, default, enabled) in sites {
             if enabled {
@@ -97,14 +98,24 @@ impl GatewayConfig {
             }
         }
 
+        // A bearer is `<NAME>` or the file `<NAME>_FILE` names (the stack mounts generated
+        // secrets, S27); unset, the development default.
+        let secret = |name: &str, default: &str| -> anyhow::Result<String> {
+            Ok(chelabase_types::secret_env::lookup_secret(&get, name)
+                .map_err(anyhow::Error::msg)?
+                .unwrap_or_else(|| default.to_string()))
+        };
         Ok(Self {
             listen,
             entry,
             upstreams,
             internal_url: or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
-            data_keys_token: or("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
+            data_keys_token: secret("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys")?,
             app_jwt_public_key: get("CHELABASE_APP_JWT_PUBLIC_KEY").filter(|v| !v.trim().is_empty()),
-            app_sessions_token: or("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "chelabase-dev-app-sessions"),
+            app_sessions_token: secret(
+                "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN",
+                "chelabase-dev-app-sessions",
+            )?,
             upstream_timeout: parse_timeout_secs(&or("CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS", "60"))
                 .map_err(anyhow::Error::msg)?,
         })
@@ -264,5 +275,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("CHELABASE_GATEWAY_LISTEN"), "{msg}");
+    }
+
+    // ---- RT1 T3 (S18): the realtime upstream ----
+
+    #[test]
+    fn realtime_upstream_defaults_to_loopback_8087() {
+        let c = GatewayConfig::from_lookup(with(&[])).unwrap();
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Realtime), "127.0.0.1:8087");
+    }
+
+    #[test]
+    fn realtime_upstream_is_set_by_chelabase_realtime_url() {
+        let c = GatewayConfig::from_lookup(with(&[("CHELABASE_REALTIME_URL", "http://realtime:8087/")])).unwrap();
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Realtime), "realtime:8087");
+        // The other upstreams are untouched.
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Rest), "127.0.0.1:8085");
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Orchestrator), "127.0.0.1:8081");
+    }
+
+    #[test]
+    fn a_bad_realtime_url_is_refused_naming_the_variable() {
+        for bad in ["https://realtime:8087", "http://realtime", "http://realtime:8087/ws"] {
+            let msg = GatewayConfig::from_lookup(with(&[("CHELABASE_REALTIME_URL", bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("CHELABASE_REALTIME_URL") || msg.contains(bad), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn upstreams_new_resolves_realtime_to_the_pinned_default() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        assert_eq!(upstreams.addr(chelabase_routes::Service::Realtime), "127.0.0.1:8087");
     }
 }

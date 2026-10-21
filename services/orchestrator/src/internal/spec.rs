@@ -40,6 +40,7 @@ pub(crate) async fn endpoint_config<M: NeonMetadataPort, L: ComputeLocator>(
         )),
         &state.member_logins,
         branch_protected,
+        &state.signer,
     )
     .await
 }

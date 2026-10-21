@@ -92,7 +92,13 @@ async fn setup() -> (RealWorker, MetadataClient) {
     .expect("metadata database");
     let key =
         SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (run through just workbench test)");
-    let worker = build(&config, metadata.clone(), key).expect("worker");
+    let worker = build(
+        &config,
+        metadata.clone(),
+        key,
+        std::sync::Arc::new(worker::rt_events::NoopPublisher),
+    )
+    .expect("worker");
     (worker, metadata)
 }
 
@@ -169,7 +175,10 @@ where
     }
 
     let (private, public) = generate_keypair_pem();
-    let internal_token = env_or("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal");
+    // The runner reads rest's generated bearer from its file (S27).
+    let internal_token = chelabase_types::secret_env::env_secret("CHELABASE_REST_INTERNAL_TOKEN")
+        .expect("CHELABASE_REST_INTERNAL_TOKEN(_FILE)")
+        .unwrap_or_else(|| "chelabase-dev-rest-internal".into());
     let state = Arc::new(AppState {
         // U15: the orchestrator names each compute's certificate; verify it as rest does.
         engine: Engine::with_server_tls(

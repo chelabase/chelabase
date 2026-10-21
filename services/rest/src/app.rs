@@ -72,7 +72,10 @@ impl Config {
             addr: env_or("CHELABASE_REST_ADDR", "127.0.0.1:8085").parse()?,
             internal_addr: env_or("CHELABASE_REST_INTERNAL_ADDR", "127.0.0.1:8086").parse()?,
             internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
-            internal_token: env_or("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
+            // `CHELABASE_REST_INTERNAL_TOKEN` or the file `…_FILE` names (S27).
+            internal_token: chelabase_types::secret_env::env_secret("CHELABASE_REST_INTERNAL_TOKEN")
+                .map_err(anyhow::Error::msg)?
+                .unwrap_or_else(|| "chelabase-dev-rest-internal".to_owned()),
             max_connections: env_or("CHELABASE_REST_MAX_CONNECTIONS", "200").parse()?,
             max_response_bytes: env_or(
                 "CHELABASE_REST_MAX_RESPONSE_BYTES",

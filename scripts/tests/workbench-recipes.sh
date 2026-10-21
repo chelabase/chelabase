@@ -116,4 +116,14 @@ grep -B3 -A3 'test-group = "stack-serial"' "$nextest" | grep -qF 'package(worker
 # catalog_live creates cluster-wide roles (the reserved ones on a fresh stack) and reads them all.
 grep -B3 -A3 'test-group = "stack-serial"' "$nextest" | grep -qF 'package(chelabase-schema) & binary(catalog_live)' ||
   fail "chelabase-schema's catalog_live is in stack-serial"
+# RT1 final fix round (T1 audit): a script reads the stack's generated bearer (`<NAME>` or
+# `<NAME>_FILE`, secret_value) and stops with a message when it has none; it never falls back to a
+# public development bearer (`chelabase-dev-*`), which the stack refuses. compute-network-e2e.sh
+# lists them only to prove every port refuses them.
+dev_hits="$(grep -nE 'chelabase-dev-[a-z]' "${scripts[@]}" | grep -v '^scripts/compute-network-e2e\.sh:' || true)"
+[[ -z "$dev_hits" ]] || fail "scripts fall back to a public development bearer:
+$dev_hits"
+just --show check | grep -q 'scripts/tests/compose-secret-argv.sh' || fail "just check runs compose-secret-argv.sh"
+just --show rename-test | grep -q 'scripts/tests/rename-chelabase-isolation.sh' ||
+  fail "just rename-test runs rename-chelabase-isolation.sh"
 echo "workbench-recipes: ok"

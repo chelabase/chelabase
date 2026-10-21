@@ -141,7 +141,13 @@ async fn lifecycle(
         None,
         "container still there"
     );
-    let storcon = StorconClient::new(&config.storcon_url, 0);
+    let storcon = StorconClient::new(&config.storcon_url, 0).with_token(
+        chelabase_neon::jwt::storage_token_from_dir(
+            &config.compute_jwt_dir,
+            &chelabase_neon::jwt::StorageScope::Admin,
+        )
+        .unwrap(),
+    );
     match storcon.describe_tenant(&tenant).await {
         Err(StorconError::Rejected { status, .. }) => assert_eq!(status.as_u16(), 404),
         other => panic!("tenant still described: {other:?}"),

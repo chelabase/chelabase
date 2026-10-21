@@ -154,12 +154,18 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     ("CHELABASE_NATS_URL", "nats://nats:4222"),
     ("CHELABASE_VALKEY_URL", "redis://valkey:6379"),
     ("CHELABASE_STORCON_URL", "http://storage-controller:1234"),
-    ("CHELABASE_SAFEKEEPER_HTTP", "1=http://safekeeper1:7676"),
+    // Three safekeepers: the storage controller runs without --dev (RT1 T1, user).
+    (
+        "CHELABASE_SAFEKEEPER_HTTP",
+        "1=http://safekeeper1:7676,2=http://safekeeper2:7676,3=http://safekeeper3:7676",
+    ),
     ("CHELABASE_INTERNAL_URL", "http://orchestrator:8083"),
     ("CHELABASE_REST_INTERNAL_URL", "http://rest:8086"),
     ("CHELABASE_ORCHESTRATOR_URL", "http://orchestrator:8081"),
     ("CHELABASE_AUTH_URL", "http://auth:8084"),
     ("CHELABASE_REST_URL", "http://rest:8085"),
+    // RT1 T7: the gateway's realtime upstream (the ticket and socket routes).
+    ("CHELABASE_REALTIME_URL", "http://realtime:8087"),
     ("CHELABASE_STUDIO_UPSTREAM", "http://studio:3000"),
     ("CHELABASE_ZITADEL_UPSTREAM", "http://zitadel:8080"),
     ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
@@ -171,6 +177,8 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     ("CHELABASE_AUTH_ADDR", "0.0.0.0:8084"),
     ("CHELABASE_REST_ADDR", "0.0.0.0:8085"),
     ("CHELABASE_REST_INTERNAL_ADDR", "0.0.0.0:8086"),
+    ("CHELABASE_REALTIME_ADDR", "0.0.0.0:8087"),
+    ("CHELABASE_REALTIME_INTERNAL_ADDR", "0.0.0.0:8088"),
 ];
 
 /// Keys in file order; setting a known key replaces its value in place.
@@ -244,6 +252,11 @@ fn path(p: &Path) -> String {
     p.display().to_string()
 }
 
+/// The Docker network a stack's computes run on (`CHELABASE_COMPUTE_NETWORK`, P4).
+pub fn compute_network(project: &str) -> String {
+    format!("{project}_compute")
+}
+
 /// Renders `stack.env`: every `KEY=VALUE` line of `example` in its order (overlaid keys get the
 /// stack's value), then the overlaid keys the example lacks in their pinned order, then `extra`.
 /// Values are written literally. Callers check the scheme with [`example_scheme`] first; an
@@ -315,12 +328,11 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
     for (key, value) in SERVICE_KEYS {
         lines.set(key, *value);
     }
-    lines.set("CHELABASE_AUTH_TRUSTED_PROXY", "true");
+    // Ruling (e): only the gateway's X-Forwarded-For counts (computes reach auth directly).
+    lines.set("CHELABASE_AUTH_TRUSTED_PROXY", "gateway");
     lines.set("CHELABASE_CONTROL_PLANE_URI", "http://orchestrator:8083");
-    lines.set(
-        "CHELABASE_COMPUTE_NETWORK",
-        format!("{}_default", input.project),
-    );
+    // P4/W14: computes get the stack's own network, without NATS, Valkey or any database.
+    lines.set("CHELABASE_COMPUTE_NETWORK", compute_network(input.project));
     let control = control_net(input.control_slot);
     lines.set(
         "CHELABASE_COMPUTE_CONTROL_NETWORK",

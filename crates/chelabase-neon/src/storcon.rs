@@ -124,19 +124,29 @@ pub struct StorconClient {
     detach_timeout: Duration,
     delete_poll_interval: Duration,
     delete_poll_attempts: u32,
+    /// The NeonJWT sent as `Authorization: Bearer` on every request (scope `admin`).
+    token: Option<String>,
 }
 
-fn http_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .expect("reqwest client without TLS")
+/// A client sending `token` as a bearer on every request.
+pub(crate) fn http_client_with(timeout: Duration, token: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(token) = token {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .expect("a JWT is a valid header value");
+        value.set_sensitive(true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    builder.build().expect("reqwest client without TLS")
 }
 
 impl StorconClient {
     pub fn new(base: &str, tenant_secondaries: u32) -> Self {
         Self {
-            http: http_client(REQUEST_TIMEOUT),
+            http: http_client_with(REQUEST_TIMEOUT, None),
+            token: None,
             base: base.trim_end_matches('/').to_string(),
             tenant_secondaries,
             request_timeout: REQUEST_TIMEOUT,
@@ -149,8 +159,16 @@ impl StorconClient {
 
     /// Per-request timeout (default 30 s).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.http = http_client(timeout);
+        self.http = http_client_with(timeout, self.token.as_deref());
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Sends `token` (a NeonJWT with scope `admin`) as the bearer on every request: the
+    /// storage controller runs without `--dev` and refuses unauthenticated calls.
+    pub fn with_token(mut self, token: String) -> Self {
+        self.http = http_client_with(self.request_timeout, Some(&token));
+        self.token = Some(token);
         self
     }
 

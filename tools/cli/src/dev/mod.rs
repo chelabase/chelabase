@@ -4,6 +4,7 @@ pub mod env_files;
 pub mod internal_keys;
 pub mod requests;
 pub mod secrets_key;
+pub mod stack_secrets;
 pub mod steps;
 pub mod tenant;
 pub mod token;

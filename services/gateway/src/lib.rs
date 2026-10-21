@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod data_keys;
+pub mod logging;
 pub mod pipeline;
 pub mod proxy;
 pub mod registry;

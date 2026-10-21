@@ -1,0 +1,121 @@
+---
+title: "Realtime"
+description: "The realtime service behind Studio's live rows and presence: how a socket is opened, how changes are found and filtered, its ports, settings, secrets and limits."
+---
+
+The realtime service (`services/realtime`) pushes changes to Studio over a WebSocket: the rows of the table you are looking at, who else is looking at it, and project events (a branch changing status, a database appearing). Studio's side is described in [Table editor](/docs/using/table-editor#live-rows-and-presence).
+
+Realtime sends **keys, not rows**. A change reaches a viewer as the primary key of a row that was inserted, updated or deleted, and Studio reads the row again as the role the viewer acts as. Row-level security and grants therefore decide what each viewer sees, in Postgres, on every read. See [Security](/docs/architecture/security#realtime-sends-keys-only).
+
+## How a socket is opened
+
+1. Studio asks the gateway for a ticket: `POST /v1/realtime/tickets`, authenticated with the member's token. The gateway mints its usual internal identity and realtime stores the verified identity in Valkey under the hash of a 32-byte random ticket, sealed with AES-256-GCM. The ticket is valid for 30 seconds and single use.
+2. Studio opens `GET /v1/realtime/socket?ticket=…` (subprotocol `chelabase.realtime.v1`). Realtime consumes the ticket with `GETDEL` before it answers the upgrade, so a replayed ticket finds nothing. The gateway is the only route that upgrades to a WebSocket, and its access log omits the query string.
+3. The first frame is `auth {token}` with the member's current token. Studio sends it again whenever the token is renewed; realtime closes the socket with 4001 when the token expires without a renewal, and with 4003 when access is revoked or the token's subject differs from the ticket's.
+4. Studio joins channels: `table:` (one table, for one acting role) and `project:` (platform events). Every joined channel is authorized by the orchestrator (the same member check as the API) when it is joined, on each token renewal, on an access change and every 60 seconds. A channel that is no longer allowed is left with a `forbidden` error.
+
+The server pings every 25 seconds and closes with 4008 when no pong comes within 10 seconds. Inbound frames over 64 KB are refused. Close code 4029 means a socket-level limit was hit, and 1012 means the service is restarting (Studio reconnects with a backoff).
+
+## How changes are found
+
+For each (branch, Postgres database) with a viewer, one realtime instance holds a **lease** in a NATS key-value bucket (`CHELABASE_RT_LEASES`, 10 s TTL, renewed every 3 s) and runs the decoder:
+
+- It connects to the compute as `chelabase_realtime` (`LOGIN REPLICATION NOBYPASSRLS`, not a superuser; the worker creates it and grants it `CONNECT` on every served database) and opens a temporary logical replication slot with the `chelabase_keys` output plugin. The plugin emits only relation, operation and primary-key text, never row values.
+- It acknowledges the WAL once a transaction's keys are published to NATS. Keys are merged per table over a 100 ms window; more than 1000 keys in a window, a table without a primary key, a bulk change or `TRUNCATE` become a keyless `changed` (Studio then reads the page again).
+- It drops and recreates a slot whose confirmed lag passes 64 MB or 60 seconds. Computes run with `max_replication_slots` and `max_wal_senders` of 20 and `max_slot_wal_keep_size = '1GB'`.
+- Realtime holds at most `CHELABASE_REALTIME_MAX_SLOTS_PER_COMPUTE` slots on one compute (10), so the customer keeps the rest. Slots are counted across instances with index keys in a second bucket (`CHELABASE_RT_SLOTS`) and checked against `pg_replication_slots`. When no slot is free, joins still succeed with live updates paused (`no_slot`) and realtime retries after 30 seconds, doubling the wait up to 5 minutes.
+- A lost lease, a crashed holder or a compute restart gives the next holder a fresh slot starting now, and every watcher of that database receives `resync`. The worker publishes a stop signal before every compute stop or restart it performs, so watchers see `compute_stopping` at once instead of waiting for a timeout.
+
+Before a key reaches a viewer, realtime checks that the viewer could read that row: viewers are grouped by acting identity, and each group runs one short read-only query (2 s timeout) as that identity against pooled `authenticator` connections (at most 4 per compute per instance). Owner viewers' checks go to the orchestrator, because realtime never holds owner credentials. A check that fails or times out sends that group a keyless `changed`, never keys. The invariant is that a viewer receives a key only if, at the moment of the check, their own read would return that row.
+
+## Ports
+
+Realtime listens on two ports inside the stack's network. Neither is published on the host.
+
+| Port | Setting | Serves |
+| --- | --- | --- |
+| `realtime:8087` | `CHELABASE_REALTIME_ADDR` | The ticket route and the socket, reached through the gateway (`CHELABASE_REALTIME_URL`). A socket needs a ticket. |
+| `realtime:8088` | `CHELABASE_REALTIME_INTERNAL_ADDR` | `/health` only, without authentication. |
+
+Outside a workbench stack the defaults are `127.0.0.1:8087` and `127.0.0.1:8088`; the stack binds `0.0.0.0` inside its network. Realtime is on both the default and the [compute network](/docs/architecture/neon#the-compute-network), because it dials computes.
+
+## Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CHELABASE_REALTIME_ADDR` | `127.0.0.1:8087` | Public listener (behind the gateway) |
+| `CHELABASE_REALTIME_INTERNAL_ADDR` | `127.0.0.1:8088` | Health listener |
+| `CHELABASE_ORCHESTRATOR_URL` | `http://127.0.0.1:8081` | Authorization calls (`/internal/realtime/*`) |
+| `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | Branch connection lookups (`/internal/data/*`) |
+| `CHELABASE_REALTIME_INTERNAL_TOKEN` or `_FILE` | required | Realtime's bearer on the orchestrator's internal routes |
+| `CHELABASE_REALTIME_TICKET_KEY_FILE` | required | 32 raw bytes: the key that seals tickets |
+| `CHELABASE_REALTIME_PG_PASSWORD_FILE` | required | The password of `chelabase_realtime` |
+| `CHELABASE_COMPUTE_CA_FILE` | required | The platform CA certificate; every compute connection is TLS-verified against it |
+| `CHELABASE_INTERNAL_VERIFY_KEY` | required | The gateway's public key, to verify the identity on ticket requests |
+| `CHELABASE_AUTH_HOST`, `CHELABASE_ZITADEL_JWKS_URL`, `CHELABASE_ZITADEL_AUDIENCES` | the gateway's | How member tokens are verified |
+| `CHELABASE_NATS_URL`, `_USER`, `_PASSWORD[_FILE]`, `_INBOX_PREFIX` | user `realtime`, inbox `_INBOX_realtime` | NATS login |
+| `CHELABASE_VALKEY_URL`, `_USER`, `_PASSWORD[_FILE]`, `CHELABASE_VALKEY_TLS` | `redis://127.0.0.1:6379`, none, none, `off` | Valkey login; `on` for `rediss://` |
+| `CHELABASE_REALTIME_MAX_SLOTS_PER_COMPUTE` | `10` | Replication slots realtime may hold on one compute |
+| `CHELABASE_REALTIME_INSTANCE_ID` | a random UUID per start | Names an instance in leases and presence |
+
+A password or token has a plain variable and a `_FILE` variable; setting both is an error, and so is a Valkey user without a password. Errors name the variable and the path, never the value.
+
+## Limits
+
+Only the slot cap is a setting. The others are built-in defaults.
+
+| Limit | Default |
+| --- | --- |
+| Sockets per member | 20 |
+| Channels per socket | 50 |
+| Joins per second per socket | 5 |
+| Tickets per second per member | 10 |
+| Presence frames per socket | 20 per second (the latest state wins) |
+| Members per channel | 1000 |
+| Inbound frame / presence state | 64 KB / 1 KB |
+| Slots realtime may hold per compute | 10 (of 20) |
+| Merge window / keys per window before `changed` | 100 ms / 1000 |
+
+A limit hit on a frame answers `error limit`; a socket over its limit closes with 4029. Socket and ticket counts are kept in Valkey, so they hold across instances.
+
+## Generated secrets
+
+`just workbench up` creates each missing secret once and never rewrites it. Each is a 0600 file under `.chelabase/` (shared by every stack of the machine) and is mounted only into the services that read it. An empty file is an error: delete it and run `up` again, then restart the services that read it.
+
+| File | Holds | Read by |
+| --- | --- | --- |
+| `nats/{orchestrator,worker,realtime,runner}.password` | NATS user passwords | that service |
+| `valkey/{proxy,control,realtime,runner,health}.password` | Valkey user passwords | that service (`control` is the orchestrator and worker) |
+| `realtime/pg.password` | `chelabase_realtime`'s Postgres password | realtime, the worker |
+| `realtime/ticket.key` | 32 raw bytes, the ticket sealing key | realtime |
+| `realtime/internal.token` | realtime's bearer on the orchestrator | realtime, the orchestrator |
+| `tokens/*.token` | the other internal bearers (`rest-internal`, `data-keys`, `app-auth`, `app-sessions`, `proxy-api`, `storcon-hook`) | the service each names |
+
+The NATS and Valkey files the servers read hold only hashes (bcrypt and SHA-256), rendered into the stack's state directory.
+
+## Upgrading a stack
+
+On the next `just workbench up` of a stack that predates realtime:
+
+1. The new secrets are created and the NATS and Valkey credential files and the storage tokens are rendered, before any container starts. Existing secrets are untouched.
+2. NATS and Valkey restart with credentials; the apps are recreated with their per-service login.
+3. `safekeeper2` and `safekeeper3` start, and computes that aren't on the `<project>_compute` network are removed. The worker's reconcile creates each again within 30 seconds, with the new replication settings (compute settings version 4) and a fresh spec. Data is not lost: it lives in the pageserver and safekeepers.
+4. The Neon services run as the stack's uid; an older root-owned data directory is re-owned once.
+
+## When realtime is unavailable
+
+- **Realtime down:** ticket requests fail with 502, and Studio keeps its polling with no live rows.
+- **NATS down:** sockets stay open; every channel gets `resync` and Studio shows "Live updates paused".
+- **Valkey down:** no new tickets (503); open sockets are unaffected.
+- **Orchestrator down:** new joins fail with `unavailable`; joined channels receive only keyless `changed` and a `resync` every 30 seconds, and are left with `unavailable` after three failed re-authorizations in a row.
+- **Instance stops or crashes:** on SIGTERM it closes sockets with 1012, releases its leases and closes its replication connections. After a crash its sockets reconnect to another instance, its leases expire after 10 seconds, and other instances drop its presence after 15 seconds.
+
+## Known gaps
+
+These belong to the Neon fork or the proxy and are scheduled for the next fork round:
+
+- `/profile/cpu`, `/profile/heap` and `/metrics` on the pageserver and safekeepers answer without a token.
+- `compute_ctl`'s internal server on `compute:3081` has no authentication and is reachable from other computes.
+- Tenant storage tokens have no expiry: `compute_ctl` hands a compute its token only when Postgres starts, and the compute reads it once. Rotating means a new key pair.
+- The proxy takes its Valkey password on its command line, so it shows in `ps` inside the container.
+- Platform mode's `pg_hba` rule that limits logins by address is keyed to member roles and does not yet cover `chelabase_realtime`.

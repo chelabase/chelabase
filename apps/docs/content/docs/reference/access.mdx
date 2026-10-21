@@ -166,6 +166,8 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/v1/projects/\{id\}/users/\{user_id\}/reactivate` | Zitadel token | Project Developer |
 | DELETE | `/v1/projects/\{id\}/users/\{user_id\}/sessions` | Zitadel token | Project Developer |
 | GET | `/v1/projects/\{id\}/users/\{user_id\}/sessions` | Zitadel token | Project Viewer |
+| GET | `/v1/realtime/socket` | none | Public |
+| POST | `/v1/realtime/tickets` | Zitadel token | Signed in |
 | PATCH | `/v1/tenant` | Zitadel token | Tenant admin |
 
 {/* END GENERATED access-table */}

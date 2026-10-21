@@ -95,14 +95,14 @@ if command -v docker >/dev/null; then
   compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x -f "$compose_file" --env-file "$fixture")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
   check "the stack has every service (infra, app tier, no hook relay)" \
-    test "$(services)" = "auth create-bucket gateway mailpit metadata-db nats orchestrator pageserver proxy proxy-tls register-safekeepers rest safekeeper1 seaweedfs storage-broker storage-controller storcon-db studio valkey worker zitadel zitadel-db "
+    test "$(services)" = "auth create-bucket gateway mailpit metadata-db nats orchestrator pageserver proxy proxy-tls realtime register-safekeepers rest safekeeper1 safekeeper2 safekeeper3 seaweedfs storage-broker storage-controller storcon-db studio valkey worker zitadel zitadel-db "
   check "the project name comes from -p" \
     test "$("${compose[@]}" config --format json | jq -r '.name')" = "chelabase-feat-x"
   check "the compose file names no project" bash -c '! grep -qE "^name:" "$1"' _ "$compose_file"
   neon_json="$("${compose[@]}" config --format json)"
   published="$(jq <<<"$neon_json" -r '
     [.services | to_entries[]
-      | select(.key | IN("seaweedfs","storage-broker","safekeeper1","storcon-db","storage-controller","pageserver","proxy"))
+      | select(.key | IN("seaweedfs","storage-broker","safekeeper1","safekeeper2","safekeeper3","storcon-db","storage-controller","pageserver","proxy"))
       | .value.ports[]?
       | "\(.host_ip):\(.published)"] | sort | join(" ")')"
   check "neon publishes only the proxy's Postgres port, on loopback" \
@@ -114,11 +114,14 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2' <<<"$zitadel")" = "http://studio.feat-x.chelabase.localhost:8137/login?authRequest="
   check "zitadel writes the login-client token" \
     test "$(jq -r '.environment.ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH' <<<"$zitadel")" = "/zitadel-bootstrap/login-client.pat"
-  token="$(CHELABASE_STORCON_HOOK_TOKEN=from-env "${compose[@]}" config --format json |
-    jq -r '.services["storage-controller"].command[]' | grep -- '--control-plane-jwt-token=' || true)"
-  check "the hook token comes from CHELABASE_STORCON_HOOK_TOKEN" \
-    test "$token" = "--control-plane-jwt-token=from-env"
   storcon="$(jq -r '.services["storage-controller"]' <<<"$neon_json")"
+  # RT1 T1 (S27): the hook token is a generated secret, read from its mount by an entrypoint
+  # wrapper; no literal (and no public default) in the command.
+  check "the hook token comes from the mounted /run/storcon-hook.token" \
+    bash -c "grep -q -- '--control-plane-jwt-token=' <<<\"\$1\" && grep -q 'cat /run/storcon-hook.token' <<<\"\$1\"" _ \
+    "$(jq -r '.entrypoint // [] | join(" ")' <<<"$storcon")"
+  check "no hook token in the storage controller's command" \
+    bash -c "! grep -q -- '--control-plane-jwt-token' <<<\"\$1\"" _ "$(jq -r '.command[]' <<<"$storcon")"
   check "the storage controller calls the orchestrator's internal listener" \
     grep -qx -- '--control-plane-url=http://orchestrator:8083/storcon' <(jq -r '.command[]' <<<"$storcon")
   proxy="$(jq -r '.services.proxy' <<<"$neon_json")"
@@ -129,8 +132,10 @@ if command -v docker >/dev/null; then
     bash -c "grep -qx -- '--proxy=0.0.0.0:4432' <<<\"\$1\" && grep -qx -- '--wss=0.0.0.0:4444' <<<\"\$1\"" _ "$proxy_args"
   check "the proxy caches role secrets for at most a minute" \
     grep -qx -- '--project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m' <<<"$proxy_args"
-  check "the proxy uses Valkey (cache clearing, query cancel)" \
-    bash -c "grep -qx -- '--redis-auth-type=plain' <<<\"\$1\" && grep -qx -- '--redis-plain=redis://valkey:6379' <<<\"\$1\"" _ "$proxy_args"
+  # RT1 T1 (S6): as the `proxy` ACL user, its password read from its mount by the entrypoint.
+  proxy_entry="$(jq -r '.entrypoint // [] | join(" ")' <<<"$proxy")"
+  check "the proxy uses Valkey (cache clearing, query cancel) as its ACL user" \
+    bash -c "grep -qx -- '--redis-auth-type=plain' <<<\"\$1\" && grep -q -- '--redis-plain=redis://proxy:' <<<\"\$2\" && grep -q 'cat /run/valkey-proxy.password' <<<\"\$2\" && grep -q '@valkey:6379' <<<\"\$2\"" _ "$proxy_args" "$proxy_entry"
   valkey="$(jq -r '.services.valkey' <<<"$neon_json")"
   check "valkey is 9.1.2, pinned by digest" \
     grep -Eq '"valkey/valkey:9\.1\.2-alpine@sha256:[0-9a-f]{64}"' <<<"$valkey"
@@ -142,9 +147,11 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.healthcheck.timeout // empty' <<<"$valkey")" != ""
   check "the proxy waits for its TLS certificate" \
     test "$(jq -r '.depends_on["proxy-tls"].condition' <<<"$proxy")" = "service_completed_successfully"
-  ptoken="$(CHELABASE_PROXY_API_TOKEN=from-env "${compose[@]}" config --format json |
-    jq -r '.services.proxy.environment.NEON_PROXY_TO_CONTROLPLANE_TOKEN')"
-  check "the proxy's token comes from CHELABASE_PROXY_API_TOKEN" test "$ptoken" = "from-env"
+  # RT1 T1 (S27): a generated secret from its mount, never a literal in the environment.
+  check "the proxy's token comes from the mounted /run/proxy-api.token" \
+    bash -c "grep -q 'NEON_PROXY_TO_CONTROLPLANE_TOKEN' <<<\"\$1\" && grep -q 'cat /run/proxy-api.token' <<<\"\$1\"" _ "$proxy_entry"
+  check "no proxy token literal in its environment" \
+    test "$(jq -r '.environment.NEON_PROXY_TO_CONTROLPLANE_TOKEN // empty' <<<"$proxy")" = ""
 else
   pass "no docker: skipped the compose config checks"
 fi

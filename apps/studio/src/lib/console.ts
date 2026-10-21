@@ -161,8 +161,8 @@ export function buildSelect(args: {
   pk: string[];
   /** Rows per page; the server clamps to its max_rows, so a smaller max_rows lowers it. */
   pageSize?: number;
-  /** The columns to read (`tree.select`); every column when absent. */
-  columns?: string[];
+  /** The columns to read (`tree.select`), with any `text_of` items (S9); every column when absent. */
+  columns?: (string | { text_of: string; as: string })[];
   /** The first row to read; overrides `page * pageSize` (pages whose size changed, e.g. halved on `too_large`). */
   offset?: number;
 }): Tree {

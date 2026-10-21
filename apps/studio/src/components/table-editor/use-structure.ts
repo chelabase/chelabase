@@ -35,7 +35,7 @@ export function useTableStructure(target: TableTarget, opts: { enabled?: boolean
   const { databaseId, branchId, database, schema, table, key } = target;
   const params = database ? { database } : undefined;
   const draft = target.draft;
-  const got = useGetTable(databaseId, branchId, schema, table, params, { query: { enabled: (opts.enabled ?? true) && !draft } });
+  const got = useGetTable(databaseId, branchId, schema, table, params, { query: { enabled: (opts.enabled ?? true) && !draft && !target.notTable } });
   const types = useListTypes(databaseId, branchId, params);
   const changeset = useTableEditor((s) => s.changesets[key]);
   const addEdit = useTableEditor((s) => s.addEdit);

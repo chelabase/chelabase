@@ -75,6 +75,8 @@ pub struct VerifiedClaims {
     pub email: Option<String>,
     /// The `name` claim, when the token carries a non-empty one.
     pub name: Option<String>,
+    /// The `exp` claim (unix seconds).
+    pub exp: u64,
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +87,9 @@ pub enum AuthError {
     Unauthorized,
     #[error("token verification failed: {0}")]
     InvalidToken(String),
+    /// The token's `exp` has passed (beyond the leeway).
+    #[error("token expired")]
+    Expired,
     #[error("jwks fetch failed: {0}")]
     Jwks(String),
 }
@@ -96,6 +101,9 @@ struct JwksCache {
     keys: HashMap<String, DecodingKey>,
     fetched_at: Instant,
 }
+
+/// How long one JWKS fetch may take (RT1 S14).
+pub const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// In-process JWKS JWT verifier with TTL cache.
 #[derive(Clone)]
@@ -110,7 +118,12 @@ impl JwtVerifier {
     pub fn new(config: ZitadelAuthConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            // A hung JWKS endpoint fails the verification well inside its callers' budgets
+            // (RT1 S14: realtime gives an authorize 20 s).
+            http: reqwest::Client::builder()
+                .timeout(JWKS_FETCH_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             cache: Arc::new(RwLock::new(None)),
             cache_ttl: Duration::from_secs(600),
         }
@@ -144,8 +157,10 @@ impl JwtVerifier {
         validation.validate_aud = false;
         validation.leeway = 60;
 
-        let data = decode::<Value>(token, &key, &validation)
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+        let data = decode::<Value>(token, &key, &validation).map_err(|e| match e.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::Expired,
+            _ => AuthError::InvalidToken(e.to_string()),
+        })?;
 
         build_claims(&data.claims, &self.config)
     }
@@ -258,7 +273,13 @@ fn build_claims(claims: &Value, config: &ZitadelAuthConfig) -> Result<VerifiedCl
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    Ok(VerifiedClaims { sub, org_id, email: text("email"), name: text("name") })
+    // `verify`'s validation requires `exp` (and checks it); a fractional one is truncated to
+    // whole seconds.
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)))
+        .unwrap_or(0);
+    Ok(VerifiedClaims { sub, org_id, email: text("email"), name: text("name"), exp })
 }
 
 fn check_audience(claims: &Value, config: &ZitadelAuthConfig) -> Result<(), AuthError> {

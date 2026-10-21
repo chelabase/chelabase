@@ -934,6 +934,12 @@ where
     Ok(Member::new(listing, invite))
 }
 
+/// P10/W18: an access write committed; realtime re-checks `member_sub`'s channels (the whole
+/// tenant's for `None`, S28) within a second.
+fn access_changed<M, J>(state: &AppState<M, J>, tenant: TenantId, member_sub: Option<&str>) {
+    crate::internal::realtime::access_changed(&state.rt_events, tenant, member_sub);
+}
+
 /// Asks every branch of these projects to reconcile its member roles. Failures are logged:
 /// the worker's sweep reconciles every branch within minutes anyway.
 async fn reconcile_projects<M, J>(state: &AppState<M, J>, projects: Vec<Uuid>)
@@ -1968,6 +1974,7 @@ where
     );
     if changed {
         info!(request_id = %principal.request_id, member_id = %id, tenant_admin = body.tenant_admin, "member: tenant admin changed");
+        access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
         reconcile_tenant(&state, principal.tenant_id).await;
     }
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
@@ -2021,6 +2028,7 @@ where
             .map_err(|err| write_failed("remove member", err, "member not found"))
     );
     info!(request_id = %principal.request_id, member_id = %id, "member: removed");
+    access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
     reconcile_projects(&state, touched).await;
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
@@ -2101,6 +2109,7 @@ where
             .map_err(|err| write_failed("approve member", err, "project not found"))
     );
     info!(request_id = %principal.request_id, member_id = %id, grants = rows.len(), "member: approved");
+    access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
     reconcile_projects(&state, granted_projects(&rows)).await;
     Json(Member::new(listing, None)).into_response()
 }
@@ -2154,6 +2163,7 @@ where
                 .map_err(|err| write_failed("decline member", err, "member not found"))
         );
         info!(request_id = %principal.request_id, member_id = %id, "member: declined");
+        access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
     }
     let z = tri!(admin_zitadel(&state));
     match z.deactivate_user(&m.zitadel_user_id).await {
@@ -2216,6 +2226,8 @@ where
     let email = tri!(invite_email(&body.email));
     let grants = tri!(invite_grants(&state, principal.tenant_id, body.grants).await);
     let (status, result) = tri!(invite(&state, &principal, email, grants, body.delivery).await);
+    // S28: an invite's writer names no member: the whole tenant re-checks.
+    access_changed(&state, principal.tenant_id, None);
     no_store((status, Json(result)).into_response())
 }
 
@@ -2270,6 +2282,8 @@ where
     };
     let grants = tri!(invite_grants(&state, principal.tenant_id, vec![grant]).await);
     let (status, result) = tri!(invite(&state, &principal, email, grants, body.delivery).await);
+    // S28: an invite's writer names no member: the whole tenant re-checks.
+    access_changed(&state, principal.tenant_id, None);
     no_store((status, Json(result)).into_response())
 }
 
@@ -2443,6 +2457,8 @@ where
                 .map_err(|err| write_failed("revoke invite", err, "invite not found"))
         );
         info!(request_id = %principal.request_id, invite = %id, member_id = %m.id, "invite: revoked");
+        // S28: an invite's writer names no member.
+        access_changed(&state, principal.tenant_id, None);
         user
     };
     if let Err(err) = clean_up_revoked_user(z, &user).await {
@@ -2536,7 +2552,7 @@ where
     let project =
         tri!(authorize_project(&state, &principal, ep::PUT_PROJECT_GRANT.policy.access, id).await);
     let actor = tri!(actor(principal.member.as_ref()));
-    tri!(live_member(&state, principal.tenant_id, member_id).await);
+    let member = tri!(live_member(&state, principal.tenant_id, member_id).await);
     let context = tri!(RoleContext::project(&state, project.id).await);
     // Names no grant may hold are refused at any level; R17: then an Admin grant is every role
     // on the project, whatever (valid) roles the request names.
@@ -2563,6 +2579,7 @@ where
     };
     if changed {
         info!(request_id = %principal.request_id, project_id = %id, %member_id, platform_role = grant.platform_role.as_str(), "grant: put");
+        access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
         reconcile_projects(&state, vec![id]).await;
     }
     match tri!(project_grant(&state, id, member_id).await) {
@@ -2610,7 +2627,7 @@ where
         .await
     );
     let actor = tri!(actor(principal.member.as_ref()));
-    tri!(live_member(&state, principal.tenant_id, member_id).await);
+    let member = tri!(live_member(&state, principal.tenant_id, member_id).await);
     tri!(
         state
             .metadata
@@ -2619,6 +2636,7 @@ where
             .map_err(|err| write_failed("delete grant", err, "grant not found"))
     );
     info!(request_id = %principal.request_id, project_id = %id, %member_id, "grant: deleted");
+    access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
     reconcile_projects(&state, vec![id]).await;
     StatusCode::NO_CONTENT.into_response()
 }
@@ -2659,7 +2677,7 @@ where
 {
     tri!(authorize_project(&state, &principal, ep::PUT_GRANT_OVERRIDE.policy.access, id).await);
     let actor = tri!(actor(principal.member.as_ref()));
-    tri!(live_member(&state, principal.tenant_id, member_id).await);
+    let member = tri!(live_member(&state, principal.tenant_id, member_id).await);
     let database = match state.metadata.get_database(body.database_id).await {
         Ok(Some(db))
             if db.project_id.as_uuid() == id
@@ -2725,6 +2743,7 @@ where
     };
     if changed {
         info!(request_id = %principal.request_id, project_id = %id, %member_id, database_id = %body.database_id, "override: put");
+        access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
         reconcile_projects(&state, vec![id]).await;
     }
     let mut pg_roles = o.pg_roles;
@@ -2783,7 +2802,7 @@ where
         |rej| ApiError::invalid_request(400, format!("invalid query: {}", rej.body_text()))
     ));
     let actor = tri!(actor(principal.member.as_ref()));
-    tri!(live_member(&state, principal.tenant_id, member_id).await);
+    let member = tri!(live_member(&state, principal.tenant_id, member_id).await);
     let database = match state.metadata.get_database(DatabaseId(database_id)).await {
         Ok(Some(db)) if db.project_id.as_uuid() == id => db,
         Ok(_) => return ApiError::not_found("database not found").into_response(),
@@ -2807,6 +2826,7 @@ where
         }
     }
     info!(request_id = %principal.request_id, project_id = %id, %member_id, %database_id, "override: deleted");
+    access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
     reconcile_projects(&state, vec![id]).await;
     StatusCode::NO_CONTENT.into_response()
 }

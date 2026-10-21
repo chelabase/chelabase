@@ -1,0 +1,141 @@
+[
+  {
+    "texts": [
+      "1"
+    ],
+    "key": "[\"1\"]"
+  },
+  {
+    "texts": [
+      "a",
+      "b"
+    ],
+    "key": "[\"a\",\"b\"]"
+  },
+  {
+    "texts": [
+      ""
+    ],
+    "key": "[\"\"]"
+  },
+  {
+    "texts": [
+      "he said \"hi\""
+    ],
+    "key": "[\"he said \\\"hi\\\"\"]"
+  },
+  {
+    "texts": [
+      "a\\b",
+      "\\",
+      "\\\\"
+    ],
+    "key": "[\"a\\\\b\",\"\\\\\",\"\\\\\\\\\"]"
+  },
+  {
+    "texts": [
+      "\"",
+      "\"\""
+    ],
+    "key": "[\"\\\"\",\"\\\"\\\"\"]"
+  },
+  {
+    "texts": [
+      "line1\nline2",
+      "tab\there",
+      "cr\rlf",
+      "bs\bff\f"
+    ],
+    "key": "[\"line1\\nline2\",\"tab\\there\",\"cr\\rlf\",\"bs\\bff\\f\"]"
+  },
+  {
+    "texts": [
+      "\u0000",
+      "\u0001\u0002",
+      "\u001f",
+      "\u0007bell",
+      "\u000b\u000e"
+    ],
+    "key": "[\"\\u0000\",\"\\u0001\\u0002\",\"\\u001f\",\"\\u0007bell\",\"\\u000b\\u000e\"]"
+  },
+  {
+    "texts": [
+      ""
+    ],
+    "key": "[\"\"]"
+  },
+  {
+    "texts": [
+      "héllo",
+      "naïve",
+      "Ünï"
+    ],
+    "key": "[\"héllo\",\"naïve\",\"Ünï\"]"
+  },
+  {
+    "texts": [
+      "日本語",
+      "مرحبا"
+    ],
+    "key": "[\"日本語\",\"مرحبا\"]"
+  },
+  {
+    "texts": [
+      "😀",
+      "a👩‍💻b"
+    ],
+    "key": "[\"😀\",\"a👩‍💻b\"]"
+  },
+  {
+    "texts": [
+      " ",
+      " ",
+      " ",
+      "﻿"
+    ],
+    "key": "[\" \",\" \",\" \",\"﻿\"]"
+  },
+  {
+    "texts": [
+      "a,b",
+      "][",
+      "\",\"",
+      "[\"x\"]",
+      "{\"k\":1}"
+    ],
+    "key": "[\"a,b\",\"][\",\"\\\",\\\"\",\"[\\\"x\\\"]\",\"{\\\"k\\\":1}\"]"
+  },
+  {
+    "texts": [
+      "9007199254740993",
+      "1.50",
+      "2026-10-16 12:00:00+00"
+    ],
+    "key": "[\"9007199254740993\",\"1.50\",\"2026-10-16 12:00:00+00\"]"
+  },
+  {
+    "texts": [
+      "550e8400-e29b-41d4-a716-446655440000",
+      "O'Brien",
+      "100%",
+      "a\\\"b"
+    ],
+    "key": "[\"550e8400-e29b-41d4-a716-446655440000\",\"O'Brien\",\"100%\",\"a\\\\\\\"b\"]"
+  },
+  {
+    "texts": [
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "\\\\\\\\\\\"\"\"\"\""
+    ],
+    "key": "[\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"\\\\\\\\\\\\\\\\\\\\\\\"\\\"\\\"\\\"\\\"\"]"
+  },
+  {
+    "texts": [
+      "1",
+      "2",
+      "3",
+      "4"
+    ],
+    "key": "[\"1\",\"2\",\"3\",\"4\"]"
+  }
+]

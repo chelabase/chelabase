@@ -40,6 +40,24 @@ export function toTsv(columns: string[], rows: Row[]): string {
   return [columns.join("\t"), ...rows.map((r) => columns.map((c) => tsvField(r[c])).join("\t"))].join("\n");
 }
 
+/** A JSON number literal, as Postgres writes a numeric (never NaN or an infinity, which it quotes). */
+const JSON_NUMBER = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/;
+const rawJson = (JSON as { rawJSON?: (text: string) => unknown }).rawJSON;
+
+/**
+ * Rows as JSON for Copy (JSON). A number column's value read as its exact text (`2.50`, a 20-digit numeric) is written
+ * back as that JSON number, as Postgres wrote it; other strings (NaN, the infinities) stay strings. Without
+ * `JSON.rawJSON` the text stays a string rather than lose digits.
+ */
+export function toJson(rows: Row[], numeric: ReadonlySet<string>): string {
+  const out = rawJson
+    ? rows.map((r) =>
+        Object.fromEntries(Object.entries(r).map(([k, v]) => [k, numeric.has(k) && typeof v === "string" && JSON_NUMBER.test(v) ? rawJson(v) : v])),
+      )
+    : rows;
+  return JSON.stringify(out, null, 2);
+}
+
 /** The grid's columns of a table, in attnum order, typed for `inputKind`/`parseValue`. */
 export function columnDescs(table: Table, catalog: TypeEntry[]): RowColumn[] {
   const byOid = new Map(catalog.map((t) => [t.oid, t]));

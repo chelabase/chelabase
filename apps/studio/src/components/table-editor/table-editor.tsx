@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { Tabs as TabsPrimitive } from "@base-ui/react/tabs";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   useGetDatabase,
   useGetMe,
@@ -20,6 +21,8 @@ import { isTransitional } from "@/lib/branches";
 import { pageSizeFor } from "@/lib/console";
 import { pollWhile } from "@/lib/query";
 import { errorText } from "@/lib/errors";
+import { useRealtime } from "@/lib/realtime/context";
+import { fallbackInterval, invalidateAll, invalidateForEvent } from "@/lib/realtime/events";
 import { rowAccess, structureAccess } from "@/lib/table-editor/access";
 import { changesetKey } from "@/lib/table-editor/changeset";
 import { branchTree, editorPath, readLast, resolveParams, writeLast, type EditorParams, type Resolution } from "@/lib/table-editor/context";
@@ -27,7 +30,7 @@ import { formatBytes } from "@/lib/table-editor/dry-run";
 import { TableEditorStoreContext, createTableEditorStore, useTableEditor } from "@/lib/table-editor/store";
 import { ColumnStrip } from "./column-strip";
 import { ContextBar } from "./context-bar";
-import { EditorPanel, reviewLabel } from "./panel";
+import { DiscardPrompt, EditorPanel, reviewLabel } from "./panel";
 import { RlsBanner } from "./rls-banner";
 import { RowsView } from "./rows-view";
 import { NewTableView } from "./new-table";
@@ -39,6 +42,8 @@ import type { TableTarget } from "./target";
 export interface TableEditorProps {
   params: EditorParams;
   navigate: (p: EditorParams, opts?: { replace?: boolean }) => void;
+  /** Rendered inside the editor's store (the route's blocker for a dirty row draft); the editor stays router-free. */
+  leaveGuard?: ComponentType;
 }
 
 const NOT_FOUND: Record<Extract<Resolution, { kind: "not_found" }>["level"], string> = {
@@ -88,6 +93,7 @@ export function TableEditor(props: TableEditorProps) {
   const [store] = useState(() => createTableEditorStore(browserStorage("session")));
   return (
     <TableEditorStoreContext.Provider value={store}>
+      {props.leaveGuard && <props.leaveGuard />}
       <Editor {...props} />
     </TableEditorStoreContext.Provider>
   );
@@ -112,11 +118,46 @@ function useFillViewport() {
   return { ref, style: top === null ? undefined : { height: `calc(100dvh - ${top}px)` } };
 }
 
+/**
+ * The project's `project:` channel (§5.3): its events invalidate exactly the queries they concern;
+ * a rejoin after a reconnect, or a `resync`, invalidates everything the editor shows. True while joined.
+ */
+function useProjectChannel(projectId: string | undefined, databaseId: string | undefined, branchId: string | undefined): boolean {
+  const realtime = useRealtime();
+  const queryClient = useQueryClient();
+  const [live, setLive] = useState(false);
+  const scope = useRef({ databaseId: "", branchId: "" });
+  scope.current = { databaseId: databaseId ?? "", branchId: branchId ?? "" };
+  useEffect(() => {
+    if (!realtime || !projectId) return;
+    let joinedBefore = false;
+    const sub = realtime.joinProject(projectId, {
+      onEvent: (event) => invalidateForEvent(queryClient, event),
+      onResync: () => invalidateAll(queryClient, scope.current),
+      onLive: (next) => {
+        setLive(next);
+        if (!next) return;
+        // Events may have been missed while the socket was down.
+        if (joinedBefore) invalidateAll(queryClient, scope.current);
+        joinedBefore = true;
+      },
+      onError: () => setLive(false),
+    });
+    return () => {
+      sub.leave();
+      setLive(false);
+    };
+  }, [realtime, projectId, queryClient]);
+  return live;
+}
+
 function Editor({ params, navigate }: TableEditorProps) {
   const fill = useFillViewport();
   // The last place, read once: it only matters for the levels this visit leaves out.
   const [last] = useState(() => readLast(browserStorage("local")));
-  const me = useGetMe();
+  // P10: while the project channel is live, events drive the refetches and a slow poll is the fallback.
+  const projectLive = useProjectChannel(params.projectId, params.databaseId, params.branchId);
+  const me = useGetMe({ query: { refetchInterval: fallbackInterval(projectLive, false) } });
   const projectList = useListProjects();
   const projects = withDatabases(projectList.data, me.data);
   const project = projects?.find((p) => p.id === params.projectId);
@@ -124,11 +165,13 @@ function Editor({ params, navigate }: TableEditorProps) {
   const databaseId = databaseOk ? params.databaseId! : "";
   const detail = useGetDatabase(databaseId, { query: { enabled: databaseOk } });
   // Only a branch created here is polled until it settles; opening the Branch picker refetches the list.
+  // While live, branch events invalidate the list instead (the slow poll stays as the fallback).
   const [createdBranchId, setCreatedBranchId] = useState<string | null>(null);
+  const settling = pollWhile<Branch[]>((bs) => bs.some((b) => b.id === createdBranchId && isTransitional(b)));
   const branches = useListBranches(databaseId, {
     query: {
       enabled: databaseOk,
-      refetchInterval: pollWhile<Branch[]>((bs) => bs.some((b) => b.id === createdBranchId && isTransitional(b))),
+      refetchInterval: (query) => fallbackInterval(projectLive, settling(query)),
     },
   });
   const branch = branches.data?.find((b) => b.id === params.branchId);
@@ -169,6 +212,10 @@ function Editor({ params, navigate }: TableEditorProps) {
   const actAsKey = `${params.databaseId}/${params.branchId}`;
   const picked = useTableEditor((s) => s.actAs[actAsKey]);
   const setActAs = useTableEditor((s) => s.setActAs);
+  // Leaving the table (another table, branch, database, project, an FK link) or switching Act as remounts the row
+  // panel: an unsaved draft is asked about first.
+  const guardDiscard = useTableEditor((s) => s.guardDiscard);
+  const go = (p: EditorParams) => guardDiscard(() => navigate(p));
   // A roles error degrades to no roles (the owner stays for an Admin); the error shows by Act as.
   const allowed = withDataApiRoles(caps, actAsRoles(caps, roles.isSuccess ? roles.data : []));
   // The chosen role while the caller may still act as it, else the owner (Admin) or the first allowed role.
@@ -186,6 +233,7 @@ function Editor({ params, navigate }: TableEditorProps) {
     structureReason ??
     (!actAsReady ? "Loading roles…" : !allowed.owner && actAs === null ? "You can't act as any Postgres role here." : null);
   const rows = pg ? rowAccess(caps, { owner: allowed.owner && actAs === null, roles: actAs ? [actAs] : [] }, pg) : null;
+  const object = objects.data?.objects?.find((o) => o.schema === current.schema && o.name === current.table);
   const target: TableTarget | null =
     ready && current.table && pg && current.schema
       ? {
@@ -197,6 +245,7 @@ function Editor({ params, navigate }: TableEditorProps) {
           table: current.table,
           role: actAs,
           key: changesetKey({ databaseId: current.databaseId!, branchId: current.branchId!, pgDatabase: pg.name, schema: current.schema, table: current.table }),
+          ...(object && !(object.kind === "table" && object.editable) ? { notTable: true } : {}),
         }
       : null;
   // The enums view and the new-table form have no table: their changesets are `…/{schema}.#types` and `…/{schema}.#new`.
@@ -225,7 +274,6 @@ function Editor({ params, navigate }: TableEditorProps) {
     if (lastScope.current !== viewScope) setView("table");
     lastScope.current = viewScope;
   }, [viewScope, setView]);
-  const object = objects.data?.objects?.find((o) => o.schema === current.schema && o.name === current.table);
   const pageSize = detail.isPending ? null : pageSizeFor(detail.data?.max_rows);
   const exactRows = useTableEditor((s) => (target ? (s.exactRows[target.key] ?? null) : null));
 
@@ -283,6 +331,7 @@ function Editor({ params, navigate }: TableEditorProps) {
               object={object}
               pageSize={pageSize}
               toolsSlot={toolsSlot}
+              selfSub={me.data?.sub}
               above={(layout) => <ColumnStrip target={target} layout={layout} reason={structure && !structure.allowed ? structure.reason : null} />}
             />
           ) : (
@@ -300,12 +349,12 @@ function Editor({ params, navigate }: TableEditorProps) {
       <HeaderContext>
         <ContextBar
           params={current}
-          navigate={(p) => navigate(p)}
+          navigate={go}
           projects={projects}
           branches={databaseOk ? branches.data : undefined}
           pgDatabases={branchOk ? pgList : undefined}
           actAs={actAsReady ? { owner: allowed.owner, roles: allowed.roles, selected: actAs } : undefined}
-          onActAs={(role) => setActAs(actAsKey, role)}
+          onActAs={(role) => guardDiscard(() => setActAs(actAsKey, role))}
           rolesError={rolesError}
           historyWindow={detail.data?.history_window}
           onBranchesOpen={() => void branches.refetch()}
@@ -314,7 +363,7 @@ function Editor({ params, navigate }: TableEditorProps) {
       </HeaderContext>
       <TableList
         params={current}
-        navigate={(p) => navigate(p)}
+        navigate={go}
         objects={branchOk && pg ? objects.data?.objects : undefined}
         noDatabase={ready && !current.pgDatabase}
         exactRows={exactRows}
@@ -325,10 +374,11 @@ function Editor({ params, navigate }: TableEditorProps) {
         access={draftTarget ? null : rows}
         object={draftTarget ? undefined : object}
         params={current}
-        navigate={(p) => navigate(p)}
+        navigate={go}
         structureReason={dryRunReason}
         totalBytes={draftTarget ? null : (object?.total_bytes ?? null)}
       />
+      <DiscardPrompt />
     </div>
   );
 }
@@ -353,6 +403,8 @@ function TableView({ target, object, structureReason, renderRows }: TableViewPro
   const openPanel = useTableEditor((s) => s.openPanel);
   const setCollapsed = useTableEditor((s) => s.setCollapsed);
   const exactRows = useTableEditor((s) => s.exactRows[target.key] ?? null);
+  // The rows on screen: the estimate never reads below them.
+  const shownRows = useTableEditor((s) => s.shownRows[target.key] ?? 0);
   // Structure has no use for the open row: its panel folds to the strip (its draft kept) and Rows unfolds it.
   const foldedRow = useRef(false);
   function changeTab(next: TableTab) {
@@ -378,7 +430,7 @@ function TableView({ target, object, structureReason, renderRows }: TableViewPro
   const facts = object
     ? [
         object.row_estimate != null
-          ? `≈ ${object.row_estimate.toLocaleString("en-US")} rows`
+          ? `≈ ${Math.max(object.row_estimate, shownRows).toLocaleString("en-US")} rows`
           : exactRows !== null
             ? `${exactRows.toLocaleString("en-US")} ${exactRows === 1 ? "row" : "rows"}`
             : null,
@@ -438,7 +490,7 @@ function TableView({ target, object, structureReason, renderRows }: TableViewPro
         {toolsSlot && renderRows(tab === "rows" ? toolsSlot : null)}
       </TabsPrimitive.Panel>
       <TabsPrimitive.Panel value="structure" className="flex min-h-0 flex-1 flex-col outline-none">
-        <StructureView target={target} reason={structureReason} />
+        <StructureView target={target} reason={structureReason} kind={object?.kind} />
       </TabsPrimitive.Panel>
     </TabsPrimitive.Root>
   );

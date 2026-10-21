@@ -333,7 +333,7 @@ async fn delete_everything(
             "endpoint row {ep}"
         );
     }
-    let storcon = StorconClient::new(&config.storcon_url, 0);
+    let storcon = admin_storcon(config);
     for timeline in &timelines {
         match storcon.get_timeline(tenant, timeline).await {
             Err(StorconError::Rejected { status, .. }) => assert_eq!(status.as_u16(), 404),
@@ -374,6 +374,17 @@ async fn provisioned<'a>(
     (story, tenant)
 }
 
+/// The storage controller with an admin NeonJWT (it runs without --dev).
+fn admin_storcon(config: &WorkerConfig) -> StorconClient {
+    StorconClient::new(&config.storcon_url, 0).with_token(
+        chelabase_neon::jwt::storage_token_from_dir(
+            &config.compute_jwt_dir,
+            &chelabase_neon::jwt::StorageScope::Admin,
+        )
+        .expect("the compute-JWT key pair"),
+    )
+}
+
 /// The ancestor of `timeline` and its point on it (`None` once detached), read from the
 /// storage controller.
 async fn ancestor_of(
@@ -382,7 +393,7 @@ async fn ancestor_of(
     timeline: &Option<String>,
 ) -> Option<(String, Lsn)> {
     let timeline: NeonId = timeline.as_deref().expect("a timeline").parse().unwrap();
-    let info = StorconClient::new(&config.storcon_url, 0)
+    let info = admin_storcon(config)
         .get_timeline(tenant, &timeline)
         .await
         .expect("timeline");

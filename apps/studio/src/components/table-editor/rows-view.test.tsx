@@ -71,7 +71,7 @@ describe("RowsView", () => {
     await user.clear(input);
     await user.type(input, "46000{Enter}");
     await vi.waitFor(async () => expect(await writes(f)).toHaveLength(1));
-    expect((await writes(f))[0].tree).toEqual({ v: 1, op: "update", table: "public.invoices", set: { amount_cents: 46000 }, where: { col: "id", eq: "81c4-2" }, returning: "*" });
+    expect((await writes(f))[0].tree).toEqual({ v: 1, op: "update", table: "public.invoices", set: { amount_cents: 46000 }, where: { and: [{ col: "id", eq: "81c4-2", parse: true }, { col: "amount_cents", eq: "45000", text: true }] }, returning: "*" });
   });
 
   it("escape_cancels_an_edit", async () => {
@@ -154,8 +154,8 @@ describe("RowsView", () => {
     await user.click(within(dialog).getByRole("button", { name: "Delete 2 rows" }));
     await vi.waitFor(async () => expect(await writes(f)).toHaveLength(1));
     expect((await writes(f))[0].tree).toEqual({ v: 1, op: "batch", ops: [
-      { op: "delete", from: "public.invoices", where: { col: "id", eq: "3f9a-1" }, returning: ["id"] },
-      { op: "delete", from: "public.invoices", where: { col: "id", eq: "c2d1-3" }, returning: ["id"] },
+      { op: "delete", from: "public.invoices", where: { col: "id", eq: "3f9a-1", parse: true }, returning: ["id"] },
+      { op: "delete", from: "public.invoices", where: { col: "id", eq: "c2d1-3", parse: true }, returning: ["id"] },
     ] });
   });
 

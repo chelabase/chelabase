@@ -55,7 +55,7 @@ mod roles;
 pub mod sql_editor;
 mod table_api;
 pub use table_api::{DEFAULT_DRY_RUN_MAX_BYTES as DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES, dry_run_max_bytes as table_api_dry_run_max_bytes};
-pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, RestReply};
+pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, REALTIME_OWNER_CONNECTIONS, RestReply};
 pub use openapi::openapi;
 use access::{authorize, authorize_database, Target};
 
@@ -1610,6 +1610,10 @@ pub struct AppState<M, J> {
     /// The orchestrator's client pair for TLS to computes (RT3-7); `None` connects without TLS
     /// (tests only: `main` always sets it).
     pub compute_tls: Option<Arc<compute_tls::ComputeTls>>,
+    /// Realtime's bearer and the OIDC verifier its `/internal/realtime/*` routes use (RT1 T6).
+    pub realtime: internal::realtime::RealtimeAuth,
+    /// Publishes realtime's platform and access events after metadata writes (P10).
+    pub rt_events: Arc<dyn internal::realtime::RtEvents>,
 }
 
 /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
@@ -1946,6 +1950,28 @@ where
             member,
         })
     }
+}
+
+/// RT1 R10: the principal for a member's verified OIDC claims, **read only**: the tenant bound to
+/// the token's org (`None` when there is none; nothing is bound) and the member row as it is
+/// (`None` for a person with no row: no admission, no first-member admin claim, no invite
+/// activation, no claim refresh). [`access::authorize`] then refuses anyone not active.
+pub(crate) async fn read_only_principal<M: MetadataPort, J>(
+    state: &AppState<M, J>,
+    claims: &chelabase_auth::VerifiedClaims,
+) -> Result<Option<AuthPrincipal>, MetadataError> {
+    let Some(tenant_id) = lookup_tenant(state, &claims.org_id).await? else {
+        return Ok(None);
+    };
+    let member = state.metadata.member_by_zitadel(tenant_id, &claims.sub).await?;
+    Ok(Some(AuthPrincipal {
+        sub: claims.sub.clone(),
+        org_id: claims.org_id.clone(),
+        tenant_id,
+        request_id: Uuid::new_v4().to_string(),
+        member,
+        in_operator_org: in_operator_org(state, &claims.org_id),
+    }))
 }
 
 /// The tenant bound to `org_id`, if any (lookup failures are logged).
@@ -2343,6 +2369,9 @@ where
     let (router, _) = api_router().split_for_parts();
     router
         .route(routes::HEALTH.path, get(health))
+        // Realtime's internal routes (behind its bearer; undocumented, never routed by the
+        // gateway, S15).
+        .merge(internal::realtime::routes(&state))
         .merge(openapi::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -2558,6 +2587,9 @@ where
     {
         return map_metadata_error(err);
     }
+    // P10: the row exists now (pending, or failed below if the job can't be queued). Announced
+    // once the job is queued or the failure written, in one ordered publish with the failure.
+    let created = chelabase_nats::rt::ProjectEvent::DatabaseCreated { database_id: database_id.as_uuid() };
 
     let job = JobEnvelope {
         job_id,
@@ -2571,10 +2603,21 @@ where
 
     if let Err(err) = state.js.publish_provision(&job).await {
         error!("publish failed: {err}");
-        let _ = state
+        let mut events = vec![created];
+        // The failure is a status write too (main's status, whose id is the database's).
+        if state
             .metadata
             .set_failed(database_id, &format!("publish failed: {err}"))
-            .await;
+            .await
+            .is_ok()
+        {
+            events.push(chelabase_nats::rt::ProjectEvent::BranchStatus {
+                database_id: database_id.as_uuid(),
+                branch_id: database_id.as_uuid(),
+                status: "failed".into(),
+            });
+        }
+        internal::realtime::spawn_project(state.rt_events.clone(), body.project_id.as_uuid(), events);
         return ApiError::new(
             503,
             ErrorCode::WorkerUnavailable,
@@ -2582,6 +2625,8 @@ where
         )
         .into_response();
     }
+
+    internal::realtime::project_changed(&state.rt_events, body.project_id, created);
 
     info!(
         %job_id,
@@ -3137,6 +3182,12 @@ where
             return ApiError::internal().into_response();
         }
     }
+    // P10: the database is going (`deleting`); the worker reports its end.
+    internal::realtime::project_changed(
+        &state.rt_events,
+        record.project_id,
+        chelabase_nats::rt::ProjectEvent::DatabaseDeleted { database_id: record.database_id.as_uuid() },
+    );
     let job = JobEnvelope {
         job_id: Uuid::new_v4(),
         payload: DeleteDatabaseJob {

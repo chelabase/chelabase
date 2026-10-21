@@ -391,6 +391,13 @@ impl Types {
         }
         Some(format!("{}.{}", quote_ident(&t.1), quote_ident(&t.2)))
     }
+
+    /// The type by its own schema and name, each quoted, without modifiers (an array is its
+    /// `_` type, a domain itself): never resolved through the search path.
+    fn qualified(&self, oid: u32) -> Option<String> {
+        let t = self.get(oid)?;
+        Some(format!("{}.{}", quote_ident(&t.1), quote_ident(&t.2)))
+    }
 }
 
 impl Schema {
@@ -434,8 +441,11 @@ impl Schema {
                                 });
                                 let text_like =
                                     !ty.array && types.base(typid).is_some_and(|b| b.6 == "S");
+                                let type_qualified =
+                                    types.qualified(typid).unwrap_or_else(|| formatted.clone());
                                 Column {
                                     info: ColumnInfo {
+                                        type_qualified,
                                         type_sql: types
                                             .sql(typid, Some(&formatted))
                                             .unwrap_or(formatted),
@@ -837,6 +847,7 @@ mod tests {
             info: ColumnInfo {
                 name: name.into(),
                 type_sql: ty.name.clone(),
+                type_qualified: format!("\"pg_catalog\".{}", quote_ident(&ty.name)),
                 array: ty.array,
                 text_like: false,
                 generated,

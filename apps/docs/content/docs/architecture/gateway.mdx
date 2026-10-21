@@ -49,6 +49,7 @@ The gateway answers its own 404 and 405 under `/data/` with the data API's error
 
 - The gateway sets `X-Forwarded-For` to the client's address (never trust it for authorization), `X-Forwarded-Host` to the request's host, and `X-Forwarded-Proto` to `CHELABASE_PUBLIC_SCHEME`. It speaks plain HTTP itself.
 - Studio endpoints allow Studio's origin (from `CHELABASE_STUDIO_HOST`); the sign-in routes also allow cookies for it. The data API endpoints allow any origin (`Access-Control-Allow-Origin: *`, never with credentials), so browsers can call them with a public key.
+- Only `GET /v1/realtime/socket` takes a protocol upgrade, and only `Upgrade: websocket`; its socket may sit idle up to an hour both ways. Any other API request that asks for an upgrade gets 400 `invalid_request` before it reaches an upstream.
 - A host the gateway does not serve gets a 404 with an empty body, and a request without a `Host` a 400 with an empty body: nothing in the answer names the gateway or its hosts.
 
 ## Health
@@ -63,6 +64,7 @@ The gateway answers its own 404 and 405 under `/data/` with the data API's error
 | `CHELABASE_ORCHESTRATOR_URL` | `http://127.0.0.1:8081` | Management API upstream |
 | `CHELABASE_AUTH_URL` | `http://127.0.0.1:8084` | Login API upstream |
 | `CHELABASE_REST_URL` | `http://127.0.0.1:8085` | Data API upstream |
+| `CHELABASE_REALTIME_URL` | `http://127.0.0.1:8087` | Realtime upstream (tickets and the websocket) |
 | `CHELABASE_API_HOST`, `CHELABASE_STUDIO_HOST`, `CHELABASE_AUTH_HOST` | none (required) | The hosts that serve the API, Studio and Zitadel |
 | `CHELABASE_DOCS_HOST`, `CHELABASE_LANDING_HOST`, `CHELABASE_MAIL_HOST` | unset | Optional hosts for the docs site, the landing page and Mailpit |
 | `CHELABASE_PUBLIC_SCHEME` | `https` | The scheme clients use; derives Studio's origin and the issuer |

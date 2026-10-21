@@ -199,6 +199,7 @@ pub(crate) mod tests {
             let col = |name: &str, ty: &str, text_like: bool| ColumnInfo {
                 name: name.into(),
                 type_sql: ty.into(),
+                type_qualified: String::new(),
                 array: false,
                 text_like,
                 generated: false,

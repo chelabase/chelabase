@@ -94,6 +94,7 @@ import type {
   PutGrantRequest,
   RecomputeRequest,
   RehearseRequest,
+  Relation,
   ResendInviteRequest,
   ResentInvite,
   RestoreAccepted,
@@ -107,7 +108,6 @@ import type {
   SavedQuerySummary,
   SchemaChangeRequest,
   SchemaChangeResponse,
-  Table,
   TenantName,
   TypeCatalog,
   UpdateAppUserRequest,
@@ -4259,16 +4259,16 @@ export const getGetTableUrl = (id: string,
 }
 
 /**
- * The table's columns, constraints, indexes, triggers, policies, privileges and comment, as the schema merge reads them. Only ordinary tables are returned: a view, a partition child or a missing table is 404 (the object list's `editable` says why).
- * @summary One ordinary table's structure
+ * Any relation the object list shows, with its `kind`. An ordinary table (`kind: table`) carries its columns, constraints, indexes, policies, privileges, options and comment, as the schema merge reads them; a table that inherits from another is read the same way. A view, materialized view, foreign table or partitioned table is read-only: its columns (in `attnum` order, with `format_type`'s text and `not_null`) and comment, every other list empty; a view's definition and a foreign table's options are never returned. A partition, an index, a sequence, a composite type, a relation in a schema the object list leaves out, or a missing one is 404.
+ * @summary One table's or other relation's structure
  */
 export const getTable = async (id: string,
     branchId: string,
     schema: string,
     table: string,
-    params?: GetTableParams, options?: Parameters<typeof customFetch>[1]): Promise<Table> => {
+    params?: GetTableParams, options?: Parameters<typeof customFetch>[1]): Promise<Relation> => {
 
-  return customFetch<Table>(getGetTableUrl(id,branchId,schema,table,params),
+  return customFetch<Relation>(getGetTableUrl(id,branchId,schema,table,params),
   {
     ...options,
     method: 'GET'
@@ -4355,7 +4355,7 @@ export function useGetTable<TData = Awaited<ReturnType<typeof getTable>>, TError
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 /**
- * @summary One ordinary table's structure
+ * @summary One table's or other relation's structure
  */
 
 export function useGetTable<TData = Awaited<ReturnType<typeof getTable>>, TError = ErrorType<ErrorEnvelope>>(

@@ -548,6 +548,24 @@ where
     let Some(kind) = user_event_kind(&event.event_type) else {
         return StatusCode::OK.into_response();
     };
+    // W18: a tenant member's Zitadel user removed, deactivated or locked loses what realtime
+    // lets them watch: an access event naming them (`sub` = the Zitadel user id). Tenant orgs
+    // have no app users, so nothing below applies to them.
+    if matches!(kind, UserEventKind::Gone | UserEventKind::Deactivated) {
+        match state.metadata.tenant_by_org(&event.resource_owner).await {
+            Ok(Some(tenant)) => {
+                let event = chelabase_nats::rt::AccessEvent {
+                    tenant_id: tenant.as_uuid(),
+                    member_sub: Some(event.aggregate_id.clone()),
+                };
+                super::realtime::spawn_access(state.rt_events.clone(), event);
+                return StatusCode::OK.into_response();
+            }
+            Ok(None) => {}
+            // Best effort: the member's next re-authorization (60 s) catches it.
+            Err(e) => warn!("Zitadel event: the org's tenant isn't readable: {e:#}"),
+        }
+    }
     let auth = match state
         .metadata
         .project_auth_by_org(&event.resource_owner)

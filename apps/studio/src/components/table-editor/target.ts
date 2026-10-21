@@ -17,4 +17,9 @@ export interface TableTarget {
    * and the new-table form (`new_table`, `…/{schema}.#new`). `table` then holds the `#…` name.
    */
   draft?: "types" | "new_table";
+  /**
+   * Set when the object list says this is not an editable table (a view, materialized view, foreign or partitioned
+   * table): the table-only endpoints (`GET …/tables/{schema}/{name}`) are never asked for it.
+   */
+  notTable?: boolean;
 }

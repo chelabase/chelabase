@@ -2,7 +2,7 @@
 //!
 //! The safekeepers' `commit_lsn` is the highest LSN a quorum has durably accepted, so a
 //! branch at it is safe even when the pageserver hasn't ingested that far yet. Plain HTTP,
-//! like [`crate::storcon::StorconClient`] (the Compose safekeeper runs without auth).
+//! like [`crate::storcon::StorconClient`], with a NeonJWT bearer (the safekeepers check it).
 
 use std::time::Duration;
 
@@ -33,14 +33,17 @@ pub struct SafekeeperClient {
 
 impl SafekeeperClient {
     pub fn new(base_url: Url) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest client without TLS");
         Self {
-            http,
+            http: crate::storcon::http_client_with(REQUEST_TIMEOUT, None),
             base: base_url,
         }
+    }
+
+    /// Sends `token` (a NeonJWT with scope `safekeeperdata`) as the bearer on every request:
+    /// the safekeepers check NeonJWT on their HTTP API.
+    pub fn with_token(mut self, token: String) -> Self {
+        self.http = crate::storcon::http_client_with(REQUEST_TIMEOUT, Some(&token));
+        self
     }
 
     /// `GET /v1/tenant/{tenant}/timeline/{timeline}`: the timeline's `commit_lsn`; `None`

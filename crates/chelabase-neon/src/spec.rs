@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::compute_tls::{CA_CERT_PATH, SERVER_CERT_PATH, SERVER_KEY_PATH};
 use crate::id::NeonId;
+use crate::jwt::{ComputeSigner, StorageScope};
 use crate::storcon::{StorconClient, StorconError};
 
 pub struct RoleSpec {
@@ -130,6 +131,9 @@ pub struct SpecInputs<'a> {
     pub member_logins: MemberLogins,
     /// The branch is protected: the compute refuses databases born open (`neon.branch_protected`).
     pub branch_protected: bool,
+    /// The compute's NeonJWT for its own tenant (scope `tenant`): compute_ctl passes it to the
+    /// pageserver and safekeepers as the password (and `NEON_AUTH_TOKEN`).
+    pub storage_auth_token: String,
 }
 
 /// Where an attached tenant lives; `StorconClient` in production, a fake in tests.
@@ -170,6 +174,7 @@ pub async fn stored_endpoint_config(
     console_url: Option<String>,
     member_logins: &MemberLogins,
     branch_protected: bool,
+    signer: &ComputeSigner,
 ) -> anyhow::Result<Value> {
     endpoint_config(
         placement,
@@ -197,6 +202,7 @@ pub async fn stored_endpoint_config(
         console_url,
         member_logins,
         branch_protected,
+        signer,
     )
     .await
 }
@@ -212,11 +218,15 @@ pub async fn endpoint_config(
     console_url: Option<String>,
     member_logins: &MemberLogins,
     branch_protected: bool,
+    signer: &ComputeSigner,
 ) -> anyhow::Result<Value> {
     let tenant: NeonId = endpoint.tenant_id.parse().context("stored tenant id")?;
     let timeline: NeonId = endpoint.timeline_id.parse().context("stored timeline id")?;
     let pageserver_connstring = placement.pageserver_connstring(&tenant).await?;
     let safekeeper_connstrings = placement.active_safekeepers().await?;
+    let storage_auth_token = signer
+        .storage_token(&StorageScope::Tenant(tenant.clone()))
+        .context("signing the compute's storage token")?;
     Ok(config_response(&SpecInputs {
         endpoint_id: endpoint.id,
         tenant_id: &tenant,
@@ -230,6 +240,7 @@ pub async fn endpoint_config(
         mode: endpoint.mode,
         member_logins: member_logins.clone(),
         branch_protected,
+        storage_auth_token,
     }))
 }
 
@@ -265,9 +276,12 @@ pub fn config_response(inputs: &SpecInputs<'_>) -> Value {
         setting("wal_level", "logical", "enum"),
         setting("wal_log_hints", "on", "bool"),
         setting("max_connections", "100", "integer"),
-        setting("max_wal_senders", "10", "integer"),
-        setting("max_replication_slots", "10", "integer"),
+        // Room for realtime's temporary logical slots (P14), one walsender each.
+        setting("max_wal_senders", "20", "integer"),
+        setting("max_replication_slots", "20", "integer"),
         setting("wal_keep_size", "0", "integer"),
+        // W8: a slot that falls this far behind is invalidated instead of filling the disk.
+        setting("max_slot_wal_keep_size", "1GB", "integer"),
         setting("restart_after_crash", "off", "bool"),
         setting("synchronous_standby_names", "walproposer", "string"),
         setting("password_encryption", "scram-sha-256", "enum"),
@@ -311,6 +325,7 @@ pub fn config_response(inputs: &SpecInputs<'_>) -> Value {
             "features": ["tls_experimental"],
             "member_logins": inputs.member_logins,
             "branch_protected": inputs.branch_protected,
+            "storage_auth_token": inputs.storage_auth_token,
         },
         "compute_ctl_config": {
             "jwks": inputs.jwks,
@@ -351,6 +366,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         });
         assert_eq!(v["status"], "attached");
         assert_eq!(v["spec"]["tenant_id"], "00000000000000000000000000000001");
@@ -402,6 +418,11 @@ mod tests {
     const TENANT: &str = "00000000000000000000000000000001";
     const TIMELINE: &str = "00000000000000000000000000000002";
 
+    fn test_signer() -> ComputeSigner {
+        let (pem, x) = crate::jwt::generate_keypair();
+        ComputeSigner::new(&pem, &x).unwrap()
+    }
+
     fn endpoint(tenant_id: &str) -> Endpoint<'_> {
         Endpoint {
             id: "ep-a",
@@ -431,6 +452,7 @@ mod tests {
             None,
             &logins(),
             false,
+            &test_signer(),
         )
         .await
         .unwrap();
@@ -452,7 +474,7 @@ mod tests {
         let placement = FakePlacement {
             pageserver: Err("no pageserver"),
         };
-        let err = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins(), false)
+        let err = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins(), false, &test_signer())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("no pageserver"), "{err:#}");
@@ -463,7 +485,7 @@ mod tests {
         let placement = FakePlacement {
             pageserver: Ok(String::new()),
         };
-        let err = endpoint_config(&placement, endpoint("nope"), vec![], vec![], json!({}), None, &logins(), false)
+        let err = endpoint_config(&placement, endpoint("nope"), vec![], vec![], json!({}), None, &logins(), false, &test_signer())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("stored tenant id"), "{err:#}");
@@ -496,6 +518,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         });
         let roles = v["spec"]["cluster"]["roles"].as_array().unwrap();
 
@@ -533,6 +556,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting = settings.iter().find(|s| s["name"] == "neon.console_url");
@@ -553,6 +577,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         });
         let settings2 = v2["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting2 = settings2.iter().find(|s| s["name"] == "neon.console_url");
@@ -577,11 +602,47 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let grant_setting = settings.iter().find(|s| s["name"] == "createrole_self_grant");
         assert!(grant_setting.is_some(), "createrole_self_grant setting should be present");
         assert_eq!(grant_setting.unwrap()["value"], "set, inherit");
+    }
+
+    /// RT1 T5 (P14, W8): room for realtime's slots and walsenders (20 each), and a slot that
+    /// falls more than 1 GB behind is invalidated instead of filling the compute's disk.
+    #[test]
+    fn replication_settings_leave_room_for_realtime_and_bound_slot_wal() {
+        let tenant = NeonId::from(Uuid::from_u128(1));
+        let timeline = NeonId::from(Uuid::from_u128(2));
+        let v = config_response(&SpecInputs {
+            endpoint_id: "ep-a",
+            tenant_id: &tenant,
+            timeline_id: &timeline,
+            pageserver_connstring: "postgresql://no_user@ps:6400".into(),
+            safekeeper_connstrings: vec![],
+            roles: vec![],
+            databases: vec![],
+            jwks: json!({}),
+            console_url: None,
+            mode: ComputeMode::Primary,
+            member_logins: logins(),
+            branch_protected: false,
+            storage_auth_token: "tok".into(),
+        });
+        let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
+        let get = |name: &str| {
+            let found: Vec<&Value> = settings.iter().filter(|s| s["name"] == name).collect();
+            assert_eq!(found.len(), 1, "{name} once: {settings:?}");
+            (found[0]["value"].clone(), found[0]["vartype"].clone())
+        };
+        assert_eq!(get("max_replication_slots"), (json!("20"), json!("integer")));
+        assert_eq!(get("max_wal_senders"), (json!("20"), json!("integer")));
+        assert_eq!(get("max_slot_wal_keep_size"), (json!("1GB"), json!("integer")));
+        // Unchanged: no WAL kept for walsenders beyond what slots retain.
+        assert_eq!(get("wal_keep_size"), (json!("0"), json!("integer")));
+        assert_eq!(get("max_connections"), (json!("100"), json!("integer")));
     }
 
     #[test]
@@ -601,6 +662,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         };
         let protected = |v: &Value| {
             v["spec"]["cluster"]["settings"]
@@ -683,6 +745,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         });
         // Primary is the fork's default: the only addition to the old spec is `mode`.
         assert_eq!(v["spec"]["mode"], "Primary");
@@ -700,6 +763,7 @@ mod tests {
                 "mode",
                 "pageserver_connstring",
                 "safekeeper_connstrings",
+                "storage_auth_token",
                 "suspend_timeout_seconds",
                 "tenant_id",
                 "timeline_id"
@@ -713,7 +777,7 @@ mod tests {
             pageserver: Ok("postgresql://no_user@ps:6400".into()),
         };
         let logins = MemberLogins::orchestrator(vec!["10.213.0.10/32".into()]);
-        let v = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins, false)
+        let v = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins, false, &test_signer())
             .await
             .unwrap();
         assert_eq!(
@@ -752,6 +816,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         }
     }
 
@@ -792,6 +857,7 @@ mod tests {
                 None,
                 &logins(),
                 protected,
+                &test_signer(),
             )
             .await
             .unwrap();
@@ -816,6 +882,7 @@ mod tests {
             mode: ComputeMode::Primary,
             member_logins: logins(),
             branch_protected: false,
+            storage_auth_token: "tok".into(),
         });
         assert_eq!(v["spec"]["features"], json!(["tls_experimental"]));
         assert_eq!(

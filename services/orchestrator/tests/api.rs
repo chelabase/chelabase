@@ -4624,6 +4624,62 @@ async fn owner_password_unknown_is_409_before_any_connection() {
     assert!(calls.lock().unwrap().is_empty());
 }
 
+/// RT1 T4: the console takes the console-only forms (`text_of`, `"text": true`) on both
+/// paths: as a role they go to rest as written, as the owner they get past the parser to the
+/// compute lookup (503 with none running, not a 400). A form that is wrong is still a 400
+/// before anything runs.
+#[tokio::test]
+async fn console_takes_the_console_only_forms_on_both_paths() {
+    let (t, calls) = console_app(rest_ok(json!([]))).await;
+    let main = t.main();
+    let trees = [
+        json!({ "v": 1, "op": "select", "from": "notes",
+            "select": [{ "text_of": "id", "as": "id_text" }, "body"],
+            "where": { "col": "id", "eq": "9007199254740993", "text": true } }),
+        json!({ "v": 1, "op": "count", "from": "notes",
+            "where": { "col": "id", "in": ["1", "2"], "text": true } }),
+        json!({ "v": 1, "op": "batch", "ops": [select_notes(),
+            { "op": "select", "from": "notes", "select": [{ "text_of": "id", "as": "k" }] }] }),
+    ];
+    for tree in &trees {
+        let resp = t.console(main, json!({ "role": "editor", "tree": tree })).await;
+        assert_eq!(resp.status(), 200, "{tree}");
+    }
+    let forwarded: Vec<Value> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.path.ends_with("/query"))
+        .map(|c| serde_json::from_str::<Value>(&c.body).unwrap()["tree"].clone())
+        .collect();
+    assert_eq!(forwarded, trees.to_vec(), "rest gets the trees as written");
+
+    let before = t.compute_lookups();
+    for tree in &trees {
+        let resp = t.console(main, json!({ "role": null, "tree": tree })).await;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(status, 503, "{tree}: {body}");
+        assert_eq!(code_of(&body), "unavailable", "{tree}");
+    }
+    assert_eq!(t.compute_lookups(), before + trees.len(), "the owner path went on to the compute");
+
+    // Wrong forms never get that far, on either path.
+    let sent = calls.lock().unwrap().len();
+    for bad in [
+        json!({ "v": 1, "op": "select", "from": "notes", "select": [{ "text_of": "id" }] }),
+        json!({ "v": 1, "op": "select", "from": "notes", "where": { "col": "id", "neq": "1", "text": true } }),
+        json!({ "v": 1, "op": "select", "from": "notes", "where": { "col": "id", "eq": 1, "text": true } }),
+    ] {
+        for role in [json!("editor"), Value::Null] {
+            let resp = t.console(main, json!({ "role": role, "tree": bad })).await;
+            assert_eq!(code_of(&error_of(resp, 400).await), "invalid_query", "{role}: {bad}");
+        }
+    }
+    assert_eq!(calls.lock().unwrap().len(), sent);
+    assert_eq!(t.compute_lookups(), before + trees.len());
+}
+
 #[tokio::test]
 async fn owner_console_without_a_running_compute_is_503() {
     let (t, calls) = console_app(rest_ok(json!([]))).await;
@@ -7434,7 +7490,13 @@ async fn table_reads_over_http() {
     let columns: Vec<&str> = table["columns"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
     assert_eq!(columns, ["id", "body"]);
     assert!(table["constraints"].as_array().unwrap().iter().any(|c| c["kind"] == "primary_key"), "{table}");
-    for rest in ["tables/public/notes_v", "tables/public/nope"] {
+    assert_eq!(table["kind"], "table", "{table}");
+    // gc: a view answers too (read-only, columns only); a missing relation is still 404.
+    let resp = t.table_get(main, "tables/public/notes_v").await;
+    assert_eq!(resp.status(), 200);
+    let view: Value = resp.json().await.unwrap();
+    assert_eq!((view["kind"].as_str(), view["columns"][0]["name"].as_str()), (Some("view"), Some("id")), "{view}");
+    for rest in ["tables/public/nope"] {
         assert_eq!(code_of(&error_of(t.table_get(main, rest).await, 404).await), "not_found", "{rest}");
     }
     let resp = t.table_get(main, "types").await;
@@ -7445,6 +7507,346 @@ async fn table_reads_over_http() {
     assert!(types.iter().any(|t| t["name"] == "mood" && t["labels"] == json!(["sad", "ok"])));
     wait_no_editor_sessions(&scratch).await;
     scratch.drop().await;
+}
+
+// --- gc (user ruling 2026-10-21): `GET …/tables/{schema}/{table}` answers, read-only, for views,
+// materialized views, foreign tables and partitioned tables ------------------------------------
+
+/// `(name, data_type, not_null)` of a relation answer's columns, in the order given.
+fn column_shapes(body: &Value) -> Vec<(String, String, bool)> {
+    body["columns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no columns in {body}"))
+        .iter()
+        .map(|c| {
+            (
+                c["name"].as_str().unwrap().to_string(),
+                c["data_type"].as_str().unwrap().to_string(),
+                c["not_null"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn shapes(want: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
+    want.iter().map(|(n, t, nn)| (n.to_string(), t.to_string(), *nn)).collect()
+}
+
+/// A read-only kind's answer: the generated `Table` shape with every list but `columns` empty
+/// (required fields, never absent or null).
+fn assert_columns_only(body: &Value, what: &str) {
+    for list in ["constraints", "indexes", "policies", "grants", "options"] {
+        assert_eq!(body[list], json!([]), "{what}: {list} in {body}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn table_get_serves_views_and_other_relations_read_only() {
+    let (scratch, t) = changes_app("gc-kinds").await;
+    let main = t.main();
+    // file_fdw ships with the stack's Postgres (contrib); a foreign table needs no file to exist
+    // until it is scanned.
+    let fdw = scratch.yes("SELECT EXISTS (SELECT FROM pg_available_extensions WHERE name = 'file_fdw')").await;
+    scratch
+        .exec_in(&format!(
+            "CREATE TABLE public.orders (id uuid PRIMARY KEY, placed_at timestamptz NOT NULL, \
+               amount numeric(12,2) NOT NULL, note text); \
+             CREATE VIEW public.orders_v AS SELECT placed_at, id, amount, note FROM public.orders; \
+             GRANT SELECT ON public.orders_v TO PUBLIC; \
+             CREATE MATERIALIZED VIEW public.orders_mv AS SELECT id, amount FROM public.orders WITH NO DATA; \
+             CREATE UNIQUE INDEX orders_mv_id ON public.orders_mv (id); \
+             CREATE TABLE public.events (id bigint NOT NULL, gone int, at timestamptz) PARTITION BY RANGE (id); \
+             ALTER TABLE public.events DROP COLUMN gone; \
+             CREATE TABLE public.events_1 PARTITION OF public.events FOR VALUES FROM (0) TO (10); \
+             CREATE SEQUENCE public.counter; \
+             CREATE TYPE public.pair AS (a int, b int); \
+             ALTER TABLE public.orders OWNER TO {o}; ALTER VIEW public.orders_v OWNER TO {o}; \
+             ALTER MATERIALIZED VIEW public.orders_mv OWNER TO {o}; ALTER TABLE public.events OWNER TO {o}; \
+             ALTER TABLE public.events_1 OWNER TO {o}; ALTER SEQUENCE public.counter OWNER TO {o};",
+            o = scratch.owner
+        ))
+        .await;
+    if fdw {
+        scratch
+            .exec_in(&format!(
+                "CREATE EXTENSION file_fdw; CREATE SERVER gc_files FOREIGN DATA WRAPPER file_fdw; \
+                 CREATE FOREIGN TABLE public.imports (id integer NOT NULL, label varchar(40), seen timestamptz) \
+                   SERVER gc_files OPTIONS (filename '/gc/secret-path.csv', format 'csv'); \
+                 ALTER FOREIGN TABLE public.imports OWNER TO {o};",
+                o = scratch.owner
+            ))
+            .await;
+    } else {
+        eprintln!("skipping the foreign table: file_fdw isn't available on this Postgres");
+    }
+
+    // The view: format_type's text, attnum order, every column nullable (a view's attnotnull).
+    let resp = t.table_get(main, "tables/public/orders_v").await;
+    assert_eq!(resp.status(), 200, "a view answers");
+    let text = resp.text().await.unwrap();
+    let view: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(view["kind"], "view", "{view}");
+    assert_eq!((view["schema"].as_str(), view["name"].as_str()), (Some("public"), Some("orders_v")));
+    assert_eq!(
+        column_shapes(&view),
+        shapes(&[
+            ("placed_at", "timestamp with time zone", false),
+            ("id", "uuid", false),
+            ("amount", "numeric(12,2)", false),
+            ("note", "text", false),
+        ])
+    );
+    assert_columns_only(&view, "view");
+    // Nothing of the definition: the base table's name appears nowhere.
+    assert!(!text.contains("orders\"") && !text.contains("FROM") && !text.contains("public.orders "), "{text}");
+
+    let resp = t.table_get(main, "tables/public/orders_mv").await;
+    assert_eq!(resp.status(), 200, "a materialized view answers");
+    let mv: Value = resp.json().await.unwrap();
+    assert_eq!(mv["kind"], "materialized_view", "{mv}");
+    assert_eq!(column_shapes(&mv), shapes(&[("id", "uuid", false), ("amount", "numeric(12,2)", false)]));
+    assert_columns_only(&mv, "materialized view");
+
+    // The partitioned table: its own NOT NULLs, the dropped column left out.
+    let resp = t.table_get(main, "tables/public/events").await;
+    assert_eq!(resp.status(), 200, "a partitioned table answers");
+    let parted: Value = resp.json().await.unwrap();
+    assert_eq!(parted["kind"], "partitioned_table", "{parted}");
+    assert_eq!(column_shapes(&parted), shapes(&[("id", "bigint", true), ("at", "timestamp with time zone", false)]));
+    assert_columns_only(&parted, "partitioned table");
+
+    if fdw {
+        let resp = t.table_get(main, "tables/public/imports").await;
+        assert_eq!(resp.status(), 200, "a foreign table answers");
+        let text = resp.text().await.unwrap();
+        let ft: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(ft["kind"], "foreign_table", "{ft}");
+        assert_eq!(
+            column_shapes(&ft),
+            shapes(&[
+                ("id", "integer", true),
+                ("label", "character varying(40)", false),
+                ("seen", "timestamp with time zone", false),
+            ])
+        );
+        assert_columns_only(&ft, "foreign table");
+        for leak in ["secret-path", "gc_files", "filename", "csv"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+    }
+
+    // An ordinary table is unchanged, with its kind.
+    let resp = t.table_get(main, "tables/public/orders").await;
+    assert_eq!(resp.status(), 200);
+    let orders: Value = resp.json().await.unwrap();
+    assert_eq!(orders["kind"], "table", "{orders}");
+    assert!(orders["constraints"].as_array().unwrap().iter().any(|c| c["kind"] == "primary_key"), "{orders}");
+    assert_eq!(
+        column_shapes(&orders),
+        shapes(&[
+            ("id", "uuid", true),
+            ("placed_at", "timestamp with time zone", true),
+            ("amount", "numeric(12,2)", true),
+            ("note", "text", false),
+        ])
+    );
+
+    // Any other kind, a partition, Postgres's own catalogs and Chelabase's schema stay 404.
+    for rest in [
+        "tables/public/counter",
+        "tables/public/orders_pkey",
+        "tables/public/orders_mv_id",
+        "tables/public/pair",
+        "tables/public/events_1",
+        "tables/pg_catalog/pg_roles",
+        "tables/pg_catalog/pg_class",
+        "tables/information_schema/tables",
+        "tables/chelabase/schema_version",
+        "tables/public/nope",
+    ] {
+        assert_eq!(code_of(&error_of(t.table_get(main, rest).await, 404).await), "not_found", "{rest}");
+    }
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// gc: a view is checked as a table is. A member whose login may connect reads it (its own
+// columns, even when it selects from a table the owner and the member can't read: that's the
+// view's pg_attribute, as Postgres's own catalog shows it); without CONNECT, or without access
+// to the project, the refusal is the table's own.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn table_get_checks_a_view_as_it_checks_a_table() {
+    let (scratch, t) = changes_app("gc-access").await;
+    let main = t.main();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    let group = format!("{}_grp", scratch.owner);
+    t.metadata.add_group_role(&ep, &group, &[]);
+    let vic = t.grant_member("vic", PlatformRole::Viewer, &[&group]);
+    let login = chelabase_types::role_name::member_role_name(vic);
+    let record = t.metadata.database(t.db);
+    let elsewhere = t.metadata.create_project(record.tenant_id, "Elsewhere").await.unwrap().id;
+    t.metadata.add_granted(record.tenant_id, "outsider", elsewhere, PlatformRole::Viewer, &[]);
+    scratch
+        .exec_in(&format!(
+            "CREATE ROLE {group} NOLOGIN; CREATE ROLE {login} LOGIN NOINHERIT; \
+             GRANT {group} TO {login} WITH INHERIT FALSE, SET TRUE; \
+             CREATE SCHEMA gc_vault; REVOKE ALL ON SCHEMA gc_vault FROM PUBLIC; \
+             CREATE TABLE gc_vault.ledger (k uuid, total numeric(12,2), at timestamptz); \
+             REVOKE ALL ON gc_vault.ledger FROM PUBLIC; \
+             CREATE VIEW public.ledger_v AS SELECT k AS ref, total AS sum_total, at AS booked FROM gc_vault.ledger;"
+        ))
+        .await;
+    let get = |sub: &'static str, rest: &'static str| {
+        let path = format!("{}/{rest}", t.branch(main));
+        let t = &t;
+        async move { t.send_as(sub, Method::GET, &path, None).await }
+    };
+    for sub in ["vic", "user-1"] {
+        let resp = get(sub, "tables/public/ledger_v").await;
+        assert_eq!(resp.status(), 200, "{sub}: a view over a table no one but the admin reads");
+        let text = resp.text().await.unwrap();
+        let view: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(view["kind"], "view", "{sub}: {view}");
+        assert_eq!(
+            column_shapes(&view),
+            shapes(&[
+                ("ref", "uuid", false),
+                ("sum_total", "numeric(12,2)", false),
+                ("booked", "timestamp with time zone", false),
+            ]),
+            "{sub}"
+        );
+        for leak in ["gc_vault", "ledger\"", "ledger.", "SELECT"] {
+            assert!(!text.contains(leak), "{sub}: {leak} in {text}");
+        }
+    }
+    // Without CONNECT for the member's login: the table's 403, word for word.
+    scratch
+        .exec_in(&format!(
+            "REVOKE CONNECT ON DATABASE {db} FROM PUBLIC; GRANT CONNECT ON DATABASE {db} TO {group};",
+            db = scratch.database
+        ))
+        .await;
+    let table = error_of(get("vic", "tables/public/notes").await, 403).await;
+    assert_eq!(code_of(&table), "permission_denied");
+    let view = error_of(get("vic", "tables/public/ledger_v").await, 403).await;
+    assert_eq!((code_of(&view), message_of(&view)), (code_of(&table), message_of(&table)));
+    // No access to the project: the table's 404.
+    let table = error_of(get("outsider", "tables/public/notes").await, 404).await;
+    let view = error_of(get("outsider", "tables/public/ledger_v").await, 404).await;
+    assert_eq!(code_of(&table), "not_found");
+    assert_eq!((code_of(&view), message_of(&view)), (code_of(&table), message_of(&table)));
+    wait_no_editor_sessions(&scratch).await;
+    let admin = scratch.admin.clone();
+    scratch.drop().await;
+    use sqlx::Executor;
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {login}"))).await.unwrap();
+    admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {group}"))).await.unwrap();
+}
+
+// gc (coordinator ruling): every relation `…/objects` lists answers `…/tables/{schema}/{name}`.
+// A table that inherits from another is listed as a table, not editable, and answers with its
+// full table read (inherited columns and CHECK constraints included) as kind `table`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn table_get_serves_every_listed_object_and_inheriting_tables() {
+    let (scratch, t) = changes_app("gc-every").await;
+    let main = t.main();
+    scratch
+        .exec_in(&format!(
+            "CREATE TABLE public.animals (id bigint PRIMARY KEY, name text NOT NULL CHECK (name <> '')); \
+             CREATE TABLE public.dogs (good boolean NOT NULL DEFAULT true) INHERITS (public.animals); \
+             CREATE INDEX dogs_name ON public.dogs (name); \
+             CREATE TABLE public.\"Odd Name\" (x int); \
+             CREATE VIEW public.\"we'ird v\" AS SELECT x FROM public.\"Odd Name\"; \
+             CREATE TABLE public.parted (k int NOT NULL) PARTITION BY LIST (k); \
+             CREATE TABLE public.parted_1 PARTITION OF public.parted FOR VALUES IN (1); \
+             ALTER TABLE public.animals OWNER TO {o}; ALTER TABLE public.dogs OWNER TO {o}; \
+             ALTER TABLE public.\"Odd Name\" OWNER TO {o}; ALTER VIEW public.\"we'ird v\" OWNER TO {o}; \
+             ALTER TABLE public.parted OWNER TO {o}; ALTER TABLE public.parted_1 OWNER TO {o};",
+            o = scratch.owner
+        ))
+        .await;
+
+    let resp = t.table_get(main, "tables/public/dogs").await;
+    assert_eq!(resp.status(), 200, "an inheriting table answers");
+    let dogs: Value = resp.json().await.unwrap();
+    assert_eq!(dogs["kind"], "table", "{dogs}");
+    assert_eq!(
+        column_shapes(&dogs),
+        shapes(&[("id", "bigint", true), ("name", "text", true), ("good", "boolean", true)])
+    );
+    assert_eq!(dogs["columns"][2]["default"], "true", "{dogs}");
+    // The inherited CHECK applies to the child; its own index is there.
+    let constraints = dogs["constraints"].as_array().unwrap();
+    assert!(constraints.iter().any(|c| c["kind"] == "check"), "{dogs}");
+    assert!(dogs["indexes"].as_array().unwrap().iter().any(|i| i["name"] == "dogs_name"), "{dogs}");
+    // The parent is unchanged.
+    let resp = t.table_get(main, "tables/public/animals").await;
+    assert_eq!(resp.status(), 200);
+    let animals: Value = resp.json().await.unwrap();
+    assert_eq!(animals["kind"], "table", "{animals}");
+    assert!(animals["constraints"].as_array().unwrap().iter().any(|c| c["kind"] == "primary_key"), "{animals}");
+
+    // Every object the list shows answers 200 with the list's kind, and nothing else is listed.
+    let resp = t.table_get(main, "objects").await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let objects = body["objects"].as_array().unwrap();
+    let names: Vec<&str> = objects.iter().map(|o| o["name"].as_str().unwrap()).collect();
+    for want in ["animals", "dogs", "Odd Name", "we'ird v", "parted"] {
+        assert!(names.contains(&want), "{want} in {names:?}");
+    }
+    assert!(!names.contains(&"parted_1"), "{names:?}");
+    for o in objects {
+        let (schema, name) = (o["schema"].as_str().unwrap(), o["name"].as_str().unwrap());
+        let rest = format!("tables/{}/{}", urlencoding::encode(schema), urlencoding::encode(name));
+        let resp = t.table_get(main, &rest).await;
+        assert_eq!(resp.status(), 200, "{schema}.{name}: {o}");
+        let got: Value = resp.json().await.unwrap();
+        assert_eq!(got["kind"], o["kind"], "{schema}.{name}: {got}");
+        assert_eq!((got["schema"].as_str(), got["name"].as_str()), (Some(schema), Some(name)), "{got}");
+        assert_eq!(got["oid"], o["oid"], "{schema}.{name}");
+    }
+    // The partition stays out.
+    assert_eq!(code_of(&error_of(t.table_get(main, "tables/public/parted_1").await, 404).await), "not_found");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop().await;
+}
+
+// gc: the OpenAPI document gives `getTable`'s answer a required `kind` (the object list's
+// `ObjectKind`) beside the `Table` fields.
+#[test]
+fn get_table_documents_the_relation_kind() {
+    let doc = serde_json::to_value(orchestrator::openapi()).unwrap();
+    let op = &doc["paths"]["/v1/databases/{id}/branches/{branch_id}/tables/{schema}/{table}"]["get"];
+    let schema = &op["responses"]["200"]["content"]["application/json"]["schema"];
+    assert!(!schema.is_null(), "{op}");
+    // Every property and required name reachable through `$ref` and `allOf`.
+    fn walk<'a>(doc: &'a Value, s: &'a Value, props: &mut Vec<(String, &'a Value)>, required: &mut Vec<String>) {
+        if let Some(r) = s["$ref"].as_str() {
+            let name = r.rsplit('/').next().unwrap();
+            return walk(doc, &doc["components"]["schemas"][name], props, required);
+        }
+        for part in s["allOf"].as_array().into_iter().flatten() {
+            walk(doc, part, props, required);
+        }
+        for (k, v) in s["properties"].as_object().into_iter().flatten() {
+            props.push((k.clone(), v));
+        }
+        required.extend(s["required"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)));
+    }
+    let (mut props, mut required) = (Vec::new(), Vec::new());
+    walk(&doc, schema, &mut props, &mut required);
+    let kind = props.iter().find(|(k, _)| k == "kind").map(|(_, v)| *v).unwrap_or_else(|| panic!("no kind in {schema}"));
+    assert!(kind.to_string().contains("#/components/schemas/ObjectKind"), "{kind}");
+    for name in ["kind", "columns", "constraints", "indexes", "policies", "grants", "options"] {
+        assert!(required.iter().any(|r| r == name), "{name} isn't required: {required:?}");
+    }
+    let summary = op["summary"].as_str().unwrap_or_default();
+    assert!(!summary.contains("ordinary table"), "the summary still says only tables: {summary}");
 }
 
 // --- Schema merges (step 6g, T10) ------------------------------------------------------------
