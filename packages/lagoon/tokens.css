@@ -7,26 +7,28 @@
 @import "@fontsource-variable/jetbrains-mono";
 
 :root {
+  /* THEME: Basalt, the default. This bare :root block is the Basalt theme; the Lagoon alternate below
+     overrides its neutrals under :root[data-theme="lagoon"], so a future picker only sets that attribute. */
   color-scheme: dark;
 
-  /* Lagoon palette (same values as the landing page). */
-  --ink: #0b1c1f;
-  --deep: #0f2a2d;
-  --channel: #14363a;
-  --shallows: #163d3e; /* reserved: unused in Studio, shared with the landing page */
+  /* Basalt palette: warm matte black grounds, warm chalk (same values as the landing page). */
+  --ink: #0c0b0a;
+  --deep: #161412;
+  --channel: #1e1b18;
+  --shallows: #25211d; /* reserved: unused in Studio, shared with the landing page */
   --sand: #f2c7a3;
   --sand-lit: #f7d6b9; /* primary button hover, as on the landing */
   --seafoam: #9fd4c6;
   --coral: #eda6aa;
   --palm: #a9c89a;
-  --chalk: #e6ede7;
-  --chalk-dim: #aebfc0;
+  --chalk: #ebe6e0;
+  --chalk-dim: #b0a89f;
   --wet-sand: #dcae8a; /* sand the tide has just left: the landing's crab trails */
-  --ink-lit: #18333a; /* sand-plate hover on an ink-on-sand band, as on the landing */
-  --line: rgb(230 237 231 / 0.16);
-  --line-strong: rgb(230 237 231 / 0.34);
+  --ink-lit: #2b2621; /* sand-plate hover on an ink-on-sand band, as on the landing */
+  --line: rgb(235 230 224 / 0.15);
+  --line-strong: rgb(235 230 224 / 0.34);
   /* Control borders need 3:1 (WCAG 1.4.11): chalk at 40% clears it on ink, deep and channel. */
-  --input: rgb(230 237 231 / 0.4);
+  --input: rgb(235 230 224 / 0.4);
   /* The claw mark. */
   --shell: #f2936e;
   --shell-dark: #b85a3e;
@@ -49,4 +51,20 @@
   --lagoon-font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif;
   --lagoon-font-serif: Spectral, "Iowan Old Style", Georgia, serif;
   --lagoon-font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+}
+
+/* THEME: Lagoon, the alternate. The former default (dusk teal grounds, cool chalk), kept for a future
+   theme picker; nothing sets data-theme today, so it is inactive. It redeclares exactly the neutrals
+   the Basalt :root block changed; the pastels, claw colours and method tones are shared by both themes. */
+:root[data-theme="lagoon"] {
+  --ink: #0b1c1f;
+  --deep: #0f2a2d;
+  --channel: #14363a;
+  --shallows: #163d3e;
+  --chalk: #e6ede7;
+  --chalk-dim: #aebfc0;
+  --ink-lit: #18333a;
+  --line: rgb(230 237 231 / 0.16);
+  --line-strong: rgb(230 237 231 / 0.34);
+  --input: rgb(230 237 231 / 0.4);
 }

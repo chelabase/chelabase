@@ -25,8 +25,8 @@ export function colourLiterals(text: string): string[] {
 describe('no colour literals', () => {
   it('the_check_catches_hex_rgb_and_hsl', () => {
     expect(colourLiterals('fill="#fff6ee"')).toEqual(['#fff6ee']);
-    expect(colourLiterals('background: #18333a;')).toEqual(['#18333a']);
-    expect(colourLiterals('color: rgb(11 28 31 / 0.8)')).toEqual(['rgb(']);
+    expect(colourLiterals('background: #2b2621;')).toEqual(['#2b2621']);
+    expect(colourLiterals('color: rgb(12 11 10 / 0.8)')).toEqual(['rgb(']);
     expect(colourLiterals('color: hsl(0 0% 0%)')).toEqual(['hsl(']);
     expect(colourLiterals('href="#what-title" fill="var(--ink)" bg-ink/8')).toEqual([]);
   });

@@ -45,3 +45,11 @@ export function selectors(css: string): string[] {
     .map((chunk) => chunk.split("}").pop()!.trim());
   return prelude.flatMap((selector) => selector.split(",").map((part) => part.trim()));
 }
+
+/** The custom properties of the one rule whose selector is exactly `selector` (comments stripped). */
+export function blockProperties(css: string, selector: string): Map<string, string> {
+  for (const m of stripComments(css).matchAll(/([^{};]*)\{([^{}]*)\}/g)) {
+    if (m[1]!.trim().replace(/\s+/g, " ") === selector) return customProperties(`${m[2]};`);
+  }
+  throw new Error(`no rule for ${selector}`);
+}

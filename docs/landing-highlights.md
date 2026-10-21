@@ -7,7 +7,7 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Neon fork round 3 (2026-10-15, in progress: tested, awaiting the merge decision)
+## Neon fork round 3 (2026-10-15, shipped)
 
 Branch `neon-fork-round-3`; spec `docs/superpowers/specs/2026-10-15-neon-fork-round-3-design.md`; plan and full history `docs/superpowers/plans/2026-10-15-neon-fork-round-3.md`. Fork heads: `chelabase/neon` `round-3` `629166cee`, `chelabase/postgres` `round-3-v17` `76ce76278c5`, `chelabase/rust-postgres` `chelabase/sasl-verified` `9a1b048b`.
 

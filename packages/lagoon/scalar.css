@@ -25,15 +25,15 @@ body > .scalar-app {
   --scalar-color-2: var(--chalk-dim);
   --scalar-color-3: var(--chalk-dim);
   --scalar-color-accent: var(--sand);
-  /* Control borders need 3:1 on ink, deep and channel: --input (0.4 chalk) gives 3.4, 3.2, 3.1. */
+  /* Control borders need 3:1 on ink, deep and channel: --input (0.4 chalk) gives 3.3 on all three in Basalt (3.4, 3.2, 3.1 in the Lagoon alternate). */
   --scalar-border-color: var(--input);
 
   --scalar-button-1: var(--sand);
   --scalar-button-1-hover: var(--sand-lit);
   --scalar-button-1-color: var(--ink);
 
-  --scalar-scrollbar-color: rgb(230 237 231 / 0.2);
-  --scalar-scrollbar-color-active: rgb(230 237 231 / 0.4);
+  --scalar-scrollbar-color: color-mix(in srgb, var(--chalk) 20%, transparent);
+  --scalar-scrollbar-color-active: color-mix(in srgb, var(--chalk) 40%, transparent);
 
   /* Method colours: each method its own hue, as API docs conventionally do. POST (green, also 2xx)
      = seafoam and DELETE (red, also errors) = coral keep their lagoon meanings (yes, hazard). GET,

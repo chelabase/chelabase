@@ -1,24 +1,24 @@
 ---
 name: Chelabase Studio
-description: The signed-in app system for Chelabase Studio, a tool frame on the dusk lagoon.
+description: The signed-in app system for Chelabase Studio, a tool frame on warm matte black.
 colors:
-  ink: "#0b1c1f"
-  deep-water: "#0f2a2d"
-  channel: "#14363a"
-  shallows: "#163d3e"
+  ink: "#0c0b0a"
+  deep-water: "#161412"
+  channel: "#1e1b18"
+  shallows: "#25211d"
   sand: "#f2c7a3"
   sand-lit: "#f7d6b9"
   seafoam: "#9fd4c6"
   coral: "#eda6aa"
   palm: "#a9c89a"
-  chalk: "#e6ede7"
-  chalk-dim: "#aebfc0"
-  hairline: "rgb(230 237 231 / 0.16)"
-  hairline-strong: "rgb(230 237 231 / 0.34)"
-  control-border: "rgb(230 237 231 / 0.4)"
-  chalk-wash: "rgb(230 237 231 / 0.06)"
-  chalk-wash-strong: "rgb(230 237 231 / 0.08)"
-  zebra: "rgb(230 237 231 / 0.045)"
+  chalk: "#ebe6e0"
+  chalk-dim: "#b0a89f"
+  hairline: "rgb(235 230 224 / 0.15)"
+  hairline-strong: "rgb(235 230 224 / 0.34)"
+  control-border: "rgb(235 230 224 / 0.4)"
+  chalk-wash: "rgb(235 230 224 / 0.06)"
+  chalk-wash-strong: "rgb(235 230 224 / 0.08)"
+  zebra: "rgb(235 230 224 / 0.045)"
   sand-tint: "rgb(242 199 163 / 0.25)"
   sand-wash: "rgb(242 199 163 / 0.08)"
   pending-edge: "rgb(242 199 163 / 0.45)"
@@ -237,7 +237,7 @@ The shell is desktop first. Phone-width behaviour is an open gap, not a rule (se
 
 ## Colors
 
-A deep lagoon-teal dark carrying pastel roles, each with one meaning.
+A warm matte-black (Basalt) dark carrying pastel roles, each with one meaning.
 
 ### Primary
 - **Sand** (`sand`): the one action, selection and pending colour. Primary buttons (ink text on sand), the 2px active edge-mark in the rail and the table list, the checked indicator in the behaviour menu, checkbox ticks and radio dots, the chosen segment's underline, the resize grip, every focus outline (`--ring`), and the global text selection (solid sand under ink glyphs). In the SQL editor the selection is a sand tint with chalk glyphs (`sand-tint`, sand at 25%).

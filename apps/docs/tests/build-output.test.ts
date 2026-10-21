@@ -218,7 +218,7 @@ describe('the built docs site', () => {
       .filter((name) => name.endsWith('.css'))
       .map((name) => readFileSync(join(assets, name), 'utf8'));
     expect(sheets.length).toBeGreaterThan(0);
-    expect(sheets.some((css) => css.includes('--ink:#0b1c1f'))).toBe(true);
+    expect(sheets.some((css) => css.includes('--ink:#0c0b0a'))).toBe(true);
     expect(sheets.some((css) => css.includes('--color-fd-background:var(--ink)'))).toBe(true);
   });
 

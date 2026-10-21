@@ -4,7 +4,7 @@ The single source of the lagoon design: tokens, fonts, the Tailwind preset, the 
 
 ## Files
 
-- `tokens.css`: the font imports and one `:root` block: the palette (`--ink`, `--deep`, `--channel`, `--shallows`, `--sand`, `--sand-lit`, `--wet-sand`, `--ink-lit`, `--seafoam`, `--coral`, `--palm`, `--chalk`, `--chalk-dim`, `--line`, `--line-strong`, `--input`), the claw colours (including `--claw-eye`), the HTTP method tones (`--method-get/put/patch`), `--radius`, `color-scheme: dark`, and the font stacks `--lagoon-font-sans/serif/mono`.
+- `tokens.css`: the font imports and one `:root` block (the default Basalt theme; a `:root[data-theme="lagoon"]` block holds the former Lagoon neutrals for a future theme picker, nothing sets it today): the palette (`--ink`, `--deep`, `--channel`, `--shallows`, `--sand`, `--sand-lit`, `--wet-sand`, `--ink-lit`, `--seafoam`, `--coral`, `--palm`, `--chalk`, `--chalk-dim`, `--line`, `--line-strong`, `--input`), the claw colours (including `--claw-eye`), the HTTP method tones (`--method-get/put/patch`), `--radius`, `color-scheme: dark`, and the font stacks `--lagoon-font-sans/serif/mono`.
 - `src/crab-marks.tsx` (export `@chelabase/lagoon/crab-marks`): the claw `ClawMark`, `Wordmark`, `CrabFigure` and `PalmTree` as React components, eye whites on `--claw-eye`. They use Tailwind utilities; the preset's `@source "./src"` makes any app that imports it generate them. `Wordmark` carries only the styling both apps share (serif, bold, tight, chalk; claw `h-[1.32em]`); apps add nudges through `className`, `visualClassName` and `clawClassName`. Needs `react` (peer).
 - `base.css`: box-sizing, scrollbars, `body` colours and font, `::selection`.
 - `tailwind.css`: Tailwind v4 mapping: `--color-*` for the palette, `--ease-lagoon`, radii, and Tailwind's `--font-sans/serif/mono` onto the `--lagoon-font-*` stacks.
@@ -34,7 +34,7 @@ Studio then imports `@chelabase/lagoon/scalar.css?inline` for the API page. The 
 
 `pnpm --filter @chelabase/lagoon test` runs eight files:
 
-- `tokens.test.ts`: token values against Studio's at 34ec766, dark `color-scheme`, no font properties in `tokens.css`, Tailwind's font mapping.
+- `tokens.test.ts`: token values (Basalt neutrals), dark `color-scheme`, no font properties in `tokens.css`, Tailwind's font mapping.
 - `contrast.test.ts`: WCAG contrast of text and method tones (4.5:1), method tones on their 10% badge tint (5.4:1), Fumadocs callout and diff colours (4.5:1) and control borders (3:1).
 - `scalar-scope.test.ts`: the Scalar skin's scoping, theming of popovers and the token mapping.
 - `fumadocs.test.ts`: the Fumadocs skin maps every colour onto tokens, with the badge remaps (including the sand Deprecated override), hairline popovers and serif/mono fonts.

@@ -1,22 +1,22 @@
 import { describe, expect, test } from "vitest";
-import { customProperties, readCss } from "./css.ts";
+import { blockProperties, customProperties, readCss } from "./css.ts";
 
-// Values as Studio had them at 34ec766 (styles.css and the Scalar skin).
+// The Basalt neutrals (user, 2026-10-21) over the unchanged accents, claw and method tones.
 const expected: Record<string, string> = {
-  "--ink": "#0b1c1f",
-  "--deep": "#0f2a2d",
-  "--channel": "#14363a",
-  "--shallows": "#163d3e",
+  "--ink": "#0c0b0a",
+  "--deep": "#161412",
+  "--channel": "#1e1b18",
+  "--shallows": "#25211d",
   "--sand": "#f2c7a3",
   "--sand-lit": "#f7d6b9",
   "--seafoam": "#9fd4c6",
   "--coral": "#eda6aa",
   "--palm": "#a9c89a",
-  "--chalk": "#e6ede7",
-  "--chalk-dim": "#aebfc0",
-  "--line": "rgb(230 237 231 / 0.16)",
-  "--line-strong": "rgb(230 237 231 / 0.34)",
-  "--input": "rgb(230 237 231 / 0.4)",
+  "--chalk": "#ebe6e0",
+  "--chalk-dim": "#b0a89f",
+  "--line": "rgb(235 230 224 / 0.15)",
+  "--line-strong": "rgb(235 230 224 / 0.34)",
+  "--input": "rgb(235 230 224 / 0.4)",
   "--shell": "#f2936e",
   "--shell-dark": "#b85a3e",
   "--shell-light": "#f8b896",
@@ -32,12 +32,35 @@ const expected: Record<string, string> = {
 
 describe("lagoon tokens", () => {
   const tokens = readCss("tokens.css");
-  const props = customProperties(tokens);
+  const props = blockProperties(tokens, ":root");
 
   test("tokens_match_studio_values", () => {
     for (const [name, value] of Object.entries(expected)) {
       expect(props.get(name), name).toBe(value);
     }
+  });
+
+  // The alternate theme, kept for a future picker: the former Lagoon neutrals under a data attribute.
+  const lagoon: Record<string, string> = {
+    "--ink": "#0b1c1f",
+    "--deep": "#0f2a2d",
+    "--channel": "#14363a",
+    "--shallows": "#163d3e",
+    "--chalk": "#e6ede7",
+    "--chalk-dim": "#aebfc0",
+    "--ink-lit": "#18333a",
+    "--line": "rgb(230 237 231 / 0.16)",
+    "--line-strong": "rgb(230 237 231 / 0.34)",
+    "--input": "rgb(230 237 231 / 0.4)",
+  };
+
+  test("lagoon_alternate_block_holds_the_former_neutrals", () => {
+    const alt = blockProperties(tokens, ':root[data-theme="lagoon"]');
+    expect(Object.fromEntries(alt)).toEqual(lagoon);
+  });
+
+  test("every_neutral_basalt_differs_on_has_a_lagoon_value", () => {
+    for (const name of Object.keys(lagoon)) expect(props.get(name), name).not.toBe(lagoon[name]);
   });
 
   test("dark_color_scheme", () => {
@@ -66,7 +89,7 @@ describe("lagoon tokens", () => {
       "--shell-light": "#f8b896",
       "--tip": "#fde3cf",
       "--wet-sand": "#dcae8a",
-      "--ink-lit": "#18333a",
+      "--ink-lit": "#2b2621",
     };
     const tw = customProperties(readCss("tailwind.css"));
     for (const [name, value] of Object.entries(landing)) {

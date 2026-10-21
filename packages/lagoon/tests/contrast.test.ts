@@ -1,7 +1,11 @@
-import { describe, expect, test } from "vitest";
-import { customProperties, readCss } from "./css.ts";
+import { beforeEach, describe, expect, test } from "vitest";
+import { blockProperties, customProperties, readCss } from "./css.ts";
 
-const props = customProperties(readCss("tokens.css"));
+const tokensCss = readCss("tokens.css");
+const basalt = blockProperties(tokensCss, ":root");
+// The Lagoon alternate overrides only the neutrals; everything else is the :root value.
+const lagoon = new Map([...basalt, ...blockProperties(tokensCss, ':root[data-theme="lagoon"]')]);
+let props = basalt;
 
 function rgb(value: string | undefined): [number, number, number] {
   const hex = /^#([0-9a-f]{6})$/i.exec(value ?? "");
@@ -25,7 +29,11 @@ function ratio(a: [number, number, number], b: [number, number, number]): number
 
 const grounds = ["--ink", "--deep", "--channel"];
 
-describe("lagoon contrast", () => {
+describe.each([["basalt", basalt], ["lagoon", lagoon]] as const)("%s contrast", (_name, theme) => {
+  beforeEach(() => {
+    props = theme;
+  });
+
   test("method_tones_and_text_reach_4_5_to_1", () => {
     const fg = ["--method-get", "--method-put", "--method-patch", "--seafoam", "--coral", "--chalk", "--chalk-dim", "--sand"];
     for (const f of fg) {

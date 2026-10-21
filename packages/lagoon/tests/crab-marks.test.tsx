@@ -54,7 +54,7 @@ describe("crab marks", () => {
 
   test("the_colour_check_catches_hex_rgb_and_hsl", () => {
     expect(colourLiterals('fill="#fff6ee"')).toEqual(["#fff6ee"]);
-    expect(colourLiterals("color: rgb(11 28 31 / 0.8)")).toEqual(["rgb("]);
+    expect(colourLiterals("color: rgb(12 11 10 / 0.8)")).toEqual(["rgb("]);
     expect(colourLiterals("color: hsla(0 0% 0%)")).toEqual(["hsla("]);
     expect(colourLiterals('fill="var(--claw-eye)" href="#a-title"')).toEqual([]);
   });
