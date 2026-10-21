@@ -267,23 +267,24 @@ impl WalStream for PgWalStream {
     }
 }
 
-/// Replication sessions as `chelabase_realtime` to the branch's compute (the connection
-/// route's address, TLS verified as its certificate name).
+/// Replication sessions as `chelabase_realtime` to the branch's compute: the connection route's
+/// `replication_host` (the compute's `control`-network IP) is dialled, the compute verified as
+/// its certificate name, and realtime's client pair presented (W31).
 pub struct PgReplicator {
     lookup: std::sync::Arc<crate::pool::ConnLookup>,
-    tls: Option<chelabase_query::server_tls::ServerTls>,
+    client: std::sync::Arc<crate::client_tls::ClientPair>,
     password: String,
 }
 
 impl PgReplicator {
     pub fn new(
         lookup: std::sync::Arc<crate::pool::ConnLookup>,
-        tls: Option<chelabase_query::server_tls::ServerTls>,
+        client: std::sync::Arc<crate::client_tls::ClientPair>,
         password: String,
     ) -> Self {
         Self {
             lookup,
-            tls,
+            client,
             password,
         }
     }
@@ -310,38 +311,49 @@ impl Replicator for PgReplicator {
             .get(target.branch_id)
             .await
             .map_err(|e| SlotError::Unavailable(e.to_string()))?;
+        // W31: `chelabase_realtime` logs in only over the control network with the realtime
+        // certificate. No address, no name or no pair is "unavailable", never a fallback to
+        // `host` or to plaintext. A cached answer without a usable address (the compute was
+        // restarting) is dropped, so the next start asks the route again.
+        let (Some(replication_host), Some(server_name)) =
+            (info.replication_host.clone(), info.server_name.clone())
+        else {
+            self.lookup.invalidate(target.branch_id);
+            return Err(SlotError::Unavailable(
+                "the compute has no control-network address or certificate name".into(),
+            ));
+        };
+        // The address is dialled as is; anything but an IP would make the driver resolve a name.
+        if replication_host.parse::<std::net::IpAddr>().is_err() {
+            self.lookup.invalidate(target.branch_id);
+            return Err(SlotError::Unavailable(
+                "the compute's control-network address isn't an IP".into(),
+            ));
+        }
+        // Read on every start: a renewed pair is used by the next session.
+        let Some(client_tls) = self.client.get() else {
+            return Err(SlotError::Unavailable(
+                "no realtime client certificate is loaded".into(),
+            ));
+        };
         let config = replication_config(&ReplicationTarget {
-            host: info.host.clone(),
+            host: replication_host,
             port: info.port,
-            server_name: info.server_name.clone(),
+            server_name: Some(server_name),
             database: target.pg_database.clone(),
             password: self.password.clone(),
         });
-        let (client, conn) = match (&info.server_name, &self.tls) {
-            (Some(_), Some(tls)) => {
-                let (client, connection) = config
-                    .connect(tls.connector())
-                    .await
-                    .map_err(|e| slot_error(&e))?;
-                (client, ConnTask(tokio::spawn(async move {
-                    let _ = connection.await;
-                })))
-            }
-            (None, None) => {
-                let (client, connection) = config
-                    .connect(tokio_postgres::NoTls)
-                    .await
-                    .map_err(|e| slot_error(&e))?;
-                (client, ConnTask(tokio::spawn(async move {
-                    let _ = connection.await;
-                })))
-            }
-            _ => {
-                return Err(SlotError::Unavailable(
-                    "the compute's TLS can't be verified (CA and certificate name)".into(),
-                ));
+        let (client, connection) = match config.connect(client_tls.connector()).await {
+            Ok(connected) => connected,
+            Err(e) => {
+                // The cached address may be a compute that moved: the next start asks again.
+                self.lookup.invalidate(target.branch_id);
+                return Err(slot_error(&e));
             }
         };
+        let conn = ConnTask(tokio::spawn(async move {
+            let _ = connection.await;
+        }));
         let rows = client
             .simple_query(&create_slot_command(slot))
             .await

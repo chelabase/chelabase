@@ -101,6 +101,14 @@ api-gen:
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
 
+# Install the pinned cargo-deny (latest release as of 2026-10-21)
+deny-install:
+    cargo install cargo-deny --version 0.20.2 --locked
+
+# RustSec advisories and yanked crates against Cargo.lock (deny.toml); fix by upgrading, never by an unapproved ignore
+deny:
+    cargo deny check advisories
+
 check:
     scripts/tests/entry-urls.sh
     scripts/tests/entry-sh.sh
@@ -112,6 +120,7 @@ check:
     scripts/tests/compose-secret-argv.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
+    just deny
     cargo check --workspace
     cargo clippy --workspace --all-targets -- -D warnings
     cargo nextest run --workspace

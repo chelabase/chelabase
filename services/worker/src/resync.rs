@@ -19,7 +19,8 @@ use chelabase_secrets::seal_role_password;
 use chelabase_types::BranchId;
 use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{
-    has_reserved_prefix, is_membership_reserved, is_reserved_for, quote_ident, quote_literal,
+    has_reserved_prefix, is_membership_reserved, is_reserved_for, is_reserved_target,
+    mark_personal_login_sql, quote_ident, quote_literal,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use chelabase_types::role_password::{PasswordKind, hash_kind};
@@ -308,6 +309,10 @@ pub struct ObservedRole {
     pub member_no_set: Vec<String>,
     /// Those of [`Self::member_of`] some grantor gave the ADMIN option (I2), sorted.
     pub member_admin: Vec<String>,
+    /// The role carries the personal-login marker (SP22's predicate: a `pg_db_role_setting`
+    /// row with `setdatabase = 0` whose `setconfig` sets `chelabase.managed_role`), read from
+    /// the catalog read's `m` lines.
+    pub marked: bool,
 }
 
 impl ObservedRole {
@@ -329,6 +334,7 @@ impl ObservedRole {
             owner_granted: Vec::new(),
             member_no_set: Vec::new(),
             member_admin: Vec::new(),
+            marked: false,
         }
     }
 
@@ -363,6 +369,7 @@ impl std::fmt::Debug for ObservedRole {
             .field("owner_granted", &self.owner_granted)
             .field("member_no_set", &self.member_no_set)
             .field("member_admin", &self.member_admin)
+            .field("marked", &self.marked)
             .finish()
     }
 }
@@ -426,6 +433,16 @@ SELECT 'd',
        NULL, NULL, NULL, NULL, NULL, NULL, NULL
 FROM pg_database d
 WHERE NOT d.datistemplate AND d.datconnlimit <> -2
+UNION ALL
+SELECT 'm',
+       encode(convert_to(a.rolname, 'UTF8'), 'hex'),
+       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM pg_authid a
+WHERE a.oid >= 16384
+  AND EXISTS (SELECT 1 FROM pg_db_role_setting s
+              WHERE s.setrole = a.oid AND s.setdatabase = 0
+                AND EXISTS (SELECT 1 FROM unnest(s.setconfig) AS c
+                            WHERE starts_with(c, 'chelabase.managed_role=')))
 ORDER BY 1, 2;";
 
 /// The catalog read (plan Task 1, plus Task 12's owner-attributes column and step 6g's
@@ -436,7 +453,9 @@ pub fn resync_sql(owner: &str) -> String {
         .replace("$OWNER", &quote_literal(owner))
 }
 
-/// The catalog read of one role (its `r` line, or nothing when it doesn't exist).
+/// The catalog read of one role (its `r` line, or nothing when it doesn't exist). It has no
+/// `m` line, so the parsed role's [`ObservedRole::marked`] is always `false`: only the resync's
+/// read ([`resync_sql`]) may decide an origin from it.
 pub fn role_read_sql(owner: &str, name: &str) -> String {
     format!(
         "SET search_path = pg_catalog, pg_temp;\n{}\nWHERE a.rolname = {};",
@@ -549,10 +568,13 @@ fn flag(field: &str) -> Option<bool> {
     }
 }
 
-/// [`resync_sql`]'s output: `r|…` and `d|…` lines, names hex-encoded. Any malformed line is an
-/// error (the message never echoes the line: it may hold a password hash).
+/// [`resync_sql`]'s output: `r|…`, `d|…` and `m|…` lines, names hex-encoded. An `m` line marks
+/// the `r` role of its name, wherever it comes; one naming no `r` role (a role the read leaves
+/// out) is ignored. Any malformed line is an error (the message never echoes the line: it may
+/// hold a password hash).
 pub fn parse_observed(out: &str) -> anyhow::Result<Observed> {
     let mut observed = Observed::default();
+    let mut marked = std::collections::HashSet::new();
     for (i, line) in out.lines().enumerate() {
         let line = line.trim_end_matches('\r');
         if line.trim().is_empty() {
@@ -605,7 +627,14 @@ pub fn parse_observed(out: &str) -> anyhow::Result<Observed> {
                     owner_granted,
                     member_no_set: no_set,
                     member_admin: admin,
+                    marked: false,
                 });
+            }
+            "m" => {
+                if [a, b, c, d, e, f, g, h, i, j].iter().any(|x| !x.is_empty()) {
+                    return Err(bad("has unexpected fields for a marker"));
+                }
+                marked.insert(name);
             }
             "d" => {
                 if !a.is_empty() || !d.is_empty() || !e.is_empty() || [f, g, h, i, j].iter().any(|x| !x.is_empty()) {
@@ -623,6 +652,9 @@ pub fn parse_observed(out: &str) -> anyhow::Result<Observed> {
             }
             _ => return Err(bad("has an unknown kind")),
         }
+    }
+    for role in &mut observed.roles {
+        role.marked = marked.contains(&role.name);
     }
     Ok(observed)
 }
@@ -781,6 +813,63 @@ pub fn plan_resync(
         });
     }
 
+    // Personal logins (RT4-4): one the catalog lost is made again with its stored verifier, its
+    // surviving memberships and the marker, in one script run as the superuser, only under a
+    // name a personal login may take and only with a whole SCRAM verifier. Its row is never
+    // removed from the metadata. One that exists is handled below like any catalog role: it
+    // keeps its origin only while the catalog shows the marker.
+    for row in copies
+        .iter()
+        .filter(is_copy)
+        .filter(|c| c.origin == RoleOrigin::Personal)
+        .filter(|c| !is_reserved_target(&c.name, owner) && !seen(&c.name))
+    {
+        let Some(stored) = row
+            .scram_verifier
+            .as_deref()
+            .filter(|v| chelabase_neon::scram::is_verifier(v))
+        else {
+            error!(role = %row.name, "a personal login has no whole stored verifier; the resync skips it");
+            continue;
+        };
+        let kept: Vec<String> = row
+            .attributes
+            .member_of
+            .iter()
+            .filter(|g| seen(g.as_str()))
+            .cloned()
+            .collect();
+        let attributes = RoleAttributes {
+            member_no_set: Vec::new(),
+            member_admin: Vec::new(),
+            member_of: kept,
+            ..row.attributes.clone()
+        };
+        let wanted = WantedRole {
+            name: &row.name,
+            owner_level: false,
+            login: true,
+            attributes: &attributes,
+        };
+        push_repair(
+            &mut repairs,
+            &row.name,
+            create_personal_login_sql(&wanted, stored),
+        );
+        write.upserts.push(CopyUpsert {
+            name: row.name.clone(),
+            origin: RoleOrigin::Personal,
+            verifier: Some(stored.to_string()),
+            password_enc: SealedChange::Keep,
+            login: true,
+            level: RoleLevel::Plain,
+            pending: false,
+            attributes,
+            api_owner_level: None,
+            no_password: false,
+        });
+    }
+
     // Everything else: the database wins.
     for o in observed.roles.iter().filter(|o| o.name != owner) {
         let row = row_of(&o.name);
@@ -815,7 +904,10 @@ pub fn plan_resync(
             // password was removed. It exists, so it's kept (members can be granted it), with no
             // verifier; Chelabase's reserved names (the data API's roles) are not listed.
             Some((PasswordKind::Other, _)) | None => {
-                if is_reserved_for(&o.name, owner) {
+                // A personal login's row is never removed: under a reserved name it is recorded
+                // as an SQL role below, like any personal row the resync doesn't adopt.
+                let personal_row = row.is_some_and(|r| r.origin == RoleOrigin::Personal);
+                if is_reserved_for(&o.name, owner) && !personal_row {
                     if row.is_some() {
                         write.removals.push(o.name.clone());
                     }
@@ -828,9 +920,21 @@ pub fn plan_resync(
             Some(r) if r.scram_verifier == verifier => SealedChange::Keep,
             _ => SealedChange::Clear,
         };
+        // A personal login keeps its origin only while the catalog shows the marker and its name
+        // is one a personal login may take: an unmarked role of the same name (say an
+        // owner-made `alice` on a point-in-time child) is the owner's, never adopted.
+        let personal_row = row.is_some_and(|r| r.origin == RoleOrigin::Personal);
+        let personal = personal_row && o.marked && !is_reserved_target(&o.name, owner);
+        if personal_row && !personal {
+            warn!(role = %o.name, marked = o.marked, "a personal login's name exists without the marker (or is reserved); the resync records it as an SQL role");
+        }
         write.upserts.push(CopyUpsert {
             name: o.name.clone(),
-            origin: RoleOrigin::Sql,
+            origin: if personal {
+                RoleOrigin::Personal
+            } else {
+                RoleOrigin::Sql
+            },
             verifier,
             password_enc,
             login: o.login,
@@ -1249,13 +1353,9 @@ fn micros(at: Option<DateTime<Utc>>) -> Option<i64> {
     at.map(|t| t.timestamp_micros())
 }
 
-/// `SET ROLE <owner>; CREATE ROLE … [NO]LOGIN [attributes] [PASSWORD …]; GRANT <group> TO …;
-/// RESET ROLE` (the owner gets ADMIN on it through `createrole_self_grant`, and grants the
-/// memberships it administers), then `GRANT neon_superuser` as `cloud_admin` for an
-/// owner-level role, which is also made with the owner's attributes (the owner holds them, so
-/// it may give them). Only attributes that differ from Postgres' defaults are spelled out.
-pub fn create_role_sql(owner: &str, role: &WantedRole<'_>, verifier: Option<&str>) -> String {
-    let ident = quote_ident(role.name);
+/// The options of a `CREATE ROLE` for `role`: only attributes that differ from Postgres'
+/// defaults are spelled out.
+fn create_role_options(role: &WantedRole<'_>, verifier: Option<&str>) -> Vec<String> {
     let a = role.attributes;
     let mut options = vec![if role.login { "LOGIN" } else { "NOLOGIN" }.to_string()];
     if role.owner_level {
@@ -1276,6 +1376,36 @@ pub fn create_role_sql(owner: &str, role: &WantedRole<'_>, verifier: Option<&str
     if let Some(verifier) = verifier {
         options.push(format!("PASSWORD {}", quote_literal(verifier)));
     }
+    options
+}
+
+/// The script that makes a lost personal login again (RT4-4): one transaction run by the
+/// superuser session (no `SET ROLE`, so the owner holds no ADMIN on it and grants nothing
+/// itself), the role, its memberships and then the marker, so no session sees it unmarked.
+fn create_personal_login_sql(role: &WantedRole<'_>, verifier: &str) -> String {
+    let ident = quote_ident(role.name);
+    let mut sql = format!(
+        "BEGIN;\nCREATE ROLE {ident} {};",
+        create_role_options(role, Some(verifier)).join(" ")
+    );
+    for group in &role.attributes.member_of {
+        sql.push_str(&format!("\nGRANT {} TO {ident};", quote_ident(group)));
+    }
+    sql.push('\n');
+    sql.push_str(&mark_personal_login_sql(role.name));
+    sql.push_str("\nCOMMIT;");
+    sql
+}
+
+/// `SET ROLE <owner>; CREATE ROLE … [NO]LOGIN [attributes] [PASSWORD …]; GRANT <group> TO …;
+/// RESET ROLE` (the owner gets ADMIN on it through `createrole_self_grant`, and grants the
+/// memberships it administers), then `GRANT neon_superuser` as `cloud_admin` for an
+/// owner-level role, which is also made with the owner's attributes (the owner holds them, so
+/// it may give them). Only attributes that differ from Postgres' defaults are spelled out.
+pub fn create_role_sql(owner: &str, role: &WantedRole<'_>, verifier: Option<&str>) -> String {
+    let ident = quote_ident(role.name);
+    let a = role.attributes;
+    let options = create_role_options(role, verifier);
     let mut sql = format!(
         "SET ROLE {};\nCREATE ROLE {ident} {};",
         quote_ident(owner),
@@ -3172,5 +3302,171 @@ mod tests {
         // The unknown branch fails on its own and is not swallowed by the first one's claim.
         assert!(b.unwrap_err().starts_with("syncing login roles: "));
         assert_eq!(count(&journal, "metadata.apply_resync"), 1);
+    }
+
+    // --- Personal logins (c3, RT4-4, K6 H2) ----------------------------------------------------
+
+    fn personal(name: &str, verifier: Option<&str>) -> RoleCopy {
+        copy(name, RoleOrigin::Personal, verifier)
+    }
+
+    /// F2: a whole SCRAM verifier: a lost personal login is made again with no other.
+    const SCRAM_WHOLE: &str = crate::f2_tests::PENCIL;
+
+    /// The statements of `role`'s repair group.
+    fn group_of<'a>(repairs: &'a [RepairGroup], role: &str) -> &'a RepairGroup {
+        repairs
+            .iter()
+            .find(|g| g.role == role)
+            .unwrap_or_else(|| panic!("no repair group for {role}: {repairs:?}"))
+    }
+
+    // A personal login the catalog lost is made again with its marker, in the same script
+    // (one group = one script = one transaction), and nowhere else.
+    #[test]
+    fn a_lost_personal_login_is_recreated_marked_in_the_same_script() {
+        use chelabase_types::role_name::mark_personal_login_sql;
+        let copies = [personal("alice", Some(SCRAM_WHOLE)), copy("api_gone", RoleOrigin::Api, Some(SCRAM_B))];
+
+        let (repairs, write) = plan_resync(OWNER_ROLE, &copies, &observed(vec![]));
+
+        let group = group_of(&repairs, "alice");
+        let script = group.statements.join("\n");
+        let create = script.find("CREATE ROLE \"alice\"").expect(&script);
+        let mark = script.find(&mark_personal_login_sql("alice")).expect(&script);
+        assert!(create < mark, "{script}");
+        assert!(script.contains(&format!("PASSWORD '{SCRAM_WHOLE}'")), "{script}");
+        let marked_groups: Vec<&str> = repairs
+            .iter()
+            .filter(|g| g.statements.iter().any(|s| s.contains("chelabase.managed_role")))
+            .map(|g| g.role.as_str())
+            .collect();
+        assert_eq!(marked_groups, ["alice"], "only the personal login is marked: {repairs:?}");
+        // Not removed from the metadata, and never downgraded to another origin.
+        assert!(!write.removals.contains(&"alice".to_string()), "{write:?}");
+        if let Some(u) = upsert(&write, "alice") {
+            assert_eq!(u.origin, RoleOrigin::Personal);
+        }
+    }
+
+    // K6 H2: the marked role's memberships are granted by a superuser (the script has no
+    // `SET ROLE owner`), because the guard refuses the owner's GRANT of a marked role and a
+    // `DROP OWNED BY <grantor>` would take memberships the owner granted.
+    #[test]
+    fn a_recreated_personal_login_gets_its_memberships_from_a_superuser() {
+        let mut row = personal("alice", Some(SCRAM_WHOLE));
+        row.attributes.member_of = vec!["readers".into(), "gone_group".into()];
+        let (repairs, _) = plan_resync(
+            OWNER_ROLE,
+            &[row],
+            &observed(vec![role("readers", None)]),
+        );
+
+        let script = group_of(&repairs, "alice").statements.join("\n");
+        assert!(script.contains("GRANT \"readers\" TO \"alice\";"), "{script}");
+        assert!(!script.contains("gone_group"), "a group dropped in SQL is gone: {script}");
+        assert!(!script.contains("SET ROLE"), "{script}");
+        assert!(!script.contains("RESET ROLE"), "{script}");
+        assert!(!script.contains("WITH ADMIN"), "the owner gets no ADMIN on it: {script}");
+    }
+
+    // The personal login's catalog role isn't owner-administered like an API role: the resync
+    // must not hand the owner ADMIN on it.
+    #[test]
+    fn a_present_personal_login_is_left_alone_and_keeps_its_origin() {
+        let mut present = role("alice", Some(SCRAM_A));
+        present.owner_admin = false;
+        // F2: an existing personal login keeps its origin only while it carries the marker.
+        present.marked = true;
+        let (repairs, write) = plan_resync(
+            OWNER_ROLE,
+            &[personal("alice", Some(SCRAM_A))],
+            &observed(vec![present]),
+        );
+
+        assert!(repairs.is_empty(), "{repairs:?}");
+        assert!(write.removals.is_empty(), "{write:?}");
+        if let Some(u) = upsert(&write, "alice") {
+            assert_eq!(u.origin, RoleOrigin::Personal, "not recorded as an SQL role");
+        }
+    }
+
+    // Without a verifier a personal login can't be made again with its password: like an API
+    // role, it is skipped (and kept), never made without one.
+    #[test]
+    fn a_personal_login_without_a_verifier_is_not_recreated() {
+        let (repairs, write) = plan_resync(
+            OWNER_ROLE,
+            &[personal("alice", None)],
+            &observed(vec![]),
+        );
+        assert!(repairs.is_empty(), "{repairs:?}");
+        assert!(write.removals.is_empty(), "{write:?}");
+    }
+
+    // The recreate script of every other row is what it was: no marker, the owner creates and
+    // grants (golden against `create_role_sql`).
+    #[test]
+    fn the_recreate_script_of_a_non_personal_row_is_unchanged() {
+        let mut api = copy("api_gone", RoleOrigin::Api, Some(SCRAM_B));
+        api.attributes.member_of = vec!["readers".into()];
+        let (repairs, _) = plan_resync(OWNER_ROLE, &[api.clone()], &observed(vec![role("readers", None)]));
+
+        let attributes = RoleAttributes { member_of: vec!["readers".into()], ..RoleAttributes::default() };
+        let wanted = WantedRole { name: "api_gone", owner_level: false, login: true, attributes: &attributes };
+        assert_eq!(
+            group_of(&repairs, "api_gone").statements,
+            [create_role_sql(OWNER_ROLE, &wanted, Some(SCRAM_B))]
+        );
+        let script = group_of(&repairs, "api_gone").statements.join("\n");
+        assert!(script.starts_with("SET ROLE \"postgres\";"), "{script}");
+        assert!(!script.contains("managed_role"), "{script}");
+        // An SQL row the catalog lost is removed, not recreated, as before.
+        let (repairs, write) = plan_resync(OWNER_ROLE, &[copy("sql_gone", RoleOrigin::Sql, Some(SCRAM_A))], &observed(vec![]));
+        assert!(repairs.is_empty() && write.removals == ["sql_gone"], "{repairs:?} {write:?}");
+        // The script `create_role_sql` makes has no marker for any input.
+        assert!(!create_role_sql(OWNER_ROLE, &wanted, None).contains("managed_role"));
+    }
+
+    // The whole path: a personal login dropped behind the platform's back is made again by one
+    // resync, marked in the same script that creates it (live: `a_recreated_personal_login_is_marked_again`).
+    #[tokio::test(start_paused = true)]
+    async fn the_resync_recreates_a_lost_personal_login_marked() {
+        use chelabase_types::role_name::mark_personal_login_sql;
+        let (w, journal) = worker();
+        let (branch, ep) = ready(&w, &journal).await;
+        {
+            let mut state = w.metadata.state();
+            let endpoint = state.endpoints.get_mut(&ep).unwrap();
+            endpoint.set_verifier("alice", Some(SCRAM_WHOLE));
+            endpoint.logins.insert(
+                "alice".into(),
+                FakeLogin {
+                    origin: RoleOrigin::Personal,
+                    password_enc: None,
+                    pending: false,
+                    login: true,
+                    level: RoleLevel::Plain,
+                    api_owner_level: false,
+                    attributes: RoleAttributes::default(),
+                    attributes_pending: false,
+                    attributes_change_id: None,
+                },
+            );
+        }
+        w.computes.answer("FROM pg_authid", &d_line("app", "postgres", false));
+
+        w.resync(branch).await.unwrap();
+
+        let sql = w.computes.sql.lock().unwrap().clone();
+        let made: Vec<&String> = sql
+            .iter()
+            .map(|(_, _, s)| s)
+            .filter(|s| s.contains("CREATE ROLE \"alice\""))
+            .collect();
+        assert_eq!(made.len(), 1, "{sql:?}");
+        assert!(made[0].contains(&mark_personal_login_sql("alice")), "{}", made[0]);
+        let state = w.metadata.state();
+        assert_eq!(state.endpoints[&ep].logins["alice"].origin, RoleOrigin::Personal);
     }
 }

@@ -43,3 +43,12 @@ mod r11_edge_tests;
 
 #[cfg(test)]
 mod fa_tests;
+
+#[cfg(test)]
+mod c5_tests;
+
+#[cfg(test)]
+mod c5_api_tests;
+
+#[cfg(test)]
+mod c5_edge_tests;

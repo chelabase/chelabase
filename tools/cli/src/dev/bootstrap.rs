@@ -5,7 +5,7 @@ use crate::dev::zitadel::HttpZitadel;
 use crate::dev::{app_keys, internal_keys, secrets_key, steps, tenant};
 use crate::neon::{compute_ca, compute_jwt};
 use crate::paths::{
-    auth_dir, compute_ca_dir, demo_tenant_id, entry, gateway_dir, neon_dir, orchestrator_tls_dir, secrets_dir, studio_env_file,
+    auth_dir, compute_ca_dir, demo_tenant_id, entry, gateway_dir, neon_dir, orchestrator_tls_dir, realtime_tls_dir, secrets_dir, studio_env_file,
     zitadel_dir,
 };
 use anyhow::{Context, Result, bail};
@@ -86,6 +86,7 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
         app_jwt,
         compute_ca,
         orchestrator_tls,
+        realtime_tls,
     } = ensure_machine_keys(
         &gateway_dir(),
         &secrets_dir(),
@@ -93,12 +94,14 @@ pub async fn run(admin_email: Option<&str>) -> Result<()> {
         &neon_dir(),
         &compute_ca_dir(),
         &orchestrator_tls_dir(),
+        &realtime_tls_dir(),
     )?;
 
     info!(
-        "compute CA in {}, orchestrator client pair in {}",
+        "compute CA in {}, orchestrator client pair in {}, realtime client pair in {}",
         compute_ca.dir.display(),
-        orchestrator_tls.display()
+        orchestrator_tls.display(),
+        realtime_tls.display()
     );
 
     let admin_pat = wait_for_file(&zdir.join("admin.pat"), "admin.pat", 45, TOKEN_POLL).await?;
@@ -228,11 +231,13 @@ pub struct MachineKeys {
     pub compute_ca: compute_ca::ComputeCaPaths,
     /// The directory holding the orchestrator's client pair (`current/` inside it).
     pub orchestrator_tls: std::path::PathBuf,
+    /// The directory holding realtime's client pair, CN `chelabase-realtime`.
+    pub realtime_tls: std::path::PathBuf,
 }
 
 /// Creates the machine keys that are missing (never overwrites one): the gateway's internal key
 /// pair, the secrets key, auth's cookie key and app-JWT pair, the compute-JWT pair, the compute
-/// CA and the orchestrator's first client pair (renewed by the worker's sweep). The
+/// CA and the orchestrator's and realtime's first client pairs (renewed by the worker's sweep). The
 /// workbench runs this before any container mounts the key dirs.
 pub fn ensure_machine_keys(
     gateway: &Path,
@@ -241,6 +246,7 @@ pub fn ensure_machine_keys(
     neon: &Path,
     compute_ca_dir: &Path,
     orchestrator_tls: &Path,
+    realtime_tls: &Path,
 ) -> Result<MachineKeys> {
     let compute_ca = compute_ca::ensure(compute_ca_dir)?;
     std::fs::create_dir_all(orchestrator_tls)
@@ -253,9 +259,21 @@ pub fn ensure_machine_keys(
         &orchestrator_tls,
         std::time::SystemTime::now(),
     )?;
+    std::fs::create_dir_all(realtime_tls)
+        .with_context(|| format!("mkdir {}", realtime_tls.display()))?;
+    let realtime_tls = realtime_tls
+        .canonicalize()
+        .with_context(|| format!("resolve {}", realtime_tls.display()))?;
+    chelabase_neon::compute_tls::renew_client_pair(
+        &realtime_tls,
+        &chelabase_neon::compute_tls::ComputeCa::load(&compute_ca.dir)?,
+        chelabase_neon::compute_tls::REALTIME_CN,
+        std::time::SystemTime::now(),
+    )?;
     Ok(MachineKeys {
         compute_ca,
         orchestrator_tls,
+        realtime_tls,
         internal: internal_keys::ensure(gateway)?,
         secrets: secrets_key::ensure(secrets)?,
         cookie_key: secrets_key::ensure_file(auth, secrets_key::COOKIE_KEY_FILE)?,

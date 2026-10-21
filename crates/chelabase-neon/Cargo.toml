@@ -24,6 +24,7 @@ getrandom = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 humantime = { workspace = true }
+libc = { workspace = true }
 jsonwebtoken = { workspace = true }
 pbkdf2 = { workspace = true }
 rcgen = { workspace = true }

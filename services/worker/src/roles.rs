@@ -24,7 +24,7 @@ use chelabase_types::BranchId;
 use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{
     RoleNameError, check_any_role_name, check_login_role_name, is_membership_reserved,
-    is_reserved_for, is_reserved_target, quote_ident, quote_literal,
+    is_reserved_for, is_reserved_target, mark_personal_login_sql, quote_ident, quote_literal,
 };
 use chrono::{DateTime, SubsecRound, Utc};
 use tokio::time::timeout;
@@ -529,6 +529,43 @@ pub(crate) fn exists_sql(name: &str) -> String {
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
 {
+    /// Makes a personal login on `endpoint` (RT4-4): `CREATE ROLE name LOGIN PASSWORD <verifier>`
+    /// and the marker in one script, run in one transaction by a superuser session, so no other
+    /// session sees the role unmarked and the owner never holds ADMIN on it. A plain login with
+    /// none of the owner's attributes. The name is never adopted: `CREATE ROLE` on an existing
+    /// one fails and nothing else runs. Takes no endpoint lock and writes no metadata row (the
+    /// Members step records it). Reserved names and any password that isn't a SCRAM verifier are
+    /// refused before any SQL runs.
+    pub async fn create_personal_login(
+        &self,
+        endpoint: &str,
+        name: &str,
+        scram_verifier: &str,
+    ) -> anyhow::Result<()> {
+        if check_any_role_name(name).is_err()
+            || name == OWNER_ROLE
+            || is_reserved_target(name, OWNER_ROLE)
+        {
+            anyhow::bail!("the role name {name:?} can't be a personal login");
+        }
+        // A whole verifier only: anything else would be taken by `PASSWORD '…'` as a plaintext
+        // password (and the error never echoes it).
+        if !chelabase_neon::scram::is_verifier(scram_verifier) {
+            anyhow::bail!("a personal login needs a whole SCRAM-SHA-256 verifier");
+        }
+        let script = format!(
+            "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nCREATE ROLE {} LOGIN PASSWORD {};\n{}\nCOMMIT;",
+            quote_ident(name),
+            quote_literal(scram_verifier),
+            mark_personal_login_sql(name),
+        );
+        self.computes
+            .admin_sql(endpoint, crate::resync::SYSTEM_DATABASE, &script)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("making the personal login {name}: {e:#}"))
+    }
+
     /// Creates a role (spec Part 3, U1): the name rules and the attribute and membership
     /// rules, a ready `normal` branch, then under the endpoint's lock the SQL existence check,
     /// the membership targets' check, the `pending` row, the role made in SQL as the owner, the
@@ -3202,5 +3239,179 @@ mod tests {
         let endpoint = &state.endpoints[&ep];
         assert_eq!(endpoint.logins["app"].password_enc.as_deref(), Some("v1:garbage"));
         assert!(!endpoint.unreadable.contains("app"), "the flag it had");
+    }
+
+    // --- Personal logins (c3, RT4-4, K6 H2/H5) -----------------------------------------------
+
+    /// F2: a whole verifier: `create_personal_login` takes no other.
+    const PERSONAL_VERIFIER: &str = crate::f2_tests::PENCIL;
+
+    /// The one script that made `name`, with its endpoint and database.
+    fn creating_scripts(w: &FakeWorker, name: &str) -> Vec<(String, String, String)> {
+        let needle = format!("CREATE ROLE {}", chelabase_types::role_name::quote_ident(name));
+        w.computes
+            .sql
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, s)| s.contains(&needle))
+            .cloned()
+            .collect()
+    }
+
+    // The role and its marker are one script (one simple query, so one transaction): no other
+    // session sees the role unmarked.
+    #[tokio::test]
+    async fn a_personal_login_is_made_and_marked_in_one_script() {
+        use chelabase_types::role_name::mark_personal_login_sql;
+        let (w, journal) = worker();
+        let (_branch, ep, _db) = ready(&w, &journal).await;
+
+        w.create_personal_login(&ep, "alice", PERSONAL_VERIFIER).await.unwrap();
+
+        let made = creating_scripts(&w, "alice");
+        assert_eq!(made.len(), 1, "{:?}", sql(&w));
+        let (at, database, script) = &made[0];
+        assert_eq!(at, &ep);
+        assert_eq!(database, crate::resync::SYSTEM_DATABASE);
+        let create = script.find("CREATE ROLE \"alice\"").unwrap();
+        let mark = script
+            .find(&mark_personal_login_sql("alice"))
+            .unwrap_or_else(|| panic!("no marker in {script}"));
+        assert!(create < mark, "the marker follows the CREATE: {script}");
+        assert!(script.contains(" LOGIN") && !script.contains("NOLOGIN"), "{script}");
+        assert!(script.contains(&format!("PASSWORD '{PERSONAL_VERIFIER}'")), "{script}");
+        // Made by a superuser (cloud_admin): no `SET ROLE`, so the owner never holds ADMIN on it
+        // and no membership is ever granted by the owner (K6 H2).
+        assert!(!script.contains("SET ROLE"), "{script}");
+        // Plain: none of the owner's attributes.
+        for attribute in ["SUPERUSER", "CREATEROLE", "CREATEDB", "REPLICATION", "BYPASSRLS", "neon_superuser"] {
+            assert!(!script.contains(attribute), "{attribute} in {script}");
+        }
+        // No script made the role without the marker, and none marks it without making it.
+        assert!(
+            !sql(&w).iter().any(|s| s.contains(&mark_personal_login_sql("alice")) && !s.contains("CREATE ROLE")),
+            "{:?}",
+            sql(&w)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_personal_login_name_is_quoted_exactly() {
+        use chelabase_types::role_name::mark_personal_login_sql;
+        let (w, journal) = worker();
+        let (_branch, ep, _db) = ready(&w, &journal).await;
+
+        for name in ["Al\"ice", "Alice", "a b"] {
+            w.create_personal_login(&ep, name, PERSONAL_VERIFIER).await.unwrap();
+            let made = creating_scripts(&w, name);
+            assert_eq!(made.len(), 1, "{name}: {:?}", sql(&w));
+            assert!(made[0].2.contains(&mark_personal_login_sql(name)), "{name}: {}", made[0].2);
+        }
+    }
+
+    // `CREATE ROLE` on a name that exists fails and nothing else runs: the worker never adopts
+    // a customer's role (no IF NOT EXISTS, no ALTER of the existing one, no marker alone).
+    #[tokio::test]
+    async fn an_existing_name_is_never_adopted() {
+        let (w, journal) = worker();
+        let (_branch, ep, _db) = ready(&w, &journal).await;
+        w.computes.fail_when("CREATE ROLE \"bob\"");
+
+        let err = w.create_personal_login(&ep, "bob", PERSONAL_VERIFIER).await;
+
+        assert!(err.is_err());
+        let ran = sql(&w);
+        assert!(
+            !ran.iter().any(|s| s.contains("\"bob\"")),
+            "nothing about bob ran after the refusal: {ran:?}"
+        );
+        let first = journal.lock().unwrap().clone();
+        assert!(!first.iter().any(|e| e.contains("metadata.insert")), "{first:?}");
+    }
+
+    #[tokio::test]
+    async fn the_create_script_never_adopts_or_skips() {
+        let (w, journal) = worker();
+        let (_branch, ep, _db) = ready(&w, &journal).await;
+
+        w.create_personal_login(&ep, "carol", PERSONAL_VERIFIER).await.unwrap();
+
+        let script = creating_scripts(&w, "carol").remove(0).2.to_ascii_uppercase();
+        for forbidden in ["IF NOT EXISTS", "DO $", "DO '", "ON CONFLICT", "EXCEPTION"] {
+            assert!(!script.contains(forbidden), "{forbidden} in {script}");
+        }
+        // The existence check of `create_role` is not used either: the CREATE itself decides.
+        assert!(
+            !sql(&w).iter().any(|s| s.contains("FROM pg_catalog.pg_roles WHERE rolname = 'carol'")),
+            "{:?}",
+            sql(&w)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_personal_login_needs_a_scram_verifier_and_a_name_it_may_take() {
+        let (w, journal) = worker();
+        let (_branch, ep, _db) = ready(&w, &journal).await;
+
+        for bad in ["", "md5000102030405060708090a0b0c0d0e0f", "plaintext"] {
+            assert!(w.create_personal_login(&ep, "dave", bad).await.is_err(), "{bad:?}");
+        }
+        // Names the platform keeps for itself are refused before any SQL.
+        for name in ["postgres", "cloud_admin", "chelabase_realtime", "cb_m_0123", "pg_monitor", "neon_superuser", "owner"] {
+            assert!(w.create_personal_login(&ep, name, PERSONAL_VERIFIER).await.is_err(), "{name}");
+        }
+        assert!(creating_scripts(&w, "dave").is_empty());
+        assert!(
+            !sql(&w).iter().any(|s| s.contains("CREATE ROLE")),
+            "a refusal runs no SQL: {:?}",
+            sql(&w)
+        );
+    }
+
+    // K6 H5: a personal login is dropped like any non-owner row, objects first. A `GRANTED BY`
+    // dependency blocks DROP ROLE, so REASSIGN OWNED and DROP OWNED (in every database) come
+    // before it, in that order.
+    #[tokio::test]
+    async fn deleting_a_personal_login_reassigns_and_drops_owned_first() {
+        let (w, journal) = worker();
+        let (branch, ep, db) = ready(&w, &journal).await;
+        {
+            let mut state = w.metadata.state();
+            let endpoint = state.endpoints.get_mut(&ep).unwrap();
+            endpoint.set_verifier("alice", Some(PERSONAL_VERIFIER));
+            endpoint.logins.insert(
+                "alice".into(),
+                FakeLogin {
+                    origin: RoleOrigin::Personal,
+                    password_enc: None,
+                    pending: false,
+                    login: true,
+                    level: RoleLevel::Plain,
+                    api_owner_level: false,
+                    attributes: chelabase_metadata::RoleAttributes::default(),
+                    attributes_pending: false,
+                    attributes_change_id: None,
+                },
+            );
+        }
+        w.computes.answer(
+            "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'alice'",
+            "1\n",
+        );
+        w.computes.answer("FROM pg_database", &databases(&["app", "other"]));
+
+        assert_eq!(w.delete_role(branch, "alice").await, RoleOutcome::Ok);
+
+        let ran = sql_on(&w);
+        let at = |needle: &str, d: &str| {
+            ran.iter()
+                .position(|(database, s)| s.contains(needle) && database == d)
+                .unwrap_or_else(|| panic!("{needle:?} in {d} missing from {ran:?}"))
+        };
+        let reassign = "REASSIGN OWNED BY \"alice\" TO postgres; DROP OWNED BY \"alice\";";
+        let order = [at(reassign, "app"), at(reassign, "other"), at("DROP ROLE IF EXISTS \"alice\";", &db)];
+        assert!(order.is_sorted(), "{ran:?}");
+        assert!(login(&w, &ep, "alice").is_none(), "the row goes");
     }
 }

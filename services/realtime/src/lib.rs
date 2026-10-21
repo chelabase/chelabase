@@ -42,6 +42,7 @@ pub mod auth;
 pub mod bus;
 pub mod channel;
 pub mod check;
+pub mod client_tls;
 pub mod config;
 pub mod decoder;
 pub mod filter;

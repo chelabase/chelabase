@@ -258,6 +258,32 @@ pub fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// The role setting (`ALTER ROLE … SET`) that marks a personal login: the compute's guard
+/// refuses every change to a marked role from anyone but a superuser.
+pub const PERSONAL_LOGIN_MARKER: &str = "chelabase.managed_role";
+
+/// `ALTER ROLE <role> SET chelabase.managed_role = 'personal';`
+pub fn mark_personal_login_sql(role: &str) -> String {
+    format!(
+        "ALTER ROLE {} SET {PERSONAL_LOGIN_MARKER} = 'personal';",
+        quote_ident(role)
+    )
+}
+
+/// One boolean row: whether `role` carries the marker, i.e. a `pg_db_role_setting` row with
+/// `setdatabase = 0` for the role whose `setconfig` has an entry starting
+/// `chelabase.managed_role=` (the one predicate K3's `/grants`, K6's guard and C3 share).
+pub fn is_marked_sql(role: &str) -> String {
+    format!(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s \
+         JOIN pg_catalog.pg_roles r ON r.oid = s.setrole \
+         WHERE s.setdatabase = 0 AND r.rolname = {} \
+         AND EXISTS (SELECT 1 FROM pg_catalog.unnest(s.setconfig) AS c \
+         WHERE pg_catalog.starts_with(c, '{PERSONAL_LOGIN_MARKER}=')));",
+        quote_literal(role)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +546,75 @@ mod tests {
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(quote_literal("it's"), "'it''s'");
         assert_eq!(quote_literal("a\\b"), "'a\\b'");
+    }
+
+    // c3 (RT4-4, SP22): the role marker's name and the two statements built on it.
+    #[test]
+    fn the_personal_login_marker_is_the_pinned_guc() {
+        assert_eq!(PERSONAL_LOGIN_MARKER, "chelabase.managed_role");
+    }
+
+    #[test]
+    fn marking_a_personal_login_is_one_alter_role_set() {
+        assert_eq!(
+            mark_personal_login_sql("alice"),
+            "ALTER ROLE \"alice\" SET chelabase.managed_role = 'personal';"
+        );
+    }
+
+    #[test]
+    fn marking_quotes_the_name_exactly() {
+        // A double quote is doubled and the case is kept (the role is `Al"ice`, not `al"ice`).
+        assert_eq!(
+            mark_personal_login_sql("Al\"ice"),
+            "ALTER ROLE \"Al\"\"ice\" SET chelabase.managed_role = 'personal';"
+        );
+        assert_eq!(
+            mark_personal_login_sql("Alice"),
+            "ALTER ROLE \"Alice\" SET chelabase.managed_role = 'personal';"
+        );
+        // A name that tries to end the identifier and add a statement stays one identifier.
+        let evil = mark_personal_login_sql("x\"; DROP ROLE y; --");
+        assert_eq!(
+            evil,
+            "ALTER ROLE \"x\"\"; DROP ROLE y; --\" SET chelabase.managed_role = 'personal';"
+        );
+        // One statement: the only `;` outside the identifier is the last character.
+        assert_eq!(mark_personal_login_sql("a;b").matches(';').count(), 2);
+    }
+
+    #[test]
+    fn the_marked_predicate_is_the_sp22_one() {
+        let sql = is_marked_sql("alice");
+        // A `pg_db_role_setting` row with `setdatabase = 0` for the role (resolved from its
+        // name as a literal) whose `setconfig` has an entry starting `chelabase.managed_role=`.
+        for needle in [
+            "pg_db_role_setting",
+            "setdatabase = 0",
+            "setrole",
+            "setconfig",
+            "chelabase.managed_role=",
+            "'alice'",
+        ] {
+            assert!(sql.contains(needle), "{needle} missing from {sql}");
+        }
+        assert!(
+            sql.trim_start().to_ascii_uppercase().starts_with("SELECT"),
+            "one boolean row, so a SELECT: {sql}"
+        );
+        // The marker named in the predicate is the constant's.
+        assert!(sql.contains(&format!("{PERSONAL_LOGIN_MARKER}=")), "{sql}");
+    }
+
+    #[test]
+    fn the_marked_predicate_quotes_the_name_as_a_literal() {
+        let sql = is_marked_sql("x' OR true --");
+        assert!(sql.contains(&quote_literal("x' OR true --")), "{sql}");
+        assert!(sql.contains("'x'' OR true --'"), "{sql}");
+        // Case is kept: `Alice` is not `alice`.
+        assert!(is_marked_sql("Alice").contains("'Alice'"));
+        assert!(!is_marked_sql("Alice").contains("'alice'"));
+        // A database-scoped row doesn't mark: the predicate must not accept `setdatabase <> 0`.
+        assert!(!sql.contains("setdatabase <> 0") && !sql.contains("setdatabase > 0"), "{sql}");
     }
 }

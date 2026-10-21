@@ -122,6 +122,11 @@ pub struct ConnInfo {
     /// this name (U15).
     #[serde(default)]
     pub server_name: Option<String>,
+    /// The compute's address on the `control` network (C4, SP11): where the replication session
+    /// dials, since `chelabase_realtime` logs in only there. `null` or absent when the
+    /// orchestrator found none (the session is then unavailable); the check pools use `host`.
+    #[serde(default)]
+    pub replication_host: Option<String>,
     pub user: String,
     pub password: String,
 }
@@ -132,6 +137,7 @@ impl std::fmt::Debug for ConnInfo {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("server_name", &self.server_name)
+            .field("replication_host", &self.replication_host)
             .field("user", &self.user)
             .field("password", &"<redacted>")
             .finish()

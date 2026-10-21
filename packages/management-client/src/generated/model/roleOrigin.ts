@@ -6,8 +6,8 @@
  */
 
 /**
- * Where a `neon_roles` row came from: the branch's owner, a role made in SQL, or one made
- * through the API.
+ * Where a `neon_roles` row came from: the branch's owner, a role made in SQL, one made
+ * through the API, or a personal login (made by the worker and marked, RT4-4).
  */
 export type RoleOrigin = typeof RoleOrigin[keyof typeof RoleOrigin];
 
@@ -16,4 +16,5 @@ export const RoleOrigin = {
   owner: 'owner',
   sql: 'sql',
   api: 'api',
+  personal: 'personal',
 } as const;

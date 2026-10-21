@@ -26,17 +26,18 @@ pub struct StackEnvInput<'a> {
 }
 
 /// One stack's control network: the subnet Compose creates, the range computes get addresses
-/// from, and the static addresses of the orchestrator and the test runner.
+/// from, and the static addresses of the orchestrator, the test runner and realtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlNet {
     pub subnet: String,
     pub compute_range: String,
     pub orchestrator_ip: String,
     pub runner_ip: String,
+    pub realtime_ip: String,
 }
 
 /// Slot `k` (0..=63): subnet `10.213.{4k}.0/22`, computes from the upper `/23`
-/// (`10.213.{4k+2}.0/23`), the orchestrator at `.10` and the runner at `.11` of the first `/24`.
+/// (`10.213.{4k+2}.0/23`), the orchestrator at `.10`, the runner at `.11` and realtime at `.12` of the first `/24`.
 pub fn control_net(slot: u8) -> ControlNet {
     let base = u16::from(slot) * 4;
     ControlNet {
@@ -44,6 +45,7 @@ pub fn control_net(slot: u8) -> ControlNet {
         compute_range: format!("10.213.{}.0/23", base + 2),
         orchestrator_ip: format!("10.213.{base}.10"),
         runner_ip: format!("10.213.{base}.11"),
+        realtime_ip: format!("10.213.{base}.12"),
     }
 }
 
@@ -352,6 +354,13 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
         "CHELABASE_MEMBER_LOGIN_CIDRS",
         format!("{}/32,{}/32", control.orchestrator_ip, control.runner_ip),
     );
+    // Realtime's own address on `control` (outside the computes' range) and the two addresses the
+    // `chelabase_realtime` login is allowed from: realtime and the runner (it runs realtime).
+    lines.set("CHELABASE_REALTIME_CONTROL_IP", control.realtime_ip.as_str());
+    lines.set(
+        "CHELABASE_REALTIME_LOGIN_CIDRS",
+        format!("{}/32,{}/32", control.realtime_ip, control.runner_ip),
+    );
     lines.set(
         "CHELABASE_ZITADEL_ACTIONS_ENDPOINT",
         "http://orchestrator:8083/internal/zitadel/events",
@@ -379,6 +388,10 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
     lines.set(
         "CHELABASE_COMPUTE_TLS_DIR",
         path(&keys_dir.join("orchestrator-tls")),
+    );
+    lines.set(
+        "CHELABASE_REALTIME_TLS_DIR",
+        path(&keys_dir.join("realtime-tls")),
     );
     // The machine keys every app reads at startup. The gateway starts before the first bootstrap
     // (bootstrap reaches Zitadel through it), so these can't wait for demo.env.

@@ -52,6 +52,37 @@ pub fn verifies(stored: &str, password: &str) -> bool {
     verifier_with_salt(password, &salt, iterations) == stored
 }
 
+/// Whether `s` is a whole SCRAM-SHA-256 verifier as Postgres' `parse_scram_secret` reads one:
+/// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, the iterations a positive
+/// decimal integer (digits only), the salt non-empty standard base64, both keys standard
+/// base64 of exactly 32 bytes, and nothing else (no extra parts, no whitespace). A string that
+/// isn't one would be taken by `CREATE ROLE … PASSWORD '…'` as a plaintext password.
+pub fn is_verifier(s: &str) -> bool {
+    const KEY_LEN: usize = 32;
+    let Some(rest) = s.strip_prefix("SCRAM-SHA-256$") else {
+        return false;
+    };
+    let mut parts = rest.split('$');
+    let (Some(params), Some(keys), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let mut params = params.split(':');
+    let (Some(iterations), Some(salt), None) = (params.next(), params.next(), params.next())
+    else {
+        return false;
+    };
+    let mut keys = keys.split(':');
+    let (Some(stored), Some(server), None) = (keys.next(), keys.next(), keys.next()) else {
+        return false;
+    };
+    let iterations_ok = !iterations.is_empty()
+        && iterations.bytes().all(|b| b.is_ascii_digit())
+        && iterations.parse::<i32>().is_ok_and(|n| n > 0);
+    let salt_ok = STANDARD.decode(salt).is_ok_and(|salt| !salt.is_empty());
+    let key_ok = |k: &str| STANDARD.decode(k).is_ok_and(|k| k.len() == KEY_LEN);
+    iterations_ok && salt_ok && key_ok(stored) && key_ok(server)
+}
+
 fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut mac =
         <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key size");

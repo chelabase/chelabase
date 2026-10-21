@@ -34,6 +34,8 @@ impl Env {
             "CHELABASE_INTERNAL_VERIFY_KEY",
             "/keys/gateway/internal-verify.pem",
         );
+        // C4 (SP9): the realtime client pair's directory is required.
+        env.set("CHELABASE_REALTIME_TLS_DIR", "/keys/realtime-tls");
         env
     }
     fn file(&self, name: &str, bytes: &[u8]) -> String {
@@ -154,6 +156,22 @@ fn required_secrets_and_bad_files_are_errors_without_the_secret() {
     let mut env = Env::new();
     env.set("CHELABASE_REALTIME_ADDR", "not an address");
     assert!(env.load().is_err());
+}
+
+// C4 (SP9, spec §10): the realtime client pair (`<dir>/current/{client.crt,client.key,ca.crt}`)
+// is how the replication session logs in, so its directory is required: unset or blank is a
+// startup error that names the variable.
+#[test]
+fn the_realtime_tls_dir_is_required() {
+    Env::new().load().unwrap();
+    let mut env = Env::new();
+    env.unset("CHELABASE_REALTIME_TLS_DIR");
+    let err = format!("{:#}", env.load().err().expect("no TLS dir is an error"));
+    assert!(err.contains("CHELABASE_REALTIME_TLS_DIR"), "{err}");
+    let mut env = Env::new();
+    env.set("CHELABASE_REALTIME_TLS_DIR", "   ");
+    let err = format!("{:#}", env.load().err().expect("a blank TLS dir is an error"));
+    assert!(err.contains("CHELABASE_REALTIME_TLS_DIR"), "{err}");
 }
 
 #[test]

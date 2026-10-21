@@ -9,3 +9,6 @@ pub mod steps;
 pub mod tenant;
 pub mod token;
 pub mod zitadel;
+
+#[cfg(test)]
+mod c5_tests;

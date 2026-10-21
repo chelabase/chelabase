@@ -66,6 +66,7 @@ fn buildable(dir: &Path) -> WorkerConfig {
     config.compute_jwt_dir = jwt;
     config.compute_ca_dir = ca_dir;
     config.member_login_cidrs = Some(vec![]);
+    config.realtime_login_cidrs = Some(vec![]);
     config
 }
 

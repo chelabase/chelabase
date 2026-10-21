@@ -846,6 +846,7 @@ fn start_stack(
             &keys.join("neon"),
             &keys.join("compute-ca"),
             &keys.join("orchestrator-tls"),
+            &keys.join("realtime-tls"),
         )?;
         // RT1 T1 (R11, S1, S27): the service secrets (created once, never overwritten), the
         // NATS and Valkey auth files rendered from them, and the storage NeonJWTs derived from

@@ -107,6 +107,14 @@ pub fn orchestrator_tls_dir() -> PathBuf {
     repo_root().join(".chelabase/orchestrator-tls")
 }
 
+/// Realtime's client pair (`current/` -> `v<secs>/`), CN `chelabase-realtime`.
+pub fn realtime_tls_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELABASE_REALTIME_TLS_DIR") {
+        return PathBuf::from(dir);
+    }
+    repo_root().join(".chelabase/realtime-tls")
+}
+
 pub fn gateway_dir() -> PathBuf {
     if let Ok(dir) = env::var("CHELABASE_GATEWAY_DIR") {
         return PathBuf::from(dir);

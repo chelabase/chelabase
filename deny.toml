@@ -1,0 +1,10 @@
+# cargo-deny configuration. `just deny` runs `cargo deny check advisories`
+# (called from `just check`).
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+
+# Policy: this ignore list only shrinks. A new advisory is fixed by upgrading the
+# dependency; an ignore needs the user's explicit approval and a reason.

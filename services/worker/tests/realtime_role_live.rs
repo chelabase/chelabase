@@ -16,7 +16,8 @@
 //! role; the spill effect of the setting is T8's live check).
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,16 +26,19 @@ use chelabase_metadata::{
 };
 use chelabase_nats::rt::{COMPUTE_STOPPING, ComputeStopping, ProjectEvent};
 use chelabase_nats::{BranchJob, NatsConfig, NatsError};
-use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend};
+use chelabase_neon::compute::ComputeLocator;
+use chelabase_neon::compute_tls::server_name;
+use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend, DockerLocator};
 use chelabase_types::{BranchId, DatabaseId};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use worker::config::{RealWorker, WorkerConfig};
 use worker::rt_events::{NatsPublisher, RtPublisher};
 
 mod common;
-use common::{cleanup, setup, setup_with, workspace_root};
+use common::{cleanup, setup, setup_with, stack_name, workspace_root};
 
 const ROLE: &str = "chelabase_realtime";
 
@@ -432,6 +436,188 @@ async fn compute_stopping_is_published_before_a_reset_stops_the_compute() {
                     branch_id: dev.as_uuid()
                 }
             );
+        },
+    )
+    .await;
+}
+
+/// `psql` with `conninfo`, `script` on stdin: stdout, or stderr when it fails.
+async fn psql(conninfo: &str, script: &str) -> Result<String, String> {
+    let mut child = tokio::process::Command::new("psql")
+        .args([conninfo, "-X", "-qtA", "-v", "ON_ERROR_STOP=1", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("psql");
+    child.stdin.take().unwrap().write_all(script.as_bytes()).await.unwrap();
+    let out = child.wait_with_output().await.unwrap();
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// The refusal Postgres sends when an `hba` line requires a client certificate and none came.
+const NO_CERTIFICATE: &str = "connection requires a valid client certificate";
+/// The refusal after SCRAM when the certificate's CN isn't in the role's ident map
+/// (`clientcert=verify-full map=…` on a `scram-sha-256` line: `auth_failed` names the method).
+const CN_REFUSED: &str = "password authentication failed for user \"chelabase_realtime\"";
+/// The refusal of an `hba` `reject` line (no `hostssl` line matched).
+const HBA_REJECTS: &str = "pg_hba.conf rejects";
+
+/// `result` failed, with stderr naming `refusal`: the login was refused for that reason, not
+/// for another one (e.g. the fork's "may only open logical replication connections", which a
+/// plain session of the role always gets).
+fn assert_refused(result: &Result<String, String>, refusal: &str, what: &str) {
+    match result {
+        Ok(out) => panic!("{what}: logged in ({out:?})"),
+        Err(stderr) => assert!(
+            stderr.contains(refusal),
+            "{what}: refused, but not with {refusal:?}: {stderr}"
+        ),
+    }
+}
+
+/// Fork round 4 (W31, SP9): `chelabase_realtime` logs in only over TLS, from the `control`
+/// network, with a client certificate whose CN is `chelabase-realtime`. The positive control is
+/// a replication session (the role never opens another kind: the fork refuses a plain session
+/// of it after authentication) with the realtime pair; then each way in that must fail, each
+/// matched on its own refusal: no certificate, the orchestrator's certificate (a valid pair of
+/// the same CA, another CN), a password-only login from the compute network (how the proxy
+/// reaches a compute), and the control address without TLS. The stack comes from
+/// `common::stack_name` (`CHELABASE_COMPOSE_PROJECT` in a stack's runner).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the round-4 images"]
+async fn realtime_logs_in_only_with_its_certificate() {
+    let (worker, metadata, config) = setup().await;
+    let stack = stack_name(&config.stack);
+    let control_network = config.compute_control_network.clone();
+    let (realtime_dir, orchestrator_dir) = (
+        config.realtime_tls_dir.join("current"),
+        config.compute_tls_dir.join("current"),
+    );
+    with_database(
+        worker,
+        metadata,
+        move |worker, metadata, id, database| async move {
+            for dir in [&realtime_dir, &orchestrator_dir] {
+                for file in ["client.crt", "client.key", "ca.crt"] {
+                    assert!(
+                        dir.join(file).exists(),
+                        "{} is missing: the worker's certificate sweep writes both pairs",
+                        dir.join(file).display()
+                    );
+                }
+            }
+            let ep = metadata
+                .get_branch(BranchId::from(id))
+                .await
+                .unwrap()
+                .unwrap()
+                .endpoint_id
+                .unwrap();
+            let control = DockerLocator::connect(&control_network, &stack)
+                .expect("docker")
+                .postgres_addr(&ep)
+                .await
+                .expect("locating the compute")
+                .expect("the compute has an address on the control network");
+            let password = realtime_password();
+            // verify-full as the compute's certificate name, the IP dialled; `cert` is the
+            // client pair's directory (`current/`), if any; `replication` asks for a walsender.
+            let over_control = |cert: Option<&Path>, replication: bool| {
+                let mut conninfo = format!(
+                    "host={} hostaddr={} port={} dbname={database} user={ROLE} password={password} \
+                     sslmode=verify-full sslrootcert={}",
+                    server_name(&ep),
+                    control.ip(),
+                    control.port(),
+                    realtime_dir.join("ca.crt").display(),
+                );
+                if let Some(dir) = cert {
+                    conninfo.push_str(&format!(
+                        " sslcert={} sslkey={}",
+                        dir.join("client.crt").display(),
+                        dir.join("client.key").display()
+                    ));
+                }
+                if replication {
+                    conninfo.push_str(" replication=database");
+                }
+                conninfo
+            };
+
+            // The right pair: a replication session (the only kind the role opens).
+            let ident = psql(&over_control(Some(&realtime_dir), true), "IDENTIFY_SYSTEM;").await;
+            assert!(ident.as_ref().is_ok_and(|o| !o.is_empty()), "{ident:?}");
+
+            // Each of these must fail, replication or not, for its own reason: authentication
+            // runs before the fork's plain-session refusal, so the hba or certificate refusal is
+            // what the client sees either way.
+            for replication in [false, true] {
+                let script = if replication { "IDENTIFY_SYSTEM;" } else { "SELECT 1;" };
+                let no_cert = psql(&over_control(None, replication), script).await;
+                assert_refused(
+                    &no_cert,
+                    NO_CERTIFICATE,
+                    &format!("no client certificate (replication {replication})"),
+                );
+                let other_cn = psql(&over_control(Some(&orchestrator_dir), replication), script).await;
+                assert_refused(
+                    &other_cn,
+                    CN_REFUSED,
+                    &format!(
+                        "the orchestrator's certificate (CN chelabase-orchestrator), replication {replication}"
+                    ),
+                );
+            }
+
+            // Without TLS on the control address: `hostssl` only, so the role's `reject` line.
+            for replication in [false, true] {
+                let mut plain = format!(
+                    "host={} port={} dbname={database} user={ROLE} password={password} sslmode=disable",
+                    control.ip(),
+                    control.port()
+                );
+                if replication {
+                    plain.push_str(" replication=database");
+                }
+                let script = if replication { "IDENTIFY_SYSTEM;" } else { "SELECT 1;" };
+                assert_refused(
+                    &psql(&plain, script).await,
+                    HBA_REJECTS,
+                    &format!("plaintext on the control network (replication {replication})"),
+                );
+            }
+
+            // The compute network, password only (how the proxy reaches a compute): the runner's
+            // address there is in no `hostssl` line of the role, so its `reject` line.
+            let compute_addr = worker
+                .computes
+                .postgres_addr(&ep)
+                .await
+                .unwrap()
+                .expect("the compute's address on the compute network");
+            for sslmode in ["prefer", "require"] {
+                for replication in [false, true] {
+                    let mut conninfo = format!(
+                        "host={} port={} dbname={database} user={ROLE} password={password} sslmode={sslmode}",
+                        compute_addr.ip(),
+                        compute_addr.port()
+                    );
+                    if replication {
+                        conninfo.push_str(" replication=database");
+                    }
+                    let script = if replication { "IDENTIFY_SYSTEM;" } else { "SELECT 1;" };
+                    assert_refused(
+                        &psql(&conninfo, script).await,
+                        HBA_REJECTS,
+                        &format!("from the compute network ({sslmode}, replication {replication})"),
+                    );
+                }
+            }
         },
     )
     .await;

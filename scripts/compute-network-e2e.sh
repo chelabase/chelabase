@@ -103,11 +103,11 @@ pg_needs_auth() {
   if grep -Eqi 'password|authentication|jwt|unauthori[sz]ed' <<<"$out"; then ok "$3 requires a credential"; else fail "$3 accepts a startup without a credential: $out"; fi
 }
 
-# The storage HTTP APIs keep a few routes open even with NeonJWT (pageserver/src/http/routes.rs:135,
-# safekeeper/src/http/routes.rs:709). /v1/status is public by design (health). The profiling
-# routes and /metrics are KNOWN GAPS, allowlisted here by name until fork round 4 closes them; every other
-# route probed must refuse an unauthenticated caller.
-known_gaps=(/profile/cpu /profile/heap /metrics)
+# The storage HTTP APIs keep /v1/status open (pageserver/src/http/routes.rs, safekeeper/src/http/routes.rs):
+# public by design (health). Fork round 4 closed the profiling routes and /metrics (a `metrics`
+# scope token or an admin/own-service token opens /metrics; profiles are admin only), so there are
+# no known gaps left: every other route probed must refuse an unauthenticated caller (401/403).
+known_gaps=()
 storage_http_allowlist() { # storage_http_allowlist <host:port> <what>
   local got p
   got="$(status GET "http://$1/v1/status")"
@@ -115,7 +115,12 @@ storage_http_allowlist() { # storage_http_allowlist <host:port> <what>
   for p in "${known_gaps[@]}"; do
     got="$(status GET "http://$1$p?seconds=0")"
     [[ "$got" == 401 || "$got" == 403 ]] && ok "$2: $p is refused (the known gap is closed; drop it from known_gaps)" ||
-      say "KNOWN GAP (fork round 4): $2 serves $p unauthenticated ($got)"
+      say "KNOWN GAP: $2 serves $p unauthenticated ($got)"
+  done
+  for p in /profile/cpu /profile/heap /metrics; do
+    got="$(status GET "http://$1$p?seconds=0")"
+    [[ "$got" == 401 || "$got" == 403 ]] && ok "$2: $p is refused without a credential" ||
+      fail "$2: $p answers $got without a credential (not an allowlisted gap)"
   done
   for p in /v1/tenant /v1/utilization; do
     got="$(status GET "http://$1$p")"
@@ -181,12 +186,17 @@ audit() { # audit <service> <port>: the check for one listener; returns 1 when i
         fail "realtime:8087: a socket without a ticket answers $got" ;;
     realtime:8088) health_only realtime:8088 "realtime:8088" ;;
     compute:5432) ok "compute:5432 is public by design (password logins)" ;;
-    # compute_ctl's external API answers 400 (not 401) to a request without a bearer; still a
-    # refusal. Fork round 4 makes it 401; then drop this exception.
-    compute:3080) no_cred_also=400 refused GET http://"$compute_host":3080/status "compute_ctl's external API" ;;
-    # KNOWN GAP (user, 2026-10-16; fork round 4): compute_ctl's internal server listens on [::]:3081
-    # without auth. Named here by port; nothing else on a compute is allowed through.
-    compute:3081) say "KNOWN GAP (fork round 4): compute_ctl's internal server on $compute_host:3081 has no auth" ;;
+    # compute_ctl's external API answers 401 (with WWW-Authenticate: Bearer) to a request without
+    # a bearer, on every route, /metrics and /autoscaling_metrics included (K3/K4). Its internal
+    # server listens on loopback TCP only: a listener on :3081 is not in this table,
+    # so the run fails on it.
+    compute:3080)
+      local p got
+      for p in /status /metrics /autoscaling_metrics; do
+        got="$(status GET "http://$compute_host:3080$p")"
+        [[ "$got" == 401 ]] || fail "compute_ctl's external API: GET $p without a credential answers $got, want 401"
+        refused GET "http://$compute_host:3080$p" "compute_ctl's external API"
+      done ;;
     *) return 1 ;;
   esac
 }

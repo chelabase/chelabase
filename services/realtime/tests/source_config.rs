@@ -36,6 +36,8 @@ impl Env {
             "CHELABASE_INTERNAL_VERIFY_KEY",
             "/keys/gateway/internal-verify.pem",
         );
+        // C4 (SP9): the realtime client pair's directory is required.
+        env.set("CHELABASE_REALTIME_TLS_DIR", "/keys/realtime-tls");
         env
     }
     fn file(&self, name: &str, bytes: &[u8]) -> String {

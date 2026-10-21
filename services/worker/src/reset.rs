@@ -18,7 +18,7 @@ use crate::{OWNER_ROLE, Worker, credentials};
 
 /// How long `apply_pending` waits for Docker to find the compute, while it holds the
 /// endpoint's lock.
-const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
@@ -112,6 +112,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .with_context(|| format!("finding the compute for {endpoint_id}"))
     }
 
+    /// compute_ctl's status and capabilities (`GET /status`), bounded like the control address:
+    /// a hung compute_ctl must not keep the endpoint's lock. An error is never "no capability"
+    /// (SP2).
+    pub(crate) async fn report_bounded(
+        &self,
+        control_addr: std::net::SocketAddr,
+        endpoint_id: &str,
+    ) -> anyhow::Result<chelabase_neon::reconfigure::ComputeCtlReport> {
+        tokio::time::timeout(DOCKER_TIMEOUT, self.pusher.report(control_addr, endpoint_id))
+            .await
+            .map_err(|_| anyhow!("compute_ctl didn't answer /status in time"))?
+            .context("asking compute_ctl what it supports")
+    }
+
     /// Builds the endpoint's spec (with `protected` as the branch's protection) and pushes it
     /// to the running compute at `control_addr`: the one place the worker does so. The caller
     /// holds the endpoint's lock; the push is bounded.
@@ -123,6 +137,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         protected: bool,
     ) -> anyhow::Result<()> {
         let endpoint_id = endpoint.id.as_str();
+        // Ask the compute what it can do first (RT4-2): an expiring token only for one that
+        // takes refreshes. A failed or hung report fails the push (SP2); there is no fallback to
+        // a non-expiring token.
+        let report = self.report_bounded(control_addr, endpoint_id).await?;
         let databases = self
             .metadata
             .neon_databases(endpoint_id)
@@ -138,8 +156,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 &self.control_plane_uri,
                 endpoint_id,
             )),
-            &self.member_logins,
-            protected,
+            &chelabase_neon::spec::SpecPolicy {
+                member_logins: &self.member_logins,
+                realtime_logins: &self.realtime_logins,
+                branch_protected: protected,
+                storage_token_expiring: report.storage_token_refresh,
+            },
             self.pusher.signer(),
         )
         .await

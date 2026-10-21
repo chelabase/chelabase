@@ -191,16 +191,37 @@ pub fn start_replication_command(slot: &str, from: PgLsn) -> String {
     )
 }
 
-/// Where the replication session connects (from the branch's connection route).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where the replication session connects (from the branch's connection route; `host` is its
+/// `replication_host`).
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReplicationTarget {
     pub host: String,
     pub port: u16,
     /// The compute certificate's name (TLS verified as it, `host` dialled).
     pub server_name: Option<String>,
     pub database: String,
-    /// `chelabase_realtime`'s password (`CHELABASE_REALTIME_PG_PASSWORD_FILE`).
+    /// `chelabase_realtime`'s password (`CHELABASE_REALTIME_PG_PASSWORD_FILE`); never shown by
+    /// `Debug`.
     pub password: String,
+}
+
+impl std::fmt::Debug for ReplicationTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            host,
+            port,
+            server_name,
+            database,
+            password: _,
+        } = self;
+        f.debug_struct("ReplicationTarget")
+            .field("host", host)
+            .field("port", port)
+            .field("server_name", server_name)
+            .field("database", database)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The session's settings: user [`ROLE`], the database, `replication=database`,

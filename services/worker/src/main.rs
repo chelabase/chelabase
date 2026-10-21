@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_member_roles_enqueue(worker.clone(), nats.clone()));
     tokio::spawn(member_roles_sweep_loop(worker.clone()));
     tokio::spawn(cert_sweep_loop(worker.clone()));
+    tokio::spawn(worker::token_refresh::storage_token_refresh_loop(worker.clone()));
     tokio::spawn(reconcile_loop(worker.clone(), js.clone()));
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
@@ -676,7 +677,7 @@ async fn serve_review(worker: Arc<RealWorker>, client: async_nats::Client) {
 }
 
 /// RT3-7: at start and then daily, every running compute's server certificate and the
-/// orchestrator's client pair are renewed when due.
+/// orchestrator's and realtime's client pairs are renewed when due.
 async fn cert_sweep_loop(worker: Arc<RealWorker>) {
     let mut ticks = tokio::time::interval(worker::certs::CERT_SWEEP_EVERY);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

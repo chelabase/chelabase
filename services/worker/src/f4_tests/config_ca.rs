@@ -20,6 +20,7 @@ async fn build_without_the_compute_ca_names_the_bootstrap() {
     config.compute_jwt_dir = jwt.path().to_path_buf();
     config.compute_ca_dir = empty_ca_dir.path().to_path_buf();
     config.member_login_cidrs = Some(vec![]);
+    config.realtime_login_cidrs = Some(vec![]);
     let metadata = MetadataClient::connect_lazy(&MetadataConfig {
         database_url: "postgres://u:p@127.0.0.1:1/none".into(),
     })

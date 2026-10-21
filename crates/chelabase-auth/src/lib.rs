@@ -435,9 +435,9 @@ pub mod test_support {
     use axum::{routing::get, Json, Router};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use jsonwebtoken::{encode, EncodingKey, Header};
-    use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::traits::PublicKeyParts;
-    use rsa::RsaPrivateKey;
+    use aws_lc_rs::encoding::AsDer;
+    use aws_lc_rs::rsa::{KeyPair, KeySize, PublicKeyComponents};
+    use aws_lc_rs::signature::KeyPair as _;
     use serde_json::{json, Value};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
@@ -456,15 +456,22 @@ pub mod test_support {
     impl MockJwks {
         /// Start the mock JWKS server on an ephemeral localhost port.
         pub async fn start() -> Self {
-            let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("rsa keygen");
-            let public_key = private_key.to_public_key();
-            let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-            let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+            let key_pair = KeyPair::generate(KeySize::Rsa2048).expect("rsa keygen");
+            let components: PublicKeyComponents<Vec<u8>> = key_pair.public_key().into();
+            let n = URL_SAFE_NO_PAD.encode(&components.n);
+            let e = URL_SAFE_NO_PAD.encode(&components.e);
             let kid = "test-key-1".to_string();
 
-            let pem = private_key
-                .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
-                .expect("encode rsa pem");
+            let pkcs8 = AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&key_pair)
+                .expect("encode rsa pkcs8");
+            let body = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref());
+            let wrapped = body
+                .as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).expect("base64 is ascii"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let pem = format!("-----BEGIN PRIVATE KEY-----\n{wrapped}\n-----END PRIVATE KEY-----\n");
             let encoding_key =
                 EncodingKey::from_rsa_pem(pem.as_bytes()).expect("build jsonwebtoken encoding key");
 

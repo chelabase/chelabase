@@ -1186,33 +1186,60 @@ async fn bigint_numeric_and_timestamptz_keys_match_studios_page_keys() {
 
 #[tokio::test]
 #[ignore = "needs the workbench stack (just workbench test -p realtime --test realtime_live -- --run-ignored only)"]
-async fn a_big_transaction_spills_through_the_rt_slot() {
+async fn a_big_transaction_streams_through_the_rt_slot() {
     with_database(|fx| async move {
+        // The watcher watches `rt_big` itself (spec §3: it gets the big transaction as
+        // `changed`), so the table exists before the join.
+        fx.psql(&fx.pg_database, "CREATE TABLE rt_big (id int PRIMARY KEY, pad text);").await;
         let live = live_one().await;
         let mut ws = live.socket(&fx.token).await;
-        join_live(&mut ws, "1", join_in("1", &fx, &fx.pg_database, "public", "rt_items", None), Duration::from_secs(60)).await;
-        // S21: ~20+ MB of changes in one transaction; with logical_decoding_work_mem = 8MB for
-        // chelabase_realtime it spills (the 64 MB default would not).
+        let ch = join_live(&mut ws, "1", join_in("1", &fx, &fx.pg_database, "public", "rt_big", None), Duration::from_secs(60)).await;
+        // S21 + K2: ~20+ MB of changes in one transaction; with logical_decoding_work_mem = 8MB
+        // for chelabase_realtime the plugin's stream callbacks take it in chunks as it runs
+        // (`stream_txns > 0`) and nothing spills (`spill_txns = 0`; the 64 MB default would do
+        // neither). Only this database's slots count: `pg_stat_replication_slots` is
+        // cluster-wide, and another database's slot on the same compute may spill.
         fx.psql(
             &fx.pg_database,
-            "CREATE TABLE rt_big (id int PRIMARY KEY, pad text); \
-             INSERT INTO rt_big SELECT g, repeat('x', 100) FROM generate_series(1, 200000) g;",
+            "INSERT INTO rt_big SELECT g, repeat('x', 100) FROM generate_series(1, 200000) g;",
         )
         .await;
+        let own_slots = "FROM pg_stat_replication_slots s \
+                         JOIN pg_replication_slots r ON r.slot_name = s.slot_name \
+                         WHERE r.database = current_database() AND r.slot_name LIKE 'rt\\_%'";
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let spilled = fx
+            let streamed = fx
                 .psql(
                     &fx.pg_database,
-                    "SELECT coalesce(sum(spill_txns), 0) > 0 FROM pg_stat_replication_slots WHERE slot_name LIKE 'rt\\_%'",
+                    &format!("SELECT coalesce(sum(s.stream_txns), 0) > 0 {own_slots}"),
                 )
                 .await;
-            if spilled == "t" {
+            if streamed == "t" {
                 break;
             }
-            assert!(Instant::now() < deadline, "no spill through the rt_ slot");
+            assert!(Instant::now() < deadline, "no stream through the rt_ slot");
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        let spilled = fx
+            .psql(
+                &fx.pg_database,
+                &format!("SELECT coalesce(sum(s.spill_txns), 0) {own_slots}"),
+            )
+            .await;
+        assert_eq!(spilled.trim(), "0", "the rt_ slot streamed; it must not also spill");
+        // The streamed transaction reaches the watcher once it commits: far past the plugin's
+        // key budget, so `rt_big` comes as `changed` (keyless).
+        let c = ch.clone();
+        let rows = frame_where(&mut ws, Duration::from_secs(120), |v| {
+            v["type"] == "rows"
+                && v["channel"] == c.as_str()
+                && v["changes"]
+                    .as_array()
+                    .is_some_and(|changes| changes.iter().any(|x| x["op"] == "changed"))
+        })
+        .await;
+        assert_eq!(rows["channel"], ch.as_str(), "{rows}");
         live.rt.shutdown();
     })
     .await;

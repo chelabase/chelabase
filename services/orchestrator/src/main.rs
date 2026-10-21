@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let internal_config = InternalConfig::from_env()?;
     // Unset is a startup error (P13); empty means no address rule.
     let member_logins = internal_config.member_logins()?;
+    let realtime_logins = internal_config.realtime_logins()?;
     let signer = internal_config.load_signer()?;
     let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
     entry.check_mode(mode).map_err(anyhow::Error::new)?;
@@ -103,6 +104,11 @@ async fn main() -> anyhow::Result<()> {
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
         policy: ModePolicy::new(mode),
         member_logins,
+        realtime_logins,
+        control_locator: DockerLocator::connect(
+            &internal_config.compute_control_network,
+            &internal_config.stack,
+        )?,
     });
 
     // The console and the SQL editor reach computes over TLS on the control network.

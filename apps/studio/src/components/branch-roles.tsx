@@ -32,7 +32,7 @@ type Shown = { role: string; details: ConnectionDetails; fresh: boolean; notice:
 /** The API's name rule; reserved names are left to the API. */
 const NAME_RULE = /^[a-z_][a-z0-9_]{0,62}$/;
 const NOT_APPLIED_NOTICE = "The new password is stored but not yet applied; it will be retried.";
-const ORIGIN_LABEL: Record<BranchRole["origin"], string> = { sql: "SQL", api: "Studio", owner: "Owner" };
+const ORIGIN_LABEL: Record<BranchRole["origin"], string> = { sql: "SQL", api: "Studio", owner: "Owner", personal: "Personal" };
 const utc = (iso: string) => `${new Date(iso).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 const isKey = (k: unknown): k is RoleInUseKey =>
   typeof k === "object" && k !== null && typeof (k as RoleInUseKey).id === "string" && typeof (k as RoleInUseKey).name === "string";

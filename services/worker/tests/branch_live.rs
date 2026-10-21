@@ -23,7 +23,7 @@ use chelabase_types::{BranchId, DatabaseId};
 use worker::config::{RealWorker, WorkerConfig};
 
 mod common;
-use common::{cleanup, pageserver_container, setup, sqlx_delete};
+use common::{cleanup, pageserver_container, setup, sqlx_delete, storage_broker_container};
 
 struct Story<'a> {
     worker: &'a RealWorker,
@@ -726,8 +726,16 @@ async fn grandchild_story(
 
 /// Patch 6 (D11): right after the pageserver restarts, its `last_record_lsn` for main can lag
 /// what the safekeepers have committed; a branch of main with no point must still see main's
-/// last committed write. The test forces that window (restart the pageserver container right
-/// after a committed write) and asserts it was real; it fails rather than passing vacuously.
+/// last committed write.
+///
+/// The window is produced deterministically, not raced: a graceful restart freezes and flushes
+/// everything the pageserver ingested, and it ingests a committed write within milliseconds, so
+/// "write, then restart" leaves no lag. Instead the storage broker is stopped (the pageserver
+/// finds safekeepers only through it), the pageserver restarted (dropping its WAL stream), and
+/// main written: the safekeepers commit the write and nobody streams it to the pageserver. The
+/// test asserts the lag is real, then starts the broker and branches at once, while the
+/// pageserver is still catching up.
+
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn branch_right_after_a_pageserver_restart_sees_the_last_write() {
@@ -749,22 +757,136 @@ async fn branch_right_after_a_pageserver_restart_sees_the_last_write() {
         cleanup(&worker, &metadata, id).await;
         std::panic::resume_unwind(panic.into_panic());
     }
-    worker.handle_delete(id).await.expect("handle_delete");
+    // After the pageserver's re-attach the storage controller holds it "warming up" (not
+    // schedulable) until its next heartbeat, a few seconds; a tenant delete needs it
+    // schedulable. Waiting here also leaves the stack settled for the next test.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match worker.handle_delete(id).await {
+            Ok(()) => break,
+            Err(e)
+                if format!("{e:?}").contains("No pageserver found matching constraint")
+                    && Instant::now() < deadline =>
+            {
+                println!("delete waits for the pageserver to be schedulable: {e:?}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("handle_delete: {e:?}"),
+        }
+    }
     sqlx_delete(&metadata, id).await.unwrap();
 }
 
-/// How many write+restart rounds to try for a pageserver that lags the safekeepers.
-const STALE_HEAD_ATTEMPTS: u32 = 8;
-
-/// Restarts the stack's pageserver container (`<CHELABASE_COMPOSE_PROJECT>-pageserver-1`).
-async fn restart_pageserver() {
+/// `docker <verb> <container>`, asserting it succeeded.
+async fn docker(verb: &str, container: &str) {
     let status = tokio::process::Command::new("docker")
-        .args(["restart", &pageserver_container()])
+        .args([verb, container])
         .stdout(std::process::Stdio::null())
         .status()
         .await
         .expect("run docker");
-    assert!(status.success(), "docker restart {}", pageserver_container());
+    assert!(status.success(), "docker {verb} {container}");
+}
+
+/// The stack's storage broker, stopped while this lives. Dropping it (a panic included) starts
+/// the broker again, so a failed run never leaves the shared stack without one.
+struct BrokerStopped {
+    container: String,
+    running: bool,
+}
+
+impl BrokerStopped {
+    async fn stop() -> Self {
+        let container = storage_broker_container();
+        docker("stop", &container).await;
+        Self {
+            container,
+            running: false,
+        }
+    }
+
+    async fn start(mut self) {
+        docker("start", &self.container).await;
+        self.running = true;
+    }
+}
+
+impl Drop for BrokerStopped {
+    fn drop(&mut self) {
+        if !self.running {
+            let started = std::process::Command::new("docker")
+                .args(["start", &self.container])
+                .stdout(std::process::Stdio::null())
+                .status();
+            if !matches!(started, Ok(s) if s.success()) {
+                eprintln!("could not start {} again: {started:?}", self.container);
+            }
+        }
+    }
+}
+
+/// Main's timeline as the pageserver sees it, once the storage controller answers for it again.
+async fn timeline_after_restart(
+    worker: &RealWorker,
+    tenant: &NeonId,
+    timeline: &NeonId,
+) -> chelabase_neon::storcon::TimelineInfo {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match worker.storage.storcon.get_timeline(tenant, timeline).await {
+            Ok(info) => return info,
+            Err(e) if Instant::now() < deadline => {
+                println!("waiting for get_timeline: {e:?}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("get_timeline after the restart: {e:?}"),
+        }
+    }
+}
+
+/// The safekeepers' commit LSN for the timeline, read from each active one directly: a refused
+/// or failed read fails the test (the worker's `head` would fold it into its fallback).
+async fn safekeepers_commit_lsn(worker: &RealWorker, tenant: &NeonId, timeline: &NeonId) -> Lsn {
+    let active = worker
+        .storage
+        .storcon
+        .active_safekeeper_ids()
+        .await
+        .expect("active safekeepers");
+    assert!(!active.is_empty(), "no active safekeepers");
+    let mut commit = None;
+    for id in active {
+        let client =
+            worker.storage.safekeepers.client(id).unwrap_or_else(|| {
+                panic!("safekeeper {id} has no URL in CHELABASE_SAFEKEEPER_HTTP")
+            });
+        match client.commit_lsn(tenant, timeline).await {
+            Ok(lsn) => commit = commit.max(lsn),
+            Err(e) => panic!("safekeeper {id}: reading the commit LSN: {e:#}"),
+        }
+    }
+    commit.expect("no safekeeper knows main's timeline")
+}
+
+/// A committed write on main; right after a restart the compute may need a moment to reconnect
+/// to the pageserver, so the statement is retried for a while.
+async fn write_main(worker: &RealWorker, endpoint: &str, database_name: &str, value: &str) {
+    let sql = format!("INSERT INTO t VALUES ('{value}');");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match worker
+            .computes
+            .admin_sql(endpoint, database_name, &sql)
+            .await
+        {
+            Ok(_) => return,
+            Err(e) if Instant::now() < deadline => {
+                println!("write retry: {e:#}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => panic!("write on main: {e:#}"),
+        }
+    }
 }
 
 async fn stale_head_story(
@@ -804,83 +926,35 @@ async fn stale_head_story(
 
     story.sql(&main, "CREATE TABLE t (v text);").await;
 
-    let mut written = Vec::new();
-    let mut produced = false;
-    for attempt in 1..=STALE_HEAD_ATTEMPTS {
-        // A committed write; right after a restart the compute may need a moment to reconnect
-        // to the pageserver, so retry the statement for a while.
-        let value = format!("w{attempt}");
-        let sql = format!("INSERT INTO t VALUES ('{value}');");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match worker
-                .computes
-                .admin_sql(&endpoint, &database_name, &sql)
-                .await
-            {
-                Ok(_) => break,
-                Err(e) if Instant::now() < deadline => {
-                    println!("write retry: {e:#}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                Err(e) => panic!("write on main: {e:#}"),
-            }
-        }
-        written.push(value);
-
-        restart_pageserver().await;
-        // Storcon answers again for main's timeline.
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let info = loop {
-            match worker
-                .storage
-                .storcon
-                .get_timeline(&tenant, &timeline)
-                .await
-            {
-                Ok(info) => break info,
-                Err(e) if Instant::now() < deadline => {
-                    println!("waiting for get_timeline: {e:?}");
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                Err(e) => panic!("get_timeline after the restart: {e:?}"),
-            }
-        };
-        // The safekeepers' commit LSN (the head over a last record of 0 is their maximum).
-        let active = worker
-            .storage
-            .storcon
-            .active_safekeeper_ids()
-            .await
-            .expect("active safekeepers");
-        let commit = worker
-            .storage
-            .safekeepers
-            .head(Lsn(0), &active, &tenant, &timeline)
-            .await;
-        println!(
-            "attempt {attempt}: pageserver last_record_lsn {:?}, safekeepers commit_lsn {commit:?}",
-            info.last_record_lsn
-        );
-        if commit > info.last_record_lsn {
-            produced = true;
-            break;
-        }
-    }
+    // w1: a committed write the pageserver ingests (and flushes on the graceful restart).
+    write_main(worker, &endpoint, &database_name, "w1").await;
+    let broker = BrokerStopped::stop().await;
+    docker("restart", &pageserver_container()).await;
+    let reloaded = timeline_after_restart(worker, &tenant, &timeline).await;
+    // w2: committed by the safekeepers; with no broker the pageserver has no WAL stream.
+    write_main(worker, &endpoint, &database_name, "w2").await;
+    let info = timeline_after_restart(worker, &tenant, &timeline).await;
+    let commit = safekeepers_commit_lsn(worker, &tenant, &timeline).await;
+    println!(
+        "pageserver last_record_lsn {:?} (reloaded at {:?}), safekeepers commit_lsn {commit:?}",
+        info.last_record_lsn, reloaded.last_record_lsn
+    );
     assert!(
-        produced,
-        "could not produce a stale head: after {STALE_HEAD_ATTEMPTS} write+restart rounds the \
-         pageserver's last_record_lsn was never behind the safekeepers' commit_lsn"
+        commit > info.last_record_lsn,
+        "no stale head: the pageserver's last_record_lsn {:?} isn't behind the safekeepers' \
+         commit_lsn {commit:?} although it had no WAL stream when w2 was written",
+        info.last_record_lsn
     );
 
-    // At once: a branch of main with no point sees every committed write.
+    // At once: the pageserver can stream again (it still has to find the safekeepers and catch
+    // up), and a branch of main with no point sees every committed write.
+    broker.start().await;
     let after_id = story.create("after-restart", main_id, None).await;
     let after = story.branch(after_id).await;
     assert_eq!(after.status, BranchStatus::Ready, "{:?}", after.error);
-    written.sort();
     assert_eq!(
         story.rows(&after).await,
-        written.join(","),
+        "w1,w2",
         "branch right after a pageserver restart"
     );
 }

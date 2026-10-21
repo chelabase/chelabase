@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 
 use crate::compute_tls::{CA_CERT_PATH, SERVER_CERT_PATH, SERVER_KEY_PATH};
 use crate::id::NeonId;
-use crate::jwt::{ComputeSigner, StorageScope};
+use crate::jwt::ComputeSigner;
+// The unit tests below build tokens by scope.
+#[cfg(test)]
+use crate::jwt::StorageScope;
 use crate::storcon::{StorconClient, StorconError};
 
 pub struct RoleSpec {
@@ -73,16 +76,43 @@ impl MemberLogins {
             client_cns: vec![crate::compute_tls::ORCHESTRATOR_CN.to_string()],
         }
     }
+
+    /// Realtime's certificate CN ([`crate::compute_tls::REALTIME_CN`]) and the given CIDRs: who
+    /// may log in as `chelabase_realtime`. An empty list means any address (with the certificate).
+    pub fn realtime(allowed_cidrs: Vec<String>) -> Self {
+        Self {
+            allowed_cidrs,
+            client_cns: vec![crate::compute_tls::REALTIME_CN.to_string()],
+        }
+    }
 }
 
 /// `CHELABASE_MEMBER_LOGIN_CIDRS`: a comma-separated list of `<ipv4|ipv6>/<prefix>`. Unset is
 /// an error (the services refuse to start); empty (or blank) is the empty list, "no address
 /// rule". Entries are trimmed; an empty entry or anything else is an error naming it.
 pub fn parse_member_login_cidrs(raw: Option<&str>) -> anyhow::Result<Vec<String>> {
+    parse_login_cidrs(
+        raw,
+        "CHELABASE_MEMBER_LOGIN_CIDRS",
+        "the addresses member logins come from",
+    )
+}
+
+/// `CHELABASE_REALTIME_LOGIN_CIDRS`: the same grammar as [`parse_member_login_cidrs`], for
+/// realtime's logins.
+pub fn parse_realtime_login_cidrs(raw: Option<&str>) -> anyhow::Result<Vec<String>> {
+    parse_login_cidrs(
+        raw,
+        "CHELABASE_REALTIME_LOGIN_CIDRS",
+        "the addresses realtime's logins come from",
+    )
+}
+
+fn parse_login_cidrs(raw: Option<&str>, var: &str, what: &str) -> anyhow::Result<Vec<String>> {
     let Some(raw) = raw else {
         anyhow::bail!(
-            "CHELABASE_MEMBER_LOGIN_CIDRS is unset: set it to the addresses member logins come \
-             from (comma-separated CIDRs), or to an empty value for no address rule"
+            "{var} is unset: set it to {what} (comma-separated CIDRs), or to an empty value for \
+             no address rule"
         );
     };
     if raw.trim().is_empty() {
@@ -91,8 +121,7 @@ pub fn parse_member_login_cidrs(raw: Option<&str>) -> anyhow::Result<Vec<String>
     raw.split(',')
         .map(|entry| {
             let entry = entry.trim();
-            check_cidr(entry)
-                .with_context(|| format!("CHELABASE_MEMBER_LOGIN_CIDRS entry {entry:?}"))?;
+            check_cidr(entry).with_context(|| format!("{var} entry {entry:?}"))?;
             Ok(entry.to_string())
         })
         .collect()
@@ -129,11 +158,22 @@ pub struct SpecInputs<'a> {
     pub mode: ComputeMode,
     /// The member-login rules every compute gets.
     pub member_logins: MemberLogins,
+    /// Who may log in as `chelabase_realtime` (JSON key `realtime_logins`).
+    pub realtime_logins: MemberLogins,
     /// The branch is protected: the compute refuses databases born open (`neon.branch_protected`).
     pub branch_protected: bool,
-    /// The compute's NeonJWT for its own tenant (scope `tenant`): compute_ctl passes it to the
-    /// pageserver and safekeepers as the password (and `NEON_AUTH_TOKEN`).
+    /// The compute's NeonJWT for its own tenant (scope `tenant`): compute_ctl writes it to its
+    /// storage token file, the password of every pageserver and safekeeper connection.
     pub storage_auth_token: String,
+}
+
+/// What differs between callers of [`endpoint_config`]: the login rules, branch protection and
+/// whether the compute gets an expiring storage token.
+pub struct SpecPolicy<'a> {
+    pub member_logins: &'a MemberLogins,
+    pub realtime_logins: &'a MemberLogins,
+    pub branch_protected: bool,
+    pub storage_token_expiring: bool,
 }
 
 /// Where an attached tenant lives; `StorconClient` in production, a fake in tests.
@@ -172,8 +212,7 @@ pub async fn stored_endpoint_config(
     databases: Vec<chelabase_metadata::NeonDatabase>,
     jwks: Value,
     console_url: Option<String>,
-    member_logins: &MemberLogins,
-    branch_protected: bool,
+    policy: &SpecPolicy<'_>,
     signer: &ComputeSigner,
 ) -> anyhow::Result<Value> {
     endpoint_config(
@@ -200,8 +239,7 @@ pub async fn stored_endpoint_config(
             .collect(),
         jwks,
         console_url,
-        member_logins,
-        branch_protected,
+        policy,
         signer,
     )
     .await
@@ -216,16 +254,19 @@ pub async fn endpoint_config(
     databases: Vec<DatabaseSpec>,
     jwks: Value,
     console_url: Option<String>,
-    member_logins: &MemberLogins,
-    branch_protected: bool,
+    policy: &SpecPolicy<'_>,
     signer: &ComputeSigner,
 ) -> anyhow::Result<Value> {
     let tenant: NeonId = endpoint.tenant_id.parse().context("stored tenant id")?;
     let timeline: NeonId = endpoint.timeline_id.parse().context("stored timeline id")?;
     let pageserver_connstring = placement.pageserver_connstring(&tenant).await?;
     let safekeeper_connstrings = placement.active_safekeepers().await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("the system clock is before 1970")?
+        .as_secs();
     let storage_auth_token = signer
-        .storage_token(&StorageScope::Tenant(tenant.clone()))
+        .tenant_token(&tenant, now, policy.storage_token_expiring)
         .context("signing the compute's storage token")?;
     Ok(config_response(&SpecInputs {
         endpoint_id: endpoint.id,
@@ -238,8 +279,9 @@ pub async fn endpoint_config(
         jwks,
         console_url,
         mode: endpoint.mode,
-        member_logins: member_logins.clone(),
-        branch_protected,
+        member_logins: policy.member_logins.clone(),
+        realtime_logins: policy.realtime_logins.clone(),
+        branch_protected: policy.branch_protected,
         storage_auth_token,
     }))
 }
@@ -290,6 +332,9 @@ pub fn config_response(inputs: &SpecInputs<'_>) -> Value {
         // check (R4) reads Postgres's `drop cascades to …` notices by their English text.
         // `lc_messages` is superuser-only, so no role of the branch can change it.
         setting("lc_messages", "C", "string"),
+        // pg_partman 5.5 requires the background worker's role; the library isn't preloaded, so
+        // this is only the value it would use.
+        setting("pg_partman_bgw.role", "postgres", "string"),
     ];
 
     if let Some(ref console_url) = inputs.console_url {
@@ -324,6 +369,7 @@ pub fn config_response(inputs: &SpecInputs<'_>) -> Value {
             // Every compute serves TLS with the certificate the worker uploads before start.
             "features": ["tls_experimental"],
             "member_logins": inputs.member_logins,
+            "realtime_logins": inputs.realtime_logins,
             "branch_protected": inputs.branch_protected,
             "storage_auth_token": inputs.storage_auth_token,
         },
@@ -367,6 +413,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         assert_eq!(v["status"], "attached");
         assert_eq!(v["spec"]["tenant_id"], "00000000000000000000000000000001");
@@ -450,8 +497,7 @@ mod tests {
             }],
             json!({"keys": [{"kid": "k"}]}),
             None,
-            &logins(),
-            false,
+            &policy(&logins(), &realtime_logins(), false, false),
             &test_signer(),
         )
         .await
@@ -474,7 +520,7 @@ mod tests {
         let placement = FakePlacement {
             pageserver: Err("no pageserver"),
         };
-        let err = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins(), false, &test_signer())
+        let err = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &policy(&logins(), &realtime_logins(), false, false), &test_signer())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("no pageserver"), "{err:#}");
@@ -485,7 +531,7 @@ mod tests {
         let placement = FakePlacement {
             pageserver: Ok(String::new()),
         };
-        let err = endpoint_config(&placement, endpoint("nope"), vec![], vec![], json!({}), None, &logins(), false, &test_signer())
+        let err = endpoint_config(&placement, endpoint("nope"), vec![], vec![], json!({}), None, &policy(&logins(), &realtime_logins(), false, false), &test_signer())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("stored tenant id"), "{err:#}");
@@ -519,6 +565,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         let roles = v["spec"]["cluster"]["roles"].as_array().unwrap();
 
@@ -557,6 +604,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting = settings.iter().find(|s| s["name"] == "neon.console_url");
@@ -578,6 +626,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         let settings2 = v2["spec"]["cluster"]["settings"].as_array().unwrap();
         let console_setting2 = settings2.iter().find(|s| s["name"] == "neon.console_url");
@@ -603,6 +652,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let grant_setting = settings.iter().find(|s| s["name"] == "createrole_self_grant");
@@ -630,6 +680,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
         let get = |name: &str| {
@@ -663,6 +714,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         };
         let protected = |v: &Value| {
             v["spec"]["cluster"]["settings"]
@@ -746,6 +798,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         // Primary is the fork's default: the only addition to the old spec is `mode`.
         assert_eq!(v["spec"]["mode"], "Primary");
@@ -762,6 +815,7 @@ mod tests {
                 "member_logins",
                 "mode",
                 "pageserver_connstring",
+                "realtime_logins",
                 "safekeeper_connstrings",
                 "storage_auth_token",
                 "suspend_timeout_seconds",
@@ -777,7 +831,7 @@ mod tests {
             pageserver: Ok("postgresql://no_user@ps:6400".into()),
         };
         let logins = MemberLogins::orchestrator(vec!["10.213.0.10/32".into()]);
-        let v = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &logins, false, &test_signer())
+        let v = endpoint_config(&placement, endpoint(TENANT), vec![], vec![], json!({}), None, &policy(&logins, &realtime_logins(), false, false), &test_signer())
             .await
             .unwrap();
         assert_eq!(
@@ -802,6 +856,24 @@ mod tests {
         }
     }
 
+    fn realtime_logins() -> MemberLogins {
+        MemberLogins::realtime(vec!["10.213.4.12/32".into(), "10.213.4.11/32".into()])
+    }
+
+    fn policy<'a>(
+        member: &'a MemberLogins,
+        realtime: &'a MemberLogins,
+        branch_protected: bool,
+        storage_token_expiring: bool,
+    ) -> SpecPolicy<'a> {
+        SpecPolicy {
+            member_logins: member,
+            realtime_logins: realtime,
+            branch_protected,
+            storage_token_expiring,
+        }
+    }
+
     fn inputs_for_tests<'a>(tenant: &'a NeonId, timeline: &'a NeonId) -> SpecInputs<'a> {
         SpecInputs {
             endpoint_id: "ep-a",
@@ -817,6 +889,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         }
     }
 
@@ -855,8 +928,7 @@ mod tests {
                 vec![],
                 json!({}),
                 None,
-                &logins(),
-                protected,
+                &policy(&logins(), &realtime_logins(), protected, false),
                 &test_signer(),
             )
             .await
@@ -883,6 +955,7 @@ mod tests {
             member_logins: logins(),
             branch_protected: false,
             storage_auth_token: "tok".into(),
+            realtime_logins: realtime_logins(),
         });
         assert_eq!(v["spec"]["features"], json!(["tls_experimental"]));
         assert_eq!(
@@ -905,5 +978,228 @@ mod tests {
         empty.allowed_cidrs.clear();
         let v = config_response(&SpecInputs { member_logins: empty, ..inputs_for_tests(&tenant, &timeline) });
         assert_eq!(v["spec"]["member_logins"]["allowed_cidrs"], json!([]));
+    }
+
+    // --- round 4 (C1): realtime logins (W31), expiring storage tokens (item 7), S21 ----------
+
+    fn payload(token: &str) -> Value {
+        use base64::Engine;
+        let part = token.split('.').nth(1).expect("a JWT");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn realtime_logins_use_the_realtime_certificate_cn() {
+        let rt = MemberLogins::realtime(vec!["10.213.4.12/32".into()]);
+        assert_eq!(rt.allowed_cidrs, ["10.213.4.12/32"]);
+        assert_eq!(rt.client_cns, ["chelabase-realtime"]);
+        assert_eq!(rt.client_cns, [crate::compute_tls::REALTIME_CN]);
+        // Not the orchestrator's: a member login and a realtime login are different rules.
+        assert_ne!(rt.client_cns, MemberLogins::orchestrator(vec![]).client_cns);
+        assert_eq!(MemberLogins::realtime(Vec::new()).allowed_cidrs, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_spec_carries_realtime_logins_beside_the_member_logins() {
+        let tenant = NeonId::from(Uuid::from_u128(1));
+        let timeline = NeonId::from(Uuid::from_u128(2));
+        let v = config_response(&inputs_for_tests(&tenant, &timeline));
+        assert_eq!(
+            v["spec"]["realtime_logins"],
+            json!({
+                "allowed_cidrs": ["10.213.4.12/32", "10.213.4.11/32"],
+                "client_cns": ["chelabase-realtime"],
+            })
+        );
+        assert_eq!(
+            v["spec"]["member_logins"]["client_cns"],
+            json!(["chelabase-orchestrator"]),
+            "the member block is untouched"
+        );
+        // An empty list is "no address rule" (spec §10): sent as an empty list, never omitted,
+        // and the CN stays.
+        let v = config_response(&SpecInputs {
+            realtime_logins: MemberLogins::realtime(Vec::new()),
+            ..inputs_for_tests(&tenant, &timeline)
+        });
+        assert_eq!(
+            v["spec"]["realtime_logins"],
+            json!({"allowed_cidrs": [], "client_cns": ["chelabase-realtime"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_config_takes_both_login_rules_from_the_policy() {
+        let placement = FakePlacement {
+            pageserver: Ok("postgresql://no_user@ps:6400".into()),
+        };
+        let member = MemberLogins::orchestrator(vec!["10.213.0.10/32".into()]);
+        let realtime = MemberLogins::realtime(vec!["10.213.0.12/32".into()]);
+        let v = endpoint_config(
+            &placement,
+            endpoint(TENANT),
+            vec![],
+            vec![],
+            json!({}),
+            None,
+            &policy(&member, &realtime, true, false),
+            &test_signer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            v["spec"]["member_logins"],
+            json!({"allowed_cidrs": ["10.213.0.10/32"], "client_cns": ["chelabase-orchestrator"]})
+        );
+        assert_eq!(
+            v["spec"]["realtime_logins"],
+            json!({"allowed_cidrs": ["10.213.0.12/32"], "client_cns": ["chelabase-realtime"]})
+        );
+        assert_eq!(v["spec"]["branch_protected"], json!(true));
+    }
+
+    #[test]
+    fn realtime_login_cidrs_parse_like_the_member_ones() {
+        let err = parse_realtime_login_cidrs(None).unwrap_err().to_string();
+        assert!(err.contains("CHELABASE_REALTIME_LOGIN_CIDRS"), "{err}");
+        assert!(!err.contains("MEMBER"), "{err}");
+        assert_eq!(parse_realtime_login_cidrs(Some("")).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_realtime_login_cidrs(Some("  ")).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_realtime_login_cidrs(Some(" 10.213.4.12/32, 10.213.4.11/32 ")).unwrap(),
+            ["10.213.4.12/32", "10.213.4.11/32"]
+        );
+        assert_eq!(parse_realtime_login_cidrs(Some("fd00::1/128")).unwrap(), ["fd00::1/128"]);
+        assert_eq!(parse_realtime_login_cidrs(Some("0.0.0.0/0")).unwrap(), ["0.0.0.0/0"]);
+        for bad in [
+            "10.0.0.1/+32",
+            "10.0.0.1/",
+            "/32",
+            "10.0.0.1",
+            "10.0.0.1/33",
+            "fd00::1/129",
+            "10.0.0.1/32/1",
+            ",10.0.0.1/32",
+            "10.0.0.1/32,",
+            "10.0.0.1/32 # c",
+            "x",
+        ] {
+            let err = parse_realtime_login_cidrs(Some(bad)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("CHELABASE_REALTIME_LOGIN_CIDRS"),
+                "{bad:?}: {err:#}"
+            );
+        }
+    }
+
+    // The two parsers agree on every input (same grammar), only the variable's name differs.
+    #[test]
+    fn the_realtime_and_member_cidr_parsers_accept_the_same_inputs() {
+        for raw in [
+            None,
+            Some(""),
+            Some("10.0.0.1/32"),
+            Some("10.0.0.1/32,fd00::/8"),
+            Some("10.0.0.1/33"),
+            Some("a,b"),
+            Some(" , "),
+        ] {
+            assert_eq!(
+                parse_realtime_login_cidrs(raw).ok(),
+                parse_member_login_cidrs(raw).ok(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    // S21: pg_partman 5.5 requires `pg_partman_bgw.role`; the branch owner role.
+    #[test]
+    fn pg_partman_bgw_role_is_the_owner_role() {
+        let tenant = NeonId::from(Uuid::from_u128(1));
+        let timeline = NeonId::from(Uuid::from_u128(2));
+        let v = config_response(&inputs_for_tests(&tenant, &timeline));
+        let settings = v["spec"]["cluster"]["settings"].as_array().unwrap();
+        let found: Vec<&Value> = settings
+            .iter()
+            .filter(|s| s["name"] == "pg_partman_bgw.role")
+            .collect();
+        assert_eq!(found.len(), 1, "{settings:?}");
+        assert_eq!(
+            found[0],
+            &json!({"name": "pg_partman_bgw.role", "value": "postgres", "vartype": "string"})
+        );
+        // Only a placeholder: the library is not preloaded, so the worker stays off.
+        let preload = settings.iter().find(|s| s["name"] == "shared_preload_libraries");
+        assert_eq!(preload.unwrap()["value"], "neon");
+    }
+
+    // SP3: `endpoint_config` reads the clock itself, so the token changes per mint and the test
+    // asserts the claims, not a fixed token.
+    #[tokio::test]
+    async fn an_expiring_policy_mints_a_24h_tenant_token_from_the_clock() {
+        let placement = FakePlacement {
+            pageserver: Ok("postgresql://no_user@ps:6400".into()),
+        };
+        let signer = test_signer();
+        let (member, realtime) = (logins(), realtime_logins());
+        let before = now_secs();
+        let v = endpoint_config(
+            &placement,
+            endpoint(TENANT),
+            vec![],
+            vec![],
+            json!({}),
+            None,
+            &policy(&member, &realtime, false, true),
+            &signer,
+        )
+        .await
+        .unwrap();
+        let after = now_secs();
+        let claims = payload(v["spec"]["storage_auth_token"].as_str().unwrap());
+        assert_eq!(claims["scope"], "tenant");
+        assert_eq!(claims["tenant_id"], TENANT);
+        let (iat, exp) = (claims["iat"].as_u64().unwrap(), claims["exp"].as_u64().unwrap());
+        assert_eq!(exp - iat, 86_400);
+        assert!((before..=after).contains(&iat), "{before} <= {iat} <= {after}");
+        let mut keys: Vec<_> = claims.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["exp", "iat", "scope", "tenant_id"]);
+    }
+
+    #[tokio::test]
+    async fn a_non_expiring_policy_keeps_todays_tenant_token() {
+        let placement = FakePlacement {
+            pageserver: Ok("postgresql://no_user@ps:6400".into()),
+        };
+        let signer = test_signer();
+        let (member, realtime) = (logins(), realtime_logins());
+        let v = endpoint_config(
+            &placement,
+            endpoint(TENANT),
+            vec![],
+            vec![],
+            json!({}),
+            None,
+            &policy(&member, &realtime, false, false),
+            &signer,
+        )
+        .await
+        .unwrap();
+        let token = v["spec"]["storage_auth_token"].as_str().unwrap();
+        assert_eq!(payload(token), json!({"tenant_id": TENANT, "scope": "tenant"}));
+        // For a compute that never refreshes (an older image) the token is byte for byte today's.
+        let tenant: NeonId = TENANT.parse().unwrap();
+        assert_eq!(token, signer.storage_token(&StorageScope::Tenant(tenant)).unwrap());
     }
 }

@@ -35,7 +35,17 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 **Storage services.** The pageserver, the safekeepers and the storage controller verify a NeonJWT on their page service, WAL service and HTTP APIs, with scoped tokens per caller (see [Neon](/docs/architecture/neon#storage-authentication)).
 
-**Generated secrets.** Every NATS and Valkey password, realtime's Postgres password, ticket key and internal token, and every internal bearer is a 0600 file under `.chelabase/`, created once with 32 random bytes and never rewritten. Each is mounted only into the services that read it, through a `_FILE` variable, so none appears in an environment or on a command line. Known exceptions, scheduled for the next Neon fork round, are listed under [Realtime](/docs/architecture/realtime#known-gaps).
+**Generated secrets.** Every NATS and Valkey password, realtime's Postgres password, ticket key and internal token, and every internal bearer is a 0600 file under `.chelabase/`, created once with 32 random bytes and never rewritten. Each is mounted only into the services that read it, through a `_FILE` variable, so none appears in a container's configured environment or on a command line. The proxy reads its Valkey password and its control-plane token from files. The storage controller and the pageserver export theirs from the mounted files into their process environment; see [Realtime](/docs/architecture/realtime#known-gaps).
+
+## Compute and storage tokens
+
+**compute_ctl's internal API** (`:3081`) listens only on loopback and requires a per-start secret, kept in a file only the postgres OS user can read. The external API on `:3080` needs a JWT.
+
+**Storage tokens expire.** For a compute that is capable of refreshing them, the tenant token it uses with the pageserver and the safekeepers lives 24 hours. The worker refreshes it every hour, without restarting the compute.
+
+**The `metrics` scope is read-only.** It opens metrics and nothing else. Its token file under `.chelabase/` never expires. Re-minting it (`chelabase neon mint-metrics-token`) does not revoke the old token; revoking means rotating the compute-JWT key pair. After a re-mint, recreate the runner.
+
+**Storage servers check scope first.** Every pageserver, safekeeper and storage-controller route checks its token's scope before it reads the request, for routes that name the tenant in the path. A tenant token can't reach another tenant's routes. No route on the pageserver or the safekeeper takes the tenant from the request body: tenant configuration and safekeeper timeline creation are global-scope only, so a tenant token is refused there.
 
 ## The compute network
 
@@ -45,7 +55,7 @@ Computes run on their own `<project>_compute` network and not on the stack's def
 
 Realtime never sends a row. A change reaches Studio as the primary key of the row that changed, and Studio reads the row as the role the viewer acts as, so Postgres (grants and row-level security) decides what each viewer sees. Before a key is sent, realtime runs a read-only check as the viewer's own identity and sends the key only when that viewer's read would return the row; a check that fails or times out sends no keys. A viewer may join a table only if the member check allows the role and the role has `SELECT` on the table and its primary-key columns. Every joined channel is re-authorized every 60 seconds, on each token renewal and on access changes.
 
-The replication login `chelabase_realtime` is `NOBYPASSRLS` and not a superuser, and its output plugin emits only keys, never row values. Realtime never holds owner credentials: owner viewers' checks go through the orchestrator. Tickets are single use, last 30 seconds and are sealed in Valkey with a key only realtime holds. Studio sockets end when the member's token expires. See [Realtime](/docs/architecture/realtime).
+The replication login `chelabase_realtime` is `NOBYPASSRLS` and not a superuser, and its output plugin emits only keys, never row values. Logins as `chelabase_realtime` are accepted only from realtime's address and the test runner's, and only with realtime's client certificate. An empty `CHELABASE_REALTIME_LOGIN_CIDRS` turns the address rule off. Realtime never holds owner credentials: owner viewers' checks go through the orchestrator. Tickets are single use, last 30 seconds and are sealed in Valkey with a key only realtime holds. Studio sockets end when the member's token expires. See [Realtime](/docs/architecture/realtime).
 
 ## What is not a boundary
 

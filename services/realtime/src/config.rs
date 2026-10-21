@@ -16,6 +16,7 @@
 //! | `CHELABASE_REALTIME_PG_PASSWORD_FILE` | `chelabase_realtime`'s password (required by `build`) |
 //! | `CHELABASE_REALTIME_MAX_SLOTS_PER_COMPUTE` | 10 |
 //! | `CHELABASE_COMPUTE_CA_FILE` | the platform CA certificate (required by `build`) |
+//! | `CHELABASE_REALTIME_TLS_DIR` | required: the client pair `<dir>/current/{client.crt,client.key,ca.crt}` |
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -122,9 +123,13 @@ pub struct Config {
     pub replication_password: Option<String>,
     /// `CHELABASE_REALTIME_MAX_SLOTS_PER_COMPUTE` (default 10, T8).
     pub max_slots_per_compute: u32,
-    /// The platform CA's certificate (`CHELABASE_COMPUTE_CA_FILE`, T8): every compute
-    /// connection is TLS verified against it (U15); required by [`crate::app::Deps::connect`].
+    /// The platform CA's certificate (`CHELABASE_COMPUTE_CA_FILE`, T8): the check pools'
+    /// connections are TLS verified against it (U15); required by [`crate::app::Deps::connect`].
     pub compute_ca: Option<PathBuf>,
+    /// `CHELABASE_REALTIME_TLS_DIR` (C4, W31): the client pair (CN `chelabase-realtime`) the
+    /// replication session logs in with, and the `ca.crt` it verifies the compute against; the
+    /// worker writes and renews it.
+    pub realtime_tls_dir: PathBuf,
 }
 
 fn default_addr() -> SocketAddr {
@@ -181,6 +186,7 @@ impl Config {
             replication_password: None,
             max_slots_per_compute: 10,
             compute_ca: None,
+            realtime_tls_dir: PathBuf::new(),
         }
     }
 
@@ -257,6 +263,10 @@ impl Config {
             })?,
         };
 
+        let Some(realtime_tls_dir) = get("CHELABASE_REALTIME_TLS_DIR") else {
+            bail!("CHELABASE_REALTIME_TLS_DIR is required (the realtime client certificate pair)");
+        };
+
         Ok(Self {
             addr,
             internal_addr,
@@ -274,6 +284,7 @@ impl Config {
             replication_password,
             max_slots_per_compute,
             compute_ca: get("CHELABASE_COMPUTE_CA_FILE").map(PathBuf::from),
+            realtime_tls_dir: PathBuf::from(realtime_tls_dir),
         })
     }
 }

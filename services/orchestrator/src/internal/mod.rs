@@ -417,6 +417,11 @@ pub struct InternalState<M, L> {
     /// Where member logins may come from and which client certificates they present: the
     /// `member_logins` of every compute spec served.
     pub member_logins: chelabase_neon::spec::MemberLogins,
+    /// Who may log in as `chelabase_realtime` (`CHELABASE_REALTIME_LOGIN_CIDRS`): the
+    /// `realtime_logins` of every compute spec served.
+    pub realtime_logins: chelabase_neon::spec::MemberLogins,
+    /// Finds computes on the control network: the connection route's `replication_host`.
+    pub control_locator: L,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router

@@ -283,6 +283,11 @@ enum NeonCommands {
         #[arg(long)]
         control_plane_uri: String,
     },
+    /// Mint a fresh metrics token (rotation), replacing the one the workbench keeps under
+    /// `CHELABASE_NEON_DIR` (default `.chelabase/neon`). A kept token isn't checked against the
+    /// current key: re-mint after a key rotation, then recreate the runner, whose single-file
+    /// mount keeps the old token
+    MintMetricsToken,
     /// Tell the proxies to drop a role's cached secret (after a password change)
     PasswordUpdated {
         #[arg(long)]
@@ -333,6 +338,14 @@ async fn main() -> anyhow::Result<()> {
                 control_plane_uri,
             } => {
                 neon::compute_args(&endpoint, &control_plane_uri);
+                Ok(())
+            }
+            NeonCommands::MintMetricsToken => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                let path = workbench::service_auth::mint_metrics_token_in(&paths::neon_dir(), now)?;
+                println!("{}", path.display());
                 Ok(())
             }
             NeonCommands::PasswordUpdated { endpoint, role } => {
@@ -415,6 +428,17 @@ mod workbench_cli_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C5: `chelabase neon mint-metrics-token` re-mints the metrics token (rotation, U2).
+    #[test]
+    fn neon_mint_metrics_token_is_a_command_without_arguments() {
+        let cli = Cli::try_parse_from(["chelabase", "neon", "mint-metrics-token"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Neon { command: NeonCommands::MintMetricsToken }
+        ));
+        assert!(Cli::try_parse_from(["chelabase", "neon", "mint-metrics-token", "extra"]).is_err());
+    }
 
     #[test]
     fn bootstrap_accepts_admin_email() {

@@ -94,8 +94,8 @@ pub enum InsertRoleOutcome {
     CapReached,
 }
 
-/// Where a `neon_roles` row came from: the branch's owner, a role made in SQL, or one made
-/// through the API.
+/// Where a `neon_roles` row came from: the branch's owner, a role made in SQL, one made
+/// through the API, or a personal login (made by the worker and marked, RT4-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -103,6 +103,7 @@ pub enum RoleOrigin {
     Owner,
     Sql,
     Api,
+    Personal,
 }
 
 impl RoleOrigin {
@@ -111,6 +112,7 @@ impl RoleOrigin {
             Self::Owner => "owner",
             Self::Sql => "sql",
             Self::Api => "api",
+            Self::Personal => "personal",
         }
     }
 
@@ -119,6 +121,7 @@ impl RoleOrigin {
             "owner" => Ok(Self::Owner),
             "sql" => Ok(Self::Sql),
             "api" => Ok(Self::Api),
+            "personal" => Ok(Self::Personal),
             other => Err(MetadataError::InvalidStatus(format!("role origin {other}"))),
         }
     }
@@ -582,6 +585,32 @@ impl std::fmt::Debug for NeonRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // c3 (P10): a personal login's row origin, stored as `'personal'`, serialised the same.
+    #[test]
+    fn the_personal_origin_round_trips_as_personal() {
+        assert_eq!(RoleOrigin::Personal.as_str(), "personal");
+        assert_eq!(RoleOrigin::parse("personal").unwrap(), RoleOrigin::Personal);
+        assert_eq!(serde_json::to_string(&RoleOrigin::Personal).unwrap(), "\"personal\"");
+        for origin in [RoleOrigin::Owner, RoleOrigin::Sql, RoleOrigin::Api, RoleOrigin::Personal] {
+            assert_eq!(RoleOrigin::parse(origin.as_str()).unwrap(), origin);
+        }
+        // Still strict: the parser knows exactly these four.
+        for bad in ["Personal", "PERSONAL", "member", ""] {
+            assert!(RoleOrigin::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_personal_logins_migration_widens_the_origin_check() {
+        let sql = include_str!("../migrations/20261021000001_personal_logins.sql");
+        let sql = sql.to_ascii_lowercase();
+        assert!(sql.contains("neon_roles_origin"), "{sql}");
+        for origin in ["'owner'", "'sql'", "'api'", "'personal'"] {
+            assert!(sql.contains(origin), "{origin} missing: {sql}");
+        }
+        assert!(sql.contains("drop constraint") && sql.contains("add constraint"), "{sql}");
+    }
 
     #[test]
     fn debug_hides_the_verifier() {
@@ -1766,6 +1795,8 @@ impl MetadataClient {
                      member_no_set = EXCLUDED.member_no_set,
                      member_admin = EXCLUDED.member_admin,
                      attributes_pending = false,
+                     origin = CASE WHEN r.origin = 'personal' AND EXCLUDED.origin = 'sql'
+                                   THEN 'sql' ELSE r.origin END,
                      api_owner_level = CASE WHEN r.origin = 'api' AND $15::bool IS NOT NULL
                                             THEN $15 ELSE r.api_owner_level END,
                      password_unreadable = CASE WHEN NOT {held}
@@ -1774,6 +1805,7 @@ impl MetadataClient {
                                                 THEN false ELSE r.password_unreadable END
                  WHERE r.origin <> 'owner'
                    AND (r.level IS DISTINCT FROM EXCLUDED.level
+                        OR (r.origin = 'personal' AND EXCLUDED.origin = 'sql')
                         OR r.pending IS DISTINCT FROM EXCLUDED.pending
                         OR r.attributes_pending
                         OR (r.origin = 'api' AND $15::bool IS NOT NULL
@@ -1822,6 +1854,7 @@ impl MetadataClient {
             let removed: Vec<String> = sqlx::query_scalar(
                 "DELETE FROM neon_roles
                  WHERE endpoint_id = $1 AND name = ANY($2) AND origin <> 'owner'
+                   AND origin <> 'personal'
                    AND (forwarded_at IS NULL OR forwarded_at <= now() - interval '10 seconds')
                  RETURNING name",
             )

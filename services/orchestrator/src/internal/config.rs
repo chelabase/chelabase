@@ -29,6 +29,9 @@ pub struct InternalConfig {
     /// carries it. `None` when unset ([`Self::member_logins`] refuses to start); read raw, so an
     /// empty value is `Some([])`, "no address rule".
     pub member_login_cidrs: Option<Vec<String>>,
+    /// `CHELABASE_REALTIME_LOGIN_CIDRS`: where `chelabase_realtime` logins come from, read raw
+    /// like [`Self::member_login_cidrs`] ([`Self::realtime_logins`] refuses to start when unset).
+    pub realtime_login_cidrs: Option<Vec<String>>,
     /// `CHELABASE_CONTROL_PLANE_URI`: how computes reach this listener; the DDL receiver's URL
     /// (`neon.console_url`) is built from it.
     pub control_plane_uri: String,
@@ -107,6 +110,9 @@ impl InternalConfig {
             )),
             member_login_cidrs: get("CHELABASE_MEMBER_LOGIN_CIDRS")
                 .map(|raw| chelabase_neon::spec::parse_member_login_cidrs(Some(&raw)))
+                .transpose()?,
+            realtime_login_cidrs: get("CHELABASE_REALTIME_LOGIN_CIDRS")
+                .map(|raw| chelabase_neon::spec::parse_realtime_login_cidrs(Some(&raw)))
                 .transpose()?,
             control_plane_uri: check_control_plane_uri(or(
                 "CHELABASE_CONTROL_PLANE_URI",
@@ -190,6 +196,16 @@ impl InternalConfig {
             Some(cidrs) => Ok(chelabase_neon::spec::MemberLogins::orchestrator(cidrs.clone())),
             None => chelabase_neon::spec::parse_member_login_cidrs(None)
                 .map(chelabase_neon::spec::MemberLogins::orchestrator),
+        }
+    }
+
+    /// What every compute's spec says about realtime logins: the configured CIDRs and realtime's
+    /// certificate CN. Unset `CHELABASE_REALTIME_LOGIN_CIDRS` is the startup error.
+    pub fn realtime_logins(&self) -> Result<chelabase_neon::spec::MemberLogins> {
+        match &self.realtime_login_cidrs {
+            Some(cidrs) => Ok(chelabase_neon::spec::MemberLogins::realtime(cidrs.clone())),
+            None => chelabase_neon::spec::parse_realtime_login_cidrs(None)
+                .map(chelabase_neon::spec::MemberLogins::realtime),
         }
     }
 

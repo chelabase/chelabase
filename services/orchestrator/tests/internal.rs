@@ -803,6 +803,8 @@ struct FakeLocator {
     controls: Arc<Mutex<HashMap<String, SocketAddr>>>,
     broken: Arc<Mutex<bool>>,
     pg: Arc<Mutex<HashMap<String, SocketAddr>>>,
+    /// F2: `address` and `control_addr` never answer, like a hung Docker daemon.
+    hang: Arc<Mutex<bool>>,
 }
 
 impl FakeLocator {
@@ -819,11 +821,19 @@ impl FakeLocator {
 
 impl ComputeLocator for FakeLocator {
     async fn address(&self, ep: &str) -> anyhow::Result<Option<IpAddr>> {
+        let hang = *self.hang.lock().unwrap();
+        if hang {
+            std::future::pending::<()>().await;
+        }
         anyhow::ensure!(!*self.broken.lock().unwrap(), "docker is down");
         Ok(self.ips.lock().unwrap().get(ep).copied())
     }
 
     async fn control_addr(&self, ep: &str) -> anyhow::Result<Option<SocketAddr>> {
+        let hang = *self.hang.lock().unwrap();
+        if hang {
+            std::future::pending::<()>().await;
+        }
         anyhow::ensure!(!*self.broken.lock().unwrap(), "docker is down");
         Ok(self.controls.lock().unwrap().get(ep).copied())
     }
@@ -1007,6 +1017,10 @@ struct AppSetup {
     resync: FakeResync,
     mode: Mode,
     rt_events: FakeRtEvents,
+    /// C4 (SP11): the control-network locator behind the route's `replication_host`.
+    control: FakeLocator,
+    /// C4 (SP4): `InternalState.realtime_logins`.
+    realtime_logins: chelabase_neon::spec::MemberLogins,
 }
 
 impl Default for AppSetup {
@@ -1019,6 +1033,8 @@ impl Default for AppSetup {
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
             rt_events: FakeRtEvents::default(),
+            control: FakeLocator::default(),
+            realtime_logins: Default::default(),
         }
     }
 }
@@ -1138,6 +1154,8 @@ async fn spawn_with_app(
         app_jobs: Arc::new(app.jobs),
         policy: chelabase_types::mode_policy::ModePolicy::new(app.mode),
         member_logins: Default::default(),
+        control_locator: app.control,
+        realtime_logins: app.realtime_logins,
     });
     let addr = serve(build_internal_router(state)).await;
     Internal {
@@ -1511,28 +1529,66 @@ async fn the_spec_waits_for_the_storage_controller() {
 struct Configured(Arc<Mutex<Vec<(String, Value)>>>);
 
 async fn compute(status: u16) -> (SocketAddr, Configured) {
+    // C4 (SP1): the hook reads `/status` first; an ordinary compute is running and advertises
+    // nothing.
+    let (addr, seen, _) = compute_ctl(status, 200, json!({ "status": "running" })).await;
+    (addr, seen)
+}
+
+/// Everything `compute_ctl` stand-in received, in order: `"status"` and `"configure"`.
+type Events = Arc<Mutex<Vec<(&'static str, String)>>>;
+
+/// [`compute`] with `/status` answering `status_code` and `status_body` (C4, SP1); the third
+/// value logs each request (`"status"` / `"configure"`, with its `Authorization`).
+async fn compute_ctl(
+    configure: u16,
+    status_code: u16,
+    status_body: Value,
+) -> (SocketAddr, Configured, Events) {
     use axum::extract::State;
+    let events: Events = Events::default();
     let seen = Configured::default();
+    let status_events = events.clone();
+    let configure_events = events.clone();
+    let status = configure;
     let app = Router::new()
+        .route(
+            "/status",
+            get(move |headers: axum::http::HeaderMap| {
+                let (events, body) = (status_events.clone(), status_body.clone());
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_string())
+                        .unwrap_or_default();
+                    events.lock().unwrap().push(("status", auth));
+                    (AxumStatus::from_u16(status_code).unwrap(), axum::Json(body))
+                }
+            }),
+        )
         .route(
             "/configure",
             axum::routing::post(
                 move |State(seen): State<Configured>,
                       headers: axum::http::HeaderMap,
-                      body: axum::Json<Value>| async move {
-                    let auth = headers
-                        .get("authorization")
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .to_string();
-                    seen.0.lock().unwrap().push((auth, body.0));
-                    (AxumStatus::from_u16(status).unwrap(), "{}")
+                      body: axum::Json<Value>| {
+                    let configure_events = configure_events.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string();
+                        configure_events.lock().unwrap().push(("configure", auth.clone()));
+                        seen.0.lock().unwrap().push((auth, body.0));
+                        (AxumStatus::from_u16(status).unwrap(), "{}")
+                    }
                 },
             ),
         )
         .with_state(seen.clone());
-    (serve(app).await, seen)
+    (serve(app).await, seen, events)
 }
 
 fn attach(tenant: &str) -> String {
@@ -1995,6 +2051,8 @@ async fn connection_opens_the_authenticator_password() {
                 "max_connections": 7,
             },
             "databases": [{ "name": "web1", "default_schema": "app" }],
+            // C4 (SP11): no control-network address found, so null; the rest is unchanged.
+            "replication_host": null,
         })
     );
 
@@ -3809,6 +3867,8 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
             rt_events: rt_events.clone(),
+            control: FakeLocator::default(),
+            realtime_logins: Default::default(),
         },
     )
     .await;
@@ -5151,4 +5211,524 @@ async fn webhook_member_user_events_publish_an_access_event() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(a.rt_events.access.lock().unwrap().len(), kinds.len());
+}
+
+// ---- Fork round 4, C4 (RT4-2, SP1, SP4, SP11, SP23) ----
+//
+// Kept apart from the rest of the file (C3 edits it too, SP20): the spec hook reads
+// `Compute-Capabilities`, the storcon-notify reconfigure asks compute_ctl's `/status` first, and
+// the connection route gains `replication_host`.
+
+mod c4 {
+    use super::*;
+    use axum::http::{HeaderName, HeaderValue};
+    use base64::Engine as _;
+    use chelabase_neon::spec::MemberLogins;
+
+    const CAPS: &str = "compute-capabilities";
+    const REFRESH: &str = "storage_token_refresh";
+
+    async fn spawn(
+        neon: FakeNeon,
+        locator: FakeLocator,
+        control: FakeLocator,
+        realtime_logins: MemberLogins,
+    ) -> Internal {
+        spawn_with_app(
+            neon,
+            locator,
+            &storcon(true).await,
+            rules(Mode::SelfHosted, false),
+            FakeCache::default(),
+            "http://127.0.0.1:9",
+            AppSetup { control, realtime_logins, ..AppSetup::default() },
+        )
+        .await
+    }
+
+    /// A compute_ctl spec fetch with these `Compute-Capabilities` header lines (raw bytes, in
+    /// order); the spec body.
+    async fn fetch(app: &Internal, lines: &[&[u8]]) -> Value {
+        let mut req = app
+            .http
+            .get(format!("{}{}", app.base, spec_path("ep-a")))
+            .bearer_auth(COMPUTE_TOKEN);
+        for line in lines {
+            req = req.header(
+                HeaderName::from_static(CAPS),
+                HeaderValue::from_bytes(line).unwrap(),
+            );
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "a spec is served whatever the header says");
+        resp.json().await.unwrap()
+    }
+
+    /// The claims of a JWT, unverified.
+    fn claims(token: &str) -> Value {
+        let payload = token.split('.').nth(1).expect("a JWT");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn app_neon() -> FakeNeon {
+        let neon = FakeNeon::default();
+        neon.add("ep-a", TENANT, TIMELINE);
+        neon
+    }
+
+    /// The spec's storage token: `Some(expiring?)`.
+    fn expiring(spec: &Value) -> bool {
+        let token = spec["spec"]["storage_auth_token"].as_str().expect("a storage token");
+        let c = claims(token);
+        assert_eq!(c["scope"], "tenant", "{c}");
+        assert_eq!(c["tenant_id"], TENANT, "{c}");
+        match c.get("exp") {
+            Some(exp) => {
+                let (exp, iat) = (exp.as_u64().unwrap(), c["iat"].as_u64().expect("iat with exp"));
+                assert_eq!(exp - iat, 86_400, "the 24 h lifetime: {c}");
+                true
+            }
+            None => {
+                assert!(c.get("iat").is_none(), "today's token has neither exp nor iat: {c}");
+                false
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compute_that_advertises_the_refresh_gets_an_expiring_token() {
+        let app = spawn(app_neon(), FakeLocator::default(), FakeLocator::default(), Default::default()).await;
+        assert!(expiring(&fetch(&app, &[REFRESH.as_bytes()]).await));
+    }
+
+    #[tokio::test]
+    async fn no_header_means_not_capable() {
+        let app = spawn(app_neon(), FakeLocator::default(), FakeLocator::default(), Default::default()).await;
+        assert!(!expiring(&fetch(&app, &[]).await), "an old compute_ctl sends no header");
+    }
+
+    // SP23: every value of the header (`get_all`), joined, split on `,`, trimmed, compared
+    // exactly and case-sensitively.
+    #[tokio::test]
+    async fn the_header_is_read_as_a_comma_list_across_all_its_lines() {
+        let app = spawn(app_neon(), FakeLocator::default(), FakeLocator::default(), Default::default()).await;
+        for (lines, capable) in [
+            (vec![&b" other , storage_token_refresh "[..]], true),
+            (vec![&b"other"[..], &b"storage_token_refresh"[..]], true),
+            (vec![&b"storage_token_refresh"[..], &b"other"[..]], true),
+            (vec![&b"x,storage_token_refresh,y"[..]], true),
+            (vec![&b""[..]], false),
+            (vec![&b"other"[..]], false),
+            (vec![&b"storage_token_refresh_v2"[..]], false),
+            (vec![&b"Storage_Token_Refresh"[..]], false),
+            (vec![&b"storage_token"[..], &b"refresh"[..]], false),
+            // Not UTF-8: not capable (and the spec is still served).
+            (vec![&b"\xff\xfe"[..]], false),
+        ] {
+            assert_eq!(
+                expiring(&fetch(&app, &lines).await),
+                capable,
+                "{:?}",
+                lines.iter().map(|l| String::from_utf8_lossy(l).into_owned()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // SP4: the spec carries the orchestrator's configured realtime logins, not an interim empty
+    // list.
+    #[tokio::test]
+    async fn the_spec_carries_the_configured_realtime_logins() {
+        let logins = MemberLogins::realtime(vec!["10.213.4.12/32".into(), "10.213.4.11/32".into()]);
+        let app = spawn(app_neon(), FakeLocator::default(), FakeLocator::default(), logins).await;
+        let spec = fetch(&app, &[]).await;
+        assert_eq!(
+            spec["spec"]["realtime_logins"],
+            json!({ "allowed_cidrs": ["10.213.4.12/32", "10.213.4.11/32"], "client_cns": ["chelabase-realtime"] })
+        );
+        // An empty list stays empty ("no address rule"), still with the CN.
+        let app = spawn(app_neon(), FakeLocator::default(), FakeLocator::default(), MemberLogins::realtime(vec![])).await;
+        let spec = fetch(&app, &[]).await;
+        assert_eq!(
+            spec["spec"]["realtime_logins"],
+            json!({ "allowed_cidrs": [], "client_cns": ["chelabase-realtime"] })
+        );
+    }
+
+    // ---- the storcon-notify reconfigure (SP1) ----
+
+    fn caps(list: &[&str]) -> Value {
+        json!({ "status": "running", "capabilities": list })
+    }
+
+    /// One endpoint with a running compute_ctl stand-in; the notify-attach answer and what the
+    /// compute received.
+    async fn notify(status: (u16, Value), logins: MemberLogins) -> (u16, Configured, Events) {
+        let neon = app_neon();
+        let (addr, seen, events) = compute_ctl(200, status.0, status.1).await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(addr));
+        let app = spawn(neon, locator, FakeLocator::default(), logins).await;
+        let code = app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await;
+        (code, seen, events)
+    }
+
+    #[tokio::test]
+    async fn a_capable_compute_is_reconfigured_with_an_expiring_token() {
+        let (code, seen, _) = notify((200, caps(&[REFRESH])), Default::default()).await;
+        assert_eq!(code, 200);
+        let seen = seen.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(expiring(&seen[0].1), "capability read from /status");
+    }
+
+    #[tokio::test]
+    async fn an_incapable_or_old_compute_keeps_a_non_expiring_token() {
+        for status in [
+            caps(&[]),
+            caps(&["something_else"]),
+            // An old compute_ctl: no `capabilities` at all.
+            json!({ "status": "running" }),
+        ] {
+            let (code, seen, events) = notify((200, status.clone()), Default::default()).await;
+            assert_eq!(code, 200, "{status}");
+            let order: Vec<_> = events.lock().unwrap().iter().map(|(w, _)| *w).collect();
+            assert_eq!(order, ["status", "configure"], "{status}: the report is read first");
+            let seen = seen.0.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{status}");
+            assert!(!expiring(&seen[0].1), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_reconfigure_reads_the_status_before_it_pushes() {
+        let (code, _, events) = notify((200, caps(&[REFRESH])), Default::default()).await;
+        assert_eq!(code, 200);
+        let events = events.lock().unwrap().clone();
+        let order: Vec<_> = events.iter().map(|(what, _)| *what).collect();
+        assert_eq!(order, ["status", "configure"]);
+        for (what, auth) in events {
+            assert!(auth.starts_with("Bearer "), "{what} carries the compute's control token");
+        }
+    }
+
+    // A failed report fails that reconfigure like a failed push (the storage controller then
+    // retries): never a silent push with a non-expiring token.
+    #[tokio::test]
+    async fn a_failed_status_report_fails_the_reconfigure_and_pushes_nothing() {
+        for status in [
+            (500, json!({ "error": "boom" })),
+            (404, json!({})),
+            (401, json!({})),
+            // 200 but not a status.
+            (200, json!("not a status")),
+        ] {
+            let (code, seen, events) = notify(status.clone(), Default::default()).await;
+            assert_eq!(code, 503, "{status:?}: the storage controller retries a 503");
+            assert!(seen.0.lock().unwrap().is_empty(), "{status:?}: nothing was pushed");
+            let order: Vec<_> = events.lock().unwrap().iter().map(|(w, _)| *w).collect();
+            assert_eq!(order, ["status"], "{status:?}");
+        }
+    }
+
+    // The hook and the spec fetch use one `SpecPolicy`: the same realtime logins.
+    #[tokio::test]
+    async fn the_reconfigure_pushes_the_configured_realtime_logins() {
+        let logins = MemberLogins::realtime(vec!["10.213.4.12/32".into()]);
+        let (code, seen, _) = notify((200, caps(&[REFRESH])), logins).await;
+        assert_eq!(code, 200);
+        let seen = seen.0.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].1["spec"]["realtime_logins"],
+            json!({ "allowed_cidrs": ["10.213.4.12/32"], "client_cns": ["chelabase-realtime"] })
+        );
+    }
+
+    // One endpoint's failed report doesn't stop the others (as one failing push, round 3).
+    #[tokio::test]
+    async fn one_failing_status_does_not_stop_the_other_computes() {
+        let neon = FakeNeon::default();
+        neon.add("ep-a", TENANT, TIMELINE);
+        neon.add("ep-b", TENANT, "33333333333333333333333333333333");
+        let (bad, bad_seen, _) = compute_ctl(200, 500, json!({})).await;
+        let (good, good_seen, _) = compute_ctl(200, 200, caps(&[REFRESH])).await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(bad));
+        locator.running("ep-b", "172.20.0.10", Some(good));
+        let app = spawn(neon, locator, FakeLocator::default(), Default::default()).await;
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await, 503);
+        assert!(bad_seen.0.lock().unwrap().is_empty());
+        assert_eq!(good_seen.0.lock().unwrap().len(), 1, "ep-b was still reconfigured");
+    }
+
+    // A compute that isn't running is still skipped without a report.
+    #[tokio::test]
+    async fn a_compute_that_is_not_running_gets_no_status_call() {
+        let neon = app_neon();
+        let (_addr, seen, events) = compute_ctl(200, 200, caps(&[REFRESH])).await;
+        let app = spawn(neon, FakeLocator::default(), FakeLocator::default(), Default::default()).await;
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await, 200);
+        assert!(seen.0.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    // ---- the connection route's `replication_host` (SP11) ----
+
+    async fn connection_with(control: FakeLocator) -> (u16, Value) {
+        let neon = FakeNeon::default();
+        let locator = FakeLocator::default();
+        let app = spawn(neon.clone(), locator.clone(), control, Default::default()).await;
+        locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+        let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+        row.authenticator_password_enc = Some(seal_credential(
+            &app.key,
+            &row.branch_id.to_string(),
+            Purpose::Authenticator,
+            "auth-pw",
+        ));
+        neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+        app.get(
+            &format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()),
+            Some(REST_TOKEN),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_connection_route_gives_the_computes_control_network_address() {
+        let control = FakeLocator::default();
+        control.running("ep-1", "10.213.4.20", None);
+        let (code, body) = connection_with(control).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["replication_host"], "10.213.4.20", "the IP alone, as a string: {body}");
+        // `host` is still the compute-network address that rest and the check pools dial.
+        assert_eq!(body["host"], "127.0.0.1");
+        assert_eq!(body["port"], 55432);
+        assert_eq!(body["server_name"], "ep-1.compute.chelabase.internal");
+    }
+
+    #[tokio::test]
+    async fn a_missing_control_address_is_null_and_the_rest_is_unchanged() {
+        // The control locator finds nothing for the endpoint.
+        let (code, body) = connection_with(FakeLocator::default()).await;
+        assert_eq!(code, 200, "{body}");
+        assert!(body["replication_host"].is_null(), "{body}");
+        assert!(body.as_object().unwrap().contains_key("replication_host"), "null, not absent: {body}");
+        assert_eq!(body["host"], "127.0.0.1");
+        assert_eq!(body["user"], "authenticator");
+        assert_eq!(body["status"], "ready");
+    }
+
+    // A control-locator failure (Docker down on that network) must not turn rest's answer
+    // into a 409 or a 5xx.
+    #[tokio::test]
+    async fn a_failing_control_locator_is_null_never_a_409() {
+        let control = FakeLocator::default();
+        control.running("ep-1", "10.213.4.20", None);
+        *control.broken.lock().unwrap() = true;
+        let (code, body) = connection_with(control).await;
+        assert_eq!(code, 200, "{body}");
+        assert!(body.as_object().unwrap().contains_key("replication_host"), "null, not absent: {body}");
+        assert!(body["replication_host"].is_null(), "{body}");
+        assert_eq!(body["host"], "127.0.0.1");
+        assert_eq!(body["password"], "auth-pw");
+        assert_eq!(body["status"], "ready");
+    }
+}
+
+/// Fork round 4, final fix round (F2, part 3): the storage-controller hook answers before the
+/// storage controller gives up (10 s) whatever a compute_ctl does, never pushes a spec to a
+/// compute other than the one whose status it read, and the connection route answers without
+/// waiting on a hung control-network lookup.
+mod f2 {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The storage controller's hook timeout; the hook must answer well within it.
+    const HOOK_ANSWER_WITHIN: Duration = Duration::from_secs(9);
+
+    /// What a compute_ctl stand-in does on each route.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Answer {
+        Running,
+        Hang,
+    }
+
+    /// A compute_ctl stand-in: `/status` and `/configure` answer or hang; `on_status` runs on
+    /// each `/status` before it answers. The number of `/configure` requests it got.
+    async fn stand_in(
+        status: Answer,
+        configure: Answer,
+        on_status: Arc<dyn Fn() + Send + Sync>,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let configured = Arc::new(AtomicUsize::new(0));
+        let seen = configured.clone();
+        let app = Router::new()
+            .route(
+                "/status",
+                get(move || {
+                    let on_status = on_status.clone();
+                    async move {
+                        on_status();
+                        if status == Answer::Hang {
+                            std::future::pending::<()>().await;
+                        }
+                        axum::Json(json!({ "status": "running", "capabilities": ["storage_token_refresh"] }))
+                    }
+                }),
+            )
+            .route(
+                "/configure",
+                axum::routing::post(move || {
+                    let seen = seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        if configure == Answer::Hang {
+                            std::future::pending::<()>().await;
+                        }
+                        (AxumStatus::OK, "{}")
+                    }
+                }),
+            );
+        (serve(app).await, configured)
+    }
+
+    fn nothing() -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(|| {})
+    }
+
+    /// One endpoint `ep-a` on [`TENANT`], its compute_ctl at `addr`; the notify-attach answer
+    /// and how long it took. Gives up after 12 s (the storage controller already did at 10 s).
+    async fn notify(locator: FakeLocator) -> (Option<u16>, Duration) {
+        let neon = FakeNeon::default();
+        neon.add("ep-a", TENANT, TIMELINE);
+        let app = spawn_internal(neon, locator, &storcon(true).await).await;
+        let started = Instant::now();
+        let code = tokio::time::timeout(
+            Duration::from_secs(12),
+            app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)),
+        )
+        .await
+        .ok();
+        (code, started.elapsed())
+    }
+
+    // A compute_ctl that never answers `/status` (hung, or a black-holed address): the hook
+    // answers 503 (the storage controller retries) before the storage controller's 10 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_status_read_still_answers_the_hook_in_time() {
+        let (addr, configured) = stand_in(Answer::Hang, Answer::Running, nothing()).await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(addr));
+        let (code, took) = notify(locator).await;
+        assert_eq!(code, Some(503), "answered after {took:?}");
+        assert!(took < HOOK_ANSWER_WITHIN, "the hook took {took:?}");
+        assert_eq!(configured.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_push_still_answers_the_hook_in_time() {
+        let (addr, configured) = stand_in(Answer::Running, Answer::Hang, nothing()).await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(addr));
+        let (code, took) = notify(locator).await;
+        assert_eq!(code, Some(503), "answered after {took:?}");
+        assert!(took < HOOK_ANSWER_WITHIN, "the hook took {took:?}");
+        assert_eq!(configured.load(Ordering::SeqCst), 1, "the push was tried");
+    }
+
+    // The compute is replaced while the hook reads its status (a restart onto another address):
+    // the spec built from the old compute's report is pushed to neither. The hook re-checks the
+    // compute's control address before the push; a different one is retried (503: the next try
+    // reads the new compute's status), none at all is "not running" (200: it pulls its spec at
+    // boot).
+    #[tokio::test]
+    async fn a_compute_replaced_between_status_and_push_gets_no_spec() {
+        for gone in [false, true] {
+            let (new_addr, new_configured) = stand_in(Answer::Running, Answer::Running, nothing()).await;
+            let locator = FakeLocator::default();
+            let swap = {
+                let locator = locator.clone();
+                Arc::new(move || {
+                    if gone {
+                        locator.controls.lock().unwrap().remove("ep-a");
+                    } else {
+                        locator.controls.lock().unwrap().insert("ep-a".into(), new_addr);
+                    }
+                }) as Arc<dyn Fn() + Send + Sync>
+            };
+            let (old_addr, old_configured) = stand_in(Answer::Running, Answer::Running, swap).await;
+            locator.running("ep-a", "172.20.0.9", Some(old_addr));
+
+            let (code, took) = notify(locator).await;
+
+            let case = if gone { "gone" } else { "moved" };
+            assert_eq!(old_configured.load(Ordering::SeqCst), 0, "{case}: the old compute got a push");
+            assert_eq!(
+                new_configured.load(Ordering::SeqCst),
+                0,
+                "{case}: the new compute got a spec built from the old one's status"
+            );
+            assert_eq!(code, Some(if gone { 200 } else { 503 }), "{case} after {took:?}");
+        }
+    }
+
+    // Nothing changed between the status read and the push: the push goes through as before.
+    #[tokio::test]
+    async fn an_unchanged_compute_is_still_reconfigured() {
+        let (addr, configured) = stand_in(Answer::Running, Answer::Running, nothing()).await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(addr));
+        let (code, _) = notify(locator).await;
+        assert_eq!(code, Some(200));
+        assert_eq!(configured.load(Ordering::SeqCst), 1);
+    }
+
+    // SP11's control-network lookup is bounded: a hung Docker on that network gives
+    // `replication_host: null` within 5 s, the rest of the answer unchanged.
+    #[tokio::test]
+    async fn a_hung_control_lookup_does_not_hold_up_the_connection_route() {
+        let neon = FakeNeon::default();
+        let locator = FakeLocator::default();
+        let control = FakeLocator::default();
+        control.running("ep-1", "10.213.4.20", None);
+        *control.hang.lock().unwrap() = true;
+        let app = spawn_with_app(
+            neon.clone(),
+            locator.clone(),
+            &storcon(true).await,
+            rules(Mode::SelfHosted, false),
+            FakeCache::default(),
+            "http://127.0.0.1:9",
+            AppSetup { control, ..AppSetup::default() },
+        )
+        .await;
+        let pg: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 55432).into();
+        locator.pg.lock().unwrap().insert("ep-1".into(), pg);
+        let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+        row.authenticator_password_enc = Some(seal_credential(
+            &app.key,
+            &row.branch_id.to_string(),
+            Purpose::Authenticator,
+            "auth-pw",
+        ));
+        neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+
+        let started = Instant::now();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(12),
+            app.get(
+                &format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()),
+                Some(REST_TOKEN),
+            ),
+        )
+        .await;
+        let took = started.elapsed();
+        let (code, body) = answer.unwrap_or_else(|_| panic!("no answer within 12 s"));
+        assert!(took < Duration::from_secs(6), "the route took {took:?}");
+        assert_eq!(code, 200, "{body}");
+        assert!(body["replication_host"].is_null(), "{body}");
+        assert_eq!(body["port"], 55432);
+        assert_eq!(body["password"], "auth-pw");
+    }
 }

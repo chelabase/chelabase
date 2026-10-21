@@ -221,40 +221,53 @@ grep -q -- '--user health' <<<"$valkey_hc" && grep -q '/run/valkey-health.passwo
 # S6: the proxy's Valkey password and its control-plane token come from narrow mounts through an
 # entrypoint wrapper; its flags stay in `command`.
 proxy_entry="$(q '.services.proxy.entrypoint // [] | join(" ")')"
-grep -q 'cat /run/valkey-proxy.password' <<<"$proxy_entry" || fail "the proxy reads its Valkey password from /run/valkey-proxy.password"
-grep -q -- '--redis-plain=redis://proxy:' <<<"$proxy_entry" || fail "the proxy logs in to Valkey as proxy"
-grep -q '@valkey:6379' <<<"$proxy_entry" || fail "the proxy dials valkey:6379"
-grep -q 'NEON_PROXY_TO_CONTROLPLANE_TOKEN' <<<"$proxy_entry" && grep -q 'cat /run/proxy-api.token' <<<"$proxy_entry" ||
+# Fork round 4 (K8, C5): the Valkey password is read by the proxy itself from its mount
+# (--redis-plain-password-file), so it is in no argument and no shell substitution.
+proxy_flags="$(q '.services.proxy | [(.entrypoint // [])[], (.command // [])[]] | join(" ")')"
+grep -q -- '--redis-plain=redis://proxy@valkey:6379' <<<"$proxy_flags" || fail "the proxy logs in to Valkey as proxy, dialing valkey:6379, with no password in the URL; got: $proxy_flags"
+grep -q -- '--redis-plain-password-file=/run/valkey-proxy.password' <<<"$proxy_flags" || fail "the proxy reads its Valkey password from /run/valkey-proxy.password (--redis-plain-password-file)"
+! grep -q 'cat /run/valkey-proxy.password' <<<"$proxy_entry" || fail "the proxy's entrypoint no longer cats its Valkey password"
+grep -q -- '--control-plane-token-file=/run/proxy-api.token' <<<"$proxy_entry" && ! grep -q 'NEON_PROXY_TO_CONTROLPLANE_TOKEN' <<<"$proxy_entry" ||
   fail "the proxy's control-plane token comes from /run/proxy-api.token"
 ! grep -q -- '--redis-plain' <<<"$(q '.services.proxy.command[]')" || fail "no unauthenticated --redis-plain left in the proxy's command"
 q '.services.proxy.command[]' | grep -qx -- '--redis-auth-type=plain' || fail "the proxy keeps --redis-auth-type=plain"
 storcon_entry="$(q '.services["storage-controller"].entrypoint // [] | join(" ")')"
-# RT1 final fix round: through the environment (CONTROL_PLANE_JWT_TOKEN, which the storage
-# controller reads when the flag is absent), never `--control-plane-jwt-token=` on its command
-# line (compose-secret-argv.sh).
-grep -qE 'export CONTROL_PLANE_JWT_TOKEN="\$\$\(cat /run/storcon-hook.token\)"' <<<"$storcon_entry" ||
-  fail "the storage controller's hook token comes from /run/storcon-hook.token through CONTROL_PLANE_JWT_TOKEN; got: $storcon_entry"
-! grep -q -- '--control-plane-jwt-token' <<<"$storcon_entry" ||
+storcon_flags="$(q '.services["storage-controller"] | [(.entrypoint // [])[], (.command // [])[]] | join(" ")')"
+# Fork round 4 (F6): the storage controller reads its hook token from its mount itself
+# (--control-plane-jwt-token-file), never through CONTROL_PLANE_JWT_TOKEN in its environment
+# and never as `--control-plane-jwt-token=` on its command line (compose-secret-argv.sh).
+grep -q -- '--control-plane-jwt-token-file=/run/storcon-hook.token' <<<"$storcon_flags" ||
+  fail "the storage controller's hook token comes from /run/storcon-hook.token (--control-plane-jwt-token-file); got: $storcon_flags"
+! grep -q 'CONTROL_PLANE_JWT_TOKEN' <<<"$storcon_flags" ||
+  fail "the storage controller's hook token is no longer in CONTROL_PLANE_JWT_TOKEN"
+! grep -qE -- '--control-plane-jwt-token([= ]|$)' <<<"$storcon_flags" ||
   fail "the storage controller's hook token is on its command line (--control-plane-jwt-token)"
-! grep -q -- '--control-plane-jwt-token' <<<"$(q '.services["storage-controller"].command[]')" ||
-  fail "no hook token literal left in the storage controller's command"
 
 # --- RT1 T1 (user, storage auth): NeonJWT on the pageserver and safekeeper, no --dev ----------
 # Tokens are signed with the compute-JWT key pair; the Neon binaries verify them against its SPKI
 # PEM (<keys>/neon/compute-jwt.pub.pem) and present the scoped tokens the workbench renders
 # into <keys>/neon/storage-tokens/ (storage_controller/src/main.rs Secrets, pageserver
-# NEON_AUTH_TOKEN and control_plane_api_token, safekeeper --auth-token-path).
+# --auth-token-file and control_plane_api_token, safekeeper --auth-token-path).
 storcon_all="$(q '.services["storage-controller"] | [(.entrypoint // [])[], (.command // [])[]] | join(" ")')"
 ! grep -qw -- '--dev' <<<"$storcon_all" || fail "the storage controller runs without --dev (strict mode)"
-for pair in PUBLIC_KEY:/run/storage-auth.pub.pem PAGESERVER_JWT_TOKEN:/run/pageserver-api.jwt SAFEKEEPER_JWT_TOKEN:/run/safekeeper-data.jwt; do
-  grep -q "${pair%%:*}" <<<"$storcon_entry" && grep -q "cat ${pair#*:}" <<<"$storcon_entry" ||
-    fail "the storage controller's ${pair%%:*} comes from ${pair#*:}"
+# The public key (no secret) may stay in PUBLIC_KEY; the tokens are read by the controller
+# itself from their mounts (F6), never through its environment.
+grep -q PUBLIC_KEY <<<"$storcon_entry" && grep -q "cat /run/storage-auth.pub.pem" <<<"$storcon_entry" ||
+  fail "the storage controller's PUBLIC_KEY comes from /run/storage-auth.pub.pem"
+for pair in pageserver-jwt-token-file:/run/pageserver-api.jwt safekeeper-jwt-token-file:/run/safekeeper-data.jwt \
+  control-plane-jwt-token-file:/run/storcon-hook.token; do
+  grep -qF -- "--${pair%%:*}=${pair#*:}" <<<"$storcon_all" ||
+    fail "the storage controller reads --${pair%%:*}=${pair#*:}"
+done
+for gone in PAGESERVER_JWT_TOKEN SAFEKEEPER_JWT_TOKEN; do
+  ! grep -q "$gone" <<<"$storcon_all" || fail "the storage controller no longer gets $gone in its environment"
 done
 ps_all="$(q '.services.pageserver | [(.entrypoint // [])[], (.command // [])[]] | join(" ")')"
 for want in "http_auth_type='NeonJWT'" "pg_auth_type='NeonJWT'" "auth_validation_public_key_path='/run/storage-auth.pub.pem'" \
-  "control_plane_api_token" "/run/generations-api.jwt" "NEON_AUTH_TOKEN" "/run/safekeeper-data.jwt"; do
+  "control_plane_api_token" "/run/generations-api.jwt" "--auth-token-file=/run/safekeeper-data.jwt"; do
   grep -qF -- "$want" <<<"$ps_all" || fail "the pageserver's config has $want"
 done
+! grep -q NEON_AUTH_TOKEN <<<"$ps_all" || fail "the pageserver no longer gets NEON_AUTH_TOKEN in its environment"
 # User, 2026-10-16: three safekeepers, so the storage controller's strict mode (no --dev) accepts
 # --timeline-safekeeper-count=3 (storage_controller/src/main.rs:397). No fork change.
 grep -q -- '--timeline-safekeeper-count=3' <<<"$storcon_all" || fail "the storage controller places every timeline on 3 safekeepers"
@@ -304,8 +317,14 @@ for dep in nats valkey; do
   [[ "$(q ".services.realtime.depends_on.$dep.condition // empty")" == service_healthy ]] || fail "realtime waits for a healthy $dep"
 done
 # P4: realtime dials computes (T8's replication and check connections) on the compute network.
-[[ "$(q '.services.realtime.networks | keys | sort | join(" ")')" == "compute default" ]] ||
-  fail "realtime is on the default and compute networks only"
+# Fork round 4 (C4, C5, SP10): realtime logs in to a compute as chelabase_realtime over the control
+# network, from a static address outside the computes' ip_range (so no compute can take it).
+[[ "$(q '.services.realtime.networks | keys | sort | join(" ")')" == "compute control default" ]] ||
+  fail "realtime is on the default, control and compute networks only"
+[[ "$(q '.services.realtime.networks.control.ipv4_address')" == 10.213.4.12 ]] ||
+  fail "realtime's static control address is \${CHELABASE_REALTIME_CONTROL_IP} (10.213.4.12)"
+[[ "$(q '.services.realtime.networks.control.ipv4_address')" == "$(sed -n 's/^CHELABASE_REALTIME_CONTROL_IP=//p' "$fixture")" ]] ||
+  fail "realtime's control address comes from CHELABASE_REALTIME_CONTROL_IP"
 # S1: realtime's own credentials and secrets, as files, in its own environment.
 want_env realtime CHELABASE_NATS_USER realtime
 want_env realtime CHELABASE_NATS_PASSWORD_FILE "$K/nats/realtime.password"
@@ -315,6 +334,36 @@ want_env realtime CHELABASE_VALKEY_PASSWORD_FILE "$K/valkey/realtime.password"
 for f in PG_PASSWORD:pg.password TICKET_KEY:ticket.key INTERNAL_TOKEN:internal.token; do
   want_env realtime "CHELABASE_REALTIME_${f%%:*}_FILE" "$K/realtime/${f#*:}"
 done
+# Fork round 4: the realtime client pair (realtime-tls/current), the CIDR list and the storage
+# token refresh interval, per service. A setting of stack.env reaches a service through its
+# env_file; eff_env is a service's environment, else stack.env's value when it reads stack.env.
+eff_env() { # eff_env <service> <key>
+  local v
+  v="$(env_of "$1" "$2")"
+  if [[ -z "$v" ]] && q ".services[\"$1\"].env_file[]? | if type == \"object\" then .path else . end" |
+    grep -qx /m/.chelabase/stacks/feat-x/env/stack.env; then
+    v="$(sed -n "s/^$2=//p" "$fixture")"
+  fi
+  printf '%s' "$v"
+}
+want_eff() { # want_eff <service> <key> <value>
+  [[ "$(eff_env "$1" "$2")" == "$3" ]] || fail "$1: $2 must be $3, got '$(eff_env "$1" "$2")'"
+}
+want_eff orchestrator CHELABASE_REALTIME_LOGIN_CIDRS "10.213.4.12/32,10.213.4.11/32"
+want_eff worker CHELABASE_REALTIME_LOGIN_CIDRS "10.213.4.12/32,10.213.4.11/32"
+want_eff runner CHELABASE_REALTIME_LOGIN_CIDRS "10.213.4.12/32,10.213.4.11/32"
+for s in realtime worker runner; do
+  want_eff "$s" CHELABASE_REALTIME_TLS_DIR "$K/realtime-tls"
+done
+[[ -n "$(env_of worker CHELABASE_STORAGE_TOKEN_REFRESH_SECS)" ]] ||
+  fail "worker: CHELABASE_STORAGE_TOKEN_REFRESH_SECS is set in its environment"
+rt_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/realtime-tls")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/realtime-tls" and .read_only == true))"] | sort | join(" ")')"
+[[ "$rt_mounts" == "realtime:true runner:true worker:false" ]] ||
+  fail "realtime-tls: rw for the worker (it renews the pair), ro for realtime and the runner, nobody else; got: $rt_mounts"
+[[ "$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .target == "/m/.chelabase/realtime-tls" and .type == "bind" and .source == .target)) | .key] | length')" == 3 ]] ||
+  fail "realtime-tls is mounted at its own path"
+mt_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/neon/storage-tokens/metrics.token")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/neon/storage-tokens/metrics.token" and .read_only == true))"] | sort | join(" ")')"
+[[ "$mt_mounts" == "runner:true" ]] || fail "metrics.token: read-only for the runner, nobody else; got: $mt_mounts"
 # S7: Valkey TLS is off in the stack (platform mode turns it on).
 [[ "$(env_of realtime CHELABASE_VALKEY_TLS)" == off ]] || fail "realtime: CHELABASE_VALKEY_TLS=off in the stack"
 echo "workbench-compose: ok"

@@ -85,6 +85,16 @@ pub struct WorkerConfig {
     /// `CHELABASE_MEMBER_LOGIN_CIDRS`: the addresses member logins may come from. `None` when
     /// unset ([`build`] refuses to start); empty means no address rule.
     pub member_login_cidrs: Option<Vec<String>>,
+    /// `CHELABASE_STORAGE_TOKEN_REFRESH_SECS` (default 3600, whole seconds, 1 to 43200,
+    /// half the 24 h token lifetime): how often computes get a fresh storage token.
+    pub storage_token_refresh_every: Duration,
+    /// `CHELABASE_REALTIME_LOGIN_CIDRS`: the addresses `chelabase_realtime` may log in from.
+    /// `None` when unset ([`WorkerConfig::realtime_logins`] refuses); empty means no address
+    /// rule.
+    pub realtime_login_cidrs: Option<Vec<String>>,
+    /// `CHELABASE_REALTIME_TLS_DIR` (default `.chelabase/realtime-tls`): where the worker
+    /// writes realtime's client pair.
+    pub realtime_tls_dir: PathBuf,
     /// `CHELABASE_REALTIME_PG_PASSWORD_FILE` (RT1 T5, S1): the `chelabase_realtime` role's
     /// password, read by [`build`]. `None` when unset or blank.
     pub realtime_pg_password_file: Option<PathBuf>,
@@ -172,16 +182,50 @@ impl WorkerConfig {
                 None => None,
                 Some(raw) => Some(chelabase_neon::spec::parse_member_login_cidrs(Some(&raw))?),
             },
+            storage_token_refresh_every: storage_token_refresh_every(non_blank(
+                &get,
+                "CHELABASE_STORAGE_TOKEN_REFRESH_SECS",
+            ))?,
+            realtime_login_cidrs: match get("CHELABASE_REALTIME_LOGIN_CIDRS") {
+                None => None,
+                Some(raw) => Some(chelabase_neon::spec::parse_realtime_login_cidrs(Some(&raw))?),
+            },
+            realtime_tls_dir: PathBuf::from(or_default(
+                "CHELABASE_REALTIME_TLS_DIR",
+                ".chelabase/realtime-tls",
+            )),
             realtime_pg_password_file: non_blank(&get, REALTIME_PG_PASSWORD_FILE)
                 .map(PathBuf::from),
         };
         check_control_plane_uri(&config.control_plane_uri)?;
+        // The sweep writes realtime's pair and the orchestrator's pair each into its own
+        // directory: one directory for both would make each pair replace the other.
+        if same_dir(&config.realtime_tls_dir, &config.compute_tls_dir) {
+            return Err(anyhow!(
+                "CHELABASE_REALTIME_TLS_DIR ({}) and CHELABASE_COMPUTE_TLS_DIR ({}) name the same \
+                 directory: realtime's client pair and the orchestrator's need one each",
+                config.realtime_tls_dir.display(),
+                config.compute_tls_dir.display()
+            ));
+        }
         if config.valkey_user.is_some() != config.valkey_password_file.is_some() {
             return Err(anyhow!(
                 "set both CHELABASE_VALKEY_USER and CHELABASE_VALKEY_PASSWORD_FILE, or neither"
             ));
         }
         Ok(config)
+    }
+
+    /// The spec's realtime logins; an unset `CHELABASE_REALTIME_LOGIN_CIDRS` is an error (a
+    /// missing setting must not silently mean "any address").
+    pub fn realtime_logins(&self) -> anyhow::Result<chelabase_neon::spec::MemberLogins> {
+        let cidrs = self.realtime_login_cidrs.clone().ok_or_else(|| {
+            anyhow!(
+                "CHELABASE_REALTIME_LOGIN_CIDRS is unset: set it to the addresses realtime's \
+                 logins come from (comma-separated CIDRs), or to an empty value for no address rule"
+            )
+        })?;
+        Ok(chelabase_neon::spec::MemberLogins::realtime(cidrs))
     }
 
     /// Requested, and in self-hosted mode: platform mode ignores the switch.
@@ -225,6 +269,36 @@ fn reconcile_every(name: &str, value: Option<String>) -> anyhow::Result<Duration
     match value.parse::<u64>() {
         Ok(secs) if (30..=86_400).contains(&secs) => Ok(Duration::from_secs(secs)),
         _ => Err(anyhow!("{name}={value:?}: expected whole seconds from 30 to 86400")),
+    }
+}
+
+/// Whether two directory settings name the same directory: by their real paths when both
+/// exist, otherwise (they may not exist yet) spelled alike once `.` components, repeated and
+/// trailing slashes are normalised away.
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::path::Component;
+    // Both exist: their real paths (`..`, symlinks, relative against absolute).
+    if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
+        return a == b;
+    }
+    let not_dot = |c: &Component<'_>| *c != Component::CurDir;
+    a.components().filter(not_dot).eq(b.components().filter(not_dot))
+}
+
+/// `CHELABASE_STORAGE_TOKEN_REFRESH_SECS`: whole seconds, above 0 and at most half the token's
+/// lifetime (`STORAGE_TOKEN_TTL`, 24 h): a pass that fails once still leaves a retry before the
+/// token expires.
+fn storage_token_refresh_every(value: Option<String>) -> anyhow::Result<Duration> {
+    const NAME: &str = "CHELABASE_STORAGE_TOKEN_REFRESH_SECS";
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(3600));
+    };
+    let max = chelabase_neon::jwt::STORAGE_TOKEN_TTL.as_secs() / 2;
+    match value.parse::<u64>() {
+        Ok(secs) if secs > 0 && secs <= max => Ok(Duration::from_secs(secs)),
+        _ => Err(anyhow!(
+            "{NAME}={value:?}: expected whole seconds from 1 to {max} (half a storage token's life)"
+        )),
     }
 }
 
@@ -319,6 +393,7 @@ pub fn build(
              from (comma-separated CIDRs), or to an empty value for no address rule"
         )
     })?;
+    let realtime_logins = config.realtime_logins()?;
     let ca = Arc::new(ComputeCa::load(&config.compute_ca_dir).with_context(|| {
         format!(
             "loading the compute CA from {} (CHELABASE_COMPUTE_CA_DIR; `just zitadel-bootstrap` creates it)",
@@ -402,7 +477,11 @@ pub fn build(
         cert_sweep: Some(crate::certs::CertSweep {
             ca,
             tls_dir: config.compute_tls_dir.clone(),
+            realtime_tls_dir: config.realtime_tls_dir.clone(),
         }),
+        realtime_logins,
+        storage_token_refresh_every: config.storage_token_refresh_every,
+        storage_token_failures: Default::default(),
         realtime_password,
     })
 }
@@ -740,6 +819,84 @@ mod tests {
     }
 
     use std::path::PathBuf;
+
+    #[test]
+    fn the_storage_token_refresh_interval_accepts_its_bounds() {
+        for ok in ["1", "43200"] {
+            let c = WorkerConfig::from_lookup(lookup(&[
+                IMAGE,
+                ("CHELABASE_STORAGE_TOKEN_REFRESH_SECS", ok),
+            ]))
+            .unwrap();
+            assert_eq!(c.storage_token_refresh_every, Duration::from_secs(ok.parse().unwrap()));
+        }
+    }
+
+    // F2 edge: a leading `./` names the same directory as the bare relative path.
+    #[test]
+    fn a_leading_dot_slash_still_names_the_same_directory() {
+        for (realtime, compute) in [("./tls", "tls"), ("tls", "./tls/"), ("././a/./b", "a/b")] {
+            let err = WorkerConfig::from_lookup(lookup(&[
+                IMAGE,
+                ("CHELABASE_REALTIME_TLS_DIR", realtime),
+                ("CHELABASE_COMPUTE_TLS_DIR", compute),
+            ]))
+            .map(|_| ())
+            .expect_err(realtime)
+            .to_string();
+            assert!(err.contains("CHELABASE_REALTIME_TLS_DIR"), "{err}");
+        }
+        // Relative and absolute spellings aren't resolved: they're different settings.
+        WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_REALTIME_TLS_DIR", "tls"),
+            ("CHELABASE_COMPUTE_TLS_DIR", "/tls"),
+        ]))
+        .unwrap();
+    }
+
+    // F2 round 2: when both directories exist, their real paths are compared, so another
+    // spelling of one directory (`..`, a symlink, an absolute and a relative path) is caught.
+    #[test]
+    fn existing_directories_are_compared_by_their_real_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let tls = root.path().join("tls");
+        std::fs::create_dir(&tls).unwrap();
+        std::fs::create_dir(root.path().join("other")).unwrap();
+        std::os::unix::fs::symlink(&tls, root.path().join("link")).unwrap();
+        let s = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+        let relative = {
+            let cwd = std::env::current_dir().unwrap();
+            let up = cwd.components().count() - 1;
+            let mut p = std::path::PathBuf::new();
+            for _ in 0..up {
+                p.push("..");
+            }
+            p.push(tls.strip_prefix("/").unwrap());
+            s(p)
+        };
+        for other in [
+            s(root.path().join("other/../tls")),
+            s(root.path().join("link")),
+            relative,
+        ] {
+            let err = WorkerConfig::from_lookup(lookup(&[
+                IMAGE,
+                ("CHELABASE_REALTIME_TLS_DIR", s(tls.clone()).as_str()),
+                ("CHELABASE_COMPUTE_TLS_DIR", other.as_str()),
+            ]))
+            .map(|_| ())
+            .expect_err(&other)
+            .to_string();
+            assert!(err.contains("CHELABASE_COMPUTE_TLS_DIR"), "{other}: {err}");
+        }
+        WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_REALTIME_TLS_DIR", s(tls.clone()).as_str()),
+            ("CHELABASE_COMPUTE_TLS_DIR", s(root.path().join("other")).as_str()),
+        ]))
+        .unwrap();
+    }
 
     #[test]
     fn config_reads_the_round_3_settings() {

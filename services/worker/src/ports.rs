@@ -1690,6 +1690,20 @@ pub trait SpecPusher: Send + Sync + 'static {
         control_addr: SocketAddr,
         endpoint_id: &str,
     ) -> impl Future<Output = anyhow::Result<chelabase_neon::reconfigure::ComputeCtlStatus>> + Send;
+    /// compute_ctl's status plus the capabilities it advertises (`GET /status`). An error
+    /// (unreachable, not a status) is never "no capability".
+    fn report(
+        &self,
+        control_addr: SocketAddr,
+        endpoint_id: &str,
+    ) -> impl Future<Output = anyhow::Result<chelabase_neon::reconfigure::ComputeCtlReport>> + Send;
+    /// Hands a running compute a new storage token (`POST /storage_token`), without a spec push.
+    fn push_storage_token(
+        &self,
+        control_addr: SocketAddr,
+        endpoint_id: &str,
+        token: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 /// [`SpecPusher`] over compute_ctl's `/configure`.
@@ -1724,5 +1738,35 @@ impl SpecPusher for HttpPusher {
     ) -> anyhow::Result<chelabase_neon::reconfigure::ComputeCtlStatus> {
         chelabase_neon::reconfigure::status(&self.http, control_addr, &self.signer, endpoint_id)
             .await
+    }
+
+    async fn report(
+        &self,
+        control_addr: SocketAddr,
+        endpoint_id: &str,
+    ) -> anyhow::Result<chelabase_neon::reconfigure::ComputeCtlReport> {
+        chelabase_neon::reconfigure::status_report(
+            &self.http,
+            control_addr,
+            &self.signer,
+            endpoint_id,
+        )
+        .await
+    }
+
+    async fn push_storage_token(
+        &self,
+        control_addr: SocketAddr,
+        endpoint_id: &str,
+        token: &str,
+    ) -> anyhow::Result<()> {
+        chelabase_neon::reconfigure::push_storage_token(
+            &self.http,
+            control_addr,
+            &self.signer,
+            endpoint_id,
+            token,
+        )
+        .await
     }
 }

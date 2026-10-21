@@ -26,11 +26,13 @@ universe='[
   "K/neon/compute-jwt.pem", "K/neon/compute-jwt.pub",
   "K/compute-ca/ca.crt", "K/compute-ca/ca.key",
   "K/orchestrator-tls/current/client.crt", "K/orchestrator-tls/current/client.key", "K/orchestrator-tls/current/ca.crt",
+  "K/realtime-tls/current/client.crt", "K/realtime-tls/current/client.key", "K/realtime-tls/current/ca.crt",
   "K/nats/orchestrator.password", "K/nats/worker.password", "K/nats/realtime.password", "K/nats/runner.password",
   "K/valkey/proxy.password", "K/valkey/control.password", "K/valkey/realtime.password", "K/valkey/runner.password",
   "K/valkey/health.password",
   "K/neon/compute-jwt.pub.pem", "K/neon/storage-tokens/pageserver-api.jwt", "K/neon/storage-tokens/safekeeper-data.jwt",
   "K/neon/storage-tokens/generations-api.jwt", "K/neon/storage-tokens/storcon-admin.jwt",
+  "K/neon/storage-tokens/metrics.token",
   "K/realtime/pg.password", "K/realtime/ticket.key", "K/realtime/internal.token",
   "K/tokens/rest-internal.token", "K/tokens/data-keys.token", "K/tokens/app-auth.token",
   "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
@@ -42,6 +44,9 @@ universe='[
 # service -> { path: mode }; every other (service, path) must be none.
 # RT1 T1 (S1, S27): each service sees its own NATS/Valkey password and the bearers it sends or
 # checks; the runner (the test harness, which also has the Docker socket) sees all of them.
+# Fork round 4 (C5): realtime sees the realtime client pair (realtime-tls, ro: it logs in to computes
+# with it), the worker renews it (rw), the runner reads it and the metrics token (ro). Nobody else
+# sees either.
 # RT1 T7 (S1): realtime sees the gateway's verify key (ticket requests), the platform CA's
 # certificate (T8's compute TLS), its NATS and Valkey passwords and its three realtime secrets.
 expected='{
@@ -60,6 +65,7 @@ expected='{
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/compute-ca/ca.crt": "rw", "K/compute-ca/ca.key": "rw",
     "K/orchestrator-tls/current/client.crt": "rw", "K/orchestrator-tls/current/client.key": "rw", "K/orchestrator-tls/current/ca.crt": "rw",
+    "K/realtime-tls/current/client.crt": "rw", "K/realtime-tls/current/client.key": "rw", "K/realtime-tls/current/ca.crt": "rw",
     "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro"
   },
   "gateway": {
@@ -84,6 +90,7 @@ expected='{
     "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
+    "K/realtime-tls/current/client.crt": "ro", "K/realtime-tls/current/client.key": "ro", "K/realtime-tls/current/ca.crt": "ro",
     "K/nats/realtime.password": "ro", "K/valkey/realtime.password": "ro",
     "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro"
   },
@@ -97,11 +104,13 @@ expected='{
     "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
     "K/compute-ca/ca.crt": "ro", "K/compute-ca/ca.key": "ro",
     "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
+    "K/realtime-tls/current/client.crt": "ro", "K/realtime-tls/current/client.key": "ro", "K/realtime-tls/current/ca.crt": "ro",
     "K/nats/orchestrator.password": "ro", "K/nats/worker.password": "ro", "K/nats/realtime.password": "ro", "K/nats/runner.password": "ro",
     "K/valkey/proxy.password": "ro", "K/valkey/control.password": "ro", "K/valkey/realtime.password": "ro", "K/valkey/runner.password": "ro",
     "K/valkey/health.password": "ro",
     "K/neon/compute-jwt.pub.pem": "ro", "K/neon/storage-tokens/pageserver-api.jwt": "ro", "K/neon/storage-tokens/safekeeper-data.jwt": "ro",
     "K/neon/storage-tokens/generations-api.jwt": "ro", "K/neon/storage-tokens/storcon-admin.jwt": "ro",
+    "K/neon/storage-tokens/metrics.token": "ro",
     "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
     "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use chelabase_neon::jwt::{PUBLIC_PEM_FILE, StorageScope};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::dev::stack_secrets::{NATS_USERS, VALKEY_USERS, create_private_dir, read_text};
 
@@ -359,7 +359,46 @@ pub fn write_storage_auth(keys: &Path) -> Result<()> {
         let token = signer.storage_token(scope)?;
         write_private(&dir.join(file), token.as_bytes())?;
     }
+    // The metrics token carries the clock (`iat`), so unlike the tokens above it is minted only
+    // when missing or empty: rewriting it on every `up` would rotate it for nothing. A kept file is
+    // left byte for byte and tightened to 0600.
+    let metrics = dir.join(METRICS_TOKEN_FILE);
+    if std::fs::metadata(&metrics).is_ok_and(|m| m.len() > 0) {
+        set_mode(&metrics, 0o600)?;
+    } else {
+        write_private(&metrics, signer.metrics_token(unix_now()?)?.as_bytes())?;
+    }
     Ok(())
+}
+
+/// The runner's metrics token under `<keys>/neon/storage-tokens/` (scope `metrics`, S17).
+pub const METRICS_TOKEN_FILE: &str = "metrics.token";
+
+fn unix_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("the clock is before the epoch")?
+        .as_secs())
+}
+
+/// Mints a metrics token at `now` into `<keys>/neon/storage-tokens/metrics.token`, replacing the
+/// kept one (rotation; `chelabase neon mint-metrics-token`). It needs the existing compute-JWT
+/// key pair and never creates one. Returns the file it wrote (0600).
+// The CLI goes through `mint_metrics_token_in` (CHELABASE_NEON_DIR); this keys-dir form is the pinned API.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn mint_metrics_token(keys: &Path, now: u64) -> Result<PathBuf> {
+    mint_metrics_token_in(&keys.join("neon"), now)
+}
+
+/// [`mint_metrics_token`] for a compute-JWT directory given directly (`CHELABASE_NEON_DIR`).
+pub fn mint_metrics_token_in(neon: &Path, now: u64) -> Result<PathBuf> {
+    let signer = chelabase_neon::jwt::load_signer(neon)?;
+    let token = signer.metrics_token(now)?;
+    let dir = neon.join("storage-tokens");
+    create_private_dir(&dir)?;
+    let path = dir.join(METRICS_TOKEN_FILE);
+    write_private(&path, token.as_bytes())?;
+    Ok(path)
 }
 
 /// Writes `contents` to `path` (0600) through a temporary file and a rename, so a reader never

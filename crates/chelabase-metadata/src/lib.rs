@@ -195,6 +195,16 @@ impl MetadataError {
         matches!(self, Self::Database(sqlx::Error::Database(e))
             if e.is_unique_violation() && e.constraint() == Some(constraint))
     }
+
+    /// [`MetadataClient::lock_endpoint`] gave up waiting: another job held the endpoint past
+    /// [`ENDPOINT_LOCK_TIMEOUT`], or no lock connection came free within it (the pool's
+    /// `PoolTimedOut`). Either way the endpoint is busy, not broken.
+    pub fn is_lock_wait_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::EndpointLockTimeout(_) | Self::Database(sqlx::Error::PoolTimedOut)
+        )
+    }
 }
 
 /// How [`MetadataClient::begin_delete`] ended.

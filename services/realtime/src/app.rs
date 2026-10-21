@@ -42,6 +42,7 @@ use crate::lease::ensure_buckets;
 use crate::owner::OwnerClient;
 use crate::pool::{CheckPools, ConnLookup};
 use crate::replication::{ReplicationSource, SourceDeps, SourceSettings};
+use crate::client_tls::ClientPair;
 use crate::slots::PgReplicator;
 use crate::source::ChangeSource;
 use chelabase_query::server_tls::ServerTls;
@@ -86,12 +87,14 @@ impl Deps {
             .context("CHELABASE_COMPUTE_CA_FILE is required (computes' TLS is verified, U15)")?;
         let tls = ServerTls::from_ca_file(ca)
             .map_err(|e| anyhow::anyhow!("CHELABASE_COMPUTE_CA_FILE: {e}"))?;
+        let client_pair = Arc::new(ClientPair::new(config.realtime_tls_dir.clone()));
+        client_pair.spawn_reload();
         let buckets = ensure_buckets(&async_nats::jetstream::new(nats))
             .await
             .map_err(|e| anyhow::anyhow!("the realtime KV buckets: {e}"))?;
         let lookup = Arc::new(ConnLookup::new(&config.internal_url, &config.internal_token));
         let checker = Arc::new(PgChecker::new(
-            CheckPools::new(lookup.clone(), Some(tls.clone())),
+            CheckPools::new(lookup.clone(), Some(tls)),
             OwnerClient::new(&config.orchestrator_url, &config.internal_token),
         ));
         let source = ReplicationSource::start(SourceDeps {
@@ -100,7 +103,7 @@ impl Deps {
             leases: Arc::new(buckets.leases),
             slots: Arc::new(buckets.slots),
             checker,
-            replicator: Arc::new(PgReplicator::new(lookup, Some(tls), password)),
+            replicator: Arc::new(PgReplicator::new(lookup, client_pair, password)),
             settings: SourceSettings {
                 max_slots_per_compute: config.max_slots_per_compute,
                 ..SourceSettings::default()

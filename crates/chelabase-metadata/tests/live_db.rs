@@ -2994,6 +2994,90 @@ async fn neon_roles_lists_only_the_owner() {
     assert_eq!(unknown, (vec![], 0));
 }
 
+// F2 round 2: a resync's removals never delete a personal row (only the platform removes a
+// personal login); an `sql` row listed with it is deleted.
+#[tokio::test]
+#[ignore]
+async fn a_resync_never_removes_a_personal_row() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "alice", "personal", Some(SQL_VERIFIER), None).await;
+    seed_copy(&client, &ep, "bob", "sql", Some(SQL_VERIFIER), None).await;
+    let (_, read) = client.role_copies(&ep).await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![],
+        removals: vec!["alice".into(), "bob".into()],
+        databases: vec![observed("app", "postgres", false)],
+    };
+    client.apply_resync(&ep, main_of(id), read, &write).await.unwrap();
+    let (after, _) = client.role_copies(&ep).await.unwrap();
+    cleanup(&client, id).await;
+    let origin_of = |n: &str| after.iter().find(|c| c.name == n).map(|c| c.origin);
+    assert_eq!(origin_of("alice"), Some(RoleOrigin::Personal));
+    assert_eq!(origin_of("bob"), None);
+}
+
+// c3 (P10, SP13): the migration lets a row be `personal`; the origin round-trips through
+// `list_roles` and `role_copies`; the spec's roles (`neon_roles`, `neon_roles_versioned`) never
+// carry a personal row, so a personal login can't reach a compute spec (RT4-4).
+#[tokio::test]
+#[ignore]
+async fn a_personal_origin_round_trips_and_never_reaches_the_spec() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    seed_copy(&client, &ep, "alice", "personal", Some(SQL_VERIFIER), None).await;
+    seed_copy(&client, &ep, "from_sql", "sql", Some(SQL_VERIFIER), None).await;
+    let listed = client.list_roles(&ep).await.unwrap();
+    let (copies, _) = client.role_copies(&ep).await.unwrap();
+    let spec_roles = client.neon_roles(&ep).await.unwrap();
+    let (versioned, _) = client.neon_roles_versioned(&ep).await.unwrap();
+    let secret = client.neon_role_secret(&ep, "alice").await.unwrap();
+    // F2: a resync that records a personal row as SQL (the catalog shows the role without the
+    // marker) makes it `sql`; no other origin changes (`resync_upsert_keeps_the_origin…`).
+    let (_, read) = client.role_copies(&ep).await.unwrap();
+    let branch = main_of(id);
+    let write = ResyncWrite {
+        upserts: vec![upsert("alice", RoleOrigin::Sql, SQL_VERIFIER)],
+        removals: vec![],
+        databases: vec![observed("app", "postgres", false)],
+    };
+    client.apply_resync(&ep, branch, read, &write).await.unwrap();
+    let (after, _) = client.role_copies(&ep).await.unwrap();
+    // A resync write of a new personal row stores it as one.
+    let (_, read) = client.role_copies(&ep).await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![upsert("bob", RoleOrigin::Personal, SQL_VERIFIER)],
+        removals: vec![],
+        databases: vec![observed("app", "postgres", false)],
+    };
+    client.apply_resync(&ep, branch, read, &write).await.unwrap();
+    let (with_bob, _) = client.role_copies(&ep).await.unwrap();
+    // The CHECK still refuses anything else.
+    let bogus = sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, 'x', 'x', 'member')")
+        .bind(&ep)
+        .execute(client.pool())
+        .await
+        .unwrap_err();
+    let constraint = match bogus {
+        sqlx::Error::Database(e) => e.constraint().unwrap_or("<none>").to_string(),
+        other => panic!("not a database error: {other}"),
+    };
+    cleanup(&client, id).await;
+    let origin_of = |rows: &[chelabase_metadata::RoleRow], n: &str| rows.iter().find(|r| r.name == n).map(|r| r.origin);
+    assert_eq!(origin_of(&listed, "alice"), Some(RoleOrigin::Personal));
+    assert_eq!(origin_of(&listed, "from_sql"), Some(RoleOrigin::Sql));
+    assert_eq!(copies.iter().find(|c| c.name == "alice").unwrap().origin, RoleOrigin::Personal);
+    let owner = chelabase_metadata::NeonRole { name: "postgres".into(), scram_verifier: "SCRAM-SHA-256$v1".into() };
+    assert_eq!(spec_roles, vec![owner.clone()], "a personal row is never a spec role");
+    assert_eq!(versioned, vec![owner]);
+    assert_eq!(secret, Some(Some(SQL_VERIFIER.to_string())), "the proxy still authenticates it");
+    assert_eq!(after.iter().find(|c| c.name == "alice").unwrap().origin, RoleOrigin::Sql, "an unmarked personal row becomes sql");
+    assert_eq!(with_bob.iter().find(|c| c.name == "bob").unwrap().origin, RoleOrigin::Personal);
+    assert_eq!(constraint, "neon_roles_origin");
+}
+
 #[tokio::test]
 #[ignore]
 async fn role_secret_of_an_md5_row_is_none() {

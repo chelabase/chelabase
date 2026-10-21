@@ -34,6 +34,9 @@ pub const PGDATA_SERVER_CERT_PATH: &str = "/var/db/postgres/compute/server.crt";
 pub const SERVER_NAME_SUFFIX: &str = "compute.chelabase.internal";
 /// The CN of the orchestrator's client certificate, the one CN the computes' ident map admits.
 pub const ORCHESTRATOR_CN: &str = "chelabase-orchestrator";
+/// The CN of realtime's client certificate (W31): the one CN the computes' ident map admits for
+/// `chelabase_realtime`.
+pub const REALTIME_CN: &str = "chelabase-realtime";
 /// The CA's CN.
 pub const CA_CN: &str = "Chelabase compute CA";
 
@@ -462,6 +465,79 @@ pub fn write_client_pair(
     }
     prune_versions(dir, &[Some(name.as_str()), previous.as_deref()]);
     Ok(version)
+}
+
+/// Writes a client pair with CN `cn` into `dir` (see [`write_client_pair`]) unless `dir/current`
+/// already holds a complete one that is still good at `now`: all three files readable, `ca.crt`
+/// the CA's certificate, the key matching the certificate, the certificate signed by `ca`,
+/// carrying CN `cn`, and with at least [`CLIENT_RENEW_BEFORE`] left. A missing, corrupt or
+/// foreign pair is reissued, not an error. Returns whether a pair was written; an invalid `cn`
+/// is an error and nothing is written.
+pub fn renew_client_pair(
+    dir: &Path,
+    ca: &ComputeCa,
+    cn: &str,
+    now: SystemTime,
+) -> anyhow::Result<bool> {
+    check_cn(cn)?;
+    if client_pair_is_current(ca, &dir.join(CURRENT), cn, now)? {
+        return Ok(false);
+    }
+    let client = ca.issue_client(cn, now)?;
+    write_client_pair(dir, &client, ca.cert_pem(), now)?;
+    Ok(true)
+}
+
+/// Whether `current/` holds a complete pair of `ca` for `cn` that isn't due for renewal. A
+/// missing file or an unparsable certificate means "not current"; other I/O errors fail.
+fn client_pair_is_current(
+    ca: &ComputeCa,
+    current: &Path,
+    cn: &str,
+    now: SystemTime,
+) -> anyhow::Result<bool> {
+    let read = |name: &str| -> anyhow::Result<Option<String>> {
+        let path = current.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            // A regular file where `current`'s directory belongs reads as absent too.
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Ok(None),
+            // A symlink loop where `current` belongs (ELOOP) holds no pair either: a new one
+            // replaces the link.
+            Err(e) if is_symlink_loop(&e) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    };
+    let (Some(crt), Some(key), Some(ca_crt)) =
+        (read(CLIENT_CERT_FILE)?, read(CLIENT_KEY_FILE)?, read(CA_CERT_FILE)?)
+    else {
+        return Ok(false);
+    };
+    if ca_crt.trim() != ca.cert_pem().trim()
+        || !key_matches_cert(&crt, &key)
+        || !signed_by(&crt, ca.cert_pem())
+        || certificate_cn(&crt).as_deref() != Some(cn)
+    {
+        return Ok(false);
+    }
+    Ok(not_after(&crt).is_ok_and(|expires| !needs_renewal(expires, now, CLIENT_RENEW_BEFORE)))
+}
+
+/// Whether `e` is ELOOP (too many levels of symbolic links). `ErrorKind::FilesystemLoop` isn't
+/// stable, so the errno is compared.
+fn is_symlink_loop(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// The subject CN of a PEM certificate, if it parses and has exactly one.
+fn certificate_cn(cert_pem: &str) -> Option<String> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).ok()?;
+    let cert = pem.parse_x509().ok()?;
+    let mut cns = cert.subject().iter_common_name();
+    let cn = cns.next()?.as_str().ok()?.to_string();
+    cns.next().is_none().then_some(cn)
 }
 
 /// The name of the version directory `<dir>/current` points at.

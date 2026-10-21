@@ -50,9 +50,29 @@ pub fn compose_project() -> String {
     std::env::var("CHELABASE_COMPOSE_PROJECT").unwrap_or_else(|_| "chelabase".into())
 }
 
+/// The stack whose computes a live test acts on. In a stack's runner the Compose project
+/// (`CHELABASE_COMPOSE_PROJECT`) names it: `chelabase` is main's, `chelabase-<stack>` any
+/// other's. Elsewhere the worker's own `CHELABASE_STACK` (`config_stack`).
+pub fn stack_name(config_stack: &str) -> String {
+    let project = std::env::var("CHELABASE_COMPOSE_PROJECT")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    match project {
+        Some(p) if p == "chelabase" => chelabase_neon::DEFAULT_STACK.to_string(),
+        Some(p) => p.strip_prefix("chelabase-").unwrap_or(&p).to_string(),
+        None => config_stack.to_string(),
+    }
+}
+
 /// The stack's pageserver container.
 pub fn pageserver_container() -> String {
     format!("{}-pageserver-1", compose_project())
+}
+
+/// The stack's storage broker container.
+pub fn storage_broker_container() -> String {
+    format!("{}-storage-broker-1", compose_project())
 }
 
 pub async fn setup() -> (RealWorker, MetadataClient, WorkerConfig) {
@@ -68,7 +88,11 @@ pub async fn setup_with(
     if config.compute_jwt_dir.is_relative() {
         config.compute_jwt_dir = workspace_root().join(&config.compute_jwt_dir);
     }
-    for dir in [&mut config.compute_ca_dir, &mut config.compute_tls_dir] {
+    for dir in [
+        &mut config.compute_ca_dir,
+        &mut config.compute_tls_dir,
+        &mut config.realtime_tls_dir,
+    ] {
         if dir.is_relative() {
             *dir = workspace_root().join(&*dir);
         }

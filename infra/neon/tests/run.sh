@@ -115,13 +115,23 @@ if command -v docker >/dev/null; then
   check "zitadel writes the login-client token" \
     test "$(jq -r '.environment.ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH' <<<"$zitadel")" = "/zitadel-bootstrap/login-client.pat"
   storcon="$(jq -r '.services["storage-controller"]' <<<"$neon_json")"
-  # RT1 T1 (S27): the hook token is a generated secret, read from its mount by an entrypoint
-  # wrapper; no literal (and no public default) in the command.
+  # RT1 T1 (S27): the hook token is a generated secret; fork round 4 (F6): the controller reads
+  # it from its mount itself (--control-plane-jwt-token-file), so it is in no argument and not
+  # in its environment.
+  storcon_args="$(jq -r '[(.entrypoint // [])[], (.command // [])[]] | join(" ")' <<<"$storcon")"
   check "the hook token comes from the mounted /run/storcon-hook.token" \
-    bash -c "grep -q -- '--control-plane-jwt-token=' <<<\"\$1\" && grep -q 'cat /run/storcon-hook.token' <<<\"\$1\"" _ \
-    "$(jq -r '.entrypoint // [] | join(" ")' <<<"$storcon")"
+    grep -qF -- '--control-plane-jwt-token-file=/run/storcon-hook.token' <<<"$storcon_args"
   check "no hook token in the storage controller's command" \
-    bash -c "! grep -q -- '--control-plane-jwt-token' <<<\"\$1\"" _ "$(jq -r '.command[]' <<<"$storcon")"
+    bash -c "! grep -qE -- '--control-plane-jwt-token([= ]|\$)' <<<\"\$1\"" _ "$storcon_args"
+  check "the storage controller reads its pageserver and safekeeper tokens from their mounts" \
+    bash -c "grep -qF -- '--pageserver-jwt-token-file=/run/pageserver-api.jwt' <<<\"\$1\" && grep -qF -- '--safekeeper-jwt-token-file=/run/safekeeper-data.jwt' <<<\"\$1\"" _ "$storcon_args"
+  check "no token in the storage controller's environment (PUBLIC_KEY is a public key)" \
+    bash -c "! grep -qE 'PAGESERVER_JWT_TOKEN|SAFEKEEPER_JWT_TOKEN|CONTROL_PLANE_JWT_TOKEN' <<<\"\$1\"" _ "$storcon_args"
+  pageserver_args="$(jq -r '.services.pageserver | [(.entrypoint // [])[], (.command // [])[]] | join(" ")' <<<"$neon_json")"
+  check "the pageserver reads its safekeeper token from its mount" \
+    grep -qF -- '--auth-token-file=/run/safekeeper-data.jwt' <<<"$pageserver_args"
+  check "no NEON_AUTH_TOKEN in the pageserver's environment" \
+    bash -c "! grep -q NEON_AUTH_TOKEN <<<\"\$1\"" _ "$pageserver_args"
   check "the storage controller calls the orchestrator's internal listener" \
     grep -qx -- '--control-plane-url=http://orchestrator:8083/storcon' <(jq -r '.command[]' <<<"$storcon")
   proxy="$(jq -r '.services.proxy' <<<"$neon_json")"
@@ -135,7 +145,7 @@ if command -v docker >/dev/null; then
   # RT1 T1 (S6): as the `proxy` ACL user, its password read from its mount by the entrypoint.
   proxy_entry="$(jq -r '.entrypoint // [] | join(" ")' <<<"$proxy")"
   check "the proxy uses Valkey (cache clearing, query cancel) as its ACL user" \
-    bash -c "grep -qx -- '--redis-auth-type=plain' <<<\"\$1\" && grep -q -- '--redis-plain=redis://proxy:' <<<\"\$2\" && grep -q 'cat /run/valkey-proxy.password' <<<\"\$2\" && grep -q '@valkey:6379' <<<\"\$2\"" _ "$proxy_args" "$proxy_entry"
+    bash -c "grep -qx -- '--redis-auth-type=plain' <<<\"\$1\" && grep -q -- '--redis-plain=redis://proxy@valkey:6379' <<<\"\$2\" && grep -q -- '--redis-plain-password-file=/run/valkey-proxy.password' <<<\"\$2\" && ! grep -Eq 'redis://proxy:[^@ ]*@' <<<\"\$2\"" _ "$proxy_args" "$proxy_entry"
   valkey="$(jq -r '.services.valkey' <<<"$neon_json")"
   check "valkey is 9.1.2, pinned by digest" \
     grep -Eq '"valkey/valkey:9\.1\.2-alpine@sha256:[0-9a-f]{64}"' <<<"$valkey"
@@ -149,7 +159,7 @@ if command -v docker >/dev/null; then
     test "$(jq -r '.depends_on["proxy-tls"].condition' <<<"$proxy")" = "service_completed_successfully"
   # RT1 T1 (S27): a generated secret from its mount, never a literal in the environment.
   check "the proxy's token comes from the mounted /run/proxy-api.token" \
-    bash -c "grep -q 'NEON_PROXY_TO_CONTROLPLANE_TOKEN' <<<\"\$1\" && grep -q 'cat /run/proxy-api.token' <<<\"\$1\"" _ "$proxy_entry"
+    bash -c "grep -q -e '--control-plane-token-file=/run/proxy-api.token' <<<\"\$1\"" _ "$proxy_entry"
   check "no proxy token literal in its environment" \
     test "$(jq -r '.environment.NEON_PROXY_TO_CONTROLPLANE_TOKEN // empty' <<<"$proxy")" = ""
 else

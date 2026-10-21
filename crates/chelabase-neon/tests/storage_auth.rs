@@ -25,7 +25,7 @@ use chelabase_neon::jwt::{PUBLIC_PEM_FILE, StorageScope, generate_keypair};
 use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::spec::{
     ComputeMode, DatabaseSpec, Endpoint, MemberLogins, Placement, RoleSpec, SpecInputs,
-    config_response, endpoint_config,
+    SpecPolicy, config_response, endpoint_config,
 };
 use chelabase_neon::{ComputeSigner, NeonId, StorconClient, StorconError};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -121,6 +121,57 @@ fn each_scope_has_neons_claim_shape() {
     );
 }
 
+// Round 4 (U2, item 7): the metrics scope and the expiring tenant token, decoded the way the
+// storage servers do (`Validation::default()`: `exp` checked with 60 s leeway, none required).
+fn neon_decode_default(signer: &ComputeSigner, token: &str) -> Result<Value, jsonwebtoken::errors::Error> {
+    let key = DecodingKey::from_ed_pem(signer.public_key_pem().as_bytes()).unwrap();
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.required_spec_claims = Default::default();
+    jsonwebtoken::decode::<Value>(token, &key, &validation).map(|d| d.claims)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn the_metrics_token_has_neons_claim_shape_and_never_expires() {
+    let s = signer();
+    let claims = neon_decode(&s, &s.metrics_token(unix_now()).unwrap());
+    assert_eq!(claims["scope"], "metrics", "{claims}");
+    assert!(claims.get("iat").is_some(), "{claims}");
+    for absent in ["exp", "aud", "tenant_id", "compute_id"] {
+        assert!(claims.get(absent).is_none(), "{absent} in {claims}");
+    }
+    // Minted long ago, still accepted by the default validation: no `exp`.
+    let old = s.metrics_token(1_000_000_000).unwrap();
+    assert_eq!(neon_decode_default(&s, &old).unwrap()["scope"], "metrics");
+}
+
+#[test]
+fn an_expiring_tenant_token_follows_neons_exp_rules() {
+    let s = signer();
+    let t = tenant();
+    let now = unix_now();
+    let live = s.tenant_token(&t, now, true).unwrap();
+    let claims = neon_decode_default(&s, &live).unwrap();
+    assert_eq!(claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(), 86_400);
+    assert_eq!(claims["scope"], "tenant");
+    assert_eq!(claims["tenant_id"], t.to_string());
+    // SP8: the servers allow 60 s of leeway. A token 30 s from expiry is still good; one
+    // 120 s past its `exp` is refused.
+    let ttl = 86_400;
+    let nearly = s.tenant_token(&t, now - ttl + 30, true).unwrap();
+    assert!(neon_decode_default(&s, &nearly).is_ok());
+    let expired = s.tenant_token(&t, now - ttl - 120, true).unwrap();
+    assert!(neon_decode_default(&s, &expired).is_err());
+    // The non-expiring token is never refused for age.
+    assert!(neon_decode_default(&s, &s.tenant_token(&t, 1, false).unwrap()).is_ok());
+}
+
 // A compute_ctl token has no `scope`, so Neon's `Claims` (scope required) refuses it.
 #[test]
 fn a_compute_ctl_token_is_no_storage_token() {
@@ -164,6 +215,7 @@ fn config_response_serves_the_storage_auth_token() {
         console_url: None,
         mode: ComputeMode::Primary,
         member_logins: logins(),
+        realtime_logins: MemberLogins::realtime(vec!["10.213.0.12/32".into()]),
         branch_protected: false,
         storage_auth_token: "tok-for-ep-a".into(),
     });
@@ -194,8 +246,12 @@ async fn each_compute_gets_a_token_for_its_own_tenant_only() {
             }],
             s.jwks(),
             None,
-            &logins(),
-            false,
+            &SpecPolicy {
+                member_logins: &logins(),
+                realtime_logins: &MemberLogins::realtime(vec!["10.213.0.12/32".into()]),
+                branch_protected: false,
+                storage_token_expiring: false,
+            },
             &s,
         )
         .await

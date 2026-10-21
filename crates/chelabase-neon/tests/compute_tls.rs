@@ -195,3 +195,142 @@ fn member_login_cidrs_parse() {
         assert!(parse_member_login_cidrs(Some(bad)).is_err(), "{bad:?}");
     }
 }
+
+// --- round 4 (C1): W31, the realtime client pair --------------------------------------------
+
+fn current_cert(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("current").join(CLIENT_CERT_FILE)).unwrap()
+}
+
+fn current_version(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_link(dir.join("current")).unwrap()
+}
+
+#[test]
+fn the_realtime_cn_is_its_own_identity() {
+    assert_eq!(REALTIME_CN, "chelabase-realtime");
+    assert_ne!(REALTIME_CN, ORCHESTRATOR_CN);
+}
+
+#[test]
+fn a_realtime_client_certificate_carries_the_cn_and_client_auth_only() {
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+    let pair = ca.issue_client(REALTIME_CN, now).unwrap();
+    let (cn, server, client, not_after, _, _) = parsed(&pair.cert_pem);
+    assert_eq!(cn, "chelabase-realtime");
+    assert!(client && !server, "clientAuth, not serverAuth");
+    assert!(near(not_after, now + CLIENT_VALIDITY));
+    assert!(signed_by(&pair.cert_pem, ca.cert_pem()));
+    assert!(key_matches_cert(&pair.cert_pem, &pair.key_pem));
+}
+
+// The orchestrator pair's renewal, generalised to `(dir, cn)`: the worker's sweep and the
+// CLI renew one directory per identity with the same code.
+#[test]
+fn renewing_a_missing_pair_writes_one_with_the_given_cn() {
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+    for cn in [REALTIME_CN, ORCHESTRATOR_CN] {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(renew_client_pair(dir.path(), &ca, cn, now).unwrap(), "{cn}");
+        let crt = current_cert(dir.path());
+        assert_eq!(parsed(&crt).0, cn);
+        assert!(signed_by(&crt, ca.cert_pem()));
+        let key = std::fs::read_to_string(dir.path().join("current/client.key")).unwrap();
+        assert!(key_matches_cert(&crt, &key));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("current/ca.crt")).unwrap().trim(),
+            ca.cert_pem().trim()
+        );
+        // And the pair loads as a client identity.
+        ClientTls::load(dir.path()).unwrap();
+    }
+}
+
+#[test]
+fn a_fresh_pair_is_left_alone() {
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    assert!(renew_client_pair(dir.path(), &ca, REALTIME_CN, now).unwrap());
+    let version = current_version(dir.path());
+    let cert = current_cert(dir.path());
+    let later = now + Duration::from_secs(10 * 86_400);
+    assert!(!renew_client_pair(dir.path(), &ca, REALTIME_CN, later).unwrap());
+    assert_eq!(current_version(dir.path()), version);
+    assert_eq!(current_cert(dir.path()), cert);
+}
+
+#[test]
+fn a_pair_under_60_days_from_expiry_is_reissued() {
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    renew_client_pair(dir.path(), &ca, REALTIME_CN, now).unwrap();
+    let old = current_cert(dir.path());
+    // 304 days in: 61 left, not due; 306 days in: 59 left, due.
+    let not_due = now + Duration::from_secs(304 * 86_400);
+    assert!(!renew_client_pair(dir.path(), &ca, REALTIME_CN, not_due).unwrap());
+    let due = now + Duration::from_secs(306 * 86_400);
+    assert!(renew_client_pair(dir.path(), &ca, REALTIME_CN, due).unwrap());
+    let new = current_cert(dir.path());
+    assert_ne!(new, old);
+    assert_eq!(parsed(&new).0, REALTIME_CN);
+    assert!(near(parsed(&new).3, due + CLIENT_VALIDITY));
+}
+
+#[test]
+fn a_corrupt_or_foreign_pair_is_reissued_not_an_error() {
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+
+    // client.crt that isn't a certificate.
+    let dir = tempfile::tempdir().unwrap();
+    renew_client_pair(dir.path(), &ca, REALTIME_CN, now).unwrap();
+    let version = std::fs::canonicalize(dir.path().join("current")).unwrap();
+    std::fs::write(version.join(CLIENT_CERT_FILE), "not a certificate").unwrap();
+    assert!(renew_client_pair(dir.path(), &ca, REALTIME_CN, now).unwrap());
+    assert_eq!(parsed(&current_cert(dir.path())).0, REALTIME_CN);
+
+    // The orchestrator's pair in the realtime directory: wrong identity, reissued with the
+    // directory's CN (a pair must never present another service's identity).
+    let dir = tempfile::tempdir().unwrap();
+    renew_client_pair(dir.path(), &ca, ORCHESTRATOR_CN, now).unwrap();
+    assert_eq!(parsed(&current_cert(dir.path())).0, ORCHESTRATOR_CN);
+    assert!(renew_client_pair(dir.path(), &ca, REALTIME_CN, now).unwrap());
+    assert_eq!(parsed(&current_cert(dir.path())).0, REALTIME_CN);
+
+    // A regenerated CA: the old pair doesn't follow it.
+    let dir = tempfile::tempdir().unwrap();
+    renew_client_pair(dir.path(), &ca, REALTIME_CN, now).unwrap();
+    let other = ComputeCa::generate(now).unwrap();
+    assert!(renew_client_pair(dir.path(), &other, REALTIME_CN, now).unwrap());
+    let crt = current_cert(dir.path());
+    assert!(signed_by(&crt, other.cert_pem()) && !signed_by(&crt, ca.cert_pem()));
+}
+
+#[test]
+fn two_identities_in_two_directories_do_not_touch_each_other() {
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+    let (rt, orch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    renew_client_pair(rt.path(), &ca, REALTIME_CN, now).unwrap();
+    renew_client_pair(orch.path(), &ca, ORCHESTRATOR_CN, now).unwrap();
+    let orch_cert = current_cert(orch.path());
+    // Renewing the realtime pair leaves the orchestrator's alone.
+    let due = now + Duration::from_secs(320 * 86_400);
+    assert!(renew_client_pair(rt.path(), &ca, REALTIME_CN, due).unwrap());
+    assert_eq!(current_cert(orch.path()), orch_cert);
+}
+
+#[test]
+fn an_invalid_cn_is_an_error_and_writes_nothing() {
+    let now = SystemTime::now();
+    let ca = ComputeCa::generate(now).unwrap();
+    for bad in ["", "has space", "a,b", "x\ny", &"a".repeat(65)] {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(renew_client_pair(dir.path(), &ca, bad, now).is_err(), "{bad:?}");
+        assert!(!dir.path().join("current").exists(), "{bad:?}");
+    }
+}

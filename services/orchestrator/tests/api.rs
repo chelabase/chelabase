@@ -2785,6 +2785,29 @@ fn role_reply(code: &str) -> RoleReply {
     RoleReply { ok: false, code: Some(code.into()), error: Some("worker said so".into()), keys: vec![] }
 }
 
+// c3 (SP13): a personal login is listed with the new `personal` origin, between the others.
+#[tokio::test]
+async fn list_roles_shows_a_personal_login_with_its_origin() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    t.metadata.add_role_row(&ep, role_row("alice", RoleOrigin::Personal, RoleLevel::Plain, PasswordState::SetInSql));
+    let resp = t.send(Method::GET, &t.roles(dev), None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let origin_of = |name: &str| {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .map(|r| r["origin"].clone())
+    };
+    assert_eq!(origin_of("alice"), Some(json!("personal")));
+    assert_eq!(origin_of("app"), Some(json!("api")));
+    assert_eq!(origin_of("postgres"), Some(json!("owner")));
+}
+
 #[tokio::test]
 async fn list_roles_shapes_and_blocked_keys() {
     let t = branching().await;

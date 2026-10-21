@@ -523,6 +523,7 @@ fn info(server_name: Option<&str>) -> ConnInfo {
         host: "10.0.0.5".into(),
         port: 5432,
         server_name: server_name.map(str::to_string),
+        replication_host: None,
         user: "authenticator".into(),
         password: "pw".into(),
     }

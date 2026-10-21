@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use chelabase_neon::ComputeBackend;
 use chelabase_neon::compute_tls::{
-    ClientTls, ComputeCa, ORCHESTRATOR_CN, PGDATA_SERVER_CERT_PATH, SERVER_CERT_PATH,
+    ClientTls, ComputeCa, ORCHESTRATOR_CN, PGDATA_SERVER_CERT_PATH, REALTIME_CN, SERVER_CERT_PATH,
     SERVER_VALIDITY, not_after, write_client_pair,
 };
 
@@ -27,6 +27,9 @@ struct Rig {
     ca: Arc<ComputeCa>,
     dir: tempfile::TempDir,
     now: SystemTime,
+    /// Realtime's pair directory (C2/SP10: the sweep renews it too, so the rig keeps a good
+    /// pair there and these tests' counts stay about what they test).
+    _realtime: tempfile::TempDir,
 }
 
 /// A worker with a sweep, a fresh orchestrator client pair on disk, and no computes.
@@ -36,12 +39,16 @@ fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let pair = ca.issue_client(ORCHESTRATOR_CN, now).unwrap();
     write_client_pair(dir.path(), &pair, ca.cert_pem(), now).unwrap();
+    let realtime = tempfile::tempdir().unwrap();
+    let rt_pair = ca.issue_client(REALTIME_CN, now).unwrap();
+    write_client_pair(realtime.path(), &rt_pair, ca.cert_pem(), now).unwrap();
     let (mut w, _journal) = worker();
     w.cert_sweep = Some(CertSweep {
         ca: ca.clone(),
         tls_dir: dir.path().to_path_buf(),
+        realtime_tls_dir: realtime.path().to_path_buf(),
     });
-    Rig { w, ca, dir, now }
+    Rig { w, ca, dir, now, _realtime: realtime }
 }
 
 impl Rig {
@@ -183,10 +190,14 @@ async fn an_orchestrator_pair_with_under_sixty_days_left_is_reissued() {
     let old = ca.issue_client(ORCHESTRATOR_CN, then).unwrap();
     write_client_pair(dir.path(), &old, ca.cert_pem(), then).unwrap();
     let before = ClientTls::load(dir.path()).unwrap().fingerprint();
+    let realtime = tempfile::tempdir().unwrap();
+    let rt_pair = ca.issue_client(REALTIME_CN, now).unwrap();
+    write_client_pair(realtime.path(), &rt_pair, ca.cert_pem(), now).unwrap();
     let (mut w, _journal) = worker();
     w.cert_sweep = Some(CertSweep {
         ca: ca.clone(),
         tls_dir: dir.path().to_path_buf(),
+        realtime_tls_dir: realtime.path().to_path_buf(),
     });
     assert_eq!(w.renew_certs_once(now).await, (1, 0));
     let tls = ClientTls::load(dir.path()).unwrap();

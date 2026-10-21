@@ -163,6 +163,9 @@ pub struct FakeState {
     pub ages: HashMap<DatabaseId, i64>,
     /// The method that fails, e.g. `"set_branch_ready"`.
     pub fail: Option<&'static str>,
+    /// `lock_endpoint` fails like a metadata pool with no free connection in time
+    /// (`sqlx::Error::PoolTimedOut`).
+    pub lock_pool_timeout: bool,
     /// The Nth `get_database` call (1-based) first flips the row to `deleting`.
     pub deleting_on_get: Option<u32>,
     /// `set_branch_ready` first flips the row to `deleting`, as a delete landing just before it
@@ -788,7 +791,9 @@ impl WorkerMetadata for FakeMetadata {
         &self,
         endpoint_id: &str,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, MetadataError> {
-        drop(self.write("lock_endpoint")?);
+        if self.write("lock_endpoint")?.lock_pool_timeout {
+            return Err(MetadataError::Database(sqlx::Error::PoolTimedOut));
+        }
         let lock = lock(&self.locks)
             .entry(endpoint_id.to_string())
             .or_default()
@@ -1607,6 +1612,11 @@ impl WorkerMetadata for FakeMetadata {
             row.pending = up.pending;
             row.attributes = up.attributes.clone();
             row.attributes_pending = false;
+            // As `apply_resync`: a personal login the catalog no longer marks becomes `sql`; no
+            // other origin changes.
+            if row.origin == RoleOrigin::Personal && up.origin == RoleOrigin::Sql {
+                row.origin = RoleOrigin::Sql;
+            }
             if row.origin == RoleOrigin::Api
                 && let Some(owner_level) = up.api_owner_level
             {
@@ -1622,7 +1632,15 @@ impl WorkerMetadata for FakeMetadata {
             }
         }
         for name in &write.removals {
-            if owner.as_deref() != Some(name.as_str()) && ep.logins.remove(name).is_some() {
+            // As `apply_resync`: never the owner's row, never a personal login's.
+            let personal = ep
+                .logins
+                .get(name)
+                .is_some_and(|l| l.origin == RoleOrigin::Personal);
+            if owner.as_deref() != Some(name.as_str())
+                && !personal
+                && ep.logins.remove(name).is_some()
+            {
                 ep.unreadable.remove(name);
                 ep.set_verifier(name, None);
                 changed.push(name.clone());
@@ -3597,6 +3615,21 @@ pub struct FakePusher {
     pub fail_status: Mutex<Option<String>>,
     /// `status` fails with this message once the scripted statuses are used up.
     pub fail_status_after_queue: Mutex<Option<String>>,
+    /// The endpoints whose compute_ctl advertises `storage_token_refresh` (none by default: an
+    /// old compute_ctl).
+    pub capable: Mutex<std::collections::HashSet<String>>,
+    /// `report` fails with this message (compute_ctl unreachable).
+    pub fail_report: Mutex<Option<String>>,
+    /// `report` never answers.
+    pub hang_report: Mutex<bool>,
+    /// While set, `report` panics (a bug anywhere in a refresh pass).
+    pub panic_report: Mutex<bool>,
+    /// `push_storage_token` never answers.
+    pub hang_storage_token: Mutex<bool>,
+    /// `push_storage_token` of the endpoint fails with the message.
+    pub fail_storage_token: Mutex<std::collections::HashMap<String, String>>,
+    /// `(endpoint, token)` of every storage token that got through.
+    pub storage_tokens: Mutex<Vec<(String, String)>>,
     pub journal: Journal,
     /// A throwaway compute-JWT key pair (specs sign their storage token with it).
     pub signer: chelabase_neon::ComputeSigner,
@@ -3611,6 +3644,29 @@ pub fn fake_signer() -> chelabase_neon::ComputeSigner {
 impl FakePusher {
     pub fn set_status(&self, endpoint_id: &str, status: ComputeCtlStatus) {
         lock(&self.statuses).insert(endpoint_id.to_string(), status);
+    }
+
+    /// Whether `endpoint_id`'s compute_ctl advertises `storage_token_refresh`.
+    pub fn set_capability(&self, endpoint_id: &str, capable: bool) {
+        let mut set = lock(&self.capable);
+        if capable {
+            set.insert(endpoint_id.to_string());
+        } else {
+            set.remove(endpoint_id);
+        }
+    }
+
+    /// `push_storage_token` of `endpoint_id` fails with `message`, or works again (`None`).
+    pub fn fail_storage_token_for(&self, endpoint_id: &str, message: Option<String>) {
+        let mut map = lock(&self.fail_storage_token);
+        match message {
+            Some(m) => {
+                map.insert(endpoint_id.to_string(), m);
+            }
+            None => {
+                map.remove(endpoint_id);
+            }
+        }
     }
 
     /// The next `statuses.len()` reads of `endpoint_id`'s status answer these, in order; later
@@ -3669,6 +3725,49 @@ impl SpecPusher for FakePusher {
             .cloned()
             .unwrap_or(ComputeCtlStatus::Running))
     }
+
+    async fn report(
+        &self,
+        _control_addr: SocketAddr,
+        endpoint_id: &str,
+    ) -> anyhow::Result<chelabase_neon::reconfigure::ComputeCtlReport> {
+        record(&self.journal, format!("pusher.report {endpoint_id}"));
+        let panic = *lock(&self.panic_report);
+        if panic {
+            panic!("FakePusher::report: panic_report is set");
+        }
+        if *lock(&self.hang_report) {
+            std::future::pending::<()>().await;
+        }
+        if let Some(message) = lock(&self.fail_report).clone() {
+            anyhow::bail!(message);
+        }
+        let status = lock(&self.statuses)
+            .get(endpoint_id)
+            .cloned()
+            .unwrap_or(ComputeCtlStatus::Running);
+        Ok(chelabase_neon::reconfigure::ComputeCtlReport {
+            status,
+            storage_token_refresh: lock(&self.capable).contains(endpoint_id),
+        })
+    }
+
+    async fn push_storage_token(
+        &self,
+        _control_addr: SocketAddr,
+        endpoint_id: &str,
+        token: &str,
+    ) -> anyhow::Result<()> {
+        record(&self.journal, format!("pusher.storage_token {endpoint_id}"));
+        if *lock(&self.hang_storage_token) {
+            std::future::pending::<()>().await;
+        }
+        if let Some(message) = lock(&self.fail_storage_token).get(endpoint_id).cloned() {
+            anyhow::bail!(message);
+        }
+        lock(&self.storage_tokens).push((endpoint_id.to_string(), token.to_string()));
+        Ok(())
+    }
 }
 
 pub type FakeWorker = Worker<FakeMetadata, FakeStorage, FakeBackend, FakeCache, FakePusher>;
@@ -3713,6 +3812,13 @@ pub fn worker() -> (FakeWorker, Journal) {
             status_queue: Mutex::default(),
             fail_status: Mutex::default(),
             fail_status_after_queue: Mutex::default(),
+            capable: Mutex::default(),
+            fail_report: Mutex::default(),
+            hang_report: Mutex::default(),
+            panic_report: Mutex::default(),
+            hang_storage_token: Mutex::default(),
+            fail_storage_token: Mutex::default(),
+            storage_tokens: Mutex::default(),
             journal: journal.clone(),
             signer: fake_signer(),
         },
@@ -3742,6 +3848,9 @@ pub fn worker() -> (FakeWorker, Journal) {
         member_role_requests: Default::default(),
         member_logins: chelabase_neon::spec::MemberLogins::orchestrator(Vec::new()),
         cert_sweep: None,
+        realtime_logins: chelabase_neon::spec::MemberLogins::realtime(Vec::new()),
+        storage_token_refresh_every: Duration::from_secs(3600),
+        storage_token_failures: Mutex::default(),
         realtime_password: None,
     };
     (worker, journal)

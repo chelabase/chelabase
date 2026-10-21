@@ -7,6 +7,81 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
+## Neon fork round 4 (2026-10-22, in progress: tested, waiting for the user's go to merge)
+
+Branch `neon-fork-round-4`; fork `chelabase/neon` `round-4` `0741b56de`, `chelabase/postgres` `round-4-v17` `7812d66fe85`; plan and full history `docs/superpowers/plans/2026-10-21-neon-fork-round-4.md`. The upstream Neon base passes secrets through the environment and leaves several storage routes open; these are ours.
+
+### No secret in a service's command line or environment
+
+- **Problem:** upstream, compute_ctl puts the storage token in Postgres' environment, and the storage controller, pageserver and proxy read their tokens and passwords from environment variables or flags. Anything that can read a process's environment or arguments sees them.
+- **What we built:**
+  - Every token and password is read from a file, through one reader: regular file only, non-blocking, size-capped, never echoed.
+  - compute_ctl's internal API listens on loopback only, behind a per-start secret.
+  - The storage token expires after 24 h, and the worker refreshes it without restarting the compute.
+- **Evidence:**
+  - `compose-secret-argv.sh` fails on any secret exported from a `/run` file. The only exception is a public key.
+  - `compute_fork_live` 11/11, including the expired-token refresh and the loopback-only internal API.
+  - The fork's token-file Python suites.
+
+### Tokens that can only do their job
+
+- **Problem:** upstream, a metrics scraper needs an admin token. Some pageserver routes checked no scope, so another tenant's token reached them (found by our audit; an exhaustive route test counted 42 gaps on the pageserver and 4 on the storage controller).
+- **What we built:**
+  - A read-only `metrics` scope.
+  - Every route authorised before its handler reads the request.
+  - Control-plane routes refuse tenant tokens.
+  - `nbf` validated.
+  - compute_ctl answers 401 with no bypass.
+- **Evidence:** `test_route_scopes.py`, whose route list is parsed from each router and fails if incomplete; `storage_auth_edges`; `compute-network-e2e.sh` with no known gaps.
+
+### Realtime logins bound to realtime, large transactions streamed
+
+- **What we built:**
+  - `chelabase_realtime` logs in only from realtime's address, with its client certificate.
+  - The `chelabase_keys` decoder streams large transactions instead of spilling them to disk.
+- **Evidence:**
+  - `realtime_role_live` 4/4 (wrong certificate, no certificate and compute-network logins refused).
+  - `realtime_live` 19/19, including a big transaction streamed through its own slot.
+
+### Personal Postgres logins the project owner can't take over
+
+- **What we built:** a marker the neon extension guards. A non-superuser can't alter, drop, grant, comment on or label a personal login, or change the marker; it holds on every Postgres version.
+- **Evidence:** `test_member_role_guard*` suites; `compute_fork_live` personal-login tests.
+- **Unlocks:** personal logins on the Members page.
+
+### Also fixed on the way
+
+- **Temporary slots:** they never reach the pageserver. A malformed slot entry is skipped instead of crashing the compute.
+- **Extension trust:** extension installs check trust for every script Postgres runs.
+- **Mock-S3 test corruption:** moto 5.2.4 fixes it; it was breaking WAL tests on fork `main`.
+- **Storage-controller retries:** with backoff (20, was 128).
+- **Minimal-image bumps:** timescaledb 2.31.0, pg_partman 5.5.0, pg_cron 1.6.8, pgbouncer 1.26.1 (security fixes) and the exporters. pgrag is removed.
+- **Evidence:**
+  - fork gate: lint, build, Rust tests, pg-check (core 225/225), regress selection;
+  - `just check` 3748 tests;
+  - live pass: every suite and e2e green.
+
+## TE-RT RT1: realtime table editor (2026-10-21, shipped)
+
+Branch `table-realtime`, merged `87d2d633`; spec `docs/superpowers/specs/2026-10-14-realtime-design.md`; plan and full history `docs/superpowers/plans/2026-10-16-realtime-rt1.md`.
+
+### Live rows that respect each viewer's row-level security
+
+- **Problem:** a shared table editor needs to show other people's changes as they happen, but streaming row contents to every viewer leaks rows that Postgres RLS hides from them.
+- **What we built:** the stream carries only primary keys (our `chelabase_keys` decoder, fork round 3), and each key reaches a viewer only after a check run as that viewer's own role says they can read the row; Studio then re-reads the row as that role. Deletes reach a viewer only for keys they saw. One temporary slot per watched database is shared by all viewers and dropped when nobody watches.
+- **Evidence:** `realtime_live` 17/17 including `the_invariant_holds_against_postgres` (a viewer receives a key only if their own read returns the row), an RLS viewer in three Playwright passes never received a hidden row's key in its WebSocket frames; splices reached the other member in 110–140 ms.
+
+### Presence and safe concurrent edits
+
+- **What we built:** each person's selected cell in their own colour (nested rings when several share a cell, your own outermost), an "editing" fill, hover tags with the acting-as role; saves carry the original values, so a concurrent change opens "Changed by someone else" (overwrite or take theirs) instead of silently winning; the row panel marks fields a live update changed and asks before discarding an unsaved draft on every path (incl. browser Back and closing the tab).
+- **Evidence:** Studio suite 2030/2030; three Playwright passes with two to three signed-in members (51 regression scenarios in the second); presence colours tested for contrast and distinctness on both themes.
+
+### Every watcher sees the true live state
+
+- **Problem (found in the browser pass):** a viewer joining after the slot started streaming was told "waiting" forever.
+- **What we built:** the holder seeds new watchers with its state and re-tells it every 5 s in every state; a fenced holder never claims live.
+- **Evidence:** a property test over join/leave/holder sequences across two instances (`fr_status`), live rejoin and second-table tests.
+
 ## Neon fork round 3 (2026-10-15, shipped)
 
 Branch `neon-fork-round-3`; spec `docs/superpowers/specs/2026-10-15-neon-fork-round-3-design.md`; plan and full history `docs/superpowers/plans/2026-10-15-neon-fork-round-3.md`. Fork heads: `chelabase/neon` `round-3` `629166cee`, `chelabase/postgres` `round-3-v17` `76ce76278c5`, `chelabase/rust-postgres` `chelabase/sasl-verified` `9a1b048b`.

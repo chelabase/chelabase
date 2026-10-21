@@ -170,6 +170,9 @@ pub(crate) fn rt_worker() -> Rt {
         member_role_requests: w.member_role_requests,
         member_logins: w.member_logins,
         cert_sweep: w.cert_sweep,
+        realtime_logins: w.realtime_logins,
+        storage_token_refresh_every: w.storage_token_refresh_every,
+        storage_token_failures: w.storage_token_failures,
         realtime_password: w.realtime_password,
     };
     Rt {

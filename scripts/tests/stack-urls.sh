@@ -28,9 +28,21 @@ grep -qE 'metadata-db:5432' "${files[@]}" ||
 # env (with a fallback), because the tests run in the stack's runner: no cargo, no dev pids, no
 # fixed project, and `0.0.0.0` bind addresses are never dialled.
 mapfile -t tests < <(printf '%s\n' "${files[@]}" | grep -v '^services/rest/src/conn\.rs$')
+# Loopback that is a test's own fixture, not a host-only dependency: realtime's c4_* tests run a
+# fake compute in the test process and dial it, and the orchestrator's route tests assert the
+# fake locator's address in a response body.
+# The exemption covers only the `"127.0.0.1"` rule, and the c4_* files only while none of them is
+# a live test (no `#[ignore`): a live test dialling loopback is still caught.
+in_process='^(services/realtime/tests/c4_[a-z_]*\.rs:[0-9]+:|services/orchestrator/tests/internal\.rs:[0-9]+:.*body\["host"\], "127\.0\.0\.1")'
+if grep -nE '#\[ignore' services/realtime/tests/c4_*.rs >&2; then
+  echo "stack-urls: a c4_* test is live, so its loopback lines are no longer exempt" >&2
+  bad=1
+fi
 for pat in '\.chelabase/dev' 'cargo run' '"chelabase-[a-z0-9-]+-1"' 'CHELABASE_INTERNAL_ADDR' \
   '"127\.0\.0\.1"' '5433'; do
-  if hits="$(grep -nE "$pat" "${tests[@]}")"; then
+  exempt='^$'
+  [[ "$pat" == '"127\.0\.0\.1"' ]] && exempt="$in_process"
+  if hits="$(grep -nE "$pat" "${tests[@]}" | grep -vE "$exempt")"; then
     echo "stack-urls: host-only state ($pat)" >&2
     echo "$hits" >&2
     bad=1

@@ -24,6 +24,7 @@ const UNKNOWN_ENDPOINT_DIGEST: &str =
 pub(crate) async fn endpoint_config<M: NeonMetadataPort, L: ComputeLocator>(
     state: &InternalState<M, L>,
     endpoint: &NeonEndpoint,
+    storage_token_expiring: bool,
 ) -> anyhow::Result<Value> {
     let roles = state.metadata.neon_roles(&endpoint.id).await?;
     let databases = state.metadata.neon_databases(&endpoint.id).await?;
@@ -38,11 +39,31 @@ pub(crate) async fn endpoint_config<M: NeonMetadataPort, L: ComputeLocator>(
             &state.control_plane_uri,
             &endpoint.id,
         )),
-        &state.member_logins,
-        branch_protected,
+        &chelabase_neon::spec::SpecPolicy {
+            member_logins: &state.member_logins,
+            realtime_logins: &state.realtime_logins,
+            branch_protected,
+            storage_token_expiring,
+        },
         &state.signer,
     )
     .await
+}
+
+/// Whether compute_ctl's `Compute-Capabilities` header lists the storage-token refresh (SP23):
+/// every value of the header is read, joined with `,`; a value that isn't UTF-8 counts as not
+/// capable.
+fn advertises_refresh(headers: &HeaderMap) -> bool {
+    let mut values = Vec::new();
+    for value in headers.get_all(chelabase_neon::reconfigure::CAPABILITIES_HEADER) {
+        match value.to_str() {
+            Ok(v) => values.push(v),
+            Err(_) => return false,
+        }
+    }
+    chelabase_neon::reconfigure::advertises_storage_token_refresh(
+        (!values.is_empty()).then(|| values.join(",")).as_deref(),
+    )
 }
 
 /// Whether the branch linked to the endpoint is protected: the spec of a restarted or
@@ -103,7 +124,8 @@ pub async fn compute_spec<M: NeonMetadataPort, L: ComputeLocator>(
         Ok(endpoint) => endpoint,
         Err(refused) => return refused,
     };
-    match endpoint_config(&state, &endpoint).await {
+    let expiring = advertises_refresh(&headers);
+    match endpoint_config(&state, &endpoint, expiring).await {
         Ok(config) => Json(config).into_response(),
         Err(e) => {
             warn!(endpoint = %id, "spec: {e:#}");

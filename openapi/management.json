@@ -18000,11 +18000,12 @@
       },
       "RoleOrigin": {
         "type": "string",
-        "description": "Where a `neon_roles` row came from: the branch's owner, a role made in SQL, or one made\nthrough the API.",
+        "description": "Where a `neon_roles` row came from: the branch's owner, a role made in SQL, one made\nthrough the API, or a personal login (made by the worker and marked, RT4-4).",
         "enum": [
           "owner",
           "sql",
-          "api"
+          "api",
+          "personal"
         ]
       },
       "RoleRef": {

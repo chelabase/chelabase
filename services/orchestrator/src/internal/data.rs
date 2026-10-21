@@ -17,6 +17,10 @@ use uuid::Uuid;
 
 use super::{InternalState, NeonMetadataPort};
 
+/// How long the connection route waits for the compute's control-network address (SP11)
+/// before answering with `replication_host: null`.
+const CONTROL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// `{"key_id","branch_id","project_id","kind","role","databases","role_oid"}` (`databases` is null for every served
 /// database, else the key's allow-list; `role_oid` the secret key's role identity, or null) for the live key with this hash (64 lowercase hex
 /// characters); 404 for anything else. `last_used_at` is stamped after the answer is on its way.
@@ -130,6 +134,29 @@ where
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    // SP11: realtime's replication connection dials the control network (the role only logs in
+    // there). Rest ignores it; a locator that finds nothing, fails or hangs (a stuck Docker
+    // daemon: bounded by `CONTROL_LOOKUP_TIMEOUT`) must not change or hold up the answer.
+    let replication_host = match tokio::time::timeout(
+        CONTROL_LOOKUP_TIMEOUT,
+        state.control_locator.address(endpoint),
+    )
+    .await
+    {
+        Ok(Ok(ip)) => ip.map(|ip| ip.to_string()),
+        Ok(Err(err)) => {
+            warn!(branch_id = %branch, "locating the compute on the control network: {err:#}");
+            None
+        }
+        Err(_) => {
+            warn!(
+                branch_id = %branch,
+                "locating the compute on the control network took over {}s; answering without it",
+                CONTROL_LOOKUP_TIMEOUT.as_secs()
+            );
+            None
+        }
+    };
     let mut response = Json(json!({
         "host": addr.ip().to_string(),
         "port": addr.port(),
@@ -137,6 +164,7 @@ where
         // U15: rest dials `host` and verifies the compute as this name, the only one its
         // certificate carries.
         "server_name": chelabase_neon::compute_tls::server_name(endpoint),
+        "replication_host": replication_host,
         "user": "authenticator",
         "password": password,
         "status": row.status.as_str(),

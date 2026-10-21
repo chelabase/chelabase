@@ -17,11 +17,19 @@ pub mod branch_create;
 pub mod branch_delete;
 pub mod branch_job;
 pub mod branch_switch;
+#[cfg(test)]
+mod c2_tests;
+#[cfg(test)]
+mod c3_tests;
 pub mod certs;
 pub mod config;
 pub mod credentials;
 pub mod data_api;
 pub mod delete;
+#[cfg(test)]
+mod f2_coder_tests;
+#[cfg(test)]
+mod f2_tests;
 #[cfg(test)]
 mod f4_coder_tests;
 #[cfg(test)]
@@ -49,6 +57,7 @@ pub mod rt_events;
 pub mod safekeepers;
 pub mod schema_base;
 pub mod settings;
+pub mod token_refresh;
 
 /// The role that owns every database, and whose password is revealed.
 pub const OWNER_ROLE: &str = "postgres";
@@ -120,6 +129,13 @@ pub struct Worker<M, S, C, N, P> {
     pub member_logins: chelabase_neon::spec::MemberLogins,
     /// What the daily certificate sweep needs; `None` where there is no CA (the fakes).
     pub cert_sweep: Option<certs::CertSweep>,
+    /// Who may log in as `chelabase_realtime`, pushed with every spec:
+    /// `CHELABASE_REALTIME_LOGIN_CIDRS` and realtime's certificate CN.
+    pub realtime_logins: chelabase_neon::spec::MemberLogins,
+    /// How often the storage-token refresh pass runs (`CHELABASE_STORAGE_TOKEN_REFRESH_SECS`).
+    pub storage_token_refresh_every: Duration,
+    /// Consecutive refresh failures per endpoint (reset by a success), for the log and tests.
+    pub storage_token_failures: Mutex<std::collections::HashMap<String, u32>>,
     /// The `chelabase_realtime` role's password (`CHELABASE_REALTIME_PG_PASSWORD_FILE`, RT1
     /// T5). `None`: the role is neither created nor granted anything (the fakes by default).
     pub realtime_password: Option<String>,

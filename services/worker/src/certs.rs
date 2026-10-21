@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use anyhow::Context;
 use chelabase_neon::compute_tls::{
-    CLIENT_CERT_FILE, CLIENT_RENEW_BEFORE, ComputeCa, ORCHESTRATOR_CN, PGDATA_SERVER_CERT_PATH,
-    SERVER_RENEW_BEFORE, needs_renewal, not_after, write_client_pair,
+    ComputeCa, ORCHESTRATOR_CN, PGDATA_SERVER_CERT_PATH, REALTIME_CN, SERVER_RENEW_BEFORE,
+    needs_renewal, not_after, renew_client_pair,
 };
 use chelabase_neon::{ComputeBackend, ComputeStatus};
 use tracing::{info, warn};
@@ -20,12 +20,14 @@ use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 pub const CERT_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// What the sweep needs beyond the compute backend: the CA that signs, and the directory the
-/// orchestrator's client pair lives in.
+/// orchestrator's and realtime's client pairs live in.
 #[derive(Clone)]
 pub struct CertSweep {
     pub ca: Arc<ComputeCa>,
     /// `CHELABASE_COMPUTE_TLS_DIR`.
     pub tls_dir: PathBuf,
+    /// `CHELABASE_REALTIME_TLS_DIR` (SP10): realtime's client pair.
+    pub realtime_tls_dir: PathBuf,
 }
 
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
@@ -35,7 +37,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// `pgdata`, not the upload: a reload that failed leaves a fresh upload next to an old
     /// copy) has under 30 days left gets a new one
     /// (uploaded; compute_ctl reloads Postgres with it and the status never leaves `running`),
-    /// and the orchestrator's client pair is reissued with under 60 days left. Returns
+    /// and the orchestrator's and realtime's client pairs are reissued with under 60 days left. Returns
     /// `(renewed, failed)`; a failure is logged and the next pass retries.
     pub async fn renew_certs_once(&self, now: SystemTime) -> (usize, usize) {
         let Some(sweep) = &self.cert_sweep else {
@@ -59,12 +61,21 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
             }
         }
-        match renew_orchestrator_pair(sweep, now) {
-            Ok(true) => renewed += 1,
-            Ok(false) => {}
-            Err(e) => {
-                failed += 1;
-                warn!("certificate sweep: the orchestrator's client certificate: {e:#}");
+        // Each pair on its own: a failure on one doesn't block the other.
+        for (dir, cn, who) in [
+            (&sweep.tls_dir, ORCHESTRATOR_CN, "the orchestrator's"),
+            (&sweep.realtime_tls_dir, REALTIME_CN, "realtime's"),
+        ] {
+            match renew_client_pair(dir, &sweep.ca, cn, now) {
+                Ok(true) => {
+                    renewed += 1;
+                    info!("reissued {who} client certificate");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    failed += 1;
+                    warn!("certificate sweep: {who} client certificate: {e:#}");
+                }
             }
         }
         (renewed, failed)
@@ -104,28 +115,4 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         info!(endpoint_id = %ep, "renewed the compute's server certificate");
         Ok(true)
     }
-}
-
-/// `true` when a new pair was written. A missing pair is written too.
-fn renew_orchestrator_pair(sweep: &CertSweep, now: SystemTime) -> anyhow::Result<bool> {
-    let current = sweep.tls_dir.join("current").join(CLIENT_CERT_FILE);
-    let due = match std::fs::read_to_string(&current) {
-        // A client.crt that can't be read as a certificate is reissued, not an error.
-        Ok(pem) => match not_after(&pem) {
-            Ok(expires) => needs_renewal(expires, now, CLIENT_RENEW_BEFORE),
-            Err(e) => {
-                warn!("certificate sweep: {} is corrupt ({e:#}); reissuing", current.display());
-                true
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(e) => return Err(e).with_context(|| format!("reading {}", current.display())),
-    };
-    if !due {
-        return Ok(false);
-    }
-    let pair = sweep.ca.issue_client(ORCHESTRATOR_CN, now)?;
-    write_client_pair(&sweep.tls_dir, &pair, sweep.ca.cert_pem(), now)?;
-    info!("reissued the orchestrator's client certificate");
-    Ok(true)
 }

@@ -108,6 +108,12 @@ impl<C: CommitLsnSource> SafekeeperSet<C> {
         }
         head_lsn(last_record, commit)
     }
+
+    /// The client for safekeeper `id`, when it has a URL. [`Self::head`] folds errors into
+    /// its fallback; callers that must see each safekeeper's own answer (live tests) ask it here.
+    pub fn client(&self, id: u64) -> Option<&C> {
+        self.clients.get(&id)
+    }
 }
 
 #[cfg(test)]

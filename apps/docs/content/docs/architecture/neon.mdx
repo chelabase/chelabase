@@ -67,7 +67,7 @@ Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4
 | Neon proxy | `proxy:4432`, `proxy:4444` | Postgres wire; WebSocket and SQL over HTTP |
 | Valkey | `valkey:6379` | Proxy cache invalidation and query cancel; realtime tickets and counters; ACL users only |
 
-The storage APIs (storcon `:1234`, pageserver `:9898`, safekeepers `:7676`) require a NeonJWT, and none is published on the host. Three routes stay open even with NeonJWT on, and are known gaps for the next Neon fork round: `/profile/cpu` and `/profile/heap` on the pageserver and safekeepers, and `/metrics` on both. `/v1/status` is public by design.
+The storage APIs (storcon `:1234`, pageserver `:9898`, safekeepers `:7676`) require a NeonJWT, and none is published on the host. `/metrics` and the profile routes (`/profile/cpu`, `/profile/heap`) on the pageserver, the safekeepers and the storage controller need a token. `/v1/status` is public by design.
 
 Run `just workbench psql`, `just workbench exec <service> <cmd>` and `just workbench test|run` to reach those addresses from your checkout. [`infra/compose/.env.example`](https://github.com/chelabase/chelabase/blob/main/infra/compose/.env.example) holds the documented defaults that `just workbench up` renders each stack's env file from.
 
@@ -75,7 +75,7 @@ Run `just workbench psql`, `just workbench exec <service> <cmd>` and `just workb
 
 Each stack has a `<project>_compute` network, apart from the stack's default one. Computes join only it (and `control`, the orchestrator's and test runner's path to them), never the default network. On it, besides the computes: the pageserver and the three safekeepers, which computes read and stream to; the orchestrator, whose hooks listener computes call; and the clients that dial computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). Not on it: NATS, Valkey, every database container, Zitadel, Mailpit, SeaweedFS, the storage broker and controller, the gateway and Studio. Every listener of a member of this network needs a credential or is public by design (health, OpenAPI); `scripts/compute-network-e2e.sh` probes each one.
 
-Two gaps remain, both for the next Neon fork round: `compute_ctl`'s internal server on `compute:3081` has no authentication and is reachable from other computes, and tenant storage tokens have no expiry (rotating them means a new key pair). The orchestrator's internal listener is reached by its service name (`http://orchestrator:8083`), so no address needs to be picked per Docker flavour.
+`compute_ctl`'s internal server on `compute:3081` listens on loopback only and needs a per-start secret, so other computes can't reach it. Tenant storage tokens for capable computes expire after 24 hours and the worker refreshes them hourly. The orchestrator's internal listener is reached by its service name (`http://orchestrator:8083`), so no address needs to be picked per Docker flavour.
 
 ### Upgrading a stack
 
