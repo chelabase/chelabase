@@ -487,6 +487,22 @@ pub(super) fn restart_targets(apps: &[String]) -> anyhow::Result<Vec<String>> {
     Ok(apps.to_vec())
 }
 
+/// The Zitadel PATs (under the stack's state dir `state`) that `apps` mount as Compose secrets,
+/// each once: admin.pat for the orchestrator, the worker and auth, login-client.pat for auth.
+fn pat_files(state: &Path, apps: &[String]) -> Vec<PathBuf> {
+    let reads = |file: &str| {
+        apps.iter().any(|a| match file {
+            "admin.pat" => matches!(a.as_str(), "orchestrator" | "worker" | "auth"),
+            _ => a == "auth",
+        })
+    };
+    ["admin.pat", "login-client.pat"]
+        .into_iter()
+        .filter(|f| reads(f))
+        .map(|f| state.join("zitadel").join(f))
+        .collect()
+}
+
 /// The services of `ps --format json` that failed: unhealthy, restarting, or exited non-zero.
 /// Compose prints one object per line (an array in older releases).
 fn failed_services(ps_json: &str) -> Vec<String> {
@@ -1068,8 +1084,14 @@ fn compose_up(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Re
 }
 
 /// `compose up -d --force-recreate --no-deps --wait <apps>`: env files are read when a container
-/// is created, so a restart would keep the old ones (T4 review M3).
+/// is created, so a restart would keep the old ones (T4 review M3). The Zitadel PATs are Compose
+/// secrets of the apps that read them: a missing one (Zitadel rewriting them after `just
+/// zitadel-reset`) would fail the create, so it first waits for them, as `up` does.
 fn recreate(stack: &Stack, apps: &[String]) -> anyhow::Result<()> {
+    let pats = pat_files(&stack.state, apps);
+    if !pats.is_empty() {
+        wait_for_files(&pats, Duration::from_secs(180))?;
+    }
     let mut args = vec![
         "--profile",
         "sites",
@@ -1839,6 +1861,81 @@ mod tests {
         assert_eq!(restart_targets(&[]).unwrap(), RUST_APPS);
         assert_eq!(restart_targets(&["studio".into()]).unwrap(), ["studio"]);
         assert!(restart_targets(&["blog".into()]).is_err());
+    }
+
+    #[test]
+    fn recreate_waits_for_the_pats_of_the_apps_that_mount_them() {
+        let state = Path::new("/s");
+        let names = |apps: &[&str]| -> Vec<PathBuf> {
+            let apps: Vec<String> = apps.iter().map(|a| a.to_string()).collect();
+            pat_files(state, &apps)
+        };
+        assert!(names(&["gateway", "rest", "realtime", "studio", "docs"]).is_empty());
+        assert_eq!(names(&["worker"]), [state.join("zitadel/admin.pat")]);
+        // Each PAT once, whatever the order or the number of readers.
+        assert_eq!(
+            names(&["orchestrator", "auth", "worker"]),
+            [
+                state.join("zitadel/admin.pat"),
+                state.join("zitadel/login-client.pat")
+            ]
+        );
+        assert_eq!(names(&[]), Vec::<PathBuf>::new());
+
+        // The table matches the compose file: every service listing a PAT secret, and only those.
+        let compose = include_str!("../../../../infra/compose/docker-compose.yml");
+        let mut mounted: Vec<(String, &str)> = Vec::new();
+        let mut service = None;
+        let mut in_services = false;
+        for line in compose.lines() {
+            if !line.starts_with(' ') && !line.is_empty() && !line.starts_with('#') {
+                in_services = line == "services:";
+                service = None;
+            } else if in_services
+                && let Some(name) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':'))
+                && !name.starts_with([' ', '#'])
+            {
+                service = Some(name.to_string());
+            }
+            for (secret, file) in [
+                ("zitadel-admin-pat", "admin.pat"),
+                ("zitadel-login-client-pat", "login-client.pat"),
+            ] {
+                if let Some(svc) = &service
+                    && line.contains(&format!("{{source: {secret}, "))
+                {
+                    mounted.push((svc.clone(), file));
+                }
+            }
+        }
+        mounted.sort();
+        // A service that mounts a PAT must be one `recreate()` can be asked to recreate, or its
+        // PAT wait is skipped and its create fails on the missing file after a zitadel reset.
+        let recreatable: Vec<&str> = APPS
+            .iter()
+            .copied()
+            .chain(["docs", "landing", "runner"])
+            .collect();
+        for (svc, _) in &mounted {
+            assert!(
+                recreatable.contains(&svc.as_str()),
+                "service `{svc}` mounts a Zitadel PAT but recreate() can't be asked for it"
+            );
+        }
+        let mut table: Vec<(String, &str)> = Vec::new();
+        for app in APPS.iter().chain(&["docs", "landing", "runner"]) {
+            for f in pat_files(Path::new(""), &[app.to_string()]) {
+                let file = if f.ends_with("admin.pat") {
+                    "admin.pat"
+                } else {
+                    "login-client.pat"
+                };
+                table.push((app.to_string(), file));
+            }
+        }
+        table.sort();
+        assert_eq!(mounted, table);
+        assert!(!table.is_empty());
     }
 
     #[test]

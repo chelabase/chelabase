@@ -72,11 +72,14 @@ for s in gateway auth rest studio zitadel mailpit metadata-db; do
     fail "$s must not get the Docker socket"
 done
 
-for s in orchestrator worker gateway auth rest runner; do
-  # Which key files each service sees: compose-key-visibility.sh (U10).
-  [[ "$(q ".services[\"$s\"].volumes[] | select(.source == \"/m/.chelabase/stacks/feat-x\") | \"\(.target) \(.read_only // false)\"")" == "/m/.chelabase/stacks/feat-x false" ]] ||
-    fail "$s mounts the state dir read-write at its own path"
+# Which key and state files each service sees: compose-key-visibility.sh (U10). Only the runner
+# mounts the whole state dir (read-write, at its own path); the apps get single state files.
+for s in orchestrator worker gateway auth rest realtime studio; do
+  [[ -z "$(q ".services[\"$s\"].volumes[]? | select(.source == \"/m/.chelabase/stacks/feat-x\") | .target")" ]] ||
+    fail "$s must not mount the whole state dir"
 done
+[[ "$(q '.services.runner.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x") | "\(.target) \(.read_only // false)"')" == "/m/.chelabase/stacks/feat-x false" ]] ||
+  fail "runner mounts the state dir read-write at its own path"
 
 [[ "$(q '.services.zitadel.volumes[] | select(.target == "/zitadel-bootstrap") | .source')" == /m/.chelabase/stacks/feat-x/zitadel ]] ||
   fail "zitadel's PATs go to the stack's state dir"
@@ -304,8 +307,8 @@ done
   fail "realtime runs the checkout's debug binary"
 [[ "$(q '.services.realtime.volumes[] | select(.source == "/w/feat-x") | .read_only // false')" == true ]] ||
   fail "realtime mounts the checkout read-only"
-[[ "$(q '.services.realtime.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x") | "\(.target) \(.read_only // false)"')" == "/m/.chelabase/stacks/feat-x false" ]] ||
-  fail "realtime mounts the state dir read-write at its own path"
+[[ -z "$(q '.services.realtime.volumes[]? | select((.source // "") | . == "/m/.chelabase/stacks/feat-x" or startswith("/m/.chelabase/stacks/feat-x/")) | .source')" ]] ||
+  fail "realtime mounts nothing from the state dir (it opens no state file)"
 [[ -z "$(q '.services.realtime.volumes[]? | select(.source == "/var/run/docker.sock") | .source')" ]] ||
   fail "realtime must not get the Docker socket"
 [[ -z "$(q '.services.realtime.ports // [] | .[]?')" ]] || fail "realtime publishes no port (the gateway is the way in)"

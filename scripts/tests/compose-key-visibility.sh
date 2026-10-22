@@ -43,7 +43,12 @@ universe='[
   "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
   "K/unlisted/a-future-key", "K/stacks/registry.json", "K/stacks/other/env/stack.env",
   "C/scripts/tests/workbench-compose.sh", "C/.chelabase/anything",
-  "S/env/stack.env"
+  "S/env/stack.env",
+  "S/zitadel/admin.pat", "S/zitadel/login-client.pat", "S/zitadel/demo-sa.json",
+  "S/zitadel/demo.env", "S/zitadel/actions.env", "S/studio.env",
+  "S/nats/auth.conf", "S/valkey/users.acl", "S/binaries.json", "S/runner/.curlrc",
+  "S/neon/proxy-ca.crt", "S/logs/x", "S/test/x", "S/test/archive.tar.zst", "S/upgrade-e2e.env",
+  "S/unlisted/x"
 ]'
 
 # service -> { path: mode }; every other (service, path) must be none.
@@ -54,9 +59,24 @@ universe='[
 # sees either.
 # RT1 T7 (S1): realtime sees the gateway's verify key (ticket requests), the platform CA's
 # certificate (T8's compute TLS), its NATS and Valkey passwords and its three realtime secrets.
+# The stack's state dir (least privilege): an app sees only the state files it reads itself, ro.
+# Its env files (stack.env, demo.env, actions.env, studio.env) are read by Compose on the host, at
+# create time, so they need no mount; nothing in an app writes under the state dir (logs, test
+# archives, the proxy CA copy, binaries.json and the runner's .curlrc are the host CLI's). The
+# Zitadel PATs are the only state files an app opens, once at startup
+# (CHELABASE_ZITADEL_ADMIN_PAT_FILE, CHELABASE_AUTH_TOKEN_FILE from demo.env); `up` creates the
+# apps that read them only after Zitadel has written them. CHELABASE_PROXY_CA_FILE is a path the
+# orchestrator hands to clients, never opens. Orchestrator and worker: admin.pat (Zitadel admin
+# API); auth: admin.pat (invites, app users) and login-client.pat (its own Zitadel client).
+# Gateway, rest and realtime open no state file. The runner (the test harness, which has the
+# Docker socket anyway) keeps the whole dir, rw: it runs nextest archives from test/, curl with
+# CURL_HOME=runner/, `docker compose` with stack.env and the env files to recreate apps
+# (roles_live), `dev token` (demo-sa.json, demo.env), reads proxy-ca.crt, studio.env and the PATs,
+# and writes upgrade-e2e.env at the dir's root.
 expected='{
   "orchestrator": {
-    "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "S/zitadel/admin.pat": "ro",
     "K/secrets/secrets.key": "ro", "K/gateway/internal-verify.pem": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
@@ -65,7 +85,8 @@ expected='{
     "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
   },
   "worker": {
-    "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "S/zitadel/admin.pat": "ro",
     "K/secrets/secrets.key": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/compute-ca/ca.crt": "rw", "K/compute-ca/ca.key": "rw",
@@ -74,25 +95,26 @@ expected='{
     "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro"
   },
   "gateway": {
-    "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
+    "C/scripts/tests/workbench-compose.sh": "ro",
     "K/gateway/internal-signing.pem": "ro", "K/auth/app-jwt.pub": "ro",
     "K/tokens/data-keys.token": "ro", "K/tokens/app-sessions.token": "ro"
   },
   "auth": {
-    "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "S/zitadel/admin.pat": "ro", "S/zitadel/login-client.pat": "ro",
     "K/auth/cookie.key": "ro", "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
     "K/tokens/app-auth.token": "ro"
   },
   "rest": {
-    "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
+    "C/scripts/tests/workbench-compose.sh": "ro",
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
     "K/tokens/rest-internal.token": "ro"
   },
   "realtime": {
-    "C/scripts/tests/workbench-compose.sh": "ro", "S/env/stack.env": "rw",
+    "C/scripts/tests/workbench-compose.sh": "ro",
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
     "K/realtime-tls/current/client.crt": "ro", "K/realtime-tls/current/client.key": "ro", "K/realtime-tls/current/ca.crt": "ro",
@@ -103,7 +125,13 @@ expected='{
   "docs": { "C/scripts/tests/workbench-compose.sh": "rw" },
   "landing": { "C/scripts/tests/workbench-compose.sh": "rw" },
   "runner": {
-    "C/scripts/tests/workbench-compose.sh": "rw", "S/env/stack.env": "rw",
+    "C/scripts/tests/workbench-compose.sh": "rw",
+    "S/env/stack.env": "rw",
+    "S/zitadel/admin.pat": "rw", "S/zitadel/login-client.pat": "rw", "S/zitadel/demo-sa.json": "rw",
+    "S/zitadel/demo.env": "rw", "S/zitadel/actions.env": "rw", "S/studio.env": "rw",
+    "S/nats/auth.conf": "rw", "S/valkey/users.acl": "rw", "S/binaries.json": "rw", "S/runner/.curlrc": "rw",
+    "S/neon/proxy-ca.crt": "rw", "S/logs/x": "rw", "S/test/x": "rw", "S/test/archive.tar.zst": "rw",
+    "S/upgrade-e2e.env": "rw", "S/unlisted/x": "rw",
     "K/secrets/secrets.key": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
@@ -143,6 +171,23 @@ expected_secret_binds='[
   "safekeeper3:K/neon/storage-tokens/safekeeper-data.jwt->/run/safekeeper-data.jwt",
   "register-safekeepers:K/neon/storage-tokens/storcon-admin.jwt->/run/storcon-admin.jwt",
   "valkey:K/valkey/health.password->/run/valkey-health.password"
+]'
+
+# Every bind whose source is the stack's state dir or under it, for all services, as
+# service:S/<source>->target (":rw" when writable; a target in the state dir also as S/…): the
+# table above goes by target, so it can't see a state file mounted at another path. NATS and
+# Valkey read the auth files the workbench renders (hashes only); Zitadel writes its PATs into
+# zitadel/ (FirstInstance, on a fresh volume); the apps get their PATs at their own paths, ro;
+# the runner gets the whole dir.
+expected_state_binds='[
+  "nats:S/nats/auth.conf->/etc/nats/auth.conf",
+  "valkey:S/valkey/users.acl->/etc/valkey/users.acl",
+  "zitadel:S/zitadel->/zitadel-bootstrap:rw",
+  "orchestrator:S/zitadel/admin.pat->S/zitadel/admin.pat",
+  "worker:S/zitadel/admin.pat->S/zitadel/admin.pat",
+  "auth:S/zitadel/admin.pat->S/zitadel/admin.pat",
+  "auth:S/zitadel/login-client.pat->S/zitadel/login-client.pat",
+  "runner:S->S:rw"
 ]'
 
 # $1 label, $2 checkout, $3 keys dir, $4 state dir, $5 link (1: <checkout>/.chelabase is a symlink
@@ -218,6 +263,15 @@ $bad"
     | sort' <<<"$config")"
   want_binds="$(jq -S -c 'sort' <<<"$expected_secret_binds")"
   [[ "$binds" == "$want_binds" ]] || fail "$label: secrets mounted at another path differ; want $want_binds, got $binds"
+  # Least privilege on the state dir, by source: exactly the binds listed above.
+  binds="$(jq -S -c --arg s "$state" '
+    def rel: if . == $s then "S" elif startswith($s + "/") then "S/" + .[($s | length) + 1:] else . end;
+    [.services | to_entries[] | .key as $svc | (.value.volumes // [])[]
+      | select(.type == "bind" and ((.source // "") | rel | . == "S" or startswith("S/")))
+      | "\($svc):\(.source | rel)->\(.target | rel)\(if (.read_only // false) then "" else ":rw" end)"]
+    | sort' <<<"$config")"
+  want_binds="$(jq -S -c 'sort' <<<"$expected_state_binds")"
+  [[ "$binds" == "$want_binds" ]] || fail "$label: binds of the state dir differ; want $want_binds, got $binds"
   # NATS and Valkey see no machine key or service secret at all (Valkey: its healthcheck's own
   # password only, listed above).
   bad="$(jq -r --arg k "$keys" '

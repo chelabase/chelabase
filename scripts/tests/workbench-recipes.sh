@@ -58,6 +58,9 @@ done
 for f in scripts/zitadel-reset.sh; do
   grep -q -- '-p "\$CHELABASE_COMPOSE_PROJECT"' "$f" || fail "$f acts on the stack's project"
 done
+# The apps mount both PATs as Compose secrets: the reset waits until Zitadel has rewritten both.
+grep -qF '[[ -s "${ZDIR}/admin.pat" ]] && [[ -s "${ZDIR}/login-client.pat" ]]' scripts/zitadel-reset.sh ||
+  fail "zitadel-reset waits for both PATs"
 for f in scripts/neon-e2e.sh scripts/branch-e2e.sh; do
   grep -q 'chelabase.dev/stack' "$f" || fail "$f selects computes by the stack's label"
 done

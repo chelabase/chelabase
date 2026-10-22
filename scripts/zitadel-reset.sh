@@ -35,14 +35,17 @@ chmod 777 "$ZDIR" 2>/dev/null || true
 echo "[zitadel-reset] starting Zitadel fresh…"
 "${compose[@]}" up -d zitadel-db zitadel
 
-echo "[zitadel-reset] waiting for admin.pat…"
+# Both PATs: the orchestrator, the worker and auth mount them as Compose secrets, so an app
+# created or restarted while one is missing fails to start. The running apps keep the old PATs
+# (read once, at startup) until they are recreated.
+echo "[zitadel-reset] waiting for admin.pat and login-client.pat…"
 for _ in $(seq 1 60); do
-  if [[ -f "${ZDIR}/admin.pat" ]] && [[ -s "${ZDIR}/admin.pat" ]]; then
-    echo "[zitadel-reset] admin.pat ready — run: just zitadel-bootstrap"
+  if [[ -s "${ZDIR}/admin.pat" ]] && [[ -s "${ZDIR}/login-client.pat" ]]; then
+    echo "[zitadel-reset] PATs ready — run: just zitadel-bootstrap, then just workbench restart"
     exit 0
   fi
   sleep 2
 done
 
-echo "[zitadel-reset] ERROR: admin.pat not written. Check: ${compose[*]} logs zitadel" >&2
+echo "[zitadel-reset] ERROR: admin.pat or login-client.pat not written. Check: ${compose[*]} logs zitadel" >&2
 exit 1

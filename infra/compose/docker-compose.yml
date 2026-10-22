@@ -47,8 +47,11 @@ x-neon-s3-env: &neon-s3-env
 
 # --- The app tier's shared parts ---
 # Every path is mounted at its own host path (the checkout, the shared machine keys under
-# <main>/.chelabase, the stack's state dir), so the file paths in demo.env mean the same thing
-# inside and outside the containers.
+# <main>/.chelabase, the state files an app reads), so the file paths in demo.env mean the same
+# thing inside and outside the containers. Of the stack's state dir an app sees only the state
+# files it opens itself, read-only, as Compose secrets at their own paths (the Zitadel PATs); its
+# env files (stack.env, demo.env, actions.env, studio.env) are read by Compose on the host, at
+# create time, and need no mount. Only the runner mounts the whole state dir (`x-state`).
 x-workbench: &workbench
   image: ${CHELABASE_WORKBENCH_IMAGE:?set by chelabase workbench (stack.env)}
   user: "${CHELABASE_UID:?set by chelabase workbench (stack.env)}:${CHELABASE_GID:?set by chelabase workbench (stack.env)}"
@@ -132,6 +135,11 @@ x-keys-realtime-tls-ro: &keys-realtime-tls-ro
   target: ${CHELABASE_KEYS_DIR}/realtime-tls
   read_only: true
   bind: {create_host_path: false}
+# The stack's whole state dir, read-write at its own path: the runner's alone (the test harness,
+# which has the Docker socket anyway). It runs nextest archives from test/, curl with
+# CURL_HOME=runner/, `docker compose` with stack.env and the env files to recreate apps
+# (roles_live), `dev token` (demo-sa.json, demo.env), reads proxy-ca.crt, studio.env and the PATs,
+# and writes into the dir (upgrade-e2e.env). No app mounts it.
 x-state: &state
   type: bind
   source: ${CHELABASE_STACK_DIR}
@@ -232,7 +240,10 @@ services:
 
   # Zitadel v4: sign-in pages are Studio's own (/login …), served by auth. FirstInstance writes
   # admin.pat and login-client.pat once, on a fresh zitadel_pg_data volume, into the stack's
-  # state dir.
+  # state dir. Its mount is the whole <state>/zitadel directory (rw), which also holds the
+  # bootstrap's demo.env, demo-sa.json and actions.env: that exposes nothing new to Zitadel, which
+  # generated those secrets itself (the service account's key, the actions signing key) and
+  # controls its own instance.
   zitadel:
     image: ghcr.io/zitadel/zitadel:v4.19.1@sha256:f98935f56505ec6fa3e6523261cd1b8ace0c622e16da4a45acd493cb472f003f
     restart: unless-stopped
@@ -756,9 +767,9 @@ services:
       - *keys-mask
       - *checkout-mask
       - *keys-orchestrator-tls-ro
-      - *state
       - *docker-sock
     secrets:
+      - {source: zitadel-admin-pat, target: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
       - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
       - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
       - {source: compute-jwt-private, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
@@ -817,9 +828,9 @@ services:
       - *keys-compute-ca-rw
       - *keys-orchestrator-tls-rw
       - *keys-realtime-tls-rw
-      - *state
       - *docker-sock
     secrets:
+      - {source: zitadel-admin-pat, target: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
       - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
       - {source: compute-jwt-private, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
       - {source: compute-jwt-public, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
@@ -881,7 +892,6 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *state
     secrets:
       - {source: internal-signing, target: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
       - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
@@ -915,8 +925,9 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *state
     secrets:
+      - {source: zitadel-admin-pat, target: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
+      - {source: zitadel-login-client-pat, target: "${CHELABASE_STACK_DIR}/zitadel/login-client.pat"}
       - {source: cookie, target: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}
       - {source: app-jwt-private, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
       - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
@@ -948,7 +959,6 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *state
     secrets:
       - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
       - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
@@ -996,7 +1006,6 @@ services:
       - *keys-mask
       - *checkout-mask
       - *keys-realtime-tls-ro
-      - *state
     secrets:
       - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
       - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
@@ -1110,6 +1119,7 @@ services:
       - *keys-compute-ca-ro
       - *keys-orchestrator-tls-ro
       - *keys-realtime-tls-ro
+      # The whole state dir, rw (x-state): the runner works in it, see there.
       - *state
       - *docker-sock
       - type: bind
@@ -1199,6 +1209,16 @@ secrets:
   # The platform CA's certificate alone (never ca.key): auth, rest and realtime verify every
   # compute's TLS against it (U15, CHELABASE_COMPUTE_CA_FILE).
   compute-ca-cert: {file: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+  # The Zitadel PATs, the only state files an app opens (once, at startup, from the paths demo.env
+  # gives: CHELABASE_ZITADEL_ADMIN_PAT_FILE, CHELABASE_AUTH_TOKEN_FILE), at their own paths, ro:
+  # admin.pat for the orchestrator, the worker and auth, login-client.pat for auth. Zitadel writes
+  # them on a fresh volume, so a missing one fails the app's create or start (no longer a warning
+  # in the orchestrator or the worker): `workbench up`, `restart` and `test`'s recreate of
+  # stale apps wait for the PATs before they create these apps, and `scripts/zitadel-reset.sh`
+  # (which deletes them) returns only once Zitadel has rewritten both. A running app keeps the
+  # file it started with.
+  zitadel-admin-pat: {file: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
+  zitadel-login-client-pat: {file: "${CHELABASE_STACK_DIR}/zitadel/login-client.pat"}
 
 networks:
   # Orchestrator and test runner to computes (<project>_control). A fixed subnet per stack from
