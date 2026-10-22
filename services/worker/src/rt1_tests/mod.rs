@@ -161,6 +161,7 @@ pub(crate) fn rt_worker() -> Rt {
         claim_refresh: w.claim_refresh,
         schema_check_cursor: w.schema_check_cursor,
         enabling_seen: w.enabling_seen,
+        recreate_backoff: w.recreate_backoff,
         zitadel: w.zitadel,
         app_users_reconcile_every: w.app_users_reconcile_every,
         member_roles_sweep_every: w.member_roles_sweep_every,

@@ -297,11 +297,11 @@ fn write_auth_files_reports_whether_the_nats_file_changed() {
     stack_secrets::ensure(&keys).unwrap();
 
     assert!(
-        write_auth_files(&keys, &state).unwrap(),
+        write_auth_files(&keys, &state).unwrap().nats,
         "the first render creates it"
     );
     assert!(
-        !write_auth_files(&keys, &state).unwrap(),
+        !write_auth_files(&keys, &state).unwrap().nats,
         "an unchanged re-render"
     );
 
@@ -310,7 +310,7 @@ fn write_auth_files_reports_whether_the_nats_file_changed() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            !write_auth_files(&keys, &state).unwrap(),
+            !write_auth_files(&keys, &state).unwrap().nats,
             "only the mode was fixed"
         );
         assert_eq!(mode(&auth), 0o600);
@@ -320,7 +320,7 @@ fn write_auth_files_reports_whether_the_nats_file_changed() {
     std::fs::remove_file(keys.join("valkey/realtime.password")).unwrap();
     stack_secrets::ensure(&keys).unwrap();
     assert!(
-        !write_auth_files(&keys, &state).unwrap(),
+        !write_auth_files(&keys, &state).unwrap().nats,
         "only users.acl changed"
     );
 
@@ -328,18 +328,18 @@ fn write_auth_files_reports_whether_the_nats_file_changed() {
     std::fs::remove_file(keys.join("nats/worker.password")).unwrap();
     stack_secrets::ensure(&keys).unwrap();
     assert!(
-        write_auth_files(&keys, &state).unwrap(),
+        write_auth_files(&keys, &state).unwrap().nats,
         "a NATS password changed"
     );
-    assert!(!write_auth_files(&keys, &state).unwrap());
+    assert!(!write_auth_files(&keys, &state).unwrap().nats);
 
     // A file edited by hand (or an older render with other permissions) is rewritten.
     std::fs::write(&auth, "authorization { users: [] }\n").unwrap();
     assert!(
-        write_auth_files(&keys, &state).unwrap(),
+        write_auth_files(&keys, &state).unwrap().nats,
         "a stale file was rewritten"
     );
-    assert!(!write_auth_files(&keys, &state).unwrap());
+    assert!(!write_auth_files(&keys, &state).unwrap().nats);
 }
 
 // R9: on a running stack a changed auth.conf restarts NATS (the running server keeps reading the
@@ -351,4 +351,46 @@ fn up_restarts_nats_only_for_a_changed_auth_file_on_a_running_stack() {
     assert!(!nats_needs_restart(true, false));
     assert!(!nats_needs_restart(false, true));
     assert!(!nats_needs_restart(false, false));
+}
+
+// hardening-b: `write_auth_files` reports each file separately; a Valkey-only change is
+// valkey true / nats false, and the other way round.
+#[test]
+fn write_auth_files_reports_the_valkey_file_separately() {
+    let t = tempfile::tempdir().unwrap();
+    let (keys, state) = (t.path().join("keys"), t.path().join("state"));
+    stack_secrets::ensure(&keys).unwrap();
+
+    let first = write_auth_files(&keys, &state).unwrap();
+    assert!(first.nats && first.valkey, "the first render creates both");
+    let again = write_auth_files(&keys, &state).unwrap();
+    assert!(!again.nats && !again.valkey, "an unchanged re-render");
+
+    std::fs::remove_file(keys.join("valkey/realtime.password")).unwrap();
+    stack_secrets::ensure(&keys).unwrap();
+    let c = write_auth_files(&keys, &state).unwrap();
+    assert!(c.valkey && !c.nats, "only users.acl changed");
+    let c = write_auth_files(&keys, &state).unwrap();
+    assert!(!c.valkey && !c.nats);
+
+    std::fs::remove_file(keys.join("nats/worker.password")).unwrap();
+    stack_secrets::ensure(&keys).unwrap();
+    let c = write_auth_files(&keys, &state).unwrap();
+    assert!(c.nats && !c.valkey, "only auth.conf changed");
+
+    // A hand-edited ACL file is rewritten.
+    std::fs::write(state.join("valkey/users.acl"), "user default off\n").unwrap();
+    let c = write_auth_files(&keys, &state).unwrap();
+    assert!(c.valkey && !c.nats, "a stale users.acl was rewritten");
+}
+
+// hardening-b: on a running stack a changed users.acl restarts Valkey (single-file bind mount
+// keeps the old inode); an unchanged one doesn't, and a stack that wasn't running starts fresh.
+#[test]
+fn up_restarts_valkey_only_for_a_changed_acl_on_a_running_stack() {
+    use super::commands::valkey_needs_restart;
+    assert!(valkey_needs_restart(true, true));
+    assert!(!valkey_needs_restart(true, false));
+    assert!(!valkey_needs_restart(false, true));
+    assert!(!valkey_needs_restart(false, false));
 }

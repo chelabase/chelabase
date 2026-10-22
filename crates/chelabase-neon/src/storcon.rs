@@ -65,6 +65,18 @@ impl StorconError {
         }
     }
 
+    /// Storcon forwarded the pageserver's 404 for the tenant (`NotFound: 1 (pageserver):
+    /// NotFound: tenant <id>`): the pageserver hasn't loaded the tenant yet (right after a
+    /// restart), which clears by itself. Storcon's own 404 (a tenant it doesn't know) is not.
+    pub fn is_pageserver_tenant_not_found(&self) -> bool {
+        match self {
+            Self::Rejected { status, message } if *status == StatusCode::NOT_FOUND => {
+                message.contains("(pageserver): NotFound: tenant")
+            }
+            _ => false,
+        }
+    }
+
     /// The request timed out (no answer within the per-request timeout).
     pub fn is_request_timeout(&self) -> bool {
         match self {
@@ -776,6 +788,34 @@ mod tests {
     #[test]
     fn head_lsn_higher_commit_wins() {
         assert_eq!(head_lsn(Lsn(0x100), Some(Lsn(0x180))), Lsn(0x180));
+    }
+
+    fn not_found(status: StatusCode, message: &str) -> StorconError {
+        StorconError::Rejected {
+            status,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn only_the_pageservers_forwarded_tenant_404_is_pageserver_tenant_not_found() {
+        let forwarded = "NotFound: 1 (pageserver): NotFound: tenant 7b1d";
+        assert!(not_found(StatusCode::NOT_FOUND, forwarded).is_pageserver_tenant_not_found());
+        let noted = format!("{forwarded} (after 3 attempts in 1.5s)");
+        assert!(not_found(StatusCode::NOT_FOUND, &noted).is_pageserver_tenant_not_found());
+        // Storcon's own 404, a timeline 404, other statuses, other variants.
+        for (status, message) in [
+            (StatusCode::NOT_FOUND, "NotFound: Tenant 7b1d not found"),
+            (StatusCode::NOT_FOUND, "NotFound: 1 (pageserver): NotFound: timeline 9"),
+            (StatusCode::CONFLICT, forwarded),
+            (StatusCode::BAD_REQUEST, forwarded),
+        ] {
+            assert!(
+                !not_found(status, message).is_pageserver_tenant_not_found(),
+                "{status} {message}"
+            );
+        }
+        assert!(!attaching().is_pageserver_tenant_not_found());
     }
 
     fn attaching() -> StorconError {

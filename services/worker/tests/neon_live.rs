@@ -19,7 +19,7 @@ use chelabase_types::{BranchId, DatabaseId};
 use worker::config::{RealWorker, WorkerConfig};
 
 mod common;
-use common::{cleanup, setup, sqlx_delete};
+use common::{cleanup, delete_database, setup, sqlx_delete};
 
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
@@ -135,7 +135,7 @@ async fn lifecycle(
     assert!(!state.needs_reconfigure, "flag still set after reset");
 
     // --- delete ---
-    worker.handle_delete(id).await.expect("handle_delete");
+    delete_database(worker, metadata, id).await.expect("handle_delete");
     assert_eq!(
         worker.computes.status(&ep).await.unwrap(),
         None,

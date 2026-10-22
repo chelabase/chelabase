@@ -347,3 +347,23 @@ async fn ensure_is_idempotent_fixes_drift_and_keeps_one_message_per_tenant() {
     );
     assert_eq!(held_for(&js, &subject).await, 1, "one message per tenant");
 }
+
+// A create cut off by the deadline may still be applied by the server; the wait deletes the
+// consumer by name anyway, so none is left however the deadline falls (hardening-a, item 1).
+// Deadlines from 25 ms up land before, during and after the create; each wait returns `Ok(None)`
+// or, if even the first call didn't finish, `Err`, and leaves nothing behind.
+#[tokio::test]
+#[ignore]
+async fn a_wait_cut_off_by_its_deadline_leaves_no_consumer() {
+    let js = js().await;
+    for millis in [25u64, 30, 40, 55, 75, 100, 150] {
+        for _ in 0..3 {
+            let t = tenant();
+            let _ = wait_tenant_attached(&js, &t, Duration::from_millis(millis)).await;
+            assert!(
+                wait_consumers(&js, &t).await.is_empty(),
+                "a {millis} ms wait left its consumer"
+            );
+        }
+    }
+}

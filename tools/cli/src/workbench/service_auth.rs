@@ -328,11 +328,18 @@ pub fn render_valkey_acl(passwords: &BTreeMap<String, String>) -> Result<String>
     Ok(out)
 }
 
+/// Which rendered auth files changed on disk (see [`write_auth_files`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthFilesChanged {
+    pub nats: bool,
+    pub valkey: bool,
+}
+
 /// Writes `<state>/nats/auth.conf` and `<state>/valkey/users.acl` (0600) from the secret files
 /// under `keys`. A file whose contents don't change is left alone (its mode still tightened).
-/// True when `nats/auth.conf`'s contents changed (created or rewritten): a running NATS keeps
-/// reading the old file through its single-file bind mount, so `up` restarts it (R9).
-pub fn write_auth_files(keys: &Path, state: &Path) -> Result<bool> {
+/// Reports which file's contents changed (created or rewritten): a running NATS or Valkey keeps
+/// reading the old inode through its single-file bind mount, so `up` restarts it (R9).
+pub fn write_auth_files(keys: &Path, state: &Path) -> Result<AuthFilesChanged> {
     let read = |dir: &str, users: &[&str]| -> Result<BTreeMap<String, String>> {
         users
             .iter()
@@ -351,8 +358,11 @@ pub fn write_auth_files(keys: &Path, state: &Path) -> Result<bool> {
     let nats = render_nats_auth_reusing(&read("nats", &NATS_USERS)?, &previous)?;
     let nats_changed = write_private(&nats_path, nats.as_bytes())?;
     let acl = render_valkey_acl(&read("valkey", &VALKEY_USERS)?)?;
-    write_private(&state.join("valkey/users.acl"), acl.as_bytes())?;
-    Ok(nats_changed)
+    let valkey_changed = write_private(&state.join("valkey/users.acl"), acl.as_bytes())?;
+    Ok(AuthFilesChanged {
+        nats: nats_changed,
+        valkey: valkey_changed,
+    })
 }
 
 /// The storage tokens the workbench derives (scope, file under `<keys>/neon/storage-tokens/`).

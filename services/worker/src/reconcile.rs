@@ -2,7 +2,7 @@
 //! repair what a lost job or a failed step left behind.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chelabase_metadata::{
@@ -15,6 +15,28 @@ use tracing::{error, info, warn};
 
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::{COMPUTE_SETTINGS_VERSION, Worker};
+
+/// The backoff after a recreate whose compute never got ready: one reconcile interval (main's
+/// 30 s timer), doubling with each further consecutive failure, up to [`BACKOFF_CAP`].
+pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
+pub const BACKOFF_CAP: Duration = Duration::from_secs(600);
+
+/// One endpoint's recreate failures (in memory; a worker restart forgets them).
+#[derive(Debug, Clone, Copy)]
+pub struct RecreateBackoff {
+    failures: u32,
+    next_attempt: Instant,
+}
+
+impl RecreateBackoff {
+    /// The wait after the `failures`-th consecutive failure: `BACKOFF_BASE * 2^(n-1)`, capped.
+    pub fn delay(failures: u32) -> Duration {
+        let doubled = BACKOFF_BASE.saturating_mul(
+            1u32.checked_shl(failures.saturating_sub(1)).unwrap_or(u32::MAX),
+        );
+        doubled.min(BACKOFF_CAP)
+    }
+}
 
 pub const STALE_PROVISION_SECS: i64 = 600;
 pub const STALE_DELETE_SECS: i64 = 60;
@@ -277,9 +299,10 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
             // Backups have no compute. Recreating a compute runs the data API bootstrap and
             // the resync too. A container that's there but not running (R5: crash-looping, or
             // exited) is recreated like a missing one; `create` replaces the old container.
-            // This also recreates a compute an operator stopped with `docker stop`. No job is
-            // racing it: a job moves the branch out of ready first, and a create in flight is
-            // in Docker state `created`, never listed as not running. Docker's restart policy
+            // This also recreates a compute an operator stopped with `docker stop`. A job moves
+            // the branch out of ready first, and a create in flight is in Docker state
+            // `created`, never listed as not running; a claim that lands after `observe` is
+            // seen by `execute`, which re-reads the branch when it acts. Docker's restart policy
             // can race it, though: it may bring the container back between `observe` and the
             // action, so `execute` re-checks the status when it acts. This is the worker's own
             // compute, not an orphan, so `CHELABASE_WORKER_REMOVE_ORPHANS` doesn't apply.
@@ -512,11 +535,72 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// waited for, up to `ready_timeout` (60 s in production), so after a mass outage one pass
     /// can take minutes; the 30 s timer then fires the next pass straight after.
     pub async fn reconcile_once(&self) -> Result<(), String> {
+        self.reconcile_once_with(&Instant::now).await
+    }
+
+    /// [`Self::reconcile_once`] with the clock given (tests move it).
+    ///
+    /// A recreate whose compute never got ready is not planned again at once: the endpoint
+    /// waits [`RecreateBackoff::delay`] after each consecutive failure, so a branch that can't
+    /// come up doesn't spend `ready_timeout` of every serial pass. An endpoint no longer
+    /// planned for a recreate (its branch left ready, its compute is running) is forgotten.
+    pub async fn reconcile_once_with(
+        &self,
+        clock: &(dyn Fn() -> Instant + Sync),
+    ) -> Result<(), String> {
         let snapshot = self.observe().await.map_err(|e| format!("{e:#}"))?;
-        for action in plan(&snapshot) {
+        let actions = plan(&snapshot);
+        let recreating: HashSet<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::RecreateBranchCompute(_, ep) => Some(ep.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.recreate_backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|ep, _| recreating.contains(ep.as_str()));
+        for action in actions {
+            if let Action::RecreateBranchCompute(id, ep) = &action {
+                let next = self
+                    .recreate_backoff
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(ep)
+                    .map(|b| b.next_attempt);
+                if let Some(next) = next.filter(|n| *n > clock()) {
+                    info!(
+                        branch_id = %id,
+                        endpoint_id = %ep,
+                        retry_in_secs = next.saturating_duration_since(clock()).as_secs(),
+                        "compute never got ready; not recreating it yet"
+                    );
+                    continue;
+                }
+            }
             info!(?action, "reconcile");
-            if let Err(err) = self.execute(&action).await {
+            let result = self.execute(&action).await;
+            if let Err(err) = &result {
                 warn!(?action, "reconcile action failed: {err}");
+            }
+            if let Action::RecreateBranchCompute(_, ep) = &action {
+                let mut backoff = self.recreate_backoff.lock().unwrap_or_else(|e| e.into_inner());
+                match result {
+                    Ok(()) => {
+                        backoff.remove(ep);
+                    }
+                    Err(_) => {
+                        let failures = backoff.get(ep).map_or(0, |b| b.failures).saturating_add(1);
+                        backoff.insert(
+                            ep.clone(),
+                            RecreateBackoff {
+                                failures,
+                                next_attempt: clock() + RecreateBackoff::delay(failures),
+                            },
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -768,6 +852,25 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Action::RetryBranchDelete(id) => self.handle_branch_delete(*id).await,
             Action::FinishSwitch(id) => self.finish_switch(*id).await,
             Action::RecreateBranchCompute(id, ep) => {
+                // A pass is serial and can take minutes, so a job may have claimed the branch
+                // since `observe` (a delete, which removes the compute: a recreate now would
+                // leave one nobody owns; a reset or restore, which switches it itself): act
+                // only on a branch still ready with this endpoint.
+                let branch = self
+                    .metadata
+                    .get_branch(*id)
+                    .await
+                    .map_err(|e| format!("reading the branch before recreating its compute: {e}"))?;
+                if !branch.is_some_and(|b| {
+                    b.status == BranchStatus::Ready && b.endpoint_id.as_deref() == Some(ep.as_str())
+                }) {
+                    info!(
+                        branch_id = %id,
+                        endpoint_id = %ep,
+                        "the branch is no longer ready with this compute; not recreating it"
+                    );
+                    return Ok(());
+                }
                 // Docker's restart policy may have brought the container back since `observe`:
                 // recreate only one that is absent or still not running. If the status can't be
                 // read, skip: a truly dead compute waits one pass (30 s), whereas recreating
@@ -3077,7 +3180,8 @@ mod tests {
             w.computes.remove(&d.ep);
             *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
 
-            w.reconcile_once().await.unwrap();
+            let t0 = std::time::Instant::now();
+            pass_at(&w, t0, 0).await;
 
             assert!(
                 !w.computes.list().await.unwrap().contains(&d.ep),
@@ -3086,7 +3190,8 @@ mod tests {
             );
             assert_eq!(creates(&journal, &d.ep), 1, "{:?}", entries(&journal));
 
-            w.reconcile_once().await.unwrap();
+            // The next pass after the backoff (one interval).
+            pass_at(&w, t0, 30).await;
 
             assert_eq!(
                 creates(&journal, &d.ep),
@@ -3098,7 +3203,7 @@ mod tests {
 
             // Once the compute can get ready, the next pass brings it back for good.
             *w.computes.sql_failures_left.lock().unwrap() = 0;
-            w.reconcile_once().await.unwrap();
+            pass_at(&w, t0, 90).await;
             assert!(w.computes.list().await.unwrap().contains(&d.ep));
             assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Ready);
         }
@@ -3350,6 +3455,75 @@ mod tests {
             w.computes.status(&d.ep).await.unwrap(),
             Some(chelabase_neon::ComputeStatus::Running)
         );
+    }
+
+    // A pass is serial and can take minutes (each recreate waits up to `ready_timeout`), so a
+    // job may claim a branch between `observe` and the moment its planned recreate acts: a
+    // database or branch delete (which then removes the compute; a recreate after that would
+    // leave a compute nobody owns) or a reset or restore (which switches the compute itself).
+    // The action re-reads the branch and recreates only one still ready with that endpoint.
+    #[tokio::test]
+    async fn a_recreate_planned_before_a_job_claimed_the_branch_does_not_act() {
+        for status in [
+            BranchStatus::Deleting,
+            BranchStatus::Deleted,
+            BranchStatus::Resetting,
+        ] {
+            let (w, journal) = worker();
+            let d = dev_setup(&w, &journal).await;
+            w.computes.remove(&d.ep);
+            let planned = plan(&w.observe().await.unwrap());
+            assert!(
+                planned.contains(&Action::RecreateBranchCompute(d.dev, d.ep.clone())),
+                "{planned:?}"
+            );
+
+            // The job's claim lands, then the job removes the compute (a delete) or not yet.
+            set_branch(&w, d.dev, status, 0);
+            journal.lock().unwrap().clear();
+            w.execute(&Action::RecreateBranchCompute(d.dev, d.ep.clone()))
+                .await
+                .unwrap();
+
+            assert_eq!(creates(&journal, &d.ep), 0, "{status:?}: {:?}", entries(&journal));
+            assert!(
+                !entries(&journal)
+                    .iter()
+                    .any(|e| e.starts_with("metadata.replace_compute_token")),
+                "{status:?}: {:?}",
+                entries(&journal)
+            );
+            assert_eq!(w.computes.status(&d.ep).await.unwrap(), None, "{status:?}");
+        }
+    }
+
+    // The same when the branch moved to another endpoint, or its row is gone.
+    #[tokio::test]
+    async fn a_recreate_for_an_endpoint_the_branch_no_longer_has_does_not_act() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.computes.remove(&d.ep);
+        w.metadata
+            .state()
+            .branches
+            .get_mut(&d.dev)
+            .unwrap()
+            .endpoint_id = Some("ep-another".into());
+        journal.lock().unwrap().clear();
+        w.execute(&Action::RecreateBranchCompute(d.dev, d.ep.clone()))
+            .await
+            .unwrap();
+        assert_eq!(creates(&journal, &d.ep), 0, "{:?}", entries(&journal));
+
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.computes.remove(&d.ep);
+        w.metadata.state().branches.remove(&d.dev);
+        journal.lock().unwrap().clear();
+        w.execute(&Action::RecreateBranchCompute(d.dev, d.ep.clone()))
+            .await
+            .unwrap();
+        assert_eq!(creates(&journal, &d.ep), 0, "{:?}", entries(&journal));
     }
 
     // R5: the fake's listing, which `observe` reads: a stopped compute is listed both as a
@@ -3703,5 +3877,113 @@ mod tests {
         let s = w.observe().await.unwrap();
         assert!(s.computes.contains(&d.ep));
         assert_eq!(s.not_running, [d.ep.clone()].into());
+    }
+
+    // --- Backoff for a never-ready compute (hardening C, item 8) ------------------------
+
+    /// A pass at `base + secs`.
+    async fn pass_at(w: &FakeWorker, base: std::time::Instant, secs: u64) {
+        let now = move || base + Duration::from_secs(secs);
+        w.reconcile_once_with(&now).await.unwrap();
+    }
+
+    fn never_ready(w: &FakeWorker, ep: &str) {
+        w.computes.remove(ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+    }
+
+    #[test]
+    fn the_backoff_delay_doubles_from_the_reconcile_interval_and_caps_at_ten_minutes() {
+        let secs: Vec<u64> = [1u32, 2, 3, 4, 5, 6, 7, 40, 1000, u32::MAX]
+            .iter()
+            .map(|n| RecreateBackoff::delay(*n).as_secs())
+            .collect();
+        assert_eq!(secs, [30, 60, 120, 240, 480, 600, 600, 600, 600, 600]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_recreate_skips_the_next_pass_then_retries_and_doubles() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        never_ready(&w, &d.ep);
+        let t0 = std::time::Instant::now();
+
+        pass_at(&w, t0, 0).await;
+        assert_eq!(creates(&journal, &d.ep), 1);
+        pass_at(&w, t0, 10).await;
+        pass_at(&w, t0, 29).await;
+        assert_eq!(creates(&journal, &d.ep), 1, "{:?}", entries(&journal));
+        // The second consecutive failure waits twice as long.
+        pass_at(&w, t0, 30).await;
+        assert_eq!(creates(&journal, &d.ep), 2);
+        pass_at(&w, t0, 89).await;
+        assert_eq!(creates(&journal, &d.ep), 2, "{:?}", entries(&journal));
+        pass_at(&w, t0, 90).await;
+        assert_eq!(creates(&journal, &d.ep), 3);
+        pass_at(&w, t0, 209).await;
+        assert_eq!(creates(&journal, &d.ep), 3);
+        pass_at(&w, t0, 210).await;
+        assert_eq!(creates(&journal, &d.ep), 4);
+    }
+
+    #[tokio::test]
+    async fn a_successful_recreate_resets_the_backoff() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        never_ready(&w, &d.ep);
+        let t0 = std::time::Instant::now();
+        pass_at(&w, t0, 0).await;
+        pass_at(&w, t0, 30).await;
+        assert_eq!(creates(&journal, &d.ep), 2);
+
+        *w.computes.sql_failures_left.lock().unwrap() = 0;
+        pass_at(&w, t0, 90).await;
+        assert_eq!(creates(&journal, &d.ep), 3);
+        assert!(w.computes.list().await.unwrap().contains(&d.ep));
+
+        // Down again: the first failure after a success waits one interval, not four.
+        never_ready(&w, &d.ep);
+        pass_at(&w, t0, 100).await;
+        assert_eq!(creates(&journal, &d.ep), 4);
+        pass_at(&w, t0, 129).await;
+        assert_eq!(creates(&journal, &d.ep), 4);
+        pass_at(&w, t0, 130).await;
+        assert_eq!(creates(&journal, &d.ep), 5);
+    }
+
+    #[tokio::test]
+    async fn a_branch_leaving_ready_resets_the_backoff() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        never_ready(&w, &d.ep);
+        let t0 = std::time::Instant::now();
+        pass_at(&w, t0, 0).await;
+        pass_at(&w, t0, 30).await;
+        assert_eq!(creates(&journal, &d.ep), 2);
+
+        // Not ready for a pass (a reset in flight), then ready again with no compute.
+        set_branch(&w, d.dev, BranchStatus::Resetting, 0);
+        pass_at(&w, t0, 31).await;
+        set_branch(&w, d.dev, BranchStatus::Ready, 0);
+        w.computes.remove(&d.ep);
+        pass_at(&w, t0, 32).await;
+        assert_eq!(creates(&journal, &d.ep), 3, "{:?}", entries(&journal));
+    }
+
+    #[tokio::test]
+    async fn one_endpoints_backoff_does_not_hold_back_another() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let main_ep = w.metadata.main(d.db).endpoint_id.unwrap();
+        never_ready(&w, &d.ep);
+        let t0 = std::time::Instant::now();
+        pass_at(&w, t0, 0).await;
+        assert_eq!(creates(&journal, &d.ep), 1);
+
+        *w.computes.sql_failures_left.lock().unwrap() = 0;
+        w.computes.remove(&main_ep);
+        pass_at(&w, t0, 10).await;
+        assert_eq!(creates(&journal, &main_ep), 1, "{:?}", entries(&journal));
+        assert_eq!(creates(&journal, &d.ep), 1, "{:?}", entries(&journal));
     }
 }

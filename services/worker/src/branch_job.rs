@@ -42,7 +42,9 @@ impl StepFailure {
     }
 
     /// A storage-controller failure under `prefix`: transient unless the controller refused
-    /// the request (4xx).
+    /// the request (4xx). The one 4xx that is transient: storcon forwarding the pageserver's
+    /// 404 for the tenant, which the pageserver hasn't loaded yet after a restart. Storcon's own
+    /// 404 stays permanent.
     ///
     /// A branch create whose start LSN the pageserver hasn't ingested yet doesn't come back
     /// as a 406: the pageserver waits up to `WaitLsnTimeout::Default` (300 s), longer than the
@@ -53,7 +55,7 @@ impl StepFailure {
     pub fn storage(prefix: &str, e: &StorconError) -> Self {
         Self {
             message: format!("{prefix}: {e:#}"),
-            transient: matches!(e, StorconError::Other(_)),
+            transient: matches!(e, StorconError::Other(_)) || e.is_pageserver_tenant_not_found(),
         }
     }
 
@@ -225,6 +227,41 @@ mod tests {
                  is reconfiguring"
             )
         );
+    }
+
+    // The pageserver doesn't have the tenant yet (right after a restart): storcon forwards its
+    // 404, which clears by itself. Storcon's own 404 (an unknown tenant) is permanent.
+    #[tokio::test]
+    async fn a_create_retries_the_pageservers_tenant_404_but_not_storcons_own() {
+        for method in ["lsn_by_timestamp", "create_branch_timeline"] {
+            let (w, _journal) = worker();
+            let (dev, _) = pending_dev(&w).await;
+            *w.storage.not_found.lock().unwrap() = Some((
+                method,
+                "NotFound: 1 (pageserver): NotFound: tenant 0123".to_string(),
+            ));
+            let err = w
+                .handle_branch_job_attempt(create(dev), Attempt(1))
+                .await
+                .expect_err(method);
+            assert!(err.contains("(pageserver): NotFound: tenant"), "{method}: {err}");
+            assert_eq!(
+                w.metadata.branch(dev).status,
+                BranchStatus::Provisioning,
+                "{method}"
+            );
+
+            *w.storage.not_found.lock().unwrap() =
+                Some((method, "NotFound: Tenant 0123 not found".to_string()));
+            w.handle_branch_job_attempt(create(dev), Attempt(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                w.metadata.branch(dev).status,
+                BranchStatus::Failed,
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test]

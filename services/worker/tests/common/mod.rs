@@ -124,8 +124,28 @@ pub async fn setup_with(
     (worker, metadata, config)
 }
 
-/// Best-effort cleanup for a failed run: every branch's compute, the tenant, and the rows.
+/// What the API does for a database delete, then the job: the claim (`begin_delete`: the
+/// database and its live branches `deleting`), then `handle_delete`. Without the claim the
+/// stack's own worker sees ready branches whose computes the delete just removed and recreates
+/// them (its reconcile pass), leaving computes behind.
+pub async fn delete_database(
+    worker: &RealWorker,
+    metadata: &MetadataClient,
+    id: DatabaseId,
+) -> Result<(), String> {
+    assert_eq!(
+        metadata.begin_delete(id).await.expect("begin_delete"),
+        chelabase_metadata::BeginDelete::Started,
+        "the delete claim"
+    );
+    worker.handle_delete(id).await
+}
+
+/// Best-effort cleanup for a failed run: every branch's compute, the tenant, and the rows. It
+/// claims the database first (as a delete does), so the stack's worker doesn't recreate the
+/// computes it removes.
 pub async fn cleanup(worker: &RealWorker, metadata: &MetadataClient, id: DatabaseId) {
+    let _ = metadata.begin_delete(id).await;
     for branch in metadata.list_branches(id).await.unwrap_or_default() {
         let Some(ep) = branch.endpoint_id else {
             continue;

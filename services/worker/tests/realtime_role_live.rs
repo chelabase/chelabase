@@ -82,7 +82,9 @@ where
         }
     })
     .await;
-    // Branches first (their computes), then the database's own rows.
+    // Branches first (their computes), then the database's own rows. Claimed first, as the API
+    // does, so the stack's worker doesn't recreate the computes the delete removes.
+    let _ = metadata.begin_delete(id).await;
     let _ = worker.handle_delete(id).await;
     cleanup(&worker, &metadata, id).await;
     if let Err(panic) = outcome {

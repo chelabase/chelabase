@@ -3193,6 +3193,8 @@ pub struct FakeStorage {
     pub unavailable: Mutex<HashMap<&'static str, u32>>,
     /// The method the storage controller refuses (400).
     pub reject: Mutex<Option<&'static str>>,
+    /// The method the storage controller answers 404 to, with this message.
+    pub not_found: Mutex<Option<(&'static str, String)>>,
     /// How `detach_ancestor` ends.
     pub detach: Mutex<FakeDetach>,
     /// How long `detach_ancestor` takes.
@@ -3237,6 +3239,14 @@ impl FakeStorage {
             return Err(StorconError::Other(anyhow::anyhow!(
                 "storage controller returned 503 Service Unavailable: {UNAVAILABLE_CAUSE}"
             )));
+        }
+        if let Some((m, message)) = lock(&self.not_found).clone()
+            && m == method
+        {
+            return Err(StorconError::Rejected {
+                status: reqwest::StatusCode::NOT_FOUND,
+                message,
+            });
         }
         if *lock(&self.reject) == Some(method) {
             return Err(StorconError::Rejected {
@@ -3823,6 +3833,7 @@ pub fn worker() -> (FakeWorker, Journal) {
             fail: Mutex::default(),
             unavailable: Mutex::default(),
             reject: Mutex::default(),
+            not_found: Mutex::default(),
             detach: Mutex::default(),
             detach_delay: Mutex::default(),
             on_create_tenant: Mutex::default(),
@@ -3877,6 +3888,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
+        recreate_backoff: Mutex::default(),
         zitadel: None,
         app_users_reconcile_every: Duration::from_secs(300),
         member_roles_sweep_every: Duration::from_secs(300),

@@ -23,7 +23,9 @@ use chelabase_types::{BranchId, DatabaseId};
 use worker::config::{RealWorker, WorkerConfig};
 
 mod common;
-use common::{cleanup, pageserver_container, setup, sqlx_delete, storage_broker_container};
+use common::{
+    cleanup, delete_database, pageserver_container, setup, sqlx_delete, storage_broker_container,
+};
 
 struct Story<'a> {
     worker: &'a RealWorker,
@@ -322,7 +324,7 @@ async fn delete_everything(
         .filter_map(|t| t.parse().ok())
         .collect();
     let started = Instant::now();
-    worker.handle_delete(id).await.expect("handle_delete");
+    delete_database(worker, metadata, id).await.expect("handle_delete");
     println!("delete database took {:?}", started.elapsed());
     for ep in &endpoints {
         if let Ok(Some(status)) = worker.computes.status(ep).await {
@@ -754,7 +756,7 @@ async fn branch_right_after_a_pageserver_restart_sees_the_last_write() {
             stale_head_story(&worker, &metadata, id, &name).await;
             // Right after the pageserver's re-attach the storage controller may not schedule
             // it yet; the client retries that (T1), so the delete is plain.
-            worker.handle_delete(id).await.expect("handle_delete");
+            delete_database(&worker, &metadata, id).await.expect("handle_delete");
         }
     })
     .await;
@@ -791,7 +793,7 @@ async fn provision_right_after_a_pageserver_restart_succeeds() {
                 .expect("handle_provision right after the restart");
             let record = metadata.get_database(id).await.unwrap().unwrap();
             assert_eq!(record.status, DatabaseStatus::Ready, "{:?}", record.error);
-            worker.handle_delete(id).await.expect("handle_delete");
+            delete_database(&worker, &metadata, id).await.expect("handle_delete");
         }
     })
     .await;

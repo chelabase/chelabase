@@ -213,3 +213,116 @@ async fn a_wait_for_an_invalid_tenant_is_refused_at_once() {
     assert!(result.is_err(), "{result:?}");
     assert!(started.elapsed() < Duration::from_secs(1));
 }
+
+fn js_refusal(code: usize, err_code: u64) -> async_nats::jetstream::stream::ConsumerErrorKind {
+    let e: async_nats::jetstream::Error = serde_json::from_value(
+        json!({ "code": code, "err_code": err_code, "description": "refused" }),
+    )
+    .unwrap();
+    async_nats::jetstream::stream::ConsumerErrorKind::JetStream(e)
+}
+
+// P3: a refusal that can't change within the wait ends it; anything else is retried.
+#[test]
+fn permanent_consumer_refusals_are_told_from_transient_ones() {
+    use async_nats::jetstream::stream::ConsumerErrorKind as K;
+    // STREAM_NOT_FOUND (10059), JETSTREAM_NOT_ENABLED (10076), ..._FOR_ACCOUNT (10039).
+    assert!(consumer_create_refusal_is_permanent(&js_refusal(
+        404, 10059
+    )));
+    assert!(consumer_create_refusal_is_permanent(&js_refusal(
+        503, 10076
+    )));
+    assert!(consumer_create_refusal_is_permanent(&js_refusal(
+        503, 10039
+    )));
+    // Other API errors (e.g. resource limits, a leader election) may pass.
+    assert!(!consumer_create_refusal_is_permanent(&js_refusal(
+        500, 10008
+    )));
+    assert!(!consumer_create_refusal_is_permanent(&js_refusal(503, 0)));
+    // A permissions violation is a silently dropped request: a timeout, like a slow server.
+    assert!(!consumer_create_refusal_is_permanent(&K::TimedOut));
+    assert!(!consumer_create_refusal_is_permanent(&K::Request));
+    assert!(!consumer_create_refusal_is_permanent(&K::Other));
+}
+
+// Item 4: pulls that keep failing are a failure, not a timeout.
+#[test]
+fn a_wait_whose_pulls_keep_failing_is_a_failure() {
+    // No pull ever answered (create alone doesn't count): failed, whatever the count.
+    assert!(attach_wait_failed(false, 0));
+    assert!(attach_wait_failed(false, 5));
+    // A pull answered, and the last calls were not all failures: a plain timeout.
+    assert!(!attach_wait_failed(true, 0));
+    assert!(!attach_wait_failed(true, ATTACH_FAILURE_LIMIT - 1));
+    // The last ATTACH_FAILURE_LIMIT calls all failed after an answered pull: failed.
+    assert!(attach_wait_failed(true, ATTACH_FAILURE_LIMIT));
+    assert!(attach_wait_failed(true, ATTACH_FAILURE_LIMIT + 4));
+    assert_eq!(ATTACH_FAILURE_LIMIT, 3);
+}
+
+// Rule 4's other side: a pull that ran until the deadline is no NATS answer, so a wait with no
+// event and one long pull (a 1 s wait: the server's batch expiry used to land at the deadline,
+// which cut the pull off first) was an `Err`. Every pull now expires before the deadline, by
+// `ATTACH_PULL_MARGIN` (half what is left, for a short wait), so the server's empty-batch answer
+// arrives within it; a pull too short to ask for isn't asked.
+#[test]
+fn every_pull_expires_before_the_deadline_so_the_server_answers_it() {
+    let ms = Duration::from_millis;
+    // A long wait: the longest pull, well before the deadline.
+    assert_eq!(attach_pull_expires(Duration::from_secs(60)), Some(ATTACH_FETCH_EXPIRES));
+    assert_eq!(
+        attach_pull_expires(ATTACH_FETCH_EXPIRES + ATTACH_PULL_MARGIN),
+        Some(ATTACH_FETCH_EXPIRES)
+    );
+    // The last pull of a wait, and a 1 s wait's only pull: it ends ATTACH_PULL_MARGIN early.
+    assert_eq!(attach_pull_expires(ms(1000)), Some(ms(1000) - ATTACH_PULL_MARGIN));
+    assert_eq!(attach_pull_expires(ms(2000)), Some(ms(2000) - ATTACH_PULL_MARGIN));
+    // A short wait keeps half of what is left for the answer.
+    assert_eq!(attach_pull_expires(ms(100)), Some(ms(50)));
+    assert_eq!(attach_pull_expires(ATTACH_FETCH_MIN * 2), Some(ATTACH_FETCH_MIN));
+    // Too little left for a pull worth asking for: none.
+    assert_eq!(attach_pull_expires(ATTACH_FETCH_MIN * 2 - ms(1)), None);
+    assert_eq!(attach_pull_expires(ms(0)), None);
+    // Exhaustively over 0..10 s in 1 ms steps: a pull ends before the deadline with room for the
+    // answer, and is never shorter than ATTACH_FETCH_MIN nor longer than ATTACH_FETCH_EXPIRES.
+    for left in (0..10_000).map(ms) {
+        if let Some(expires) = attach_pull_expires(left) {
+            assert!(expires >= ATTACH_FETCH_MIN, "{left:?}: {expires:?}");
+            assert!(expires <= ATTACH_FETCH_EXPIRES, "{left:?}: {expires:?}");
+            assert!(
+                left - expires >= ATTACH_PULL_MARGIN.min(left / 2),
+                "{left:?}: {expires:?} leaves no room for the answer"
+            );
+        } else {
+            assert!(left < ATTACH_FETCH_MIN * 2, "{left:?}: no pull");
+        }
+    }
+    assert_eq!(ATTACH_PULL_MARGIN, ms(250));
+}
+
+// Item 3: at most 2 tries.
+#[test]
+fn a_refused_create_is_tried_at_most_twice() {
+    assert_eq!(ATTACH_REFUSAL_LIMIT, 2);
+}
+
+// Item 2: the pause between tries never outlasts the deadline.
+#[tokio::test]
+async fn the_retry_pause_is_bounded_by_the_deadline() {
+    let started = tokio::time::Instant::now();
+    pause_until(started + Duration::from_millis(30)).await;
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(25) && took < ATTACH_RETRY_PAUSE,
+        "{took:?}"
+    );
+    let started = tokio::time::Instant::now();
+    pause_until(started + Duration::from_secs(5)).await;
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(240) && took < Duration::from_secs(1),
+        "{took:?}"
+    );
+}

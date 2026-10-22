@@ -903,6 +903,8 @@ pub fn neon_events_stream_config() -> async_nats::jetstream::stream::Config {
         retention: RetentionPolicy::Limits,
         storage: StorageType::File,
         max_messages_per_subject: 1,
+        // Events expire after 1 h (P2): a provision retried later than that finds no event, waits
+        // its timeout, then proceeds (R8).
         max_age: std::time::Duration::from_secs(3600),
         max_messages: 100_000,
         max_bytes: 64 * 1024 * 1024,
@@ -1008,18 +1010,71 @@ pub fn tenant_attached_consumer_config(
 const ATTACH_FETCH_EXPIRES: std::time::Duration = std::time::Duration::from_secs(5);
 /// A pull shorter than this isn't asked for: the deadline is as good as reached.
 const ATTACH_FETCH_MIN: std::time::Duration = std::time::Duration::from_millis(20);
+/// How long before the wait's deadline each pull expires, so the server's empty-batch answer
+/// (sent at the pull's expiry) arrives within the deadline: a pull the deadline cuts off is no
+/// answer from NATS (rule 4), so a pull that ran to the deadline would turn a plain "no event"
+/// into an `Err`. A short wait keeps half of what is left instead ([`attach_pull_expires`]).
+const ATTACH_PULL_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
 /// The pause after a failed NATS call before the next try (within the deadline).
 const ATTACH_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 /// How long the consumer's delete may take once the wait is over (the deadline may be spent by
 /// then; the consumer's `inactive_threshold` removes one whose delete failed).
 const ATTACH_DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How many failed NATS calls in a row (creates and pulls, no pull answering in between) make a
+/// wait that has seen a pull answer a failure rather than a timeout.
+const ATTACH_FAILURE_LIMIT: u32 = 3;
+/// How many times a create refused for a reason that won't change is tried before the wait ends.
+const ATTACH_REFUSAL_LIMIT: u32 = 2;
+
+/// Whether a consumer create's refusal will not change within the wait: the stream doesn't exist
+/// (`STREAM_NOT_FOUND`) or JetStream isn't enabled (for the server or the account). A permissions
+/// violation can't be told apart: the server drops the request without an answer, so it surfaces
+/// as a timeout like a slow server, and is retried until the deadline.
+fn consumer_create_refusal_is_permanent(
+    kind: &async_nats::jetstream::stream::ConsumerErrorKind,
+) -> bool {
+    use async_nats::jetstream::ErrorCode;
+    use async_nats::jetstream::stream::ConsumerErrorKind;
+    matches!(
+        kind,
+        ConsumerErrorKind::JetStream(e)
+            if matches!(
+                e.error_code(),
+                ErrorCode::STREAM_NOT_FOUND
+                    | ErrorCode::JETSTREAM_NOT_ENABLED
+                    | ErrorCode::JETSTREAM_NOT_ENABLED_FOR_ACCOUNT
+            )
+    )
+}
+
+/// Whether a wait that found no event is a failure (`Err`) rather than a timeout (`Ok(None)`).
+/// A timeout needs proof that NATS answered the question "is there an event?": some pull has
+/// answered (an event or an empty batch; a successful create alone proves nothing), and the
+/// latest `ATTACH_FAILURE_LIMIT` calls have not all failed since the last answered pull
+/// (`trailing_failures` counts failed creates and pulls since then).
+fn attach_wait_failed(pull_answered: bool, trailing_failures: u32) -> bool {
+    !pull_answered || trailing_failures >= ATTACH_FAILURE_LIMIT
+}
+
+/// The `expires` of a pull asked with `left` before the wait's deadline: at most
+/// [`ATTACH_FETCH_EXPIRES`], ending [`ATTACH_PULL_MARGIN`] (or half of `left`, if less) before the
+/// deadline so the server answers it in time; `None` when that is shorter than
+/// [`ATTACH_FETCH_MIN`] (no pull is asked).
+fn attach_pull_expires(left: std::time::Duration) -> Option<std::time::Duration> {
+    let expires = ATTACH_FETCH_EXPIRES.min(left - ATTACH_PULL_MARGIN.min(left / 2));
+    (expires >= ATTACH_FETCH_MIN).then_some(expires)
+}
+
 /// Waits up to `timeout` for `tenant`'s attach event (P11): `Some` as soon as one is stored
 /// (one published before the wait included), `None` at the deadline. A NATS failure is retried
-/// within the deadline; `Err` when no NATS call succeeded during the whole wait (NATS down, no
-/// stream: the caller says why it didn't wait). Every NATS call is bounded by what is left of the
-/// deadline; the wait's consumer is deleted before it returns. It never looks the stream up
-/// (`STREAM.INFO`): the worker may only create, pull from and delete its own consumers.
+/// within the deadline; `Err` per [`attach_wait_failed`] (NATS down, pulls failing, no stream:
+/// the caller says why it didn't wait), and early, after `ATTACH_REFUSAL_LIMIT` tries, when the
+/// consumer create is refused for a reason that won't change
+/// ([`consumer_create_refusal_is_permanent`]). Every NATS call is bounded by what is left of the
+/// deadline; the wait's consumer is deleted before it returns (also when its create timed out,
+/// which may still have been applied). It never looks the stream up (`STREAM.INFO`): the worker
+/// may only create, pull from and delete its own consumers.
 pub async fn wait_tenant_attached(
     js: &async_nats::jetstream::Context,
     tenant: &str,
@@ -1031,8 +1086,12 @@ pub async fn wait_tenant_attached(
     let config = tenant_attached_consumer_config(tenant)?;
     let name = config.name.clone().unwrap_or_default();
     let deadline = Instant::now() + timeout;
-    // Whether any NATS call answered, and the last failure.
-    let mut reached = false;
+    // Whether a pull answered, the failed calls since the last answered pull, the refusals that
+    // won't change, and the last failure.
+    let mut pull_answered = false;
+    let mut trailing_failures: u32 = 0;
+    let mut refusals: u32 = 0;
+    let mut gave_up = false;
     let mut last_error: Option<String> = None;
     let mut consumer: Option<PullConsumer> = None;
     let mut created = false;
@@ -1050,25 +1109,36 @@ pub async fn wait_tenant_attached(
             .await
             {
                 Ok(Ok(c)) => {
-                    reached = true;
                     created = true;
                     consumer = Some(c);
                 }
                 Ok(Err(e)) => {
                     last_error = Some(format!("creating the wait's consumer: {e}"));
+                    trailing_failures += 1;
+                    if consumer_create_refusal_is_permanent(&e.kind()) {
+                        refusals += 1;
+                        if refusals >= ATTACH_REFUSAL_LIMIT {
+                            gave_up = true;
+                            break None;
+                        }
+                    }
                     pause_until(deadline).await;
                     continue;
                 }
-                Err(_) => break None,
+                Err(_) => {
+                    // The create may have been applied after the deadline cut it off.
+                    created = true;
+                    break None;
+                }
             }
         }
         let Some(c) = consumer.as_ref() else {
             continue;
         };
-        let expires = ATTACH_FETCH_EXPIRES.min(deadline.saturating_duration_since(Instant::now()));
-        if expires < ATTACH_FETCH_MIN {
+        let Some(expires) = attach_pull_expires(deadline.saturating_duration_since(Instant::now()))
+        else {
             break None;
-        }
+        };
         let pulled = timeout_at(deadline, async {
             let mut batch = c
                 .batch()
@@ -1086,7 +1156,8 @@ pub async fn wait_tenant_attached(
         .await;
         match pulled {
             Ok(Ok(Some(message))) => {
-                reached = true;
+                pull_answered = true;
+                trailing_failures = 0;
                 match serde_json::from_slice::<TenantAttachedEvent>(&message.payload) {
                     Ok(event) if event.tenant_id == tenant => break Some(event),
                     Ok(event) => warn!(
@@ -1101,14 +1172,21 @@ pub async fn wait_tenant_attached(
                 consumer = None;
                 pause_until(deadline).await;
             }
-            Ok(Ok(None)) => reached = true,
+            Ok(Ok(None)) => {
+                // An empty batch; a server that ends batches at once must not be spun on.
+                pull_answered = true;
+                trailing_failures = 0;
+                pause_until(deadline).await;
+            }
             Ok(Err(e)) => {
+                trailing_failures += 1;
                 // The consumer may be gone (deleted, or removed while NATS was away): a fresh
                 // one is created on the next turn (create is create-or-update by name).
                 last_error = Some(e);
                 consumer = None;
                 pause_until(deadline).await;
             }
+            // Cut off by the deadline although it expired before it: NATS didn't answer in time.
             Err(_) => break None,
         }
     };
@@ -1128,7 +1206,7 @@ pub async fn wait_tenant_attached(
 
     match found {
         Some(event) => Ok(Some(event)),
-        None if reached => Ok(None),
+        None if !gave_up && !attach_wait_failed(pull_answered, trailing_failures) => Ok(None),
         None => Err(NatsError::JetStream(last_error.unwrap_or_else(|| {
             format!("no answer from NATS within {timeout:?}")
         }))),
